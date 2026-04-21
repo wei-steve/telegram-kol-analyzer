@@ -19,10 +19,12 @@ class TelegramAuthConfig:
 def load_telegram_auth_config(
     environ: dict[str, str] | None = None,
     session_path: str | Path | None = None,
+    env_file_paths: list[str | Path] | None = None,
 ) -> TelegramAuthConfig:
     """Load Telegram user-account credentials from environment variables."""
 
-    env = environ or os.environ
+    env = dict(_load_env_file_values(env_file_paths))
+    env.update(environ or os.environ)
     api_id = env.get("TELEGRAM_API_ID")
     api_hash = env.get("TELEGRAM_API_HASH")
     resolved_session_path = Path(session_path or env.get("TELEGRAM_SESSION_PATH", "data/telegram.session"))
@@ -37,6 +39,27 @@ def load_telegram_auth_config(
         api_hash=api_hash,
         session_path=resolved_session_path,
     )
+
+
+def _load_env_file_values(
+    env_file_paths: list[str | Path] | None = None,
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    candidate_paths = env_file_paths or [
+        ".env",
+        "config/telegram.env",
+    ]
+    for raw_path in candidate_paths:
+        path = Path(raw_path).expanduser()
+        if not path.exists() or not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
 
 
 def create_telegram_client(auth_config: TelegramAuthConfig) -> Any:

@@ -20,6 +20,7 @@
       <span>
         刷新模式：{{ refresh_mode_label }}
       </span>
+      <button type="button" class="secondary-button" data-refresh-now>立即刷新</button>
       <span class="message-sync-state{% if live_listener_enabled %} is-live{% endif %}">
         {% if live_listener_enabled %}
           实时监听已启用

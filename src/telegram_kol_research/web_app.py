@@ -41,7 +41,8 @@ from telegram_kol_research.web_queries import (
     load_selected_messages,
 )
 from telegram_kol_research.telegram_live_listener import launch_live_listener_task, run_live_listener
-from telegram_kol_research.telegram_live_listener import run_periodic_reconcile
+from telegram_kol_research.telegram_live_listener import run_periodic_reconcile, run_reconcile_once
+from telegram_kol_research.telegram_client import create_telegram_client, load_telegram_auth_config, maybe_await
 
 
 def create_web_app(
@@ -124,6 +125,9 @@ def create_web_app(
     app.state.reconcile_runner = reconcile_runner or run_periodic_reconcile
     app.state.reconcile_interval_seconds = reconcile_interval_seconds
     app.state.reconcile_task = None
+    app.state.telegram_auth_loader = load_telegram_auth_config
+    app.state.telegram_client_factory = create_telegram_client
+    app.state.reconcile_once_runner = run_reconcile_once
 
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
     app.mount(
@@ -281,6 +285,31 @@ def create_web_app(
             ),
             "sources": build_source_reference_map(messages),
         }
+
+    @app.post("/api/refresh")
+    def refresh():
+        try:
+            auth_config = app.state.telegram_auth_loader()
+            telegram_client = app.state.telegram_client_factory(auth_config)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        async def run_refresh():
+            await maybe_await(getattr(telegram_client, "connect", lambda: None)())
+            try:
+                return await app.state.reconcile_once_runner(
+                    client=telegram_client,
+                    session_factory=app.state.session_factory,
+                    broker=app.state.live_update_broker,
+                    target_titles=set(app.state.live_target_titles),
+                    media_root=app.state.media_root,
+                )
+            finally:
+                disconnect = getattr(telegram_client, "disconnect", None)
+                if callable(disconnect):
+                    await maybe_await(disconnect())
+
+        return asyncio.run(run_refresh())
 
     @app.get("/api/events")
     def events():

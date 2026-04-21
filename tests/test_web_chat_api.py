@@ -16,6 +16,68 @@ def test_chat_api_rejects_missing_question(tmp_path):
     assert response.status_code == 422
 
 
+def test_refresh_api_reports_missing_telegram_credentials(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post("/api/refresh")
+
+    assert response.status_code == 503
+    assert "TELEGRAM_API_ID is required" in response.json()["detail"]
+
+
+def test_refresh_api_runs_reconcile_once_when_credentials_are_available(tmp_path):
+    captured: dict[str, object] = {}
+
+    def fake_auth_loader():
+        from telegram_kol_research.telegram_client import TelegramAuthConfig
+
+        return TelegramAuthConfig(
+            api_id=123456,
+            api_hash="hash",
+            session_path=tmp_path / "telegram.session",
+        )
+
+    def fake_create_client(auth_config):
+        captured["auth_config"] = auth_config
+        return object()
+
+    async def fake_reconcile_once(
+        *,
+        client,
+        session_factory,
+        broker,
+        target_titles,
+        media_root,
+        message_limit=50,
+        checkpoint_overlap=5,
+        discover_dialogs_fn=None,
+        fetch_dialog_messages_fn=None,
+    ):
+        captured["client"] = client
+        captured["target_titles"] = set(target_titles)
+        return {
+            "matched_dialogs": 2,
+            "inserted_messages": 3,
+            "inserted_candidates": 1,
+            "inserted_trade_ideas": 1,
+        }
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        live_target_titles={"Demo Group"},
+    )
+    app.state.telegram_auth_loader = fake_auth_loader
+    app.state.telegram_client_factory = fake_create_client
+    app.state.reconcile_once_runner = fake_reconcile_once
+    client = TestClient(app)
+
+    response = client.post("/api/refresh")
+
+    assert response.status_code == 200
+    assert response.json()["inserted_messages"] == 3
+    assert captured["target_titles"] == {"Demo Group"}
+
+
 def test_chat_api_accepts_question_and_chat_scope(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

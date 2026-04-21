@@ -343,6 +343,31 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
       bindMessagePanelControls(panel);
     });
   }
+
+  const refreshButton = panel.querySelector('[data-refresh-now]');
+  if (refreshButton) {
+    refreshButton.addEventListener('click', async () => {
+      refreshButton.disabled = true;
+      setAiStatus('Refreshing Telegram data...');
+      try {
+        const response = await fetch('/api/refresh', { method: 'POST' });
+        const payload = await response.json();
+        if (!response.ok) {
+          const detail = payload && typeof payload.detail === 'string'
+            ? payload.detail
+            : 'Refresh failed.';
+          setAiStatus(detail, true);
+          return;
+        }
+        await refreshCurrentGroupPanel();
+        setAiStatus(`Refresh complete. Inserted ${payload.inserted_messages || 0} new message(s).`);
+      } catch {
+        setAiStatus('Refresh failed. Please check Telegram credentials and try again.', true);
+      } finally {
+        refreshButton.disabled = false;
+      }
+    });
+  }
 }
 
 function bindGroupLinks() {

@@ -3,6 +3,7 @@ from typer.testing import CliRunner
 from telegram_kol_research.cli import app
 from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig
 from telegram_kol_research.telegram_client import TelegramAuthConfig
+from telegram_kol_research.telegram_client import load_telegram_auth_config
 
 
 def test_sync_discover_mode_does_not_fetch_messages(monkeypatch, tmp_path):
@@ -92,6 +93,29 @@ def test_sync_reports_friendly_auth_error(monkeypatch, tmp_path):
     assert result.exit_code == 1
     assert "Telegram auth/config error" in result.stdout
     assert "TELEGRAM_API_ID is required" in result.stdout
+
+
+def test_load_telegram_auth_config_reads_local_env_file(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "TELEGRAM_API_ID=123456",
+                "TELEGRAM_API_HASH=hash-from-file",
+                "TELEGRAM_SESSION_PATH=data/from-env-file.session",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    auth_config = load_telegram_auth_config(
+        environ={},
+        env_file_paths=[env_file],
+    )
+
+    assert auth_config.api_id == 123456
+    assert auth_config.api_hash == "hash-from-file"
+    assert str(auth_config.session_path) == "data/from-env-file.session"
 
 
 def test_sync_prompts_for_first_time_login(monkeypatch, tmp_path):

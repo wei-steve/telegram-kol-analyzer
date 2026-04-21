@@ -34,6 +34,10 @@ export TELEGRAM_SESSION_PATH="data/telegram.session"
 This project uses your Telegram user session and targets archived chats. It
 does not use the Bot API.
 
+If you do not want to export them in every shell, save the same values in a
+repo-local `.env` file or `config/telegram.env`. The CLI and web workbench
+load those files automatically.
+
 ## 3. Configure Target Groups
 
 Copy the example config and edit the target groups:
@@ -76,6 +80,10 @@ Realtime delivery uses two paths:
 - Push path: Telethon live listener publishes browser updates through SSE
 - Recovery path: a periodic reconcile pass replays a small recent window so
   missed messages after reconnects can still land in SQLite safely
+
+The message header also includes an `立即刷新` button for a one-shot reconcile.
+If credentials are missing or invalid, the failure reason is returned directly
+in the page instead of failing silently.
 
 If Telegram credentials are missing, the workbench still opens but stays in
 local-snapshot mode and shows how stale the current database is.

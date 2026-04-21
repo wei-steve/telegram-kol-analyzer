@@ -56,6 +56,8 @@ The workbench shows:
 - Database freshness and refresh-mode status in the message header
 - SSE-based browser live updates for new messages
 - Periodic reconcile replay to reduce missed-message gaps after reconnects
+- A manual `立即刷新` action that runs a one-shot reconcile and reports
+  credential errors directly in the page
 
 Inside the message panel you can:
 
@@ -98,6 +100,10 @@ export TELEGRAM_SESSION_PATH="data/telegram.session"
 ```
 
 The session file is stored locally on your Mac.
+
+You can also place the same values in a local `.env` file or
+`config/telegram.env`. The app loads those files automatically when the shell
+environment is missing Telegram credentials.
 
 ## Target Group Config
 
