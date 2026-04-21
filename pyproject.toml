@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-kol-research"
+version = "0.1.0"
+description = "Local-first Telegram KOL win-rate research toolkit."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "httpx",
+    "jinja2",
+    "pillow",
+    "pyyaml",
+    "pytesseract",
+    "pytest",
+    "sqlalchemy",
+    "telethon",
+    "typer",
+    "uvicorn",
+]
+
+[project.scripts]
+telegram-kol-research = "telegram_kol_research.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

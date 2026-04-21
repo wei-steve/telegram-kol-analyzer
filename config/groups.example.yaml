@@ -1,0 +1,15 @@
+groups:
+  - chat_title: "VIP BTC Room"
+    enabled: true
+    custom_group_label: "BTC Core"
+    sync_start_date: "2026-01-01"
+    sync_end_date: null
+    tracked_senders:
+      - display_name: "Alice"
+        username: "alice_signals"
+        telegram_sender_id: 10001
+        custom_label: "Alice"
+      - display_name: "Bob"
+        username: "bob_trader"
+        telegram_sender_id: 10002
+        custom_label: "Bob"

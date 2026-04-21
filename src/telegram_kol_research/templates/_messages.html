@@ -1,0 +1,102 @@
+<section
+  class="panel messages-panel"
+  data-messages-panel
+  data-layout-scroll-panel
+  data-chat-id="{{ selected_chat_id or 0 }}"
+  data-latest-message-id="{{ messages[0].message_id if messages else 0 }}"
+>
+  <div class="messages-panel-header">
+    <h2>{{ selected_group.title if selected_group else "Messages" }}</h2>
+    <div class="message-sync-meta">
+      <span>
+        最后入库时间：{{ selected_group.last_posted_at.strftime('%Y-%m-%d %H:%M') if selected_group and selected_group.last_posted_at else '暂无数据' }}
+      </span>
+      <span>
+        数据库最新消息时间：{{ database_latest_message_at.strftime('%Y-%m-%d %H:%M') if database_latest_message_at else '暂无数据' }}
+      </span>
+      <span>
+        数据新鲜度：{{ '%.1f 小时未刷新'|format(database_stale_hours) if database_stale_hours is not none else '暂无数据' }}
+      </span>
+      <span>
+        刷新模式：{{ refresh_mode_label }}
+      </span>
+      <span class="message-sync-state{% if live_listener_enabled %} is-live{% endif %}">
+        {% if live_listener_enabled %}
+          实时监听已启用
+        {% else %}
+          实时监听未启用
+        {% endif %}
+      </span>
+      {% if not live_listener_enabled and live_listener_status_reason %}
+        <span>{{ live_listener_status_reason }}</span>
+      {% endif %}
+    </div>
+    <form class="message-filters" data-message-filters>
+      <label>
+        Search
+        <input
+          type="search"
+          name="search_text"
+          value="{{ search_text or '' }}"
+          placeholder="Search message text"
+        />
+      </label>
+      <label>
+        Sender
+        <input
+          type="search"
+          name="sender_name"
+          value="{{ sender_name or '' }}"
+          placeholder="Filter by sender"
+        />
+      </label>
+      <div class="message-filter-actions">
+        <button type="submit">Apply filters</button>
+        <button type="button" data-clear-message-filters>Clear</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="message-list" data-message-list>
+    {% for message in messages %}
+      <article class="message-card" id="message-{{ message.raw_message_id }}">
+        <header>
+          <span>{{ message.sender_name or "Unknown" }}</span>
+          <span>{{ message.posted_at.strftime('%Y-%m-%d %H:%M') if message.posted_at else '' }}</span>
+          <span>{{ message.message_id }}</span>
+        </header>
+        <p>{{ message.text or "" }}</p>
+        {% if message.media_assets %}
+          <div class="media-list">
+            {% for media in message.media_assets %}
+              <div class="media-item">
+                {% if media.local_path %}
+                  <img src="/local-media/{{ media.local_path.split('data/media/')[-1] }}" alt="message media" />
+                {% endif %}
+                {% if media.ocr_text %}
+                  <details>
+                    <summary>OCR text</summary>
+                    <pre>{{ media.ocr_text }}</pre>
+                  </details>
+                {% endif %}
+              </div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      </article>
+    {% endfor %}
+  </div>
+
+  {% set next_before_message_id = messages[-1].message_id if messages else None %}
+  <div class="message-list-footer">
+    {% if next_before_message_id %}
+      <button
+        type="button"
+        data-load-more
+        data-before-message-id="{{ next_before_message_id }}"
+      >
+        Load more
+      </button>
+    {% endif %}
+  </div>
+</section>

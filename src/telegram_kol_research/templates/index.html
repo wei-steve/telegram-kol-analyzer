@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}Telegram Workbench{% endblock %}
+
+{% block body %}
+  <main class="layout">
+    <aside class="panel groups-panel" data-layout-scroll-panel>
+      <h1>Groups</h1>
+      <ul>
+        {% for group in groups %}
+          <li>
+            <button
+              type="button"
+              class="group-link{% if group.chat_id == selected_chat_id %} is-active{% endif %}"
+              data-group-link
+              data-chat-id="{{ group.chat_id }}"
+            >
+              <strong>{{ group.title }}</strong>
+            </button>
+            <span>{{ group.message_count }}</span>
+          </li>
+        {% endfor %}
+      </ul>
+    </aside>
+
+    {% include "_messages.html" %}
+
+    <aside class="panel ai-panel" data-layout-scroll-panel>
+      <div class="ai-workbench" data-ai-workbench>
+        <header class="ai-workbench-header">
+          <h2>AI Analysis</h2>
+          <section class="group-prompt-panel">
+            <h3>该群默认提示词</h3>
+            <p class="ai-helper-text">仅影响当前群，下次提问立即生效</p>
+            <textarea
+              name="group_prompt"
+              data-group-prompt
+              rows="5"
+              placeholder="例如：请像交易研究员一样，优先总结最新变化、可执行信号和分歧点。"
+            ></textarea>
+          </section>
+        </header>
+
+        <section class="ai-history-panel">
+          <div class="ai-history-header">
+            <h3>Conversation</h3>
+            <button type="button" class="secondary-button" data-clear-ai-history>清理聊天记录</button>
+          </div>
+          <div class="ai-history-scroll" data-ai-history-scroll>
+            <div class="ai-history" data-ai-history></div>
+          </div>
+        </section>
+
+        <form class="ai-composer" data-ai-form data-ai-composer>
+          <input type="hidden" name="chat_id" value="{{ selected_chat_id or 0 }}" />
+          <p class="ai-helper-text">默认分析当前群最近 50 条消息；你也可以直接问“总结最近 200 条”。</p>
+          <div class="ai-form-status" data-ai-status aria-live="polite"></div>
+          <textarea name="question" rows="4" placeholder="Ask AI to analyze this group's messages..."></textarea>
+          <button type="submit">Analyze</button>
+        </form>
+      </div>
+    </aside>
+  </main>
+{% endblock %}
