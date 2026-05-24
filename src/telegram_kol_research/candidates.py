@@ -8,11 +8,6 @@ from typing import Iterable
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import MediaAsset, RawMessage, SignalCandidate, Source
-from telegram_kol_research.parsing.ocr_parser import (
-    extract_text_from_image,
-    image_signal_confidence,
-    merge_caption_and_ocr_text,
-)
 from telegram_kol_research.parsing.text_parser import parse_signal_text
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 
@@ -106,43 +101,6 @@ def persist_text_signal_candidates(
 
             parsed = parse_signal_text(text_input) if text_input else None
             parse_source = "text"
-            ocr_text = None
-
-            if record.media_path:
-                try:
-                    ocr_text = extract_text_from_image(record.media_path)
-                except RuntimeError:
-                    ocr_text = None
-
-                media_asset = (
-                    session.query(MediaAsset)
-                    .filter(
-                        MediaAsset.raw_message_id == raw_message.id,
-                        MediaAsset.local_path == record.media_path,
-                    )
-                    .order_by(MediaAsset.id.desc())
-                    .first()
-                )
-                if media_asset is None:
-                    media_asset = (
-                        session.query(MediaAsset)
-                        .filter(MediaAsset.raw_message_id == raw_message.id)
-                        .order_by(MediaAsset.id.asc())
-                        .first()
-                    )
-                if media_asset is not None and ocr_text is not None:
-                    media_asset.ocr_text = ocr_text
-
-                merged_text = merge_caption_and_ocr_text(record.text, ocr_text)
-                if merged_text.strip():
-                    ocr_parsed = parse_signal_text(merged_text)
-                    ocr_parsed.confidence = image_signal_confidence(
-                        ocr_parsed.confidence,
-                        image_only=not bool(text_input),
-                    )
-                    if ocr_parsed.symbol and ocr_parsed.side:
-                        parsed = ocr_parsed
-                        parse_source = "text+ocr" if text_input else "ocr"
 
             if parsed is None or not parsed.symbol or not parsed.side:
                 continue

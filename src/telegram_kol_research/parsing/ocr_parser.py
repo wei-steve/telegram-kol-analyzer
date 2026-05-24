@@ -31,5 +31,8 @@ def extract_text_from_image(image_path: str | Path) -> str:
             "OCR dependencies are not installed in the current environment. Install Pillow and pytesseract first."
         ) from exc
 
-    with Image.open(Path(image_path)) as image:
-        return pytesseract.image_to_string(image).strip()
+    try:
+        with Image.open(Path(image_path)) as image:
+            return pytesseract.image_to_string(image).strip()
+    except Exception as exc:
+        raise RuntimeError(f"OCR failed for {image_path}: {exc}") from exc

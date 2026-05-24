@@ -18,16 +18,42 @@ class LLMProxyConfig:
     timeout_seconds: float
 
 
-def load_llm_proxy_config(environ: dict[str, str] | None = None) -> LLMProxyConfig:
+def load_llm_proxy_config(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | os.PathLike[str]] | None = None,
+) -> LLMProxyConfig:
     """Load LLM proxy settings from environment variables."""
 
-    env = environ or os.environ
+    env = dict(_load_env_file_values(env_file_paths))
+    env.update(environ or os.environ)
     return LLMProxyConfig(
         base_url=env.get("TELEGRAM_KOL_LLM_BASE_URL", "http://127.0.0.1:8317"),
         api_key=env.get("TELEGRAM_KOL_LLM_API_KEY", ""),
         model=env.get("TELEGRAM_KOL_LLM_MODEL", "gpt-4.1-mini"),
         timeout_seconds=float(env.get("TELEGRAM_KOL_LLM_TIMEOUT_SECONDS", "60")),
     )
+
+
+def _load_env_file_values(
+    env_file_paths: list[str | os.PathLike[str]] | None = None,
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    candidate_paths = env_file_paths or [
+        ".env",
+        "config/llm.env",
+    ]
+    for raw_path in candidate_paths:
+        path = os.fspath(raw_path)
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                key, value = stripped.split("=", 1)
+                values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
 
 
 def build_scope_context(messages: list[dict[str, Any]]) -> str:
@@ -139,13 +165,6 @@ def request_grounded_chat_answer(
     client: httpx.Client | None = None,
 ) -> str:
     """Send a grounded chat request through an OpenAI-compatible proxy."""
-
-    payload = build_proxy_chat_payload(
-        question=question,
-        scope_context=scope_context,
-        model=config.model,
-        group_prompt=group_prompt,
-    )
     headers = {"Content-Type": "application/json"}
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
@@ -153,13 +172,14 @@ def request_grounded_chat_answer(
     created_client = client is None
     active_client = client or httpx.Client(timeout=config.timeout_seconds)
     try:
-        response = active_client.post(
-            f"{config.base_url.rstrip('/')}/v1/chat/completions",
-            json=payload,
+        data = _request_chat_completion(
+            active_client=active_client,
+            config=config,
+            question=question,
+            scope_context=scope_context,
+            group_prompt=group_prompt,
             headers=headers,
         )
-        response.raise_for_status()
-        data = response.json()
     finally:
         if created_client:
             active_client.close()
@@ -173,6 +193,107 @@ def request_grounded_chat_answer(
         return ""
     _raise_for_error_like_answer(content)
     return content
+
+
+def _request_chat_completion(
+    *,
+    active_client: httpx.Client,
+    config: LLMProxyConfig,
+    question: str,
+    scope_context: str,
+    group_prompt: str | None,
+    headers: dict[str, str],
+) -> dict[str, Any]:
+    payload = build_proxy_chat_payload(
+        question=question,
+        scope_context=scope_context,
+        model=config.model,
+        group_prompt=group_prompt,
+    )
+    response = active_client.post(
+        f"{config.base_url.rstrip('/')}/v1/chat/completions",
+        json=payload,
+        headers=headers,
+    )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if not _is_unknown_model_error(exc):
+            raise
+        fallback_model = _resolve_supported_model(
+            active_client=active_client,
+            config=config,
+            headers=headers,
+        )
+        if not fallback_model or fallback_model == config.model:
+            raise
+        config.model = fallback_model
+        payload = build_proxy_chat_payload(
+            question=question,
+            scope_context=scope_context,
+            model=config.model,
+            group_prompt=group_prompt,
+        )
+        response = active_client.post(
+            f"{config.base_url.rstrip('/')}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+        )
+        response.raise_for_status()
+    return response.json()
+
+
+def _is_unknown_model_error(exc: httpx.HTTPStatusError) -> bool:
+    try:
+        payload = exc.response.json()
+    except ValueError:
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    return isinstance(message, str) and "unknown provider for model" in message.lower()
+
+
+def _resolve_supported_model(
+    *,
+    active_client: httpx.Client,
+    config: LLMProxyConfig,
+    headers: dict[str, str],
+) -> str | None:
+    response = active_client.get(
+        f"{config.base_url.rstrip('/')}/v1/models",
+        headers=headers,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    raw_models = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(raw_models, list):
+        return None
+    available_models = [
+        model_id
+        for item in raw_models
+        if isinstance(item, dict)
+        for model_id in [item.get("id")]
+        if isinstance(model_id, str) and model_id
+    ]
+    if config.model in available_models:
+        return config.model
+
+    preferred_models = (
+        "gpt-5.4-mini",
+        "gpt-5.4",
+        "gpt-5.2",
+        "gpt-4.1-mini",
+        "gpt-4.1",
+    )
+    for candidate in preferred_models:
+        if candidate in available_models:
+            return candidate
+
+    for candidate in available_models:
+        if "codex" not in candidate.lower():
+            return candidate
+
+    return available_models[0] if available_models else None
 
 
 def _raise_for_error_like_answer(content: str) -> None:

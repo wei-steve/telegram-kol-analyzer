@@ -1,0 +1,15 @@
+<ul data-groups-list>
+  {% for group in groups %}
+    <li>
+      <button
+        type="button"
+        class="group-link{% if group.chat_id == selected_chat_id %} is-active{% endif %}"
+        data-group-link
+        data-chat-id="{{ group.chat_id }}"
+      >
+        <strong>{{ group.title }}</strong>
+      </button>
+      <span>{{ group.message_count }}</span>
+    </li>
+  {% endfor %}
+</ul>

@@ -13,6 +13,7 @@ from telegram_kol_research.candidates import persist_text_signal_candidates
 from telegram_kol_research.dataset_export import export_dataset_jsonl
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.group_config import load_group_config
+from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.llm_adjudication import (
     export_llm_adjudication_pack,
     export_llm_submission_sample,
@@ -35,6 +36,10 @@ from telegram_kol_research.review_queue import (
     load_candidates,
     write_candidates,
 )
+from telegram_kol_research.strategy_alerts import (
+    load_strategy_alert_config,
+    strategy_alerts_enabled,
+)
 from telegram_kol_research.telegram_client import (
     create_telegram_client,
     discover_dialogs,
@@ -44,6 +49,12 @@ from telegram_kol_research.telegram_client import (
     load_telegram_auth_config,
     maybe_await,
 )
+from telegram_kol_research.telegram_session_lock import (
+    TelegramSessionLockError,
+    acquire_telegram_session_lock,
+    reap_stopped_session_lock_owner,
+)
+from telegram_kol_research.telegram_live_listener import run_live_listener
 from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidates
 from telegram_kol_research.web_app import create_web_app
 
@@ -231,72 +242,77 @@ def sync(
 
     try:
         auth_config = load_telegram_auth_config()
-        client = create_telegram_client(auth_config)
     except (ValueError, RuntimeError) as exc:
         typer.echo(f"Telegram auth/config error: {exc}", err=False)
         raise typer.Exit(code=1) from exc
 
-    session_factory = create_session_factory(database_path)
-    repair_history_checkpoints(session_factory)
-
-    matched_dialogs: list[dict[str, str | int | bool | None]] = []
-    inserted_messages = 0
-    inserted_candidates = 0
-    inserted_trade_ideas = 0
-    unmatched_titles: set[str] = set()
-
     try:
-        (
-            matched_dialogs,
-            inserted_messages,
-            inserted_candidates,
-            inserted_trade_ideas,
-        ) = asyncio.run(
-            _run_telegram_sync(
-                client=client,
-                session_factory=session_factory,
-                target_titles=target_titles,
-                windows_by_title=windows_by_title,
-                message_limit=message_limit,
-                mode=mode,
-            )
-        )
-        matched_titles = {str(dialog.get("title")) for dialog in matched_dialogs}
-        unmatched_titles = target_titles - matched_titles
-        if mode == SyncMode.discover:
+        with acquire_telegram_session_lock(auth_config.session_path):
+            client = create_telegram_client(auth_config)
+            session_factory = create_session_factory(database_path)
+            repair_history_checkpoints(session_factory)
+
+            matched_dialogs: list[dict[str, str | int | bool | None]] = []
+            inserted_messages = 0
+            inserted_candidates = 0
+            inserted_trade_ideas = 0
+            unmatched_titles: set[str] = set()
+
+            try:
+                (
+                    matched_dialogs,
+                    inserted_messages,
+                    inserted_candidates,
+                    inserted_trade_ideas,
+                ) = asyncio.run(
+                    _run_telegram_sync(
+                        client=client,
+                        session_factory=session_factory,
+                        target_titles=target_titles,
+                        windows_by_title=windows_by_title,
+                        message_limit=message_limit,
+                        mode=mode,
+                    )
+                )
+                matched_titles = {str(dialog.get("title")) for dialog in matched_dialogs}
+                unmatched_titles = target_titles - matched_titles
+                if mode == SyncMode.discover:
+                    typer.echo(f"Discovered {len(matched_dialogs)} archived target group(s)")
+                    typer.echo("Discovery only mode: no messages were fetched or persisted.")
+                    for dialog in matched_dialogs:
+                        typer.echo(f"- {dialog.get('title')}")
+                    if unmatched_titles:
+                        typer.echo("Configured groups not currently matched:")
+                        for title in sorted(unmatched_titles):
+                            typer.echo(f"- {title}")
+                    return
+            except Exception as exc:
+                typer.echo(f"Telegram sync error: {exc}", err=False)
+                raise typer.Exit(code=1) from exc
+            finally:
+                disconnect = getattr(client, "disconnect", None)
+                if callable(disconnect):
+                    try:
+                        asyncio.run(maybe_await(disconnect()))
+                    except RuntimeError:
+                        pass
+
             typer.echo(f"Discovered {len(matched_dialogs)} archived target group(s)")
-            typer.echo("Discovery only mode: no messages were fetched or persisted.")
+            typer.echo(f"Persisted {inserted_messages} raw message(s) to {database_path}")
+            if mode != SyncMode.backfill:
+                typer.echo(
+                    f"Persisted {inserted_candidates} signal candidate(s) to {database_path}"
+                )
+                typer.echo(f"Persisted {inserted_trade_ideas} trade idea(s) to {database_path}")
             for dialog in matched_dialogs:
                 typer.echo(f"- {dialog.get('title')}")
             if unmatched_titles:
                 typer.echo("Configured groups not currently matched:")
                 for title in sorted(unmatched_titles):
                     typer.echo(f"- {title}")
-            return
-    except Exception as exc:
-        typer.echo(f"Telegram sync error: {exc}", err=False)
+    except TelegramSessionLockError as exc:
+        typer.echo(str(exc), err=False)
         raise typer.Exit(code=1) from exc
-    finally:
-        disconnect = getattr(client, "disconnect", None)
-        if callable(disconnect):
-            try:
-                asyncio.run(maybe_await(disconnect()))
-            except RuntimeError:
-                pass
-
-    typer.echo(f"Discovered {len(matched_dialogs)} archived target group(s)")
-    typer.echo(f"Persisted {inserted_messages} raw message(s) to {database_path}")
-    if mode != SyncMode.backfill:
-        typer.echo(
-            f"Persisted {inserted_candidates} signal candidate(s) to {database_path}"
-        )
-        typer.echo(f"Persisted {inserted_trade_ideas} trade idea(s) to {database_path}")
-    for dialog in matched_dialogs:
-        typer.echo(f"- {dialog.get('title')}")
-    if unmatched_titles:
-        typer.echo("Configured groups not currently matched:")
-        for title in sorted(unmatched_titles):
-            typer.echo(f"- {title}")
 
 
 @app.command()
@@ -518,10 +534,28 @@ def web(
 
     telegram_client = None
     live_listener_status_reason = None
+    telegram_session_lock = None
+    telegram_session_lock_entered = False
     try:
         auth_config = load_telegram_auth_config()
+        reap_stopped_session_lock_owner(
+            auth_config.session_path,
+            current_command="telegram-kol-research web",
+        )
+        telegram_session_lock = acquire_telegram_session_lock(auth_config.session_path)
+        telegram_session_lock.__enter__()
+        telegram_session_lock_entered = True
         telegram_client = create_telegram_client(auth_config)
+    except TelegramSessionLockError as exc:
+        live_listener_status_reason = str(exc)
+        typer.echo(
+            f"Telegram live listener disabled: {exc}",
+            err=False,
+        )
     except (ValueError, RuntimeError) as exc:
+        if telegram_session_lock_entered and telegram_session_lock is not None:
+            telegram_session_lock.__exit__(None, None, None)
+            telegram_session_lock_entered = False
         live_listener_status_reason = "缺少 Telegram API 凭据或 Telethon 运行依赖"
         typer.echo(
             f"Telegram live listener disabled: {exc}",
@@ -535,7 +569,68 @@ def web(
         live_listener_status_reason=live_listener_status_reason,
         group_labels_by_title=group_labels_by_title,
     )
-    uvicorn.run(app_instance, host=host, port=port)
+    try:
+        uvicorn.run(app_instance, host=host, port=port)
+    finally:
+        if telegram_session_lock_entered and telegram_session_lock is not None:
+            telegram_session_lock.__exit__(None, None, None)
+
+
+@app.command()
+def alerts(
+    database_path: Path = Path("data/research.db"),
+    config_path: Path = Path("config/groups.yaml"),
+    media_root: Path = Path("data/media"),
+) -> None:
+    """Run realtime AI strategy alert forwarding without the web UI."""
+
+    group_config = load_group_config(config_path)
+    target_titles = {group.chat_title for group in group_config.groups if group.enabled}
+    alert_config = load_strategy_alert_config()
+    if not strategy_alerts_enabled(alert_config):
+        typer.echo(
+            "Strategy alerts are not configured. Set TELEGRAM_KOL_ALERT_BOT_TOKEN and TELEGRAM_KOL_ALERT_CHAT_ID.",
+            err=False,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        auth_config = load_telegram_auth_config()
+        reap_stopped_session_lock_owner(
+            auth_config.session_path,
+            current_command="telegram-kol-research alerts",
+        )
+    except (ValueError, RuntimeError) as exc:
+        typer.echo(f"Telegram auth/config error: {exc}", err=False)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        with acquire_telegram_session_lock(auth_config.session_path):
+            client = create_telegram_client(auth_config)
+            session_factory = create_session_factory(database_path)
+            broker = LiveUpdateBroker()
+            try:
+                asyncio.run(
+                    run_live_listener(
+                        client=client,
+                        session_factory=session_factory,
+                        broker=broker,
+                        target_titles=target_titles,
+                        media_root=media_root,
+                        strategy_alert_config=alert_config,
+                    )
+                )
+            finally:
+                broker.close()
+                disconnect = getattr(client, "disconnect", None)
+                if callable(disconnect):
+                    try:
+                        asyncio.run(maybe_await(disconnect()))
+                    except RuntimeError:
+                        pass
+    except TelegramSessionLockError as exc:
+        typer.echo(str(exc), err=False)
+        raise typer.Exit(code=1) from exc
 
 
 def main() -> None:

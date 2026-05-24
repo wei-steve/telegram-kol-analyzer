@@ -112,6 +112,7 @@ def load_group_messages(
             .limit(limit)
             .all()
         )
+        raw_messages.reverse()
 
         rows: list[dict[str, object | None]] = []
         for raw_message in raw_messages:

@@ -13,9 +13,14 @@ __pycache__/
 src/*.egg-info/
 
 config/groups.yaml
+config/*.env
 
 data/*.db
+data/*.db-*
 data/*.session
+data/*.session-*
+data/*.session.*
+data/*.lock
 data/media/
 
 exports/

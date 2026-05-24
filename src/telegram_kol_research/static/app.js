@@ -117,7 +117,7 @@ function renderConversationHistory() {
   }
   const history = loadConversationHistory();
   if (history.length === 0) {
-    container.innerHTML = '<div class="history-empty">No messages yet.</div>';
+    container.innerHTML = '<div class="history-empty">还没有分析报告。输入一个问题后，这里会生成该群的研究卡片。</div>';
     return;
   }
   container.innerHTML = history
@@ -125,12 +125,14 @@ function renderConversationHistory() {
       const normalizedAnswer = normalizeAiAnswerText(entry.answer || '');
       const shouldShowSources = !isImageInputErrorText(normalizedAnswer);
       return `
-      <article class="history-turn">
-        <div class="history-question-block">
-          ${renderHistoryTimestamp(entry.createdAt)}
+      <article class="history-turn ai-report-card">
+        <div class="history-question-block ai-report-meta">
+          <span class="ai-report-label">提问</span>
           <div class="history-content">${escapeHtml(entry.question || '')}</div>
+          ${renderHistoryTimestamp(entry.createdAt)}
         </div>
-        <div class="history-answer-block">
+        <div class="history-answer-block ai-report-body">
+          <div class="ai-report-kicker">AI 研究结论</div>
           <div class="history-content">${renderCitations(normalizedAnswer, shouldShowSources ? (entry.sources || []) : [])}</div>
           ${shouldShowSources ? renderHistorySources(entry.sources || []) : ''}
         </div>
@@ -163,8 +165,8 @@ function renderHistorySources(sources) {
     return '';
   }
   return `
-    <details class="history-sources" open>
-      <summary>Sources (${sources.length})</summary>
+    <details class="history-sources">
+      <summary>引用消息 ${sources.length} 条</summary>
       <div class="history-sources-list">${renderSourceList(sources)}</div>
     </details>
   `;
@@ -258,6 +260,13 @@ function getLatestMessageId(panel = getMessagePanel()) {
   return Number(panel.dataset.latestMessageId || '0');
 }
 
+function scrollMessagePanelToBottom(panel = getMessagePanel()) {
+  if (!panel) {
+    return;
+  }
+  panel.scrollTo({ top: panel.scrollHeight, behavior: 'auto' });
+}
+
 function buildMessagesUrl(chatId, options = {}) {
   const params = new URLSearchParams();
   if (options.beforeMessageId) {
@@ -271,6 +280,30 @@ function buildMessagesUrl(chatId, options = {}) {
   }
   const query = params.toString();
   return query ? `/groups/${chatId}/messages?${query}` : `/groups/${chatId}/messages`;
+}
+
+function getSelectedChatId() {
+  const panel = getMessagePanel();
+  if (panel && panel.dataset.chatId) {
+    return Number(panel.dataset.chatId || '0');
+  }
+  const chatIdInput = document.querySelector('[name="chat_id"]');
+  return Number(chatIdInput ? chatIdInput.value : '0');
+}
+
+async function refreshGroupList() {
+  const selectedChatId = getSelectedChatId();
+  const response = await fetch('/groups?selected_chat_id=' + selectedChatId);
+  const html = await response.text();
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+  const nextList = doc.querySelector('[data-groups-list]');
+  const currentList = document.querySelector('[data-groups-list]');
+  if (!nextList || !currentList) {
+    return;
+  }
+  currentList.replaceWith(nextList);
+  bindGroupLinks();
 }
 
 async function fetchMessagePanel(chatId, options = {}) {
@@ -295,6 +328,7 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
       if (currentPanel && nextPanel) {
         currentPanel.replaceWith(nextPanel);
         bindMessagePanelControls(nextPanel);
+        scrollMessagePanelToBottom(nextPanel);
       }
     });
   }
@@ -316,6 +350,7 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
       if (currentPanel && nextPanel) {
         currentPanel.replaceWith(nextPanel);
         bindMessagePanelControls(nextPanel);
+        scrollMessagePanelToBottom(nextPanel);
       }
     });
   }
@@ -332,7 +367,11 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
       const nextList = nextPanel ? nextPanel.querySelector('[data-message-list]') : null;
       const currentList = panel.querySelector('[data-message-list]');
       if (currentList && nextList) {
-        currentList.insertAdjacentHTML('beforeend', nextList.innerHTML);
+        const previousScrollHeight = panel.scrollHeight;
+        const previousScrollTop = panel.scrollTop;
+        currentList.insertAdjacentHTML('afterbegin', nextList.innerHTML);
+        const newScrollHeight = panel.scrollHeight;
+        panel.scrollTop = previousScrollTop + (newScrollHeight - previousScrollHeight);
       }
       const nextLoadMore = nextPanel ? nextPanel.querySelector('[data-load-more]') : null;
       const currentFooter = panel.querySelector('.message-list-footer');
@@ -360,6 +399,7 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
           return;
         }
         await refreshCurrentGroupPanel();
+        await refreshGroupList();
         setAiStatus(`Refresh complete. Inserted ${payload.inserted_messages || 0} new message(s).`);
       } catch {
         setAiStatus('Refresh failed. Please check Telegram credentials and try again.', true);
@@ -379,6 +419,7 @@ function bindGroupLinks() {
       if (nextPanel && currentPanel) {
         currentPanel.replaceWith(nextPanel);
         bindMessagePanelControls(nextPanel);
+        scrollMessagePanelToBottom(nextPanel);
       }
       document.querySelectorAll('[data-group-link]').forEach((button) => button.classList.remove('is-active'));
       element.classList.add('is-active');
@@ -502,6 +543,7 @@ async function refreshCurrentGroupPanel() {
   }
   currentPanel.replaceWith(nextPanel);
   bindMessagePanelControls(nextPanel);
+  scrollMessagePanelToBottom(nextPanel);
   setAiStatus('New group messages loaded automatically.');
 }
 
@@ -519,6 +561,7 @@ function connectLiveUpdates() {
       if (!currentPanel || !payload) {
         return;
       }
+      await refreshGroupList();
       const currentChatId = Number(currentPanel.dataset.chatId || '0');
       if (Number(payload.chat_id || 0) !== currentChatId) {
         return;
@@ -528,12 +571,16 @@ function connectLiveUpdates() {
     source.onerror = () => {
       setAiStatus('实时连接中断，已退回轮询刷新。', true);
       source.close();
-      window.setInterval(refreshCurrentGroupPanel, 15000);
     };
     return;
   }
+}
 
-  window.setInterval(refreshCurrentGroupPanel, 15000);
+function startPollingUpdates() {
+  window.setInterval(async () => {
+    await refreshCurrentGroupPanel();
+    await refreshGroupList();
+  }, 15000);
 }
 
 window.addEventListener('DOMContentLoaded', () => {
@@ -547,5 +594,7 @@ window.addEventListener('DOMContentLoaded', () => {
   bindClearAiHistory();
   renderConversationHistory();
   setAiStatus('Ready to analyze the current group.');
+  scrollMessagePanelToBottom();
   connectLiveUpdates();
+  startPollingUpdates();
 });

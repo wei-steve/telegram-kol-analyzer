@@ -1,5 +1,7 @@
 import sqlite3
 
+from sqlalchemy import text
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import Base
 
@@ -50,3 +52,12 @@ def test_database_bootstrap_backfills_missing_sqlite_columns(tmp_path):
     assert "source_id" in columns
     assert "event_type" in columns
     assert "review_note" in columns
+
+
+def test_database_bootstrap_enables_sqlite_busy_timeout(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    with session_factory() as session:
+        busy_timeout = session.execute(text("PRAGMA busy_timeout")).scalar_one()
+
+    assert busy_timeout >= 30000

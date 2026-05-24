@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 from telegram_kol_research.candidates import persist_text_signal_candidates
 from telegram_kol_research.raw_ingest import normalize_message_payload, persist_normalized_messages
 from telegram_kol_research.raw_ingest import repair_history_checkpoints
+from telegram_kol_research.strategy_alerts import process_strategy_alert_for_record
 from telegram_kol_research.telegram_client import (
     _download_media_if_present,
     _format_sender_name,
@@ -26,6 +27,9 @@ async def persist_live_message_event(
     session_factory,
     broker,
     media_root: str | Path = "data/media",
+    chat_title: str | None = None,
+    strategy_alert_config: Any | None = None,
+    strategy_alert_processor=process_strategy_alert_for_record,
 ) -> dict[str, int]:
     """Normalize and persist one live Telegram event into the existing raw ingest flow."""
 
@@ -62,12 +66,20 @@ async def persist_live_message_event(
         else None,
     }
     record = normalize_message_payload(payload, archived_target_group=True)
-    return persist_normalized_messages(
+    stats = persist_normalized_messages(
         session_factory,
         [record],
         sync_kind="live",
         broker=broker,
     )
+    if strategy_alert_config is not None and chat_title:
+        await strategy_alert_processor(
+            session_factory=session_factory,
+            record=record,
+            chat_title=chat_title,
+            config=strategy_alert_config,
+        )
+    return stats
 
 
 async def run_live_listener(
@@ -77,6 +89,7 @@ async def run_live_listener(
     broker,
     target_titles: set[str],
     media_root: str | Path = "data/media",
+    strategy_alert_config: Any | None = None,
 ) -> None:
     """Attach Telethon new-message handlers and keep the client alive."""
 
@@ -97,11 +110,17 @@ async def run_live_listener(
             session_factory=session_factory,
             broker=broker,
             media_root=media_root,
+            chat_title=title,
+            strategy_alert_config=strategy_alert_config,
         )
 
     add_event_handler = getattr(client, "add_event_handler", None)
     if not callable(add_event_handler):
         raise RuntimeError("Telegram client does not support realtime event handlers")
+
+    connect = getattr(client, "connect", None)
+    if callable(connect):
+        await maybe_await(connect())
 
     add_event_handler(handle_new_message, events.NewMessage())
     run_until_disconnected = getattr(client, "run_until_disconnected", None)
@@ -117,6 +136,7 @@ def launch_live_listener_task(
     broker,
     target_titles: set[str],
     media_root: str | Path,
+    strategy_alert_config: Any | None = None,
 ) -> asyncio.Task[None]:
     """Schedule the realtime listener in the current event loop."""
 
@@ -127,6 +147,7 @@ def launch_live_listener_task(
             broker=broker,
             target_titles=target_titles,
             media_root=media_root,
+            strategy_alert_config=strategy_alert_config,
         )
     )
 
@@ -140,6 +161,8 @@ async def run_reconcile_once(
     media_root: str | Path = "data/media",
     message_limit: int = 50,
     checkpoint_overlap: int = 5,
+    strategy_alert_config: Any | None = None,
+    strategy_alert_processor=process_strategy_alert_for_record,
     discover_dialogs_fn=discover_dialogs,
     fetch_dialog_messages_fn=fetch_dialog_messages,
 ) -> dict[str, int]:
@@ -200,6 +223,14 @@ async def run_reconcile_once(
         inserted_candidates += candidate_stats["inserted_candidates"]
         trade_stats = persist_trade_ideas_from_candidates(session_factory)
         inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
+        if strategy_alert_config is not None:
+            for record in records:
+                await strategy_alert_processor(
+                    session_factory=session_factory,
+                    record=record,
+                    chat_title=str(dialog.get("title") or ""),
+                    config=strategy_alert_config,
+                )
 
     return {
         "matched_dialogs": len(matched_dialogs),
@@ -218,16 +249,31 @@ async def run_periodic_reconcile(
     media_root: str | Path = "data/media",
     interval_seconds: int = 300,
     message_limit: int = 50,
+    operation_lock: Any | None = None,
+    strategy_alert_config: Any | None = None,
 ) -> None:
     """Periodically replay a small recent history window for missed-message recovery."""
 
     while True:
-        await run_reconcile_once(
-            client=client,
-            session_factory=session_factory,
-            broker=broker,
-            target_titles=target_titles,
-            media_root=media_root,
-            message_limit=message_limit,
-        )
+        if operation_lock is None:
+            await run_reconcile_once(
+                client=client,
+                session_factory=session_factory,
+                broker=broker,
+                target_titles=target_titles,
+                media_root=media_root,
+                message_limit=message_limit,
+                strategy_alert_config=strategy_alert_config,
+            )
+        else:
+            async with operation_lock:
+                await run_reconcile_once(
+                    client=client,
+                    session_factory=session_factory,
+                    broker=broker,
+                    target_titles=target_titles,
+                    media_root=media_root,
+                    message_limit=message_limit,
+                    strategy_alert_config=strategy_alert_config,
+                )
         await asyncio.sleep(interval_seconds)

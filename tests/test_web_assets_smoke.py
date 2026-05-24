@@ -32,3 +32,36 @@ def test_app_js_includes_ai_history_timestamps_for_saved_and_rendered_turns(tmp_
     assert "renderHistoryTimestamp" in response.text
     assert "createdAt: new Date().toISOString()" in response.text
     assert "${renderHistoryTimestamp(entry.createdAt)}" in response.text
+
+
+def test_app_js_refreshes_group_list_after_live_or_manual_updates(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "refreshGroupList" in response.text
+    assert "fetch('/groups" in response.text
+    assert "await refreshGroupList();" in response.text
+
+
+def test_app_js_polls_for_updates_even_when_sse_stays_quiet(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "startPollingUpdates" in response.text
+    assert "window.setInterval" in response.text
+    assert "connectLiveUpdates();" in response.text
+    assert "startPollingUpdates();" in response.text
+
+
+def test_app_css_keeps_message_header_sticky(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.css")
+
+    assert response.status_code == 200
+    assert ".messages-panel-header" in response.text
+    assert "position: sticky" in response.text

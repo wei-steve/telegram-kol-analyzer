@@ -3,9 +3,9 @@
   data-messages-panel
   data-layout-scroll-panel
   data-chat-id="{{ selected_chat_id or 0 }}"
-  data-latest-message-id="{{ messages[0].message_id if messages else 0 }}"
+  data-latest-message-id="{{ messages[-1].message_id if messages else 0 }}"
 >
-  <div class="messages-panel-header">
+  <div class="messages-panel-header" data-message-sticky-header>
     <h2>{{ selected_group.title if selected_group else "Messages" }}</h2>
     <div class="message-sync-meta">
       <span>
@@ -58,6 +58,19 @@
     </form>
   </div>
 
+  {% set next_before_message_id = messages[0].message_id if messages else None %}
+  <div class="message-list-footer">
+    {% if next_before_message_id %}
+      <button
+        type="button"
+        data-load-more
+        data-before-message-id="{{ next_before_message_id }}"
+      >
+        Load more
+      </button>
+    {% endif %}
+  </div>
+
   <div class="message-list" data-message-list>
     {% for message in messages %}
       <article class="message-card" id="message-{{ message.raw_message_id }}">
@@ -72,7 +85,18 @@
             {% for media in message.media_assets %}
               <div class="media-item">
                 {% if media.local_path %}
-                  <img src="/local-media/{{ media.local_path.split('data/media/')[-1] }}" alt="message media" />
+                  <a
+                    class="media-link"
+                    href="/local-media/{{ media.local_path.split('data/media/')[-1] }}"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <img
+                      class="message-media-preview"
+                      src="/local-media/{{ media.local_path.split('data/media/')[-1] }}"
+                      alt="message media"
+                    />
+                  </a>
                 {% endif %}
                 {% if media.ocr_text %}
                   <details>
@@ -88,16 +112,4 @@
     {% endfor %}
   </div>
 
-  {% set next_before_message_id = messages[-1].message_id if messages else None %}
-  <div class="message-list-footer">
-    {% if next_before_message_id %}
-      <button
-        type="button"
-        data-load-more
-        data-before-message-id="{{ next_before_message_id }}"
-      >
-        Load more
-      </button>
-    {% endif %}
-  </div>
 </section>

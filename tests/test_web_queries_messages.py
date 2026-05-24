@@ -5,7 +5,7 @@ from telegram_kol_research.models import MediaAsset, RawMessage
 from telegram_kol_research.web_queries import load_group_messages
 
 
-def test_load_group_messages_includes_media_and_orders_newest_first(tmp_path):
+def test_load_group_messages_includes_media_and_orders_oldest_first_within_page(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         older = RawMessage(
@@ -31,8 +31,8 @@ def test_load_group_messages_includes_media_and_orders_newest_first(tmp_path):
 
     rows = load_group_messages(session_factory, chat_id=9, limit=10)
 
-    assert rows[0]["message_id"] == 2
-    assert rows[0]["media_assets"][0]["local_path"] == "data/media/9/2.jpg"
+    assert [row["message_id"] for row in rows] == [1, 2]
+    assert rows[-1]["media_assets"][0]["local_path"] == "data/media/9/2.jpg"
 
 
 def test_load_group_messages_can_load_older_page(tmp_path):
@@ -64,7 +64,7 @@ def test_load_group_messages_can_load_older_page(tmp_path):
 
     rows = load_group_messages(session_factory, chat_id=9, limit=2, before_message_id=3)
 
-    assert [row["message_id"] for row in rows] == [2, 1]
+    assert [row["message_id"] for row in rows] == [1, 2]
 
 
 def test_load_group_messages_can_filter_by_text_and_sender(tmp_path):

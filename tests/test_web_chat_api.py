@@ -1,11 +1,58 @@
 from fastapi.testclient import TestClient
 from datetime import UTC, datetime
+import asyncio
 import httpx
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.llm_chat import LLMProxyConfig
 from telegram_kol_research.models import RawMessage
+from telegram_kol_research.telegram_session_lock import TelegramSessionLockError
 from telegram_kol_research.web_app import create_web_app
+
+
+def test_refresh_api_allows_longer_full_group_reconcile(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    def fake_auth_loader():
+        from telegram_kol_research.telegram_client import TelegramAuthConfig
+
+        return TelegramAuthConfig(
+            api_id=123456,
+            api_hash="hash",
+            session_path=tmp_path / "telegram.session",
+        )
+
+    class RefreshClient:
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    async def fake_wait_for(awaitable, timeout):
+        captured["timeout"] = timeout
+        return await awaitable
+
+    async def fake_reconcile_once(**kwargs):
+        return {
+            "matched_dialogs": 18,
+            "inserted_messages": 0,
+            "inserted_candidates": 0,
+            "inserted_trade_ideas": 0,
+        }
+
+    monkeypatch.setattr("telegram_kol_research.web_app.asyncio.wait_for", fake_wait_for)
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    app.state.telegram_auth_loader = fake_auth_loader
+    app.state.telegram_client_factory = lambda auth_config: RefreshClient()
+    app.state.reconcile_once_runner = fake_reconcile_once
+    client = TestClient(app)
+
+    response = client.post("/api/refresh")
+
+    assert response.status_code == 200
+    assert captured["timeout"] >= 180
 
 
 def test_chat_api_rejects_missing_question(tmp_path):
@@ -17,7 +64,11 @@ def test_chat_api_rejects_missing_question(tmp_path):
 
 
 def test_refresh_api_reports_missing_telegram_credentials(tmp_path):
-    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    app = create_web_app(database_path=tmp_path / "research.db")
+    app.state.telegram_auth_loader = lambda: (_ for _ in ()).throw(
+        ValueError("TELEGRAM_API_ID is required")
+    )
+    client = TestClient(app)
 
     response = client.post("/api/refresh")
 
@@ -50,6 +101,7 @@ def test_refresh_api_runs_reconcile_once_when_credentials_are_available(tmp_path
         media_root,
         message_limit=50,
         checkpoint_overlap=5,
+        strategy_alert_config=None,
         discover_dialogs_fn=None,
         fetch_dialog_messages_fn=None,
     ):
@@ -76,6 +128,235 @@ def test_refresh_api_runs_reconcile_once_when_credentials_are_available(tmp_path
     assert response.status_code == 200
     assert response.json()["inserted_messages"] == 3
     assert captured["target_titles"] == {"Demo Group"}
+
+
+def test_refresh_api_does_not_create_client_when_session_lock_is_busy(tmp_path):
+    def fake_auth_loader():
+        from telegram_kol_research.telegram_client import TelegramAuthConfig
+
+        return TelegramAuthConfig(
+            api_id=123456,
+            api_hash="hash",
+            session_path=tmp_path / "telegram.session",
+        )
+
+    def busy_lock_factory(session_path):
+        raise TelegramSessionLockError(f"{session_path} is already in use")
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    app.state.telegram_auth_loader = fake_auth_loader
+    app.state.telegram_session_lock_factory = busy_lock_factory
+    app.state.telegram_client_factory = lambda auth_config: (_ for _ in ()).throw(
+        AssertionError("refresh must not create a Telegram client when the lock is busy")
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/refresh")
+
+    assert response.status_code == 409
+    assert "already in use" in response.json()["detail"]
+
+
+def test_refresh_api_serializes_overlapping_reconcile_requests(tmp_path):
+    active_reconciles = 0
+    max_active_reconciles = 0
+
+    def fake_auth_loader():
+        from telegram_kol_research.telegram_client import TelegramAuthConfig
+
+        return TelegramAuthConfig(
+            api_id=123456,
+            api_hash="hash",
+            session_path=tmp_path / "telegram.session",
+        )
+
+    class RefreshClient:
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    class NoopLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    async def slow_reconcile_once(**kwargs):
+        nonlocal active_reconciles, max_active_reconciles
+        active_reconciles += 1
+        max_active_reconciles = max(max_active_reconciles, active_reconciles)
+        await asyncio.sleep(0.01)
+        active_reconciles -= 1
+        return {
+            "matched_dialogs": 1,
+            "inserted_messages": 0,
+            "inserted_candidates": 0,
+            "inserted_trade_ideas": 0,
+        }
+
+    async def run_requests():
+        app = create_web_app(database_path=tmp_path / "research.db")
+        app.state.telegram_auth_loader = fake_auth_loader
+        app.state.telegram_session_lock_factory = lambda session_path: NoopLock()
+        app.state.telegram_client_factory = lambda auth_config: RefreshClient()
+        app.state.reconcile_once_runner = slow_reconcile_once
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await asyncio.gather(
+                client.post("/api/refresh"),
+                client.post("/api/refresh"),
+            )
+
+    responses = asyncio.run(run_requests())
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert max_active_reconciles == 1
+
+
+def test_refresh_api_returns_clear_error_when_reconcile_fails(tmp_path):
+    class RefreshClient:
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    def fake_auth_loader():
+        from telegram_kol_research.telegram_client import TelegramAuthConfig
+
+        session_path = tmp_path / "telegram.session"
+        session_path.write_text("session", encoding="utf-8")
+        return TelegramAuthConfig(
+            api_id=123456,
+            api_hash="hash",
+            session_path=session_path,
+        )
+
+    async def failing_reconcile_once(**kwargs):
+        raise ConnectionError("Cannot send requests while disconnected")
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    app.state.telegram_auth_loader = fake_auth_loader
+    app.state.telegram_client_factory = lambda auth_config: RefreshClient()
+    app.state.reconcile_once_runner = failing_reconcile_once
+    client = TestClient(app)
+
+    response = client.post("/api/refresh")
+
+    assert response.status_code == 503
+    assert "Cannot send requests while disconnected" in response.json()["detail"]
+
+
+def test_refresh_api_explains_duplicated_telegram_session_error(tmp_path):
+    class RefreshClient:
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    async def failing_reconcile_once(**kwargs):
+        raise RuntimeError(
+            "The authorization key (session file) was used under two different IP addresses simultaneously"
+        )
+
+    def fake_auth_loader():
+        from telegram_kol_research.telegram_client import TelegramAuthConfig
+
+        return TelegramAuthConfig(
+            api_id=123456,
+            api_hash="hash",
+            session_path=tmp_path / "telegram.session",
+        )
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    app.state.telegram_auth_loader = fake_auth_loader
+    app.state.telegram_client_factory = lambda auth_config: RefreshClient()
+    app.state.reconcile_once_runner = failing_reconcile_once
+    client = TestClient(app)
+
+    response = client.post("/api/refresh")
+
+    assert response.status_code == 503
+    assert "Telegram 登录会话已失效" in response.json()["detail"]
+    assert "重新登录" in response.json()["detail"]
+
+
+def test_refresh_api_reuses_live_client_without_session_copy(tmp_path):
+    captured: dict[str, object] = {}
+
+    class LiveClient:
+        def __init__(self):
+            self.connect_calls = 0
+            self.disconnect_calls = 0
+
+        async def connect(self):
+            self.connect_calls += 1
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+    live_client = LiveClient()
+    original_session_path = tmp_path / "telegram.session"
+    original_session_path.write_text("session-bytes", encoding="utf-8")
+
+    async def fake_reconcile_once(
+        *,
+        client,
+        session_factory,
+        broker,
+        target_titles,
+        media_root,
+        message_limit=50,
+        checkpoint_overlap=5,
+        strategy_alert_config=None,
+        discover_dialogs_fn=None,
+        fetch_dialog_messages_fn=None,
+    ):
+        captured["client"] = client
+        captured["target_titles"] = set(target_titles)
+        return {
+            "matched_dialogs": 1,
+            "inserted_messages": 2,
+            "inserted_candidates": 0,
+            "inserted_trade_ideas": 0,
+        }
+
+    def fake_auth_loader():
+        from telegram_kol_research.telegram_client import TelegramAuthConfig
+
+        return TelegramAuthConfig(
+            api_id=123456,
+            api_hash="hash",
+            session_path=original_session_path,
+        )
+
+    def fake_create_client(auth_config):
+        captured["session_path"] = auth_config.session_path
+        raise AssertionError("manual refresh must not create a second Telegram client")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        live_target_titles={"Demo Group"},
+        telegram_client=live_client,
+    )
+    app.state.telegram_auth_loader = fake_auth_loader
+    app.state.telegram_client_factory = fake_create_client
+    app.state.reconcile_once_runner = fake_reconcile_once
+    client = TestClient(app)
+
+    response = client.post("/api/refresh")
+
+    assert response.status_code == 200
+    assert response.json()["inserted_messages"] == 2
+    assert captured["client"] is live_client
+    assert captured["target_titles"] == {"Demo Group"}
+    assert "session_path" not in captured
+    assert live_client.connect_calls == 1
+    assert live_client.disconnect_calls == 0
 
 
 def test_chat_api_accepts_question_and_chat_scope(tmp_path):

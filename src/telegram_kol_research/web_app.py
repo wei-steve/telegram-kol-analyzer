@@ -33,6 +33,10 @@ from telegram_kol_research.llm_chat import (
     load_llm_proxy_config,
     request_grounded_chat_answer,
 )
+from telegram_kol_research.strategy_alerts import (
+    load_strategy_alert_config,
+    strategy_alerts_enabled,
+)
 from telegram_kol_research.web_queries import (
     load_database_freshness,
     load_group_messages,
@@ -43,6 +47,13 @@ from telegram_kol_research.web_queries import (
 from telegram_kol_research.telegram_live_listener import launch_live_listener_task, run_live_listener
 from telegram_kol_research.telegram_live_listener import run_periodic_reconcile, run_reconcile_once
 from telegram_kol_research.telegram_client import create_telegram_client, load_telegram_auth_config, maybe_await
+from telegram_kol_research.telegram_session_lock import (
+    TelegramSessionLockError,
+    acquire_telegram_session_lock,
+)
+
+
+REFRESH_TIMEOUT_SECONDS = 180
 
 
 def create_web_app(
@@ -56,6 +67,7 @@ def create_web_app(
     now_provider=None,
     reconcile_runner=None,
     reconcile_interval_seconds: int = 300,
+    reconcile_startup_delay_seconds: int | None = None,
 ) -> FastAPI:
     """Create the minimal FastAPI app used by the web command."""
 
@@ -76,15 +88,20 @@ def create_web_app(
                 broker=app.state.live_update_broker,
                 target_titles=set(app.state.live_target_titles),
                 media_root=app.state.media_root,
+                strategy_alert_config=app.state.strategy_alert_config,
             )
             app.state.reconcile_task = asyncio.create_task(
-                app.state.reconcile_runner(
+                _run_reconcile_after_startup_delay(
+                    runner=app.state.reconcile_runner,
                     client=app.state.telegram_client,
                     session_factory=app.state.session_factory,
                     broker=app.state.live_update_broker,
                     target_titles=set(app.state.live_target_titles),
                     media_root=app.state.media_root,
                     interval_seconds=app.state.reconcile_interval_seconds,
+                    operation_lock=app.state.telegram_operation_lock,
+                    strategy_alert_config=app.state.strategy_alert_config,
+                    startup_delay_seconds=app.state.reconcile_startup_delay_seconds,
                 )
             )
         try:
@@ -114,6 +131,12 @@ def create_web_app(
     app.state.media_root = resolved_media_root.resolve()
     app.state.live_update_broker = LiveUpdateBroker()
     app.state.llm_proxy_config = load_llm_proxy_config()
+    loaded_strategy_alert_config = load_strategy_alert_config()
+    app.state.strategy_alert_config = (
+        loaded_strategy_alert_config
+        if strategy_alerts_enabled(loaded_strategy_alert_config)
+        else None
+    )
     app.state.chat_requester = request_grounded_chat_answer
     app.state.live_target_titles = live_target_titles or set()
     app.state.live_listener_runner = live_listener_runner or run_live_listener
@@ -124,10 +147,17 @@ def create_web_app(
     app.state.now_provider = now_provider or (lambda: datetime.now(UTC))
     app.state.reconcile_runner = reconcile_runner or run_periodic_reconcile
     app.state.reconcile_interval_seconds = reconcile_interval_seconds
+    app.state.reconcile_startup_delay_seconds = (
+        15
+        if reconcile_startup_delay_seconds is None
+        else reconcile_startup_delay_seconds
+    )
     app.state.reconcile_task = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client
     app.state.reconcile_once_runner = run_reconcile_once
+    app.state.telegram_session_lock_factory = acquire_telegram_session_lock
+    app.state.telegram_operation_lock = asyncio.Lock()
 
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
     app.mount(
@@ -175,6 +205,21 @@ def create_web_app(
                     if app.state.telegram_client is not None
                     else "仅本地快照"
                 ),
+            },
+        )
+
+    @app.get("/groups")
+    def groups_partial(request: Request, selected_chat_id: int | None = None):
+        groups = load_group_rows(
+            app.state.session_factory,
+            group_labels_by_title=app.state.group_labels_by_title,
+        )
+        return templates.TemplateResponse(
+            request,
+            "_groups.html",
+            {
+                "groups": groups,
+                "selected_chat_id": selected_chat_id,
             },
         )
 
@@ -259,7 +304,7 @@ def create_web_app(
             chat_id=chat_id,
             limit=message_limit,
         )
-        scope_context = build_scope_context(list(reversed(messages)))
+        scope_context = build_scope_context(messages)
         config = app.state.llm_proxy_config
         try:
             answer = app.state.chat_requester(
@@ -287,29 +332,61 @@ def create_web_app(
         }
 
     @app.post("/api/refresh")
-    def refresh():
+    async def refresh():
+        shared_client = app.state.telegram_client is not None
+        session_lock = None
+        session_lock_entered = False
         try:
-            auth_config = app.state.telegram_auth_loader()
-            telegram_client = app.state.telegram_client_factory(auth_config)
+            if shared_client:
+                telegram_client = app.state.telegram_client
+            else:
+                auth_config = app.state.telegram_auth_loader()
+                session_lock = app.state.telegram_session_lock_factory(auth_config.session_path)
+                session_lock.__enter__()
+                session_lock_entered = True
+                telegram_client = app.state.telegram_client_factory(auth_config)
+        except TelegramSessionLockError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (ValueError, RuntimeError) as exc:
+            if session_lock_entered and session_lock is not None:
+                session_lock.__exit__(None, None, None)
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
         async def run_refresh():
-            await maybe_await(getattr(telegram_client, "connect", lambda: None)())
-            try:
-                return await app.state.reconcile_once_runner(
-                    client=telegram_client,
-                    session_factory=app.state.session_factory,
-                    broker=app.state.live_update_broker,
-                    target_titles=set(app.state.live_target_titles),
-                    media_root=app.state.media_root,
-                )
-            finally:
-                disconnect = getattr(telegram_client, "disconnect", None)
-                if callable(disconnect):
-                    await maybe_await(disconnect())
+            async with app.state.telegram_operation_lock:
+                await maybe_await(getattr(telegram_client, "connect", lambda: None)())
+                try:
+                    return await asyncio.wait_for(
+                        app.state.reconcile_once_runner(
+                            client=telegram_client,
+                            session_factory=app.state.session_factory,
+                            broker=app.state.live_update_broker,
+                            target_titles=set(app.state.live_target_titles),
+                            media_root=app.state.media_root,
+                            strategy_alert_config=app.state.strategy_alert_config,
+                        ),
+                        timeout=REFRESH_TIMEOUT_SECONDS,
+                    )
+                finally:
+                    disconnect = getattr(telegram_client, "disconnect", None)
+                    if callable(disconnect) and not shared_client:
+                        await maybe_await(disconnect())
 
-        return asyncio.run(run_refresh())
+        try:
+            return await run_refresh()
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "Telegram refresh timed out after "
+                    f"{REFRESH_TIMEOUT_SECONDS} seconds. Please try again."
+                ),
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=_build_refresh_error_detail(exc)) from exc
+        finally:
+            if session_lock_entered and session_lock is not None:
+                session_lock.__exit__(None, None, None)
 
     @app.get("/api/events")
     def events():
@@ -324,6 +401,17 @@ def create_web_app(
         )
 
     return app
+
+
+async def _run_reconcile_after_startup_delay(
+    *,
+    runner,
+    startup_delay_seconds: int,
+    **kwargs,
+):
+    if startup_delay_seconds > 0:
+        await asyncio.sleep(startup_delay_seconds)
+    await runner(**kwargs)
 
 
 def _parse_optional_datetime(value: Any) -> datetime | None:
@@ -344,6 +432,17 @@ def _build_chat_proxy_error_detail(exc: httpx.HTTPError) -> str:
     ):
         return "当前模型不支持直接图片理解，本次分析会优先基于文字消息与 OCR 内容。"
     return "AI proxy request failed. Check CLIProxyAPI connectivity and credentials."
+
+
+def _build_refresh_error_detail(exc: Exception) -> str:
+    message = str(exc)
+    lowered = message.lower()
+    if "authorization key" in lowered and "used under two different" in lowered:
+        return (
+            "Telegram 登录会话已失效：同一个 session 曾被多个客户端同时使用。"
+            "请重新登录生成新的 Telegram session 后再刷新。"
+        )
+    return message
 
 
 def _extract_proxy_error_message(exc: httpx.HTTPError) -> str:

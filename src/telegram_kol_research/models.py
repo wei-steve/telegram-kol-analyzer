@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -123,3 +123,29 @@ class SyncCheckpoint(Base):
     last_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     last_message_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_synced_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class StrategyAlert(Base):
+    __tablename__ = "strategy_alerts"
+    __table_args__ = (
+        UniqueConstraint("chat_id", "message_id", name="uq_strategy_alerts_chat_message"),
+        Index("ix_strategy_alerts_chat_id_message_id", "chat_id", "message_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_message_id: Mapped[Optional[int]] = mapped_column(ForeignKey("raw_messages.id"), nullable=True, index=True)
+    chat_title: Mapped[str] = mapped_column(String(255), nullable=False)
+    sender_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    original_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(64), nullable=False, default="pending", index=True)
+    is_strategy: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    strategy_kind: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    ai_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    kol_label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    reason_short: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    forwarded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)

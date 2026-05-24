@@ -53,6 +53,7 @@ def test_fetch_dialog_messages_downloads_media_to_local_path(tmp_path):
             dialog,
             limit=10,
             media_root=tmp_path / "downloaded-media",
+            media_download_timeout_seconds=3,
         )
     )
 
@@ -101,3 +102,24 @@ def test_fetch_dialog_messages_skips_video_download(tmp_path):
 
     assert payloads[0]["media"]["path"] is None
     assert client.download_calls == 0
+
+
+def test_fetch_dialog_messages_keeps_message_when_media_download_times_out(tmp_path):
+    class SlowDownloadingClient(_FakeClient):
+        async def download_media(self, media, file):
+            await asyncio.sleep(0.05)
+            return str(Path(file).with_suffix(".jpg"))
+
+    dialog = {"id": 9001, "title": "VIP BTC Room", "archived": True}
+    payloads = asyncio.run(
+        fetch_dialog_messages(
+            SlowDownloadingClient(),
+            dialog,
+            limit=10,
+            media_root=tmp_path / "downloaded-media",
+            media_download_timeout_seconds=0.001,
+        )
+    )
+
+    assert payloads[0]["message_id"] == 77
+    assert payloads[0]["media"]["path"] is None

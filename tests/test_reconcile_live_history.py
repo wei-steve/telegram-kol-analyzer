@@ -2,11 +2,27 @@ from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import RawMessage, SyncCheckpoint
-from telegram_kol_research.telegram_live_listener import run_reconcile_once
+from telegram_kol_research.telegram_live_listener import run_live_listener, run_reconcile_once
 
 
 class _FakeClient:
     pass
+
+
+class _FakeListenerClient:
+    def __init__(self):
+        self.connect_calls = 0
+        self.handlers = []
+        self.run_until_disconnected_calls = 0
+
+    async def connect(self):
+        self.connect_calls += 1
+
+    def add_event_handler(self, handler, event):
+        self.handlers.append((handler, event))
+
+    async def run_until_disconnected(self):
+        self.run_until_disconnected_calls += 1
 
 
 async def _fake_discover_dialogs(client):
@@ -74,3 +90,46 @@ def test_run_reconcile_once_persists_only_messages_newer_than_checkpoint(tmp_pat
     assert stats["inserted_messages"] == 1
     assert [message.message_id for message in raw_messages] == [78]
     assert checkpoint.last_message_id == 78
+
+
+def test_run_reconcile_once_triggers_strategy_alert_processor_for_fresh_messages(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    processed = []
+
+    async def fake_strategy_alert_processor(**kwargs):
+        processed.append(kwargs)
+        return {"status": "sent"}
+
+    __import__("asyncio").run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            strategy_alert_config=object(),
+            strategy_alert_processor=fake_strategy_alert_processor,
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=_fake_fetch_dialog_messages,
+        )
+    )
+
+    assert len(processed) == 2
+    assert [item["record"].message_id for item in processed] == [77, 78]
+    assert {item["chat_title"] for item in processed} == {"VIP BTC Room"}
+
+
+def test_run_live_listener_connects_client_before_waiting_for_events():
+    client = _FakeListenerClient()
+
+    __import__("asyncio").run(
+        run_live_listener(
+            client=client,
+            session_factory=None,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+        )
+    )
+
+    assert client.connect_calls == 1
+    assert client.run_until_disconnected_calls == 1
+    assert len(client.handlers) == 1

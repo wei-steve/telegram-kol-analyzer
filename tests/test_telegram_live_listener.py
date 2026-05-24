@@ -56,3 +56,30 @@ def test_persist_live_message_event_writes_db_and_broker_event(tmp_path):
     assert stored.text == "live hello"
     assert broker.published_events[-1]["chat_id"] == 123
     assert broker.published_events[-1]["message_id"] == 42
+
+
+def test_persist_live_message_event_triggers_strategy_alert_processor(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    broker = LiveUpdateBroker()
+    processed = []
+
+    async def fake_strategy_alert_processor(**kwargs):
+        processed.append(kwargs)
+        return {"status": "sent"}
+
+    asyncio.run(
+        persist_live_message_event(
+            event=_FakeEvent(),
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            chat_title="VIP BTC Room",
+            strategy_alert_config=object(),
+            strategy_alert_processor=fake_strategy_alert_processor,
+        )
+    )
+
+    assert len(processed) == 1
+    assert processed[0]["chat_title"] == "VIP BTC Room"
+    assert processed[0]["record"].chat_id == 123
+    assert processed[0]["record"].message_id == 42

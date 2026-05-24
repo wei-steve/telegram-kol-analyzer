@@ -6,21 +6,7 @@
   <main class="layout">
     <aside class="panel groups-panel" data-layout-scroll-panel>
       <h1>Groups</h1>
-      <ul>
-        {% for group in groups %}
-          <li>
-            <button
-              type="button"
-              class="group-link{% if group.chat_id == selected_chat_id %} is-active{% endif %}"
-              data-group-link
-              data-chat-id="{{ group.chat_id }}"
-            >
-              <strong>{{ group.title }}</strong>
-            </button>
-            <span>{{ group.message_count }}</span>
-          </li>
-        {% endfor %}
-      </ul>
+      {% include "_groups.html" %}
     </aside>
 
     {% include "_messages.html" %}
@@ -29,8 +15,11 @@
       <div class="ai-workbench" data-ai-workbench>
         <header class="ai-workbench-header">
           <h2>AI Analysis</h2>
-          <section class="group-prompt-panel">
-            <h3>该群默认提示词</h3>
+          <details class="group-prompt-panel" data-group-prompt-panel>
+            <summary>
+              <span>群组分析偏好</span>
+              <small>该群默认提示词</small>
+            </summary>
             <p class="ai-helper-text">仅影响当前群，下次提问立即生效</p>
             <textarea
               name="group_prompt"
@@ -38,12 +27,15 @@
               rows="5"
               placeholder="例如：请像交易研究员一样，优先总结最新变化、可执行信号和分歧点。"
             ></textarea>
-          </section>
+          </details>
         </header>
 
-        <section class="ai-history-panel">
+        <section class="ai-history-panel" data-ai-report-feed>
           <div class="ai-history-header">
-            <h3>Conversation</h3>
+            <div>
+              <h3>Conversation · 研究报告流</h3>
+              <p class="ai-helper-text">AI 回复会整理成报告卡片，便于连续阅读和回溯。</p>
+            </div>
             <button type="button" class="secondary-button" data-clear-ai-history>清理聊天记录</button>
           </div>
           <div class="ai-history-scroll" data-ai-history-scroll>

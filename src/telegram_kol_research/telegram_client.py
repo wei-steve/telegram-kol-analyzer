@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 from inspect import isawaitable
 from dataclasses import dataclass
 from pathlib import Path
@@ -152,6 +153,7 @@ async def fetch_dialog_messages(
     dialog: dict[str, Any],
     limit: int = 100,
     media_root: str | Path = "data/media",
+    media_download_timeout_seconds: float = 0,
 ) -> list[dict[str, Any]]:
     """Fetch recent messages for a dialog and normalize the Telegram fields we need."""
 
@@ -168,6 +170,7 @@ async def fetch_dialog_messages(
             dialog_id=dialog["id"],
             message=message,
             media_root=resolved_media_root,
+            timeout_seconds=media_download_timeout_seconds,
         )
         messages.append(
             {
@@ -196,6 +199,7 @@ async def _download_media_if_present(
     dialog_id: int,
     message: Any,
     media_root: Path,
+    timeout_seconds: float = 0,
 ) -> str | None:
     media = getattr(message, "media", None)
     if media is None:
@@ -206,11 +210,19 @@ async def _download_media_if_present(
     download_media = getattr(client, "download_media", None)
     if not callable(download_media):
         return None
+    if timeout_seconds <= 0:
+        return None
 
     message_id = getattr(message, "id", None) or "unknown"
     target_dir = media_root / str(dialog_id)
     target_dir.mkdir(parents=True, exist_ok=True)
-    output_path = await download_media(media, file=str(target_dir / f"{message_id}"))
+    try:
+        output_path = await asyncio.wait_for(
+            download_media(media, file=str(target_dir / f"{message_id}")),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        return None
     if output_path in (None, ""):
         return None
     return str(Path(output_path))
