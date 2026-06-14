@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from fastapi.testclient import TestClient
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import MediaAsset, RawMessage, SignalCandidate
 from telegram_kol_research.web_app import create_web_app
 
 
@@ -118,18 +118,31 @@ def test_group_messages_route_renders_filter_state_and_load_more_button(tmp_path
     assert "data-load-more" in response.text
     assert 'data-before-message-id="1"' in response.text
     assert 'data-latest-message-id="2"' in response.text
-    assert response.text.index("data-load-more") < response.text.index("first")
+    assert response.text.index('data-message-list') < response.text.index('message-list-footer')
+    assert response.text.index("second") < response.text.index("first")
     assert "data-message-select" not in response.text
 
 
-def test_group_messages_route_renders_messages_in_chronological_order(tmp_path):
+def test_group_messages_route_renders_messages_newest_first(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
     with session_factory() as session:
         session.add_all(
             [
-                RawMessage(chat_id=88, message_id=1, sender_name="Alice", text="older"),
-                RawMessage(chat_id=88, message_id=2, sender_name="Alice", text="newer"),
+                RawMessage(
+                    chat_id=88,
+                    message_id=1,
+                    sender_name="Alice",
+                    posted_at=datetime(2026, 4, 1, tzinfo=UTC),
+                    text="older",
+                ),
+                RawMessage(
+                    chat_id=88,
+                    message_id=2,
+                    sender_name="Alice",
+                    posted_at=datetime(2026, 4, 2, tzinfo=UTC),
+                    text="newer",
+                ),
             ]
         )
         session.commit()
@@ -138,7 +151,9 @@ def test_group_messages_route_renders_messages_in_chronological_order(tmp_path):
     response = client.get("/groups/88/messages")
 
     assert response.status_code == 200
-    assert response.text.index("older") < response.text.index("newer")
+    assert response.text.index('class="message-text">newer</p>') < response.text.index(
+        'class="message-text">older</p>'
+    )
 
 
 def test_group_messages_route_renders_posted_at_timestamp_for_each_message(tmp_path):
@@ -161,4 +176,96 @@ def test_group_messages_route_renders_posted_at_timestamp_for_each_message(tmp_p
 
     assert response.status_code == 200
     assert "timed message" in response.text
-    assert "2026-04-19 09:30" in response.text
+    assert "2026-04-19 17:30" in response.text
+
+
+def test_group_messages_route_shows_ai_strategy_detection_results(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        strategy_message = RawMessage(
+            chat_id=88,
+            message_id=3,
+            sender_name="Alice",
+            posted_at=datetime(2026, 4, 3, tzinfo=UTC),
+            text="BTC long 68000-68200 SL 67500 TP 69000/70000",
+        )
+        text_message = RawMessage(
+            chat_id=88,
+            message_id=2,
+            sender_name="Alice",
+            posted_at=datetime(2026, 4, 2, tzinfo=UTC),
+            text="普通聊天",
+        )
+        video_message = RawMessage(
+            chat_id=88,
+            message_id=1,
+            sender_name="Alice",
+            posted_at=datetime(2026, 4, 1, tzinfo=UTC),
+            text="视频复盘",
+        )
+        session.add_all([strategy_message, text_message, video_message])
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=strategy_message.id,
+                source_id=None,
+                symbol="BTC",
+                side="long",
+                entry_text="68000-68200",
+                stop_loss_text="67500",
+                take_profit_text="69000/70000",
+                leverage_text="20x",
+                event_type="entry_signal",
+                parse_source="text",
+                confidence=0.91,
+            )
+        )
+        session.add(
+            MediaAsset(
+                raw_message_id=video_message.id,
+                kind="messagemediadocument",
+                mime_type="video/mp4",
+                local_path="data/media/88/1.mp4",
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/88/messages")
+
+    assert response.status_code == 200
+    assert response.text.count("AI识别结果：") == 3
+    assert "AI识别结果：是策略" in response.text
+    assert "策略内容：" in response.text
+    assert "BTC long" in response.text
+    assert "Entry 68000-68200" in response.text
+    assert "SL 67500" in response.text
+    assert "TP 69000/70000" in response.text
+    assert "20x" in response.text
+    assert "AI识别结果：待识别" in response.text
+    assert "AI识别结果：非策略" in response.text
+    assert "视频消息默认跳过" in response.text
+
+
+def test_group_messages_route_renders_immediate_recognition_button(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=88,
+                message_id=1,
+                sender_name="Alice",
+                text="BTC long 68000-68200",
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/88/messages")
+
+    assert response.status_code == 200
+    assert "立即识别" in response.text
+    assert "data-recognize-message" in response.text
+    assert 'data-raw-message-id="1"' in response.text

@@ -3,7 +3,7 @@
   data-messages-panel
   data-layout-scroll-panel
   data-chat-id="{{ selected_chat_id or 0 }}"
-  data-latest-message-id="{{ messages[-1].message_id if messages else 0 }}"
+  data-latest-message-id="{{ messages[0].message_id if messages else 0 }}"
 >
   <div class="messages-panel-header" data-message-sticky-header>
     <h2>{{ selected_group.title if selected_group else "Messages" }}</h2>
@@ -17,9 +17,6 @@
       <span>
         数据新鲜度：{{ '%.1f 小时未刷新'|format(database_stale_hours) if database_stale_hours is not none else '暂无数据' }}
       </span>
-      <span>
-        刷新模式：{{ refresh_mode_label }}
-      </span>
       <button type="button" class="secondary-button" data-refresh-now>立即刷新</button>
       <span class="message-sync-state{% if live_listener_enabled %} is-live{% endif %}">
         {% if live_listener_enabled %}
@@ -30,35 +27,127 @@
       </span>
       {% if not live_listener_enabled and live_listener_status_reason %}
         <span>{{ live_listener_status_reason }}</span>
+        {% if session_lock_owner_pid %}
+          <span class="session-lock-hint">
+            Telegram session 被占用。先运行 <code>telegram-kol-research session-status</code>
+            查看占用；确认无实盘任务后运行
+            <code>telegram-kol-research session-release --pid {{ session_lock_owner_pid }}</code>
+            释放。
+          </span>
+        {% endif %}
       {% endif %}
     </div>
-    <form class="message-filters" data-message-filters>
-      <label>
-        Search
-        <input
-          type="search"
-          name="search_text"
-          value="{{ search_text or '' }}"
-          placeholder="Search message text"
-        />
-      </label>
-      <label>
-        Sender
-        <input
-          type="search"
-          name="sender_name"
-          value="{{ sender_name or '' }}"
-          placeholder="Filter by sender"
-        />
-      </label>
-      <div class="message-filter-actions">
-        <button type="submit">Apply filters</button>
-        <button type="button" data-clear-message-filters>Clear</button>
-      </div>
-    </form>
+    <details class="message-filter-panel" data-message-filter-panel>
+      <summary>筛选</summary>
+      <form class="message-filters" data-message-filters>
+        <label>
+          Search
+          <input
+            type="search"
+            name="search_text"
+            value="{{ search_text or '' }}"
+            placeholder="Search message text"
+          />
+        </label>
+        <label>
+          Sender
+          <input
+            type="search"
+            name="sender_name"
+            value="{{ sender_name or '' }}"
+            placeholder="Filter by sender"
+          />
+        </label>
+        <div class="message-filter-actions">
+          <button type="submit">Apply filters</button>
+          <button type="button" data-clear-message-filters>Clear</button>
+        </div>
+      </form>
+    </details>
   </div>
 
-  {% set next_before_message_id = messages[0].message_id if messages else None %}
+  <div class="message-list" data-message-list>
+    {% for message in messages %}
+      <article class="message-card" id="message-{{ message.raw_message_id }}">
+        <header class="message-card-header">
+          <div class="message-heading-main">
+            <span class="message-sender-name">{{ message.sender_name or "Unknown" }}</span>
+            <span class="message-posted-at">{{ message.posted_at.strftime('%Y-%m-%d %H:%M') if message.posted_at else '' }}</span>
+          </div>
+          <span class="message-id-badge">#{{ message.message_id }}</span>
+        </header>
+        <div class="message-card-body">
+          {% if message.text %}
+            <p class="message-text">{{ message.text }}</p>
+          {% endif %}
+          {% if message.media_assets %}
+            <div class="media-list">
+              {% for media in message.media_assets %}
+                {% set media_kind = (media.kind or '')|lower %}
+                {% set mime_type = (media.mime_type or '')|lower %}
+                <div class="media-item">
+                  {% if 'photo' in media_kind or 'image' in mime_type %}
+                    {% if media.local_path %}
+                      <a
+                        class="media-link"
+                        href="/local-media/{{ media.local_path.split('data/media/')[-1] }}"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        <img
+                          class="message-media-preview"
+                          src="/local-media/{{ media.local_path.split('data/media/')[-1] }}"
+                          alt="message media"
+                        />
+                      </a>
+                    {% else %}
+                      <span class="media-token">[图片]</span>
+                    {% endif %}
+                  {% elif 'video' in media_kind or 'document' in media_kind or mime_type.startswith('video/') %}
+                    <span class="media-token">[视频]</span>
+                  {% else %}
+                    <span class="media-token">[媒体]</span>
+                  {% endif %}
+                  {% if media.ocr_text %}
+                    <details>
+                      <summary>OCR text</summary>
+                      <pre>{{ media.ocr_text }}</pre>
+                    </details>
+                  {% endif %}
+                </div>
+              {% endfor %}
+            </div>
+          {% endif %}
+          {% set detection = message.strategy_detection %}
+          <div class="message-ai-result {{ detection.status_class if detection else 'is-pending' }}">
+            <div class="message-ai-status">
+              <span>AI识别结果：{{ detection.status if detection else '待识别' }}</span>
+              {% if detection and detection.reason %}
+                <small>{{ detection.reason }}</small>
+              {% endif %}
+            </div>
+            {% if detection and detection.summary %}
+              <div class="message-strategy-content">
+                <span>策略内容：</span>
+                <strong>{{ detection.summary }}</strong>
+              </div>
+            {% endif %}
+          </div>
+          <div class="message-actions">
+            <button
+              type="button"
+              class="secondary-button message-recognize-button"
+              data-recognize-message
+              data-raw-message-id="{{ message.raw_message_id }}"
+            >立即识别</button>
+            <span class="message-recognition-status" data-message-recognition-status aria-live="polite"></span>
+          </div>
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+
+  {% set next_before_message_id = messages[-1].message_id if messages else None %}
   <div class="message-list-footer">
     {% if next_before_message_id %}
       <button
@@ -69,47 +158,6 @@
         Load more
       </button>
     {% endif %}
-  </div>
-
-  <div class="message-list" data-message-list>
-    {% for message in messages %}
-      <article class="message-card" id="message-{{ message.raw_message_id }}">
-        <header>
-          <span>{{ message.sender_name or "Unknown" }}</span>
-          <span>{{ message.posted_at.strftime('%Y-%m-%d %H:%M') if message.posted_at else '' }}</span>
-          <span>{{ message.message_id }}</span>
-        </header>
-        <p>{{ message.text or "" }}</p>
-        {% if message.media_assets %}
-          <div class="media-list">
-            {% for media in message.media_assets %}
-              <div class="media-item">
-                {% if media.local_path %}
-                  <a
-                    class="media-link"
-                    href="/local-media/{{ media.local_path.split('data/media/')[-1] }}"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    <img
-                      class="message-media-preview"
-                      src="/local-media/{{ media.local_path.split('data/media/')[-1] }}"
-                      alt="message media"
-                    />
-                  </a>
-                {% endif %}
-                {% if media.ocr_text %}
-                  <details>
-                    <summary>OCR text</summary>
-                    <pre>{{ media.ocr_text }}</pre>
-                  </details>
-                {% endif %}
-              </div>
-            {% endfor %}
-          </div>
-        {% endif %}
-      </article>
-    {% endfor %}
   </div>
 
 </section>

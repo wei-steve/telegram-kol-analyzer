@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import MediaAsset, RawMessage, SyncCheckpoint
+from telegram_kol_research.time_utils import parse_datetime_to_utc_naive
 
 
 @dataclass(slots=True)
@@ -60,11 +61,7 @@ def normalize_message_payload(
 
 
 def _parse_optional_datetime(value: Any) -> datetime | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, datetime):
-        return value
-    return datetime.fromisoformat(str(value))
+    return parse_datetime_to_utc_naive(value)
 
 
 def _json_default(value: Any) -> str:

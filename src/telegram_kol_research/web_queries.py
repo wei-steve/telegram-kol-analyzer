@@ -8,7 +8,13 @@ from typing import Iterable
 from sqlalchemy import func, or_
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.models import MediaAsset, RawMessage
+from telegram_kol_research.models import (
+    MediaAsset,
+    MessageRecognition,
+    RawMessage,
+    SignalCandidate,
+)
+from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
 
 
 def load_group_rows(
@@ -49,7 +55,7 @@ def load_group_rows(
                     "chat_id": row.chat_id,
                     "title": label_map.get(raw_title, raw_title),
                     "raw_title": raw_title,
-                    "last_posted_at": row.last_posted_at,
+                    "last_posted_at": utc_naive_to_local(row.last_posted_at),
                     "message_count": row.message_count,
                     "has_media": False,
                 }
@@ -69,13 +75,16 @@ def load_database_freshness(
 
     stale_hours = None
     if latest_message_at is not None:
-        effective_latest = latest_message_at
-        if latest_message_at.tzinfo is None and now.tzinfo is not None:
-            effective_latest = latest_message_at.replace(tzinfo=now.tzinfo)
-        stale_hours = round((now - effective_latest).total_seconds() / 3600, 1)
+        now_utc = normalize_to_utc_naive(now)
+        latest_utc = (
+            latest_message_at
+            if latest_message_at.tzinfo is None
+            else normalize_to_utc_naive(latest_message_at)
+        )
+        stale_hours = round((now_utc - latest_utc).total_seconds() / 3600, 1)
 
     return {
-        "latest_message_at": latest_message_at,
+        "latest_message_at": utc_naive_to_local(latest_message_at),
         "stale_hours": stale_hours,
     }
 
@@ -112,42 +121,8 @@ def load_group_messages(
             .limit(limit)
             .all()
         )
-        raw_messages.reverse()
 
-        rows: list[dict[str, object | None]] = []
-        for raw_message in raw_messages:
-            media_assets = (
-                session.query(MediaAsset)
-                .filter(MediaAsset.raw_message_id == raw_message.id)
-                .order_by(MediaAsset.id.asc())
-                .all()
-            )
-            rows.append(
-                {
-                    "raw_message_id": raw_message.id,
-                    "chat_id": raw_message.chat_id,
-                    "message_id": raw_message.message_id,
-                    "sender_id": raw_message.sender_id,
-                    "sender_name": raw_message.sender_name,
-                    "posted_at": raw_message.posted_at,
-                    "edit_date": raw_message.edit_date,
-                    "text": raw_message.text,
-                    "reply_to_message_id": raw_message.reply_to_message_id,
-                    "media_assets": [
-                        {
-                            "id": media_asset.id,
-                            "kind": media_asset.kind,
-                            "mime_type": media_asset.mime_type,
-                            "local_path": media_asset.local_path,
-                            "ocr_text": media_asset.ocr_text,
-                        }
-                        for media_asset in media_assets
-                    ],
-                    "reply_context": None,
-                }
-            )
-
-    return rows
+        return _serialize_raw_messages(session, raw_messages)
 
 
 def load_selected_messages(
@@ -188,9 +163,9 @@ def load_messages_in_time_window(
     with session_factory() as session:
         query = session.query(RawMessage).filter(RawMessage.chat_id == chat_id)
         if posted_after is not None:
-            query = query.filter(RawMessage.posted_at >= posted_after)
+            query = query.filter(RawMessage.posted_at >= normalize_to_utc_naive(posted_after))
         if posted_before is not None:
-            query = query.filter(RawMessage.posted_at <= posted_before)
+            query = query.filter(RawMessage.posted_at <= normalize_to_utc_naive(posted_before))
         raw_messages = (
             query.order_by(RawMessage.posted_at.desc(), RawMessage.message_id.desc())
             .limit(limit)
@@ -211,6 +186,7 @@ def _serialize_raw_messages(
             .order_by(MediaAsset.id.asc())
             .all()
         )
+        media_asset_rows = _serialize_media_assets(media_assets)
         rows.append(
             {
                 "raw_message_id": raw_message.id,
@@ -218,22 +194,122 @@ def _serialize_raw_messages(
                 "message_id": raw_message.message_id,
                 "sender_id": raw_message.sender_id,
                 "sender_name": raw_message.sender_name,
-                "posted_at": raw_message.posted_at,
-                "edit_date": raw_message.edit_date,
+                "posted_at": utc_naive_to_local(raw_message.posted_at),
+                "edit_date": utc_naive_to_local(raw_message.edit_date),
                 "text": raw_message.text,
                 "reply_to_message_id": raw_message.reply_to_message_id,
-                "media_assets": [
-                    {
-                        "id": media_asset.id,
-                        "kind": media_asset.kind,
-                        "mime_type": media_asset.mime_type,
-                        "local_path": media_asset.local_path,
-                        "ocr_text": media_asset.ocr_text,
-                    }
-                    for media_asset in media_assets
-                ],
+                "media_assets": media_asset_rows,
+                "strategy_detection": _load_strategy_detection(
+                    session,
+                    raw_message=raw_message,
+                    media_assets=media_assets,
+                ),
                 "reply_context": None,
             }
         )
 
     return rows
+
+
+def _serialize_media_assets(media_assets: list[MediaAsset]) -> list[dict[str, object | None]]:
+    return [
+        {
+            "id": media_asset.id,
+            "kind": media_asset.kind,
+            "mime_type": media_asset.mime_type,
+            "local_path": media_asset.local_path,
+            "ocr_text": media_asset.ocr_text,
+        }
+        for media_asset in media_assets
+    ]
+
+
+def _load_strategy_detection(
+    session,
+    *,
+    raw_message: RawMessage,
+    media_assets: list[MediaAsset],
+) -> dict[str, str | None]:
+    recognition = (
+        session.query(MessageRecognition)
+        .filter(MessageRecognition.raw_message_id == raw_message.id)
+        .one_or_none()
+    )
+    if recognition is not None:
+        return {
+            "status": recognition.status,
+            "status_class": _recognition_status_class(recognition.status),
+            "summary": recognition.summary,
+            "reason": recognition.reason,
+        }
+
+    candidate = (
+        session.query(SignalCandidate)
+        .filter(SignalCandidate.raw_message_id == raw_message.id)
+        .order_by(SignalCandidate.confidence.desc(), SignalCandidate.id.asc())
+        .first()
+    )
+    if candidate is not None:
+        return {
+            "status": "是策略",
+            "status_class": "is-strategy",
+            "summary": _format_signal_candidate_summary(candidate),
+            "reason": None,
+        }
+
+    if _has_video_like_media(media_assets):
+        return {
+            "status": "非策略",
+            "status_class": "is-not-strategy",
+            "summary": None,
+            "reason": "视频消息默认跳过",
+        }
+
+    return {
+        "status": "待识别",
+        "status_class": "is-pending",
+        "summary": None,
+        "reason": None,
+    }
+
+
+def _recognition_status_class(status: str) -> str:
+    if status == "是策略":
+        return "is-strategy"
+    if status == "非策略":
+        return "is-not-strategy"
+    if status == "识别失败":
+        return "is-failed"
+    return "is-pending"
+
+
+def _format_signal_candidate_summary(candidate: SignalCandidate) -> str:
+    parts: list[str] = []
+    symbol_side = " ".join(
+        value
+        for value in [
+            candidate.symbol,
+            candidate.side,
+        ]
+        if value
+    )
+    if symbol_side:
+        parts.append(symbol_side)
+    if candidate.entry_text:
+        parts.append(f"Entry {candidate.entry_text}")
+    if candidate.stop_loss_text:
+        parts.append(f"SL {candidate.stop_loss_text}")
+    if candidate.take_profit_text:
+        parts.append(f"TP {candidate.take_profit_text}")
+    if candidate.leverage_text:
+        parts.append(candidate.leverage_text)
+    return "；".join(parts) or "已命中策略候选"
+
+
+def _has_video_like_media(media_assets: list[MediaAsset]) -> bool:
+    for media_asset in media_assets:
+        media_kind = (media_asset.kind or "").lower()
+        mime_type = (media_asset.mime_type or "").lower()
+        if "video" in media_kind or "document" in media_kind or mime_type.startswith("video/"):
+            return True
+    return False

@@ -3,54 +3,303 @@
 {% block title %}Telegram Workbench{% endblock %}
 
 {% block body %}
-  <main class="layout">
-    <aside class="panel groups-panel" data-layout-scroll-panel>
-      <h1>Groups</h1>
-      {% include "_groups.html" %}
-    </aside>
+  <main class="trader-layout" data-trader-dashboard>
+    <header class="trader-desk-header">
+      <div>
+        <p class="trader-kicker">Deepcoin Auto Trading</p>
+        <h1>交易执行台</h1>
+      </div>
+    </header>
 
-    {% include "_messages.html" %}
+    <nav class="dashboard-menu" aria-label="工作区菜单">
+      <button type="button" class="dashboard-menu-item is-active" data-dashboard-tab="main">主界面</button>
+      <button type="button" class="dashboard-menu-item" data-dashboard-tab="prompt">AI识别提示词</button>
+      <button type="button" class="dashboard-menu-item" data-dashboard-tab="config">AI配置</button>
+    </nav>
 
-    <aside class="panel ai-panel" data-layout-scroll-panel>
-      <div class="ai-workbench" data-ai-workbench>
-        <header class="ai-workbench-header">
-          <h2>AI Analysis</h2>
-          <details class="group-prompt-panel" data-group-prompt-panel>
-            <summary>
-              <span>群组分析偏好</span>
-              <small>该群默认提示词</small>
-            </summary>
-            <p class="ai-helper-text">仅影响当前群，下次提问立即生效</p>
-            <textarea
-              name="group_prompt"
-              data-group-prompt
-              rows="5"
-              placeholder="例如：请像交易研究员一样，优先总结最新变化、可执行信号和分歧点。"
-            ></textarea>
-          </details>
-        </header>
+    <section class="dashboard-tab-panel is-active" data-dashboard-panel="main">
+    <section class="trader-kpi-grid" aria-label="交易执行概览">
+      <article class="trader-kpi">
+        <span>今日 / 48小时策略</span>
+        <strong>{{ trader_dashboard.strategy_count }}</strong>
+      </article>
+      <article class="trader-kpi">
+        <span>待人工审核</span>
+        <strong>{{ trader_dashboard.pending_review_count }}</strong>
+      </article>
+      <article class="trader-kpi">
+        <span>可模拟提交</span>
+        <strong>{{ trader_dashboard.ready_to_simulate_count }}</strong>
+      </article>
+      <article class="trader-kpi">
+        <span>阻断项</span>
+        <strong>{{ trader_dashboard.blocked_count }}</strong>
+      </article>
+    </section>
 
-        <section class="ai-history-panel" data-ai-report-feed>
-          <div class="ai-history-header">
+    <section class="trader-shell">
+      <aside class="panel groups-panel trader-groups-panel" data-layout-scroll-panel>
+        <div class="panel-heading">
+          <h2>群组 / KOL 策略</h2>
+          <span>{{ groups|length }} groups</span>
+        </div>
+        <div class="kol-strategy-list">
+          {% for group in trader_dashboard.group_rows %}
+            <article class="kol-strategy-row{% if group.chat_id == selected_chat_id %} is-active{% endif %}">
+              <button
+                type="button"
+                class="kol-open-button"
+                data-group-link
+                data-chat-id="{{ group.chat_id }}"
+              >
+                <strong>{{ group.title }}</strong>
+                <span>{{ group.message_count }} 条消息 · {{ group.strategy_work_count }} 个工单</span>
+              </button>
+              <div class="group-automation-actions">
+                <button
+                  type="button"
+                  class="group-toggle{% if group.ai_strategy_enabled %} is-enabled{% endif %}"
+                  data-toggle-group-automation
+                  data-setting="ai_strategy_enabled"
+                  data-enabled="{{ 'true' if group.ai_strategy_enabled else 'false' }}"
+                  data-chat-id="{{ group.chat_id }}"
+                  data-chat-title="{{ group.raw_title or group.title }}"
+                >AI识别策略</button>
+                <button
+                  type="button"
+                  class="group-toggle{% if group.auto_trade_enabled %} is-enabled{% endif %}"
+                  data-toggle-group-automation
+                  data-setting="auto_trade_enabled"
+                  data-enabled="{{ 'true' if group.auto_trade_enabled else 'false' }}"
+                  data-chat-id="{{ group.chat_id }}"
+                  data-chat-title="{{ group.raw_title or group.title }}"
+                >自动交易</button>
+              </div>
+            </article>
+          {% endfor %}
+        </div>
+        <details class="legacy-group-list">
+          <summary>Groups</summary>
+          {% include "_groups.html" %}
+        </details>
+      </aside>
+
+      <section class="panel trader-worklist-panel" data-strategy-worklist data-layout-scroll-panel>
+        <div class="worklist-header">
+          <div>
+            <h2>策略执行队列</h2>
+            <p class="ai-helper-text">恢复扫描发现的策略先进入交易工单，再经过人工审核、最终确认和模拟提交。</p>
+          </div>
+          <button type="button" class="secondary-button" data-run-recovery-scan>运行扫描</button>
+        </div>
+        <div class="recovery-scan-status" data-recovery-status aria-live="polite"></div>
+
+        <section class="recovery-decisions-panel" data-recovery-decisions>
+          <div class="recovery-decisions-header">
             <div>
-              <h3>Conversation · 研究报告流</h3>
-              <p class="ai-helper-text">AI 回复会整理成报告卡片，便于连续阅读和回溯。</p>
+              <h3>恢复扫描 · 交易工单</h3>
+              <p class="ai-helper-text">重启后两天内未入场策略的补挂单审计结果。</p>
             </div>
-            <button type="button" class="secondary-button" data-clear-ai-history>清理聊天记录</button>
           </div>
-          <div class="ai-history-scroll" data-ai-history-scroll>
-            <div class="ai-history" data-ai-history></div>
-          </div>
+          {% if recovery_decisions %}
+            <div class="recovery-decision-list recovery-decision-list--desk">
+              {% for decision in recovery_decisions %}
+                <article class="recovery-decision-row strategy-ticket">
+                  <div class="recovery-decision-main">
+                    <strong>{{ decision.kol_id }}</strong>
+                    <span>{{ decision.symbol }} {{ decision.side }}</span>
+                    <code>{{ decision.action }}</code>
+                  </div>
+                  <div class="recovery-decision-meta">
+                    <span>Chat {{ decision.chat_id }} · Msg {{ decision.message_id }}</span>
+                    {% if decision.entry_range_text %}
+                      <span>Entry {{ decision.entry_range_text }}</span>
+                    {% endif %}
+                    {% if decision.max_loss_usdt is not none %}
+                      <span>Risk {{ "%g"|format(decision.max_loss_usdt) }} USDT</span>
+                    {% endif %}
+                    <span>
+                      审核：
+                      {% if decision.review_status == "pending" %}
+                        待人工审核
+                      {% elif decision.review_status == "approved_for_order" %}
+                        已同意补挂单
+                      {% elif decision.review_status == "ignored" %}
+                        已忽略
+                      {% else %}
+                        {{ decision.review_status }}
+                      {% endif %}
+                    </span>
+                    <span class="sr-only">
+                      {% if decision.review_status == "pending" %}待审核{% endif %}
+                    </span>
+                  </div>
+                  {% if decision.reason_codes %}
+                    <div class="recovery-reason-list">
+                      {% for reason_code in decision.reason_codes %}
+                        <code>{{ reason_code }}</code>
+                      {% endfor %}
+                    </div>
+                  {% endif %}
+                  {% if decision.review_status == "pending" %}
+                    <div class="recovery-review-actions">
+                      <button
+                        type="button"
+                        class="secondary-button"
+                        data-review-recovery
+                        data-review-status="approved_for_order"
+                        data-chat-id="{{ decision.chat_id }}"
+                        data-message-id="{{ decision.message_id }}"
+                        data-symbol="{{ decision.symbol }}"
+                        data-side="{{ decision.side }}"
+                      >同意补挂单</button>
+                      <button
+                        type="button"
+                        class="secondary-button"
+                        data-review-recovery
+                        data-review-status="ignored"
+                        data-chat-id="{{ decision.chat_id }}"
+                        data-message-id="{{ decision.message_id }}"
+                        data-symbol="{{ decision.symbol }}"
+                        data-side="{{ decision.side }}"
+                      >忽略</button>
+                    </div>
+                  {% endif %}
+                </article>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="ai-helper-text">暂无恢复扫描记录。</p>
+          {% endif %}
         </section>
 
-        <form class="ai-composer" data-ai-form data-ai-composer>
-          <input type="hidden" name="chat_id" value="{{ selected_chat_id or 0 }}" />
-          <p class="ai-helper-text">默认分析当前群最近 50 条消息；你也可以直接问“总结最近 200 条”。</p>
-          <div class="ai-form-status" data-ai-status aria-live="polite"></div>
-          <textarea name="question" rows="4" placeholder="Ask AI to analyze this group's messages..."></textarea>
-          <button type="submit">Analyze</button>
+        <section class="recovery-execution-panel" data-recovery-execution-queue>
+          <div class="recovery-decisions-header">
+            <div>
+              <h3>执行前队列</h3>
+              <p class="ai-helper-text">仅展示已同意补挂单的 Deepcoin 请求参数预览，不会下单。</p>
+            </div>
+          </div>
+          {% if recovery_execution_queue %}
+            <div class="recovery-decision-list recovery-decision-list--desk">
+              {% for item in recovery_execution_queue %}
+                <article class="recovery-decision-row strategy-ticket">
+                  <div class="recovery-decision-main">
+                    <strong>{{ item.kol_id }}</strong>
+                    <span>{{ item.symbol }} {{ item.side }}</span>
+                    <code>{{ item.execution_status }}</code>
+                    <span class="contract-spec-badge contract-spec-badge--{{ item.contract_spec_status.code }}">
+                      {{ item.contract_spec_status.label }}
+                    </span>
+                  </div>
+                  <div class="recovery-decision-meta">
+                    <span>{{ item.deepcoin_order_draft.instrument_id }}</span>
+                    <span>{{ item.deepcoin_order_draft.margin_mode }}</span>
+                    <span>{{ item.deepcoin_order_draft.position_mode }}</span>
+                    <span>{{ item.contract_spec_status.quantity_unit }}</span>
+                    <span>{{ item.payload_preview.open_side }}</span>
+                    <span>Entry {{ item.entry_range_text }}</span>
+                    <span>Risk {{ "%g"|format(item.max_loss_usdt) }} USDT</span>
+                    {% for reason_code in item.deepcoin_order_draft.blocking_reason_codes %}
+                      <code>{{ reason_code }}</code>
+                    {% endfor %}
+                  </div>
+                  <div class="recovery-review-actions">
+                    <button
+                      type="button"
+                      class="secondary-button"
+                      data-confirm-recovery-order
+                      data-chat-id="{{ item.chat_id }}"
+                      data-message-id="{{ item.message_id }}"
+                      data-symbol="{{ item.symbol }}"
+                      data-side="{{ item.side }}"
+                    >最终确认</button>
+                    <span
+                      class="recovery-order-confirm-status"
+                      data-recovery-order-confirm-status
+                      aria-live="polite"
+                    ></span>
+                    <button
+                      type="button"
+                      class="secondary-button"
+                      data-simulate-recovery-submit
+                      data-chat-id="{{ item.chat_id }}"
+                      data-message-id="{{ item.message_id }}"
+                      data-symbol="{{ item.symbol }}"
+                      data-side="{{ item.side }}"
+                    >模拟提交</button>
+                    <span
+                      class="recovery-order-confirm-status"
+                      data-recovery-submit-gate-status
+                      aria-live="polite"
+                    ></span>
+                  </div>
+                  <pre class="recovery-payload-preview">{{ item.deepcoin_order_draft }}</pre>
+                </article>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="ai-helper-text">暂无待执行预览。</p>
+          {% endif %}
+        </section>
+      </section>
+
+      <aside class="trader-right-rail" data-strategy-detail-panel>
+        <div class="panel detail-shell">
+          <div class="panel-heading">
+            <h2>策略详情 / 原始消息</h2>
+            <span>{{ selected_group.title if selected_group else "Messages" }}</span>
+          </div>
+          {% include "_messages.html" %}
+        </div>
+      </aside>
+    </section>
+    </section>
+
+    <section class="dashboard-tab-panel" data-dashboard-panel="prompt">
+      <section class="panel ai-recognition-panel" data-ai-recognition-prompt>
+        <div class="panel-heading">
+          <div>
+            <h2>AI识别提示词</h2>
+            <p class="ai-helper-text">用于后续每条 KOL 消息识别的统一提示词。当前“立即识别”先使用本地规则解析器。</p>
+          </div>
+        </div>
+        <form class="ai-recognition-prompt-form" data-ai-recognition-prompt-form>
+          <label>
+            识别提示词
+            <textarea name="recognition_prompt" data-ai-recognition-prompt-input>{{ ai_recognition_config.recognition_prompt }}</textarea>
+          </label>
+          <div class="prompt-actions">
+            <button type="submit">保存提示词</button>
+            <span class="ai-recognition-save-status" data-ai-recognition-save-status aria-live="polite"></span>
+          </div>
         </form>
-      </div>
-    </aside>
+      </section>
+    </section>
+
+    <section class="dashboard-tab-panel" data-dashboard-panel="config">
+      <section class="panel ai-recognition-panel" data-ai-recognition-config>
+        <div class="panel-heading">
+          <div>
+            <h2>AI配置</h2>
+            <p class="ai-helper-text">当前 V1 立即识别模式：{{ ai_recognition_config.mode }}。后续这里接入模型、OCR 和重试参数。</p>
+          </div>
+        </div>
+        <div class="ai-config-grid">
+          <div>
+            <span>识别模式</span>
+            <strong>{{ ai_recognition_config.mode }}</strong>
+          </div>
+          <div>
+            <span>图片识别</span>
+            <strong>待接入 OCR/AI</strong>
+          </div>
+          <div>
+            <span>视频识别</span>
+            <strong>默认跳过</strong>
+          </div>
+        </div>
+      </section>
+    </section>
   </main>
 {% endblock %}

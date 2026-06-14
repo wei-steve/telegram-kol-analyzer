@@ -41,6 +41,22 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "forwarded_at": "ALTER TABLE strategy_alerts ADD COLUMN forwarded_at DATETIME",
         "updated_at": "ALTER TABLE strategy_alerts ADD COLUMN updated_at DATETIME",
     },
+    "execution_bindings": {
+        "pos_id": "ALTER TABLE execution_bindings ADD COLUMN pos_id VARCHAR(255)",
+        "status": "ALTER TABLE execution_bindings ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'open'",
+        "updated_at": "ALTER TABLE execution_bindings ADD COLUMN updated_at DATETIME",
+    },
+    "recovery_decisions": {
+        "reason_codes_json": "ALTER TABLE recovery_decisions ADD COLUMN reason_codes_json TEXT NOT NULL DEFAULT '[]'",
+        "entry_range_text": "ALTER TABLE recovery_decisions ADD COLUMN entry_range_text VARCHAR(255)",
+        "stop_loss_text": "ALTER TABLE recovery_decisions ADD COLUMN stop_loss_text VARCHAR(255)",
+        "max_loss_usdt": "ALTER TABLE recovery_decisions ADD COLUMN max_loss_usdt FLOAT NOT NULL DEFAULT 100.0",
+        "review_status": "ALTER TABLE recovery_decisions ADD COLUMN review_status VARCHAR(32) NOT NULL DEFAULT 'pending'",
+        "reviewed_at": "ALTER TABLE recovery_decisions ADD COLUMN reviewed_at DATETIME",
+        "review_note": "ALTER TABLE recovery_decisions ADD COLUMN review_note TEXT",
+        "run_at": "ALTER TABLE recovery_decisions ADD COLUMN run_at DATETIME",
+        "updated_at": "ALTER TABLE recovery_decisions ADD COLUMN updated_at DATETIME",
+    },
 }
 
 

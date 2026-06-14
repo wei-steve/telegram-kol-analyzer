@@ -8,3 +8,4 @@ def test_cli_help_renders():
     assert result.exit_code == 0
     assert "sync" in result.stdout
     assert "report" in result.stdout
+    assert "recovery-dry-run" in result.stdout

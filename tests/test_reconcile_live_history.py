@@ -118,6 +118,31 @@ def test_run_reconcile_once_triggers_strategy_alert_processor_for_fresh_messages
     assert {item["chat_title"] for item in processed} == {"VIP BTC Room"}
 
 
+def test_run_reconcile_once_skips_strategy_alert_processor_when_group_ai_is_disabled(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    processed = []
+
+    async def fake_strategy_alert_processor(**kwargs):
+        processed.append(kwargs)
+        return {"status": "sent"}
+
+    __import__("asyncio").run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            strategy_alert_config=object(),
+            strategy_alert_enabled_for_title=lambda title: False,
+            strategy_alert_processor=fake_strategy_alert_processor,
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=_fake_fetch_dialog_messages,
+        )
+    )
+
+    assert processed == []
+
+
 def test_run_live_listener_connects_client_before_waiting_for_events():
     client = _FakeListenerClient()
 

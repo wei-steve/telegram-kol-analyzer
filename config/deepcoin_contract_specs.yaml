@@ -1,0 +1,8 @@
+# Copy to config/deepcoin_contract_specs.yaml only after verifying each value
+# against Deepcoin's current contract specifications.
+contracts:
+  - instrument_id: "BTC-USDT-SWAP"
+    contract_value: 0.001
+    quantity_step: 1
+    min_quantity: 1
+    price_tick: 0.1

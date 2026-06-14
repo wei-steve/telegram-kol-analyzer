@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import SyncCheckpoint
@@ -35,6 +36,22 @@ def test_normalize_message_payload_serializes_datetime_fields_in_raw_payload():
 
     assert "2026-04-10T08:30:00+00:00" in normalized.raw_payload
     assert "2026-04-10T08:45:00+00:00" in normalized.raw_payload
+
+
+def test_normalize_message_payload_stores_message_times_as_utc_naive():
+    normalized = normalize_message_payload(
+        {
+            "chat_id": 1001,
+            "message_id": 79,
+            "posted_at": datetime(2026, 6, 12, 16, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+            "edit_date": "2026-06-12T16:45:00+08:00",
+        }
+    )
+
+    assert normalized.posted_at == datetime(2026, 6, 12, 8, 30)
+    assert normalized.posted_at.tzinfo is None
+    assert normalized.edit_date == datetime(2026, 6, 12, 8, 45)
+    assert normalized.edit_date.tzinfo is None
 
 
 def test_persist_normalized_messages_updates_checkpoint_to_latest_message_id(tmp_path):

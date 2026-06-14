@@ -1,7 +1,11 @@
 groups:
   - chat_title: "VIP BTC Room"
+    chat_id: null
     enabled: true
     custom_group_label: "BTC Core"
+    trading_mode: "notify_only"
+    max_loss_usdt: 100
+    symbol_whitelist: ["BTC", "ETH"]
     sync_start_date: "2026-01-01"
     sync_end_date: null
     tracked_senders:
@@ -9,7 +13,9 @@ groups:
         username: "alice_signals"
         telegram_sender_id: 10001
         custom_label: "Alice"
+        trading_mode: "notify_only"
       - display_name: "Bob"
         username: "bob_trader"
         telegram_sender_id: 10002
         custom_label: "Bob"
+        trading_mode: "notify_only"

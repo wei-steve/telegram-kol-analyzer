@@ -9,10 +9,13 @@ from pathlib import Path
 import typer
 
 from telegram_kol_research.backfill import build_backfill_windows
+from telegram_kol_research.binance_market_data import BinanceMarketDataProvider
 from telegram_kol_research.candidates import persist_text_signal_candidates
 from telegram_kol_research.dataset_export import export_dataset_jsonl
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.deepcoin_contract_specs import load_deepcoin_contract_specs
 from telegram_kol_research.group_config import load_group_config
+from telegram_kol_research.gate_market_data import GateMarketDataProvider
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.llm_adjudication import (
     export_llm_adjudication_pack,
@@ -36,6 +39,10 @@ from telegram_kol_research.review_queue import (
     load_candidates,
     write_candidates,
 )
+from telegram_kol_research.recovery_runner import (
+    RecoveryDryRunProviderMissingError,
+    run_recovery_dry_run,
+)
 from telegram_kol_research.strategy_alerts import (
     load_strategy_alert_config,
     strategy_alerts_enabled,
@@ -52,8 +59,11 @@ from telegram_kol_research.telegram_client import (
 from telegram_kol_research.telegram_session_lock import (
     TelegramSessionLockError,
     acquire_telegram_session_lock,
+    describe_session_lock_owner,
     reap_stopped_session_lock_owner,
+    release_session_lock_owner,
 )
+from telegram_kol_research.time_utils import normalize_to_utc_naive
 from telegram_kol_research.telegram_live_listener import run_live_listener
 from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidates
 from telegram_kol_research.web_app import create_web_app
@@ -72,7 +82,9 @@ def _record_within_window(record: NormalizedMessageRecord, *, start_at, end_at) 
     posted_at = record.posted_at
     if posted_at is None:
         return True
-    return start_at <= posted_at <= end_at
+    normalized_start = normalize_to_utc_naive(start_at)
+    normalized_end = normalize_to_utc_naive(end_at)
+    return normalized_start <= posted_at <= normalized_end
 
 
 def _load_normalized_records_from_db(
@@ -336,6 +348,56 @@ def report(
     typer.echo(f"Report written to {written_path}")
 
 
+@app.command("recovery-dry-run")
+def recovery_dry_run(
+    config_path: Path = Path("config/groups.yaml"),
+    database_path: Path = Path("data/research.db"),
+    lookback_hours: int = 48,
+    market_provider: str = "none",
+    persist: bool = False,
+) -> None:
+    """Evaluate restart-recovery candidates without placing orders."""
+
+    group_config = load_group_config(config_path)
+    session_factory = create_session_factory(database_path)
+    market_data = None
+    try:
+        market_data = _build_recovery_market_provider(market_provider)
+        result = run_recovery_dry_run(
+            session_factory,
+            group_config=group_config,
+            now=datetime.now(UTC),
+            lookback_hours=lookback_hours,
+            market_data=market_data,
+            persist=persist,
+        )
+    except RecoveryDryRunProviderMissingError as exc:
+        typer.echo(f"Recovery dry-run unavailable: {exc}", err=False)
+        raise typer.Exit(code=1) from exc
+    finally:
+        close_provider = getattr(market_data, "close", None)
+        if callable(close_provider):
+            close_provider()
+
+    typer.echo(f"Recovery dry-run candidates: {result.total_candidates}")
+    if not result.action_counts:
+        typer.echo("No recovery actions.")
+        return
+    for action, count in sorted(result.action_counts.items()):
+        typer.echo(f"{action}: {count}")
+
+
+def _build_recovery_market_provider(market_provider: str):
+    normalized = market_provider.strip().lower()
+    if normalized in {"", "none"}:
+        return None
+    if normalized == "gate":
+        return GateMarketDataProvider()
+    if normalized == "binance":
+        return BinanceMarketDataProvider()
+    raise typer.BadParameter("market-provider must be one of: none, gate, binance")
+
+
 @app.command("export-dataset")
 def export_dataset(
     output_path: Path = Path("exports/llm-dataset.jsonl"),
@@ -509,6 +571,7 @@ def web(
     port: int = 8000,
     database_path: Path = Path("data/research.db"),
     config_path: Path = Path("config/groups.yaml"),
+    deepcoin_contract_specs_path: Path = Path("config/deepcoin_contract_specs.yaml"),
 ) -> None:
     """Run the local web workbench."""
 
@@ -531,6 +594,10 @@ def web(
         for group in group_config.groups
         if group.enabled
     }
+    deepcoin_contract_spec_provider = load_deepcoin_contract_specs(
+        deepcoin_contract_specs_path,
+        required=False,
+    )
 
     telegram_client = None
     live_listener_status_reason = None
@@ -568,12 +635,57 @@ def web(
         telegram_client=telegram_client,
         live_listener_status_reason=live_listener_status_reason,
         group_labels_by_title=group_labels_by_title,
+        group_config=group_config,
+        group_config_path=config_path,
+        deepcoin_contract_spec_provider=deepcoin_contract_spec_provider,
     )
     try:
         uvicorn.run(app_instance, host=host, port=port)
     finally:
         if telegram_session_lock_entered and telegram_session_lock is not None:
             telegram_session_lock.__exit__(None, None, None)
+
+
+@app.command("session-status")
+def session_status() -> None:
+    """Show which process currently owns the Telegram session lock."""
+
+    try:
+        auth_config = load_telegram_auth_config()
+    except (ValueError, RuntimeError) as exc:
+        typer.echo(f"Telegram auth/config error: {exc}", err=False)
+        raise typer.Exit(code=1) from exc
+
+    owner = describe_session_lock_owner(auth_config.session_path)
+    if owner is None:
+        typer.echo(f"Telegram session is free: {auth_config.session_path}")
+        return
+    typer.echo(f"Telegram session owner: {owner.format_for_humans()}")
+
+
+@app.command("session-release")
+def session_release(pid: int = typer.Option(..., "--pid")) -> None:
+    """Release a Telegram session owner after explicitly confirming its PID."""
+
+    try:
+        auth_config = load_telegram_auth_config()
+    except (ValueError, RuntimeError) as exc:
+        typer.echo(f"Telegram auth/config error: {exc}", err=False)
+        raise typer.Exit(code=1) from exc
+
+    owner = release_session_lock_owner(
+        auth_config.session_path,
+        expected_pid=pid,
+        current_command="telegram-kol-research session-release",
+    )
+    if owner is None:
+        typer.echo(
+            "Telegram session owner was not released. "
+            "Check `session-status`, then pass the exact same PID.",
+            err=False,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"Released Telegram session owner: {owner.format_for_humans()}")
 
 
 @app.command()
@@ -618,6 +730,12 @@ def alerts(
                         target_titles=target_titles,
                         media_root=media_root,
                         strategy_alert_config=alert_config,
+                        strategy_alert_enabled_for_title=lambda title: any(
+                            group.enabled
+                            and group.ai_strategy_enabled
+                            and group.chat_title == title
+                            for group in group_config.groups
+                        ),
                     )
                 )
             finally:

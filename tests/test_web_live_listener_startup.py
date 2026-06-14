@@ -8,7 +8,16 @@ def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
     reconcile_calls: list[tuple[object, set[str], str, int]] = []
     fake_client = object()
 
-    async def fake_live_listener_runner(*, client, session_factory, broker, target_titles, media_root, strategy_alert_config=None):
+    async def fake_live_listener_runner(
+        *,
+        client,
+        session_factory,
+        broker,
+        target_titles,
+        media_root,
+        strategy_alert_config=None,
+        strategy_alert_enabled_for_title=None,
+    ):
         calls.append((client, set(target_titles), str(media_root), strategy_alert_config))
 
     async def fake_reconcile_runner(
@@ -21,6 +30,7 @@ def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
         interval_seconds,
         operation_lock=None,
         strategy_alert_config=None,
+        strategy_alert_enabled_for_title=None,
     ):
         reconcile_calls.append((client, set(target_titles), str(media_root), interval_seconds))
 

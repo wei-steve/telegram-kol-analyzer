@@ -102,6 +102,7 @@ def test_refresh_api_runs_reconcile_once_when_credentials_are_available(tmp_path
         message_limit=50,
         checkpoint_overlap=5,
         strategy_alert_config=None,
+        strategy_alert_enabled_for_title=None,
         discover_dialogs_fn=None,
         fetch_dialog_messages_fn=None,
     ):
@@ -313,6 +314,7 @@ def test_refresh_api_reuses_live_client_without_session_copy(tmp_path):
         message_limit=50,
         checkpoint_overlap=5,
         strategy_alert_config=None,
+        strategy_alert_enabled_for_title=None,
         discover_dialogs_fn=None,
         fetch_dialog_messages_fn=None,
     ):

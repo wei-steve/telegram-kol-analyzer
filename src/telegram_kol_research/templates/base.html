@@ -4,10 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{% block title %}Telegram KOL Research{% endblock %}</title>
-    <link rel="stylesheet" href="{{ request.url_for('static', path='app.css') }}" />
+    <link rel="stylesheet" href="{{ request.url_for('static', path='app.css') }}?v={{ asset_version }}" />
   </head>
   <body>
     {% block body %}{% endblock %}
-    <script src="{{ request.url_for('static', path='app.js') }}"></script>
+    <script src="{{ request.url_for('static', path='app.js') }}?v={{ asset_version }}"></script>
   </body>
 </html>

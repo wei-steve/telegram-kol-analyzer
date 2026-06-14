@@ -7,12 +7,27 @@ import os
 import signal
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 
 class TelegramSessionLockError(RuntimeError):
     """Raised when another process already owns the Telegram session."""
+
+
+@dataclass(frozen=True)
+class TelegramSessionLockOwner:
+    """Best-effort details about the process that owns a Telegram session lock."""
+
+    pid: int
+    status: str | None
+    command: str | None
+
+    def format_for_humans(self) -> str:
+        status_text = self.status or "unknown"
+        command_text = self.command or "unknown command"
+        return f"owner pid={self.pid} status={status_text} command={command_text}"
 
 
 class TelegramSessionLock:
@@ -31,9 +46,14 @@ class TelegramSessionLock:
         except BlockingIOError as exc:
             self._file.close()
             self._file = None
+            owner = describe_session_lock_owner(self.session_path)
+            owner_text = (
+                f" {owner.format_for_humans()}." if owner is not None else ""
+            )
             raise TelegramSessionLockError(
                 f"Telegram session {self.session_path} is already in use by another process. "
                 "Close the other web/sync process before starting a new Telegram client."
+                f"{owner_text}"
             ) from exc
 
         self._file.seek(0)
@@ -54,6 +74,54 @@ def acquire_telegram_session_lock(session_path: str | Path) -> TelegramSessionLo
     """Create a lock context for the configured Telethon session file."""
 
     return TelegramSessionLock(session_path)
+
+
+def describe_session_lock_owner(
+    session_path: str | Path,
+    *,
+    process_status: Callable[[int], str | None] | None = None,
+    process_command: Callable[[int], str | None] | None = None,
+) -> TelegramSessionLockOwner | None:
+    """Return best-effort owner details from the session lock file."""
+
+    session = Path(session_path)
+    lock_path = session.with_name(f"{session.name}.lock")
+    pid = _read_lock_pid(lock_path)
+    if pid is None:
+        return None
+    status_reader = process_status or _read_process_status
+    command_reader = process_command or _read_process_command
+    return TelegramSessionLockOwner(
+        pid=pid,
+        status=status_reader(pid),
+        command=command_reader(pid),
+    )
+
+
+def release_session_lock_owner(
+    session_path: str | Path,
+    *,
+    expected_pid: int,
+    current_command: str | None = None,
+    process_status: Callable[[int], str | None] | None = None,
+    process_command: Callable[[int], str | None] | None = None,
+    kill_process: Callable[[int], None] | None = None,
+) -> TelegramSessionLockOwner | None:
+    """Terminate the lock owner when the caller confirms the exact project PID."""
+
+    owner = describe_session_lock_owner(
+        session_path,
+        process_status=process_status,
+        process_command=process_command,
+    )
+    if owner is None or owner.pid != expected_pid or owner.pid == os.getpid():
+        return None
+    active_command = current_command or " ".join([sys.executable, *sys.argv])
+    if not _looks_like_same_project_entrypoint(owner.command or "", active_command):
+        return None
+    terminator = kill_process or _terminate_process
+    terminator(owner.pid)
+    return owner
 
 
 def reap_stopped_session_lock_owner(
@@ -111,7 +179,7 @@ def _read_process_status(pid: int) -> str | None:
             text=True,
             stderr=subprocess.DEVNULL,
         )
-    except subprocess.CalledProcessError:
+    except (OSError, subprocess.CalledProcessError):
         return None
     return output.strip()[:1] or None
 
@@ -123,7 +191,7 @@ def _read_process_command(pid: int) -> str | None:
             text=True,
             stderr=subprocess.DEVNULL,
         )
-    except subprocess.CalledProcessError:
+    except (OSError, subprocess.CalledProcessError):
         return None
     return output.strip() or None
 
@@ -134,8 +202,15 @@ def _terminate_process(pid: int) -> None:
 
 
 def _looks_like_same_project_entrypoint(command: str, current_command: str) -> bool:
-    if "telegram-kol-research" not in command:
+    if not (
+        "telegram-kol-research" in command
+        or "telegram_kol_research.cli" in command
+    ):
         return False
     command_parts = set(Path(part).name for part in command.split())
     current_parts = set(Path(part).name for part in current_command.split())
-    return bool(command_parts & current_parts) or "telegram-kol-research" in current_command
+    return (
+        bool(command_parts & current_parts)
+        or "telegram-kol-research" in current_command
+        or "telegram_kol_research.cli" in current_command
+    )

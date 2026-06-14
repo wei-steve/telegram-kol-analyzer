@@ -54,6 +54,77 @@ def test_database_bootstrap_backfills_missing_sqlite_columns(tmp_path):
     assert "review_note" in columns
 
 
+def test_database_bootstrap_backfills_missing_execution_binding_columns(tmp_path):
+    database_path = tmp_path / "research.db"
+    conn = sqlite3.connect(database_path)
+    conn.execute(
+        """
+        CREATE TABLE execution_bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kol_id VARCHAR(255),
+            chat_id INTEGER,
+            message_id INTEGER,
+            symbol VARCHAR(64),
+            side VARCHAR(16),
+            venue VARCHAR(64),
+            order_id VARCHAR(255),
+            created_at DATETIME
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(execution_bindings)").fetchall()
+    }
+    conn.close()
+
+    assert "pos_id" in columns
+    assert "status" in columns
+    assert "updated_at" in columns
+
+
+def test_database_bootstrap_backfills_missing_recovery_decision_columns(tmp_path):
+    database_path = tmp_path / "research.db"
+    conn = sqlite3.connect(database_path)
+    conn.execute(
+        """
+        CREATE TABLE recovery_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kol_id VARCHAR(255),
+            chat_id INTEGER,
+            message_id INTEGER,
+            symbol VARCHAR(64),
+            side VARCHAR(16),
+            action VARCHAR(64),
+            created_at DATETIME
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(recovery_decisions)").fetchall()
+    }
+    conn.close()
+
+    assert "reason_codes_json" in columns
+    assert "entry_range_text" in columns
+    assert "max_loss_usdt" in columns
+    assert "run_at" in columns
+    assert "updated_at" in columns
+
+
 def test_database_bootstrap_enables_sqlite_busy_timeout(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
 

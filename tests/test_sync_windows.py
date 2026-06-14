@@ -1,12 +1,30 @@
-from datetime import date
+from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 from typer.testing import CliRunner
 
-from telegram_kol_research.cli import app
+from telegram_kol_research.cli import _record_within_window, app
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig
 from telegram_kol_research.models import RawMessage
+from telegram_kol_research.raw_ingest import normalize_message_payload
 from telegram_kol_research.telegram_client import TelegramAuthConfig
+
+
+def test_record_within_window_normalizes_mixed_timezone_inputs():
+    record = normalize_message_payload(
+        {
+            "chat_id": 9001,
+            "message_id": 77,
+            "posted_at": datetime(2026, 6, 12, 16, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        }
+    )
+
+    assert _record_within_window(
+        record,
+        start_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+        end_at=datetime(2026, 6, 12, 9, 0, tzinfo=UTC),
+    )
 
 
 def test_sync_command_skips_messages_older_than_group_start(monkeypatch, tmp_path):

@@ -29,6 +29,7 @@ async def persist_live_message_event(
     media_root: str | Path = "data/media",
     chat_title: str | None = None,
     strategy_alert_config: Any | None = None,
+    strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
     strategy_alert_processor=process_strategy_alert_for_record,
 ) -> dict[str, int]:
     """Normalize and persist one live Telegram event into the existing raw ingest flow."""
@@ -72,7 +73,14 @@ async def persist_live_message_event(
         sync_kind="live",
         broker=broker,
     )
-    if strategy_alert_config is not None and chat_title:
+    if (
+        strategy_alert_config is not None
+        and chat_title
+        and (
+            strategy_alert_enabled_for_title is None
+            or strategy_alert_enabled_for_title(chat_title)
+        )
+    ):
         await strategy_alert_processor(
             session_factory=session_factory,
             record=record,
@@ -90,6 +98,7 @@ async def run_live_listener(
     target_titles: set[str],
     media_root: str | Path = "data/media",
     strategy_alert_config: Any | None = None,
+    strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
 ) -> None:
     """Attach Telethon new-message handlers and keep the client alive."""
 
@@ -112,6 +121,7 @@ async def run_live_listener(
             media_root=media_root,
             chat_title=title,
             strategy_alert_config=strategy_alert_config,
+            strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
         )
 
     add_event_handler = getattr(client, "add_event_handler", None)
@@ -137,6 +147,7 @@ def launch_live_listener_task(
     target_titles: set[str],
     media_root: str | Path,
     strategy_alert_config: Any | None = None,
+    strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
 ) -> asyncio.Task[None]:
     """Schedule the realtime listener in the current event loop."""
 
@@ -148,6 +159,7 @@ def launch_live_listener_task(
             target_titles=target_titles,
             media_root=media_root,
             strategy_alert_config=strategy_alert_config,
+            strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
         )
     )
 
@@ -162,6 +174,7 @@ async def run_reconcile_once(
     message_limit: int = 50,
     checkpoint_overlap: int = 5,
     strategy_alert_config: Any | None = None,
+    strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
     strategy_alert_processor=process_strategy_alert_for_record,
     discover_dialogs_fn=discover_dialogs,
     fetch_dialog_messages_fn=fetch_dialog_messages,
@@ -223,12 +236,19 @@ async def run_reconcile_once(
         inserted_candidates += candidate_stats["inserted_candidates"]
         trade_stats = persist_trade_ideas_from_candidates(session_factory)
         inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
-        if strategy_alert_config is not None:
+        dialog_title = str(dialog.get("title") or "")
+        if (
+            strategy_alert_config is not None
+            and (
+                strategy_alert_enabled_for_title is None
+                or strategy_alert_enabled_for_title(dialog_title)
+            )
+        ):
             for record in records:
                 await strategy_alert_processor(
                     session_factory=session_factory,
                     record=record,
-                    chat_title=str(dialog.get("title") or ""),
+                    chat_title=dialog_title,
                     config=strategy_alert_config,
                 )
 
@@ -251,6 +271,7 @@ async def run_periodic_reconcile(
     message_limit: int = 50,
     operation_lock: Any | None = None,
     strategy_alert_config: Any | None = None,
+    strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
 ) -> None:
     """Periodically replay a small recent history window for missed-message recovery."""
 
@@ -264,6 +285,7 @@ async def run_periodic_reconcile(
                 media_root=media_root,
                 message_limit=message_limit,
                 strategy_alert_config=strategy_alert_config,
+                strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
             )
         else:
             async with operation_lock:
@@ -275,5 +297,6 @@ async def run_periodic_reconcile(
                     media_root=media_root,
                     message_limit=message_limit,
                     strategy_alert_config=strategy_alert_config,
+                    strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
                 )
         await asyncio.sleep(interval_seconds)

@@ -82,6 +82,23 @@ class SignalCandidate(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class MessageRecognition(Base):
+    __tablename__ = "message_recognitions"
+    __table_args__ = (
+        UniqueConstraint("raw_message_id", name="uq_message_recognitions_raw_message_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(ForeignKey("raw_messages.id"), index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    engine: Mapped[str] = mapped_column(String(64), default="local_rule_parser", nullable=False)
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class TradeIdea(Base):
     __tablename__ = "trade_ideas"
 
@@ -147,5 +164,91 @@ class StrategyAlert(Base):
     reason_short: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     forwarded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class ExecutionBinding(Base):
+    __tablename__ = "execution_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "venue",
+            "chat_id",
+            "message_id",
+            "symbol",
+            "side",
+            name="uq_execution_bindings_signal",
+        ),
+        Index("ix_execution_bindings_venue_status", "venue", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kol_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    pos_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class RecoveryDecisionRecord(Base):
+    __tablename__ = "recovery_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "chat_id",
+            "message_id",
+            "symbol",
+            "side",
+            name="uq_recovery_decisions_signal",
+        ),
+        Index("ix_recovery_decisions_action_run_at", "action", "run_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kol_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    reason_codes_json: Mapped[str] = mapped_column(Text, nullable=False)
+    entry_range_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    stop_loss_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    max_loss_usdt: Mapped[float] = mapped_column(Float, default=100.0, nullable=False)
+    review_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    review_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    run_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class RecoveryOrderConfirmation(Base):
+    __tablename__ = "recovery_order_confirmations"
+    __table_args__ = (
+        UniqueConstraint(
+            "chat_id",
+            "message_id",
+            "symbol",
+            "side",
+            name="uq_recovery_order_confirmations_signal",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kol_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ready_confirmed", index=True)
+    confirmation_payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)

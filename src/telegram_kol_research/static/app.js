@@ -260,11 +260,18 @@ function getLatestMessageId(panel = getMessagePanel()) {
   return Number(panel.dataset.latestMessageId || '0');
 }
 
-function scrollMessagePanelToBottom(panel = getMessagePanel()) {
+function scrollMessagePanelToTop(panel = getMessagePanel()) {
   if (!panel) {
     return;
   }
-  panel.scrollTo({ top: panel.scrollHeight, behavior: 'auto' });
+  panel.scrollTo({ top: 0, behavior: 'auto' });
+}
+
+function resetInitialMessagePanelScroll() {
+  scrollMessagePanelToTop();
+  window.requestAnimationFrame(() => {
+    scrollMessagePanelToTop();
+  });
 }
 
 function buildMessagesUrl(chatId, options = {}) {
@@ -328,7 +335,7 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
       if (currentPanel && nextPanel) {
         currentPanel.replaceWith(nextPanel);
         bindMessagePanelControls(nextPanel);
-        scrollMessagePanelToBottom(nextPanel);
+        scrollMessagePanelToTop(nextPanel);
       }
     });
   }
@@ -350,7 +357,7 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
       if (currentPanel && nextPanel) {
         currentPanel.replaceWith(nextPanel);
         bindMessagePanelControls(nextPanel);
-        scrollMessagePanelToBottom(nextPanel);
+        scrollMessagePanelToTop(nextPanel);
       }
     });
   }
@@ -367,11 +374,7 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
       const nextList = nextPanel ? nextPanel.querySelector('[data-message-list]') : null;
       const currentList = panel.querySelector('[data-message-list]');
       if (currentList && nextList) {
-        const previousScrollHeight = panel.scrollHeight;
-        const previousScrollTop = panel.scrollTop;
-        currentList.insertAdjacentHTML('afterbegin', nextList.innerHTML);
-        const newScrollHeight = panel.scrollHeight;
-        panel.scrollTop = previousScrollTop + (newScrollHeight - previousScrollHeight);
+        currentList.insertAdjacentHTML('beforeend', nextList.innerHTML);
       }
       const nextLoadMore = nextPanel ? nextPanel.querySelector('[data-load-more]') : null;
       const currentFooter = panel.querySelector('.message-list-footer');
@@ -408,6 +411,59 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
       }
     });
   }
+
+  panel.querySelectorAll('[data-recognize-message]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const rawMessageId = Number(button.dataset.rawMessageId || '0');
+      const status = button
+        .closest('.message-actions')
+        ?.querySelector('[data-message-recognition-status]');
+      button.disabled = true;
+      if (status) {
+        status.textContent = '正在识别...';
+        status.classList.remove('is-error');
+      }
+      try {
+        const response = await fetch(`/api/messages/${rawMessageId}/recognize`, {
+          method: 'POST',
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          if (status) {
+            status.textContent = payload.detail || '识别失败';
+            status.classList.add('is-error');
+          }
+          return;
+        }
+        if (status) {
+          status.textContent = `识别完成：${payload.status}`;
+        }
+        await refreshSelectedGroupPanel();
+      } catch {
+        if (status) {
+          status.textContent = '识别失败，请检查服务状态。';
+          status.classList.add('is-error');
+        }
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+}
+
+async function refreshSelectedGroupPanel() {
+  const currentPanel = getMessagePanel();
+  if (!currentPanel) {
+    return;
+  }
+  const { chatId, searchText, senderName } = getMessageFilterState(currentPanel);
+  const nextPanel = await fetchMessagePanel(chatId, { searchText, senderName });
+  if (!nextPanel) {
+    return;
+  }
+  currentPanel.replaceWith(nextPanel);
+  bindMessagePanelControls(nextPanel);
+  scrollMessagePanelToTop(nextPanel);
 }
 
 function bindGroupLinks() {
@@ -419,10 +475,13 @@ function bindGroupLinks() {
       if (nextPanel && currentPanel) {
         currentPanel.replaceWith(nextPanel);
         bindMessagePanelControls(nextPanel);
-        scrollMessagePanelToBottom(nextPanel);
+        scrollMessagePanelToTop(nextPanel);
       }
-      document.querySelectorAll('[data-group-link]').forEach((button) => button.classList.remove('is-active'));
-      element.classList.add('is-active');
+      document.querySelectorAll('.kol-strategy-row').forEach((row) => row.classList.remove('is-active'));
+      const row = element.closest('.kol-strategy-row');
+      if (row) {
+        row.classList.add('is-active');
+      }
       const chatIdInput = document.querySelector('[name="chat_id"]');
       if (chatIdInput) {
         chatIdInput.value = String(chatId);
@@ -430,6 +489,43 @@ function bindGroupLinks() {
       setAiStatus('Group switched. Ask a new question or continue the conversation.');
       applyGroupPromptToEditor(String(chatId));
       renderConversationHistory();
+    });
+  });
+}
+
+function bindGroupAutomationToggles() {
+  document.querySelectorAll('[data-toggle-group-automation]').forEach((button) => {
+    button.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      const setting = button.dataset.setting || '';
+      const chatId = Number(button.dataset.chatId || '0');
+      const chatTitle = button.dataset.chatTitle || String(chatId);
+      const nextEnabled = button.dataset.enabled !== 'true';
+      const payload = { chat_title: chatTitle };
+      payload[setting] = nextEnabled;
+      button.disabled = true;
+      button.classList.add('is-updating');
+      try {
+        const response = await fetch(`/api/groups/${chatId}/automation`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          setRecoveryStatus(result.detail || '群组开关保存失败', true);
+          return;
+        }
+        const resolvedEnabled = Boolean(result[setting]);
+        button.dataset.enabled = resolvedEnabled ? 'true' : 'false';
+        button.classList.toggle('is-enabled', resolvedEnabled);
+        setRecoveryStatus('群组开关已保存');
+      } catch {
+        setRecoveryStatus('群组开关保存失败，请检查服务状态。', true);
+      } finally {
+        button.disabled = false;
+        button.classList.remove('is-updating');
+      }
     });
   });
 }
@@ -448,6 +544,69 @@ function bindGroupPromptEditor() {
   promptInput.addEventListener('change', persist);
 }
 
+function bindDashboardTabs() {
+  const buttons = document.querySelectorAll('[data-dashboard-tab]');
+  const panels = document.querySelectorAll('[data-dashboard-panel]');
+  buttons.forEach((button) => {
+    button.addEventListener('click', () => {
+      const tab = button.dataset.dashboardTab || 'main';
+      buttons.forEach((item) => item.classList.toggle('is-active', item === button));
+      panels.forEach((panel) => {
+        panel.classList.toggle('is-active', panel.dataset.dashboardPanel === tab);
+      });
+    });
+  });
+}
+
+function bindAiRecognitionPromptForm() {
+  const form = document.querySelector('[data-ai-recognition-prompt-form]');
+  if (!form) {
+    return;
+  }
+  const input = form.querySelector('[data-ai-recognition-prompt-input]');
+  const status = form.querySelector('[data-ai-recognition-save-status]');
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const submitButton = form.querySelector('button[type="submit"]');
+    if (submitButton) {
+      submitButton.disabled = true;
+    }
+    if (status) {
+      status.textContent = '正在保存...';
+      status.classList.remove('is-error');
+    }
+    try {
+      const response = await fetch('/api/ai-recognition-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recognition_prompt: input ? input.value : '',
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        if (status) {
+          status.textContent = payload.detail || '保存失败';
+          status.classList.add('is-error');
+        }
+        return;
+      }
+      if (status) {
+        status.textContent = '提示词已保存';
+      }
+    } catch {
+      if (status) {
+        status.textContent = '保存失败，请检查服务状态。';
+        status.classList.add('is-error');
+      }
+    } finally {
+      if (submitButton) {
+        submitButton.disabled = false;
+      }
+    }
+  });
+}
+
 function bindClearAiHistory() {
   const clearButton = document.querySelector('[data-clear-ai-history]');
   if (!clearButton) {
@@ -457,6 +616,205 @@ function bindClearAiHistory() {
     clearConversationHistory();
     renderConversationHistory();
     setAiStatus('Current group conversation cleared.');
+  });
+}
+
+function setRecoveryStatus(message, isError = false) {
+  const status = document.querySelector('[data-recovery-status]');
+  if (!status) {
+    return;
+  }
+  status.textContent = message;
+  status.classList.toggle('is-error', Boolean(isError));
+}
+
+function formatRecoveryActionCounts(actionCounts) {
+  return Object.entries(actionCounts || {})
+    .map(([action, count]) => `${action}: ${count}`)
+    .join(', ');
+}
+
+function bindRecoveryScanButton() {
+  const button = document.querySelector('[data-run-recovery-scan]');
+  if (!button) {
+    return;
+  }
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    setRecoveryStatus('正在运行恢复扫描...');
+    try {
+      const response = await fetch('/api/recovery-dry-run', { method: 'POST' });
+      const payload = await response.json();
+      if (!response.ok) {
+        const detail = payload && typeof payload.detail === 'string'
+          ? payload.detail
+          : '恢复扫描失败，请检查服务日志。';
+        setRecoveryStatus(detail, true);
+        return;
+      }
+      const actionCounts = formatRecoveryActionCounts(payload.action_counts);
+      const suffix = actionCounts ? `；${actionCounts}` : '';
+      setRecoveryStatus(
+        `扫描完成：候选 ${payload.total_candidates}，写入 ${payload.persisted_decisions}${suffix}`
+      );
+      window.setTimeout(() => window.location.reload(), 700);
+    } catch {
+      setRecoveryStatus('恢复扫描失败，请检查网络或服务状态。', true);
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+
+function bindRecoveryReviewButtons() {
+  document.querySelectorAll('[data-review-recovery]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const reviewStatus = button.dataset.reviewStatus || '';
+      const label = reviewStatus === 'approved_for_order' ? '同意补挂单' : '忽略';
+      button.disabled = true;
+      setRecoveryStatus(`正在记录“${label}”...`);
+      try {
+        const response = await fetch('/api/recovery-decisions/review', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: Number(button.dataset.chatId || 0),
+            message_id: Number(button.dataset.messageId || 0),
+            symbol: button.dataset.symbol || '',
+            side: button.dataset.side || '',
+            review_status: reviewStatus,
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          const detail = payload && typeof payload.detail === 'string'
+            ? payload.detail
+            : '审核记录失败，请检查服务日志。';
+          setRecoveryStatus(detail, true);
+          return;
+        }
+        setRecoveryStatus(`已记录：${label}`);
+        window.setTimeout(() => window.location.reload(), 500);
+      } catch {
+        setRecoveryStatus('审核记录失败，请检查网络或服务状态。', true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+}
+
+function setRecoveryOrderConfirmStatus(button, message, isError = false) {
+  const row = button.closest('.recovery-decision-row');
+  const status = row ? row.querySelector('[data-recovery-order-confirm-status]') : null;
+  if (!status) {
+    return;
+  }
+  status.textContent = message || '';
+  status.classList.toggle('is-error', Boolean(isError));
+  status.classList.toggle('is-ready', Boolean(message) && !isError);
+}
+
+function formatRecoveryOrderConfirmation(payload) {
+  if (payload.ready_for_live_order) {
+    return '可进入真实下单前确认';
+  }
+  const reasonCodes = Array.isArray(payload.reason_codes) ? payload.reason_codes.join(', ') : '';
+  return reasonCodes ? `仍有阻断：${reasonCodes}` : '仍有阻断，请检查订单草稿。';
+}
+
+function bindRecoveryOrderConfirmationButtons() {
+  document.querySelectorAll('[data-confirm-recovery-order]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      setRecoveryOrderConfirmStatus(button, '正在最终确认...');
+      try {
+        const response = await fetch('/api/recovery-order-confirm-dry-run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: Number(button.dataset.chatId || 0),
+            message_id: Number(button.dataset.messageId || 0),
+            symbol: button.dataset.symbol || '',
+            side: button.dataset.side || '',
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          const detail = payload && typeof payload.detail === 'string'
+            ? payload.detail
+            : '最终确认失败，请检查服务日志。';
+          setRecoveryOrderConfirmStatus(button, detail, true);
+          return;
+        }
+        setRecoveryOrderConfirmStatus(
+          button,
+          formatRecoveryOrderConfirmation(payload),
+          !payload.ready_for_live_order
+        );
+      } catch {
+        setRecoveryOrderConfirmStatus(button, '最终确认失败，请检查网络或服务状态。', true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+}
+
+function setRecoverySubmitGateStatus(button, message, isError = false) {
+  const row = button.closest('.recovery-decision-row');
+  const status = row ? row.querySelector('[data-recovery-submit-gate-status]') : null;
+  if (!status) {
+    return;
+  }
+  status.textContent = message || '';
+  status.classList.toggle('is-error', Boolean(isError));
+  status.classList.toggle('is-ready', Boolean(message) && !isError);
+}
+
+function formatRecoverySubmitGate(payload) {
+  if (payload.would_submit) {
+    return '模拟通过，可进入真实提交实现';
+  }
+  const reasonCodes = Array.isArray(payload.reason_codes) ? payload.reason_codes.join(', ') : '';
+  return reasonCodes ? `模拟阻断：${reasonCodes}` : '模拟阻断，请检查闸门结果。';
+}
+
+function bindRecoverySubmitGateButtons() {
+  document.querySelectorAll('[data-simulate-recovery-submit]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      setRecoverySubmitGateStatus(button, '正在模拟提交闸门...');
+      try {
+        const response = await fetch('/api/recovery-live-submit-gate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: Number(button.dataset.chatId || 0),
+            message_id: Number(button.dataset.messageId || 0),
+            symbol: button.dataset.symbol || '',
+            side: button.dataset.side || '',
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          const detail = payload && typeof payload.detail === 'string'
+            ? payload.detail
+            : '模拟提交失败，请检查服务日志。';
+          setRecoverySubmitGateStatus(button, detail, true);
+          return;
+        }
+        setRecoverySubmitGateStatus(
+          button,
+          formatRecoverySubmitGate(payload),
+          !payload.would_submit
+        );
+      } catch {
+        setRecoverySubmitGateStatus(button, '模拟提交失败，请检查网络或服务状态。', true);
+      } finally {
+        button.disabled = false;
+      }
+    });
   });
 }
 
@@ -543,7 +901,7 @@ async function refreshCurrentGroupPanel() {
   }
   currentPanel.replaceWith(nextPanel);
   bindMessagePanelControls(nextPanel);
-  scrollMessagePanelToBottom(nextPanel);
+  scrollMessagePanelToTop(nextPanel);
   setAiStatus('New group messages loaded automatically.');
 }
 
@@ -589,12 +947,19 @@ window.addEventListener('DOMContentLoaded', () => {
     form.addEventListener('submit', submitAiQuestion);
   }
   bindGroupLinks();
+  bindGroupAutomationToggles();
   bindMessagePanelControls();
+  bindDashboardTabs();
+  bindAiRecognitionPromptForm();
   bindGroupPromptEditor();
   bindClearAiHistory();
+  bindRecoveryScanButton();
+  bindRecoveryReviewButtons();
+  bindRecoveryOrderConfirmationButtons();
+  bindRecoverySubmitGateButtons();
   renderConversationHistory();
   setAiStatus('Ready to analyze the current group.');
-  scrollMessagePanelToBottom();
+  resetInitialMessagePanelScroll();
   connectLiveUpdates();
   startPollingUpdates();
 });
