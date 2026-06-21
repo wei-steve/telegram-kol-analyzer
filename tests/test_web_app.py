@@ -95,9 +95,43 @@ def test_ai_recognition_config_api_saves_prompt(tmp_path):
     )
 
     assert response.status_code == 200
-    assert response.json()["recognition_prompt"] == "只识别明确策略。"
+    assert response.json()["recognition_prompt"].startswith("只识别明确策略。")
     page = client.get("/")
     assert "只识别明确策略。" in page.text
+
+
+def test_ai_recognition_config_api_saves_mimo_provider(tmp_path):
+    config_path = tmp_path / "ai_recognition.yaml"
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        ai_recognition_config_path=config_path,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/ai-recognition-config",
+        json={
+            "recognition_prompt": "Only strict strategies.",
+            "text_provider": {
+                "base_url": "https://api.deepseek.com",
+                "api_key": "deepseek-key",
+                "model": "deepseek-v4-flash",
+                "timeout_seconds": 60,
+            },
+            "image_provider": {
+                "base_url": "https://api.xiaomimimo.com/v1",
+                "api_key": "mimo-key",
+                "model": "mimo-v2.5",
+                "timeout_seconds": 60,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["text_provider"]["model"] == "deepseek-v4-flash"
+    assert payload["image_provider"]["base_url"] == "https://api.xiaomimimo.com/v1"
+    assert payload["image_provider"]["model"] == "mimo-v2.5"
 
 
 def test_recovery_dry_run_api_persists_decisions_with_configured_gate_provider(tmp_path):

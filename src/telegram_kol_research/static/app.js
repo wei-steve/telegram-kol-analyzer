@@ -878,6 +878,7 @@ function bindAiRecognitionConfigForm() {
   if (!form) {
     return;
   }
+  bindAiProviderPresetButtons(form);
   const status = form.querySelector('[data-ai-config-save-status]');
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -916,6 +917,36 @@ function bindAiRecognitionConfigForm() {
         submitButton.disabled = false;
       }
     }
+  });
+}
+
+function bindAiProviderPresetButtons(form) {
+  const selectorForTarget = {
+    text: {
+      baseUrl: '[data-ai-text-base-url]',
+      model: '[data-ai-text-model]',
+    },
+    image: {
+      baseUrl: '[data-ai-image-base-url]',
+      model: '[data-ai-image-model]',
+    },
+  };
+  form.querySelectorAll('[data-ai-provider-preset]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const target = button.dataset.aiProviderTarget;
+      const selectors = selectorForTarget[target];
+      if (!selectors) {
+        return;
+      }
+      const baseUrlInput = form.querySelector(selectors.baseUrl);
+      const modelInput = form.querySelector(selectors.model);
+      if (baseUrlInput) {
+        baseUrlInput.value = button.dataset.aiProviderBaseUrl || '';
+      }
+      if (modelInput) {
+        modelInput.value = button.dataset.aiProviderModel || '';
+      }
+    });
   });
 }
 

@@ -2,7 +2,7 @@ mode: ai_provider
 text_provider:
   base_url: "https://api.deepseek.com"
   api_key: "your_deepseek_api_key"
-  model: "deepseek-chat"
+  model: "deepseek-v4-flash"
   timeout_seconds: 60
 image_provider:
   base_url: "https://open.bigmodel.cn/api/paas/v4"

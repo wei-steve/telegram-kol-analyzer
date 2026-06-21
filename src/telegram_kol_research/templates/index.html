@@ -94,15 +94,23 @@
         </div>
 
         <h3>Text recognition AI, e.g. DeepSeek</h3>
+        <div class="ai-provider-presets" aria-label="Text AI provider presets">
+          <button type="button" class="secondary-button" data-ai-provider-preset data-ai-provider-target="text" data-ai-provider-base-url="https://api.deepseek.com" data-ai-provider-model="deepseek-v4-flash">DeepSeek V4 Flash</button>
+          <button type="button" class="secondary-button" data-ai-provider-preset data-ai-provider-target="text" data-ai-provider-base-url="https://api.xiaomimimo.com/v1" data-ai-provider-model="mimo-v2.5">MiMo V2.5</button>
+        </div>
         <label>Base URL<input name="text_base_url" data-ai-text-base-url value="{{ ai_recognition_config.text_provider.base_url }}" placeholder="https://api.deepseek.com" /></label>
         <label>API Key<input name="text_api_key" data-ai-text-api-key value="{{ ai_recognition_config.text_provider.api_key }}" placeholder="sk-..." /></label>
-        <label>Model<input name="text_model" data-ai-text-model value="{{ ai_recognition_config.text_provider.model }}" placeholder="deepseek-chat" /></label>
+        <label>Model<input name="text_model" data-ai-text-model value="{{ ai_recognition_config.text_provider.model }}" placeholder="deepseek-v4-flash" /></label>
         <label>Timeout seconds<input name="text_timeout_seconds" data-ai-text-timeout type="number" min="1" value="{{ ai_recognition_config.text_provider.timeout_seconds }}" /></label>
 
         <h3>Image recognition AI, must support image input</h3>
-        <label>Base URL<input name="image_base_url" data-ai-image-base-url value="{{ ai_recognition_config.image_provider.base_url }}" placeholder="https://api.openai.com" /></label>
+        <div class="ai-provider-presets" aria-label="Image AI provider presets">
+          <button type="button" class="secondary-button" data-ai-provider-preset data-ai-provider-target="image" data-ai-provider-base-url="https://open.bigmodel.cn/api/paas/v4" data-ai-provider-model="glm-ocr">GLM-OCR</button>
+          <button type="button" class="secondary-button" data-ai-provider-preset data-ai-provider-target="image" data-ai-provider-base-url="https://api.xiaomimimo.com/v1" data-ai-provider-model="mimo-v2.5">MiMo V2.5</button>
+        </div>
+        <label>Base URL<input name="image_base_url" data-ai-image-base-url value="{{ ai_recognition_config.image_provider.base_url }}" placeholder="https://api.xiaomimimo.com/v1" /></label>
         <label>API Key<input name="image_api_key" data-ai-image-api-key value="{{ ai_recognition_config.image_provider.api_key }}" placeholder="sk-..." /></label>
-        <label>Model<input name="image_model" data-ai-image-model value="{{ ai_recognition_config.image_provider.model }}" placeholder="gpt-4.1-mini" /></label>
+        <label>Model<input name="image_model" data-ai-image-model value="{{ ai_recognition_config.image_provider.model }}" placeholder="mimo-v2.5" /></label>
         <label>Timeout seconds<input name="image_timeout_seconds" data-ai-image-timeout type="number" min="1" value="{{ ai_recognition_config.image_provider.timeout_seconds }}" /></label>
         <div class="prompt-actions">
           <button type="submit">Save AI config</button>

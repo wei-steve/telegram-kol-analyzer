@@ -1031,6 +1031,14 @@ body {
   gap: 8px;
 }
 
+.ai-provider-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 2px 0 8px;
+}
+
 .message-list {
   overflow-y: auto;
   min-height: 0;
