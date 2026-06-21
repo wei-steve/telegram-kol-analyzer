@@ -26,6 +26,7 @@ from telegram_kol_research.llm_adjudication import (
     export_llm_submission_sample,
 )
 from telegram_kol_research.llm_import import import_llm_adjudication_results
+from telegram_kol_research.media_retention import cleanup_media_files
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import SyncCheckpoint
 from telegram_kol_research.reporting import load_leaderboard_rows, write_report
@@ -759,6 +760,41 @@ def alerts(
     except TelegramSessionLockError as exc:
         typer.echo(str(exc), err=False)
         raise typer.Exit(code=1) from exc
+
+
+@app.command("media-cleanup")
+def media_cleanup(
+    database_path: Path = Path("data/research.db"),
+    media_root: Path = Path("data/media"),
+    retain_days: int = 14,
+    max_media_dir_gb: float | None = 5.0,
+    min_free_disk_gb: float | None = 10.0,
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview deletions by default; pass --apply to delete files.",
+    ),
+) -> None:
+    """Clean old local media cache files without deleting message history."""
+
+    session_factory = create_session_factory(database_path)
+    result = cleanup_media_files(
+        session_factory,
+        media_root=media_root,
+        retain_days=retain_days,
+        max_media_dir_gb=max_media_dir_gb,
+        min_free_disk_gb=min_free_disk_gb,
+        dry_run=dry_run,
+    )
+    mode_label = "dry-run" if dry_run else "applied"
+    typer.echo(f"Media cleanup {mode_label}")
+    typer.echo(f"Scanned assets: {result.scanned_assets}")
+    typer.echo(f"Eligible assets: {result.eligible_assets}")
+    typer.echo(f"Protected assets: {result.protected_assets}")
+    typer.echo(f"Missing files: {result.missing_files}")
+    typer.echo(f"Deleted files: {result.deleted_files}")
+    typer.echo(f"Cleared local paths: {result.cleared_local_paths}")
+    typer.echo(f"Freed bytes: {result.freed_bytes}")
 
 
 def main() -> None:

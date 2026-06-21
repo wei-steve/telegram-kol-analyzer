@@ -78,3 +78,37 @@ data/telegram.session
 
 The `.gitignore` is expected to keep database files, Telegram sessions, media,
 logs, and local config out of Git.
+
+## Media Retention
+
+Downloaded Telegram images are treated as a local cache. Message history, OCR
+text, and AI recognition results stay in SQLite, but old non-critical image
+files can be deleted to protect server disk space.
+
+Preview cleanup:
+
+```bash
+cd /opt/telegram-kol-analyzer
+. .venv/bin/activate
+telegram-kol-research media-cleanup --dry-run
+```
+
+Apply cleanup:
+
+```bash
+cd /opt/telegram-kol-analyzer
+. .venv/bin/activate
+telegram-kol-research media-cleanup --apply
+```
+
+Default policy:
+
+```text
+retain_days: 14
+max_media_dir_gb: 5
+min_free_disk_gb: 10
+```
+
+The cleanup protects media linked to signal candidates or strategy lifecycle
+records. When a file is removed, `media_assets.local_path` is cleared so the web
+UI shows the media label and any OCR text instead of a broken image.

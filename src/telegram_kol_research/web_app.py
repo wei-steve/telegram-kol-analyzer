@@ -1019,6 +1019,8 @@ def create_web_app(
             candidate.relative_to(app.state.media_root)
         except ValueError as exc:
             raise RuntimeError("Invalid media path") from exc
+        if not candidate.is_file():
+            raise HTTPException(status_code=404, detail="media file not found")
         return FileResponse(candidate)
 
     @app.get("/api/freshness")

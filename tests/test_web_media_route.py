@@ -17,3 +17,14 @@ def test_media_route_serves_downloaded_file(tmp_path):
 
     assert response.status_code == 200
     assert response.content == b"fake-image"
+
+
+def test_media_route_returns_404_for_cleaned_file(tmp_path):
+    app = create_web_app(
+        database_path=tmp_path / "research.db", media_root=tmp_path / "media"
+    )
+    client = TestClient(app)
+
+    response = client.get("/local-media/cleaned.jpg")
+
+    assert response.status_code == 404
