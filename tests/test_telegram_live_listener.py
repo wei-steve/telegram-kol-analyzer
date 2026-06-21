@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 
+from telegram_kol_research.ai_recognition_config import AiRecognitionConfig, save_ai_recognition_config
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.models import RawMessage
@@ -83,3 +84,57 @@ def test_persist_live_message_event_triggers_strategy_alert_processor(tmp_path):
     assert processed[0]["chat_title"] == "VIP BTC Room"
     assert processed[0]["record"].chat_id == 123
     assert processed[0]["record"].message_id == 42
+
+
+def test_persist_live_message_event_loads_ai_config_path_per_message(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    broker = LiveUpdateBroker()
+    config_path = tmp_path / "ai_recognition.yaml"
+    save_ai_recognition_config(
+        config_path,
+        AiRecognitionConfig(
+            recognition_prompt="First prompt.",
+            mimo_direct_prompt="First MiMo prompt.",
+        ),
+    )
+    seen_prompts: list[str] = []
+
+    def fake_recognize_message_now(session_factory, *, raw_message_id, ai_recognition_config):
+        seen_prompts.append(ai_recognition_config.recognition_prompt)
+        return None
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.recognize_message_now",
+        fake_recognize_message_now,
+    )
+
+    asyncio.run(
+        persist_live_message_event(
+            event=_FakeEvent(),
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            ai_recognition_config_path=config_path,
+        )
+    )
+    save_ai_recognition_config(
+        config_path,
+        AiRecognitionConfig(
+            recognition_prompt="Second prompt.",
+            mimo_direct_prompt="Second MiMo prompt.",
+        ),
+    )
+    second_event = _FakeEvent()
+    second_event.message.id = 43
+    asyncio.run(
+        persist_live_message_event(
+            event=second_event,
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            ai_recognition_config_path=config_path,
+        )
+    )
+
+    assert seen_prompts[0].startswith("First prompt.")
+    assert seen_prompts[1].startswith("Second prompt.")

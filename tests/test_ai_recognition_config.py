@@ -1,4 +1,6 @@
 from telegram_kol_research.ai_recognition_config import (
+    DEFAULT_LIFECYCLE_EVENT_PROMPT,
+    DEFAULT_MIMO_DIRECT_PROMPT,
     DEFAULT_RECOGNITION_PROMPT,
     AiModelConfig,
     AiProviderConfig,
@@ -13,6 +15,8 @@ def test_load_ai_recognition_config_uses_defaults_when_file_is_missing(tmp_path)
 
     assert config.mode == "local_rule_parser"
     assert config.recognition_prompt == DEFAULT_RECOGNITION_PROMPT
+    assert config.lifecycle_event_prompt == DEFAULT_LIFECYCLE_EVENT_PROMPT
+    assert config.mimo_direct_prompt == DEFAULT_MIMO_DIRECT_PROMPT
 
 
 def test_save_and_load_ai_recognition_config_round_trips_prompt(tmp_path):
@@ -22,6 +26,7 @@ def test_save_and_load_ai_recognition_config_round_trips_prompt(tmp_path):
         AiRecognitionConfig(
             recognition_prompt="只识别明确包含进场、止损、止盈的消息。",
             lifecycle_event_prompt="Decide lifecycle events from context.",
+            mimo_direct_prompt="Read images directly.",
             mode="local_rule_parser",
         ),
     )
@@ -30,6 +35,7 @@ def test_save_and_load_ai_recognition_config_round_trips_prompt(tmp_path):
 
     assert config.recognition_prompt.startswith("只识别明确包含进场、止损、止盈的消息。")
     assert config.lifecycle_event_prompt == "Decide lifecycle events from context."
+    assert config.mimo_direct_prompt == "Read images directly."
     assert config.mode == "local_rule_parser"
 
 

@@ -336,9 +336,7 @@ def create_web_app(
                 media_root=app.state.media_root,
                 strategy_alert_config=app.state.strategy_alert_config,
                 strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
-                ai_recognition_config=load_ai_recognition_config(
-                    app.state.ai_recognition_config_path
-                ),
+                ai_recognition_config_path=app.state.ai_recognition_config_path,
                 lifecycle_monitor=app.state.lifecycle_monitor,
             )
             app.state.reconcile_task = asyncio.create_task(
@@ -476,9 +474,7 @@ def create_web_app(
                 media_root=app.state.media_root,
                 strategy_alert_config=app.state.strategy_alert_config,
                 strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
-                ai_recognition_config=load_ai_recognition_config(
-                    app.state.ai_recognition_config_path
-                ),
+                ai_recognition_config_path=app.state.ai_recognition_config_path,
                 lifecycle_monitor=app.state.lifecycle_monitor,
             )
         reconcile_task = app.state.reconcile_task
@@ -934,13 +930,24 @@ def create_web_app(
 
     @app.post("/api/ai-recognition-config")
     def update_ai_recognition_config(payload: dict[str, Any]):
-        recognition_prompt = str(payload.get("recognition_prompt") or "").strip()
+        existing_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
+        recognition_prompt = str(
+            payload.get("recognition_prompt") or existing_config.recognition_prompt
+        ).strip()
         if not recognition_prompt:
             raise HTTPException(status_code=422, detail="recognition_prompt is required")
         config = save_ai_recognition_config(
             app.state.ai_recognition_config_path,
             AiRecognitionConfig(
                 recognition_prompt=recognition_prompt,
+                lifecycle_event_prompt=str(
+                    payload.get("lifecycle_event_prompt")
+                    or existing_config.lifecycle_event_prompt
+                ),
+                mimo_direct_prompt=str(
+                    payload.get("mimo_direct_prompt")
+                    or existing_config.mimo_direct_prompt
+                ),
                 mode=str(payload.get("mode") or "ai_provider"),
                 text_provider=_provider_config_from_payload(payload.get("text_provider")),
                 image_provider=_provider_config_from_payload(payload.get("image_provider")),
@@ -952,6 +959,8 @@ def create_web_app(
         return {
             "mode": config.mode,
             "recognition_prompt": config.recognition_prompt,
+            "lifecycle_event_prompt": config.lifecycle_event_prompt,
+            "mimo_direct_prompt": config.mimo_direct_prompt,
             "active_text_model_id": config.active_text_model_id,
             "active_image_model_id": config.active_image_model_id,
             "ai_models": [_model_config_response(model) for model in config.ai_models],

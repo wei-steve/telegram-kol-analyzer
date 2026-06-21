@@ -7,7 +7,7 @@ import inspect
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
+from telegram_kol_research.ai_recognition_config import AiRecognitionConfig, load_ai_recognition_config
 from telegram_kol_research.candidates import persist_text_signal_candidates
 from telegram_kol_research.message_recognition import (
     filter_records_by_inserted_message_keys,
@@ -40,15 +40,16 @@ async def persist_live_message_event(
     strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
     strategy_alert_processor=process_strategy_alert_for_record,
     ai_recognition_config: AiRecognitionConfig | None = None,
+    ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
 ) -> dict[str, int]:
     """Normalize and persist one live Telegram event into the existing raw ingest flow.
 
-    When *ai_recognition_config* is provided the freshly persisted message is
-    immediately submitted for AI strategy recognition (text → text AI,
-    image → GLM-OCR → text AI, video → skipped).  When *lifecycle_monitor* is
-    provided and the AI recognises an exit signal it will be matched against
-    the active position.
+    When AI recognition config or a config path is provided, the freshly
+    persisted message is immediately submitted for AI strategy recognition
+    (text -> text AI, image -> GLM-OCR -> text AI, video -> skipped). When
+    a path is provided it is loaded per message so prompt edits take effect
+    without restarting the listener.
     """
 
     message = getattr(event, "message", None)
@@ -94,7 +95,10 @@ async def persist_live_message_event(
     # ── Immediately run AI recognition on every newly persisted message ──
     inserted_keys = stats.get("inserted_message_keys") or []
     recog_result = None
-    if inserted_keys and ai_recognition_config is not None:
+    live_ai_config = ai_recognition_config
+    if ai_recognition_config_path is not None:
+        live_ai_config = load_ai_recognition_config(ai_recognition_config_path)
+    if inserted_keys and live_ai_config is not None:
         chat_id, message_id = inserted_keys[0]
         with session_factory() as session:
             raw_message = (
@@ -110,7 +114,7 @@ async def persist_live_message_event(
                 recognize_message_now,
                 session_factory,
                 raw_message_id=raw_message.id,
-                ai_recognition_config=ai_recognition_config,
+                ai_recognition_config=live_ai_config,
             )
             # ── exit signal → lifecycle monitor ──
             if lifecycle_monitor is not None and recog_result is not None:
@@ -156,6 +160,7 @@ async def run_live_listener(
     strategy_alert_config: Any | None = None,
     strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
     ai_recognition_config: AiRecognitionConfig | None = None,
+    ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
 ) -> None:
     """Attach Telethon new-message handlers and keep the client alive."""
@@ -181,6 +186,7 @@ async def run_live_listener(
             strategy_alert_config=strategy_alert_config,
             strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
             ai_recognition_config=ai_recognition_config,
+            ai_recognition_config_path=ai_recognition_config_path,
             lifecycle_monitor=lifecycle_monitor,
         )
 
@@ -209,6 +215,7 @@ def launch_live_listener_task(
     strategy_alert_config: Any | None = None,
     strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
     ai_recognition_config: AiRecognitionConfig | None = None,
+    ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
 ) -> asyncio.Task[None]:
     """Schedule the realtime listener in the current event loop."""
@@ -224,6 +231,7 @@ def launch_live_listener_task(
             "strategy_alert_config": strategy_alert_config,
             "strategy_alert_enabled_for_title": strategy_alert_enabled_for_title,
             "ai_recognition_config": ai_recognition_config,
+            "ai_recognition_config_path": ai_recognition_config_path,
             "lifecycle_monitor": lifecycle_monitor,
         },
     )

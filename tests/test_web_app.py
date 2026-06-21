@@ -91,13 +91,21 @@ def test_ai_recognition_config_api_saves_prompt(tmp_path):
 
     response = client.post(
         "/api/ai-recognition-config",
-        json={"recognition_prompt": "只识别明确策略。"},
+        json={
+            "recognition_prompt": "只识别明确策略。",
+            "lifecycle_event_prompt": "识别生命周期事件。",
+            "mimo_direct_prompt": "直接阅读图片和文字。",
+        },
     )
 
     assert response.status_code == 200
     assert response.json()["recognition_prompt"].startswith("只识别明确策略。")
+    assert response.json()["lifecycle_event_prompt"] == "识别生命周期事件。"
+    assert response.json()["mimo_direct_prompt"] == "直接阅读图片和文字。"
     page = client.get("/")
     assert "只识别明确策略。" in page.text
+    assert "识别生命周期事件。" in page.text
+    assert "直接阅读图片和文字。" in page.text
 
 
 def test_ai_recognition_config_api_saves_mimo_provider(tmp_path):

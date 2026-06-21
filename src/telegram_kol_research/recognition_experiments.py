@@ -115,6 +115,7 @@ def run_mimo_direct_experiment(
                     raw_message=raw_message,
                     media_assets=media_assets,
                     model_config=model_config,
+                    prompt=config.mimo_direct_prompt,
                     media_root=media_root,
                 )
                 _upsert_experiment_result(
@@ -170,6 +171,7 @@ def _call_mimo_direct_model(
     raw_message: RawMessage,
     media_assets: list[MediaAsset],
     model_config: AiModelConfig,
+    prompt: str,
     media_root: str | Path,
 ) -> dict[str, Any]:
     headers = {"Content-Type": "application/json"}
@@ -178,6 +180,7 @@ def _call_mimo_direct_model(
     payload = _build_mimo_payload(
         raw_message=raw_message,
         media_assets=media_assets,
+        prompt=prompt,
         model=model_config.model,
         media_root=media_root,
     )
@@ -187,7 +190,11 @@ def _call_mimo_direct_model(
             json=payload,
             headers=headers,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            response_body = exc.response.text[:1200]
+            raise RuntimeError(f"{exc}; response_body={response_body}") from exc
         data = response.json()
     content = _extract_chat_content(data)
     return _parse_json_object(content)
@@ -198,6 +205,7 @@ def _build_mimo_payload(
     raw_message: RawMessage,
     media_assets: list[MediaAsset],
     model: str,
+    prompt: str = MIMO_DIRECT_PROMPT,
     media_root: str | Path = "data/media",
 ) -> dict[str, Any]:
     user_text = (
@@ -215,7 +223,7 @@ def _build_mimo_payload(
     return {
         "model": model,
         "messages": [
-            {"role": "system", "content": MIMO_DIRECT_PROMPT},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": user_parts if len(user_parts) > 1 else user_text},
         ],
         "temperature": 0,
@@ -275,6 +283,8 @@ def _media_asset_to_data_url(media_asset: MediaAsset, *, media_root: str | Path 
         return None
     path = resolve_media_path(media_asset.local_path, media_root=media_root)
     if path is None or not path.exists():
+        return None
+    if path.stat().st_size <= 0:
         return None
     mime_type = media_asset.mime_type or mimetypes.guess_type(path.name)[0] or "image/jpeg"
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")

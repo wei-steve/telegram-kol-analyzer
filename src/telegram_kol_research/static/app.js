@@ -1087,6 +1087,8 @@ function buildAiRecognitionConfigPayload() {
   return {
     mode: 'ai_provider',
     recognition_prompt: value('[data-ai-recognition-prompt-input]'),
+    lifecycle_event_prompt: value('[data-ai-lifecycle-event-prompt-input]'),
+    mimo_direct_prompt: value('[data-ai-mimo-direct-prompt-input]'),
     active_text_model_id: activeTextModelId,
     active_image_model_id: activeImageModelId,
     ai_models: aiModels,
@@ -1140,6 +1142,8 @@ function buildLegacyAiRecognitionConfigPayload() {
   return {
     mode: 'ai_provider',
     recognition_prompt: value('[data-ai-recognition-prompt-input]'),
+    lifecycle_event_prompt: value('[data-ai-lifecycle-event-prompt-input]'),
+    mimo_direct_prompt: value('[data-ai-mimo-direct-prompt-input]'),
     text_provider: {
       base_url: value('[data-ai-text-base-url]'),
       api_key: value('[data-ai-text-api-key]'),

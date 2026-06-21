@@ -255,7 +255,8 @@ body {
   grid-template-rows: minmax(0, 1fr);
 }
 .dashboard-tab-panel[data-dashboard-panel="prompt"].is-active,
-.dashboard-tab-panel[data-dashboard-panel="config"].is-active {
+.dashboard-tab-panel[data-dashboard-panel="config"].is-active,
+.dashboard-tab-panel[data-dashboard-panel="model-selection"].is-active {
   height: 100%;
   min-height: 0;
   overflow-x: hidden;
@@ -268,7 +269,8 @@ body {
   height: 100%;
 }
 .dashboard-tab-panel[data-dashboard-panel="prompt"] .ai-recognition-panel,
-.dashboard-tab-panel[data-dashboard-panel="config"] .ai-recognition-panel {
+.dashboard-tab-panel[data-dashboard-panel="config"] .ai-recognition-panel,
+.dashboard-tab-panel[data-dashboard-panel="model-selection"] .ai-recognition-panel {
   height: auto;
   min-height: 100%;
   overflow: visible;
@@ -276,7 +278,7 @@ body {
 .ai-recognition-prompt-form {
   display: grid;
   gap: 12px;
-  max-width: 900px;
+  max-width: 1180px;
   padding-bottom: 48px;
 }
 .ai-recognition-prompt-form label {
@@ -307,6 +309,53 @@ body {
 .prompt-actions button { width: auto; }
 .ai-recognition-save-status { color: #93c5fd; }
 .ai-recognition-save-status.is-error { color: #fca5a5; }
+
+.ai-prompt-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(320px, 1fr));
+  gap: 14px;
+}
+.ai-prompt-card {
+  display: grid;
+  gap: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 8px;
+  padding: 14px;
+  background: rgba(15, 23, 42, 0.58);
+}
+.ai-prompt-card.is-readonly {
+  align-content: start;
+}
+.ai-prompt-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: start;
+}
+.ai-prompt-card-head h3 {
+  margin: 4px 0 0;
+  color: #f8fafc;
+  font-size: 1rem;
+}
+.ai-prompt-card-head small {
+  color: #93c5fd;
+  white-space: nowrap;
+}
+.ai-prompt-card p {
+  margin: 0;
+  color: #94a3b8;
+  line-height: 1.55;
+  font-size: 0.88rem;
+}
+.ai-prompt-tag {
+  color: #a7f3d0;
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+.ai-prompt-card textarea {
+  min-height: 360px;
+  resize: vertical;
+}
 
 .ai-config-grid {
   display: grid;
@@ -1069,6 +1118,9 @@ body {
 }
 
 @media (max-width: 760px) {
+  .ai-prompt-grid {
+    grid-template-columns: 1fr;
+  }
   .ai-model-row {
     grid-template-columns: 1fr;
   }

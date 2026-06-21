@@ -52,17 +52,70 @@
       <div class="panel-heading">
         <div>
           <h2>AI识别提示词</h2>
-          <p class="ai-helper-text">用于后续每条 KOL 消息识别的统一提示词。</p>
+          <p class="ai-helper-text">查看和微调在线识别链路会用到的提示词；保存后下一次识别立即使用。</p>
         </div>
         <button type="button" class="secondary-button" data-dashboard-tab="main">返回主界面</button>
       </div>
       <form class="ai-recognition-prompt-form" data-ai-recognition-prompt-form>
-        <label>
-          识别提示词
-          <textarea name="recognition_prompt" data-ai-recognition-prompt-input>{{ ai_recognition_config.recognition_prompt }}</textarea>
-        </label>
+        <div class="ai-prompt-grid">
+          <section class="ai-prompt-card">
+            <div class="ai-prompt-card-head">
+              <div>
+                <span class="ai-prompt-tag">DeepSeek / 文本策略识别</span>
+                <h3>单条消息是否为新开仓策略</h3>
+              </div>
+              <small>在线生效</small>
+            </div>
+            <p>文字消息直接使用；GLM-OCR 图片转文字后也会把 OCR 文本交给这个提示词判断。</p>
+            <label>
+              提示词
+              <textarea name="recognition_prompt" data-ai-recognition-prompt-input>{{ ai_recognition_config.recognition_prompt }}</textarea>
+            </label>
+          </section>
+
+          <section class="ai-prompt-card">
+            <div class="ai-prompt-card-head">
+              <div>
+                <span class="ai-prompt-tag">DeepSeek / 生命周期识别</span>
+                <h3>入场、撤单、平仓、仓位管理事件</h3>
+              </div>
+              <small>在线生效</small>
+            </div>
+            <p>在同群存在活跃策略时使用，用来判断当前消息是否改变已有策略状态。</p>
+            <label>
+              提示词
+              <textarea name="lifecycle_event_prompt" data-ai-lifecycle-event-prompt-input>{{ ai_recognition_config.lifecycle_event_prompt }}</textarea>
+            </label>
+          </section>
+
+          <section class="ai-prompt-card">
+            <div class="ai-prompt-card-head">
+              <div>
+                <span class="ai-prompt-tag">MiMo / 多模态直识别</span>
+                <h3>文字和图片一起直接判断</h3>
+              </div>
+              <small>实验链路</small>
+            </div>
+            <p>用于 MiMo 小样本实验；直接发送文字和原图，不复用 GLM-OCR 结果。</p>
+            <label>
+              提示词
+              <textarea name="mimo_direct_prompt" data-ai-mimo-direct-prompt-input>{{ ai_recognition_config.mimo_direct_prompt }}</textarea>
+            </label>
+          </section>
+
+          <section class="ai-prompt-card is-readonly">
+            <div class="ai-prompt-card-head">
+              <div>
+                <span class="ai-prompt-tag">GLM-OCR / 图片转文字</span>
+                <h3>图片 OCR 提取</h3>
+              </div>
+              <small>无自定义提示词</small>
+            </div>
+            <p>当前 GLM-OCR 调用的是独立 layout_parsing 接口，只传 model 和图片文件；策略判断由上面的文本策略识别提示词完成。</p>
+          </section>
+        </div>
         <div class="prompt-actions">
-          <button type="submit">保存提示词</button>
+          <button type="submit">保存全部提示词</button>
           <span class="ai-recognition-save-status" data-ai-recognition-save-status aria-live="polite"></span>
         </div>
       </form>

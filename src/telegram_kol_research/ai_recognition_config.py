@@ -78,6 +78,77 @@ NORMALIZED_STRATEGY_OUTPUT_INSTRUCTIONS = """
 """
 
 
+DEFAULT_LIFECYCLE_EVENT_PROMPT = """
+你是 Telegram 加密货币 KOL 策略生命周期事件判定器。
+你会收到：当前消息、同群最近的活跃策略列表、以及最近聊天上下文。
+
+你的任务不是识别新策略，而是判断“当前消息”是否在改变某一条已有策略的状态。
+
+只允许输出 JSON，不要输出解释文本：
+{
+  "event_type": "none | entry_confirm | cancel_entry | exit_position | position_update",
+  "target_lifecycle_id": null,
+  "symbol": null,
+  "side": null,
+  "entry_price": null,
+  "exit_price": null,
+  "management_action": null,
+  "confidence": 0.0,
+  "reason": "一句话说明判断依据"
+}
+
+判定规则：
+- entry_confirm：当前消息是在通知之前 pending_entry 策略现在/现价/市价/直接入场，或明确说已经进场。
+- cancel_entry：当前消息是在取消之前 pending_entry 限价挂单或等待入场策略，例如取消限价、撤单、取消挂单、等后续信号。
+- exit_position：当前消息是在关闭已 entered 策略，例如平仓、全平、离场、临时离场、止盈了、止损了、先出来、保本出局、成本附近保本出局、保本走、成本走、breakeven exit。
+- position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、分批止盈30%、按比例止盈、减仓一半、减仓30%、持仓收益达到100%后分批止盈、带保护、保护止损、上移止损、推保护、继续持有。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
+- none：普通聊天、行情观点、广告、复盘、联系方式、无法确定目标策略、或只是识别新策略但不改变已有策略。
+- 必须优先依据当前消息，不要把上下文里的旧消息当成当前动作。
+- 如果能明确对应活跃策略，请输出 target_lifecycle_id。
+- 如果不能唯一对应，event_type 必须为 none 或 confidence 低于 0.7。
+- confidence 低于 0.7 时，系统不会执行状态变更。
+""".strip()
+
+
+DEFAULT_MIMO_DIRECT_PROMPT = """
+你是 Telegram 加密货币 KOL 消息的多模态交易策略识别器。
+你会收到一条消息的文字/图片。请只判断当前这条消息是否包含“新的、可执行的开仓策略”。
+
+必须判定为“是策略”的条件：
+1. 有明确交易标的，例如 BTC、ETH、SOL、DOGE、BNB 等。
+2. 有明确方向：long/short，做多/做空，开多/开空。
+3. 有明确入场方式：具体价格、区间、市价、到价进入、挂单区间之一。
+4. 至少有止损、止盈、无效价、保护价、分批止盈计划之一。
+5. 表达的是新开仓或新挂单，不是已有仓位管理、复盘、教学或广告。
+
+图片要求：
+- 直接阅读图片中的文字、表格、标注和截图内容。
+- 不要依赖外部 OCR 文本。
+- 不要补全图片或文字里没有出现的价格、币种、方向。
+- 如果图片模糊、裁切、遮挡或关键数字不确定，请判定为“识别失败”或低置信度。
+
+只输出 JSON，不要输出解释性文字：
+{
+  "recognition_result": "是策略 | 非策略 | 识别失败",
+  "input_reading": {
+    "observed_text": "你从当前文字或图片中实际读到的关键内容；如果没有可读内容则为空字符串",
+    "image_quality": "clear | blurry | cropped | unreadable | none"
+  },
+  "reason": "一句话说明判断依据",
+  "strategy": {
+    "symbol": null,
+    "side": null,
+    "entry": null,
+    "stop_loss": null,
+    "take_profit": null,
+    "leverage": null,
+    "order_type": null
+  },
+  "confidence": 0.0
+}
+""".strip()
+
+
 @dataclass(frozen=True)
 class AiProviderConfig:
     base_url: str = ""
@@ -114,7 +185,8 @@ class AiModelConfig:
 @dataclass(frozen=True)
 class AiRecognitionConfig:
     recognition_prompt: str = DEFAULT_RECOGNITION_PROMPT
-    lifecycle_event_prompt: str = ""
+    lifecycle_event_prompt: str = DEFAULT_LIFECYCLE_EVENT_PROMPT
+    mimo_direct_prompt: str = DEFAULT_MIMO_DIRECT_PROMPT
     mode: str = "local_rule_parser"
     text_provider: AiProviderConfig = field(default_factory=AiProviderConfig)
     image_provider: AiProviderConfig = field(default_factory=AiProviderConfig)
@@ -165,7 +237,8 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
     recognition_prompt = _with_normalized_strategy_output_instructions(
         str(raw_data.get("recognition_prompt") or DEFAULT_RECOGNITION_PROMPT)
     )
-    lifecycle_event_prompt = str(raw_data.get("lifecycle_event_prompt") or "")
+    lifecycle_event_prompt = str(raw_data.get("lifecycle_event_prompt") or DEFAULT_LIFECYCLE_EVENT_PROMPT)
+    mimo_direct_prompt = str(raw_data.get("mimo_direct_prompt") or DEFAULT_MIMO_DIRECT_PROMPT)
     mode = str(raw_data.get("mode") or "local_rule_parser")
     raw_text_provider = _load_provider_config(raw_data.get("text_provider"))
     raw_image_provider = _load_provider_config(raw_data.get("image_provider"))
@@ -191,6 +264,7 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
     return AiRecognitionConfig(
         recognition_prompt=recognition_prompt,
         lifecycle_event_prompt=lifecycle_event_prompt,
+        mimo_direct_prompt=mimo_direct_prompt,
         mode=mode,
         text_provider=text_model.provider if text_model else raw_text_provider,
         image_provider=image_model.provider if image_model else raw_image_provider,
@@ -229,7 +303,8 @@ def save_ai_recognition_config(
         recognition_prompt=_with_normalized_strategy_output_instructions(
             config.recognition_prompt.strip() or DEFAULT_RECOGNITION_PROMPT
         ),
-        lifecycle_event_prompt=config.lifecycle_event_prompt.strip(),
+        lifecycle_event_prompt=config.lifecycle_event_prompt.strip() or DEFAULT_LIFECYCLE_EVENT_PROMPT,
+        mimo_direct_prompt=config.mimo_direct_prompt.strip() or DEFAULT_MIMO_DIRECT_PROMPT,
         mode=_resolve_mode(config),
         text_provider=text_model.provider if text_model else _normalize_provider_config(config.text_provider),
         image_provider=image_model.provider if image_model else _normalize_provider_config(config.image_provider),
@@ -241,6 +316,7 @@ def save_ai_recognition_config(
         "mode": normalized.mode,
         "recognition_prompt": normalized.recognition_prompt,
         "lifecycle_event_prompt": normalized.lifecycle_event_prompt,
+        "mimo_direct_prompt": normalized.mimo_direct_prompt,
         "active_text_model_id": normalized.active_text_model_id,
         "active_image_model_id": normalized.active_image_model_id,
         "ai_models": [_model_to_payload(model) for model in normalized.ai_models],
