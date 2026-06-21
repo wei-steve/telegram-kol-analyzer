@@ -18,12 +18,13 @@
         数据新鲜度：{{ '%.1f 小时未刷新'|format(database_stale_hours) if database_stale_hours is not none else '暂无数据' }}
       </span>
       <button type="button" class="secondary-button" data-refresh-now>立即刷新</button>
-      <span class="message-sync-state{% if live_listener_enabled %} is-live{% endif %}">
-        {% if live_listener_enabled %}
-          实时监听已启用
-        {% else %}
-          实时监听未启用
-        {% endif %}
+      <span
+        class="message-sync-state{% if monitor_status and monitor_status.state == 'monitoring' %} is-live{% elif monitor_status and monitor_status.state == 'idle' %} is-idle{% else %} is-disconnected{% endif %}"
+        data-monitor-status
+        data-monitor-state="{{ monitor_status.state if monitor_status else ('monitoring' if live_listener_enabled else 'disconnected') }}"
+        title="{{ monitor_status.detail if monitor_status else '' }}"
+      >
+        {{ monitor_status.label if monitor_status else ('监控中' if live_listener_enabled else '已断开') }}
       </span>
       {% if not live_listener_enabled and live_listener_status_reason %}
         <span>{{ live_listener_status_reason }}</span>
@@ -90,13 +91,13 @@
                     {% if media.local_path %}
                       <a
                         class="media-link"
-                        href="/local-media/{{ media.local_path.split('data/media/')[-1] }}"
+                        href="/local-media/{{ media.local_path.replace('\\', '/').split('data/media/')[-1] }}"
                         target="_blank"
                         rel="noopener noreferrer"
                       >
                         <img
                           class="message-media-preview"
-                          src="/local-media/{{ media.local_path.split('data/media/')[-1] }}"
+                          src="/local-media/{{ media.local_path.replace('\\', '/').split('data/media/')[-1] }}"
                           alt="message media"
                         />
                       </a>
@@ -109,10 +110,10 @@
                     <span class="media-token">[媒体]</span>
                   {% endif %}
                   {% if media.ocr_text %}
-                    <details>
-                      <summary>OCR text</summary>
+                    <div class="ocr-text-block" title="GLM-OCR 识别结果">
+                      <span class="ocr-label">📷 OCR</span>
                       <pre>{{ media.ocr_text }}</pre>
-                    </details>
+                    </div>
                   {% endif %}
                 </div>
               {% endfor %}

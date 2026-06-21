@@ -1,3 +1,6 @@
+let latestFreshnessSnapshot = null;
+let currentSelectedChatId = null;
+
 function escapeHtml(value) {
   return value
     .replaceAll('&', '&amp;')
@@ -8,13 +11,12 @@ function escapeHtml(value) {
 }
 
 function getConversationKey() {
-  const chatIdInput = document.querySelector('[name="chat_id"]');
-  const chatId = chatIdInput ? chatIdInput.value : '0';
+  const chatId = getSelectedChatId() || 0;
   return `telegram-workbench:${chatId}:current_group`;
 }
 
 function getPromptKey(chatId = null) {
-  const resolvedChatId = chatId || document.querySelector('[name="chat_id"]')?.value || '0';
+  const resolvedChatId = chatId || getSelectedChatId() || '0';
   return `telegram-workbench:prompt:${resolvedChatId}`;
 }
 
@@ -235,6 +237,37 @@ function setAiStatus(message, isError = false) {
   status.classList.toggle('is-active', Boolean(message));
 }
 
+function setMonitorStatus(status) {
+  const badge = document.querySelector('[data-monitor-status]');
+  if (!badge) {
+    return;
+  }
+  const state = status && status.state ? status.state : 'disconnected';
+  const label = status && status.label ? status.label : '已断开';
+  badge.textContent = label;
+  badge.dataset.monitorState = state;
+  badge.title = status && status.detail ? status.detail : '';
+  badge.classList.toggle('is-live', state === 'monitoring');
+  badge.classList.toggle('is-idle', state === 'idle');
+  badge.classList.toggle('is-disconnected', state === 'disconnected');
+}
+
+async function refreshMonitorStatus() {
+  try {
+    const response = await fetch('/api/monitor-status', { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error('monitor status request failed');
+    }
+    setMonitorStatus(await response.json());
+  } catch {
+    setMonitorStatus({
+      state: 'disconnected',
+      label: '已断开',
+      detail: 'Web 服务连接失败，等待恢复',
+    });
+  }
+}
+
 function getMessagePanel() {
   return document.querySelector('[data-messages-panel]');
 }
@@ -290,6 +323,9 @@ function buildMessagesUrl(chatId, options = {}) {
 }
 
 function getSelectedChatId() {
+  if (currentSelectedChatId) {
+    return currentSelectedChatId;
+  }
   const panel = getMessagePanel();
   if (panel && panel.dataset.chatId) {
     return Number(panel.dataset.chatId || '0');
@@ -298,27 +334,247 @@ function getSelectedChatId() {
   return Number(chatIdInput ? chatIdInput.value : '0');
 }
 
+function setSelectedChatId(chatId) {
+  currentSelectedChatId = Number(chatId || 0);
+  document.querySelectorAll('[name="chat_id"]').forEach((input) => {
+    input.value = String(currentSelectedChatId);
+  });
+}
+
+function syncSelectedGroupState(chatId, options = {}) {
+  const selectedChatId = Number(chatId || 0);
+  if (!selectedChatId) {
+    return;
+  }
+  setSelectedChatId(selectedChatId);
+  let selectedButton = null;
+  document.querySelectorAll('[data-group-link]').forEach((button) => {
+    const isSelected = Number(button.dataset.chatId || '0') === selectedChatId;
+    button.setAttribute('aria-current', isSelected ? 'true' : 'false');
+    const row = button.closest('.kol-strategy-row');
+    if (row) {
+      row.classList.toggle('is-active', isSelected);
+    }
+    if (isSelected) {
+      selectedButton = button;
+    }
+  });
+  if (options.focus && selectedButton) {
+    selectedButton.focus({ preventScroll: true });
+  }
+}
+
 async function refreshGroupList() {
   const selectedChatId = getSelectedChatId();
-  const response = await fetch('/groups?selected_chat_id=' + selectedChatId);
+  const url = `/groups?selected_chat_id=${selectedChatId}&_t=${Date.now()}`;
+  const response = await fetch(url, { cache: 'no-store' });
   const html = await response.text();
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
-  const nextList = doc.querySelector('[data-groups-list]');
-  const currentList = document.querySelector('[data-groups-list]');
-  if (!nextList || !currentList) {
-    return;
+
+  const nextKolList = doc.querySelector('.kol-strategy-list');
+  const currentKolList = document.querySelector('.kol-strategy-list');
+  if (nextKolList && currentKolList) {
+    currentKolList.replaceWith(nextKolList);
+    bindGroupAutomationToggles();
   }
-  currentList.replaceWith(nextList);
+
   bindGroupLinks();
+  syncSelectedGroupState(selectedChatId);
 }
 
 async function fetchMessagePanel(chatId, options = {}) {
-  const response = await fetch(buildMessagesUrl(chatId, options));
+  const url = buildMessagesUrl(chatId, options);
+  const cacheBusted = url.includes('?') ? `${url}&_t=${Date.now()}` : `${url}?_t=${Date.now()}`;
+  const response = await fetch(cacheBusted, { cache: 'no-store' });
   const html = await response.text();
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
   return doc.querySelector('[data-messages-panel]');
+}
+
+async function fetchDetailPanel(chatId) {
+  const url = `/groups/${chatId}/detail?_t=${Date.now()}`;
+  const response = await fetch(url, { cache: 'no-store' });
+  const html = await response.text();
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+  return doc.querySelector('.strategy-detail-shell');
+}
+
+async function fetchStrategyMidPanel(chatId, filter) {
+  const url = `/groups/${chatId}/strategy-mid-panel?filter=${filter}&_t=${Date.now()}`;
+  const response = await fetch(url, { cache: 'no-store' });
+  const html = await response.text();
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+  return doc.querySelector('.strategy-panel-content');
+}
+
+async function refreshStrategyMidPanel() {
+  const chatId = getSelectedChatId();
+  if (!chatId) return;
+
+  const filterInput = document.querySelector('[data-strategy-filter-input]');
+  const filter = filterInput ? filterInput.value : 'holding';
+
+  const strategyPanel = document.querySelector('[data-strategy-panel]');
+  if (!strategyPanel) return;
+
+  const nextContent = await fetchStrategyMidPanel(chatId, filter);
+  if (!nextContent) return;
+
+  strategyPanel.innerHTML = '';
+  strategyPanel.appendChild(nextContent);
+  bindStrategyFilterBadges();
+  bindDetailPanelControls();
+}
+
+function bindStrategyFilterBadges() {
+  document.querySelectorAll('[data-strategy-filter]').forEach((badge) => {
+    badge.addEventListener('click', async () => {
+      const filter = badge.dataset.strategyFilter;
+      document.querySelectorAll('[data-strategy-filter]').forEach((b) => {
+        b.classList.toggle('is-active-filter', b === badge);
+      });
+      const filterInput = document.querySelector('[data-strategy-filter-input]');
+      if (filterInput) {
+        filterInput.value = filter;
+      }
+      await refreshStrategyMidPanel();
+    });
+  });
+}
+
+function bindDetailPanelControls() {
+  // Horizontal tab switching with lazy loading
+  document.querySelectorAll('[data-detail-tab]').forEach((tab) => {
+    tab.addEventListener('click', async () => {
+      const targetPanel = tab.dataset.detailTab;
+      // Update tab active states
+      const tabsContainer = tab.closest('.detail-tabs');
+      if (tabsContainer) {
+        tabsContainer.querySelectorAll('[data-detail-tab]').forEach((t) => {
+          t.classList.toggle('is-active', t === tab);
+        });
+      }
+      // Show matching panel
+      const shell = tab.closest('.strategy-detail-shell');
+      if (!shell) return;
+      const panel = shell.querySelector(`[data-detail-panel-content="${targetPanel}"]`);
+      if (!panel) return;
+      
+      shell.querySelectorAll('[data-detail-panel-content]').forEach((p) => {
+        p.classList.toggle('is-active', p === panel);
+      });
+
+      // Lazy-load tab content if needed
+      if (panel.dataset.tabLazy !== undefined) {
+        const chatId = getSelectedChatId();
+        panel.innerHTML = '<p class="empty-state">加载中...</p>';
+        try {
+          let url;
+          if (targetPanel === 'messages') {
+            url = `/groups/${chatId}/detail/tab/messages`;
+          } else {
+            url = `/groups/${chatId}/detail/tab/${targetPanel}`;
+          }
+          const response = await fetch(url, { cache: 'no-store' });
+          const html = await response.text();
+          panel.innerHTML = html;
+          delete panel.dataset.tabLazy;
+          
+          // Re-bind controls for newly loaded content
+          if (targetPanel === 'messages') {
+            const msgPanel = panel.querySelector('[data-messages-panel]');
+            if (msgPanel) bindMessagePanelControls(msgPanel);
+          }
+          bindDetailPanelControls();
+        } catch {
+          panel.innerHTML = '<p class="empty-state">加载失败，请重试</p>';
+        }
+      }
+    });
+  });
+
+  // Bind recovery scan button
+  const scanBtn = document.querySelector('[data-run-recovery-scan]');
+  if (scanBtn) {
+    scanBtn.addEventListener('click', async () => {
+      const chatId = getSelectedChatId();
+      if (chatId) {
+        setRecoveryStatus('正在扫描...');
+        await refreshStrategyPanels(chatId);
+        setRecoveryStatus('扫描完成');
+      }
+    });
+  }
+
+  // Bind recovery confirmation buttons (from pending tab)
+  document.querySelectorAll('[data-confirm-recovery-order]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const chatId = Number(button.dataset.chatId || '0');
+      const messageId = Number(button.dataset.messageId || '0');
+      const symbol = button.dataset.symbol || '';
+      const side = button.dataset.side || '';
+      const status = button.parentElement.querySelector('[data-recovery-order-confirm-status]');
+      button.disabled = true;
+      if (status) { status.textContent = '确认中...'; status.classList.remove('is-error', 'is-ready'); }
+      try {
+        const response = await fetch('/api/recovery-order-confirm-dry-run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, message_id: messageId, symbol, side }),
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          if (status) { status.textContent = result.detail || '确认失败'; status.classList.add('is-error'); }
+          return;
+        }
+        if (status) { status.textContent = '已确认'; status.classList.add('is-ready'); }
+      } catch {
+        if (status) { status.textContent = '确认失败'; status.classList.add('is-error'); }
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+
+  // Bind simulate submit buttons
+  document.querySelectorAll('[data-simulate-recovery-submit]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const chatId = Number(button.dataset.chatId || '0');
+      const messageId = Number(button.dataset.messageId || '0');
+      const symbol = button.dataset.symbol || '';
+      const side = button.dataset.side || '';
+      const status = button.parentElement.querySelector('[data-recovery-submit-gate-status]');
+      button.disabled = true;
+      if (status) { status.textContent = '提交中...'; status.classList.remove('is-error', 'is-ready'); }
+      try {
+        const response = await fetch('/api/recovery-live-submit-gate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, message_id: messageId, symbol, side }),
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          if (status) { status.textContent = result.detail || '提交失败'; status.classList.add('is-error'); }
+          return;
+        }
+        if (status) { status.textContent = '已提交'; status.classList.add('is-ready'); }
+      } catch {
+        if (status) { status.textContent = '提交失败'; status.classList.add('is-error'); }
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+
+  // Bind message panel controls (always visible in lower section)
+  const messagesPanel = document.querySelector('[data-messages-panel]');
+  if (messagesPanel) {
+    bindMessagePanelControls(messagesPanel);
+  }
 }
 
 function bindMessagePanelControls(panel = getMessagePanel()) {
@@ -452,41 +708,50 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
 }
 
 async function refreshSelectedGroupPanel() {
-  const currentPanel = getMessagePanel();
-  if (!currentPanel) {
-    return;
+  const chatId = getSelectedChatId();
+  if (!chatId) return;
+  await refreshCurrentGroupPanel({ force: true });
+}
+
+async function refreshStrategyPanels(chatId) {
+  // Refresh the complete detail panel for the selected group
+  const detailPanel = document.querySelector('[data-detail-panel]');
+  if (!detailPanel || !chatId) return;
+  try {
+    const nextPanel = await fetchDetailPanel(chatId);
+    if (nextPanel) {
+      detailPanel.innerHTML = '';
+      detailPanel.appendChild(nextPanel);
+      bindDetailPanelControls();
+    }
+  } catch (e) {
+    // Silently ignore fetch errors
   }
-  const { chatId, searchText, senderName } = getMessageFilterState(currentPanel);
-  const nextPanel = await fetchMessagePanel(chatId, { searchText, senderName });
-  if (!nextPanel) {
-    return;
-  }
-  currentPanel.replaceWith(nextPanel);
-  bindMessagePanelControls(nextPanel);
-  scrollMessagePanelToTop(nextPanel);
+  // Also refresh group list to update position counts
+  await refreshGroupList();
 }
 
 function bindGroupLinks() {
   document.querySelectorAll('[data-group-link]').forEach((element) => {
+    if (element.dataset.groupLinkBound === 'true') {
+      return;
+    }
+    element.dataset.groupLinkBound = 'true';
     element.addEventListener('click', async () => {
       const chatId = Number(element.dataset.chatId);
-      const nextPanel = await fetchMessagePanel(chatId);
-      const currentPanel = document.querySelector('[data-messages-panel]');
-      if (nextPanel && currentPanel) {
-        currentPanel.replaceWith(nextPanel);
-        bindMessagePanelControls(nextPanel);
-        scrollMessagePanelToTop(nextPanel);
+      syncSelectedGroupState(chatId, { focus: true });
+      // Load detail panel (messages)
+      const detailPanel = document.querySelector('[data-detail-panel]');
+      const nextContent = await fetchDetailPanel(chatId);
+      if (detailPanel && nextContent) {
+        detailPanel.innerHTML = '';
+        detailPanel.appendChild(nextContent);
+        bindDetailPanelControls();
       }
-      document.querySelectorAll('.kol-strategy-row').forEach((row) => row.classList.remove('is-active'));
-      const row = element.closest('.kol-strategy-row');
-      if (row) {
-        row.classList.add('is-active');
-      }
-      const chatIdInput = document.querySelector('[name="chat_id"]');
-      if (chatIdInput) {
-        chatIdInput.value = String(chatId);
-      }
-      setAiStatus('Group switched. Ask a new question or continue the conversation.');
+      // Load strategy mid panel
+      await refreshStrategyMidPanel();
+      syncSelectedGroupState(chatId);
+      setAiStatus('');
       applyGroupPromptToEditor(String(chatId));
       renderConversationHistory();
     });
@@ -519,6 +784,7 @@ function bindGroupAutomationToggles() {
         const resolvedEnabled = Boolean(result[setting]);
         button.dataset.enabled = resolvedEnabled ? 'true' : 'false';
         button.classList.toggle('is-enabled', resolvedEnabled);
+        await refreshMonitorStatus();
         setRecoveryStatus('群组开关已保存');
       } catch {
         setRecoveryStatus('群组开关保存失败，请检查服务状态。', true);
@@ -561,6 +827,7 @@ function bindDashboardTabs() {
 function bindAiRecognitionPromptForm() {
   const form = document.querySelector('[data-ai-recognition-prompt-form]');
   if (!form) {
+    bindAiRecognitionConfigForm();
     return;
   }
   const input = form.querySelector('[data-ai-recognition-prompt-input]');
@@ -579,9 +846,7 @@ function bindAiRecognitionPromptForm() {
       const response = await fetch('/api/ai-recognition-config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          recognition_prompt: input ? input.value : '',
-        }),
+        body: JSON.stringify(buildAiRecognitionConfigPayload()),
       });
       const payload = await response.json();
       if (!response.ok) {
@@ -605,6 +870,77 @@ function bindAiRecognitionPromptForm() {
       }
     }
   });
+  bindAiRecognitionConfigForm();
+}
+
+function bindAiRecognitionConfigForm() {
+  const form = document.querySelector('[data-ai-recognition-config-form]');
+  if (!form) {
+    return;
+  }
+  const status = form.querySelector('[data-ai-config-save-status]');
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const submitButton = form.querySelector('button[type="submit"]');
+    if (submitButton) {
+      submitButton.disabled = true;
+    }
+    if (status) {
+      status.textContent = '正在保存...';
+      status.classList.remove('is-error');
+    }
+    try {
+      const response = await fetch('/api/ai-recognition-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildAiRecognitionConfigPayload()),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        if (status) {
+          status.textContent = payload.detail || '保存失败';
+          status.classList.add('is-error');
+        }
+        return;
+      }
+      if (status) {
+        status.textContent = 'AI 配置已保存';
+      }
+    } catch {
+      if (status) {
+        status.textContent = '保存失败，请检查服务状态。';
+        status.classList.add('is-error');
+      }
+    } finally {
+      if (submitButton) {
+        submitButton.disabled = false;
+      }
+    }
+  });
+}
+
+function buildAiRecognitionConfigPayload() {
+  const value = (selector) => document.querySelector(selector)?.value || '';
+  const numericValue = (selector, fallback) => {
+    const parsed = Number(value(selector));
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  };
+  return {
+    mode: 'ai_provider',
+    recognition_prompt: value('[data-ai-recognition-prompt-input]'),
+    text_provider: {
+      base_url: value('[data-ai-text-base-url]'),
+      api_key: value('[data-ai-text-api-key]'),
+      model: value('[data-ai-text-model]'),
+      timeout_seconds: numericValue('[data-ai-text-timeout]', 60),
+    },
+    image_provider: {
+      base_url: value('[data-ai-image-base-url]'),
+      api_key: value('[data-ai-image-api-key]'),
+      model: value('[data-ai-image-model]'),
+      timeout_seconds: numericValue('[data-ai-image-timeout]', 60),
+    },
+  };
 }
 
 function bindClearAiHistory() {
@@ -822,7 +1158,7 @@ async function submitAiQuestion(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const questionInput = form.querySelector('[name="question"]');
-  const chatIdInput = form.querySelector('[name="chat_id"]');
+  const chatId = getSelectedChatId();
   const groupPromptInput = document.querySelector('[data-group-prompt]');
   const question = questionInput ? questionInput.value.trim() : '';
 
@@ -846,7 +1182,7 @@ async function submitAiQuestion(event) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         question,
-        chat_id: Number(chatIdInput.value),
+        chat_id: Number(chatId),
         group_prompt: groupPromptInput ? groupPromptInput.value : '',
       }),
     });
@@ -884,25 +1220,83 @@ async function submitAiQuestion(event) {
   }
 }
 
-async function refreshCurrentGroupPanel() {
-  const currentPanel = getMessagePanel();
-  if (!currentPanel) {
+async function refreshCurrentGroupPanel(options = {}) {
+  const chatId = getSelectedChatId();
+  if (!chatId) return;
+
+  const detailPanel = document.querySelector('[data-detail-panel]');
+  if (!detailPanel) return;
+
+  const nextContent = await fetchDetailPanel(chatId);
+  if (!nextContent) return;
+
+  detailPanel.innerHTML = '';
+  detailPanel.appendChild(nextContent);
+  bindDetailPanelControls();
+
+  // Also refresh the strategy mid panel
+  await refreshStrategyMidPanel();
+
+  if (options.showStatus !== false) {
+    setAiStatus('Panel refreshed.');
+  }
+}
+
+async function fetchFreshnessSnapshot() {
+  const selectedChatId = getSelectedChatId();
+  const url = selectedChatId ? `/api/freshness?chat_id=${selectedChatId}` : '/api/freshness';
+  const response = await fetch(url, { cache: 'no-store' });
+  if (!response.ok) {
+    throw new Error('freshness request failed');
+  }
+  return response.json();
+}
+
+function snapshotKey(snapshot, scope) {
+  const item = snapshot && snapshot[scope] ? snapshot[scope] : {};
+  return [
+    item.raw_message_id || 0,
+    item.message_id || 0,
+    item.message_count || 0,
+    item.created_at || '',
+    item.posted_at || '',
+  ].join(':');
+}
+
+async function refreshFromDatabaseChanges(options = {}) {
+  let snapshot = null;
+  try {
+    snapshot = await fetchFreshnessSnapshot();
+  } catch {
+    setMonitorStatus({
+      state: 'disconnected',
+      label: '已断开',
+      detail: 'Web 服务连接失败，等待恢复',
+    });
     return;
   }
-  const { chatId, searchText, senderName } = getMessageFilterState(currentPanel);
-  const currentLatestMessageId = getLatestMessageId(currentPanel);
-  const nextPanel = await fetchMessagePanel(chatId, { searchText, senderName });
-  if (!nextPanel) {
+
+  if (!latestFreshnessSnapshot) {
+    latestFreshnessSnapshot = snapshot;
+    if (options.force) {
+      await refreshCurrentGroupPanel({ force: true, showStatus: false });
+      await refreshGroupList();
+    }
     return;
   }
-  const nextLatestMessageId = getLatestMessageId(nextPanel);
-  if (nextLatestMessageId <= currentLatestMessageId) {
-    return;
+
+  const globalChanged =
+    snapshotKey(snapshot, 'global') !== snapshotKey(latestFreshnessSnapshot, 'global');
+  const selectedChanged =
+    snapshotKey(snapshot, 'selected') !== snapshotKey(latestFreshnessSnapshot, 'selected');
+  latestFreshnessSnapshot = snapshot;
+
+  if (globalChanged || options.force) {
+    await refreshGroupList();
   }
-  currentPanel.replaceWith(nextPanel);
-  bindMessagePanelControls(nextPanel);
-  scrollMessagePanelToTop(nextPanel);
-  setAiStatus('New group messages loaded automatically.');
+  if (selectedChanged || options.force) {
+    await refreshCurrentGroupPanel({ force: true });
+  }
 }
 
 function connectLiveUpdates() {
@@ -915,20 +1309,32 @@ function connectLiveUpdates() {
       } catch {
         payload = null;
       }
-      const currentPanel = getMessagePanel();
-      if (!currentPanel || !payload) {
-        return;
-      }
+      if (!payload) return;
       await refreshGroupList();
-      const currentChatId = Number(currentPanel.dataset.chatId || '0');
+      const currentChatId = getSelectedChatId();
       if (Number(payload.chat_id || 0) !== currentChatId) {
         return;
       }
       await refreshCurrentGroupPanel();
     });
+    let sseWasDisconnected = false;
     source.onerror = () => {
-      setAiStatus('实时连接中断，已退回轮询刷新。', true);
-      source.close();
+      sseWasDisconnected = true;
+      setAiStatus('实时连接中断，自动重连中...', true);
+      setMonitorStatus({
+        state: 'reconnecting',
+        label: '重连中',
+        detail: '实时事件连接中断，浏览器将自动重连',
+      });
+      // Do NOT call source.close() — let the browser's built-in
+      // EventSource reconnection handle it with exponential backoff.
+    };
+    source.onopen = () => {
+      if (sseWasDisconnected) {
+        // Only reload on reconnection, not on initial connect
+        setAiStatus('实时连接已恢复，刷新界面...');
+        window.location.reload();
+      }
     };
     return;
   }
@@ -936,9 +1342,9 @@ function connectLiveUpdates() {
 
 function startPollingUpdates() {
   window.setInterval(async () => {
-    await refreshCurrentGroupPanel();
-    await refreshGroupList();
-  }, 15000);
+    await refreshMonitorStatus();
+    await refreshFromDatabaseChanges();
+  }, 5000);
 }
 
 window.addEventListener('DOMContentLoaded', () => {
@@ -948,18 +1354,29 @@ window.addEventListener('DOMContentLoaded', () => {
   }
   bindGroupLinks();
   bindGroupAutomationToggles();
-  bindMessagePanelControls();
+  bindDetailPanelControls();
   bindDashboardTabs();
+  bindStrategyFilterBadges();
   bindAiRecognitionPromptForm();
   bindGroupPromptEditor();
   bindClearAiHistory();
-  bindRecoveryScanButton();
-  bindRecoveryReviewButtons();
-  bindRecoveryOrderConfirmationButtons();
-  bindRecoverySubmitGateButtons();
   renderConversationHistory();
-  setAiStatus('Ready to analyze the current group.');
+  setAiStatus('');
   resetInitialMessagePanelScroll();
   connectLiveUpdates();
+  refreshMonitorStatus();
+  refreshFromDatabaseChanges({ force: true });
   startPollingUpdates();
+
+  // ── Refresh immediately when the tab gains focus (catch up) ──────
+  window.addEventListener('focus', () => {
+    refreshMonitorStatus();
+    refreshFromDatabaseChanges({ force: true });
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      refreshMonitorStatus();
+      refreshFromDatabaseChanges({ force: true });
+    }
+  });
 });

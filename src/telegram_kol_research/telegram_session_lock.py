@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 import signal
 import subprocess
@@ -10,6 +9,16 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+try:
+    import fcntl
+except ModuleNotFoundError:
+    fcntl = None
+
+try:
+    import msvcrt
+except ModuleNotFoundError:
+    msvcrt = None
 
 
 class TelegramSessionLockError(RuntimeError):
@@ -42,8 +51,8 @@ class TelegramSessionLock:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.lock_path.open("a+", encoding="utf-8")
         try:
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+            self._lock_file()
+        except (BlockingIOError, OSError) as exc:
             self._file.close()
             self._file = None
             owner = describe_session_lock_owner(self.session_path)
@@ -64,10 +73,27 @@ class TelegramSessionLock:
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
         if self._file is not None:
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            self._unlock_file()
             self._file.close()
             self._file = None
         return False
+
+    def _lock_file(self) -> None:
+        if fcntl is not None:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        if msvcrt is None:
+            raise RuntimeError("No supported file locking implementation is available")
+        self._file.seek(0)
+        msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+
+    def _unlock_file(self) -> None:
+        if fcntl is not None:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            return
+        if msvcrt is not None:
+            self._file.seek(0)
+            msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def acquire_telegram_session_lock(session_path: str | Path) -> TelegramSessionLock:
@@ -198,7 +224,8 @@ def _read_process_command(pid: int) -> str | None:
 
 def _terminate_process(pid: int) -> None:
     os.kill(pid, signal.SIGTERM)
-    os.kill(pid, signal.SIGCONT)
+    if hasattr(signal, "SIGCONT"):
+        os.kill(pid, signal.SIGCONT)
 
 
 def _looks_like_same_project_entrypoint(command: str, current_command: str) -> bool:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -67,10 +67,36 @@ DEFAULT_RECOGNITION_PROMPT = """你是 Telegram 加密货币 KOL 消息的交易
 """
 
 
+NORMALIZED_STRATEGY_OUTPUT_INSTRUCTIONS = """
+【策略字段统一格式】
+- strategy.symbol 输出大写币种简称，例如 "BTC"、"ETH"。
+- strategy.side 只能输出 "long" 或 "short"；中文做多/开多统一为 "long"，做空/开空统一为 "short"。
+- strategy.entry 必须是字符串。单价保留原意，例如 "62400附近"；区间入场统一为 "62000-62500"；分批/多档入场用 "/" 分隔。
+- strategy.stop_loss 必须是字符串。只输出止损价或无效价本身，不要输出解释性长句。
+- strategy.take_profit 必须是字符串。单个止盈输出单价；分批止盈统一用 "/" 分隔，例如 "63600/64800/66000"。
+- 不要把 entry、stop_loss、take_profit 输出成数组或对象；不要补全原文没有给出的价格。
+"""
+
+
+@dataclass(frozen=True)
+class AiProviderConfig:
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    timeout_seconds: float = 60.0
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.base_url.strip() and self.model.strip())
+
+
 @dataclass(frozen=True)
 class AiRecognitionConfig:
     recognition_prompt: str = DEFAULT_RECOGNITION_PROMPT
+    lifecycle_event_prompt: str = ""
     mode: str = "local_rule_parser"
+    text_provider: AiProviderConfig = field(default_factory=AiProviderConfig)
+    image_provider: AiProviderConfig = field(default_factory=AiProviderConfig)
 
 
 def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
@@ -84,13 +110,17 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
     if not isinstance(raw_data, dict):
         return AiRecognitionConfig()
 
-    recognition_prompt = str(
-        raw_data.get("recognition_prompt") or DEFAULT_RECOGNITION_PROMPT
+    recognition_prompt = _with_normalized_strategy_output_instructions(
+        str(raw_data.get("recognition_prompt") or DEFAULT_RECOGNITION_PROMPT)
     )
+    lifecycle_event_prompt = str(raw_data.get("lifecycle_event_prompt") or "")
     mode = str(raw_data.get("mode") or "local_rule_parser")
     return AiRecognitionConfig(
         recognition_prompt=recognition_prompt,
+        lifecycle_event_prompt=lifecycle_event_prompt,
         mode=mode,
+        text_provider=_load_provider_config(raw_data.get("text_provider")),
+        image_provider=_load_provider_config(raw_data.get("image_provider")),
     )
 
 
@@ -103,16 +133,68 @@ def save_ai_recognition_config(
     path = Path(config_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized = AiRecognitionConfig(
-        recognition_prompt=config.recognition_prompt.strip()
-        or DEFAULT_RECOGNITION_PROMPT,
-        mode=config.mode.strip() or "local_rule_parser",
+        recognition_prompt=_with_normalized_strategy_output_instructions(
+            config.recognition_prompt.strip() or DEFAULT_RECOGNITION_PROMPT
+        ),
+        lifecycle_event_prompt=config.lifecycle_event_prompt.strip(),
+        mode=_resolve_mode(config),
+        text_provider=_normalize_provider_config(config.text_provider),
+        image_provider=_normalize_provider_config(config.image_provider),
     )
     payload: dict[str, Any] = {
         "mode": normalized.mode,
         "recognition_prompt": normalized.recognition_prompt,
+        "lifecycle_event_prompt": normalized.lifecycle_event_prompt,
+        "text_provider": _provider_to_payload(normalized.text_provider),
+        "image_provider": _provider_to_payload(normalized.image_provider),
     }
     path.write_text(
         yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
     )
     return normalized
+
+
+def _load_provider_config(value: Any) -> AiProviderConfig:
+    if not isinstance(value, dict):
+        return AiProviderConfig()
+    return AiProviderConfig(
+        base_url=str(value.get("base_url") or ""),
+        api_key=str(value.get("api_key") or ""),
+        model=str(value.get("model") or ""),
+        timeout_seconds=float(value.get("timeout_seconds") or 60),
+    )
+
+
+def _normalize_provider_config(config: AiProviderConfig) -> AiProviderConfig:
+    return AiProviderConfig(
+        base_url=config.base_url.strip().rstrip("/"),
+        api_key=config.api_key.strip(),
+        model=config.model.strip(),
+        timeout_seconds=float(config.timeout_seconds or 60),
+    )
+
+
+def _resolve_mode(config: AiRecognitionConfig) -> str:
+    requested = config.mode.strip() or "local_rule_parser"
+    if requested != "local_rule_parser":
+        return requested
+    if config.text_provider.is_configured or config.image_provider.is_configured:
+        return "ai_provider"
+    return requested
+
+
+def _with_normalized_strategy_output_instructions(prompt: str) -> str:
+    prompt = prompt.strip()
+    if "【策略字段统一格式】" in prompt:
+        return prompt
+    return f"{prompt}\n\n{NORMALIZED_STRATEGY_OUTPUT_INSTRUCTIONS.strip()}"
+
+
+def _provider_to_payload(config: AiProviderConfig) -> dict[str, Any]:
+    return {
+        "base_url": config.base_url,
+        "api_key": config.api_key,
+        "model": config.model,
+        "timeout_seconds": config.timeout_seconds,
+    }

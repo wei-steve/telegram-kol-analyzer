@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.candidates import persist_text_signal_candidates
+from telegram_kol_research.message_recognition import (
+    filter_records_by_inserted_message_keys,
+    recognize_message_now,
+    recognize_records_with_ai_config,
+)
+from telegram_kol_research.models import MediaAsset, RawMessage
 from telegram_kol_research.raw_ingest import normalize_message_payload, persist_normalized_messages
 from telegram_kol_research.raw_ingest import repair_history_checkpoints
 from telegram_kol_research.strategy_alerts import process_strategy_alert_for_record
@@ -31,8 +39,17 @@ async def persist_live_message_event(
     strategy_alert_config: Any | None = None,
     strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
     strategy_alert_processor=process_strategy_alert_for_record,
+    ai_recognition_config: AiRecognitionConfig | None = None,
+    lifecycle_monitor: Any | None = None,
 ) -> dict[str, int]:
-    """Normalize and persist one live Telegram event into the existing raw ingest flow."""
+    """Normalize and persist one live Telegram event into the existing raw ingest flow.
+
+    When *ai_recognition_config* is provided the freshly persisted message is
+    immediately submitted for AI strategy recognition (text → text AI,
+    image → GLM-OCR → text AI, video → skipped).  When *lifecycle_monitor* is
+    provided and the AI recognises an exit signal it will be matched against
+    the active position.
+    """
 
     message = getattr(event, "message", None)
     if message is None:
@@ -73,6 +90,44 @@ async def persist_live_message_event(
         sync_kind="live",
         broker=broker,
     )
+
+    # ── Immediately run AI recognition on every newly persisted message ──
+    inserted_keys = stats.get("inserted_message_keys") or []
+    recog_result = None
+    if inserted_keys and ai_recognition_config is not None:
+        chat_id, message_id = inserted_keys[0]
+        with session_factory() as session:
+            raw_message = (
+                session.query(RawMessage)
+                .filter(
+                    RawMessage.chat_id == chat_id,
+                    RawMessage.message_id == message_id,
+                )
+                .one_or_none()
+            )
+        if raw_message is not None:
+            recog_result = await asyncio.to_thread(
+                recognize_message_now,
+                session_factory,
+                raw_message_id=raw_message.id,
+                ai_recognition_config=ai_recognition_config,
+            )
+            # ── exit signal → lifecycle monitor ──
+            if lifecycle_monitor is not None and recog_result is not None:
+                ai_payload = recog_result.ai_payload or {}
+                strategy_kind = ai_payload.get("strategy_kind")
+                if strategy_kind == "exit":
+                    strategy = ai_payload.get("strategy") or {}
+                    symbol = str(strategy.get("symbol") or "")
+                    side = str(strategy.get("side") or "")
+                    if symbol and side:
+                        await lifecycle_monitor.on_new_exit_signal(
+                            chat_id=chat_id,
+                            symbol=symbol,
+                            side=side,
+                            message_id=message_id,
+                        )
+
     if (
         strategy_alert_config is not None
         and chat_title
@@ -86,6 +141,7 @@ async def persist_live_message_event(
             record=record,
             chat_title=chat_title,
             config=strategy_alert_config,
+            recognition_result=recog_result,
         )
     return stats
 
@@ -99,6 +155,8 @@ async def run_live_listener(
     media_root: str | Path = "data/media",
     strategy_alert_config: Any | None = None,
     strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
+    ai_recognition_config: AiRecognitionConfig | None = None,
+    lifecycle_monitor: Any | None = None,
 ) -> None:
     """Attach Telethon new-message handlers and keep the client alive."""
 
@@ -122,6 +180,8 @@ async def run_live_listener(
             chat_title=title,
             strategy_alert_config=strategy_alert_config,
             strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
+            ai_recognition_config=ai_recognition_config,
+            lifecycle_monitor=lifecycle_monitor,
         )
 
     add_event_handler = getattr(client, "add_event_handler", None)
@@ -148,20 +208,40 @@ def launch_live_listener_task(
     media_root: str | Path,
     strategy_alert_config: Any | None = None,
     strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
+    ai_recognition_config: AiRecognitionConfig | None = None,
+    lifecycle_monitor: Any | None = None,
 ) -> asyncio.Task[None]:
     """Schedule the realtime listener in the current event loop."""
 
-    return asyncio.create_task(
-        runner(
-            client=client,
-            session_factory=session_factory,
-            broker=broker,
-            target_titles=target_titles,
-            media_root=media_root,
-            strategy_alert_config=strategy_alert_config,
-            strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
-        )
+    kwargs = _filter_callable_kwargs(
+        runner,
+        {
+            "client": client,
+            "session_factory": session_factory,
+            "broker": broker,
+            "target_titles": target_titles,
+            "media_root": media_root,
+            "strategy_alert_config": strategy_alert_config,
+            "strategy_alert_enabled_for_title": strategy_alert_enabled_for_title,
+            "ai_recognition_config": ai_recognition_config,
+            "lifecycle_monitor": lifecycle_monitor,
+        },
     )
+    return asyncio.create_task(runner(**kwargs))
+
+
+def _filter_callable_kwargs(callback: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    signature = inspect.signature(callback)
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return kwargs
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if key in signature.parameters
+    }
 
 
 async def run_reconcile_once(
@@ -212,6 +292,25 @@ async def run_reconcile_once(
         )
         checkpoint_message_id = history_checkpoints.get(int(dialog.get("id") or 0), 0)
         replay_floor = max(0, checkpoint_message_id - checkpoint_overlap)
+
+        # ── Also re-fetch messages whose media download failed earlier ──
+        dialog_id = int(dialog.get("id") or 0)
+        with session_factory() as session:
+            orphan_rows = (
+                session.query(RawMessage.message_id)
+                .join(MediaAsset, MediaAsset.raw_message_id == RawMessage.id)
+                .filter(
+                    RawMessage.chat_id == dialog_id,
+                    MediaAsset.local_path.is_(None),
+                )
+                .all()
+            )
+        orphan_msg_ids = {row.message_id for row in orphan_rows}
+        if orphan_msg_ids:
+            lowest_orphan = min(orphan_msg_ids)
+            if lowest_orphan > 0:
+                replay_floor = min(replay_floor, max(0, lowest_orphan - 1))
+
         payloads = [
             payload
             for payload in payloads
@@ -221,6 +320,7 @@ async def run_reconcile_once(
             normalize_message_payload(payload, archived_target_group=True)
             for payload in payloads
             if int(payload.get("message_id") or 0) > checkpoint_message_id
+            or int(payload.get("message_id") or 0) in orphan_msg_ids
         ]
         if not records:
             continue
@@ -232,7 +332,11 @@ async def run_reconcile_once(
             broker=broker,
         )
         inserted_messages += stats["inserted_messages"]
-        candidate_stats = persist_text_signal_candidates(session_factory, records)
+        candidate_stats = recognize_records_with_ai_config(
+            session_factory,
+            filter_records_by_inserted_message_keys(records, stats),
+            fallback_recognizer=persist_text_signal_candidates,
+        )
         inserted_candidates += candidate_stats["inserted_candidates"]
         trade_stats = persist_trade_ideas_from_candidates(session_factory)
         inserted_trade_ideas += trade_stats["inserted_trade_ideas"]

@@ -15,8 +15,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.llm_chat import _load_env_file_values
-from telegram_kol_research.models import RawMessage, StrategyAlert
+from telegram_kol_research.models import RawMessage, SignalCandidate, StrategyAlert, StrategyLifecycle
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
+from telegram_kol_research.time_utils import utc_naive_to_local
 
 
 @dataclass(slots=True)
@@ -38,6 +39,22 @@ class AlertDecision:
     confidence: float
     kol_label: str
     reason_short: str
+
+
+@dataclass(slots=True)
+class StrategyAlertEvent:
+    alert_type: str
+    strategy_kind: str
+    is_strategy: bool
+    confidence: float
+    reason_short: str
+    symbol: str | None
+    side: str | None
+    entry_price: str | None
+    take_profit: str | None
+    stop_loss: str | None
+    posted_at: datetime | None
+    original_text: str
 
 
 LLMRequester = Callable[..., Awaitable[str]]
@@ -191,6 +208,102 @@ def format_strategy_alert_message(
     )
 
 
+def format_structured_strategy_alert_message(
+    *,
+    chat_title: str,
+    event: StrategyAlertEvent,
+    message_id: int,
+) -> str:
+    """Format a unified human-readable Telegram alert message."""
+
+    local_time = utc_naive_to_local(event.posted_at)
+    time_text = (
+        local_time.strftime("%Y-%m-%d %H:%M:%S Asia/Shanghai")
+        if local_time is not None
+        else "-"
+    )
+    side_text = {"long": "多", "short": "空"}.get(
+        (event.side or "").lower(),
+        event.side or "-",
+    )
+    text = event.original_text.strip() or "-"
+    return "\n".join(
+        [
+            "【KOL策略提醒】",
+            f"类型: {event.alert_type}",
+            f"群组: {chat_title}",
+            f"时间: {time_text}",
+            f"交易对: {event.symbol or '-'}",
+            f"方向: {side_text}",
+            f"入场价格: {event.entry_price or '-'}",
+            f"止盈价格: {event.take_profit or '-'}",
+            f"止损价格: {event.stop_loss or '-'}",
+            f"消息ID: {message_id}",
+            "",
+            "原文:",
+            text,
+        ]
+    )
+
+
+def build_strategy_alert_event_from_recognition(
+    *,
+    session_factory: sessionmaker,
+    record: NormalizedMessageRecord,
+    recognition_result: Any | None,
+) -> StrategyAlertEvent | None:
+    """Build an alert event from persisted recognition/candidate/lifecycle state."""
+
+    raw_message, candidate, lifecycle = _load_alert_context(session_factory, record)
+    if raw_message is None or candidate is None:
+        return None
+    if candidate.event_type == "duplicate_entry_signal":
+        return None
+
+    event_type = candidate.event_type or ""
+    parse_source = candidate.parse_source or ""
+    strategy_kind = _strategy_kind_for_candidate(candidate, lifecycle)
+    alert_type = _alert_type_for_candidate(candidate, lifecycle)
+    if alert_type is None:
+        return None
+
+    confidence = float(candidate.confidence or 0.0)
+    ai_payload = getattr(recognition_result, "ai_payload", None) or {}
+    reason = str(ai_payload.get("reason") or getattr(recognition_result, "reason", None) or "").strip()
+
+    entry_price = candidate.entry_text
+    take_profit = candidate.take_profit_text
+    stop_loss = candidate.stop_loss_text
+    if lifecycle is not None:
+        if event_type == "entry_signal" and parse_source == "lifecycle_ai":
+            entry_price = _format_number(lifecycle.entry_price_actual) or entry_price
+        elif event_type == "close_signal":
+            entry_price = (
+                _format_number(lifecycle.entry_price_actual)
+                or _format_lifecycle_entry_range(lifecycle)
+                or entry_price
+            )
+        else:
+            entry_price = entry_price or _format_lifecycle_entry_range(lifecycle)
+        take_profit = take_profit or lifecycle.take_profit
+        stop_loss = stop_loss or _format_number(lifecycle.stop_loss)
+
+    return StrategyAlertEvent(
+        alert_type=alert_type,
+        strategy_kind=strategy_kind,
+        is_strategy=True,
+        confidence=confidence,
+        reason_short=reason,
+        symbol=candidate.symbol or (lifecycle.symbol if lifecycle is not None else None),
+        side=candidate.side or (lifecycle.side if lifecycle is not None else None),
+        entry_price=entry_price,
+        take_profit=take_profit,
+        stop_loss=stop_loss,
+        posted_at=raw_message.posted_at or record.posted_at,
+        original_text=raw_message.text or record.text or "",
+    )
+
+
 async def request_strategy_alert_decision(
     *,
     config: StrategyAlertConfig,
@@ -252,6 +365,7 @@ async def process_strategy_alert_for_record(
     record: NormalizedMessageRecord,
     chat_title: str,
     config: StrategyAlertConfig,
+    recognition_result: Any | None = None,
     llm_requester: LLMRequester = request_strategy_alert_decision,
     bot_sender: BotSender = send_strategy_alert_bot_message,
 ) -> dict[str, Any]:
@@ -264,6 +378,60 @@ async def process_strategy_alert_for_record(
     )
     if alert_status == "sent":
         return {"status": "already_sent"}
+
+    event = build_strategy_alert_event_from_recognition(
+        session_factory=session_factory,
+        record=record,
+        recognition_result=recognition_result,
+    )
+    if event is not None:
+        message = format_structured_strategy_alert_message(
+            chat_title=chat_title,
+            event=event,
+            message_id=record.message_id,
+        )
+        try:
+            await _retry_async(
+                lambda: bot_sender(config=config, text=message),
+                attempts=3,
+            )
+        except Exception as exc:
+            _update_alert(
+                session_factory,
+                record=record,
+                status="bot_failed",
+                is_strategy=event.is_strategy,
+                strategy_kind=event.strategy_kind,
+                ai_confidence=event.confidence,
+                reason_short=event.reason_short,
+                error_message=str(exc),
+            )
+            return {"status": "bot_failed", "error": str(exc), "event": event}
+
+        _update_alert(
+            session_factory,
+            record=record,
+            status="sent",
+            is_strategy=event.is_strategy,
+            strategy_kind=event.strategy_kind,
+            ai_confidence=event.confidence,
+            reason_short=event.reason_short,
+            error_message=None,
+            forwarded_at=datetime.now(UTC),
+        )
+        return {"status": "sent", "event": event}
+
+    if recognition_result is not None:
+        _update_alert(
+            session_factory,
+            record=record,
+            status="ignored_not_strategy",
+            is_strategy=False,
+            strategy_kind="other",
+            ai_confidence=None,
+            reason_short=getattr(recognition_result, "reason", None),
+        )
+        return {"status": "ignored_not_strategy"}
 
     text = (record.text or "").strip()
     if not text:
@@ -353,6 +521,114 @@ async def process_strategy_alert_for_record(
         forwarded_at=datetime.now(UTC),
     )
     return {"status": "sent", "decision": decision}
+
+
+def _load_alert_context(
+    session_factory: sessionmaker,
+    record: NormalizedMessageRecord,
+) -> tuple[RawMessage | None, SignalCandidate | None, StrategyLifecycle | None]:
+    with session_factory() as session:
+        raw_message = (
+            session.query(RawMessage)
+            .filter(
+                RawMessage.chat_id == record.chat_id,
+                RawMessage.message_id == record.message_id,
+            )
+            .one_or_none()
+        )
+        if raw_message is None:
+            return None, None, None
+        candidate = (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == raw_message.id)
+            .order_by(SignalCandidate.id.asc())
+            .first()
+        )
+        lifecycle = _find_related_lifecycle(session, raw_message, candidate)
+        return raw_message, candidate, lifecycle
+
+
+def _find_related_lifecycle(
+    session,
+    raw_message: RawMessage,
+    candidate: SignalCandidate | None,
+) -> StrategyLifecycle | None:
+    if candidate is None:
+        return None
+    if candidate.event_type in {"entry_signal", "duplicate_entry_signal"}:
+        lifecycle = (
+            session.query(StrategyLifecycle)
+            .filter(
+                StrategyLifecycle.chat_id == raw_message.chat_id,
+                StrategyLifecycle.message_id == raw_message.message_id,
+            )
+            .one_or_none()
+        )
+        if lifecycle is not None:
+            return lifecycle
+    query = session.query(StrategyLifecycle).filter(StrategyLifecycle.chat_id == raw_message.chat_id)
+    if candidate.symbol:
+        query = query.filter(StrategyLifecycle.symbol == candidate.symbol)
+    if candidate.side:
+        query = query.filter(StrategyLifecycle.side == candidate.side)
+    query = query.filter(
+        (
+            StrategyLifecycle.entry_signal_message_id == raw_message.message_id
+        )
+        | (
+            StrategyLifecycle.exit_signal_message_id == raw_message.message_id
+        )
+        | (
+            StrategyLifecycle.management_signal_message_id == raw_message.message_id
+        )
+    )
+    return query.order_by(StrategyLifecycle.updated_at.desc(), StrategyLifecycle.id.desc()).first()
+
+
+def _alert_type_for_candidate(
+    candidate: SignalCandidate,
+    lifecycle: StrategyLifecycle | None,
+) -> str | None:
+    if candidate.event_type == "entry_signal":
+        if candidate.parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
+            return "入场"
+        return "新策略"
+    if candidate.event_type == "close_signal":
+        if lifecycle is not None and lifecycle.exit_reason == "cancelled":
+            return "取消挂单"
+        return "离场"
+    if candidate.event_type == "position_update":
+        return "突发消息"
+    return None
+
+
+def _strategy_kind_for_candidate(
+    candidate: SignalCandidate,
+    lifecycle: StrategyLifecycle | None,
+) -> str:
+    if candidate.event_type == "entry_signal":
+        return "entry"
+    if candidate.event_type == "close_signal":
+        return "cancel_entry" if lifecycle is not None and lifecycle.exit_reason == "cancelled" else "exit"
+    if candidate.event_type == "position_update":
+        return "position_update"
+    return candidate.event_type or "other"
+
+
+def _format_lifecycle_entry_range(lifecycle: StrategyLifecycle) -> str | None:
+    low = _format_number(lifecycle.entry_range_low)
+    high = _format_number(lifecycle.entry_range_high)
+    if not low and not high:
+        return None
+    if low and high and low != high:
+        return f"{low}-{high}"
+    return low or high
+
+
+def _format_number(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return f"{value:g}"
 
 
 async def _retry_async(callback: Callable[[], Awaitable[Any]], *, attempts: int) -> Any:

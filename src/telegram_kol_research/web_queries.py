@@ -21,16 +21,41 @@ def load_group_rows(
     session_factory: sessionmaker,
     *,
     group_labels_by_title: dict[str, str] | None = None,
+    configured_groups: Iterable[object] | None = None,
 ) -> list[dict[str, int | str | datetime | None | bool]]:
     """Load aggregated group rows ordered by most recent activity."""
 
     label_map = group_labels_by_title or {}
+    configured_by_chat_id = {
+        int(getattr(group, "chat_id")): group
+        for group in configured_groups or []
+        if getattr(group, "chat_id", None) is not None
+    }
     with session_factory() as session:
+        # Single-pass: aggregate counts + latest sender via window function
+        latest_sub = (
+            session.query(
+                RawMessage.chat_id,
+                RawMessage.sender_name,
+                func.row_number()
+                .over(
+                    partition_by=RawMessage.chat_id,
+                    order_by=[RawMessage.posted_at.desc(), RawMessage.message_id.desc()],
+                )
+                .label("rn"),
+            )
+            .subquery()
+        )
         rows = (
             session.query(
                 RawMessage.chat_id.label("chat_id"),
                 func.max(RawMessage.posted_at).label("last_posted_at"),
                 func.count(RawMessage.id).label("message_count"),
+                latest_sub.c.sender_name.label("latest_sender"),
+            )
+            .outerjoin(
+                latest_sub,
+                (latest_sub.c.chat_id == RawMessage.chat_id) & (latest_sub.c.rn == 1),
             )
             .group_by(RawMessage.chat_id)
             .order_by(func.max(RawMessage.posted_at).desc(), RawMessage.chat_id.desc())
@@ -38,18 +63,13 @@ def load_group_rows(
         )
 
         results: list[dict[str, int | str | datetime | None | bool]] = []
+        seen_chat_ids: set[int] = set()
         for row in rows:
-            latest_message = (
-                session.query(RawMessage)
-                .filter(RawMessage.chat_id == row.chat_id)
-                .order_by(RawMessage.posted_at.desc(), RawMessage.message_id.desc())
-                .first()
-            )
-            raw_title = (
-                latest_message.sender_name
-                if latest_message and latest_message.sender_name
-                else str(row.chat_id)
-            )
+            seen_chat_ids.add(int(row.chat_id))
+            raw_title = row.latest_sender or str(row.chat_id)
+            configured_group = configured_by_chat_id.get(int(row.chat_id))
+            if configured_group is not None:
+                raw_title = str(getattr(configured_group, "chat_title", raw_title))
             results.append(
                 {
                     "chat_id": row.chat_id,
@@ -57,6 +77,21 @@ def load_group_rows(
                     "raw_title": raw_title,
                     "last_posted_at": utc_naive_to_local(row.last_posted_at),
                     "message_count": row.message_count,
+                    "has_media": False,
+                }
+            )
+        for group in configured_groups or []:
+            chat_id = getattr(group, "chat_id", None)
+            if chat_id is None or int(chat_id) in seen_chat_ids:
+                continue
+            title = str(getattr(group, "chat_title", chat_id))
+            results.append(
+                {
+                    "chat_id": int(chat_id),
+                    "title": label_map.get(title, title),
+                    "raw_title": title,
+                    "last_posted_at": None,
+                    "message_count": 0,
                     "has_media": False,
                 }
             )
@@ -178,14 +213,45 @@ def _serialize_raw_messages(
     session,
     raw_messages: list[RawMessage],
 ) -> list[dict[str, object | None]]:
+    if not raw_messages:
+        return []
+
+    raw_message_ids = [msg.id for msg in raw_messages]
+
+    # ── Bulk-load media assets ──
+    all_media = (
+        session.query(MediaAsset)
+        .filter(MediaAsset.raw_message_id.in_(raw_message_ids))
+        .order_by(MediaAsset.raw_message_id.asc(), MediaAsset.id.asc())
+        .all()
+    )
+    media_by_msg_id: dict[int, list[MediaAsset]] = {}
+    for m in all_media:
+        media_by_msg_id.setdefault(m.raw_message_id, []).append(m)
+
+    # ── Bulk-load recognitions ──
+    all_recs = (
+        session.query(MessageRecognition)
+        .filter(MessageRecognition.raw_message_id.in_(raw_message_ids))
+        .all()
+    )
+    rec_by_msg_id: dict[int, MessageRecognition] = {r.raw_message_id: r for r in all_recs}
+
+    # ── Bulk-load signal candidates ──
+    all_candidates = (
+        session.query(SignalCandidate)
+        .filter(SignalCandidate.raw_message_id.in_(raw_message_ids))
+        .order_by(SignalCandidate.raw_message_id.asc(), SignalCandidate.confidence.desc(), SignalCandidate.id.asc())
+        .all()
+    )
+    cand_by_msg_id: dict[int, SignalCandidate] = {}
+    for c in all_candidates:
+        if c.raw_message_id not in cand_by_msg_id:
+            cand_by_msg_id[c.raw_message_id] = c
+
     rows: list[dict[str, object | None]] = []
     for raw_message in raw_messages:
-        media_assets = (
-            session.query(MediaAsset)
-            .filter(MediaAsset.raw_message_id == raw_message.id)
-            .order_by(MediaAsset.id.asc())
-            .all()
-        )
+        media_assets = media_by_msg_id.get(raw_message.id, [])
         media_asset_rows = _serialize_media_assets(media_assets)
         rows.append(
             {
@@ -199,9 +265,9 @@ def _serialize_raw_messages(
                 "text": raw_message.text,
                 "reply_to_message_id": raw_message.reply_to_message_id,
                 "media_assets": media_asset_rows,
-                "strategy_detection": _load_strategy_detection(
-                    session,
-                    raw_message=raw_message,
+                "strategy_detection": _build_strategy_detection(
+                    recognition=rec_by_msg_id.get(raw_message.id),
+                    candidate=cand_by_msg_id.get(raw_message.id),
                     media_assets=media_assets,
                 ),
                 "reply_context": None,
@@ -224,17 +290,12 @@ def _serialize_media_assets(media_assets: list[MediaAsset]) -> list[dict[str, ob
     ]
 
 
-def _load_strategy_detection(
-    session,
+def _build_strategy_detection(
     *,
-    raw_message: RawMessage,
+    recognition: MessageRecognition | None,
+    candidate: SignalCandidate | None,
     media_assets: list[MediaAsset],
 ) -> dict[str, str | None]:
-    recognition = (
-        session.query(MessageRecognition)
-        .filter(MessageRecognition.raw_message_id == raw_message.id)
-        .one_or_none()
-    )
     if recognition is not None:
         return {
             "status": recognition.status,
@@ -243,12 +304,6 @@ def _load_strategy_detection(
             "reason": recognition.reason,
         }
 
-    candidate = (
-        session.query(SignalCandidate)
-        .filter(SignalCandidate.raw_message_id == raw_message.id)
-        .order_by(SignalCandidate.confidence.desc(), SignalCandidate.id.asc())
-        .first()
-    )
     if candidate is not None:
         return {
             "status": "是策略",
@@ -313,3 +368,710 @@ def _has_video_like_media(media_assets: list[MediaAsset]) -> bool:
         if "video" in media_kind or "document" in media_kind or mime_type.startswith("video/"):
             return True
     return False
+
+
+# ── strategy lifecycle queries ────────────────────────────────────
+
+
+def _format_lifecycle_entry_text(
+    entry_low: float | None,
+    entry_high: float | None,
+) -> str | None:
+    if entry_low is None and entry_high is None:
+        return None
+    if entry_low is None:
+        return f"{entry_high:g}"
+    if entry_high is None or entry_low == entry_high:
+        return f"{entry_low:g}"
+    return f"{entry_low:g}-{entry_high:g}"
+
+
+POSITION_SIZE_RISK_USDT = 1000.0
+
+
+def _position_size_entry_price(
+    *,
+    entry_price_actual: float | None,
+    entry_low: float | None,
+    entry_high: float | None,
+) -> float | None:
+    if entry_price_actual is not None and entry_price_actual > 0:
+        return float(entry_price_actual)
+    prices = [value for value in (entry_low, entry_high) if value is not None and value > 0]
+    if not prices:
+        return None
+    return sum(prices) / len(prices)
+
+
+def _format_position_size_text(
+    *,
+    symbol: str | None,
+    entry_price_actual: float | None,
+    entry_low: float | None,
+    entry_high: float | None,
+    stop_loss: float | None,
+    risk_usdt: float = POSITION_SIZE_RISK_USDT,
+) -> str | None:
+    entry_price = _position_size_entry_price(
+        entry_price_actual=entry_price_actual,
+        entry_low=entry_low,
+        entry_high=entry_high,
+    )
+    if entry_price is None or stop_loss is None:
+        return None
+    price_risk = abs(float(entry_price) - float(stop_loss))
+    if price_risk <= 0:
+        return None
+    quantity = risk_usdt / price_risk
+    base_symbol = _base_symbol(symbol)
+    suffix = f" {base_symbol}" if base_symbol else ""
+    return f"{quantity:.6g}{suffix}（止损{risk_usdt:g}U）"
+
+
+def _message_excerpt(text: str | None, *, limit: int = 96) -> str | None:
+    if not text:
+        return None
+    compact = " ".join(str(text).split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1] + "..."
+
+
+def _lifecycle_status_label(status: str | None, exit_reason: str | None = None) -> str:
+    if status == "pending_entry":
+        return "待入场"
+    if status == "entered":
+        return "持仓中"
+    if status == "expired" or exit_reason == "expired":
+        return "过期未入场"
+    if exit_reason == "cancelled":
+        return "取消挂单"
+    if exit_reason == "kol_signal":
+        return "KOL离场信号"
+    if exit_reason == "stop_loss":
+        return "止损离场"
+    if exit_reason == "take_profit":
+        return "止盈离场"
+    if status == "exited":
+        return "已离场"
+    return str(status or "未知状态")
+
+
+def _lifecycle_status_detail(status: str | None, exit_reason: str | None = None) -> str:
+    if status == "pending_entry":
+        return "原策略已记录，等待价格触发或 KOL 后续确认。"
+    if status == "entered":
+        return "策略已入场，继续跟踪止盈、止损和 KOL 后续离场消息。"
+    if exit_reason == "cancelled":
+        return "KOL 后续消息取消了这笔限价挂单，策略未入场。"
+    if exit_reason == "kol_signal":
+        return "KOL 后续消息要求离场或平仓。"
+    if exit_reason == "stop_loss":
+        return "行情触发止损条件。"
+    if exit_reason == "take_profit":
+        return "行情触发止盈条件。"
+    if status == "expired" or exit_reason == "expired":
+        return "超过跟踪窗口仍未触发入场。"
+    return "策略生命周期已结束。"
+
+
+def _management_action_label(action: str | None) -> str:
+    if action and "partial_take_profit" in action and "move_stop_to_protect" in action:
+        return "部分止盈 + 保护止损"
+    if action == "partial_take_profit":
+        return "部分止盈"
+    if action == "move_stop_to_protect":
+        return "保护止损"
+    if action == "risk_update":
+        return "风控更新"
+    if action == "hold_update":
+        return "继续持有"
+    if action:
+        return str(action)
+    return "持仓管理"
+
+
+def _latest_event_label(status: str | None, exit_reason: str | None = None) -> str:
+    if exit_reason == "cancelled":
+        return "取消挂单"
+    if exit_reason == "kol_signal":
+        return "KOL离场"
+    if exit_reason == "stop_loss":
+        return "止损触发"
+    if exit_reason == "take_profit":
+        return "止盈触发"
+    if status == "expired" or exit_reason == "expired":
+        return "过期未入场"
+    if status == "entered":
+        return "入场确认"
+    if status == "pending_entry":
+        return "等待入场"
+    return "状态更新"
+
+
+def _transition_text(status: str | None, exit_reason: str | None = None) -> str:
+    if exit_reason == "cancelled":
+        return "pending_entry → cancelled"
+    if status == "expired" or exit_reason == "expired":
+        return "pending_entry → expired"
+    if exit_reason in {"kol_signal", "stop_loss", "take_profit"}:
+        return "entered → exited"
+    if status == "entered":
+        return "pending_entry → entered"
+    if status == "pending_entry":
+        return "entry_signal → pending_entry"
+    return str(status or "")
+
+
+def _apply_lifecycle_display_fields(
+    row: dict[str, object],
+    lifecycle,
+    original_message=None,
+    latest_event_message=None,
+) -> dict[str, object]:
+    latest_at = lifecycle.exited_at or lifecycle.entered_at or lifecycle.signal_at
+    if lifecycle.lifecycle_status == "pending_entry":
+        latest_at = lifecycle.signal_at
+    management_message_id = getattr(lifecycle, "management_signal_message_id", None)
+    management_action = getattr(lifecycle, "management_action", None)
+    if management_message_id is not None:
+        latest_at = latest_event_message.posted_at if latest_event_message is not None else latest_at
+
+    row.update(
+        {
+            "current_status_label": _lifecycle_status_label(
+                lifecycle.lifecycle_status,
+                lifecycle.exit_reason,
+            ),
+            "status_detail": _lifecycle_status_detail(
+                lifecycle.lifecycle_status,
+                lifecycle.exit_reason,
+            ),
+            "management_action_label": _management_action_label(management_action),
+            "management_note": getattr(lifecycle, "management_note", None),
+            "transition_text": _transition_text(
+                lifecycle.lifecycle_status,
+                lifecycle.exit_reason,
+            ),
+            "original_message_id": lifecycle.message_id,
+            "original_posted_at": utc_naive_to_local(
+                original_message.posted_at if original_message is not None else lifecycle.signal_at
+            ),
+            "original_text_excerpt": _message_excerpt(
+                original_message.text if original_message is not None else None
+            ),
+            "latest_event_label": _latest_event_label(
+                lifecycle.lifecycle_status,
+                lifecycle.exit_reason,
+            )
+            if management_message_id is None
+            else _management_action_label(management_action),
+            "latest_event_message_id": (
+                lifecycle.exit_signal_message_id
+                if lifecycle.exit_signal_message_id is not None
+                else management_message_id
+                if management_message_id is not None
+                else lifecycle.entry_signal_message_id
+                if getattr(lifecycle, "entry_signal_message_id", None) is not None
+                else lifecycle.message_id
+            ),
+            "latest_event_at": utc_naive_to_local(
+                latest_event_message.posted_at
+                if latest_event_message is not None
+                else latest_at
+            ),
+            "latest_event_text_excerpt": _message_excerpt(
+                latest_event_message.text if latest_event_message is not None else None
+            ),
+        }
+    )
+    return row
+
+
+def load_lifecycle_counts(session_factory, *, chat_id: int | None = None) -> dict[str, int]:
+    """Return counts for each lifecycle status (KPI cards)."""
+    from telegram_kol_research.models import StrategyLifecycle
+
+    with session_factory() as session:
+        query = session.query(
+            StrategyLifecycle.lifecycle_status,
+            func.count(StrategyLifecycle.id),
+        )
+        if chat_id is not None:
+            query = query.filter(StrategyLifecycle.chat_id == chat_id)
+        rows = query.group_by(StrategyLifecycle.lifecycle_status).all()
+    counts: dict[str, int] = {}
+    for status, count in rows:
+        counts[str(status)] = int(count)
+    return counts
+
+
+def load_lifecycle_counts_by_chat_id(
+    session_factory,
+    *,
+    symbol_whitelist_by_chat_id: dict[int, set[str]] | None = None,
+) -> dict[int, dict[str, int]]:
+    """Return actionable lifecycle status counts grouped by chat id for sidebar badges."""
+    from telegram_kol_research.models import StrategyLifecycle
+
+    with session_factory() as session:
+        rows = (
+            session.query(
+                StrategyLifecycle.chat_id,
+                StrategyLifecycle.lifecycle_status,
+                StrategyLifecycle.symbol,
+                StrategyLifecycle.entry_range_low,
+                StrategyLifecycle.entry_range_high,
+            )
+            .all()
+        )
+
+    counts_by_chat_id: dict[int, dict[str, int]] = {}
+    whitelist_map = symbol_whitelist_by_chat_id or {}
+    for chat_id, status, symbol, entry_low, entry_high in rows:
+        if status == "pending_entry" and not _is_actionable_pending_entry(
+            symbol=symbol,
+            entry_low=entry_low,
+            entry_high=entry_high,
+            allowed_symbols=whitelist_map.get(int(chat_id)),
+        ):
+            continue
+        status_counts = counts_by_chat_id.setdefault(int(chat_id), {})
+        status_counts[str(status)] = status_counts.get(str(status), 0) + 1
+    return counts_by_chat_id
+
+
+def _is_actionable_pending_entry(
+    *,
+    symbol: str | None,
+    entry_low: float | None,
+    entry_high: float | None,
+    allowed_symbols: set[str] | None = None,
+) -> bool:
+    normalized_symbol = _base_symbol(symbol)
+    if normalized_symbol in {"", "?", "QQ"}:
+        return False
+    if allowed_symbols is not None and normalized_symbol not in allowed_symbols:
+        return False
+    if entry_low is None and entry_high is None:
+        return False
+    return _entry_price_is_plausible(
+        symbol=normalized_symbol,
+        entry_low=entry_low,
+        entry_high=entry_high,
+    )
+
+
+def _base_symbol(symbol: str | None) -> str:
+    normalized = (symbol or "").upper().replace("-", "").replace("_", "")
+    for suffix in ("USDT", "USD", "PERP", "SWAP"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix):
+            normalized = normalized[: -len(suffix)]
+    return normalized
+
+
+def _entry_price_is_plausible(
+    *,
+    symbol: str,
+    entry_low: float | None,
+    entry_high: float | None,
+) -> bool:
+    prices = [value for value in (entry_low, entry_high) if value is not None]
+    if not prices:
+        return False
+    min_price = min(prices)
+    if symbol == "BTC":
+        return min_price >= 1000
+    if symbol == "ETH":
+        return min_price >= 100
+    return min_price > 0
+
+
+def list_holding_strategies(
+    session_factory, *, chat_id: int | None = None, limit: int = 50
+) -> list[dict[str, object]]:
+    """Return *entered* lifecycle records with their signal-candidate details."""
+    from telegram_kol_research.models import (
+        SignalCandidate, RawMessage, StrategyLifecycle,
+    )
+
+    with session_factory() as session:
+        q = (
+            session.query(StrategyLifecycle, SignalCandidate, RawMessage)
+            .outerjoin(
+                SignalCandidate,
+                StrategyLifecycle.signal_candidate_id == SignalCandidate.id,
+            )
+            .outerjoin(
+                RawMessage,
+                SignalCandidate.raw_message_id == RawMessage.id,
+            )
+            .filter(StrategyLifecycle.lifecycle_status == "entered")
+        )
+        if chat_id is not None:
+            q = q.filter(StrategyLifecycle.chat_id == chat_id)
+        q = q.order_by(
+            StrategyLifecycle.entered_at.desc().nullslast(),
+            StrategyLifecycle.id.desc(),
+        ).limit(limit)
+        rows = q.all()
+
+    results: list[dict[str, object]] = []
+    for lc, cand, raw_msg in rows:
+        row: dict[str, object] = {
+            "lifecycle_id": lc.id,
+            "chat_id": lc.chat_id,
+            "message_id": lc.message_id,
+            "symbol": lc.symbol,
+            "side": lc.side,
+            "lifecycle_status": lc.lifecycle_status,
+            "signal_at": utc_naive_to_local(lc.signal_at),
+            "entered_at": utc_naive_to_local(lc.entered_at),
+            "entry_price_actual": lc.entry_price_actual,
+            "entry_range_low": lc.entry_range_low,
+            "entry_range_high": lc.entry_range_high,
+            "stop_loss": lc.stop_loss,
+            "take_profit": lc.take_profit,
+            "entry_text": _format_lifecycle_entry_text(lc.entry_range_low, lc.entry_range_high),
+            "stop_loss_text": f"{lc.stop_loss:g}" if lc.stop_loss is not None else None,
+            "take_profit_text": lc.take_profit,
+            "position_size_text": _format_position_size_text(
+                symbol=lc.symbol,
+                entry_price_actual=lc.entry_price_actual,
+                entry_low=lc.entry_range_low,
+                entry_high=lc.entry_range_high,
+                stop_loss=lc.stop_loss,
+            ),
+            "position_size_risk_usdt": POSITION_SIZE_RISK_USDT,
+            "filled_tp_index": lc.filled_tp_index,
+            "last_checked_at": utc_naive_to_local(lc.last_checked_at),
+        }
+        if cand is not None:
+            row["entry_text"] = cand.entry_text or row["entry_text"]
+            row["stop_loss_text"] = cand.stop_loss_text or row["stop_loss_text"]
+            row["take_profit_text"] = cand.take_profit_text or row["take_profit_text"]
+            row["confidence"] = cand.confidence
+        if raw_msg is not None:
+            row["sender_name"] = raw_msg.sender_name
+            row["posted_at"] = utc_naive_to_local(raw_msg.posted_at)
+        latest_event_msg = None
+        if getattr(lc, "management_signal_message_id", None) is not None:
+            latest_event_msg = (
+                session.query(RawMessage)
+                .filter(RawMessage.chat_id == lc.chat_id)
+                .filter(RawMessage.message_id == lc.management_signal_message_id)
+                .one_or_none()
+            )
+        elif getattr(lc, "entry_signal_message_id", None) is not None:
+            latest_event_msg = (
+                session.query(RawMessage)
+                .filter(RawMessage.chat_id == lc.chat_id)
+                .filter(RawMessage.message_id == lc.entry_signal_message_id)
+                .one_or_none()
+            )
+        _apply_lifecycle_display_fields(row, lc, raw_msg, latest_event_msg)
+        results.append(row)
+
+    return results
+
+
+def list_pending_strategies(
+    session_factory,
+    *,
+    chat_id: int | None = None,
+    limit: int = 50,
+    symbol_whitelist_by_chat_id: dict[int, set[str]] | None = None,
+) -> list[dict[str, object]]:
+    """Return actionable *pending_entry* lifecycle records."""
+    from telegram_kol_research.models import (
+        SignalCandidate, RawMessage, StrategyLifecycle,
+    )
+
+    with session_factory() as session:
+        q = (
+            session.query(StrategyLifecycle, SignalCandidate, RawMessage)
+            .outerjoin(
+                SignalCandidate,
+                StrategyLifecycle.signal_candidate_id == SignalCandidate.id,
+            )
+            .outerjoin(
+                RawMessage,
+                SignalCandidate.raw_message_id == RawMessage.id,
+            )
+            .filter(StrategyLifecycle.lifecycle_status == "pending_entry")
+            .filter(~StrategyLifecycle.symbol.in_(["", "?", "QQ"]))
+            .filter(
+                or_(
+                    StrategyLifecycle.entry_range_low.isnot(None),
+                    StrategyLifecycle.entry_range_high.isnot(None),
+                )
+            )
+        )
+        if chat_id is not None:
+            q = q.filter(StrategyLifecycle.chat_id == chat_id)
+        q = q.order_by(
+            StrategyLifecycle.signal_at.desc(),
+            StrategyLifecycle.id.desc(),
+        )
+        rows = q.all()
+
+    results: list[dict[str, object]] = []
+    whitelist_map = symbol_whitelist_by_chat_id or {}
+    for lc, cand, raw_msg in rows:
+        if not _is_actionable_pending_entry(
+            symbol=lc.symbol,
+            entry_low=lc.entry_range_low,
+            entry_high=lc.entry_range_high,
+            allowed_symbols=whitelist_map.get(int(lc.chat_id)),
+        ):
+            continue
+        row: dict[str, object] = {
+            "lifecycle_id": lc.id,
+            "chat_id": lc.chat_id,
+            "message_id": lc.message_id,
+            "symbol": lc.symbol,
+            "side": lc.side,
+            "lifecycle_status": lc.lifecycle_status,
+            "execution_status": "pending_entry",
+            "signal_at": utc_naive_to_local(lc.signal_at),
+            "entry_range_low": lc.entry_range_low,
+            "entry_range_high": lc.entry_range_high,
+            "stop_loss": lc.stop_loss,
+            "take_profit": lc.take_profit,
+            "entry_range_text": _format_lifecycle_entry_text(
+                lc.entry_range_low,
+                lc.entry_range_high,
+            ),
+            "entry_text": _format_lifecycle_entry_text(
+                lc.entry_range_low,
+                lc.entry_range_high,
+            ),
+            "stop_loss_text": f"{lc.stop_loss:g}" if lc.stop_loss is not None else None,
+            "take_profit_text": lc.take_profit,
+            "position_size_text": _format_position_size_text(
+                symbol=lc.symbol,
+                entry_price_actual=lc.entry_price_actual,
+                entry_low=lc.entry_range_low,
+                entry_high=lc.entry_range_high,
+                stop_loss=lc.stop_loss,
+            ),
+            "position_size_risk_usdt": POSITION_SIZE_RISK_USDT,
+            "last_checked_at": utc_naive_to_local(lc.last_checked_at),
+        }
+        if cand is not None:
+            row["entry_range_text"] = cand.entry_text or row["entry_range_text"]
+            row["entry_text"] = cand.entry_text or row["entry_text"]
+            row["stop_loss_text"] = cand.stop_loss_text or row["stop_loss_text"]
+            row["take_profit_text"] = cand.take_profit_text or row["take_profit_text"]
+            row["confidence"] = cand.confidence
+        if raw_msg is not None:
+            row["sender_name"] = raw_msg.sender_name
+            row["posted_at"] = utc_naive_to_local(raw_msg.posted_at)
+        _apply_lifecycle_display_fields(row, lc, raw_msg)
+        results.append(row)
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def list_exited_strategies(
+    session_factory, *, chat_id: int | None = None, limit: int = 50
+) -> list[dict[str, object]]:
+    """Return exited / expired strategies from all available sources.
+
+    Merges three data sources (deduplicated by chat_id + message_id + symbol + side):
+    1. StrategyLifecycle (exited / expired) — the new lifecycle tracker
+    2. ExecutionBinding (closed / cancelled) — exchange-tracked
+    3. TradeIdea (closed) + close TradeUpdates — old strategy tracker
+    """
+    from telegram_kol_research.models import (
+        SignalCandidate, RawMessage, StrategyLifecycle,
+        ExecutionBinding, TradeIdea, TradeUpdate,
+    )
+
+    results: list[dict[str, object]] = []
+    seen_signal_keys: set[tuple[int, int, str, str]] = set()
+
+    def signal_key(
+        chat_id_value: int | None,
+        message_id_value: int | None,
+        symbol_value: str | None,
+        side_value: str | None,
+    ) -> tuple[int, int, str, str] | None:
+        if chat_id_value is None or message_id_value is None:
+            return None
+        return (
+            int(chat_id_value),
+            int(message_id_value),
+            (symbol_value or "?").upper(),
+            (side_value or "?").lower(),
+        )
+
+    with session_factory() as session:
+        # ── 1. StrategyLifecycle (exited / expired) ──
+        lc_q = (
+            session.query(StrategyLifecycle, SignalCandidate, RawMessage)
+            .outerjoin(
+                SignalCandidate,
+                StrategyLifecycle.signal_candidate_id == SignalCandidate.id,
+            )
+            .outerjoin(
+                RawMessage,
+                SignalCandidate.raw_message_id == RawMessage.id,
+            )
+            .filter(
+                StrategyLifecycle.lifecycle_status.in_(["exited", "expired"])
+            )
+        )
+        if chat_id is not None:
+            lc_q = lc_q.filter(StrategyLifecycle.chat_id == chat_id)
+        lc_q = lc_q.order_by(
+            StrategyLifecycle.exited_at.desc().nullslast(),
+            StrategyLifecycle.id.desc(),
+        ).limit(limit)
+
+        for lc, cand, raw_msg in lc_q.all():
+            key = signal_key(lc.chat_id, lc.message_id, lc.symbol, lc.side)
+            if key is not None and key in seen_signal_keys:
+                continue
+            if key is not None:
+                seen_signal_keys.add(key)
+            row: dict[str, object] = {
+                "lifecycle_id": lc.id,
+                "chat_id": lc.chat_id,
+                "message_id": lc.message_id,
+                "symbol": lc.symbol,
+                "side": lc.side,
+                "source": "lifecycle",
+                "lifecycle_status": lc.lifecycle_status,
+                "exit_reason": lc.exit_reason,
+                "signal_at": utc_naive_to_local(lc.signal_at),
+                "entered_at": utc_naive_to_local(lc.entered_at),
+                "exited_at": utc_naive_to_local(lc.exited_at),
+                "entry_price_actual": lc.entry_price_actual,
+                "exit_price_actual": lc.exit_price_actual,
+                "stop_loss": lc.stop_loss,
+                "take_profit": lc.take_profit,
+                "entry_text": _format_lifecycle_entry_text(
+                    lc.entry_range_low,
+                    lc.entry_range_high,
+                ),
+                "stop_loss_text": f"{lc.stop_loss:g}" if lc.stop_loss is not None else None,
+                "take_profit_text": lc.take_profit,
+                "position_size_text": _format_position_size_text(
+                    symbol=lc.symbol,
+                    entry_price_actual=lc.entry_price_actual,
+                    entry_low=lc.entry_range_low,
+                    entry_high=lc.entry_range_high,
+                    stop_loss=lc.stop_loss,
+                ),
+                "position_size_risk_usdt": POSITION_SIZE_RISK_USDT,
+            }
+            if cand is not None:
+                row["entry_text"] = cand.entry_text or row["entry_text"]
+                row["stop_loss_text"] = cand.stop_loss_text or row["stop_loss_text"]
+                row["take_profit_text"] = cand.take_profit_text or row["take_profit_text"]
+                row["confidence"] = cand.confidence
+            if raw_msg is not None:
+                row["sender_name"] = raw_msg.sender_name
+                row["posted_at"] = utc_naive_to_local(raw_msg.posted_at)
+            latest_event_msg = None
+            if lc.exit_signal_message_id is not None:
+                latest_event_msg = (
+                    session.query(RawMessage)
+                    .filter(RawMessage.chat_id == lc.chat_id)
+                    .filter(RawMessage.message_id == lc.exit_signal_message_id)
+                    .one_or_none()
+                )
+            _apply_lifecycle_display_fields(row, lc, raw_msg, latest_event_msg)
+            results.append(row)
+
+        # ── 2. ExecutionBinding (closed / cancelled) ──
+        eb_q = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.status.in_(["closed", "cancelled", "filled"]))
+        )
+        if chat_id is not None:
+            eb_q = eb_q.filter(ExecutionBinding.chat_id == chat_id)
+        eb_q = eb_q.order_by(ExecutionBinding.updated_at.desc()).limit(limit)
+
+        for eb in eb_q.all():
+            key = signal_key(eb.chat_id, eb.message_id, eb.symbol, eb.side)
+            if key is not None and key in seen_signal_keys:
+                continue
+            if key is not None:
+                seen_signal_keys.add(key)
+            results.append({
+                "chat_id": eb.chat_id,
+                "message_id": eb.message_id,
+                "symbol": eb.symbol,
+                "side": eb.side,
+                "source": "execution_binding",
+                "lifecycle_status": "exited",
+                "exit_reason": eb.status,
+                "entered_at": utc_naive_to_local(eb.created_at),
+                "exited_at": utc_naive_to_local(eb.updated_at),
+                "sender_name": eb.kol_id,
+            })
+
+        # ── 3. TradeIdea (closed) ──
+        closed_trade_ids = set()
+        if session.query(TradeIdea).count() > 0:
+            close_rows = (
+                session.query(TradeUpdate.trade_idea_id)
+                .filter(TradeUpdate.update_type.in_([
+                    "close", "close_signal", "stop_loss_hit",
+                    "take_profit_hit", "manual_close", "closed",
+                ]))
+                .all()
+            )
+            closed_trade_ids.update(r[0] for r in close_rows)
+
+        ti_q = (
+            session.query(TradeIdea, SignalCandidate, RawMessage)
+            .outerjoin(SignalCandidate, TradeIdea.primary_signal_candidate_id == SignalCandidate.id)
+            .outerjoin(RawMessage, SignalCandidate.raw_message_id == RawMessage.id)
+            .filter(TradeIdea.status == "closed")
+        )
+        if chat_id is not None:
+            ti_q = ti_q.filter(TradeIdea.chat_id == chat_id)
+        ti_q = ti_q.order_by(TradeIdea.closed_at.desc().nullslast()).limit(limit)
+
+        for ti, cand, raw_msg in ti_q.all():
+            key = signal_key(
+                ti.chat_id,
+                raw_msg.message_id if raw_msg is not None else None,
+                ti.symbol,
+                ti.side,
+            )
+            if key is not None and key in seen_signal_keys:
+                continue
+            if key is not None:
+                seen_signal_keys.add(key)
+            row = {
+                "chat_id": ti.chat_id,
+                "symbol": ti.symbol or "?",
+                "side": ti.side or "?",
+                "source": "trade_idea",
+                "lifecycle_status": "exited",
+                "exit_reason": "closed",
+                "entered_at": utc_naive_to_local(ti.opened_at),
+                "exited_at": utc_naive_to_local(ti.closed_at),
+                "confidence": ti.confidence,
+            }
+            if cand is not None:
+                row["entry_text"] = cand.entry_text
+                row["stop_loss_text"] = cand.stop_loss_text
+                row["take_profit_text"] = cand.take_profit_text
+            if raw_msg is not None:
+                row["sender_name"] = raw_msg.sender_name
+                row["message_id"] = raw_msg.message_id
+                row["posted_at"] = utc_naive_to_local(raw_msg.posted_at)
+            results.append(row)
+
+    results.sort(
+        key=lambda r: str(r.get("exited_at") or r.get("entered_at") or ""),
+        reverse=True,
+    )
+    return results[:limit]

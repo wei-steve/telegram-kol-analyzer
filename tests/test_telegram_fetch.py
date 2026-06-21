@@ -57,10 +57,11 @@ def test_fetch_dialog_messages_downloads_media_to_local_path(tmp_path):
         )
     )
 
-    downloaded_path = Path(payloads[0]["media"]["path"])
+    media_root = tmp_path / "downloaded-media"
+    downloaded_path = media_root / payloads[0]["media"]["path"]
     assert downloaded_path.exists()
     assert downloaded_path.is_file()
-    assert downloaded_path.is_relative_to(tmp_path / "downloaded-media")
+    assert downloaded_path.is_relative_to(media_root)
 
 
 def test_fetch_dialog_messages_skips_video_download(tmp_path):

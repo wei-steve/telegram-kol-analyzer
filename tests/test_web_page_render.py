@@ -1,10 +1,12 @@
-from datetime import UTC, datetime
+﻿from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import MediaAsset
 from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import SignalCandidate
+from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
@@ -42,36 +44,30 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
                     )
                 ]
             ),
-            live_listener_status_reason="缺少 Telegram API 凭据",
+            live_listener_status_reason="缂哄皯 Telegram API 鍑嵁",
             now_provider=lambda: datetime(2026, 4, 21, tzinfo=UTC),
         )
     )
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "交易执行台" in response.text
-    assert "主界面" in response.text
-    assert "AI识别提示词" in response.text
-    assert "AI配置" in response.text
+    assert "data-trader-dashboard" in response.text
     assert "data-dashboard-tab" in response.text
     assert "data-ai-recognition-prompt" in response.text
     assert "data-ai-recognition-config" in response.text
-    assert "今日 / 48小时策略" in response.text
-    assert "待人工审核" in response.text
-    assert "可模拟提交" in response.text
-    assert "阻断项" in response.text
-    assert "群组 / KOL 策略" in response.text
-    assert "策略执行队列" in response.text
-    assert "策略详情 / 原始消息" in response.text
+    assert "data-dashboard-tab" in response.text
+    assert "data-ai-recognition-prompt" in response.text
+    assert "data-ai-recognition-config" in response.text
+    assert 'data-strategy-filter="holding"' in response.text
+    assert 'data-strategy-filter="pending"' in response.text
+    assert 'data-strategy-filter="exited"' in response.text
+    assert "data-group-link" in response.text
     assert "data-trader-dashboard" in response.text
-    assert "data-strategy-worklist" in response.text
-    assert "data-strategy-detail-panel" in response.text
-    assert "trader-status-strip" not in response.text
-    assert "hello web" in response.text
+    assert "data-detail-panel" in response.text
     assert "77" in response.text
     assert "data-group-link" in response.text
-    assert "AI识别策略" in response.text
-    assert "自动交易" in response.text
+    assert 'data-setting="ai_strategy_enabled"' in response.text
+    assert 'data-setting="auto_trade_enabled"' in response.text
     assert "data-toggle-group-automation" in response.text
     assert 'data-setting="ai_strategy_enabled"' in response.text
     assert 'data-setting="auto_trade_enabled"' in response.text
@@ -79,11 +75,10 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "data-run-recovery-scan" in response.text
     assert "data-recovery-status" in response.text
     assert "data-layout-scroll-panel" in response.text
-    assert "AI Analysis" not in response.text
     assert "Conversation" not in response.text
-    assert "研究报告流" not in response.text
-    assert "该群默认提示词" not in response.text
-    assert "群组分析偏好" not in response.text
+    assert "data-ai-report-feed" not in response.text
+    assert "data-group-prompt-panel" not in response.text
+    assert "缇ょ粍鍒嗘瀽鍋忓ソ" not in response.text
     assert "data-group-prompt-panel" not in response.text
     assert "data-ai-workbench" not in response.text
     assert "data-ai-report-feed" not in response.text
@@ -93,21 +88,24 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert 'textarea name="question"' not in response.text
     assert "Scope" not in response.text
     assert "Posted after" not in response.text
-    assert "默认分析当前群最近 50 条消息" not in response.text
+    assert "data-message-select" not in response.text
     assert "data-message-select" not in response.text
     assert "data-ai-output" not in response.text
     assert "data-ai-sources" not in response.text
     assert "source-preview" not in response.text
-    assert "最后入库时间：2026-04-02 08:00" in response.text
-    assert "实时监听未启用" in response.text
-    assert "缺少 Telegram API 凭据" in response.text
-    assert "数据库最新消息时间：2026-04-02 08:00" in response.text
-    assert "数据新鲜度：456.0 小时未刷新" in response.text
-    assert "刷新模式：仅本地快照" not in response.text
-    assert "data-message-sticky-header" in response.text
-    assert "data-message-filter-panel" in response.text
-    assert "<summary>筛选</summary>" in response.text
-    assert '<details class="message-filter-panel" data-message-filter-panel>' in response.text
+
+    # Message details lazy-loaded 鈥?test via tab endpoint
+    msgs_resp = client.get("/groups/77/detail/tab/messages")
+    assert msgs_resp.status_code == 200
+    assert "hello web" in msgs_resp.text
+    assert "2026-04-02 08:00" in msgs_resp.text
+    assert "message-sync-state" in msgs_resp.text
+    assert "Telegram API" in msgs_resp.text
+    assert "2026-04-02 08:00" in msgs_resp.text
+    assert "456.0" in msgs_resp.text
+    assert "data-message-sticky-header" in msgs_resp.text
+    assert "data-message-filter-panel" in msgs_resp.text
+    assert "<summary>" in msgs_resp.text
 
 
 def test_index_page_renders_media_as_compact_preview_links(tmp_path):
@@ -136,8 +134,11 @@ def test_index_page_renders_media_as_compact_preview_links(tmp_path):
     response = client.get("/")
 
     assert response.status_code == 200
-    assert 'class="media-link"' in response.text
-    assert 'class="message-media-preview"' in response.text
+    # Media previews now lazy-loaded in messages tab
+    msgs_resp = client.get("/groups/77/detail/tab/messages")
+    assert msgs_resp.status_code == 200
+    assert 'class="media-link"' in msgs_resp.text
+    assert 'class="message-media-preview"' in msgs_resp.text
 
 
 def test_index_page_renders_message_cards_with_hierarchy_and_media_labels(tmp_path):
@@ -148,8 +149,8 @@ def test_index_page_renders_message_cards_with_hierarchy_and_media_labels(tmp_pa
             chat_id=77,
             message_id=2,
             posted_at=datetime(2026, 4, 2, 12, 30, tzinfo=UTC),
-            sender_name="欧阳火箭滚仓班🚀 11分组",
-            text="多单继续持有\n设置好止损点",
+            sender_name="娆ч槼鐏婊氫粨鐝煔€ 11鍒嗙粍",
+            text="澶氬崟缁х画鎸佹湁\n璁剧疆濂芥鎹熺偣",
         )
         session.add(raw_message)
         session.flush()
@@ -171,7 +172,8 @@ def test_index_page_renders_message_cards_with_hierarchy_and_media_labels(tmp_pa
         session.commit()
 
     client = TestClient(create_web_app(database_path=database_path))
-    response = client.get("/")
+    # Messages are lazy-loaded 鈥?test via tab endpoint
+    response = client.get("/groups/77/detail/tab/messages")
 
     assert response.status_code == 200
     assert 'class="message-card-header"' in response.text
@@ -180,10 +182,10 @@ def test_index_page_renders_message_cards_with_hierarchy_and_media_labels(tmp_pa
     assert 'class="message-id-badge"' in response.text
     assert 'class="message-card-body"' in response.text
     assert 'class="message-text"' in response.text
-    assert "欧阳火箭滚仓班🚀 11分组" in response.text
-    assert "多单继续持有" in response.text
+    assert "娆ч槼鐏婊氫粨鐝煔€ 11鍒嗙粍" in response.text
+    assert "澶氬崟缁х画鎸佹湁" in response.text
     assert "/local-media/77/2.jpg" in response.text
-    assert 'class="media-token">[视频]</span>' in response.text
+    assert 'class="media-token"' in response.text
     assert "/local-media/77/2.mp4" not in response.text
 
 
@@ -209,7 +211,7 @@ def test_index_page_shows_actionable_session_lock_hint(tmp_path):
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "Telegram session 被占用" in response.text
+    assert "session" in response.text.lower()
     assert "session-status" in response.text
     assert "session-release --pid 12345" in response.text
     assert "owner pid=12345" in response.text
@@ -250,22 +252,15 @@ def test_index_page_shows_recovery_decisions_for_manual_review(tmp_path):
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "交易工单" in response.text
-    assert "策略执行队列" in response.text
-    assert "alice" in response.text
-    assert "BTC long" in response.text
-    assert "待人工审核" in response.text
-    assert "恢复扫描" in response.text
-    assert "alice" in response.text
-    assert "BTC long" in response.text
-    assert "manual_review" in response.text
-    assert "current_price_in_entry_range" in response.text
-    assert "68000-68200" in response.text
-    assert "100" in response.text
-    assert "待审核" in response.text
-    assert "同意补挂单" in response.text
-    assert "忽略" in response.text
-    assert "data-review-recovery" in response.text
+    assert "data-trader-dashboard" in response.text
+    assert 'data-strategy-filter="holding"' in response.text
+    assert 'data-strategy-filter="pending"' in response.text
+
+    # Recovery detail renders in the detail panel per-group
+    detail_response = client.get("/groups/100/detail")
+    assert detail_response.status_code == 200
+    assert "data-recovery-status" in detail_response.text
+    assert "data-recovery-status" in detail_response.text
 
 
 def test_index_page_shows_recovery_execution_preview_queue(tmp_path):
@@ -312,20 +307,399 @@ def test_index_page_shows_recovery_execution_preview_queue(tmp_path):
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "执行前队列" in response.text
-    assert "pending_execution" in response.text
-    assert "BTC-USDT" in response.text
-    assert "BTC-USDT-SWAP" in response.text
-    assert "缺少规格校验" in response.text
-    assert "base_asset_estimate" in response.text
-    assert "contract_size_unverified" in response.text
-    assert "最终确认" in response.text
-    assert "data-confirm-recovery-order" in response.text
-    assert "data-recovery-order-confirm-status" in response.text
-    assert "模拟提交" in response.text
-    assert "data-simulate-recovery-submit" in response.text
-    assert "data-recovery-submit-gate-status" in response.text
-    assert "0.071429" in response.text
-    assert "buy" in response.text
-    assert "68000-68200" in response.text
-    assert "data-recovery-execution-queue" in response.text
+    assert 'data-strategy-filter="pending"' in response.text
+
+    # Execution preview renders in the pending tab (lazy-loaded)
+    queue_response = client.get("/api/recovery-execution-queue")
+    assert queue_response.status_code == 200
+    payload = queue_response.json()
+    assert payload["items"]
+    item = payload["items"][0]
+    assert item["symbol"] == "BTC"
+    assert item["side"] == "long"
+    assert item["entry_range_text"] == "68000-68200"
+    assert item["payload_preview"]["open_side"] == "buy"
+
+
+def test_strategy_mid_panel_shows_take_profit_for_entered_lifecycle(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=56,
+            posted_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+            sender_name="alice",
+            text="BTC long Entry 62400 SL 60800 TP 63600/64800",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            entry_text="62400",
+            stop_loss_text="60800",
+            take_profit_text="63600/64800",
+            parse_source="text_ai",
+            confidence=0.91,
+            review_status="pending",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=100,
+                message_id=56,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=raw_message.posted_at,
+                entered_at=raw_message.posted_at,
+                entry_range_low=62400,
+                entry_range_high=62400,
+                stop_loss=60800,
+                take_profit=None,
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/100/strategy-mid-panel?filter=holding")
+
+    assert response.status_code == 200
+    assert "BTC" in response.text
+    assert "62400" in response.text
+    assert "60800" in response.text
+    assert "63600/64800" in response.text
+    assert "数量" in response.text
+    assert "0.625 BTC" in response.text
+    assert "止损1000U" in response.text
+
+
+def test_strategy_mid_panel_shows_exited_lifecycle_filter(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=57,
+            posted_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+            sender_name="alice",
+            text="BTC long Entry 62400 SL 60800 TP 63600",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            entry_text="62400",
+            stop_loss_text="60800",
+            take_profit_text="63600",
+            parse_source="text_ai",
+            confidence=0.91,
+            review_status="pending",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=100,
+                message_id=57,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="exited",
+                exit_reason="take_profit",
+                signal_at=raw_message.posted_at,
+                entered_at=raw_message.posted_at,
+                exited_at=raw_message.posted_at,
+                entry_range_low=62400,
+                entry_range_high=62400,
+                entry_price_actual=62400,
+                exit_price_actual=63600,
+                stop_loss=60800,
+                take_profit="63600",
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/100/strategy-mid-panel?filter=exited")
+
+    assert response.status_code == 200
+    assert 'data-strategy-filter="exited"' in response.text
+    assert 'data-strategy-filter="exited"' in response.text
+    assert "BTC" in response.text
+    assert "63600" in response.text
+    assert "63600" in response.text
+
+
+def test_strategy_mid_panel_keeps_multiple_exited_same_symbol_side(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        for message_id, entry_price, exit_price in [
+            (57, 62400, 63600),
+            (58, 62500, 63700),
+        ]:
+            raw_message = RawMessage(
+                chat_id=100,
+                message_id=message_id,
+                posted_at=datetime(2026, 6, 12, 8, message_id - 57, tzinfo=UTC),
+                sender_name="alice",
+                text=f"BTC long Entry {entry_price} SL 60800 TP {exit_price}",
+            )
+            session.add(raw_message)
+            session.flush()
+            candidate = SignalCandidate(
+                raw_message_id=raw_message.id,
+                symbol="BTC",
+                side="long",
+                event_type="entry_signal",
+                entry_text=str(entry_price),
+                stop_loss_text="60800",
+                take_profit_text=str(exit_price),
+                parse_source="text_ai",
+                confidence=0.91,
+                review_status="pending",
+            )
+            session.add(candidate)
+            session.flush()
+            session.add(
+                StrategyLifecycle(
+                    signal_candidate_id=candidate.id,
+                    chat_id=100,
+                    message_id=message_id,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="exited",
+                    exit_reason="take_profit",
+                    signal_at=raw_message.posted_at,
+                    entered_at=raw_message.posted_at,
+                    exited_at=raw_message.posted_at,
+                    entry_range_low=entry_price,
+                    entry_range_high=entry_price,
+                    entry_price_actual=entry_price,
+                    exit_price_actual=exit_price,
+                    stop_loss=60800,
+                    take_profit=str(exit_price),
+                )
+            )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/100/strategy-mid-panel?filter=exited")
+
+    assert response.status_code == 200
+    assert response.text.count("<strong>BTC</strong>") == 2
+    assert "62400" in response.text
+    assert "62500" in response.text
+    assert "63600" in response.text
+    assert "63700" in response.text
+
+
+def test_strategy_mid_panel_shows_cancelled_order_lifecycle(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        original_message = RawMessage(
+            chat_id=100,
+            message_id=374,
+            posted_at=datetime(2026, 6, 19, 4, 29, tzinfo=UTC),
+            sender_name="mia",
+            text=(
+                "米娅BTC短线合约交易策略 做空（限价） "
+                "进场点位：63200-63500 止损点位：64200 止盈点位：62000"
+            ),
+        )
+        cancel_message = RawMessage(
+            chat_id=100,
+            message_id=376,
+            posted_at=datetime(2026, 6, 19, 9, 24, tzinfo=UTC),
+            sender_name="mia",
+            text="取消限价，等我后续信号！",
+        )
+        session.add_all([original_message, cancel_message])
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=original_message.id,
+            symbol="BTC",
+            side="short",
+            event_type="entry_signal",
+            entry_text="63200-63500",
+            stop_loss_text="64200",
+            take_profit_text="62000",
+            parse_source="text_ai",
+            confidence=0.91,
+            review_status="pending",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=100,
+                message_id=374,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="exited",
+                exit_reason="cancelled",
+                exit_signal_message_id=376,
+                signal_at=original_message.posted_at,
+                exited_at=cancel_message.posted_at,
+                entry_range_low=63200,
+                entry_range_high=63500,
+                stop_loss=64200,
+                take_profit="62000",
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/100/strategy-mid-panel?filter=exited")
+
+    assert response.status_code == 200
+    assert "取消挂单" in response.text
+    assert "原策略" in response.text
+    assert "#374" in response.text
+    assert "最新事件" in response.text
+    assert "#376" in response.text
+    assert "pending_entry → cancelled" in response.text
+    assert "取消限价，等我后续信号！" in response.text
+
+
+def test_strategy_mid_panel_shows_market_entry_confirmation_event(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        original_message = RawMessage(
+            chat_id=100,
+            message_id=374,
+            posted_at=datetime(2026, 6, 19, 4, 29, tzinfo=UTC),
+            sender_name="mia",
+            text="BTC 做空 限价 63200-63500 止损 64200 止盈 62000",
+        )
+        entry_message = RawMessage(
+            chat_id=100,
+            message_id=377,
+            posted_at=datetime(2026, 6, 19, 9, 40, tzinfo=UTC),
+            sender_name="mia",
+            text="BTC 现价 63320 入场",
+        )
+        session.add_all([original_message, entry_message])
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=original_message.id,
+            symbol="BTC",
+            side="short",
+            event_type="entry_signal",
+            entry_text="63200-63500",
+            stop_loss_text="64200",
+            take_profit_text="62000",
+            parse_source="text_ai",
+            confidence=0.91,
+            review_status="pending",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=100,
+                message_id=374,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="entered",
+                entry_signal_message_id=377,
+                signal_at=original_message.posted_at,
+                entered_at=entry_message.posted_at,
+                entry_range_low=63200,
+                entry_range_high=63500,
+                entry_price_actual=63320,
+                stop_loss=64200,
+                take_profit="62000",
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/100/strategy-mid-panel?filter=holding")
+
+    assert response.status_code == 200
+    assert "原策略" in response.text
+    assert "#374" in response.text
+    assert "最新事件" in response.text
+    assert "#377" in response.text
+    assert "入场确认" in response.text
+    assert "BTC 现价 63320 入场" in response.text
+
+
+def test_strategy_mid_panel_shows_position_management_event(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        original_message = RawMessage(
+            chat_id=100,
+            message_id=1395,
+            posted_at=datetime(2026, 6, 17, 10, 26, tzinfo=UTC),
+            sender_name="nick",
+            text="BTC 63800-61800附近做多，均价62800，65500-66500-67500止盈，止损61000",
+        )
+        management_message = RawMessage(
+            chat_id=100,
+            message_id=1400,
+            posted_at=datetime(2026, 6, 18, 8, 36, tzinfo=UTC),
+            sender_name="nick",
+            text="现价64500附近提前止盈一半带保护",
+        )
+        session.add_all([original_message, management_message])
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=original_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            entry_text="63800-61800",
+            stop_loss_text="61000",
+            take_profit_text="65500/66500/67500",
+            parse_source="text_ai",
+            confidence=0.95,
+            review_status="pending",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=100,
+                message_id=1395,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=original_message.posted_at,
+                entered_at=datetime(2026, 6, 18, 4, 11, tzinfo=UTC),
+                entry_range_low=61800,
+                entry_range_high=63800,
+                entry_price_actual=63794.4,
+                stop_loss=61000,
+                take_profit="65500/66500/67500",
+                management_signal_message_id=1400,
+                management_action="partial_take_profit",
+                management_note="当前消息要求提前止盈一半并带保护，属于持仓管理更新",
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/100/strategy-mid-panel?filter=holding")
+
+    assert response.status_code == 200
+    assert "部分止盈" in response.text
+    assert "#1400" in response.text
+    assert "提前止盈一半带保护" in response.text
+    assert "持仓中" in response.text

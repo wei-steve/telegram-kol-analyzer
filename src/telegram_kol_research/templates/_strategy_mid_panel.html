@@ -1,0 +1,242 @@
+{# Strategy mid-panel: KPI + list for the selected group #}
+<div class="strategy-panel-content">
+  <div class="strategy-panel-toolbar">
+    <div class="trader-kpi-strip" aria-label="交易执行概览">
+      <span class="kpi-badge kpi-holding{% if filter == 'holding' %} is-active-filter{% endif %}" data-strategy-filter="holding" title="点击查看持仓中策略">
+        <strong>{{ strategy_kpi.holding_count }}</strong>
+        <small>持仓</small>
+      </span>
+      <span class="kpi-badge kpi-pending{% if filter == 'pending' %} is-active-filter{% endif %}" data-strategy-filter="pending" title="点击查看待入场策略">
+        <strong>{{ strategy_kpi.pending_count }}</strong>
+        <small>待入场</small>
+      </span>
+      <span class="kpi-badge kpi-exited{% if filter == 'exited' %} is-active-filter{% endif %}" data-strategy-filter="exited" title="点击查看已离场策略">
+        <strong>{{ strategy_kpi.exited_count }}</strong>
+        <small>已离场</small>
+      </span>
+      <span class="kpi-badge kpi-ready">
+        <strong>{{ strategy_kpi.ready_count }}</strong>
+        <small>可执行</small>
+      </span>
+    </div>
+  </div>
+
+  <input type="hidden" name="strategy_filter" value="{{ filter }}" data-strategy-filter-input />
+
+  <div class="strategy-mid-shell">
+    <div class="strategy-mid-header">
+      <h3>
+        {% if filter == 'holding' %}持仓中策略
+        {% elif filter == 'pending' %}待入场策略
+        {% elif filter == 'exited' %}已离场策略
+        {% else %}持仓中策略
+        {% endif %}
+      </h3>
+      <span class="strategy-section-count">
+        {% if filter == 'holding' %}{{ strategy_kpi.holding_count }}
+        {% elif filter == 'pending' %}{{ strategy_kpi.pending_count }}
+        {% elif filter == 'exited' %}{{ strategy_kpi.exited_count }}
+        {% else %}{{ items|length }}
+        {% endif %}
+      </span>
+    </div>
+
+    <div class="strategy-mid-list">
+      {% if filter == 'holding' %}
+        {% set display_items = holding_positions | selectattr("chat_id", "equalto", selected_chat_id) | list %}
+        {% if display_items %}
+          {% for h in display_items %}
+            <article class="position-card position-holding">
+              <div class="position-card-main">
+                <div class="position-symbol-row">
+                  <strong>{{ h.symbol }}</strong>
+                  <span class="side-badge{% if h.side == 'long' %} side-long{% elif h.side == 'short' %} side-short{% endif %}">
+                    {{ '多' if h.side == 'long' else '空' if h.side == 'short' else h.side }}
+                  </span>
+                  <code class="position-status">持仓中</code>
+                </div>
+                <div class="position-meta">
+                  {% if h.entry_text %}
+                    <span>入场: {{ h.entry_text }}</span>
+                  {% elif h.entry_price_actual %}
+                    <span>入场: {{ "%g"|format(h.entry_price_actual) }}</span>
+                  {% endif %}
+                  {% if h.stop_loss_text %}
+                    <span class="meta-sl">止损: {{ h.stop_loss_text }}</span>
+                  {% elif h.stop_loss %}
+                    <span class="meta-sl">止损: {{ "%g"|format(h.stop_loss) }}</span>
+                  {% endif %}
+                  {% if h.take_profit_text %}
+                    <span class="meta-tp">止盈: {{ h.take_profit_text }}</span>
+                  {% elif h.take_profit %}
+                    <span class="meta-tp">止盈: {{ h.take_profit }}</span>
+                  {% endif %}
+                  {% if h.position_size_text %}<span>数量: {{ h.position_size_text }}</span>{% endif %}
+                  {% if h.confidence is defined and h.confidence is not none %}<span>置信 {{ "%.0f%%"|format(h.confidence * 100) }}</span>{% endif %}
+                </div>
+                <div class="position-source">
+                  {% if h.sender_name %}<span>{{ h.sender_name }}</span>{% endif %}
+                  {% if h.entered_at %}<span>{{ h.entered_at }}</span>{% endif %}
+                </div>
+                {% if h.original_message_id or h.latest_event_message_id or h.status_detail %}
+                  <div class="position-lifecycle">
+                    <div class="position-lifecycle-row">
+                      <span>原策略</span>
+                      {% if h.original_message_id %}<code>#{{ h.original_message_id }}</code>{% endif %}
+                      {% if h.original_posted_at %}<time>{{ h.original_posted_at }}</time>{% endif %}
+                    </div>
+                    {% if h.original_text_excerpt %}<p>{{ h.original_text_excerpt }}</p>{% endif %}
+                    <div class="position-lifecycle-row">
+                      <span>最新事件</span>
+                      <strong>{{ h.latest_event_label or h.current_status_label }}</strong>
+                      {% if h.latest_event_message_id %}<code>#{{ h.latest_event_message_id }}</code>{% endif %}
+                      {% if h.latest_event_at %}<time>{{ h.latest_event_at }}</time>{% endif %}
+                      {% if h.transition_text %}<code>{{ h.transition_text }}</code>{% endif %}
+                    </div>
+                    {% if h.latest_event_text_excerpt %}<p>{{ h.latest_event_text_excerpt }}</p>{% endif %}
+                    {% if h.management_note %}<p class="position-lifecycle-detail">{{ h.management_note }}</p>{% endif %}
+                    {% if h.status_detail %}<p class="position-lifecycle-detail">{{ h.status_detail }}</p>{% endif %}
+                  </div>
+                {% endif %}
+              </div>
+            </article>
+          {% endfor %}
+        {% else %}
+          <p class="strategy-mid-empty">暂无持仓中策略</p>
+        {% endif %}
+      {% elif filter == 'pending' %}
+        {% set display_items = pending_entry_signals | selectattr("chat_id", "equalto", selected_chat_id) | list %}
+        {% if display_items %}
+          {% for item in display_items %}
+            <article class="position-card position-pending">
+              <div class="position-card-main">
+                <div class="position-symbol-row">
+                  <strong>{{ item.symbol }}</strong>
+                  <span class="side-badge{% if item.side == 'long' %} side-long{% elif item.side == 'short' %} side-short{% endif %}">
+                    {{ '多' if item.side == 'long' else '空' if item.side == 'short' else item.side }}
+                  </span>
+                  <code>{{ item.execution_status }}</code>
+                  {% if item.contract_spec_status is defined %}
+                    <span class="contract-spec-badge contract-spec-badge--{{ item.contract_spec_status.code }}">
+                      {{ item.contract_spec_status.label }}
+                    </span>
+                  {% endif %}
+                </div>
+                <div class="position-meta">
+                  {% if item.deepcoin_order_draft is defined %}
+                    <span>{{ item.deepcoin_order_draft.instrument_id }}</span>
+                    <span>{{ item.deepcoin_order_draft.margin_mode }}</span>
+                    <span>{{ item.contract_spec_status.quantity_unit }}</span>
+                  {% endif %}
+                  {% if item.entry_range_text %}<span>入场: {{ item.entry_range_text }}</span>{% endif %}
+                  {% if item.stop_loss_text %}<span class="meta-sl">止损: {{ item.stop_loss_text }}</span>{% endif %}
+                  {% if item.take_profit_text %}<span class="meta-tp">止盈: {{ item.take_profit_text }}</span>{% endif %}
+                  {% if item.position_size_text %}<span>数量: {{ item.position_size_text }}</span>{% endif %}
+                  {% if item.max_loss_usdt is defined %}<span>Risk {{ "%g"|format(item.max_loss_usdt) }} USDT</span>{% endif %}
+                  {% if item.deepcoin_order_draft is defined %}
+                    {% for reason_code in item.deepcoin_order_draft.blocking_reason_codes %}
+                      <code class="block-code">{{ reason_code }}</code>
+                    {% endfor %}
+                  {% endif %}
+                </div>
+                {% if item.original_message_id or item.latest_event_message_id or item.status_detail %}
+                  <div class="position-lifecycle">
+                    <div class="position-lifecycle-row">
+                      <span>原策略</span>
+                      {% if item.original_message_id %}<code>#{{ item.original_message_id }}</code>{% endif %}
+                      {% if item.original_posted_at %}<time>{{ item.original_posted_at }}</time>{% endif %}
+                    </div>
+                    {% if item.original_text_excerpt %}<p>{{ item.original_text_excerpt }}</p>{% endif %}
+                    <div class="position-lifecycle-row">
+                      <span>最新事件</span>
+                      <strong>{{ item.latest_event_label or item.current_status_label }}</strong>
+                      {% if item.latest_event_message_id %}<code>#{{ item.latest_event_message_id }}</code>{% endif %}
+                      {% if item.latest_event_at %}<time>{{ item.latest_event_at }}</time>{% endif %}
+                      {% if item.transition_text %}<code>{{ item.transition_text }}</code>{% endif %}
+                    </div>
+                    {% if item.latest_event_text_excerpt %}<p>{{ item.latest_event_text_excerpt }}</p>{% endif %}
+                    {% if item.status_detail %}<p class="position-lifecycle-detail">{{ item.status_detail }}</p>{% endif %}
+                  </div>
+                {% endif %}
+              </div>
+              {% if item.deepcoin_order_draft is defined %}
+              <div class="position-actions">
+                <button type="button" class="secondary-button" data-confirm-recovery-order
+                  data-chat-id="{{ item.chat_id }}" data-message-id="{{ item.message_id }}"
+                  data-symbol="{{ item.symbol }}" data-side="{{ item.side }}">最终确认</button>
+                <span class="recovery-order-confirm-status" data-recovery-order-confirm-status aria-live="polite"></span>
+                <button type="button" class="secondary-button" data-simulate-recovery-submit
+                  data-chat-id="{{ item.chat_id }}" data-message-id="{{ item.message_id }}"
+                  data-symbol="{{ item.symbol }}" data-side="{{ item.side }}">模拟提交</button>
+                <span class="recovery-order-confirm-status" data-recovery-submit-gate-status aria-live="polite"></span>
+              </div>
+              <pre class="recovery-payload-preview">{{ item.deepcoin_order_draft }}</pre>
+              {% endif %}
+            </article>
+          {% endfor %}
+        {% else %}
+          <p class="strategy-mid-empty">暂无待入场策略</p>
+        {% endif %}
+      {% elif filter == 'exited' %}
+        {% set display_items = exited_positions | selectattr("chat_id", "equalto", selected_chat_id) | list %}
+        {% if display_items %}
+          {% for ex in display_items %}
+            <article class="position-card position-exited">
+              <div class="position-card-main">
+                <div class="position-symbol-row">
+                  <strong>{{ ex.symbol }}</strong>
+                  <span class="side-badge{% if ex.side == 'long' %} side-long{% elif ex.side == 'short' %} side-short{% endif %}">
+                    {{ '多' if ex.side == 'long' else '空' if ex.side == 'short' else ex.side }}
+                  </span>
+                  <code class="exit-reason">
+                    {% if ex.exit_reason == 'stop_loss' %}止损离场
+                    {% elif ex.exit_reason == 'take_profit' %}止盈离场
+                    {% elif ex.exit_reason == 'kol_signal' %}KOL离场信号
+                    {% elif ex.exit_reason == 'cancelled' %}取消挂单
+                    {% elif ex.exit_reason == 'expired' or ex.lifecycle_status == 'expired' %}过期未入场
+                    {% else %}{{ ex.exit_reason or '已离场' }}
+                    {% endif %}
+                  </code>
+                </div>
+                <div class="position-meta">
+                  {% if ex.entry_text %}<span>入场: {{ ex.entry_text }}</span>{% endif %}
+                  {% if ex.entry_price_actual %}<span>入场价: {{ "%g"|format(ex.entry_price_actual) }}</span>{% endif %}
+                  {% if ex.exit_price_actual %}<span>离场价: {{ "%g"|format(ex.exit_price_actual) }}</span>{% endif %}
+                  {% if ex.stop_loss_text %}<span class="meta-sl">止损: {{ ex.stop_loss_text }}</span>{% endif %}
+                  {% if ex.take_profit_text %}<span class="meta-tp">止盈: {{ ex.take_profit_text }}</span>{% endif %}
+                  {% if ex.position_size_text %}<span>数量: {{ ex.position_size_text }}</span>{% endif %}
+                </div>
+                <div class="position-source">
+                  {% if ex.sender_name %}<span>{{ ex.sender_name }}</span>{% endif %}
+                  {% if ex.entered_at %}<span>入场: {{ ex.entered_at }}</span>{% endif %}
+                  {% if ex.exited_at %}<span>离场: {{ ex.exited_at }}</span>{% endif %}
+                </div>
+                {% if ex.original_message_id or ex.latest_event_message_id or ex.status_detail %}
+                  <div class="position-lifecycle">
+                    <div class="position-lifecycle-row">
+                      <span>原策略</span>
+                      {% if ex.original_message_id %}<code>#{{ ex.original_message_id }}</code>{% endif %}
+                      {% if ex.original_posted_at %}<time>{{ ex.original_posted_at }}</time>{% endif %}
+                    </div>
+                    {% if ex.original_text_excerpt %}<p>{{ ex.original_text_excerpt }}</p>{% endif %}
+                    <div class="position-lifecycle-row">
+                      <span>最新事件</span>
+                      <strong>{{ ex.latest_event_label or ex.current_status_label }}</strong>
+                      {% if ex.latest_event_message_id %}<code>#{{ ex.latest_event_message_id }}</code>{% endif %}
+                      {% if ex.latest_event_at %}<time>{{ ex.latest_event_at }}</time>{% endif %}
+                      {% if ex.transition_text %}<code>{{ ex.transition_text }}</code>{% endif %}
+                    </div>
+                    {% if ex.latest_event_text_excerpt %}<p>{{ ex.latest_event_text_excerpt }}</p>{% endif %}
+                    {% if ex.status_detail %}<p class="position-lifecycle-detail">{{ ex.status_detail }}</p>{% endif %}
+                  </div>
+                {% endif %}
+              </div>
+            </article>
+          {% endfor %}
+        {% else %}
+          <p class="strategy-mid-empty">暂无已离场策略</p>
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+</div>

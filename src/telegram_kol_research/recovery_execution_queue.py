@@ -7,7 +7,9 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_draft
 from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import RecoveryDecisionRecord
+from telegram_kol_research.models import SignalCandidate
 
 
 def list_recovery_execution_previews(
@@ -28,12 +30,19 @@ def list_recovery_execution_previews(
             .all()
         )
         active_binding_keys = _load_active_binding_keys(session)
+        take_profit_by_key = _load_take_profit_texts(session, rows)
         previews = []
         for row in rows:
             key = (row.chat_id, row.message_id, row.symbol.upper(), row.side.lower())
             if key in active_binding_keys:
                 continue
-            previews.append(_preview_row(row, contract_spec_provider=contract_spec_provider))
+            previews.append(
+                _preview_row(
+                    row,
+                    contract_spec_provider=contract_spec_provider,
+                    take_profit_text=take_profit_by_key.get(key),
+                )
+            )
         return previews
 
 
@@ -59,6 +68,7 @@ def _preview_row(
     row: RecoveryDecisionRecord,
     *,
     contract_spec_provider: DeepcoinContractSpecProvider | None,
+    take_profit_text: str | None,
 ) -> dict[str, object]:
     side = row.side.lower()
     contract = _to_deepcoin_contract(row.symbol)
@@ -95,6 +105,7 @@ def _preview_row(
         "side": side,
         "entry_range_text": row.entry_range_text,
         "stop_loss_text": row.stop_loss_text,
+        "take_profit_text": take_profit_text,
         "max_loss_usdt": row.max_loss_usdt,
         "action": row.action,
         "review_status": row.review_status,
@@ -103,6 +114,41 @@ def _preview_row(
         "payload_preview": payload_preview,
         "deepcoin_order_draft": deepcoin_order_draft,
     }
+
+
+def _load_take_profit_texts(
+    session,
+    rows: list[RecoveryDecisionRecord],
+) -> dict[tuple[int, int, str, str], str]:
+    if not rows:
+        return {}
+    message_keys = {(row.chat_id, row.message_id) for row in rows}
+    chat_ids = {chat_id for chat_id, _ in message_keys}
+    message_ids = {message_id for _, message_id in message_keys}
+    candidates = (
+        session.query(SignalCandidate, RawMessage)
+        .join(RawMessage, SignalCandidate.raw_message_id == RawMessage.id)
+        .filter(RawMessage.chat_id.in_(chat_ids))
+        .filter(RawMessage.message_id.in_(message_ids))
+        .filter(SignalCandidate.take_profit_text.isnot(None))
+        .order_by(SignalCandidate.confidence.desc(), SignalCandidate.id.asc())
+        .all()
+    )
+    result: dict[tuple[int, int, str, str], str] = {}
+    for candidate, raw_message in candidates:
+        if not candidate.symbol or not candidate.side or not candidate.take_profit_text:
+            continue
+        key = (
+            raw_message.chat_id,
+            raw_message.message_id,
+            candidate.symbol.upper(),
+            candidate.side.lower(),
+        )
+        if key in result:
+            continue
+        if (raw_message.chat_id, raw_message.message_id) in message_keys:
+            result[key] = candidate.take_profit_text
+    return result
 
 
 def _to_deepcoin_contract(symbol: str) -> str:

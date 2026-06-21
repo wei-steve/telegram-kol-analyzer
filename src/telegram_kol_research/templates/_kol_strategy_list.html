@@ -1,0 +1,48 @@
+<div class="kol-strategy-list">
+  {% for group in groups %}
+    <article class="kol-strategy-row{% if group.chat_id == selected_chat_id %} is-active{% endif %}">
+      <button
+        type="button"
+        class="kol-open-button"
+        data-group-link
+        data-chat-id="{{ group.chat_id }}"
+        aria-current="{{ 'true' if group.chat_id == selected_chat_id else 'false' }}"
+      >
+        <div class="kol-name-row">
+          <strong>{{ group.title }}</strong>
+          <span class="kol-msg-count">{{ group.message_count }} 条消息</span>
+        </div>
+        <div class="kol-status-row">
+          <span class="kol-status-badge kol-status-holding" title="持有中策略">
+            ● {{ group.holding_count }}
+          </span>
+          <span class="kol-status-badge kol-status-pending" title="待入场策略">
+            ○ {{ group.pending_count }}
+          </span>
+          <span class="kol-status-text">{{ group.strategy_work_count }} 个策略</span>
+        </div>
+      </button>
+      <div class="group-automation-actions">
+        <button
+          type="button"
+          class="group-toggle{% if group.ai_strategy_enabled %} is-enabled{% endif %}"
+          data-toggle-group-automation
+          data-setting="ai_strategy_enabled"
+          data-enabled="{{ 'true' if group.ai_strategy_enabled else 'false' }}"
+          data-chat-id="{{ group.chat_id }}"
+          data-chat-title="{{ group.raw_title or group.title }}"
+          title="AI识别策略"
+        >AI识别</button>
+        <button
+          type="button"
+          class="group-toggle{% if group.auto_trade_enabled %} is-enabled{% endif %}"
+          data-toggle-group-automation
+          data-setting="auto_trade_enabled"
+          data-enabled="{{ 'true' if group.auto_trade_enabled else 'false' }}"
+          data-chat-id="{{ group.chat_id }}"
+          data-chat-title="{{ group.raw_title or group.title }}"
+        >自动交易</button>
+      </div>
+    </article>
+  {% endfor %}
+</div>

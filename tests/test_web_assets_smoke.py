@@ -41,7 +41,7 @@ def test_app_js_refreshes_group_list_after_live_or_manual_updates(tmp_path):
 
     assert response.status_code == 200
     assert "refreshGroupList" in response.text
-    assert "fetch('/groups" in response.text
+    assert "/groups?selected_chat_id" in response.text
     assert "await refreshGroupList();" in response.text
 
 

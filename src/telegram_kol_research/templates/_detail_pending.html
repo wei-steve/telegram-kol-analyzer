@@ -1,0 +1,53 @@
+{# ── Pending tab content only ── #}
+{% set group_pending = pending_entry_signals | selectattr("chat_id", "equalto", selected_chat_id) | list %}
+{% if group_pending %}
+  <div class="position-list">
+    {% for item in group_pending %}
+      <article class="position-card position-pending">
+        <div class="position-card-main">
+          <div class="position-symbol-row">
+            <strong>{{ item.symbol }}</strong>
+            <span>{{ item.side }}</span>
+            <code>{{ item.execution_status }}</code>
+            {% if item.contract_spec_status is defined %}
+              <span class="contract-spec-badge contract-spec-badge--{{ item.contract_spec_status.code }}">
+                {{ item.contract_spec_status.label }}
+              </span>
+            {% endif %}
+          </div>
+          <div class="position-meta">
+            {% if item.deepcoin_order_draft is defined %}
+              <span>{{ item.deepcoin_order_draft.instrument_id }}</span>
+              <span>{{ item.deepcoin_order_draft.margin_mode }}</span>
+              <span>{{ item.contract_spec_status.quantity_unit }}</span>
+            {% endif %}
+            <span>Entry {{ item.entry_range_text }}</span>
+            {% if item.stop_loss_text %}<span>SL {{ item.stop_loss_text }}</span>{% endif %}
+            {% if item.take_profit_text %}<span>TP {{ item.take_profit_text }}</span>{% endif %}
+            {% if item.max_loss_usdt is defined %}<span>Risk {{ "%g"|format(item.max_loss_usdt) }} USDT</span>{% endif %}
+            {% if item.deepcoin_order_draft is defined %}
+              {% for reason_code in item.deepcoin_order_draft.blocking_reason_codes %}
+                <code class="block-code">{{ reason_code }}</code>
+              {% endfor %}
+            {% endif %}
+          </div>
+        </div>
+        {% if item.deepcoin_order_draft is defined %}
+        <div class="position-actions">
+          <button type="button" class="secondary-button" data-confirm-recovery-order
+            data-chat-id="{{ item.chat_id }}" data-message-id="{{ item.message_id }}"
+            data-symbol="{{ item.symbol }}" data-side="{{ item.side }}">最终确认</button>
+          <span class="recovery-order-confirm-status" data-recovery-order-confirm-status aria-live="polite"></span>
+          <button type="button" class="secondary-button" data-simulate-recovery-submit
+            data-chat-id="{{ item.chat_id }}" data-message-id="{{ item.message_id }}"
+            data-symbol="{{ item.symbol }}" data-side="{{ item.side }}">模拟提交</button>
+          <span class="recovery-order-confirm-status" data-recovery-submit-gate-status aria-live="polite"></span>
+        </div>
+        <pre class="recovery-payload-preview">{{ item.deepcoin_order_draft }}</pre>
+        {% endif %}
+      </article>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="empty-state">暂无待入场策略。</p>
+{% endif %}

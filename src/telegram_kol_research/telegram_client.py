@@ -63,8 +63,93 @@ def _load_env_file_values(
     return values
 
 
-def create_telegram_client(auth_config: TelegramAuthConfig) -> Any:
-    """Create a Telethon client for the configured user account."""
+def _parse_telegram_proxy(proxy_url: str) -> tuple | None:
+    """Parse a proxy URL into a Telethon-compatible proxy tuple.
+
+    Supported formats:
+        socks5://user:pass@host:port
+        socks5://host:port
+        http://host:port
+    """
+
+    from urllib.parse import urlparse, ParseResult
+
+    parsed: ParseResult = urlparse(proxy_url)
+    if not parsed.hostname or not parsed.port:
+        return None
+
+    scheme = (parsed.scheme or "socks5").lower()
+    if scheme in ("socks5", "socks5h"):
+        proxy_type = 2  # python_socks.ProxyType.SOCKS5
+    elif scheme in ("http", "https"):
+        proxy_type = 1  # python_socks.ProxyType.HTTP
+    else:
+        return None
+
+    return (
+        proxy_type,
+        parsed.hostname,
+        parsed.port,
+        True,  # rdns
+        parsed.username,
+        parsed.password,
+    )
+
+
+def _load_telethon_connect_settings(
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Read Telethon connection tuning knobs from environment variables."""
+
+    env = environ or os.environ
+    settings: dict[str, Any] = {}
+
+    # Proxy: TELEGRAM_PROXY=socks5://host:port
+    proxy_url = env.get("TELEGRAM_PROXY", "").strip()
+    if proxy_url:
+        proxy_tuple = _parse_telegram_proxy(proxy_url)
+        if proxy_tuple is not None:
+            settings["proxy"] = proxy_tuple
+
+    # Connection timeout (seconds), default 30
+    timeout_str = env.get("TELEGRAM_CONNECTION_TIMEOUT", "30").strip()
+    try:
+        settings["timeout"] = int(timeout_str)
+    except ValueError:
+        pass
+
+    # Number of reconnection attempts, default 10
+    retries_str = env.get("TELEGRAM_CONNECTION_RETRIES", "10").strip()
+    try:
+        settings["connection_retries"] = int(retries_str)
+    except ValueError:
+        pass
+
+    # Delay between reconnection attempts (seconds), default 5
+    delay_str = env.get("TELEGRAM_RETRY_DELAY", "5").strip()
+    try:
+        settings["retry_delay"] = int(delay_str)
+    except ValueError:
+        pass
+
+    # Number of auto-reconnect attempts per request, default 5
+    req_retries_str = env.get("TELEGRAM_REQUEST_RETRIES", "5").strip()
+    try:
+        settings["request_retries"] = int(req_retries_str)
+    except ValueError:
+        pass
+
+    return settings
+
+
+def create_telegram_client(
+    auth_config: TelegramAuthConfig,
+    connect_settings: dict[str, Any] | None = None,
+) -> Any:
+    """Create a Telethon client for the configured user account.
+
+    Accepts optional connect_settings for proxy, timeout, and retry tuning.
+    """
 
     try:
         from telethon import TelegramClient
@@ -74,7 +159,21 @@ def create_telegram_client(auth_config: TelegramAuthConfig) -> Any:
         ) from exc
 
     auth_config.session_path.parent.mkdir(parents=True, exist_ok=True)
-    return TelegramClient(str(auth_config.session_path), auth_config.api_id, auth_config.api_hash)
+    kwargs: dict[str, Any] = {
+        "connection_retries": 10,
+        "retry_delay": 5,
+        "timeout": 30,
+    }
+    env_settings = _load_telethon_connect_settings()
+    kwargs.update(env_settings)
+    if connect_settings:
+        kwargs.update(connect_settings)
+    return TelegramClient(
+        str(auth_config.session_path),
+        auth_config.api_id,
+        auth_config.api_hash,
+        **kwargs,
+    )
 
 
 async def maybe_await(value: Any) -> Any:
@@ -153,7 +252,7 @@ async def fetch_dialog_messages(
     dialog: dict[str, Any],
     limit: int = 100,
     media_root: str | Path = "data/media",
-    media_download_timeout_seconds: float = 0,
+    media_download_timeout_seconds: float = 30,
 ) -> list[dict[str, Any]]:
     """Fetch recent messages for a dialog and normalize the Telegram fields we need."""
 
@@ -199,7 +298,7 @@ async def _download_media_if_present(
     dialog_id: int,
     message: Any,
     media_root: Path,
-    timeout_seconds: float = 0,
+    timeout_seconds: float = 30,
 ) -> str | None:
     media = getattr(message, "media", None)
     if media is None:
@@ -225,7 +324,11 @@ async def _download_media_if_present(
         return None
     if output_path in (None, ""):
         return None
-    return str(Path(output_path))
+    resolved = Path(output_path).resolve()
+    try:
+        return str(resolved.relative_to(media_root.resolve()))
+    except ValueError:
+        return str(resolved)
 
 
 def _should_download_media(message: Any) -> bool:

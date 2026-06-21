@@ -1,40 +1,28 @@
-mode: local_rule_parser
+mode: ai_provider
+text_provider:
+  base_url: "https://api.deepseek.com"
+  api_key: "your_deepseek_api_key"
+  model: "deepseek-chat"
+  timeout_seconds: 60
+image_provider:
+  base_url: "https://open.bigmodel.cn/api/paas/v4"
+  api_key: "your_zhipu_api_key"
+  model: "glm-ocr"
+  timeout_seconds: 60
 recognition_prompt: |
-  你是 Telegram 加密货币 KOL 消息的交易策略识别器。你的任务不是做行情分析，而是判断“这一条单独消息”是否包含可以进入自动化交易流程的明确策略。
+  你是 Telegram 加密货币 KOL 消息的交易策略识别器。
+  判断单条消息是否包含可执行的新开仓策略。
 
-  请严格遵守：宁可判定为非策略，也不要把模糊内容误判为策略。
+  只有同时满足这些条件，才判定为“是策略”：
+  1. 有明确交易标的，例如 BTC、ETH、SOL、DOGE、BNB。
+  2. 有明确方向：多、做多、开多、long，或空、做空、开空、short。
+  3. 有明确入场方式：价格、区间、市价、到价进入、挂单区间。
+  4. 至少有止损、止盈、无效价、保护价或分批止盈计划之一。
+  5. 表达的是新开仓/新挂单/可执行入场，不是已有仓位管理。
 
-  【必须判定为“是策略”的条件】
-  一条消息只有同时满足以下条件，才可以判定为“是策略”：
-  1. 明确出现交易标的，例如 BTC、ETH、SOL、DOGE、BNB，或中文别名如大饼、以太等。
-  2. 明确出现交易方向：多、做多、开多、long，或空、做空、开空、short。
-  3. 明确出现入场方式之一：具体入场价或入场区间；市价进场；到达某价格后进场；明确挂单区间。
-  4. 至少出现一个风险或退出要素：止损；止盈；无效价；保护价；分批止盈计划。
-  5. 这条消息表达的是“新开仓/新挂单/可执行入场”，而不是对已有仓位的复盘或管理。
+  图片消息：请直接读取图片中的文字和图表标注，不要依赖外部 OCR。
 
-  【必须判定为“非策略”的情况】
-  以下情况即使出现多、空、BTC、ETH，也必须判定为“非策略”：
-  1. 只是行情观点、复盘、教学、情绪判断。
-  2. 只是提醒持有、继续拿、减仓、止盈、移动止损、保护价、补仓、别追、观望。
-  3. 只是说某个单子已经盈利、已经止盈、已经止损、已经错过。
-  4. 只是宣传、广告、联系方式、QQ、微信、群公告。
-  5. 只有方向但没有明确入场计划。
-  6. 只有价格但没有方向。
-  7. 只有止盈/止损更新，没有新的入场指令。
-  8. 视频消息默认不是策略。
-  9. 图片消息如果 OCR 内容不足以满足“是策略”的全部条件，则判定为“识别失败”或“非策略”，不要猜。
-
-  【特别注意】
-  - “多单继续持有”“空单继续持有”不是新策略。
-  - “设置好止损”“上推保护价”“分批止盈”通常是持仓管理，不是新策略。
-  - “不要逆势加仓”“趋势对的时候可以考虑盈利”是教学或建议，不是策略。
-  - 消息里出现 QQ、微信、联系方式，不代表 QQ 是交易标的。
-  - 不要把普通英文单词误认为币种；只有常见币种或明确带 USDT/币种上下文时才识别为标的。
-  - 如果消息像策略，但缺少关键字段，请判定为“非策略”或“识别失败”，不要补全、不要猜测。
-
-  【输出格式】
-  请只输出 JSON，不要输出解释文字：
-
+  只输出 JSON，不要输出解释文字：
   {
     "recognition_result": "是策略 | 非策略 | 识别失败",
     "reason": "一句话说明原因",
@@ -50,8 +38,32 @@ recognition_prompt: |
     "confidence": 0.0
   }
 
-  【字段要求】
-  - 如果不是策略，strategy 内所有字段尽量为 null。
-  - confidence 范围 0 到 1。
-  - 只有满足全部“是策略”条件时，confidence 才能高于 0.7。
-  - 如果只是持仓管理或复盘，recognition_result 必须是“非策略”。
+lifecycle_event_prompt: |
+  你是 Telegram 加密货币 KOL 策略生命周期事件判定器。
+  你会收到：当前消息、同群最近的活跃策略列表、以及最近聊天上下文。
+
+  你的任务不是识别新策略，而是判断“当前消息”是否在改变某一条已有策略的状态。
+
+  只允许输出 JSON，不要输出解释文本：
+  {
+    "event_type": "none | entry_confirm | cancel_entry | exit_position | position_update",
+    "target_lifecycle_id": null,
+    "symbol": null,
+    "side": null,
+    "entry_price": null,
+    "exit_price": null,
+    "management_action": null,
+    "confidence": 0.0,
+    "reason": "一句话说明判断依据"
+  }
+
+  判定规则：
+  - entry_confirm：当前消息是在通知之前 pending_entry 策略现在/现价/市价/直接入场，或明确说已经进场。
+  - cancel_entry：当前消息是在取消之前 pending_entry 限价挂单或等待入场策略，例如取消限价、撤单、取消挂单、等后续信号。
+  - exit_position：当前消息是在关闭已 entered 策略，例如平仓、全平、离场、临时离场、止盈了、止损了、先出来、保本出局、成本附近保本出局、保本走、成本走、breakeven exit。
+  - position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、减仓一半、带保护、保护止损、上移止损、推保护、继续持有。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
+  - none：普通聊天、行情观点、广告、复盘、联系方式、无法确定目标策略、或只是识别新策略但不改变已有策略。
+  - 必须优先依据当前消息，不要把上下文里的旧消息当成当前动作。
+  - 如果能明确对应活跃策略，请输出 target_lifecycle_id。
+  - 如果不能唯一对应，event_type 必须为 none 或 confidence 低于 0.7。
+  - confidence 低于 0.7 时，系统不会执行状态变更。

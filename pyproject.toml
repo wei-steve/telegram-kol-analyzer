@@ -19,6 +19,7 @@ dependencies = [
     "sqlalchemy",
     "telethon",
     "typer",
+    "tzdata",
     "uvicorn",
 ]
 

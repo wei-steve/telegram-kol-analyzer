@@ -3,6 +3,7 @@
 .ruff_cache/
 __pycache__/
 *.pyc
+.tmp/
 
 .venv/
 .venv313/
@@ -14,7 +15,9 @@ src/*.egg-info/
 
 config/groups.yaml
 config/*.env
+config/ai_recognition.yaml
 
+data/
 data/*.db
 data/*.db-*
 data/*.session
@@ -25,3 +28,4 @@ data/media/
 
 exports/
 reports/*.json
+*.log

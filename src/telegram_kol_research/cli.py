@@ -11,6 +11,10 @@ import typer
 from telegram_kol_research.backfill import build_backfill_windows
 from telegram_kol_research.binance_market_data import BinanceMarketDataProvider
 from telegram_kol_research.candidates import persist_text_signal_candidates
+from telegram_kol_research.message_recognition import (
+    filter_records_by_inserted_message_keys,
+    recognize_records_with_ai_config,
+)
 from telegram_kol_research.dataset_export import export_dataset_jsonl
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import load_deepcoin_contract_specs
@@ -128,8 +132,10 @@ def _load_normalized_records_from_db(
 def _run_parse_mode(database_path: Path) -> tuple[int, int]:
     session_factory = create_session_factory(database_path)
     normalized_records = _load_normalized_records_from_db(database_path)
-    candidate_stats = persist_text_signal_candidates(
-        session_factory, normalized_records
+    candidate_stats = recognize_records_with_ai_config(
+        session_factory,
+        normalized_records,
+        fallback_recognizer=persist_text_signal_candidates,
     )
     trade_stats = persist_trade_ideas_from_candidates(session_factory)
     return candidate_stats["inserted_candidates"], trade_stats["inserted_trade_ideas"]
@@ -212,8 +218,10 @@ async def _run_telegram_sync(
         inserted_messages += stats["inserted_messages"]
         if mode == SyncMode.backfill:
             continue
-        candidate_stats = persist_text_signal_candidates(
-            session_factory, normalized_records
+        candidate_stats = recognize_records_with_ai_config(
+            session_factory,
+            filter_records_by_inserted_message_keys(normalized_records, stats),
+            fallback_recognizer=persist_text_signal_candidates,
         )
         inserted_candidates += candidate_stats["inserted_candidates"]
         trade_stats = persist_trade_ideas_from_candidates(session_factory)
@@ -587,7 +595,9 @@ def web(
 
     group_config = load_group_config(config_path)
     live_target_titles = {
-        group.chat_title for group in group_config.groups if group.enabled
+        group.chat_title
+        for group in group_config.groups
+        if group.enabled
     }
     group_labels_by_title = {
         group.chat_title: (group.custom_group_label or group.chat_title)

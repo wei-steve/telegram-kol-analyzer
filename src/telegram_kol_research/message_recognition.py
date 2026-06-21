@@ -2,17 +2,33 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import mimetypes
+import re
+from datetime import timedelta
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
+import httpx
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.ai_recognition_config import (
+    AiProviderConfig,
+    AiRecognitionConfig,
+    load_ai_recognition_config,
+)
 from telegram_kol_research.models import (
     MediaAsset,
     MessageRecognition,
     RawMessage,
     SignalCandidate,
+    StrategyLifecycle,
+    TradeIdea,
     utc_now,
 )
+from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 from telegram_kol_research.parsing.text_parser import parse_signal_text
 
 
@@ -59,15 +75,20 @@ class MessageRecognitionResult:
     status: str
     summary: str | None = None
     reason: str | None = None
+    ai_payload: dict[str, Any] | None = None
+    parse_source: str | None = None
 
 
 def recognize_message_now(
     session_factory: sessionmaker,
     *,
     raw_message_id: int,
+    ai_recognition_config: AiRecognitionConfig | None = None,
+    ai_recognition_config_path: str | Path = "config/ai_recognition.yaml",
 ) -> MessageRecognitionResult:
     """Run V1 immediate recognition for one raw message and persist the result."""
 
+    config = ai_recognition_config or load_ai_recognition_config(ai_recognition_config_path)
     with session_factory() as session:
         raw_message = session.get(RawMessage, raw_message_id)
         if raw_message is None:
@@ -89,6 +110,65 @@ def recognize_message_now(
             session.commit()
             return result
 
+        text = raw_message.text or ""
+        if text.strip() and config.text_provider.is_configured:
+            ai_event_result = _apply_ai_lifecycle_event_if_matched(
+                session,
+                raw_message=raw_message,
+                config=config,
+            )
+            if ai_event_result is not None:
+                _upsert_recognition(session, ai_event_result, engine=config.text_provider.model)
+                session.commit()
+                return ai_event_result
+
+        if (
+            text.strip()
+            and not config.text_provider.is_configured
+            and _apply_lifecycle_transition_signal_if_matched(session, raw_message, text)
+        ):
+            result = MessageRecognitionResult(
+                raw_message_id=raw_message.id,
+                status="非策略",
+                reason="本地规则识别到明确入场/取消/离场消息，已更新匹配的策略状态。",
+                parse_source="text",
+            )
+            _upsert_recognition(session, result)
+            session.commit()
+            return result
+
+        if _has_image_like_media(media_assets) and config.image_provider.is_configured:
+            if _is_glm_ocr_model(config.image_provider.model):
+                result = _recognize_with_glm_ocr(
+                    raw_message=raw_message,
+                    media_assets=media_assets,
+                    config=config,
+                    session=session,
+                )
+            else:
+                result = _recognize_with_ai_provider(
+                    raw_message=raw_message,
+                    media_assets=media_assets,
+                    config=config,
+                    provider=config.image_provider,
+                    parse_source="image_ai",
+                )
+                _persist_ai_result(session, raw_message, result, engine=config.image_provider.model)
+            session.commit()
+            return result
+
+        if (raw_message.text or "").strip() and config.text_provider.is_configured:
+            result = _recognize_with_ai_provider(
+                raw_message=raw_message,
+                media_assets=[],
+                config=config,
+                provider=config.text_provider,
+                parse_source="text_ai",
+            )
+            _persist_ai_result(session, raw_message, result, engine=config.text_provider.model)
+            session.commit()
+            return result
+
         if _has_image_like_media(media_assets) and not (raw_message.text or "").strip():
             result = MessageRecognitionResult(
                 raw_message_id=raw_message.id,
@@ -100,6 +180,17 @@ def recognize_message_now(
             return result
 
         parsed = parse_signal_text(raw_message.text or "")
+        if _apply_lifecycle_transition_signal_if_matched(session, raw_message, raw_message.text or ""):
+            result = MessageRecognitionResult(
+                raw_message_id=raw_message.id,
+                status="非策略",
+                reason="本地规则识别到明确入场/取消/离场消息，已更新匹配的策略状态。",
+                parse_source="text",
+            )
+            _upsert_recognition(session, result)
+            session.commit()
+            return result
+
         if not _is_actionable_entry_signal(raw_message.text or "", parsed):
             result = MessageRecognitionResult(
                 raw_message_id=raw_message.id,
@@ -111,6 +202,7 @@ def recognize_message_now(
             return result
 
         candidate = _upsert_signal_candidate(session, raw_message, parsed)
+        _ensure_lifecycle_record(session, raw_message, candidate)
         result = MessageRecognitionResult(
             raw_message_id=raw_message.id,
             status="是策略",
@@ -119,6 +211,97 @@ def recognize_message_now(
         _upsert_recognition(session, result)
         session.commit()
         return result
+
+
+def recognize_records_with_ai_config(
+    session_factory: sessionmaker,
+    records: list[NormalizedMessageRecord],
+    *,
+    ai_recognition_config: AiRecognitionConfig | None = None,
+    ai_recognition_config_path: str | Path = "config/ai_recognition.yaml",
+    fallback_recognizer=None,
+) -> dict[str, int]:
+    """Recognize newly persisted records using the shared AI recognition config."""
+
+    config = ai_recognition_config or load_ai_recognition_config(ai_recognition_config_path)
+    if not (config.text_provider.is_configured or config.image_provider.is_configured):
+        if fallback_recognizer is None:
+            return {
+                "inserted_candidates": 0,
+                "processed_records": len(records),
+                "recognized_messages": 0,
+                "failed_recognitions": 0,
+                "skipped_existing": 0,
+            }
+        return fallback_recognizer(session_factory, records)
+
+    raw_message_ids: list[int] = []
+    skipped_existing = 0
+    with session_factory() as session:
+        for record in records:
+            raw_message = (
+                session.query(RawMessage)
+                .filter(
+                    RawMessage.chat_id == record.chat_id,
+                    RawMessage.message_id == record.message_id,
+                )
+                .one_or_none()
+            )
+            if raw_message is None:
+                continue
+            existing_recognition = (
+                session.query(MessageRecognition)
+                .filter(MessageRecognition.raw_message_id == raw_message.id)
+                .one_or_none()
+            )
+            if existing_recognition is not None:
+                skipped_existing += 1
+                continue
+            raw_message_ids.append(raw_message.id)
+
+    recognized_messages = 0
+    failed_recognitions = 0
+    inserted_candidates = 0
+    for raw_message_id in raw_message_ids:
+        try:
+            result = recognize_message_now(
+                session_factory,
+                raw_message_id=raw_message_id,
+                ai_recognition_config=config,
+            )
+        except Exception:
+            failed_recognitions += 1
+            continue
+        recognized_messages += 1
+        if result.parse_source in {"text_ai", "image_ai"} and result.summary:
+            inserted_candidates += 1
+
+    return {
+        "inserted_candidates": inserted_candidates,
+        "processed_records": len(records),
+        "recognized_messages": recognized_messages,
+        "failed_recognitions": failed_recognitions,
+        "skipped_existing": skipped_existing,
+    }
+
+
+def filter_records_by_inserted_message_keys(
+    records: list[NormalizedMessageRecord],
+    stats: dict[str, Any],
+) -> list[NormalizedMessageRecord]:
+    """Return records that were inserted by the preceding persistence call."""
+
+    inserted_keys = {
+        (int(chat_id), int(message_id))
+        for chat_id, message_id in stats.get("inserted_message_keys", [])
+    }
+    if not inserted_keys:
+        return []
+    return [
+        record
+        for record in records
+        if (record.chat_id, record.message_id) in inserted_keys
+    ]
 
 
 def _upsert_signal_candidate(session, raw_message: RawMessage, parsed) -> SignalCandidate:
@@ -150,6 +333,898 @@ def _upsert_signal_candidate(session, raw_message: RawMessage, parsed) -> Signal
     return candidate
 
 
+def _is_glm_ocr_model(model: str) -> bool:
+    """Check if the configured image model is GLM-OCR (Zhipu layout parsing API)."""
+    return model.strip().lower() == "glm-ocr"
+
+
+def _call_glm_ocr_api(provider: AiProviderConfig, data_url: str) -> str:
+    """Call the Zhipu GLM-OCR layout_parsing API and return recognized Markdown text.
+
+    The GLM-OCR endpoint is a dedicated document-parsing API, not the standard
+    chat completions endpoint.  It accepts a ``file`` parameter (URL or base64
+    data URL) and returns ``md_results`` containing the extracted text.
+    """
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+
+    payload: dict[str, Any] = {
+        "model": "glm-ocr",
+        "file": data_url,
+    }
+
+    api_url = f"{provider.base_url.rstrip('/')}/layout_parsing"
+    with httpx.Client(timeout=provider.timeout_seconds) as client:
+        response = client.post(api_url, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+
+    return (data.get("md_results") or "").strip()
+
+
+def _recognize_with_glm_ocr(
+    *,
+    raw_message: RawMessage,
+    media_assets: list[MediaAsset],
+    config: AiRecognitionConfig,
+    session,
+) -> MessageRecognitionResult:
+    """Recognize image messages using GLM-OCR in a two-step pipeline.
+
+    1. Send each image to the GLM-OCR layout_parsing API to extract text.
+    2. If a text AI provider is configured, feed the OCR text (plus any
+       caption) through the text provider for strategy recognition.
+    3. Otherwise fall back to the local rule parser on the OCR output.
+    """
+    # ── Guard: all media files must be available locally ──────────────
+    missing_reason = _media_missing_reason(media_assets)
+    if missing_reason:
+        result = MessageRecognitionResult(
+            raw_message_id=raw_message.id,
+            status="识别失败",
+            reason=missing_reason,
+            parse_source="image_ai",
+        )
+        _upsert_recognition(
+            session, result, engine=config.image_provider.model,
+        )
+        return result
+
+    # ── Step 1: extract text from all image assets via GLM-OCR ──────────
+    ocr_parts: list[str] = []
+    for asset in media_assets:
+        data_url = _media_asset_to_data_url(asset)
+        if not data_url:
+            continue
+        try:
+            ocr_text = _call_glm_ocr_api(config.image_provider, data_url)
+            if ocr_text:
+                asset.ocr_text = ocr_text  # persist OCR result for web display
+                ocr_parts.append(ocr_text)
+        except Exception as exc:
+            # Log and continue – one failing image should not block the rest
+            error_text = f"[OCR 失败: {exc}]"
+            asset.ocr_text = error_text
+            ocr_parts.append(error_text)
+
+    # Merge caption and OCR results
+    caption = (raw_message.text or "").strip()
+    merged_text = "\n".join(
+        part for part in ([caption] + ocr_parts) if part
+    )
+
+    if not merged_text.strip():
+        result = MessageRecognitionResult(
+            raw_message_id=raw_message.id,
+            status="识别失败",
+            reason="图片识别失败：GLM-OCR 未能提取到文字内容",
+            parse_source="image_ai",
+        )
+        _upsert_recognition(
+            session, result, engine=config.image_provider.model,
+        )
+        return result
+
+    # ── Step 2: strategy recognition on the extracted text ──────────────
+    if config.text_provider.is_configured:
+        # Use text AI provider for strategy recognition
+        result = _recognize_text_with_ai_provider(
+            raw_message=raw_message,
+            merged_text=merged_text,
+            config=config,
+        )
+        _persist_ai_result(
+            session, raw_message, result, engine=config.text_provider.model,
+        )
+        # Tag the parse_source to reflect the image→ocr→text_ai pipeline
+        object.__setattr__(result, "parse_source", "image_ai")
+        return result
+
+    # Fall back to local rule parser
+    parsed = parse_signal_text(merged_text)
+    if not _is_actionable_entry_signal(merged_text, parsed):
+        result = MessageRecognitionResult(
+            raw_message_id=raw_message.id,
+            status="非策略",
+            reason="GLM-OCR 识别完成，但未检测到可执行新入场策略",
+            parse_source="image_ai",
+        )
+        _upsert_recognition(
+            session, result, engine=config.image_provider.model,
+        )
+        return result
+
+    candidate = _upsert_signal_candidate(session, raw_message, parsed)
+    result = MessageRecognitionResult(
+        raw_message_id=raw_message.id,
+        status="是策略",
+        summary=_format_candidate_summary(candidate),
+        parse_source="image_ai",
+    )
+    _upsert_recognition(session, result, engine=config.image_provider.model)
+    return result
+
+
+def _recognize_text_with_ai_provider(
+    *,
+    raw_message: RawMessage,
+    merged_text: str,
+    config: AiRecognitionConfig,
+) -> MessageRecognitionResult:
+    """Send plain text (already merged with OCR output) through the text AI
+    provider for strategy recognition."""
+    payload = _build_ai_recognition_payload(
+        raw_message=raw_message,
+        media_assets=[],
+        prompt=config.recognition_prompt,
+        model=config.text_provider.model,
+    )
+    # Override the user message content with the merged text
+    payload["messages"][1]["content"] = merged_text
+
+    provider = config.text_provider
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+
+    with httpx.Client(timeout=provider.timeout_seconds) as client:
+        response = client.post(
+            f"{provider.base_url.rstrip('/')}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    content = _extract_ai_content(data)
+    parsed = _parse_ai_result_json(content)
+    return _result_from_ai_payload(
+        raw_message_id=raw_message.id,
+        payload=parsed,
+        parse_source="text_ai",
+    )
+
+
+def _recognize_with_ai_provider(
+    *,
+    raw_message: RawMessage,
+    media_assets: list[MediaAsset],
+    config: AiRecognitionConfig,
+    provider: AiProviderConfig,
+    parse_source: str,
+) -> MessageRecognitionResult:
+    if media_assets and not any(_media_asset_to_data_url(asset) for asset in media_assets):
+        return MessageRecognitionResult(
+            raw_message_id=raw_message.id,
+            status="识别失败",
+            reason="图片文件未下载到本地，请重新同步该消息后再识别",
+        )
+    payload = _build_ai_recognition_payload(
+        raw_message=raw_message,
+        media_assets=media_assets,
+        prompt=config.recognition_prompt,
+        model=provider.model,
+    )
+    headers = {"Content-Type": "application/json"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    with httpx.Client(timeout=provider.timeout_seconds) as client:
+        response = client.post(
+            f"{provider.base_url.rstrip('/')}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+        )
+        response.raise_for_status()
+        data = response.json()
+    content = _extract_ai_content(data)
+    parsed = _parse_ai_result_json(content)
+    return _result_from_ai_payload(
+        raw_message_id=raw_message.id,
+        payload=parsed,
+        parse_source=parse_source,
+    )
+
+
+def _build_ai_recognition_payload(
+    *,
+    raw_message: RawMessage,
+    media_assets: list[MediaAsset],
+    prompt: str,
+    model: str,
+) -> dict[str, Any]:
+    user_text = (
+        f"Message metadata:\n"
+        f"chat_id={raw_message.chat_id}\n"
+        f"message_id={raw_message.message_id}\n"
+        f"sender={raw_message.sender_name or 'Unknown'}\n\n"
+        f"Text/caption:\n{(raw_message.text or '').strip() or '(empty)'}"
+    )
+    user_parts: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+    for media_asset in media_assets:
+        data_url = _media_asset_to_data_url(media_asset)
+        if data_url:
+            user_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url},
+                }
+            )
+    user_content: str | list[dict[str, Any]] = user_parts if len(user_parts) > 1 else user_text
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0,
+    }
+
+
+LIFECYCLE_EVENT_PROMPT = """
+你是 Telegram 加密货币 KOL 策略生命周期事件判定器。
+你会收到：当前消息、同群最近的活跃策略列表、以及最近聊天上下文。
+
+你的任务不是识别新策略，而是判断“当前消息”是否在改变某一条已有策略的状态。
+
+只允许输出 JSON，不要输出解释文本：
+{
+  "event_type": "none | entry_confirm | cancel_entry | exit_position | position_update",
+  "target_lifecycle_id": null,
+  "symbol": null,
+  "side": null,
+  "entry_price": null,
+  "exit_price": null,
+  "management_action": null,
+  "confidence": 0.0,
+  "reason": "一句话说明判断依据"
+}
+
+判定规则：
+- entry_confirm：当前消息是在通知之前 pending_entry 策略现在/现价/市价/直接入场，或明确说已经进场。
+- cancel_entry：当前消息是在取消之前 pending_entry 限价挂单或等待入场策略，例如取消限价、撤单、取消挂单、等后续信号。
+- exit_position：当前消息是在关闭已 entered 策略，例如平仓、全平、离场、临时离场、止盈了、止损了、先出来、保本出局、成本附近保本出局、保本走、成本走、breakeven exit。
+- position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、分批止盈30%、按比例止盈、减仓一半、减仓30%、持仓收益达到100%后分批止盈、带保护、保护止损、上移止损、推保护、继续持有。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
+- none：普通聊天、行情观点、广告、复盘、联系方式、无法确定目标策略、或只是识别新策略但不改变已有策略。
+- 必须优先依据当前消息，不要把上下文里的旧消息当成当前动作。
+- 如果能明确对应活跃策略，请输出 target_lifecycle_id。
+- 如果不能唯一对应，event_type 必须为 none 或 confidence 低于 0.7。
+- confidence 低于 0.7 时，系统不会执行状态变更。
+""".strip()
+
+
+def _apply_ai_lifecycle_event_if_matched(
+    session,
+    *,
+    raw_message: RawMessage,
+    config: AiRecognitionConfig,
+) -> MessageRecognitionResult | None:
+    context = _load_lifecycle_event_context(session, raw_message)
+    if not context["active_strategies"]:
+        return None
+
+    try:
+        decision = _call_lifecycle_event_ai(
+            raw_message=raw_message,
+            context=context,
+            config=config,
+        )
+    except Exception:
+        return None
+
+    if not _apply_lifecycle_event_decision(session, raw_message, decision):
+        return None
+
+    event_type = str(decision.get("event_type") or "").strip()
+    reason = str(decision.get("reason") or "").strip()
+    return MessageRecognitionResult(
+        raw_message_id=raw_message.id,
+        status="非策略",
+        reason=reason or f"AI 判定为策略生命周期事件：{event_type}",
+        ai_payload={"lifecycle_event": decision},
+        parse_source="lifecycle_ai",
+    )
+
+
+def _load_lifecycle_event_context(session, raw_message: RawMessage) -> dict[str, Any]:
+    posted_at = raw_message.posted_at or utc_now()
+    since = posted_at - timedelta(hours=48)
+    active_rows = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.chat_id == raw_message.chat_id)
+        .filter(StrategyLifecycle.lifecycle_status.in_(["pending_entry", "entered"]))
+        .filter(StrategyLifecycle.signal_at <= posted_at)
+        .filter(StrategyLifecycle.signal_at >= since)
+        .order_by(StrategyLifecycle.signal_at.desc(), StrategyLifecycle.id.desc())
+        .limit(8)
+        .all()
+    )
+    active_strategies: list[dict[str, Any]] = []
+    for lifecycle in active_rows:
+        original = (
+            session.query(RawMessage)
+            .filter(RawMessage.chat_id == lifecycle.chat_id)
+            .filter(RawMessage.message_id == lifecycle.message_id)
+            .one_or_none()
+        )
+        active_strategies.append(
+            {
+                "lifecycle_id": lifecycle.id,
+                "message_id": lifecycle.message_id,
+                "status": lifecycle.lifecycle_status,
+                "symbol": lifecycle.symbol,
+                "side": lifecycle.side,
+                "signal_at": str(lifecycle.signal_at),
+                "entered_at": str(lifecycle.entered_at) if lifecycle.entered_at else None,
+                "entry_range": _format_lifecycle_range(
+                    lifecycle.entry_range_low,
+                    lifecycle.entry_range_high,
+                ),
+                "entry_price_actual": lifecycle.entry_price_actual,
+                "stop_loss": lifecycle.stop_loss,
+                "take_profit": lifecycle.take_profit,
+                "original_text": _compact_context_text(original.text if original is not None else None),
+            }
+        )
+
+    recent_messages = (
+        session.query(RawMessage)
+        .filter(RawMessage.chat_id == raw_message.chat_id)
+        .filter(RawMessage.message_id <= raw_message.message_id)
+        .order_by(RawMessage.message_id.desc())
+        .limit(12)
+        .all()
+    )
+    recent_context = [
+        {
+            "message_id": item.message_id,
+            "posted_at": str(item.posted_at) if item.posted_at else None,
+            "text": _compact_context_text(item.text),
+        }
+        for item in reversed(recent_messages)
+    ]
+    return {
+        "active_strategies": active_strategies,
+        "recent_messages": recent_context,
+    }
+
+
+def _format_lifecycle_range(low: float | None, high: float | None) -> str | None:
+    if low is None and high is None:
+        return None
+    if low is None:
+        return _format_number(high)
+    if high is None or low == high:
+        return _format_number(low)
+    return f"{_format_number(low)}-{_format_number(high)}"
+
+
+def _compact_context_text(text: str | None, *, limit: int = 260) -> str | None:
+    if not text:
+        return None
+    compact = " ".join(str(text).split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1] + "..."
+
+
+def _call_lifecycle_event_ai(
+    *,
+    raw_message: RawMessage,
+    context: dict[str, Any],
+    config: AiRecognitionConfig,
+) -> dict[str, Any]:
+    provider = config.text_provider
+    payload = {
+        "model": provider.model,
+        "messages": [
+            {
+                "role": "system",
+                "content": config.lifecycle_event_prompt.strip() or LIFECYCLE_EVENT_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "current_message": {
+                            "chat_id": raw_message.chat_id,
+                            "message_id": raw_message.message_id,
+                            "posted_at": str(raw_message.posted_at) if raw_message.posted_at else None,
+                            "sender": raw_message.sender_name,
+                            "text": raw_message.text or "",
+                        },
+                        **context,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        "temperature": 0,
+    }
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    with httpx.Client(timeout=provider.timeout_seconds) as client:
+        response = client.post(
+            f"{provider.base_url.rstrip('/')}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+        )
+        response.raise_for_status()
+        data = response.json()
+    return _parse_ai_result_json(_extract_ai_content(data))
+
+
+def _apply_lifecycle_event_decision(
+    session,
+    raw_message: RawMessage,
+    decision: dict[str, Any],
+) -> bool:
+    event_type = str(decision.get("event_type") or "none").strip()
+    try:
+        confidence = float(decision.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if event_type == "none" or confidence < 0.7:
+        return False
+
+    target = _resolve_lifecycle_event_target(session, raw_message, decision)
+    if target is None:
+        return False
+
+    event_at = raw_message.posted_at or utc_now()
+    if event_type == "entry_confirm" and target.lifecycle_status == "pending_entry":
+        target.lifecycle_status = "entered"
+        target.entered_at = event_at
+        target.entry_signal_message_id = raw_message.message_id
+        entry_price = _number_or_none(decision.get("entry_price"))
+        if entry_price is not None:
+            target.entry_price_actual = entry_price
+        target.exit_reason = None
+        target.exited_at = None
+        target.updated_at = utc_now()
+        _upsert_entry_confirmation_candidate(
+            session,
+            raw_message=raw_message,
+            lifecycle=target,
+            entry_price=entry_price,
+            parse_source="lifecycle_ai",
+        )
+        return True
+
+    if event_type == "cancel_entry" and target.lifecycle_status == "pending_entry":
+        target.lifecycle_status = "exited"
+        target.exit_reason = "cancelled"
+        target.exited_at = event_at
+        target.exit_signal_message_id = raw_message.message_id
+        target.updated_at = utc_now()
+        _upsert_close_signal_candidate(
+            session,
+            raw_message=raw_message,
+            lifecycle=target,
+            parse_source="lifecycle_ai",
+        )
+        return True
+
+    if event_type == "exit_position" and target.lifecycle_status == "entered":
+        target.lifecycle_status = "exited"
+        target.exit_reason = "kol_signal"
+        target.exited_at = event_at
+        exit_price = _number_or_none(decision.get("exit_price"))
+        if exit_price is not None:
+            target.exit_price_actual = exit_price
+        target.exit_signal_message_id = raw_message.message_id
+        target.updated_at = utc_now()
+        _upsert_close_signal_candidate(
+            session,
+            raw_message=raw_message,
+            lifecycle=target,
+            parse_source="lifecycle_ai",
+        )
+        return True
+
+    if event_type == "position_update" and target.lifecycle_status == "entered":
+        management_action = str(decision.get("management_action") or "").strip() or "position_update"
+        management_note = str(decision.get("reason") or "").strip() or None
+        protective_stop = (
+            _protective_stop_price(target)
+            if _should_move_stop_to_protect(
+                current_text=raw_message.text,
+                decision=decision,
+                management_action=management_action,
+            )
+            else None
+        )
+        if protective_stop is not None:
+            target.stop_loss = protective_stop
+            protect_note = f"止损已调整到成本保护价 {protective_stop:g}。"
+            management_note = f"{management_note} {protect_note}" if management_note else protect_note
+        target.management_signal_message_id = raw_message.message_id
+        target.management_action = management_action
+        target.management_note = management_note
+        target.updated_at = utc_now()
+        _upsert_management_signal_candidate(
+            session,
+            raw_message=raw_message,
+            lifecycle=target,
+            parse_source="lifecycle_ai",
+        )
+        return True
+
+    return False
+
+
+def _should_move_stop_to_protect(
+    *,
+    current_text: str | None,
+    decision: dict[str, Any],
+    management_action: str,
+) -> bool:
+    text = " ".join(
+        str(part or "")
+        for part in (
+            current_text,
+            decision.get("reason"),
+            decision.get("management_action"),
+            management_action,
+        )
+    ).lower()
+    protect_terms = [
+        "带保护",
+        "保护止损",
+        "推保护",
+        "上推保护",
+        "保护价",
+        "保本",
+        "成本保护",
+        "move_stop_to_protect",
+        "breakeven",
+        "break even",
+    ]
+    return any(term in text for term in protect_terms)
+
+
+def _protective_stop_price(lifecycle: StrategyLifecycle) -> float | None:
+    if lifecycle.entry_price_actual is not None:
+        return lifecycle.entry_price_actual
+    if lifecycle.entry_range_low is not None and lifecycle.entry_range_high is not None:
+        return (lifecycle.entry_range_low + lifecycle.entry_range_high) / 2
+    if lifecycle.entry_range_low is not None:
+        return lifecycle.entry_range_low
+    if lifecycle.entry_range_high is not None:
+        return lifecycle.entry_range_high
+    return None
+
+
+def _resolve_lifecycle_event_target(
+    session,
+    raw_message: RawMessage,
+    decision: dict[str, Any],
+) -> StrategyLifecycle | None:
+    target_id = _int_or_none(decision.get("target_lifecycle_id"))
+    if target_id is not None:
+        target = session.get(StrategyLifecycle, target_id)
+        if target is not None and target.chat_id == raw_message.chat_id:
+            return target
+        return None
+
+    event_type = str(decision.get("event_type") or "").strip()
+    status = "pending_entry" if event_type in {"entry_confirm", "cancel_entry"} else "entered"
+    query = session.query(StrategyLifecycle).filter(
+        StrategyLifecycle.chat_id == raw_message.chat_id,
+        StrategyLifecycle.lifecycle_status == status,
+    )
+    symbol = str(decision.get("symbol") or "").strip().upper()
+    side = str(decision.get("side") or "").strip().lower()
+    if symbol:
+        query = query.filter(StrategyLifecycle.symbol == symbol)
+    if side in {"long", "short"}:
+        query = query.filter(StrategyLifecycle.side == side)
+    if raw_message.posted_at is not None:
+        query = query.filter(StrategyLifecycle.signal_at <= raw_message.posted_at)
+        query = query.filter(StrategyLifecycle.signal_at >= raw_message.posted_at - timedelta(hours=48))
+    matches = query.order_by(
+        StrategyLifecycle.signal_at.desc(),
+        StrategyLifecycle.id.desc(),
+    ).all()
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _number_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"\d+(?:\.\d+)?", str(value))
+    if not match:
+        return None
+    return float(match.group(0))
+
+
+def _media_missing_reason(media_assets: list[MediaAsset]) -> str | None:
+    """Return a human-readable reason when no usable media file is available.
+
+    Distinguishes between "never downloaded" (local_path is NULL for every
+    asset) and "file missing from disk" (path stored but file gone).
+    """
+    if not media_assets:
+        return None
+    any_has_path = any(a.local_path for a in media_assets)
+    any_has_file = any(_media_asset_to_data_url(a) for a in media_assets)
+    if any_has_file:
+        return None  # at least one file is usable
+    if not any_has_path:
+        return (
+            "图片从未下载到本地（local_path 为空）。"
+            "请点击「立即刷新」按钮重新同步该群消息，"
+            "等待图片下载完成后再点「立即识别」。"
+        )
+    return (
+        "图片文件丢失（磁盘上找不到）。"
+        "请点击「立即刷新」按钮重新同步该群消息后再试。"
+    )
+
+
+def _media_asset_to_data_url(media_asset: MediaAsset) -> str | None:
+    if not media_asset.local_path:
+        return None
+    path = Path(media_asset.local_path)
+    # Relative paths (from live-listener / sync downloads) need to be
+    # resolved against data/media.  Some are bare like "-100…\13121.jpg",
+    # others already include the prefix like "data/media/-100…\3099.jpg".
+    if not path.is_absolute():
+        path_str = str(path).replace("\\", "/")
+        if not path_str.startswith("data/media/"):
+            path = Path("data/media") / path
+    if not path.exists() or not path.is_file():
+        return None
+    mime_type = media_asset.mime_type or mimetypes.guess_type(path.name)[0] or "image/jpeg"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _extract_ai_content(data: dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        )
+    return ""
+
+
+def _parse_ai_result_json(content: str) -> dict[str, Any]:
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
+        if not match:
+            raise ValueError("AI response did not contain JSON")
+        return json.loads(match.group(0))
+
+
+def _result_from_ai_payload(
+    *,
+    raw_message_id: int,
+    payload: dict[str, Any],
+    parse_source: str,
+) -> MessageRecognitionResult:
+    status = str(payload.get("recognition_result") or "识别失败").strip()
+    if status not in {"是策略", "非策略", "识别失败"}:
+        status = "识别失败"
+    strategy = payload.get("strategy") if isinstance(payload.get("strategy"), dict) else {}
+    summary = _format_ai_strategy_summary(strategy) if status == "是策略" else None
+    result = MessageRecognitionResult(
+        raw_message_id=raw_message_id,
+        status=status,
+        summary=summary,
+        reason=str(payload.get("reason") or "").strip() or None,
+        ai_payload=payload,
+        parse_source=parse_source,
+    )
+    return result
+
+
+def _format_ai_strategy_summary(strategy: dict[str, Any]) -> str | None:
+    strategy = _normalize_ai_strategy(strategy)
+    parts: list[str] = []
+    symbol_side = " ".join(
+        str(value)
+        for value in [strategy.get("symbol"), strategy.get("side")]
+        if value not in (None, "")
+    )
+    if symbol_side:
+        parts.append(symbol_side)
+    for label, key in [
+        ("Entry", "entry"),
+        ("SL", "stop_loss"),
+        ("TP", "take_profit"),
+        ("Lev", "leverage"),
+        ("Type", "order_type"),
+    ]:
+        value = strategy.get(key)
+        if value not in (None, ""):
+            parts.append(f"{label} {value}")
+    return "；".join(parts) if parts else None
+
+
+def _persist_ai_result(
+    session,
+    raw_message: RawMessage,
+    result: MessageRecognitionResult,
+    *,
+    engine: str,
+) -> None:
+    payload = result.ai_payload or {}
+    parse_source = result.parse_source or "ai"
+    if result.status == "是策略":
+        strategy = payload.get("strategy") if isinstance(payload.get("strategy"), dict) else {}
+        candidate = _upsert_ai_signal_candidate(
+            session,
+            raw_message,
+            strategy=strategy,
+            confidence=float(payload.get("confidence") or 0.0),
+            parse_source=parse_source,
+        )
+        _ensure_lifecycle_record(session, raw_message, candidate)
+    else:
+        _apply_lifecycle_transition_signal_if_matched(session, raw_message, raw_message.text or "")
+    _upsert_recognition(session, result, engine=engine)
+
+
+def _upsert_ai_signal_candidate(
+    session,
+    raw_message: RawMessage,
+    *,
+    strategy: dict[str, Any],
+    confidence: float,
+    parse_source: str,
+) -> SignalCandidate:
+    normalized_strategy = _normalize_ai_strategy(strategy)
+    candidate = (
+        session.query(SignalCandidate)
+        .filter(SignalCandidate.raw_message_id == raw_message.id)
+        .order_by(SignalCandidate.id.asc())
+        .first()
+    )
+    if candidate is None:
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            source_id=None,
+            parse_source=parse_source,
+            review_status="pending",
+        )
+        session.add(candidate)
+    candidate.symbol = _string_or_none(normalized_strategy.get("symbol"))
+    candidate.side = _string_or_none(normalized_strategy.get("side"))
+    candidate.event_type = "entry_signal"
+    candidate.entry_text = _string_or_none(normalized_strategy.get("entry"))
+    candidate.stop_loss_text = _string_or_none(normalized_strategy.get("stop_loss"))
+    candidate.take_profit_text = _string_or_none(normalized_strategy.get("take_profit"))
+    candidate.leverage_text = _string_or_none(normalized_strategy.get("leverage"))
+    candidate.confidence = max(0.0, min(confidence, 1.0))
+    candidate.parse_source = parse_source
+    return candidate
+
+
+def _normalize_ai_strategy(strategy: dict[str, Any]) -> dict[str, str | None]:
+    return {
+        "symbol": _normalize_symbol(strategy.get("symbol")),
+        "side": _normalize_side(strategy.get("side")),
+        "entry": _normalize_strategy_text(strategy.get("entry"), separator="-"),
+        "stop_loss": _normalize_strategy_text(strategy.get("stop_loss"), separator="/"),
+        "take_profit": _normalize_strategy_text(strategy.get("take_profit"), separator="/"),
+        "leverage": _normalize_strategy_text(strategy.get("leverage"), separator="/"),
+        "order_type": _normalize_strategy_text(strategy.get("order_type"), separator="/"),
+    }
+
+
+def _normalize_symbol(value: Any) -> str | None:
+    text = _normalize_strategy_text(value, separator="/")
+    if not text:
+        return None
+    return text.upper().replace(" ", "")
+
+
+def _normalize_side(value: Any) -> str | None:
+    text = _normalize_strategy_text(value, separator="/")
+    if not text:
+        return None
+    lowered = text.lower()
+    if any(token in lowered for token in ["long", "buy"]):
+        return "long"
+    if any(token in lowered for token in ["short", "sell"]):
+        return "short"
+    if any(token in text for token in ["多", "做多", "开多"]):
+        return "long"
+    if any(token in text for token in ["空", "做空", "开空"]):
+        return "short"
+    return lowered
+
+
+def _normalize_strategy_text(value: Any, *, separator: str) -> str | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (list, tuple, set)):
+        parts = [
+            _normalize_strategy_text(item, separator=separator)
+            for item in value
+        ]
+        return separator.join(part for part in parts if part) or None
+    if isinstance(value, dict):
+        parts = [
+            _normalize_strategy_text(item, separator=separator)
+            for item in value.values()
+        ]
+        return separator.join(part for part in parts if part) or None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    text = re.sub(
+        r"^(entry|entries|sl|stop\s*loss|tp|take\s*profit|止损|止盈|入场|进场|建仓|目标)\s*[:：]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = text.replace("－", "-").replace("—", "-").replace("~", "-").replace("至", "-")
+    text = re.sub(r"\s+", "", text)
+    if separator == "/":
+        text = re.sub(r"[，,、|]+", "/", text)
+        text = re.sub(r"\s*/\s*", "/", text)
+    else:
+        text = re.sub(r"\s*-\s*", "-", text)
+    return text or None
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value).strip() or None
+
+
 def _is_actionable_entry_signal(text: str, parsed) -> bool:
     if parsed.confidence < 0.4:
         return False
@@ -179,7 +1254,432 @@ def _looks_like_position_management(text: str) -> bool:
     return any(term in text for term in POSITION_MANAGEMENT_TERMS)
 
 
-def _upsert_recognition(session, result: MessageRecognitionResult) -> MessageRecognition:
+def _apply_lifecycle_transition_signal_if_matched(
+    session,
+    raw_message: RawMessage,
+    text: str,
+) -> bool:
+    if _apply_exit_signal_if_matched(session, raw_message, text):
+        return True
+    if _apply_entry_confirmation_signal_if_matched(session, raw_message, text):
+        return True
+    return False
+
+
+def _apply_entry_confirmation_signal_if_matched(
+    session,
+    raw_message: RawMessage,
+    text: str,
+) -> bool:
+    entry_signal = _parse_explicit_entry_confirmation_signal(text)
+    if entry_signal is None:
+        return False
+
+    symbol, side, entry_price = entry_signal
+    query = session.query(StrategyLifecycle).filter(
+        StrategyLifecycle.chat_id == raw_message.chat_id,
+        StrategyLifecycle.lifecycle_status == "pending_entry",
+    )
+    if symbol is not None:
+        query = query.filter(StrategyLifecycle.symbol == symbol)
+    if side is not None:
+        query = query.filter(StrategyLifecycle.side == side)
+    if raw_message.posted_at is not None:
+        query = query.filter(StrategyLifecycle.signal_at <= raw_message.posted_at)
+        query = query.filter(StrategyLifecycle.signal_at >= raw_message.posted_at - timedelta(hours=24))
+
+    matches = query.order_by(
+        StrategyLifecycle.signal_at.desc(),
+        StrategyLifecycle.id.desc(),
+    ).all()
+    if not matches:
+        return False
+
+    latest = matches[0]
+    if symbol is None and len(matches) > 1:
+        same_latest_time = [
+            item for item in matches if item.signal_at == latest.signal_at
+        ]
+        if len(same_latest_time) > 1:
+            return False
+
+    entered_at = raw_message.posted_at or utc_now()
+    latest.lifecycle_status = "entered"
+    latest.entered_at = entered_at
+    latest.entry_signal_message_id = raw_message.message_id
+    latest.exit_reason = None
+    latest.exited_at = None
+    if entry_price is not None:
+        latest.entry_price_actual = entry_price
+    latest.updated_at = utc_now()
+
+    if latest.trade_idea_id is not None:
+        trade_idea = session.get(TradeIdea, latest.trade_idea_id)
+        if trade_idea is not None:
+            trade_idea.status = "open"
+            if trade_idea.opened_at is None:
+                trade_idea.opened_at = entered_at
+
+    _upsert_entry_confirmation_candidate(
+        session,
+        raw_message=raw_message,
+        lifecycle=latest,
+        entry_price=entry_price,
+    )
+    return True
+
+
+def _apply_exit_signal_if_matched(
+    session,
+    raw_message: RawMessage,
+    text: str,
+) -> bool:
+    if _apply_cancel_signal_if_matched(session, raw_message, text):
+        return True
+
+    exit_signal = _parse_explicit_exit_signal(text)
+    if exit_signal is None:
+        return False
+
+    symbol, side = exit_signal
+    query = session.query(StrategyLifecycle).filter(
+        StrategyLifecycle.chat_id == raw_message.chat_id,
+        StrategyLifecycle.lifecycle_status == "entered",
+    )
+    if symbol is not None:
+        query = query.filter(StrategyLifecycle.symbol == symbol)
+    if side is not None:
+        query = query.filter(StrategyLifecycle.side == side)
+    if raw_message.posted_at is not None:
+        query = query.filter(StrategyLifecycle.signal_at <= raw_message.posted_at)
+
+    matches = query.order_by(
+        StrategyLifecycle.entered_at.desc().nullslast(),
+        StrategyLifecycle.signal_at.desc(),
+        StrategyLifecycle.id.desc(),
+    ).all()
+    if not matches:
+        return False
+    if symbol is None and len(matches) > 1:
+        return False
+
+    lifecycle = matches[0]
+    exited_at = raw_message.posted_at or utc_now()
+    lifecycle.lifecycle_status = "exited"
+    lifecycle.exit_reason = "kol_signal"
+    lifecycle.exited_at = exited_at
+    if lifecycle.entered_at is not None and _datetime_after(lifecycle.entered_at, exited_at):
+        lifecycle.entered_at = lifecycle.signal_at
+    lifecycle.exit_signal_message_id = raw_message.message_id
+    lifecycle.updated_at = utc_now()
+
+    if lifecycle.trade_idea_id is not None:
+        trade_idea = session.get(TradeIdea, lifecycle.trade_idea_id)
+        if trade_idea is not None and trade_idea.status == "open":
+            trade_idea.status = "closed"
+            trade_idea.closed_at = exited_at
+
+    _upsert_close_signal_candidate(
+        session,
+        raw_message=raw_message,
+        lifecycle=lifecycle,
+        parse_source="exit_heuristic",
+    )
+    return True
+
+
+def _apply_cancel_signal_if_matched(
+    session,
+    raw_message: RawMessage,
+    text: str,
+) -> bool:
+    cancel_signal = _parse_explicit_cancel_signal(text)
+    if cancel_signal is None:
+        return False
+
+    symbol, side = cancel_signal
+    query = session.query(StrategyLifecycle).filter(
+        StrategyLifecycle.chat_id == raw_message.chat_id,
+        StrategyLifecycle.lifecycle_status == "pending_entry",
+    )
+    if symbol is not None:
+        query = query.filter(StrategyLifecycle.symbol == symbol)
+    if side is not None:
+        query = query.filter(StrategyLifecycle.side == side)
+    if raw_message.posted_at is not None:
+        query = query.filter(StrategyLifecycle.signal_at <= raw_message.posted_at)
+        query = query.filter(StrategyLifecycle.signal_at >= raw_message.posted_at - timedelta(hours=24))
+
+    matches = query.order_by(
+        StrategyLifecycle.signal_at.desc(),
+        StrategyLifecycle.id.desc(),
+    ).all()
+    if not matches:
+        return False
+
+    latest = matches[0]
+    if symbol is None and len(matches) > 1:
+        same_latest_time = [
+            item for item in matches if item.signal_at == latest.signal_at
+        ]
+        if len(same_latest_time) > 1:
+            return False
+
+    exited_at = raw_message.posted_at or utc_now()
+    latest.lifecycle_status = "exited"
+    latest.exit_reason = "cancelled"
+    latest.exited_at = exited_at
+    latest.exit_signal_message_id = raw_message.message_id
+    latest.updated_at = utc_now()
+
+    _upsert_close_signal_candidate(
+        session,
+        raw_message=raw_message,
+        lifecycle=latest,
+        parse_source="cancel_heuristic",
+    )
+    return True
+
+
+def _upsert_close_signal_candidate(
+    session,
+    *,
+    raw_message: RawMessage,
+    lifecycle: StrategyLifecycle,
+    parse_source: str,
+) -> SignalCandidate:
+    candidate = (
+        session.query(SignalCandidate)
+        .filter(SignalCandidate.raw_message_id == raw_message.id)
+        .order_by(SignalCandidate.id.asc())
+        .first()
+    )
+    if candidate is None:
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            source_id=None,
+            parse_source=parse_source,
+            review_status="pending",
+        )
+        session.add(candidate)
+    candidate.symbol = lifecycle.symbol
+    candidate.side = lifecycle.side
+    candidate.event_type = "close_signal"
+    candidate.confidence = max(candidate.confidence or 0.0, 0.85)
+    candidate.parse_source = parse_source
+    return candidate
+
+
+def _upsert_entry_confirmation_candidate(
+    session,
+    *,
+    raw_message: RawMessage,
+    lifecycle: StrategyLifecycle,
+    entry_price: float | None,
+    parse_source: str = "entry_confirm_heuristic",
+) -> SignalCandidate:
+    candidate = (
+        session.query(SignalCandidate)
+        .filter(SignalCandidate.raw_message_id == raw_message.id)
+        .order_by(SignalCandidate.id.asc())
+        .first()
+    )
+    if candidate is None:
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            source_id=None,
+            parse_source=parse_source,
+            review_status="pending",
+        )
+        session.add(candidate)
+    candidate.symbol = lifecycle.symbol
+    candidate.side = lifecycle.side
+    candidate.event_type = "entry_signal"
+    candidate.entry_text = _format_number(entry_price) if entry_price is not None else None
+    candidate.stop_loss_text = _format_number(lifecycle.stop_loss)
+    candidate.take_profit_text = lifecycle.take_profit
+    candidate.confidence = max(candidate.confidence or 0.0, 0.85)
+    candidate.parse_source = parse_source
+    return candidate
+
+
+def _upsert_management_signal_candidate(
+    session,
+    *,
+    raw_message: RawMessage,
+    lifecycle: StrategyLifecycle,
+    parse_source: str,
+) -> SignalCandidate:
+    candidate = (
+        session.query(SignalCandidate)
+        .filter(SignalCandidate.raw_message_id == raw_message.id)
+        .order_by(SignalCandidate.id.asc())
+        .first()
+    )
+    if candidate is None:
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            source_id=None,
+            parse_source=parse_source,
+            review_status="pending",
+        )
+        session.add(candidate)
+    candidate.symbol = lifecycle.symbol
+    candidate.side = lifecycle.side
+    candidate.event_type = "position_update"
+    candidate.entry_text = None
+    candidate.stop_loss_text = _format_number(lifecycle.stop_loss)
+    candidate.take_profit_text = lifecycle.take_profit
+    candidate.confidence = max(candidate.confidence or 0.0, 0.85)
+    candidate.parse_source = parse_source
+    return candidate
+
+
+def _parse_explicit_exit_signal(text: str) -> tuple[str | None, str | None] | None:
+    normalized = (text or "").strip()
+    if not normalized:
+        return None
+
+    lowered = normalized.lower()
+    has_exit_term = (
+        any(term in normalized for term in ["平仓", "全平", "全部平", "出局", "离场", "止盈了", "止损了"])
+        or any(term in lowered for term in ["close", "closed", "exit", "stop out", "stopped out"])
+    )
+    if not has_exit_term:
+        return None
+
+    symbol = _extract_exit_symbol(normalized)
+    side = _extract_exit_side(normalized)
+    if symbol is None and side is None:
+        return None
+    return symbol, side
+
+
+def _parse_explicit_cancel_signal(text: str) -> tuple[str | None, str | None] | None:
+    normalized = (text or "").strip()
+    if not normalized:
+        return None
+    lowered = normalized.lower()
+    has_cancel_term = (
+        any(term in normalized for term in ["取消限价", "取消挂单", "撤单", "取消订单", "挂单取消"])
+        or any(term in lowered for term in ["cancel limit", "cancel order", "cancel entry"])
+    )
+    if not has_cancel_term:
+        return None
+    return _extract_exit_symbol(normalized), _extract_exit_side(normalized)
+
+
+def _parse_explicit_entry_confirmation_signal(
+    text: str,
+) -> tuple[str | None, str | None, float | None] | None:
+    normalized = (text or "").strip()
+    if not normalized:
+        return None
+    if _parse_explicit_cancel_signal(normalized) is not None:
+        return None
+    if _parse_explicit_exit_signal(normalized) is not None:
+        return None
+
+    lowered = normalized.lower()
+    has_entry_confirm_term = (
+        any(
+            term in normalized
+            for term in [
+                "现价入场",
+                "现价进",
+                "现价开",
+                "现价上车",
+                "市价入场",
+                "市价进",
+                "直接进",
+                "直接入场",
+                "现在进",
+                "现在入场",
+                "已进",
+                "进了",
+                "按现价",
+            ]
+        )
+        or (
+            any(term in normalized for term in ["现价", "市价"])
+            and any(term in normalized for term in ["入场", "进场", "开仓", "建仓", "上车"])
+        )
+        or any(
+            term in lowered
+            for term in [
+                "market entry",
+                "enter now",
+                "entry now",
+                "enter at market",
+                "market in",
+                "entered",
+            ]
+        )
+    )
+    if not has_entry_confirm_term:
+        return None
+
+    symbol = _extract_exit_symbol(normalized)
+    side = _extract_exit_side(normalized)
+    price = _extract_entry_confirmation_price(normalized, symbol)
+    return symbol, side, price
+
+
+def _extract_entry_confirmation_price(text: str, symbol: str | None) -> float | None:
+    values = [float(value) for value in re.findall(r"\d+(?:\.\d+)?", text)]
+    if not values:
+        return None
+    for value in values:
+        if symbol == "BTC" and value >= 1000:
+            return value
+        if symbol == "ETH" and value >= 100:
+            return value
+        if symbol not in {"BTC", "ETH"} and value > 100:
+            return value
+    return None
+
+
+def _datetime_after(left, right) -> bool:
+    if left is None or right is None:
+        return False
+    if getattr(left, "tzinfo", None) is not None:
+        left = left.replace(tzinfo=None)
+    if getattr(right, "tzinfo", None) is not None:
+        right = right.replace(tzinfo=None)
+    return left > right
+
+
+def _extract_exit_symbol(text: str) -> str | None:
+    for alias, symbol in {
+        "BTC": "BTC",
+        "BTCUSDT": "BTC",
+        "XBT": "BTC",
+        "大饼": "BTC",
+        "比特币": "BTC",
+        "ETH": "ETH",
+        "ETHUSDT": "ETH",
+        "以太": "ETH",
+    }.items():
+        if re.search(rf"\b{re.escape(alias)}\b", text, flags=re.IGNORECASE) or alias in text:
+            return symbol
+    return None
+
+
+def _extract_exit_side(text: str) -> str | None:
+    lowered = text.lower()
+    if any(term in text for term in ["空单", "做空", "开空"]) or "short" in lowered:
+        return "short"
+    if any(term in text for term in ["多单", "做多", "开多"]) or "long" in lowered:
+        return "long"
+    return None
+
+
+def _upsert_recognition(
+    session,
+    result: MessageRecognitionResult,
+    *,
+    engine: str = "local_rule_parser",
+) -> MessageRecognition:
     recognition = (
         session.query(MessageRecognition)
         .filter(MessageRecognition.raw_message_id == result.raw_message_id)
@@ -191,7 +1691,7 @@ def _upsert_recognition(session, result: MessageRecognitionResult) -> MessageRec
     recognition.status = result.status
     recognition.reason = result.reason
     recognition.summary = result.summary
-    recognition.engine = "local_rule_parser"
+    recognition.engine = engine
     recognition.updated_at = utc_now()
     return recognition
 
@@ -240,3 +1740,204 @@ def _has_image_like_media(media_assets: list[MediaAsset]) -> bool:
         if "photo" in media_kind or "image" in media_kind or mime_type.startswith("image/"):
             return True
     return False
+
+
+def _ensure_lifecycle_record(
+    session,
+    raw_message: RawMessage,
+    candidate: SignalCandidate,
+) -> StrategyLifecycle | None:
+    """Create a StrategyLifecycle record for a newly recognised entry signal.
+
+    Idempotent — if a lifecycle record already exists for this
+    (chat_id, message_id) it will be left unchanged.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    if not candidate.symbol or not candidate.side:
+        return None
+
+    existing = (
+        session.query(StrategyLifecycle)
+        .filter(
+            StrategyLifecycle.chat_id == raw_message.chat_id,
+            StrategyLifecycle.message_id == raw_message.message_id,
+        )
+        .one_or_none()
+    )
+    if existing is not None:
+        _backfill_lifecycle_strategy_fields(existing, candidate)
+        return existing
+
+    entry_low, entry_high = _parse_entry_range_values(candidate.entry_text)
+    stop_loss = _parse_single_float(candidate.stop_loss_text)
+    duplicate = _find_duplicate_active_lifecycle(
+        session,
+        raw_message=raw_message,
+        candidate=candidate,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        stop_loss=stop_loss,
+    )
+    if duplicate is not None:
+        candidate.review_note = (
+            f"Duplicate active strategy lifecycle #{duplicate.id}; "
+            f"original message #{duplicate.message_id}."
+        )
+        candidate.event_type = "duplicate_entry_signal"
+        candidate.confidence = max(candidate.confidence or 0.0, 0.9)
+        return duplicate
+
+    lc = StrategyLifecycle(
+        signal_candidate_id=candidate.id,
+        chat_id=raw_message.chat_id,
+        message_id=raw_message.message_id,
+        symbol=candidate.symbol.upper(),
+        side=candidate.side.lower(),
+        lifecycle_status="pending_entry",
+        signal_at=raw_message.posted_at or utc_now(),
+        entry_range_low=entry_low,
+        entry_range_high=entry_high,
+        stop_loss=stop_loss,
+        take_profit=candidate.take_profit_text,
+    )
+    session.add(lc)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        return None
+    return lc
+
+
+def _find_duplicate_active_lifecycle(
+    session,
+    *,
+    raw_message: RawMessage,
+    candidate: SignalCandidate,
+    entry_low: float | None,
+    entry_high: float | None,
+    stop_loss: float | None,
+    window_hours: int = 24,
+) -> StrategyLifecycle | None:
+    signal_at = raw_message.posted_at or utc_now()
+    symbol = (candidate.symbol or "").upper()
+    side = (candidate.side or "").lower()
+    if not symbol or not side:
+        return None
+
+    query = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.chat_id == raw_message.chat_id)
+        .filter(StrategyLifecycle.lifecycle_status.in_(["pending_entry", "entered"]))
+        .filter(StrategyLifecycle.symbol == symbol)
+        .filter(StrategyLifecycle.side == side)
+        .filter(StrategyLifecycle.signal_at <= signal_at)
+        .filter(StrategyLifecycle.signal_at >= signal_at - timedelta(hours=window_hours))
+        .order_by(StrategyLifecycle.signal_at.desc(), StrategyLifecycle.id.desc())
+    )
+    candidate_tp_values = _strategy_price_values(
+        candidate.take_profit_text,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        stop_loss=stop_loss,
+    )
+    for lifecycle in query.all():
+        if not _same_optional_float_pair(
+            (lifecycle.entry_range_low, lifecycle.entry_range_high),
+            (entry_low, entry_high),
+        ):
+            continue
+        if not _same_optional_float(lifecycle.stop_loss, stop_loss):
+            continue
+        lifecycle_tp_values = _strategy_price_values(
+            lifecycle.take_profit,
+            entry_low=lifecycle.entry_range_low,
+            entry_high=lifecycle.entry_range_high,
+            stop_loss=lifecycle.stop_loss,
+        )
+        if lifecycle_tp_values and candidate_tp_values and lifecycle_tp_values != candidate_tp_values:
+            continue
+        return lifecycle
+    return None
+
+
+def _same_optional_float(left: float | None, right: float | None, *, tolerance: float = 1e-6) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    return abs(float(left) - float(right)) <= tolerance
+
+
+def _same_optional_float_pair(
+    left: tuple[float | None, float | None],
+    right: tuple[float | None, float | None],
+) -> bool:
+    left_values = sorted(value for value in left if value is not None)
+    right_values = sorted(value for value in right if value is not None)
+    if len(left_values) != len(right_values):
+        return False
+    return all(_same_optional_float(a, b) for a, b in zip(left_values, right_values))
+
+
+def _strategy_price_values(
+    text: str | None,
+    *,
+    entry_low: float | None,
+    entry_high: float | None,
+    stop_loss: float | None,
+) -> tuple[float, ...]:
+    if not text:
+        return ()
+    values = [float(value) for value in re.findall(r"\d+(?:\.\d+)?", text)]
+    reference_prices = [
+        value for value in (entry_low, entry_high, stop_loss) if value is not None and value > 0
+    ]
+    min_strategy_price = min(reference_prices) * 0.5 if reference_prices else 0
+    filtered = [value for value in values if value >= min_strategy_price]
+    return tuple(round(value, 6) for value in filtered)
+
+
+def _backfill_lifecycle_strategy_fields(
+    lifecycle: StrategyLifecycle,
+    candidate: SignalCandidate,
+) -> None:
+    entry_low, entry_high = _parse_entry_range_values(candidate.entry_text)
+    if lifecycle.signal_candidate_id is None:
+        lifecycle.signal_candidate_id = candidate.id
+    if lifecycle.entry_range_low is None and entry_low is not None:
+        lifecycle.entry_range_low = entry_low
+    if lifecycle.entry_range_high is None and entry_high is not None:
+        lifecycle.entry_range_high = entry_high
+    if lifecycle.stop_loss is None:
+        stop_loss = _parse_single_float(candidate.stop_loss_text)
+        if stop_loss is not None:
+            lifecycle.stop_loss = stop_loss
+    if not lifecycle.take_profit and candidate.take_profit_text:
+        lifecycle.take_profit = candidate.take_profit_text
+    lifecycle.updated_at = utc_now()
+
+
+def _parse_entry_range_values(entry_text: str | None) -> tuple[float | None, float | None]:
+    """Parse '62000-62200' → (62000.0, 62200.0).  Returns (None, None) on failure."""
+    if not entry_text:
+        return None, None
+    values = re.findall(r"\d+(?:\.\d+)?", entry_text)
+    if len(values) < 2:
+        raw = re.findall(r"\d+(?:\.\d+)?", entry_text)
+        if raw:
+            single = float(raw[0])
+            return single, single
+        return None, None
+    low = float(values[0])
+    high = float(values[1])
+    if low > high:
+        low, high = high, low
+    return low, high
+
+
+def _parse_single_float(text: str | None) -> float | None:
+    """Parse '61000' → 61000.0.  Returns None on failure."""
+    if not text:
+        return None
+    values = re.findall(r"\d+(?:\.\d+)?", text)
+    return float(values[0]) if values else None

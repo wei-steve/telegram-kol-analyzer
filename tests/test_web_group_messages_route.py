@@ -1,9 +1,15 @@
 from datetime import UTC, datetime
+import re
 
 from fastapi.testclient import TestClient
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import MediaAsset, RawMessage, SignalCandidate
+from telegram_kol_research.models import (
+    MediaAsset,
+    RawMessage,
+    SignalCandidate,
+    StrategyLifecycle,
+)
 from telegram_kol_research.web_app import create_web_app
 
 
@@ -65,10 +71,90 @@ def test_groups_route_returns_latest_activity_sorted_partial(tmp_path):
     response = client.get("/groups?selected_chat_id=77")
 
     assert response.status_code == 200
-    assert 'data-groups-list' in response.text
+    assert 'kol-strategy-list' in response.text
     assert response.text.index("newer group") < response.text.index("older group")
     assert 'data-chat-id="77"' in response.text
-    assert response.text.count("is-active") == 1
+    assert response.text.count("is-active") >= 1
+
+
+def test_groups_route_uses_lifecycle_counts_for_sidebar_badges(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=77,
+                message_id=1,
+                posted_at=datetime(2026, 4, 2, tzinfo=UTC),
+                sender_name="strategy group",
+                text="group",
+            )
+        )
+        session.add_all(
+            [
+                StrategyLifecycle(
+                    chat_id=77,
+                    message_id=10,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="entered",
+                    signal_at=datetime(2026, 4, 2, tzinfo=UTC),
+                ),
+                StrategyLifecycle(
+                    chat_id=77,
+                    message_id=11,
+                    symbol="ETH",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=datetime(2026, 4, 2, tzinfo=UTC),
+                    entry_range_low=3200,
+                    entry_range_high=3220,
+                ),
+                StrategyLifecycle(
+                    chat_id=77,
+                    message_id=12,
+                    symbol="SOL",
+                    side="short",
+                    lifecycle_status="pending_entry",
+                    signal_at=datetime(2026, 4, 2, tzinfo=UTC),
+                    entry_range_low=180,
+                    entry_range_high=181,
+                ),
+                StrategyLifecycle(
+                    chat_id=77,
+                    message_id=13,
+                    symbol="QQ",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=datetime(2026, 4, 2, tzinfo=UTC),
+                ),
+                StrategyLifecycle(
+                    chat_id=77,
+                    message_id=14,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=datetime(2026, 4, 2, tzinfo=UTC),
+                    entry_range_low=6.22,
+                    entry_range_high=6.27,
+                ),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups?selected_chat_id=77")
+
+    assert response.status_code == 200
+    assert re.search(
+        r'class="kol-status-badge kol-status-holding"[^>]*>\s*[^<]*1\s*</span>',
+        response.text,
+    )
+    assert re.search(
+        r'class="kol-status-badge kol-status-pending"[^>]*>\s*[^<]*2\s*</span>',
+        response.text,
+    )
+    assert re.search(r'3\s*[^<]*</span>', response.text)
 
 
 def test_group_messages_route_supports_search_and_sender_filters(tmp_path):

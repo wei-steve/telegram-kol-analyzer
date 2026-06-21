@@ -72,6 +72,7 @@ def test_recovery_execution_preview_lists_approved_limit_orders_only(tmp_path):
             "side": "long",
             "entry_range_text": "68000-68200",
             "stop_loss_text": "67500",
+            "take_profit_text": None,
             "max_loss_usdt": 100.0,
             "action": "eligible_for_recovery_limit_order",
             "review_status": "approved_for_order",

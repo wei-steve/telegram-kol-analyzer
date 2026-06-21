@@ -252,3 +252,72 @@ class RecoveryOrderConfirmation(Base):
     confirmed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class StrategyLifecycle(Base):
+    """Track the full lifecycle of a KOL strategy signal.
+
+    A signal starts as *pending_entry*, transitions to *entered* when price
+    touches the entry range, then to *exited* when stop-loss / take-profit
+    is hit or the KOL publishes a closing signal.
+    """
+
+    __tablename__ = "strategy_lifecycles"
+    __table_args__ = (
+        UniqueConstraint(
+            "chat_id", "message_id", name="uq_strategy_lifecycles_chat_message"
+        ),
+        Index("ix_strategy_lifecycles_status", "lifecycle_status"),
+        Index("ix_strategy_lifecycles_symbol", "symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_candidate_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("signal_candidates.id"), nullable=True, index=True
+    )
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    # Core lifecycle state
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending_entry", index=True
+    )
+    # pending_entry | entered | exited | expired | cancelled
+    exit_reason: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    # None | stop_loss | take_profit | kol_signal | manual | expired
+
+    # Timestamps
+    signal_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    entered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    exited_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # Price fields
+    entry_range_low: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    entry_range_high: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    stop_loss: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    filled_tp_index: Mapped[int] = mapped_column(Integer, nullable=False, default=-1)
+    entry_price_actual: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    exit_price_actual: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Associations
+    execution_binding_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=True, index=True
+    )
+    trade_idea_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("trade_ideas.id"), nullable=True, index=True
+    )
+    exit_signal_candidate_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("signal_candidates.id"), nullable=True
+    )
+    entry_signal_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    exit_signal_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    management_signal_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    management_action: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    management_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)

@@ -57,6 +57,12 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "run_at": "ALTER TABLE recovery_decisions ADD COLUMN run_at DATETIME",
         "updated_at": "ALTER TABLE recovery_decisions ADD COLUMN updated_at DATETIME",
     },
+    "strategy_lifecycles": {
+        "entry_signal_message_id": "ALTER TABLE strategy_lifecycles ADD COLUMN entry_signal_message_id INTEGER",
+        "management_signal_message_id": "ALTER TABLE strategy_lifecycles ADD COLUMN management_signal_message_id INTEGER",
+        "management_action": "ALTER TABLE strategy_lifecycles ADD COLUMN management_action VARCHAR(64)",
+        "management_note": "ALTER TABLE strategy_lifecycles ADD COLUMN management_note TEXT",
+    },
 }
 
 

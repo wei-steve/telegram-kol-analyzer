@@ -76,11 +76,12 @@ def persist_normalized_messages(
     *,
     sync_kind: str = "history",
     broker=None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Persist normalized raw messages, media metadata, and sync checkpoints."""
 
     inserted_messages = 0
     inserted_media_assets = 0
+    inserted_message_keys: list[tuple[int, int]] = []
 
     with session_factory() as session:
         latest_records_by_chat: dict[tuple[int, str], NormalizedMessageRecord] = {}
@@ -111,6 +112,7 @@ def persist_normalized_messages(
                 session.flush()
                 inserted_messages += 1
                 inserted_current_message = True
+                inserted_message_keys.append((record.chat_id, record.message_id))
             else:
                 raw_message.sender_id = record.sender_id
                 raw_message.sender_name = record.sender_name
@@ -172,6 +174,7 @@ def persist_normalized_messages(
         "inserted_messages": inserted_messages,
         "inserted_media_assets": inserted_media_assets,
         "processed_records": len(records),
+        "inserted_message_keys": inserted_message_keys,
     }
 
 

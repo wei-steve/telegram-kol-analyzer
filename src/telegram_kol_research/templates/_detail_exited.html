@@ -1,0 +1,61 @@
+{# ── Exited tab content only ── #}
+{% set group_exited = exited_positions | selectattr("chat_id", "equalto", selected_chat_id) | list %}
+{% if group_exited %}
+  <div class="position-list">
+    {% for ex in group_exited %}
+      <article class="position-card position-exited">
+        <div class="position-card-main">
+          <div class="position-symbol-row">
+            <strong>{{ ex.symbol }}</strong>
+            <span class="side-badge{% if ex.side == 'long' %} side-long{% elif ex.side == 'short' %} side-short{% endif %}">
+              {{ '多' if ex.side == 'long' else '空' if ex.side == 'short' else ex.side }}
+            </span>
+            <code class="exit-reason">
+              {% if ex.exit_reason == 'stop_loss' %}止损离场
+              {% elif ex.exit_reason == 'take_profit' %}止盈离场
+              {% elif ex.exit_reason == 'kol_signal' %}KOL离场信号
+              {% elif ex.exit_reason == 'cancelled' %}取消挂单
+              {% elif ex.exit_reason == 'expired' %}过期未入场
+              {% elif ex.lifecycle_status == 'expired' %}过期未入场
+              {% else %}{{ ex.exit_reason or '已离场' }}
+              {% endif %}
+            </code>
+          </div>
+          <div class="position-meta">
+            {% if ex.entry_text %}<span>入场: {{ ex.entry_text }}</span>{% endif %}
+            {% if ex.entry_price_actual %}<span>入场价: {{ "%g"|format(ex.entry_price_actual) }}</span>{% endif %}
+            {% if ex.exit_price_actual %}<span>离场价: {{ "%g"|format(ex.exit_price_actual) }}</span>{% endif %}
+            {% if ex.stop_loss_text %}<span class="meta-sl">止损: {{ ex.stop_loss_text }}</span>{% endif %}
+            {% if ex.take_profit_text %}<span class="meta-tp">止盈: {{ ex.take_profit_text }}</span>{% endif %}
+          </div>
+          <div class="position-source">
+            {% if ex.sender_name %}<span>{{ ex.sender_name }}</span>{% endif %}
+            {% if ex.entered_at %}<span>入场: {{ ex.entered_at }}</span>{% endif %}
+            {% if ex.exited_at %}<span>离场: {{ ex.exited_at }}</span>{% endif %}
+          </div>
+          {% if ex.original_message_id or ex.latest_event_message_id or ex.status_detail %}
+            <div class="position-lifecycle">
+              <div class="position-lifecycle-row">
+                <span>原策略</span>
+                {% if ex.original_message_id %}<code>#{{ ex.original_message_id }}</code>{% endif %}
+                {% if ex.original_posted_at %}<time>{{ ex.original_posted_at }}</time>{% endif %}
+              </div>
+              {% if ex.original_text_excerpt %}<p>{{ ex.original_text_excerpt }}</p>{% endif %}
+              <div class="position-lifecycle-row">
+                <span>最新事件</span>
+                <strong>{{ ex.latest_event_label or ex.current_status_label }}</strong>
+                {% if ex.latest_event_message_id %}<code>#{{ ex.latest_event_message_id }}</code>{% endif %}
+                {% if ex.latest_event_at %}<time>{{ ex.latest_event_at }}</time>{% endif %}
+                {% if ex.transition_text %}<code>{{ ex.transition_text }}</code>{% endif %}
+              </div>
+              {% if ex.latest_event_text_excerpt %}<p>{{ ex.latest_event_text_excerpt }}</p>{% endif %}
+              {% if ex.status_detail %}<p class="position-lifecycle-detail">{{ ex.status_detail }}</p>{% endif %}
+            </div>
+          {% endif %}
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="empty-state">暂无已离场策略。</p>
+{% endif %}

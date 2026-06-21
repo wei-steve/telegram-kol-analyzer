@@ -1,10 +1,55 @@
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 
+from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.message_recognition import recognize_message_now
-from telegram_kol_research.models import MediaAsset, MessageRecognition, RawMessage, SignalCandidate
+from telegram_kol_research.message_recognition import (
+    _ensure_lifecycle_record,
+    _result_from_ai_payload,
+    _upsert_ai_signal_candidate,
+    recognize_message_now,
+)
+from telegram_kol_research.models import (
+    MediaAsset,
+    MessageRecognition,
+    RawMessage,
+    SignalCandidate,
+    StrategyLifecycle,
+    TradeIdea,
+)
+
+
+def _mock_deepseek_lifecycle_event(monkeypatch, payload, *, seen_requests=None):
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json, headers):
+            if seen_requests is not None:
+                seen_requests.append(json)
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": __import__("json").dumps(payload, ensure_ascii=False)
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr("telegram_kol_research.message_recognition.httpx.Client", FakeClient)
 
 
 def test_recognize_message_now_persists_text_strategy_candidate(tmp_path):
@@ -20,7 +65,11 @@ def test_recognize_message_now_persists_text_strategy_candidate(tmp_path):
         session.commit()
         raw_message_id = raw_message.id
 
-    result = recognize_message_now(session_factory, raw_message_id=raw_message_id)
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
 
     assert result.status == "是策略"
     assert "BTC long" in result.summary
@@ -33,6 +82,136 @@ def test_recognize_message_now_persists_text_strategy_candidate(tmp_path):
     assert recognition.status == "是策略"
 
 
+def test_ai_strategy_payload_normalizes_targets_and_backfills_lifecycle(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    payload = {
+        "recognition_result": "是策略",
+        "reason": "has entry, stop loss and take profits",
+        "strategy": {
+            "symbol": "btc",
+            "side": "long",
+            "entry": "Entry: 62400 nearby",
+            "stop_loss": "SL: 60800",
+            "take_profit": ["TP: 63600", "64800"],
+        },
+        "confidence": 0.91,
+    }
+
+    result = _result_from_ai_payload(
+        raw_message_id=1,
+        payload=payload,
+        parse_source="text_ai",
+    )
+
+    assert "BTC long" in (result.summary or "")
+    assert "Entry 62400nearby" in (result.summary or "")
+    assert "TP 63600/64800" in (result.summary or "")
+
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9,
+            posted_at=datetime(2026, 6, 14, tzinfo=UTC),
+            text="BTC long Entry 62400 nearby SL 60800 TP 63600/64800",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = _upsert_ai_signal_candidate(
+            session,
+            raw_message,
+            strategy=payload["strategy"],
+            confidence=0.91,
+            parse_source="text_ai",
+        )
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=raw_message.chat_id,
+            message_id=raw_message.message_id,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=raw_message.posted_at,
+        )
+        session.add(lifecycle)
+        session.flush()
+
+        _ensure_lifecycle_record(session, raw_message, candidate)
+
+        assert candidate.symbol == "BTC"
+        assert candidate.side == "long"
+        assert candidate.entry_text == "62400nearby"
+        assert candidate.stop_loss_text == "60800"
+        assert candidate.take_profit_text == "63600/64800"
+        assert lifecycle.entry_range_low == 62400
+        assert lifecycle.entry_range_high == 62400
+        assert lifecycle.stop_loss == 60800
+        assert lifecycle.take_profit == "63600/64800"
+
+
+def test_ensure_lifecycle_record_deduplicates_recent_active_same_strategy(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_payload = {
+        "symbol": "ETH",
+        "side": "short",
+        "entry": "1710/1788",
+        "stop_loss": "1850",
+        "take_profit": "第一止盈1673（70%仓位），第二止盈1618",
+    }
+    duplicate_payload = {
+        "symbol": "ETH",
+        "side": "short",
+        "entry": "1710-1788",
+        "stop_loss": "1850",
+        "take_profit": "1673/1618",
+    }
+
+    with session_factory() as session:
+        first_message = RawMessage(
+            chat_id=88,
+            message_id=12918,
+            posted_at=datetime(2026, 6, 19, 1, 30, 50, tzinfo=UTC),
+            text="ETH 1710市价直接空 再挂1788 止盈1673/1618 止损1850",
+        )
+        duplicate_message = RawMessage(
+            chat_id=88,
+            message_id=12924,
+            posted_at=datetime(2026, 6, 19, 13, 46, 42, tzinfo=UTC),
+            text="ETH 1710市价直接空 再挂1788 止盈1673/1618 止损1850",
+        )
+        session.add_all([first_message, duplicate_message])
+        session.flush()
+        first_candidate = _upsert_ai_signal_candidate(
+            session,
+            first_message,
+            strategy=first_payload,
+            confidence=0.95,
+            parse_source="text_ai",
+        )
+        first_lifecycle = _ensure_lifecycle_record(session, first_message, first_candidate)
+        first_lifecycle.lifecycle_status = "entered"
+        first_lifecycle.entered_at = first_message.posted_at
+        first_lifecycle.entry_price_actual = 1710
+        duplicate_candidate = _upsert_ai_signal_candidate(
+            session,
+            duplicate_message,
+            strategy=duplicate_payload,
+            confidence=0.95,
+            parse_source="text_ai",
+        )
+        duplicate_lifecycle = _ensure_lifecycle_record(
+            session,
+            duplicate_message,
+            duplicate_candidate,
+        )
+        session.flush()
+
+        assert duplicate_lifecycle.id == first_lifecycle.id
+        assert session.query(StrategyLifecycle).count() == 1
+        assert duplicate_candidate.event_type == "duplicate_entry_signal"
+        assert "Duplicate active strategy lifecycle" in duplicate_candidate.review_note
+
+
 def test_recognize_message_now_marks_plain_text_as_not_strategy(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
@@ -41,7 +220,11 @@ def test_recognize_message_now_marks_plain_text_as_not_strategy(tmp_path):
         session.commit()
         raw_message_id = raw_message.id
 
-    result = recognize_message_now(session_factory, raw_message_id=raw_message_id)
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),  # local rule parser
+    )
 
     assert result.status == "非策略"
     assert result.summary is None
@@ -60,7 +243,11 @@ def test_recognize_message_now_rejects_single_direction_hint(tmp_path):
         session.commit()
         raw_message_id = raw_message.id
 
-    result = recognize_message_now(session_factory, raw_message_id=raw_message_id)
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
 
     assert result.status == "非策略"
     with session_factory() as session:
@@ -83,12 +270,609 @@ def test_recognize_message_now_rejects_position_management_update(tmp_path):
         session.commit()
         raw_message_id = raw_message.id
 
-    result = recognize_message_now(session_factory, raw_message_id=raw_message_id)
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),  # local rule parser
+    )
 
     assert result.status == "非策略"
     assert result.reason == "未识别到可执行新入场策略"
     with session_factory() as session:
         assert session.query(SignalCandidate).count() == 0
+
+
+def test_recognize_message_now_closes_matching_short_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        trade_idea = TradeIdea(
+            chat_id=88,
+            symbol="BTC",
+            side="short",
+            status="open",
+            created_at=datetime(2026, 6, 15, 13, 43, tzinfo=UTC),
+        )
+        session.add(trade_idea)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            trade_idea_id=trade_idea.id,
+            chat_id=88,
+            message_id=430,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 15, 13, 43, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 16, 0, 32, tzinfo=UTC),
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=435,
+            posted_at=datetime(2026, 6, 17, 1, 32, tzinfo=UTC),
+            text="当前价格接近成本价：65540，空单全部平仓！整体亏损170点左右吧！",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+        trade_idea_id = trade_idea.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.status == "非策略"
+    assert result.reason == "本地规则识别到明确入场/取消/离场消息，已更新匹配的策略状态。"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        trade_idea = session.get(TradeIdea, trade_idea_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "kol_signal"
+    assert lifecycle.exit_signal_message_id == 435
+    assert trade_idea.status == "closed"
+    assert candidate.event_type == "close_signal"
+    assert candidate.symbol == "BTC"
+    assert candidate.side == "short"
+
+
+def test_recognize_message_now_cancels_recent_pending_limit_order(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=374,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 19, 4, 29, tzinfo=UTC),
+            entry_range_low=63200,
+            entry_range_high=63500,
+            stop_loss=64200,
+            take_profit="62000",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=376,
+            posted_at=datetime(2026, 6, 19, 9, 24, tzinfo=UTC),
+            text="取消限价，等我后续信号！",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "cancelled"
+    assert lifecycle.exit_signal_message_id == 376
+    assert candidate.event_type == "close_signal"
+    assert candidate.parse_source == "cancel_heuristic"
+    assert candidate.symbol == "BTC"
+    assert candidate.side == "short"
+
+
+def test_ai_lifecycle_event_cancels_pending_order(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=374,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 19, 4, 29, tzinfo=UTC),
+            entry_range_low=63200,
+            entry_range_high=63500,
+            stop_loss=64200,
+            take_profit="62000",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=376,
+            posted_at=datetime(2026, 6, 19, 9, 24, tzinfo=UTC),
+            text="取消限价，等我后续信号！",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "cancel_entry",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "BTC",
+            "side": "short",
+            "entry_price": None,
+            "exit_price": None,
+            "confidence": 0.92,
+            "reason": "当前消息取消前面的限价挂单",
+        },
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.parse_source == "lifecycle_ai"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "cancelled"
+    assert lifecycle.exit_signal_message_id == 376
+    assert candidate.parse_source == "lifecycle_ai"
+
+
+def test_ai_lifecycle_event_confirms_market_entry(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=374,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 19, 4, 29, tzinfo=UTC),
+            entry_range_low=63200,
+            entry_range_high=63500,
+            stop_loss=64200,
+            take_profit="62000",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=377,
+            posted_at=datetime(2026, 6, 19, 9, 40, tzinfo=UTC),
+            text="BTC 现价 63320 入场",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "entry_confirm",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "BTC",
+            "side": "short",
+            "entry_price": 63320,
+            "exit_price": None,
+            "confidence": 0.93,
+            "reason": "当前消息确认按现价入场",
+        },
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.parse_source == "lifecycle_ai"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.entry_signal_message_id == 377
+    assert lifecycle.entry_price_actual == 63320
+    assert candidate.parse_source == "lifecycle_ai"
+
+
+def test_ai_lifecycle_event_exits_entered_position(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=374,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 19, 4, 29, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 19, 9, 40, tzinfo=UTC),
+            entry_price_actual=63320,
+            stop_loss=64200,
+            take_profit="62000",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=378,
+            posted_at=datetime(2026, 6, 19, 10, 5, tzinfo=UTC),
+            text="先临时离场，等下一步通知",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "exit_position",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "BTC",
+            "side": "short",
+            "entry_price": None,
+            "exit_price": None,
+            "confidence": 0.9,
+            "reason": "当前消息要求临时离场",
+        },
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.parse_source == "lifecycle_ai"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "kol_signal"
+    assert lifecycle.exit_signal_message_id == 378
+    assert candidate.parse_source == "lifecycle_ai"
+
+
+def test_ai_lifecycle_event_treats_breakeven_exit_as_position_exit(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=9024,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 18, 15, 57, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 18, 15, 58, tzinfo=UTC),
+            entry_price_actual=62400,
+            stop_loss=60800,
+            take_profit="63600/64800",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9030,
+            posted_at=datetime(2026, 6, 19, 11, 15, tzinfo=UTC),
+            text="目前还在成本附近，保本出局。",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "exit_position",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "BTC",
+            "side": "long",
+            "entry_price": None,
+            "exit_price": None,
+            "confidence": 0.91,
+            "reason": "当前消息说明成本附近保本出局，应关闭已有持仓策略",
+        },
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.parse_source == "lifecycle_ai"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "kol_signal"
+    assert lifecycle.exit_signal_message_id == 9030
+    assert candidate.event_type == "close_signal"
+    assert candidate.parse_source == "lifecycle_ai"
+
+
+def test_ai_lifecycle_event_records_partial_take_profit_update(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=1395,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 17, 10, 26, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 18, 4, 11, tzinfo=UTC),
+            entry_price_actual=63794.4,
+            stop_loss=61000,
+            take_profit="65500/66500/67500",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=1400,
+            posted_at=datetime(2026, 6, 18, 8, 36, tzinfo=UTC),
+            text="大饼反弹一般，现价64500附近提前止盈一半带保护，整体思路还是高抛低吸为主",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "position_update",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "BTC",
+            "side": "long",
+            "entry_price": None,
+            "exit_price": None,
+            "management_action": "partial_take_profit",
+            "confidence": 0.92,
+            "reason": "当前消息要求提前止盈一半并带保护，属于持仓管理更新",
+        },
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.parse_source == "lifecycle_ai"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.management_signal_message_id == 1400
+    assert lifecycle.management_action == "partial_take_profit"
+    assert lifecycle.stop_loss == 63794.4
+    assert "提前止盈一半" in lifecycle.management_note
+    assert "止损已调整到成本保护价 63794.4" in lifecycle.management_note
+    assert candidate.event_type == "position_update"
+    assert candidate.parse_source == "lifecycle_ai"
+    assert candidate.stop_loss_text == "63794.4"
+
+
+def test_ai_lifecycle_event_records_scaled_take_profit_percentage_update(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=2124,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 19, 3, 6, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 19, 3, 7, tzinfo=UTC),
+            entry_price_actual=1705,
+            stop_loss=1740,
+            take_profit="1620",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=2131,
+            posted_at=datetime(2026, 6, 19, 10, 12, tzinfo=UTC),
+            text="现目前空单获利16个点！\n持仓收益达到100％！\n分批止盈30％！！！",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "position_update",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "ETH",
+            "side": "short",
+            "entry_price": None,
+            "exit_price": None,
+            "management_action": "partial_take_profit",
+            "confidence": 0.93,
+            "reason": "当前消息说明空单已盈利并要求分批止盈30%，属于已有持仓的部分止盈管理。",
+        },
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.parse_source == "lifecycle_ai"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.management_signal_message_id == 2131
+    assert lifecycle.management_action == "partial_take_profit"
+    assert "分批止盈30%" in lifecycle.management_note
+    assert candidate.event_type == "position_update"
+    assert candidate.parse_source == "lifecycle_ai"
+
+
+def test_recognize_message_now_confirms_recent_pending_market_entry(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=374,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 19, 4, 29, tzinfo=UTC),
+            entry_range_low=63200,
+            entry_range_high=63500,
+            stop_loss=64200,
+            take_profit="62000",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=377,
+            posted_at=datetime(2026, 6, 19, 9, 40, tzinfo=UTC),
+            text="BTC 现价 63320 入场",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.entered_at == datetime(2026, 6, 19, 9, 40)
+    assert lifecycle.entry_signal_message_id == 377
+    assert lifecycle.entry_price_actual == 63320
+    assert candidate.event_type == "entry_signal"
+    assert candidate.parse_source == "entry_confirm_heuristic"
+    assert candidate.symbol == "BTC"
+    assert candidate.side == "short"
+    assert candidate.entry_text == "63320"
+
+
+def test_recognize_message_now_confirms_unique_pending_entry_without_symbol(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=374,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 19, 4, 29, tzinfo=UTC),
+            entry_range_low=63200,
+            entry_range_high=63500,
+            stop_loss=64200,
+            take_profit="62000",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=377,
+            posted_at=datetime(2026, 6, 19, 9, 40, tzinfo=UTC),
+            text="现价入场",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.entry_signal_message_id == 377
+    assert lifecycle.entry_price_actual is None
+    assert candidate.parse_source == "entry_confirm_heuristic"
 
 
 def test_recognize_message_now_rejects_trading_education_content(tmp_path):
@@ -106,7 +890,11 @@ def test_recognize_message_now_rejects_trading_education_content(tmp_path):
         session.commit()
         raw_message_id = raw_message.id
 
-    result = recognize_message_now(session_factory, raw_message_id=raw_message_id)
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
 
     assert result.status == "非策略"
     with session_factory() as session:
@@ -145,7 +933,11 @@ def test_recognize_message_now_keeps_image_pending_for_later_ocr(tmp_path):
         session.commit()
         raw_message_id = raw_message.id
 
-    result = recognize_message_now(session_factory, raw_message_id=raw_message_id)
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),  # local rule parser
+    )
 
     assert result.status == "待识别"
     assert result.reason == "图片识别等待 OCR/AI 接入"

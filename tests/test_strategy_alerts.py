@@ -5,7 +5,8 @@ from datetime import UTC, datetime
 import httpx
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import StrategyAlert
+from telegram_kol_research.message_recognition import MessageRecognitionResult
+from telegram_kol_research.models import RawMessage, SignalCandidate, StrategyAlert, StrategyLifecycle
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord, persist_normalized_messages
 from telegram_kol_research.strategy_alerts import (
     AlertDecision,
@@ -251,6 +252,171 @@ def test_process_strategy_alert_forwards_ai_confirmed_strategy_even_when_confide
 
     assert result["status"] == "sent"
     assert len(sent_messages) == 1
+
+
+def test_process_strategy_alert_uses_recognition_candidate_for_unified_strategy_message(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    record = _record(text="BTC long 68000-68200 SL 67500 TP 69000/70000")
+    persist_normalized_messages(session_factory, [record])
+    with session_factory() as session:
+        raw_message = session.query(RawMessage).one()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw_message.id,
+                symbol="BTC",
+                side="long",
+                event_type="entry_signal",
+                entry_text="68000-68200",
+                stop_loss_text="67500",
+                take_profit_text="69000/70000",
+                parse_source="text_ai",
+                confidence=0.91,
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                chat_id=record.chat_id,
+                message_id=record.message_id,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="pending_entry",
+                signal_at=record.posted_at,
+                entry_range_low=68000,
+                entry_range_high=68200,
+                stop_loss=67500,
+                take_profit="69000/70000",
+            )
+        )
+        session.commit()
+    sent_messages: list[str] = []
+
+    async def fail_llm(*args, **kwargs):
+        raise AssertionError("alert should reuse message recognition instead of calling LLM")
+
+    async def bot_sender(*, config, text):
+        sent_messages.append(text)
+
+    result = asyncio.run(
+        process_strategy_alert_for_record(
+            session_factory=session_factory,
+            record=record,
+            chat_title="VIP BTC Room",
+            config=_config(),
+            recognition_result=MessageRecognitionResult(
+                raw_message_id=1,
+                status="是策略",
+                reason="AI recognized strategy",
+                parse_source="text_ai",
+            ),
+            llm_requester=fail_llm,
+            bot_sender=bot_sender,
+        )
+    )
+
+    assert result["status"] == "sent"
+    assert sent_messages == [
+        "\n".join(
+            [
+                "【KOL策略提醒】",
+                "类型: 新策略",
+                "群组: VIP BTC Room",
+                "时间: 2026-05-10 16:00:00 Asia/Shanghai",
+                "交易对: BTC",
+                "方向: 多",
+                "入场价格: 68000-68200",
+                "止盈价格: 69000/70000",
+                "止损价格: 67500",
+                "消息ID: 55",
+                "",
+                "原文:",
+                "BTC long 68000-68200 SL 67500 TP 69000/70000",
+            ]
+        )
+    ]
+    with session_factory() as session:
+        stored = session.query(StrategyAlert).one()
+    assert stored.status == "sent"
+    assert stored.strategy_kind == "entry"
+    assert stored.ai_confidence == 0.91
+
+
+def test_process_strategy_alert_formats_lifecycle_events(tmp_path):
+    cases = [
+        ("entry_signal", "lifecycle_ai", "entered", None, "入场", "entry"),
+        ("close_signal", "lifecycle_ai", "exited", "kol_signal", "离场", "exit"),
+        ("close_signal", "lifecycle_ai", "exited", "cancelled", "取消挂单", "cancel_entry"),
+        ("position_update", "lifecycle_ai", "entered", None, "突发消息", "position_update"),
+    ]
+
+    for index, (event_type, parse_source, lifecycle_status, exit_reason, alert_type, strategy_kind) in enumerate(cases, start=1):
+        session_factory = create_session_factory(tmp_path / f"research_{index}.db")
+        record = _record(text=f"event {index}")
+        record.message_id = 100 + index
+        persist_normalized_messages(session_factory, [record])
+        with session_factory() as session:
+            raw_message = session.query(RawMessage).one()
+            session.add(
+                SignalCandidate(
+                    raw_message_id=raw_message.id,
+                    symbol="ETH",
+                    side="short",
+                    event_type=event_type,
+                    entry_text="2330",
+                    stop_loss_text="2380",
+                    take_profit_text="2200",
+                    parse_source=parse_source,
+                    confidence=0.88,
+                )
+            )
+            lifecycle = StrategyLifecycle(
+                chat_id=record.chat_id,
+                message_id=10,
+                symbol="ETH",
+                side="short",
+                lifecycle_status=lifecycle_status,
+                exit_reason=exit_reason,
+                signal_at=record.posted_at,
+                entry_range_low=2300,
+                entry_range_high=2330,
+                stop_loss=2380,
+                take_profit="2200",
+                entry_price_actual=2330,
+            )
+            if alert_type == "入场":
+                lifecycle.entry_signal_message_id = record.message_id
+            elif alert_type in {"离场", "取消挂单"}:
+                lifecycle.exit_signal_message_id = record.message_id
+            else:
+                lifecycle.management_signal_message_id = record.message_id
+            session.add(lifecycle)
+            session.commit()
+        sent_messages: list[str] = []
+
+        async def bot_sender(*, config, text):
+            sent_messages.append(text)
+
+        result = asyncio.run(
+            process_strategy_alert_for_record(
+                session_factory=session_factory,
+                record=record,
+                chat_title="ETH Room",
+                config=_config(),
+                recognition_result=MessageRecognitionResult(
+                    raw_message_id=1,
+                    status="非策略",
+                    reason="lifecycle event",
+                    parse_source="lifecycle_ai",
+                ),
+                bot_sender=bot_sender,
+            )
+        )
+
+        assert result["status"] == "sent"
+        assert f"类型: {alert_type}" in sent_messages[0]
+        assert "方向: 空" in sent_messages[0]
+        assert "交易对: ETH" in sent_messages[0]
+        with session_factory() as session:
+            assert session.query(StrategyAlert).one().strategy_kind == strategy_kind
 
 
 def test_database_bootstrap_creates_strategy_alerts_table(tmp_path):

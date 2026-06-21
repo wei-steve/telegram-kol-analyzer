@@ -10,6 +10,7 @@ import asyncio
 import re
 
 import httpx
+from sqlalchemy import func
 
 try:
     from fastapi import FastAPI, Request
@@ -26,6 +27,7 @@ except (
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.ai_recognition_config import (
+    AiProviderConfig,
     AiRecognitionConfig,
     load_ai_recognition_config,
     save_ai_recognition_config,
@@ -36,6 +38,7 @@ from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.message_recognition import recognize_message_now
+from telegram_kol_research.models import RawMessage
 from telegram_kol_research.llm_chat import (
     build_proxy_chat_payload,
     build_scope_context,
@@ -44,6 +47,7 @@ from telegram_kol_research.llm_chat import (
     load_llm_proxy_config,
     request_grounded_chat_answer,
 )
+from telegram_kol_research.execution_bindings import list_active_positions
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import list_recovery_decisions
 from telegram_kol_research.recovery_execution_queue import list_recovery_execution_previews
@@ -51,6 +55,7 @@ from telegram_kol_research.recovery_live_submit_gate import validate_recovery_li
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_runner import run_recovery_dry_run
 from telegram_kol_research.strategy_alerts import (
+    StrategyAlertConfig,
     load_strategy_alert_config,
     strategy_alerts_enabled,
 )
@@ -58,11 +63,21 @@ from telegram_kol_research.web_queries import (
     load_database_freshness,
     load_group_messages,
     load_group_rows,
+    load_lifecycle_counts,
+    load_lifecycle_counts_by_chat_id,
+    list_exited_strategies,
+    list_holding_strategies,
+    list_pending_strategies,
     load_messages_in_time_window,
     load_selected_messages,
 )
+from telegram_kol_research.lifecycle_monitor import (
+    LifecycleMonitor,
+    LifecycleMonitorConfig,
+)
 from telegram_kol_research.telegram_live_listener import launch_live_listener_task, run_live_listener
 from telegram_kol_research.telegram_live_listener import run_periodic_reconcile, run_reconcile_once
+from telegram_kol_research.telegram_bot_commands import run_telegram_bot_command_loop
 from telegram_kol_research.telegram_client import create_telegram_client, load_telegram_auth_config, maybe_await
 from telegram_kol_research.telegram_session_lock import (
     TelegramSessionLockError,
@@ -78,45 +93,66 @@ def _build_trader_dashboard_state(
     *,
     groups: list[dict[str, Any]],
     group_config: GroupConfig,
-    recovery_decisions: list[dict[str, Any]],
-    recovery_execution_queue: list[dict[str, Any]],
-    live_listener_enabled: bool,
-    refresh_mode_label: str,
+    active_positions: list[dict[str, Any]],
+    pending_entry_signals: list[dict[str, Any]],
+    holding_positions: list[dict[str, Any]] | None = None,
+    exited_positions: list[dict[str, Any]] | None = None,
+    lifecycle_counts: dict[str, int] | None = None,
+    lifecycle_counts_by_chat_id: dict[int, dict[str, int]] | None = None,
+    live_listener_enabled: bool = False,
+    refresh_mode_label: str = "",
 ) -> dict[str, Any]:
-    pending_review_count = sum(
-        1
-        for decision in recovery_decisions
-        if decision.get("review_status") == "pending"
+    entered_count = len(active_positions)
+    pending_count = len(pending_entry_signals)
+    holding_count = (
+        len(holding_positions)
+        if holding_positions is not None
+        else len(active_positions)
     )
-    ready_to_simulate_count = sum(
+    exited_count = (
+        (lifecycle_counts or {}).get("exited", 0)
+        + (lifecycle_counts or {}).get("expired", 0)
+        if lifecycle_counts is not None or exited_positions is not None
+        else len(exited_positions) if exited_positions is not None else 0
+    )
+    ready_count = sum(
         1
-        for item in recovery_execution_queue
+        for item in pending_entry_signals
         if not item.get("deepcoin_order_draft", {}).get("blocking_reason_codes")
     )
     blocked_count = sum(
         1
-        for item in recovery_execution_queue
+        for item in pending_entry_signals
         if item.get("deepcoin_order_draft", {}).get("blocking_reason_codes")
     )
-    blocked_count += sum(
-        1
-        for decision in recovery_decisions
-        if decision.get("action") == "manual_review"
-    )
 
-    work_counts_by_chat_id: dict[int, int] = {}
-    for decision in recovery_decisions:
-        chat_id = decision.get("chat_id")
+    holding_counts_by_chat_id: dict[int, int] = {}
+    for pos in active_positions:
+        chat_id = pos.get("chat_id")
         if chat_id is not None:
-            work_counts_by_chat_id[int(chat_id)] = (
-                work_counts_by_chat_id.get(int(chat_id), 0) + 1
+            holding_counts_by_chat_id[int(chat_id)] = (
+                holding_counts_by_chat_id.get(int(chat_id), 0) + 1
             )
-    for item in recovery_execution_queue:
+    for h in (holding_positions or []):
+        chat_id = h.get("chat_id")
+        if chat_id is not None and int(chat_id) not in holding_counts_by_chat_id:
+            holding_counts_by_chat_id[int(chat_id)] = (
+                holding_counts_by_chat_id.get(int(chat_id), 0) + 1
+            )
+    pending_counts_by_chat_id: dict[int, int] = {}
+    for item in pending_entry_signals:
         chat_id = item.get("chat_id")
         if chat_id is not None:
-            work_counts_by_chat_id[int(chat_id)] = (
-                work_counts_by_chat_id.get(int(chat_id), 0) + 1
+            pending_counts_by_chat_id[int(chat_id)] = (
+                pending_counts_by_chat_id.get(int(chat_id), 0) + 1
             )
+    work_counts_by_chat_id: dict[int, int] = {}
+    for chat_id, count in holding_counts_by_chat_id.items():
+        work_counts_by_chat_id[chat_id] = count
+    for chat_id, count in pending_counts_by_chat_id.items():
+        work_counts_by_chat_id[chat_id] = (
+            work_counts_by_chat_id.get(chat_id, 0) + count
+        )
 
     config_by_chat_id = {
         int(item.chat_id): item for item in group_config.groups if item.chat_id is not None
@@ -124,13 +160,29 @@ def _build_trader_dashboard_state(
     config_by_title = {item.chat_title: item for item in group_config.groups}
     group_rows = []
     for group in groups:
+        group_chat_id = int(group["chat_id"])
+        group_lifecycle_counts = (
+            lifecycle_counts_by_chat_id or {}
+        ).get(group_chat_id)
+        group_holding_count = (
+            group_lifecycle_counts.get("entered", 0)
+            if group_lifecycle_counts is not None
+            else holding_counts_by_chat_id.get(group_chat_id, 0)
+        )
+        group_pending_count = (
+            group_lifecycle_counts.get("pending_entry", 0)
+            if group_lifecycle_counts is not None
+            else pending_counts_by_chat_id.get(group_chat_id, 0)
+        )
         config_item = config_by_chat_id.get(int(group["chat_id"])) or config_by_title.get(
             str(group.get("raw_title") or group.get("title") or "")
         )
         group_rows.append(
             {
                 **group,
-                "strategy_work_count": work_counts_by_chat_id.get(int(group["chat_id"]), 0),
+                "strategy_work_count": group_holding_count + group_pending_count,
+                "holding_count": group_holding_count,
+                "pending_count": group_pending_count,
                 "ai_strategy_enabled": (
                     bool(config_item.ai_strategy_enabled) if config_item is not None else False
                 ),
@@ -143,14 +195,67 @@ def _build_trader_dashboard_state(
         )
 
     return {
-        "strategy_count": len(recovery_decisions),
-        "pending_review_count": pending_review_count,
-        "ready_to_simulate_count": ready_to_simulate_count,
+        "entered_count": entered_count,
+        "holding_count": holding_count,
+        "pending_count": pending_count,
+        "exited_count": exited_count,
+        "ready_count": ready_count,
         "blocked_count": blocked_count,
         "group_rows": group_rows,
         "live_listener_enabled": live_listener_enabled,
         "refresh_mode_label": refresh_mode_label,
     }
+
+
+def _build_strategy_kpi_counts(
+    *,
+    selected_chat_id: int | None,
+    holding_positions: list[dict[str, Any]],
+    pending_entry_signals: list[dict[str, Any]],
+    exited_positions: list[dict[str, Any]] | None = None,
+    lifecycle_counts: dict[str, int] | None = None,
+) -> dict[str, int]:
+    def belongs_to_selected(item: dict[str, Any]) -> bool:
+        if selected_chat_id is None:
+            return True
+        chat_id = item.get("chat_id")
+        return chat_id is not None and int(chat_id) == int(selected_chat_id)
+
+    selected_holding = [item for item in holding_positions if belongs_to_selected(item)]
+    selected_pending = [item for item in pending_entry_signals if belongs_to_selected(item)]
+    if lifecycle_counts is not None:
+        exited_count = lifecycle_counts.get("exited", 0) + lifecycle_counts.get("expired", 0)
+    else:
+        selected_exited = [
+            item for item in (exited_positions or []) if belongs_to_selected(item)
+        ]
+        exited_count = len(selected_exited)
+    ready_count = sum(
+        1
+        for item in selected_pending
+        if not item.get("deepcoin_order_draft", {}).get("blocking_reason_codes")
+    )
+    return {
+        "holding_count": len(selected_holding),
+        "pending_count": len(selected_pending),
+        "exited_count": exited_count,
+        "ready_count": ready_count,
+    }
+
+
+def _symbol_whitelist_by_chat_id(group_config: GroupConfig) -> dict[int, set[str]]:
+    result: dict[int, set[str]] = {}
+    for item in group_config.groups:
+        if item.chat_id is None:
+            continue
+        symbols = {
+            str(symbol).upper()
+            for symbol in (item.symbol_whitelist or [])
+            if str(symbol).strip()
+        }
+        if symbols:
+            result[int(item.chat_id)] = symbols
+    return result
 
 
 def _extract_session_lock_owner_pid(reason: str | None) -> int | None:
@@ -196,6 +301,26 @@ def create_web_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # ── lifecycle monitor (started first; no dependency on Telegram client) ──
+        app.state.lifecycle_monitor_http = httpx.AsyncClient(timeout=10.0)
+        app.state.lifecycle_monitor = LifecycleMonitor(
+            session_factory=app.state.session_factory,
+            broker=app.state.live_update_broker,
+            config=LifecycleMonitorConfig(),
+            http_client=app.state.lifecycle_monitor_http,
+            now_provider=app.state.now_provider,
+        )
+        app.state.lifecycle_monitor_task = asyncio.create_task(
+            app.state.lifecycle_monitor.run_loop()
+        )
+        if isinstance(app.state.strategy_alert_config, StrategyAlertConfig):
+            app.state.telegram_bot_command_task = asyncio.create_task(
+                run_telegram_bot_command_loop(
+                    config=app.state.strategy_alert_config,
+                    session_factory=app.state.session_factory,
+                    group_config=app.state.group_config,
+                )
+            )
         if (
             app.state.live_target_titles
             and app.state.telegram_client is not None
@@ -206,10 +331,14 @@ def create_web_app(
                 client=app.state.telegram_client,
                 session_factory=app.state.session_factory,
                 broker=app.state.live_update_broker,
-                target_titles=set(app.state.live_target_titles),
+                target_titles=app.state.live_target_titles,
                 media_root=app.state.media_root,
                 strategy_alert_config=app.state.strategy_alert_config,
                 strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
+                ai_recognition_config=load_ai_recognition_config(
+                    app.state.ai_recognition_config_path
+                ),
+                lifecycle_monitor=app.state.lifecycle_monitor,
             )
             app.state.reconcile_task = asyncio.create_task(
                 _run_reconcile_after_startup_delay(
@@ -217,7 +346,7 @@ def create_web_app(
                     client=app.state.telegram_client,
                     session_factory=app.state.session_factory,
                     broker=app.state.live_update_broker,
-                    target_titles=set(app.state.live_target_titles),
+                    target_titles=app.state.live_target_titles,
                     media_root=app.state.media_root,
                     interval_seconds=app.state.reconcile_interval_seconds,
                     operation_lock=app.state.telegram_operation_lock,
@@ -229,6 +358,19 @@ def create_web_app(
         try:
             yield
         finally:
+            # ── lifecycle monitor shutdown ──
+            lcm_task = app.state.lifecycle_monitor_task
+            if lcm_task is not None:
+                lcm_task.cancel()
+                try:
+                    await lcm_task
+                except asyncio.CancelledError:
+                    pass
+                app.state.lifecycle_monitor_task = None
+            lcm_http = app.state.lifecycle_monitor_http
+            if lcm_http is not None:
+                await lcm_http.aclose()
+            # ── live listener shutdown ──
             task = app.state.live_listener_task
             if task is not None:
                 task.cancel()
@@ -237,6 +379,14 @@ def create_web_app(
                 except asyncio.CancelledError:
                     pass
                 app.state.live_listener_task = None
+            bot_command_task = app.state.telegram_bot_command_task
+            if bot_command_task is not None:
+                bot_command_task.cancel()
+                try:
+                    await bot_command_task
+                except asyncio.CancelledError:
+                    pass
+                app.state.telegram_bot_command_task = None
             reconcile_task = app.state.reconcile_task
             if reconcile_task is not None:
                 reconcile_task.cancel()
@@ -292,12 +442,111 @@ def create_web_app(
         else reconcile_startup_delay_seconds
     )
     app.state.reconcile_task = None
+    app.state.telegram_bot_command_task = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client
     app.state.reconcile_once_runner = run_reconcile_once
     app.state.telegram_session_lock_factory = acquire_telegram_session_lock
     app.state.telegram_operation_lock = asyncio.Lock()
     app.state.asset_version = _static_asset_version()
+
+    async def ensure_live_tasks_match_targets() -> None:
+        if not app.state.live_target_titles:
+            for task_name in ("live_listener_task", "reconcile_task"):
+                task = getattr(app.state, task_name)
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    setattr(app.state, task_name, None)
+            return
+        if app.state.telegram_client is None:
+            return
+        live_task = app.state.live_listener_task
+        if live_task is None or live_task.done():
+            app.state.live_listener_task = launch_live_listener_task(
+                runner=app.state.live_listener_runner,
+                client=app.state.telegram_client,
+                session_factory=app.state.session_factory,
+                broker=app.state.live_update_broker,
+                target_titles=app.state.live_target_titles,
+                media_root=app.state.media_root,
+                strategy_alert_config=app.state.strategy_alert_config,
+                strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
+                ai_recognition_config=load_ai_recognition_config(
+                    app.state.ai_recognition_config_path
+                ),
+                lifecycle_monitor=app.state.lifecycle_monitor,
+            )
+        reconcile_task = app.state.reconcile_task
+        if reconcile_task is None or reconcile_task.done():
+            app.state.reconcile_task = asyncio.create_task(
+                _run_reconcile_after_startup_delay(
+                    runner=app.state.reconcile_runner,
+                    client=app.state.telegram_client,
+                    session_factory=app.state.session_factory,
+                    broker=app.state.live_update_broker,
+                    target_titles=app.state.live_target_titles,
+                    media_root=app.state.media_root,
+                    interval_seconds=app.state.reconcile_interval_seconds,
+                    operation_lock=app.state.telegram_operation_lock,
+                    strategy_alert_config=app.state.strategy_alert_config,
+                    strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
+                    startup_delay_seconds=0,
+                )
+            )
+
+    def build_monitor_status() -> dict[str, Any]:
+        synced_group_count = len(app.state.live_target_titles)
+        task = app.state.live_listener_task
+        if synced_group_count == 0:
+            return {
+                "state": "idle",
+                "label": "未配置同步群",
+                "detail": "当前没有启用的 Telegram 群组可同步",
+                "monitored_group_count": synced_group_count,
+            }
+        if app.state.telegram_client is None:
+            return {
+                "state": "disconnected",
+                "label": "已断开",
+                "detail": app.state.live_listener_status_reason or "Telegram 连接未建立",
+                "monitored_group_count": synced_group_count,
+            }
+        if task is None:
+            return {
+                "state": "disconnected",
+                "label": "已断开",
+                "detail": "Telegram 同步监听任务未启动",
+                "monitored_group_count": synced_group_count,
+            }
+        if task.done():
+            detail = "Telegram 同步监听任务已停止"
+            if task.cancelled():
+                detail = "Telegram 同步监听任务已取消"
+            else:
+                try:
+                    exception = task.exception()
+                except asyncio.CancelledError:
+                    exception = None
+                    detail = "Telegram 同步监听任务已取消"
+                if exception is not None:
+                    detail = str(exception)
+            return {
+                "state": "disconnected",
+                "label": "已断开",
+                "detail": detail,
+                "monitored_group_count": synced_group_count,
+            }
+        return {
+            "state": "monitoring",
+            "label": "监控中",
+            "detail": f"Telegram 正在同步监听 {synced_group_count} 个启用群组",
+            "monitored_group_count": synced_group_count,
+        }
+
 
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
     app.mount(
@@ -311,6 +560,7 @@ def create_web_app(
         groups = load_group_rows(
             app.state.session_factory,
             group_labels_by_title=app.state.group_labels_by_title,
+            configured_groups=app.state.group_config.groups,
         )
         selected_chat_id = groups[0]["chat_id"] if groups else None
         selected_group = next(
@@ -332,12 +582,36 @@ def create_web_app(
             app.state.session_factory,
             limit=20,
         )
-        recovery_execution_queue = list_recovery_execution_previews(
+        active_positions = list_active_positions(
             app.state.session_factory,
-            limit=20,
-            contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+            chat_id=None,
+            limit=200,
         )
-        live_listener_enabled = app.state.telegram_client is not None
+        symbol_whitelist_by_chat_id = _symbol_whitelist_by_chat_id(app.state.group_config)
+        pending_entry_signals = list_pending_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=200,
+            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
+        )
+        # ── lifecycle data ──
+        lifecycle_counts = load_lifecycle_counts(app.state.session_factory)
+        lifecycle_counts_by_chat_id = load_lifecycle_counts_by_chat_id(
+            app.state.session_factory,
+            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
+        )
+        holding_positions = list_holding_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=200,
+        )
+        exited_positions = list_exited_strategies(
+            app.state.session_factory,
+            chat_id=selected_chat_id,
+            limit=50,
+        )
+        monitor_status = build_monitor_status()
+        live_listener_enabled = monitor_status["state"] == "monitoring"
         refresh_mode_label = (
             "实时监听 + SSE"
             if live_listener_enabled
@@ -346,10 +620,20 @@ def create_web_app(
         trader_dashboard = _build_trader_dashboard_state(
             groups=groups,
             group_config=app.state.group_config,
-            recovery_decisions=recovery_decisions,
-            recovery_execution_queue=recovery_execution_queue,
+            active_positions=active_positions,
+            pending_entry_signals=pending_entry_signals,
+            holding_positions=holding_positions,
+            exited_positions=exited_positions,
+            lifecycle_counts=lifecycle_counts,
+            lifecycle_counts_by_chat_id=lifecycle_counts_by_chat_id,
             live_listener_enabled=live_listener_enabled,
             refresh_mode_label=refresh_mode_label,
+        )
+        strategy_kpi = _build_strategy_kpi_counts(
+            selected_chat_id=selected_chat_id,
+            holding_positions=holding_positions,
+            pending_entry_signals=pending_entry_signals,
+            exited_positions=exited_positions,
         )
         ai_recognition_config = load_ai_recognition_config(
             app.state.ai_recognition_config_path
@@ -363,6 +647,7 @@ def create_web_app(
                 "selected_chat_id": selected_chat_id,
                 "selected_group": selected_group,
                 "live_listener_enabled": live_listener_enabled,
+                "monitor_status": monitor_status,
                 "live_listener_status_reason": app.state.live_listener_status_reason,
                 "session_lock_owner_pid": _extract_session_lock_owner_pid(
                     app.state.live_listener_status_reason
@@ -370,10 +655,13 @@ def create_web_app(
                 "database_latest_message_at": freshness["latest_message_at"],
                 "database_stale_hours": freshness["stale_hours"],
                 "asset_version": app.state.asset_version,
-                "recovery_decisions": recovery_decisions,
-                "recovery_execution_queue": recovery_execution_queue,
+                "active_positions": active_positions,
+                "pending_entry_signals": pending_entry_signals,
+                "holding_positions": holding_positions,
+                "exited_positions": exited_positions,
                 "refresh_mode_label": refresh_mode_label,
                 "trader_dashboard": trader_dashboard,
+                "strategy_kpi": strategy_kpi,
                 "ai_recognition_config": ai_recognition_config,
             },
         )
@@ -383,30 +671,214 @@ def create_web_app(
         groups = load_group_rows(
             app.state.session_factory,
             group_labels_by_title=app.state.group_labels_by_title,
+            configured_groups=app.state.group_config.groups,
+        )
+        monitor_status = build_monitor_status()
+        symbol_whitelist_by_chat_id = _symbol_whitelist_by_chat_id(app.state.group_config)
+        lifecycle_counts_by_chat_id = load_lifecycle_counts_by_chat_id(
+            app.state.session_factory,
+            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
         )
         trader_dashboard = _build_trader_dashboard_state(
             groups=groups,
             group_config=app.state.group_config,
-            recovery_decisions=[],
-            recovery_execution_queue=[],
-            live_listener_enabled=app.state.telegram_client is not None,
+            active_positions=[],
+            pending_entry_signals=[],
+            lifecycle_counts_by_chat_id=lifecycle_counts_by_chat_id,
+            live_listener_enabled=monitor_status["state"] == "monitoring",
             refresh_mode_label=(
                 "实时监听 + SSE"
-                if app.state.telegram_client is not None
+                if monitor_status["state"] == "monitoring"
                 else "仅本地快照"
             ),
         )
         return templates.TemplateResponse(
             request,
-            "_groups.html",
+            "_kol_strategy_list.html",
             {
                 "groups": trader_dashboard["group_rows"],
                 "selected_chat_id": selected_chat_id,
             },
         )
 
+    @app.get("/groups/{chat_id}/detail")
+    def group_detail(request: Request, chat_id: int):
+        """Return the right-panel strategy detail fragment for a group.
+        
+        Loads holding, pending, exited strategies + messages. All three
+        strategy sections are visible simultaneously (stacked).
+        """
+        selected_group = _lookup_single_group(
+            app.state.session_factory,
+            chat_id=chat_id,
+            group_labels_by_title=app.state.group_labels_by_title,
+            configured_groups=app.state.group_config.groups,
+        )
+        holding_positions = list_holding_strategies(
+            app.state.session_factory, chat_id=chat_id, limit=50
+        )
+        pending_entry_signals = list_pending_strategies(
+            app.state.session_factory,
+            chat_id=chat_id,
+            limit=50,
+            symbol_whitelist_by_chat_id=_symbol_whitelist_by_chat_id(app.state.group_config),
+        )
+        exited_positions = list_exited_strategies(
+            app.state.session_factory, chat_id=chat_id, limit=50
+        )
+        messages = load_group_messages(
+            app.state.session_factory, chat_id=chat_id, limit=50
+        )
+        monitor_status = build_monitor_status()
+        freshness = load_database_freshness(
+            app.state.session_factory,
+            now=app.state.now_provider(),
+        )
+        return templates.TemplateResponse(
+            request,
+            "_strategy_detail.html",
+            {
+                "selected_group": selected_group,
+                "selected_chat_id": chat_id,
+                "holding_positions": holding_positions,
+                "pending_entry_signals": pending_entry_signals,
+                "exited_positions": exited_positions,
+                "messages": messages,
+                "monitor_status": monitor_status,
+                "live_listener_enabled": monitor_status["state"] == "monitoring",
+                "live_listener_status_reason": app.state.live_listener_status_reason,
+                "database_latest_message_at": freshness["latest_message_at"],
+                "database_stale_hours": freshness["stale_hours"],
+                "refresh_mode_label": (
+                    "实时监听 + SSE"
+                    if monitor_status["state"] == "monitoring"
+                    else "仅本地快照"
+                ),
+                "search_text": "",
+                "sender_name": "",
+            },
+        )
+
+    @app.get("/groups/{chat_id}/detail/tab/pending")
+    def group_detail_tab_pending(request: Request, chat_id: int):
+        """Return only the pending tab content."""
+        pending_entry_signals = list_pending_strategies(
+            app.state.session_factory,
+            chat_id=chat_id,
+            limit=50,
+            symbol_whitelist_by_chat_id=_symbol_whitelist_by_chat_id(app.state.group_config),
+        )
+        return templates.TemplateResponse(
+            request,
+            "_detail_pending.html",
+            {
+                "pending_entry_signals": pending_entry_signals,
+                "selected_chat_id": chat_id,
+            },
+        )
+
+    @app.get("/groups/{chat_id}/detail/tab/exited")
+    def group_detail_tab_exited(request: Request, chat_id: int):
+        """Return only the exited tab content."""
+        exited_positions = list_exited_strategies(
+            app.state.session_factory, chat_id=chat_id, limit=50
+        )
+        return templates.TemplateResponse(
+            request,
+            "_detail_exited.html",
+            {
+                "exited_positions": exited_positions,
+                "selected_chat_id": chat_id,
+            },
+        )
+
+    @app.get("/groups/{chat_id}/detail/tab/messages")
+    def group_detail_tab_messages(request: Request, chat_id: int):
+        """Return only the messages tab content."""
+        messages = load_group_messages(
+            app.state.session_factory, chat_id=chat_id, limit=50
+        )
+        monitor_status = build_monitor_status()
+        freshness = load_database_freshness(
+            app.state.session_factory,
+            now=app.state.now_provider(),
+        )
+        selected_group = _lookup_single_group(
+            app.state.session_factory,
+            chat_id=chat_id,
+            group_labels_by_title=app.state.group_labels_by_title,
+            configured_groups=app.state.group_config.groups,
+        )
+        return templates.TemplateResponse(
+            request,
+            "_messages.html",
+            {
+                "messages": messages,
+                "selected_chat_id": chat_id,
+                "selected_group": selected_group,
+                "search_text": "",
+                "sender_name": "",
+                "before_message_id": None,
+                "live_listener_enabled": monitor_status["state"] == "monitoring",
+                "monitor_status": monitor_status,
+                "live_listener_status_reason": app.state.live_listener_status_reason,
+                "database_latest_message_at": freshness["latest_message_at"],
+                "database_stale_hours": freshness["stale_hours"],
+                "refresh_mode_label": (
+                    "实时监听 + SSE"
+                    if monitor_status["state"] == "monitoring"
+                    else "仅本地快照"
+                ),
+            },
+        )
+
+    @app.get("/groups/{chat_id}/strategy-mid-panel")
+    def group_strategy_mid_panel(request: Request, chat_id: int, filter: str = "holding"):
+        """Return the middle strategy panel fragment for a group."""
+        holding_positions = list_holding_strategies(
+            app.state.session_factory, chat_id=chat_id, limit=50
+        )
+        exited_positions = list_exited_strategies(
+            app.state.session_factory, chat_id=chat_id, limit=50
+        )
+        pending_entry_signals = list_pending_strategies(
+            app.state.session_factory,
+            chat_id=chat_id,
+            limit=50,
+            symbol_whitelist_by_chat_id=_symbol_whitelist_by_chat_id(app.state.group_config),
+        )
+        lifecycle_counts = load_lifecycle_counts(
+            app.state.session_factory,
+            chat_id=chat_id,
+        )
+        strategy_kpi = _build_strategy_kpi_counts(
+            selected_chat_id=chat_id,
+            holding_positions=holding_positions,
+            pending_entry_signals=pending_entry_signals,
+            exited_positions=exited_positions,
+            lifecycle_counts=lifecycle_counts,
+        )
+        items = {
+            "holding": holding_positions,
+            "pending": pending_entry_signals,
+            "exited": exited_positions,
+        }.get(filter, holding_positions)
+        return templates.TemplateResponse(
+            request,
+            "_strategy_mid_panel.html",
+            {
+                "filter": filter,
+                "selected_chat_id": chat_id,
+                "strategy_kpi": strategy_kpi,
+                "holding_positions": holding_positions,
+                "pending_entry_signals": pending_entry_signals,
+                "exited_positions": exited_positions,
+                "items": items,
+            },
+        )
+
     @app.post("/api/groups/{chat_id}/automation")
-    def update_group_automation(chat_id: int, payload: dict[str, Any]):
+    async def update_group_automation(chat_id: int, payload: dict[str, Any]):
         config_path = app.state.group_config_path
         if config_path is None:
             raise HTTPException(
@@ -423,6 +895,14 @@ def create_web_app(
         group = next(
             item for item in app.state.group_config.groups if item.chat_id == chat_id
         )
+        live_target_titles = {
+            item.chat_title
+            for item in app.state.group_config.groups
+            if item.enabled
+        }
+        app.state.live_target_titles.clear()
+        app.state.live_target_titles.update(live_target_titles)
+        await ensure_live_tasks_match_targets()
         return {
             "chat_id": chat_id,
             "chat_title": group.chat_title,
@@ -436,6 +916,9 @@ def create_web_app(
             result = app.state.message_recognizer(
                 app.state.session_factory,
                 raw_message_id=raw_message_id,
+                ai_recognition_config=load_ai_recognition_config(
+                    app.state.ai_recognition_config_path
+                ),
             )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -457,12 +940,16 @@ def create_web_app(
             app.state.ai_recognition_config_path,
             AiRecognitionConfig(
                 recognition_prompt=recognition_prompt,
-                mode="local_rule_parser",
+                mode=str(payload.get("mode") or "ai_provider"),
+                text_provider=_provider_config_from_payload(payload.get("text_provider")),
+                image_provider=_provider_config_from_payload(payload.get("image_provider")),
             ),
         )
         return {
             "mode": config.mode,
             "recognition_prompt": config.recognition_prompt,
+            "text_provider": _provider_config_response(config.text_provider),
+            "image_provider": _provider_config_response(config.image_provider),
         }
 
     @app.get("/groups/{chat_id}/messages")
@@ -473,6 +960,7 @@ def create_web_app(
         search_text: str | None = None,
         sender_name: str | None = None,
     ):
+        monitor_status = build_monitor_status()
         messages = load_group_messages(
             app.state.session_factory,
             chat_id=chat_id,
@@ -481,39 +969,34 @@ def create_web_app(
             search_text=search_text,
             sender_name=sender_name,
         )
+        freshness = load_database_freshness(
+            app.state.session_factory,
+            now=app.state.now_provider(),
+        )
+        selected_group = _lookup_single_group(
+            app.state.session_factory,
+            chat_id=chat_id,
+            group_labels_by_title=app.state.group_labels_by_title,
+            configured_groups=app.state.group_config.groups,
+        )
         return templates.TemplateResponse(
             request,
             "_messages.html",
             {
                 "messages": messages,
                 "selected_chat_id": chat_id,
-                "selected_group": next(
-                    (
-                        group
-                        for group in load_group_rows(
-                            app.state.session_factory,
-                            group_labels_by_title=app.state.group_labels_by_title,
-                        )
-                        if group["chat_id"] == chat_id
-                    ),
-                    None,
-                ),
+                "selected_group": selected_group,
                 "search_text": search_text or "",
                 "sender_name": sender_name or "",
                 "before_message_id": before_message_id,
-                "live_listener_enabled": app.state.telegram_client is not None,
+                "live_listener_enabled": monitor_status["state"] == "monitoring",
+                "monitor_status": monitor_status,
                 "live_listener_status_reason": app.state.live_listener_status_reason,
-                "database_latest_message_at": load_database_freshness(
-                    app.state.session_factory,
-                    now=app.state.now_provider(),
-                )["latest_message_at"],
-                "database_stale_hours": load_database_freshness(
-                    app.state.session_factory,
-                    now=app.state.now_provider(),
-                )["stale_hours"],
+                "database_latest_message_at": freshness["latest_message_at"],
+                "database_stale_hours": freshness["stale_hours"],
                 "refresh_mode_label": (
                     "实时监听 + SSE"
-                    if app.state.telegram_client is not None
+                    if monitor_status["state"] == "monitoring"
                     else "仅本地快照"
                 ),
             },
@@ -521,12 +1004,87 @@ def create_web_app(
 
     @app.get("/local-media/{requested_path:path}")
     def local_media(requested_path: str):
-        candidate = (app.state.media_root / requested_path).resolve()
+        # Strip any leading data/media/ prefix so we can safely join with media_root
+        normalized = requested_path.replace("\\", "/")
+        media_prefix = "data/media/"
+        while normalized.startswith(media_prefix):
+            normalized = normalized[len(media_prefix):]
+        # Also handle legacy double-prefix like media/media/ inside the path
+        media_root_name = app.state.media_root.name
+        double_prefix = f"{media_root_name}/{media_root_name}/"
+        while double_prefix in normalized:
+            normalized = normalized.replace(double_prefix, f"{media_root_name}/", 1)
+        candidate = (app.state.media_root / normalized).resolve()
         try:
             candidate.relative_to(app.state.media_root)
         except ValueError as exc:
             raise RuntimeError("Invalid media path") from exc
         return FileResponse(candidate)
+
+    @app.get("/api/freshness")
+    def api_freshness(chat_id: int | None = None):
+        with app.state.session_factory() as session:
+            global_latest = (
+                session.query(
+                    func.max(RawMessage.id).label("raw_message_id"),
+                    func.max(RawMessage.created_at).label("created_at"),
+                    func.max(RawMessage.posted_at).label("posted_at"),
+                )
+                .one()
+            )
+            selected_latest = None
+            selected_count = 0
+            if chat_id is not None:
+                selected_latest = (
+                    session.query(
+                        func.max(RawMessage.id).label("raw_message_id"),
+                        func.max(RawMessage.message_id).label("message_id"),
+                        func.max(RawMessage.created_at).label("created_at"),
+                        func.max(RawMessage.posted_at).label("posted_at"),
+                    )
+                    .filter(RawMessage.chat_id == chat_id)
+                    .one()
+                )
+                selected_count = int(
+                    session.query(func.count(RawMessage.id))
+                    .filter(RawMessage.chat_id == chat_id)
+                    .scalar()
+                    or 0
+                )
+
+        return {
+            "global": {
+                "raw_message_id": global_latest.raw_message_id or 0,
+                "created_at": _datetime_to_iso(global_latest.created_at),
+                "posted_at": _datetime_to_iso(global_latest.posted_at),
+            },
+            "selected": {
+                "chat_id": chat_id,
+                "raw_message_id": (
+                    selected_latest.raw_message_id if selected_latest is not None else 0
+                )
+                or 0,
+                "message_id": (
+                    selected_latest.message_id if selected_latest is not None else 0
+                )
+                or 0,
+                "message_count": selected_count,
+                "created_at": _datetime_to_iso(
+                    selected_latest.created_at if selected_latest is not None else None
+                ),
+                "posted_at": _datetime_to_iso(
+                    selected_latest.posted_at if selected_latest is not None else None
+                ),
+            },
+        }
+
+    @app.get("/api/monitor-status")
+    async def api_monitor_status():
+        status = build_monitor_status()
+        if status["state"] == "disconnected" and app.state.live_target_titles:
+            await ensure_live_tasks_match_targets()
+            status = build_monitor_status()
+        return status
 
     @app.post("/api/chat")
     def chat(payload: dict[str, Any]):
@@ -685,6 +1243,42 @@ def create_web_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.get("/api/strategy-panels")
+    def api_strategy_panels(chat_id: int):
+        """Return strategy panel data for a specific group as JSON."""
+        active_positions = list_active_positions(
+            app.state.session_factory,
+            chat_id=chat_id,
+            limit=50,
+        )
+        pending_entry_signals = list_recovery_execution_previews(
+            app.state.session_factory,
+            limit=20,
+            contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+        )
+        dashboard = _build_trader_dashboard_state(
+            groups=[],
+            group_config=app.state.group_config,
+            active_positions=active_positions,
+            pending_entry_signals=pending_entry_signals,
+            live_listener_enabled=True,
+            refresh_mode_label="",
+        )
+        serialized_active = []
+        for a in active_positions:
+            item = dict(a)
+            if item.get("posted_at"):
+                item["posted_at"] = str(item["posted_at"])
+            if item.get("opened_at"):
+                item["opened_at"] = str(item["opened_at"])
+            serialized_active.append(item)
+        return {
+            "entered_count": dashboard["entered_count"],
+            "pending_count": dashboard["pending_count"],
+            "active_positions": serialized_active,
+            "pending_entry_signals": [dict(p) for p in pending_entry_signals],
+        }
+
     @app.get("/api/recovery-execution-queue")
     def recovery_execution_queue():
         return {
@@ -785,12 +1379,47 @@ def _parse_optional_datetime(value: Any) -> datetime | None:
 
 def _static_asset_version() -> int:
     static_dir = Path(__file__).parent / "static"
-    return int(
-        max(
-            (static_dir / "app.css").stat().st_mtime,
-            (static_dir / "app.js").stat().st_mtime,
+    app_js = static_dir / "app.js"
+    app_css = static_dir / "app.css"
+    # Combine mtime + size so any file change produces a new version,
+    # avoiding browser 304 cache hits that keep stale JS.
+    return (
+        hash(
+            (
+                app_js.stat().st_mtime,
+                app_js.stat().st_size,
+                app_css.stat().st_mtime,
+                app_css.stat().st_size,
+            )
         )
+        & 0x7FFFFFFF
     )
+
+
+def _datetime_to_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat()
+
+
+def _provider_config_from_payload(payload: Any) -> AiProviderConfig:
+    if not isinstance(payload, dict):
+        return AiProviderConfig()
+    return AiProviderConfig(
+        base_url=str(payload.get("base_url") or ""),
+        api_key=str(payload.get("api_key") or ""),
+        model=str(payload.get("model") or ""),
+        timeout_seconds=float(payload.get("timeout_seconds") or 60),
+    )
+
+
+def _provider_config_response(config: AiProviderConfig) -> dict[str, Any]:
+    return {
+        "base_url": config.base_url,
+        "api_key": config.api_key,
+        "model": config.model,
+        "timeout_seconds": config.timeout_seconds,
+    }
 
 
 def _build_chat_proxy_error_detail(exc: httpx.HTTPError) -> str:
@@ -832,3 +1461,54 @@ def _extract_proxy_error_message(exc: httpx.HTTPError) -> str:
         if isinstance(detail, str):
             return detail
     return str(exc)
+
+
+def _lookup_single_group(
+    session_factory,
+    *,
+    chat_id: int,
+    group_labels_by_title: dict[str, str] | None = None,
+    configured_groups: list | None = None,
+) -> dict | None:
+    """Fast single-group lookup — avoids the N+1 scan of load_group_rows()."""
+    from sqlalchemy import func
+    from telegram_kol_research.models import RawMessage
+
+    label_map = group_labels_by_title or {}
+    configured_by_chat_id = {
+        int(getattr(g, "chat_id")): g
+        for g in (configured_groups or [])
+        if getattr(g, "chat_id", None) is not None
+    }
+    with session_factory() as session:
+        row = (
+            session.query(
+                func.max(RawMessage.posted_at).label("last_posted_at"),
+            )
+            .filter(RawMessage.chat_id == chat_id)
+            .first()
+        )
+        last_posted_at = row.last_posted_at if row else None
+
+        latest = (
+            session.query(RawMessage)
+            .filter(RawMessage.chat_id == chat_id)
+            .order_by(RawMessage.posted_at.desc(), RawMessage.message_id.desc())
+            .first()
+        )
+        raw_title = str(chat_id)
+        if latest and latest.sender_name:
+            raw_title = latest.sender_name
+        cfg = configured_by_chat_id.get(chat_id)
+        if cfg is not None:
+            raw_title = str(getattr(cfg, "chat_title", raw_title))
+
+    from telegram_kol_research.web_queries import utc_naive_to_local
+    return {
+        "chat_id": chat_id,
+        "title": label_map.get(raw_title, raw_title),
+        "raw_title": raw_title,
+        "last_posted_at": utc_naive_to_local(last_posted_at) if last_posted_at else None,
+        "message_count": 0,
+        "has_media": False,
+    }
