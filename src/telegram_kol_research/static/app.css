@@ -1176,6 +1176,51 @@ body {
 .message-strategy-content span { color: #86efac; font-size: 0.72rem; font-weight: 700; }
 .message-strategy-content strong { color: #f8fafc; font-weight: 700; }
 
+.recognition-comparison {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.recognition-comparison-row {
+  display: grid;
+  gap: 4px;
+  padding: 7px 8px;
+  border-left: 3px solid rgba(148, 163, 184, 0.38);
+  background: rgba(15, 23, 42, 0.34);
+}
+
+.recognition-comparison-row.is-strategy { border-left-color: #22c55e; }
+.recognition-comparison-row.is-not-strategy { border-left-color: #64748b; }
+.recognition-comparison-row.is-failed { border-left-color: #ef4444; }
+
+.recognition-comparison-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+  color: #cbd5e1;
+  font-size: 0.74rem;
+}
+
+.recognition-comparison-head strong { color: #f8fafc; }
+.recognition-comparison-head small,
+.recognition-comparison-reason {
+  color: #94a3b8;
+  font-size: 0.70rem;
+}
+
+.recognition-comparison pre {
+  max-height: 140px;
+  overflow: auto;
+  margin: 0;
+  color: #e5e7eb;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
 .message-actions {
   display: flex;
   flex-wrap: wrap;

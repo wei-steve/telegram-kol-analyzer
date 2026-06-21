@@ -12,6 +12,7 @@ from telegram_kol_research.models import (
     MediaAsset,
     MessageRecognition,
     RawMessage,
+    RecognitionExperiment,
     SignalCandidate,
 )
 from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
@@ -237,6 +238,15 @@ def _serialize_raw_messages(
     )
     rec_by_msg_id: dict[int, MessageRecognition] = {r.raw_message_id: r for r in all_recs}
 
+    all_experiments = (
+        session.query(RecognitionExperiment)
+        .filter(RecognitionExperiment.raw_message_id.in_(raw_message_ids))
+        .all()
+    )
+    experiments_by_msg_id: dict[int, list[RecognitionExperiment]] = {}
+    for experiment in all_experiments:
+        experiments_by_msg_id.setdefault(experiment.raw_message_id, []).append(experiment)
+
     # ── Bulk-load signal candidates ──
     all_candidates = (
         session.query(SignalCandidate)
@@ -270,6 +280,11 @@ def _serialize_raw_messages(
                     candidate=cand_by_msg_id.get(raw_message.id),
                     media_assets=media_assets,
                 ),
+                "recognition_comparison": _build_recognition_comparison(
+                    recognition=rec_by_msg_id.get(raw_message.id),
+                    media_assets=media_assets,
+                    experiments=experiments_by_msg_id.get(raw_message.id, []),
+                ),
                 "reply_context": None,
             }
         )
@@ -288,6 +303,95 @@ def _serialize_media_assets(media_assets: list[MediaAsset]) -> list[dict[str, ob
         }
         for media_asset in media_assets
     ]
+
+
+def _build_recognition_comparison(
+    *,
+    recognition: MessageRecognition | None,
+    media_assets: list[MediaAsset],
+    experiments: list[RecognitionExperiment],
+) -> dict[str, dict[str, str | None]]:
+    has_image = _has_image_like_media(media_assets)
+    mimo_experiment = next(
+        (
+            experiment
+            for experiment in experiments
+            if experiment.experiment_name == "mimo_direct_v1"
+        ),
+        None,
+    )
+    return {
+        "deepseek_text": _serialize_production_text_recognition(recognition),
+        "glm_ocr_image": _serialize_glm_ocr_result(media_assets),
+        "mimo_text": _serialize_mimo_experiment(mimo_experiment) if not has_image else _not_applicable("image message"),
+        "mimo_image": _serialize_mimo_experiment(mimo_experiment) if has_image else _not_applicable("text message"),
+    }
+
+
+def _serialize_production_text_recognition(recognition: MessageRecognition | None) -> dict[str, str | None]:
+    if recognition is None:
+        return _not_run()
+    return {
+        "status": recognition.status,
+        "summary": recognition.summary,
+        "reason": recognition.reason,
+        "engine": recognition.engine,
+        "status_class": _recognition_status_class(recognition.status),
+    }
+
+
+def _serialize_glm_ocr_result(media_assets: list[MediaAsset]) -> dict[str, str | None]:
+    if not _has_image_like_media(media_assets):
+        return _not_applicable("text message")
+    ocr_texts = [
+        (media_asset.ocr_text or "").strip()
+        for media_asset in media_assets
+        if (media_asset.ocr_text or "").strip()
+    ]
+    if not ocr_texts:
+        return _not_run()
+    return {
+        "status": "done",
+        "summary": "\n\n".join(ocr_texts),
+        "reason": None,
+        "engine": "glm-ocr",
+        "status_class": "is-pending",
+    }
+
+
+def _serialize_mimo_experiment(experiment: RecognitionExperiment | None) -> dict[str, str | None]:
+    if experiment is None:
+        return _not_run()
+    summary = experiment.observed_text
+    if experiment.strategy_json:
+        summary = f"{summary or ''}\n{experiment.strategy_json}".strip()
+    return {
+        "status": experiment.status,
+        "summary": summary,
+        "reason": experiment.reason or experiment.error_message,
+        "engine": experiment.model,
+        "status_class": _recognition_status_class(experiment.status),
+    }
+
+
+def _not_run() -> dict[str, str | None]:
+    return {
+        "status": "not run",
+        "summary": None,
+        "reason": None,
+        "engine": None,
+        "status_class": "is-pending",
+    }
+
+
+def _not_applicable(reason: str) -> dict[str, str | None]:
+    return {
+        "status": "n/a",
+        "summary": None,
+        "reason": reason,
+        "engine": None,
+        "status_class": "is-pending",
+    }
 
 
 def _build_strategy_detection(
@@ -366,6 +470,15 @@ def _has_video_like_media(media_assets: list[MediaAsset]) -> bool:
         media_kind = (media_asset.kind or "").lower()
         mime_type = (media_asset.mime_type or "").lower()
         if "video" in media_kind or "document" in media_kind or mime_type.startswith("video/"):
+            return True
+    return False
+
+
+def _has_image_like_media(media_assets: list[MediaAsset]) -> bool:
+    for media_asset in media_assets:
+        media_kind = (media_asset.kind or "").lower()
+        mime_type = (media_asset.mime_type or "").lower()
+        if "photo" in media_kind or mime_type.startswith("image/"):
             return True
     return False
 

@@ -134,6 +134,35 @@
               </div>
             {% endif %}
           </div>
+          {% if message.recognition_comparison %}
+            {% set comparison = message.recognition_comparison %}
+            <div class="recognition-comparison">
+              {% for item in [
+                ('DeepSeek text', comparison.deepseek_text),
+                ('GLM-OCR image', comparison.glm_ocr_image),
+                ('MiMo text', comparison.mimo_text),
+                ('MiMo image', comparison.mimo_image)
+              ] %}
+                {% set label = item[0] %}
+                {% set result = item[1] %}
+                <div class="recognition-comparison-row {{ result.status_class if result else 'is-pending' }}">
+                  <div class="recognition-comparison-head">
+                    <strong>{{ label }}</strong>
+                    <span>{{ result.status if result else 'not run' }}</span>
+                    {% if result and result.engine %}
+                      <small>{{ result.engine }}</small>
+                    {% endif %}
+                  </div>
+                  {% if result and result.reason %}
+                    <small class="recognition-comparison-reason">{{ result.reason }}</small>
+                  {% endif %}
+                  {% if result and result.summary %}
+                    <pre>{{ result.summary }}</pre>
+                  {% endif %}
+                </div>
+              {% endfor %}
+            </div>
+          {% endif %}
           <div class="message-actions">
             <button
               type="button"

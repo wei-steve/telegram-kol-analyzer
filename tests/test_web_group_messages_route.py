@@ -6,7 +6,9 @@ from fastapi.testclient import TestClient
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     MediaAsset,
+    MessageRecognition,
     RawMessage,
+    RecognitionExperiment,
     SignalCandidate,
     StrategyLifecycle,
 )
@@ -332,6 +334,59 @@ def test_group_messages_route_shows_ai_strategy_detection_results(tmp_path):
     assert "AI识别结果：待识别" in response.text
     assert "AI识别结果：非策略" in response.text
     assert "视频消息默认跳过" in response.text
+
+
+def test_group_messages_route_shows_recognition_comparison_results(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=4,
+            sender_name="Alice",
+            posted_at=datetime(2026, 4, 4, tzinfo=UTC),
+            text="BTC long 68000 SL 67000 TP 70000",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            MessageRecognition(
+                raw_message_id=raw_message.id,
+                status="是策略",
+                reason="DeepSeek detected strategy",
+                summary="BTC long Entry 68000 SL 67000 TP 70000",
+                engine="deepseek-v4-flash",
+            )
+        )
+        session.add(
+            RecognitionExperiment(
+                raw_message_id=raw_message.id,
+                experiment_name="mimo_direct_v1",
+                model="mimo-v2.5",
+                prompt_version="mimo_direct_v1",
+                input_kind="text",
+                status="是策略",
+                reason="MiMo detected strategy",
+                observed_text="BTC long 68000 SL 67000 TP 70000",
+                strategy_json='{"symbol":"BTC","side":"long"}',
+                confidence=0.88,
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/88/messages")
+
+    assert response.status_code == 200
+    assert "recognition-comparison" in response.text
+    assert "DeepSeek text" in response.text
+    assert "GLM-OCR image" in response.text
+    assert "MiMo text" in response.text
+    assert "MiMo image" in response.text
+    assert "deepseek-v4-flash" in response.text
+    assert "mimo-v2.5" in response.text
+    assert "MiMo detected strategy" in response.text
+    assert "BTC long 68000 SL 67000 TP 70000" in response.text
 
 
 def test_group_messages_route_renders_immediate_recognition_button(tmp_path):
