@@ -34,19 +34,18 @@ def test_app_js_includes_ai_history_timestamps_for_saved_and_rendered_turns(tmp_
     assert "${renderHistoryTimestamp(entry.createdAt)}" in response.text
 
 
-def test_app_js_keeps_ai_provider_api_keys_separate_by_preset(tmp_path):
+def test_app_js_collects_separate_ai_model_configs_and_active_selection(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
     response = client.get("/static/app.js")
 
     assert response.status_code == 200
-    assert "bindAiProviderKeyInputs(form);" in response.text
-    assert "cacheCurrentAiProviderKeys(form)" in response.text
-    assert "cacheAiProviderKey({" in response.text
-    assert "loadCachedAiProviderKey({" in response.text
-    assert "telegram-workbench:ai-provider-key:" in response.text
-    assert "apiKey: '[data-ai-text-api-key]'" in response.text
-    assert "apiKey: '[data-ai-image-api-key]'" in response.text
+    assert "bindAiModelSelectionForm" in response.text
+    assert "collectAiModelConfigs" in response.text
+    assert "active_text_model_id" in response.text
+    assert "active_image_model_id" in response.text
+    assert "data-ai-model-api-key" in response.text
+    assert "modelConfigToProvider(activeTextModel)" in response.text
 
 
 def test_app_js_refreshes_group_list_after_live_or_manual_updates(tmp_path):

@@ -132,6 +132,56 @@ def test_ai_recognition_config_api_saves_mimo_provider(tmp_path):
     assert payload["text_provider"]["model"] == "deepseek-v4-flash"
     assert payload["image_provider"]["base_url"] == "https://api.xiaomimimo.com/v1"
     assert payload["image_provider"]["model"] == "mimo-v2.5"
+    assert payload["active_text_model_id"] == "deepseek-v4-flash"
+    assert payload["active_image_model_id"] == "mimo-v2.5"
+    assert any(model["id"] == "mimo-v2.5" for model in payload["ai_models"])
+
+
+def test_ai_recognition_config_api_saves_model_list_and_active_selection(tmp_path):
+    config_path = tmp_path / "ai_recognition.yaml"
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        ai_recognition_config_path=config_path,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/ai-recognition-config",
+        json={
+            "recognition_prompt": "Only strict strategies.",
+            "active_text_model_id": "deepseek-v4-flash",
+            "active_image_model_id": "mimo-v2.5",
+            "ai_models": [
+                {
+                    "id": "deepseek-v4-flash",
+                    "label": "DeepSeek V4 Flash",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "deepseek-key",
+                    "model": "deepseek-v4-flash",
+                    "timeout_seconds": 60,
+                    "supports_text": True,
+                    "supports_image": False,
+                },
+                {
+                    "id": "mimo-v2.5",
+                    "label": "MiMo V2.5",
+                    "base_url": "https://api.xiaomimimo.com/v1",
+                    "api_key": "mimo-key",
+                    "model": "mimo-v2.5",
+                    "timeout_seconds": 60,
+                    "supports_text": True,
+                    "supports_image": True,
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["active_text_model_id"] == "deepseek-v4-flash"
+    assert payload["active_image_model_id"] == "mimo-v2.5"
+    assert payload["text_provider"]["api_key"] == "deepseek-key"
+    assert payload["image_provider"]["api_key"] == "mimo-key"
 
 
 def test_recovery_dry_run_api_persists_decisions_with_configured_gate_provider(tmp_path):

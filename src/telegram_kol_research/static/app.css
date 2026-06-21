@@ -1039,6 +1039,41 @@ body {
   margin: 2px 0 8px;
 }
 
+.ai-model-list {
+  display: grid;
+  gap: 12px;
+}
+
+.ai-model-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.36);
+}
+
+.ai-model-capabilities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.ai-model-capabilities label {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 6px;
+}
+
+@media (max-width: 760px) {
+  .ai-model-row {
+    grid-template-columns: 1fr;
+  }
+}
+
 .message-list {
   overflow-y: auto;
   min-height: 0;

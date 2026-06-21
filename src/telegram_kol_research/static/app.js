@@ -921,6 +921,52 @@ function bindAiRecognitionConfigForm() {
   });
 }
 
+function bindAiModelSelectionForm() {
+  const form = document.querySelector('[data-ai-model-selection-form]');
+  if (!form) {
+    return;
+  }
+  const status = form.querySelector('[data-ai-model-selection-save-status]');
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const submitButton = form.querySelector('button[type="submit"]');
+    if (submitButton) {
+      submitButton.disabled = true;
+    }
+    if (status) {
+      status.textContent = '正在保存...';
+      status.classList.remove('is-error');
+    }
+    try {
+      const response = await fetch('/api/ai-recognition-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildAiRecognitionConfigPayload()),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        if (status) {
+          status.textContent = payload.detail || '保存失败';
+          status.classList.add('is-error');
+        }
+        return;
+      }
+      if (status) {
+        status.textContent = 'AI 模型选择已保存';
+      }
+    } catch {
+      if (status) {
+        status.textContent = '保存失败，请检查服务状态。';
+        status.classList.add('is-error');
+      }
+    } finally {
+      if (submitButton) {
+        submitButton.disabled = false;
+      }
+    }
+  });
+}
+
 function bindAiProviderPresetButtons(form) {
   const selectorForTarget = {
     text: {
@@ -1032,6 +1078,60 @@ function getAiProviderKeyStorageKey({ target, baseUrl, model }) {
 }
 
 function buildAiRecognitionConfigPayload() {
+  const value = (selector) => document.querySelector(selector)?.value || '';
+  const aiModels = collectAiModelConfigs();
+  const activeTextModelId = value('[data-active-text-model-id]');
+  const activeImageModelId = value('[data-active-image-model-id]');
+  const activeTextModel = aiModels.find((model) => model.id === activeTextModelId) || null;
+  const activeImageModel = aiModels.find((model) => model.id === activeImageModelId) || null;
+  return {
+    mode: 'ai_provider',
+    recognition_prompt: value('[data-ai-recognition-prompt-input]'),
+    active_text_model_id: activeTextModelId,
+    active_image_model_id: activeImageModelId,
+    ai_models: aiModels,
+    text_provider: modelConfigToProvider(activeTextModel),
+    image_provider: modelConfigToProvider(activeImageModel),
+  };
+}
+
+function collectAiModelConfigs() {
+  return Array.from(document.querySelectorAll('[data-ai-model-row]'))
+    .map((row) => {
+      const rowValue = (selector) => row.querySelector(selector)?.value || '';
+      const parsedTimeout = Number(rowValue('[data-ai-model-timeout]'));
+      return {
+        id: rowValue('[data-ai-model-id]') || rowValue('[data-ai-model-name]'),
+        label: rowValue('[data-ai-model-label]'),
+        base_url: rowValue('[data-ai-model-base-url]'),
+        api_key: rowValue('[data-ai-model-api-key]'),
+        model: rowValue('[data-ai-model-name]'),
+        timeout_seconds: Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 60,
+        supports_text: Boolean(row.querySelector('[data-ai-model-supports-text]')?.checked),
+        supports_image: Boolean(row.querySelector('[data-ai-model-supports-image]')?.checked),
+      };
+    })
+    .filter((model) => model.id || model.model || model.base_url);
+}
+
+function modelConfigToProvider(model) {
+  if (!model) {
+    return {
+      base_url: '',
+      api_key: '',
+      model: '',
+      timeout_seconds: 60,
+    };
+  }
+  return {
+    base_url: model.base_url,
+    api_key: model.api_key,
+    model: model.model,
+    timeout_seconds: model.timeout_seconds,
+  };
+}
+
+function buildLegacyAiRecognitionConfigPayload() {
   const value = (selector) => document.querySelector(selector)?.value || '';
   const numericValue = (selector, fallback) => {
     const parsed = Number(value(selector));
@@ -1470,6 +1570,7 @@ window.addEventListener('DOMContentLoaded', () => {
   bindDashboardTabs();
   bindStrategyFilterBadges();
   bindAiRecognitionPromptForm();
+  bindAiModelSelectionForm();
   bindGroupPromptEditor();
   bindClearAiHistory();
   renderConversationHistory();

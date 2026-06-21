@@ -91,12 +91,64 @@ class AiProviderConfig:
 
 
 @dataclass(frozen=True)
+class AiModelConfig:
+    id: str
+    label: str
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    timeout_seconds: float = 60.0
+    supports_text: bool = True
+    supports_image: bool = False
+
+    @property
+    def provider(self) -> AiProviderConfig:
+        return AiProviderConfig(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            model=self.model,
+            timeout_seconds=self.timeout_seconds,
+        )
+
+
+@dataclass(frozen=True)
 class AiRecognitionConfig:
     recognition_prompt: str = DEFAULT_RECOGNITION_PROMPT
     lifecycle_event_prompt: str = ""
     mode: str = "local_rule_parser"
     text_provider: AiProviderConfig = field(default_factory=AiProviderConfig)
     image_provider: AiProviderConfig = field(default_factory=AiProviderConfig)
+    ai_models: list[AiModelConfig] = field(default_factory=list)
+    active_text_model_id: str = ""
+    active_image_model_id: str = ""
+
+
+DEFAULT_AI_MODELS = [
+    AiModelConfig(
+        id="deepseek-v4-flash",
+        label="DeepSeek V4 Flash",
+        base_url="https://api.deepseek.com",
+        model="deepseek-v4-flash",
+        supports_text=True,
+        supports_image=False,
+    ),
+    AiModelConfig(
+        id="glm-ocr",
+        label="GLM-OCR",
+        base_url="https://open.bigmodel.cn/api/paas/v4",
+        model="glm-ocr",
+        supports_text=False,
+        supports_image=True,
+    ),
+    AiModelConfig(
+        id="mimo-v2.5",
+        label="MiMo V2.5",
+        base_url="https://api.xiaomimimo.com/v1",
+        model="mimo-v2.5",
+        supports_text=True,
+        supports_image=True,
+    ),
+]
 
 
 def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
@@ -115,12 +167,36 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
     )
     lifecycle_event_prompt = str(raw_data.get("lifecycle_event_prompt") or "")
     mode = str(raw_data.get("mode") or "local_rule_parser")
+    raw_text_provider = _load_provider_config(raw_data.get("text_provider"))
+    raw_image_provider = _load_provider_config(raw_data.get("image_provider"))
+    ai_models = _load_ai_models(
+        raw_data.get("ai_models"),
+        text_provider=raw_text_provider,
+        image_provider=raw_image_provider,
+    )
+    active_text_model_id = str(raw_data.get("active_text_model_id") or "")
+    active_image_model_id = str(raw_data.get("active_image_model_id") or "")
+    text_model = _select_active_model(
+        ai_models,
+        active_text_model_id,
+        supports="text",
+        fallback_provider=raw_text_provider,
+    )
+    image_model = _select_active_model(
+        ai_models,
+        active_image_model_id,
+        supports="image",
+        fallback_provider=raw_image_provider,
+    )
     return AiRecognitionConfig(
         recognition_prompt=recognition_prompt,
         lifecycle_event_prompt=lifecycle_event_prompt,
         mode=mode,
-        text_provider=_load_provider_config(raw_data.get("text_provider")),
-        image_provider=_load_provider_config(raw_data.get("image_provider")),
+        text_provider=text_model.provider if text_model else raw_text_provider,
+        image_provider=image_model.provider if image_model else raw_image_provider,
+        ai_models=ai_models,
+        active_text_model_id=text_model.id if text_model else "",
+        active_image_model_id=image_model.id if image_model else "",
     )
 
 
@@ -132,19 +208,42 @@ def save_ai_recognition_config(
 
     path = Path(config_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    ai_models = _normalize_ai_models(
+        config.ai_models,
+        text_provider=config.text_provider,
+        image_provider=config.image_provider,
+    )
+    text_model = _select_active_model(
+        ai_models,
+        config.active_text_model_id,
+        supports="text",
+        fallback_provider=config.text_provider,
+    )
+    image_model = _select_active_model(
+        ai_models,
+        config.active_image_model_id,
+        supports="image",
+        fallback_provider=config.image_provider,
+    )
     normalized = AiRecognitionConfig(
         recognition_prompt=_with_normalized_strategy_output_instructions(
             config.recognition_prompt.strip() or DEFAULT_RECOGNITION_PROMPT
         ),
         lifecycle_event_prompt=config.lifecycle_event_prompt.strip(),
         mode=_resolve_mode(config),
-        text_provider=_normalize_provider_config(config.text_provider),
-        image_provider=_normalize_provider_config(config.image_provider),
+        text_provider=text_model.provider if text_model else _normalize_provider_config(config.text_provider),
+        image_provider=image_model.provider if image_model else _normalize_provider_config(config.image_provider),
+        ai_models=ai_models,
+        active_text_model_id=text_model.id if text_model else "",
+        active_image_model_id=image_model.id if image_model else "",
     )
     payload: dict[str, Any] = {
         "mode": normalized.mode,
         "recognition_prompt": normalized.recognition_prompt,
         "lifecycle_event_prompt": normalized.lifecycle_event_prompt,
+        "active_text_model_id": normalized.active_text_model_id,
+        "active_image_model_id": normalized.active_image_model_id,
+        "ai_models": [_model_to_payload(model) for model in normalized.ai_models],
         "text_provider": _provider_to_payload(normalized.text_provider),
         "image_provider": _provider_to_payload(normalized.image_provider),
     }
@@ -166,6 +265,121 @@ def _load_provider_config(value: Any) -> AiProviderConfig:
     )
 
 
+def _load_ai_models(
+    value: Any,
+    *,
+    text_provider: AiProviderConfig,
+    image_provider: AiProviderConfig,
+) -> list[AiModelConfig]:
+    loaded: list[AiModelConfig] = []
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                loaded.append(_model_config_from_payload(item))
+    return _normalize_ai_models(
+        loaded,
+        text_provider=text_provider,
+        image_provider=image_provider,
+    )
+
+
+def _normalize_ai_models(
+    models: list[AiModelConfig],
+    *,
+    text_provider: AiProviderConfig,
+    image_provider: AiProviderConfig,
+) -> list[AiModelConfig]:
+    normalized_by_id = {
+        model.id: _normalize_model_config(model)
+        for model in models
+        if model.id.strip()
+    }
+    for default_model in DEFAULT_AI_MODELS:
+        existing = normalized_by_id.get(default_model.id)
+        normalized_by_id[default_model.id] = _merge_default_model(
+            default_model,
+            existing=existing,
+            text_provider=text_provider,
+            image_provider=image_provider,
+        )
+    return list(normalized_by_id.values())
+
+
+def _merge_default_model(
+    default_model: AiModelConfig,
+    *,
+    existing: AiModelConfig | None,
+    text_provider: AiProviderConfig,
+    image_provider: AiProviderConfig,
+) -> AiModelConfig:
+    model = existing or default_model
+    provider = AiProviderConfig()
+    if text_provider.model.strip() == default_model.model:
+        provider = text_provider
+    elif image_provider.model.strip() == default_model.model:
+        provider = image_provider
+    if provider.model.strip() == default_model.model:
+        model = AiModelConfig(
+            id=default_model.id,
+            label=model.label or default_model.label,
+            base_url=provider.base_url or model.base_url or default_model.base_url,
+            api_key=provider.api_key or model.api_key,
+            model=provider.model or model.model or default_model.model,
+            timeout_seconds=provider.timeout_seconds or model.timeout_seconds,
+            supports_text=default_model.supports_text,
+            supports_image=default_model.supports_image,
+        )
+    return _normalize_model_config(model)
+
+
+def _model_config_from_payload(value: dict[str, Any]) -> AiModelConfig:
+    return AiModelConfig(
+        id=str(value.get("id") or value.get("model") or ""),
+        label=str(value.get("label") or value.get("model") or value.get("id") or ""),
+        base_url=str(value.get("base_url") or ""),
+        api_key=str(value.get("api_key") or ""),
+        model=str(value.get("model") or ""),
+        timeout_seconds=float(value.get("timeout_seconds") or 60),
+        supports_text=bool(value.get("supports_text", True)),
+        supports_image=bool(value.get("supports_image", False)),
+    )
+
+
+def _normalize_model_config(config: AiModelConfig) -> AiModelConfig:
+    return AiModelConfig(
+        id=config.id.strip(),
+        label=config.label.strip() or config.id.strip(),
+        base_url=config.base_url.strip().rstrip("/"),
+        api_key=config.api_key.strip(),
+        model=config.model.strip(),
+        timeout_seconds=float(config.timeout_seconds or 60),
+        supports_text=bool(config.supports_text),
+        supports_image=bool(config.supports_image),
+    )
+
+
+def _select_active_model(
+    models: list[AiModelConfig],
+    active_model_id: str,
+    *,
+    supports: str,
+    fallback_provider: AiProviderConfig,
+) -> AiModelConfig | None:
+    capability = "supports_text" if supports == "text" else "supports_image"
+    capable_models = [model for model in models if getattr(model, capability) and model.provider.is_configured]
+    for model in capable_models:
+        if model.id == active_model_id:
+            return model
+    if fallback_provider.is_configured:
+        for model in capable_models:
+            if (
+                model.model == fallback_provider.model.strip()
+                and model.base_url == fallback_provider.base_url.strip().rstrip("/")
+            ):
+                return model
+    return capable_models[0] if capable_models else None
+
+
 def _normalize_provider_config(config: AiProviderConfig) -> AiProviderConfig:
     return AiProviderConfig(
         base_url=config.base_url.strip().rstrip("/"),
@@ -179,7 +393,11 @@ def _resolve_mode(config: AiRecognitionConfig) -> str:
     requested = config.mode.strip() or "local_rule_parser"
     if requested != "local_rule_parser":
         return requested
-    if config.text_provider.is_configured or config.image_provider.is_configured:
+    if (
+        config.text_provider.is_configured
+        or config.image_provider.is_configured
+        or any(model.provider.is_configured for model in config.ai_models)
+    ):
         return "ai_provider"
     return requested
 
@@ -197,4 +415,17 @@ def _provider_to_payload(config: AiProviderConfig) -> dict[str, Any]:
         "api_key": config.api_key,
         "model": config.model,
         "timeout_seconds": config.timeout_seconds,
+    }
+
+
+def _model_to_payload(config: AiModelConfig) -> dict[str, Any]:
+    return {
+        "id": config.id,
+        "label": config.label,
+        "base_url": config.base_url,
+        "api_key": config.api_key,
+        "model": config.model,
+        "timeout_seconds": config.timeout_seconds,
+        "supports_text": config.supports_text,
+        "supports_image": config.supports_image,
     }

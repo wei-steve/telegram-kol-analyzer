@@ -27,6 +27,7 @@ except (
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.ai_recognition_config import (
+    AiModelConfig,
     AiProviderConfig,
     AiRecognitionConfig,
     load_ai_recognition_config,
@@ -943,11 +944,17 @@ def create_web_app(
                 mode=str(payload.get("mode") or "ai_provider"),
                 text_provider=_provider_config_from_payload(payload.get("text_provider")),
                 image_provider=_provider_config_from_payload(payload.get("image_provider")),
+                ai_models=_model_configs_from_payload(payload.get("ai_models")),
+                active_text_model_id=str(payload.get("active_text_model_id") or ""),
+                active_image_model_id=str(payload.get("active_image_model_id") or ""),
             ),
         )
         return {
             "mode": config.mode,
             "recognition_prompt": config.recognition_prompt,
+            "active_text_model_id": config.active_text_model_id,
+            "active_image_model_id": config.active_image_model_id,
+            "ai_models": [_model_config_response(model) for model in config.ai_models],
             "text_provider": _provider_config_response(config.text_provider),
             "image_provider": _provider_config_response(config.image_provider),
         }
@@ -1421,6 +1428,41 @@ def _provider_config_response(config: AiProviderConfig) -> dict[str, Any]:
         "api_key": config.api_key,
         "model": config.model,
         "timeout_seconds": config.timeout_seconds,
+    }
+
+
+def _model_configs_from_payload(payload: Any) -> list[AiModelConfig]:
+    if not isinstance(payload, list):
+        return []
+    models: list[AiModelConfig] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        models.append(
+            AiModelConfig(
+                id=str(item.get("id") or item.get("model") or ""),
+                label=str(item.get("label") or item.get("model") or item.get("id") or ""),
+                base_url=str(item.get("base_url") or ""),
+                api_key=str(item.get("api_key") or ""),
+                model=str(item.get("model") or ""),
+                timeout_seconds=float(item.get("timeout_seconds") or 60),
+                supports_text=bool(item.get("supports_text", True)),
+                supports_image=bool(item.get("supports_image", False)),
+            )
+        )
+    return models
+
+
+def _model_config_response(config: AiModelConfig) -> dict[str, Any]:
+    return {
+        "id": config.id,
+        "label": config.label,
+        "base_url": config.base_url,
+        "api_key": config.api_key,
+        "model": config.model,
+        "timeout_seconds": config.timeout_seconds,
+        "supports_text": config.supports_text,
+        "supports_image": config.supports_image,
     }
 
 

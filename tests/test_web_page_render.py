@@ -58,9 +58,13 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "data-dashboard-tab" in response.text
     assert "data-ai-recognition-prompt" in response.text
     assert "data-ai-recognition-config" in response.text
+    assert "data-ai-model-selection" in response.text
     assert "DeepSeek V4 Flash" in response.text
     assert "MiMo V2.5" in response.text
     assert "mimo-v2.5" in response.text
+    assert "data-ai-model-row" in response.text
+    assert "data-active-text-model-id" in response.text
+    assert "data-active-image-model-id" in response.text
     assert 'data-strategy-filter="holding"' in response.text
     assert 'data-strategy-filter="pending"' in response.text
     assert 'data-strategy-filter="exited"' in response.text

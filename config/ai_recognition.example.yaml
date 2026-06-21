@@ -1,4 +1,31 @@
 mode: ai_provider
+active_text_model_id: "deepseek-v4-flash"
+active_image_model_id: "glm-ocr"
+ai_models:
+  - id: "deepseek-v4-flash"
+    label: "DeepSeek V4 Flash"
+    base_url: "https://api.deepseek.com"
+    api_key: "your_deepseek_api_key"
+    model: "deepseek-v4-flash"
+    timeout_seconds: 60
+    supports_text: true
+    supports_image: false
+  - id: "glm-ocr"
+    label: "GLM-OCR"
+    base_url: "https://open.bigmodel.cn/api/paas/v4"
+    api_key: "your_zhipu_api_key"
+    model: "glm-ocr"
+    timeout_seconds: 60
+    supports_text: false
+    supports_image: true
+  - id: "mimo-v2.5"
+    label: "MiMo V2.5"
+    base_url: "https://api.xiaomimimo.com/v1"
+    api_key: "your_xiaomi_mimo_api_key"
+    model: "mimo-v2.5"
+    timeout_seconds: 60
+    supports_text: true
+    supports_image: true
 text_provider:
   base_url: "https://api.deepseek.com"
   api_key: "your_deepseek_api_key"
