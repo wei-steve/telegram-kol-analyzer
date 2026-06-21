@@ -1,0 +1,142 @@
+import json
+from datetime import UTC, datetime
+
+from telegram_kol_research.ai_recognition_config import AiModelConfig, AiRecognitionConfig
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.models import MediaAsset, MessageRecognition, RawMessage, RecognitionExperiment, SignalCandidate
+from telegram_kol_research.recognition_experiments import (
+    _build_mimo_payload,
+    run_mimo_direct_experiment,
+)
+
+
+def test_build_mimo_payload_uses_raw_image_without_ocr_text(tmp_path):
+    media_root = tmp_path / "media"
+    image_path = media_root / "group" / "1.jpg"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(b"fake-image")
+    raw_message = RawMessage(
+        id=1,
+        chat_id=100,
+        message_id=2,
+        sender_name="Trader",
+        text="caption",
+    )
+    media_asset = MediaAsset(
+        raw_message_id=1,
+        kind="photo",
+        local_path="group/1.jpg",
+        ocr_text="OLD OCR TEXT SHOULD NOT BE SENT",
+    )
+
+    payload = _build_mimo_payload(
+        raw_message=raw_message,
+        media_assets=[media_asset],
+        model="mimo-v2.5",
+        media_root=media_root,
+    )
+
+    user_content = payload["messages"][1]["content"]
+    assert isinstance(user_content, list)
+    assert user_content[0]["type"] == "text"
+    assert user_content[1]["type"] == "image_url"
+    assert user_content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert "OLD OCR TEXT SHOULD NOT BE SENT" not in json.dumps(payload)
+
+
+def test_run_mimo_direct_experiment_persists_side_channel_only(tmp_path, monkeypatch):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=100,
+                message_id=1,
+                sender_name="Trader",
+                posted_at=datetime(2026, 6, 1, tzinfo=UTC),
+                text="BTC long 68000 SL 67000 TP 70000",
+            )
+        )
+        session.commit()
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "recognition_result": "是策略",
+                                    "input_reading": {
+                                        "observed_text": "BTC long 68000 SL 67000 TP 70000",
+                                        "image_quality": "none",
+                                    },
+                                    "reason": "明确给出新开仓策略",
+                                    "strategy": {
+                                        "symbol": "BTC",
+                                        "side": "long",
+                                        "entry": "68000",
+                                        "stop_loss": "67000",
+                                        "take_profit": "70000",
+                                        "leverage": None,
+                                        "order_type": None,
+                                    },
+                                    "confidence": 0.9,
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json, headers):
+            assert url == "https://api.xiaomimimo.com/v1/chat/completions"
+            assert headers["Authorization"] == "Bearer mimo-key"
+            assert json["model"] == "mimo-v2.5"
+            return FakeResponse()
+
+    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", FakeClient)
+
+    stats = run_mimo_direct_experiment(
+        session_factory,
+        ai_recognition_config=AiRecognitionConfig(
+            ai_models=[
+                AiModelConfig(
+                    id="mimo-v2.5",
+                    label="MiMo V2.5",
+                    base_url="https://api.xiaomimimo.com/v1",
+                    api_key="mimo-key",
+                    model="mimo-v2.5",
+                    supports_text=True,
+                    supports_image=True,
+                )
+            ],
+        ),
+        limit=10,
+    )
+
+    assert stats.succeeded == 1
+    with session_factory() as session:
+        experiment = session.query(RecognitionExperiment).one()
+        assert experiment.experiment_name == "mimo_direct_v1"
+        assert experiment.model == "mimo-v2.5"
+        assert experiment.status == "是策略"
+        assert experiment.observed_text == "BTC long 68000 SL 67000 TP 70000"
+        assert experiment.confidence == 0.9
+        assert session.query(MessageRecognition).count() == 0
+        assert session.query(SignalCandidate).count() == 0

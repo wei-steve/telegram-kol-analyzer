@@ -48,6 +48,7 @@ from telegram_kol_research.recovery_runner import (
     RecoveryDryRunProviderMissingError,
     run_recovery_dry_run,
 )
+from telegram_kol_research.recognition_experiments import run_mimo_direct_experiment
 from telegram_kol_research.strategy_alerts import (
     load_strategy_alert_config,
     strategy_alerts_enabled,
@@ -81,6 +82,12 @@ class SyncMode(str, Enum):
     backfill = "backfill"
     parse = "parse"
     full = "full"
+
+
+class ExperimentInputKind(str, Enum):
+    all = "all"
+    text = "text"
+    image = "image"
 
 
 def _record_within_window(record: NormalizedMessageRecord, *, start_at, end_at) -> bool:
@@ -229,6 +236,47 @@ async def _run_telegram_sync(
         inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
 
     return matched_dialogs, inserted_messages, inserted_candidates, inserted_trade_ideas
+
+
+@app.command("mimo-experiment")
+def mimo_experiment(
+    database_path: Path = Path("data/research.db"),
+    ai_config_path: Path = Path("config/ai_recognition.yaml"),
+    media_root: Path = Path("data/media"),
+    limit: int = typer.Option(100, "--limit", min=1, help="Maximum messages to consider."),
+    kind: ExperimentInputKind = typer.Option(
+        ExperimentInputKind.all,
+        "--kind",
+        help="Message input kind to test.",
+    ),
+    rerun: bool = typer.Option(
+        False,
+        "--rerun",
+        help="Re-run messages that already have this experiment result.",
+    ),
+) -> None:
+    """Run the MiMo direct multimodal recognition experiment as a side channel."""
+
+    session_factory = create_session_factory(database_path)
+    try:
+        stats = run_mimo_direct_experiment(
+            session_factory,
+            ai_recognition_config_path=ai_config_path,
+            media_root=media_root,
+            limit=limit,
+            input_kind=kind.value,
+            rerun=rerun,
+        )
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        "MiMo experiment finished: "
+        f"considered={stats.considered}, "
+        f"succeeded={stats.succeeded}, "
+        f"failed={stats.failed}, "
+        f"skipped_no_input={stats.skipped_no_input}"
+    )
 
 
 @app.command()

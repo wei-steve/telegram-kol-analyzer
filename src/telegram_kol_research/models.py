@@ -99,6 +99,34 @@ class MessageRecognition(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class RecognitionExperiment(Base):
+    __tablename__ = "recognition_experiments"
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_message_id",
+            "experiment_name",
+            name="uq_recognition_experiments_message_experiment",
+        ),
+        Index("ix_recognition_experiments_name_created", "experiment_name", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(ForeignKey("raw_messages.id"), index=True)
+    experiment_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    observed_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    strategy_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    raw_response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class TradeIdea(Base):
     __tablename__ = "trade_ideas"
 
