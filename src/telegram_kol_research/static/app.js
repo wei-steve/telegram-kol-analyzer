@@ -879,6 +879,7 @@ function bindAiRecognitionConfigForm() {
     return;
   }
   bindAiProviderPresetButtons(form);
+  bindAiProviderKeyInputs(form);
   const status = form.querySelector('[data-ai-config-save-status]');
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -924,10 +925,12 @@ function bindAiProviderPresetButtons(form) {
   const selectorForTarget = {
     text: {
       baseUrl: '[data-ai-text-base-url]',
+      apiKey: '[data-ai-text-api-key]',
       model: '[data-ai-text-model]',
     },
     image: {
       baseUrl: '[data-ai-image-base-url]',
+      apiKey: '[data-ai-image-api-key]',
       model: '[data-ai-image-model]',
     },
   };
@@ -939,15 +942,93 @@ function bindAiProviderPresetButtons(form) {
         return;
       }
       const baseUrlInput = form.querySelector(selectors.baseUrl);
+      const apiKeyInput = form.querySelector(selectors.apiKey);
       const modelInput = form.querySelector(selectors.model);
+      cacheAiProviderKey({
+        target,
+        baseUrl: baseUrlInput?.value || '',
+        model: modelInput?.value || '',
+        apiKey: apiKeyInput?.value || '',
+      });
+
+      const nextBaseUrl = button.dataset.aiProviderBaseUrl || '';
+      const nextModel = button.dataset.aiProviderModel || '';
       if (baseUrlInput) {
-        baseUrlInput.value = button.dataset.aiProviderBaseUrl || '';
+        baseUrlInput.value = nextBaseUrl;
+      }
+      if (apiKeyInput) {
+        apiKeyInput.value = loadCachedAiProviderKey({
+          target,
+          baseUrl: nextBaseUrl,
+          model: nextModel,
+        });
       }
       if (modelInput) {
-        modelInput.value = button.dataset.aiProviderModel || '';
+        modelInput.value = nextModel;
       }
     });
   });
+}
+
+function bindAiProviderKeyInputs(form) {
+  form.querySelectorAll('[data-ai-text-api-key], [data-ai-image-api-key]').forEach((input) => {
+    input.addEventListener('change', () => cacheCurrentAiProviderKeys(form));
+  });
+}
+
+function cacheCurrentAiProviderKeys(form) {
+  [
+    {
+      target: 'text',
+      baseUrl: form.querySelector('[data-ai-text-base-url]')?.value || '',
+      apiKey: form.querySelector('[data-ai-text-api-key]')?.value || '',
+      model: form.querySelector('[data-ai-text-model]')?.value || '',
+    },
+    {
+      target: 'image',
+      baseUrl: form.querySelector('[data-ai-image-base-url]')?.value || '',
+      apiKey: form.querySelector('[data-ai-image-api-key]')?.value || '',
+      model: form.querySelector('[data-ai-image-model]')?.value || '',
+    },
+  ].forEach(cacheAiProviderKey);
+}
+
+function cacheAiProviderKey({ target, baseUrl, model, apiKey }) {
+  const storageKey = getAiProviderKeyStorageKey({ target, baseUrl, model });
+  if (!storageKey) {
+    return;
+  }
+  try {
+    if (apiKey) {
+      window.localStorage.setItem(storageKey, apiKey);
+    } else {
+      window.localStorage.removeItem(storageKey);
+    }
+  } catch {
+    // ignore local storage failures in browser privacy modes
+  }
+}
+
+function loadCachedAiProviderKey({ target, baseUrl, model }) {
+  const storageKey = getAiProviderKeyStorageKey({ target, baseUrl, model });
+  if (!storageKey) {
+    return '';
+  }
+  try {
+    return window.localStorage.getItem(storageKey) || '';
+  } catch {
+    return '';
+  }
+}
+
+function getAiProviderKeyStorageKey({ target, baseUrl, model }) {
+  const normalizedTarget = String(target || '').trim().toLowerCase();
+  const normalizedBaseUrl = String(baseUrl || '').trim().replace(/\/+$/, '');
+  const normalizedModel = String(model || '').trim();
+  if (!normalizedTarget || !normalizedBaseUrl || !normalizedModel) {
+    return '';
+  }
+  return `telegram-workbench:ai-provider-key:${normalizedTarget}:${normalizedBaseUrl}:${normalizedModel}`;
 }
 
 function buildAiRecognitionConfigPayload() {
