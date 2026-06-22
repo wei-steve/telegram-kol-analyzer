@@ -120,49 +120,81 @@
             </div>
           {% endif %}
           {% set detection = message.strategy_detection %}
-          <div class="message-ai-result {{ detection.status_class if detection else 'is-pending' }}">
-            <div class="message-ai-status">
+          {% set comparison = message.recognition_comparison %}
+          {% set ai_panel_class = detection.status_class if detection else 'is-pending' %}
+          {% set strategy_related = ai_panel_class == 'is-strategy' %}
+          {% if comparison %}
+            {% set strategy_ns = namespace(value=strategy_related) %}
+            {% for result in [
+              comparison.deepseek_text,
+              comparison.glm_ocr_image,
+              comparison.mimo_text,
+              comparison.mimo_image
+            ] %}
+              {% if result and result.status_class == 'is-strategy' %}
+                {% set strategy_ns.value = true %}
+              {% endif %}
+            {% endfor %}
+            {% set strategy_related = strategy_ns.value %}
+          {% endif %}
+          <details
+            class="message-ai-insights {{ ai_panel_class }}"
+            data-message-ai-insights
+            {% if strategy_related %}open{% endif %}
+          >
+            <summary class="message-ai-summary">
               <span>AI识别结果：{{ detection.status if detection else '待识别' }}</span>
-              {% if detection and detection.reason %}
+              {% if detection and detection.summary %}
+                <strong>{{ detection.summary }}</strong>
+              {% elif detection and detection.reason %}
                 <small>{{ detection.reason }}</small>
               {% endif %}
-            </div>
-            {% if detection and detection.summary %}
-              <div class="message-strategy-content">
-                <span>策略内容：</span>
-                <strong>{{ detection.summary }}</strong>
-              </div>
-            {% endif %}
-          </div>
-          {% if message.recognition_comparison %}
-            {% set comparison = message.recognition_comparison %}
-            <div class="recognition-comparison">
-              {% for item in [
-                ('DeepSeek text', comparison.deepseek_text),
-                ('GLM-OCR image', comparison.glm_ocr_image),
-                ('MiMo text', comparison.mimo_text),
-                ('MiMo image', comparison.mimo_image)
-              ] %}
-                {% set label = item[0] %}
-                {% set result = item[1] %}
-                <div class="recognition-comparison-row {{ result.status_class if result else 'is-pending' }}">
-                  <div class="recognition-comparison-head">
-                    <strong>{{ label }}</strong>
-                    <span>{{ result.status if result else 'not run' }}</span>
-                    {% if result and result.engine %}
-                      <small>{{ result.engine }}</small>
-                    {% endif %}
-                  </div>
-                  {% if result and result.reason %}
-                    <small class="recognition-comparison-reason">{{ result.reason }}</small>
-                  {% endif %}
-                  {% if result and result.summary %}
-                    <pre>{{ result.summary }}</pre>
+            </summary>
+            <div class="message-ai-details">
+              <div class="message-ai-result {{ ai_panel_class }}">
+                <div class="message-ai-status">
+                  <span>主结果：{{ detection.status if detection else '待识别' }}</span>
+                  {% if detection and detection.reason %}
+                    <small>{{ detection.reason }}</small>
                   {% endif %}
                 </div>
-              {% endfor %}
+                {% if detection and detection.summary %}
+                  <div class="message-strategy-content">
+                    <span>策略内容：</span>
+                    <strong>{{ detection.summary }}</strong>
+                  </div>
+                {% endif %}
+              </div>
+              {% if comparison %}
+                <div class="recognition-comparison">
+                  {% for item in [
+                    ('DeepSeek text', comparison.deepseek_text),
+                    ('GLM-OCR image', comparison.glm_ocr_image),
+                    ('MiMo text', comparison.mimo_text),
+                    ('MiMo image', comparison.mimo_image)
+                  ] %}
+                    {% set label = item[0] %}
+                    {% set result = item[1] %}
+                    <div class="recognition-comparison-row {{ result.status_class if result else 'is-pending' }}">
+                      <div class="recognition-comparison-head">
+                        <strong>{{ label }}</strong>
+                        <span>{{ result.status if result else 'not run' }}</span>
+                        {% if result and result.engine %}
+                          <small>{{ result.engine }}</small>
+                        {% endif %}
+                      </div>
+                      {% if result and result.reason %}
+                        <small class="recognition-comparison-reason">{{ result.reason }}</small>
+                      {% endif %}
+                      {% if result and result.summary %}
+                        <pre>{{ result.summary }}</pre>
+                      {% endif %}
+                    </div>
+                  {% endfor %}
+                </div>
+              {% endif %}
             </div>
-          {% endif %}
+          </details>
           <div class="message-actions">
             <button
               type="button"

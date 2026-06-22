@@ -334,6 +334,8 @@ def test_group_messages_route_shows_ai_strategy_detection_results(tmp_path):
     assert "AI识别结果：待识别" in response.text
     assert "AI识别结果：非策略" in response.text
     assert "视频消息默认跳过" in response.text
+    assert response.text.count('data-message-ai-insights') == 3
+    assert response.text.count('data-message-ai-insights\n            open') == 1
 
 
 def test_group_messages_route_shows_recognition_comparison_results(tmp_path):
