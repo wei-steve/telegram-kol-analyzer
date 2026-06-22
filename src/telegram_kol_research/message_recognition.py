@@ -884,28 +884,10 @@ def _should_move_stop_to_protect(
     decision: dict[str, Any],
     management_action: str,
 ) -> bool:
-    text = " ".join(
-        str(part or "")
-        for part in (
-            current_text,
-            decision.get("reason"),
-            decision.get("management_action"),
-            management_action,
-        )
-    ).lower()
-    protect_terms = [
-        "带保护",
-        "保护止损",
-        "推保护",
-        "上推保护",
-        "保护价",
-        "保本",
-        "成本保护",
-        "move_stop_to_protect",
-        "breakeven",
-        "break even",
-    ]
-    return any(term in text for term in protect_terms)
+    # Vague phrases such as "带保护" or "推保护" do not define a concrete
+    # stop price. Treat them as management notes only; otherwise the monitor
+    # may stop out a still-active KOL position at an assumed breakeven price.
+    return False
 
 
 def _protective_stop_price(lifecycle: StrategyLifecycle) -> float | None:

@@ -988,12 +988,11 @@ def test_ai_lifecycle_event_records_partial_take_profit_update(tmp_path, monkeyp
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.management_signal_message_id == 1400
     assert lifecycle.management_action == "partial_take_profit"
-    assert lifecycle.stop_loss == 63794.4
+    assert lifecycle.stop_loss == 61000
     assert "提前止盈一半" in lifecycle.management_note
-    assert "止损已调整到成本保护价 63794.4" in lifecycle.management_note
     assert candidate.event_type == "position_update"
     assert candidate.parse_source == "lifecycle_ai"
-    assert candidate.stop_loss_text == "63794.4"
+    assert candidate.stop_loss_text == "61000"
 
 
 def test_ai_lifecycle_event_records_scaled_take_profit_percentage_update(tmp_path, monkeypatch):
