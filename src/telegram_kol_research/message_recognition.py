@@ -499,6 +499,7 @@ def _recognize_text_with_ai_provider(
 
     content = _extract_ai_content(data)
     parsed = _parse_ai_result_json(content)
+    _repair_ai_strategy_entry_from_text(parsed, merged_text)
     return _result_from_ai_payload(
         raw_message_id=raw_message.id,
         payload=parsed,
@@ -539,6 +540,7 @@ def _recognize_with_ai_provider(
         data = response.json()
     content = _extract_ai_content(data)
     parsed = _parse_ai_result_json(content)
+    _repair_ai_strategy_entry_from_text(parsed, raw_message.text or "")
     return _result_from_ai_payload(
         raw_message_id=raw_message.id,
         payload=parsed,
@@ -1043,6 +1045,67 @@ def _parse_ai_result_json(content: str) -> dict[str, Any]:
         if not match:
             raise ValueError("AI response did not contain JSON")
         return json.loads(match.group(0))
+
+
+def _repair_ai_strategy_entry_from_text(payload: dict[str, Any], source_text: str) -> None:
+    """Preserve explicit entry prices when AI only returns market entry."""
+    if not isinstance(payload, dict):
+        return
+    if str(payload.get("recognition_result") or "").strip() != "\u662f\u7b56\u7565":
+        return
+    strategy = payload.get("strategy")
+    if not isinstance(strategy, dict):
+        return
+
+    entry = _normalize_strategy_text(strategy.get("entry"), separator="-")
+    if entry and not _is_market_only_entry(entry):
+        return
+
+    explicit_entry = _extract_labeled_entry_text(source_text)
+    if not explicit_entry:
+        return
+    if entry and explicit_entry in entry:
+        return
+    strategy["entry"] = f"{entry}/{explicit_entry}" if entry else explicit_entry
+
+
+def _is_market_only_entry(entry: str) -> bool:
+    if re.search(r"\d", entry):
+        return False
+    lowered = entry.lower()
+    market_terms = [
+        "market",
+        "\u5e02\u4ef7",
+        "\u73b0\u4ef7",
+        "\u73b0\u4ef7\u8fdb\u573a",
+        "\u5e02\u4ef7\u8fdb\u573a",
+    ]
+    return any(term in lowered or term in entry for term in market_terms)
+
+
+def _extract_labeled_entry_text(text: str) -> str | None:
+    if not text:
+        return None
+    label_pattern = (
+        r"(?:entry|entries|"
+        r"\u8fdb\u573a|\u5165\u573a|\u5efa\u4ed3|\u5f00\u4ed3)"
+        r"[^\n\d]{0,12}"
+        r"(?:\u70b9\u4f4d|\u4ef7\u683c|\u4ef7|price|area|range)?"
+    )
+    price_pattern = (
+        r"(\d+(?:\.\d+)?"
+        r"(?:\s*[-~/]\s*\d+(?:\.\d+)?)*"
+        r"(?:\s*(?:\u9644\u8fd1|\u5de6\u53f3|\u4e00\u7ebf|nearby|around))?)"
+    )
+    for line in text.splitlines():
+        match = re.search(
+            rf"{label_pattern}\s*[:\uff1a\-]?\s*{price_pattern}",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return _normalize_strategy_text(match.group(1), separator="/")
+    return None
 
 
 def _result_from_ai_payload(

@@ -72,6 +72,7 @@ NORMALIZED_STRATEGY_OUTPUT_INSTRUCTIONS = """
 - strategy.symbol 输出大写币种简称，例如 "BTC"、"ETH"。
 - strategy.side 只能输出 "long" 或 "short"；中文做多/开多统一为 "long"，做空/开空统一为 "short"。
 - strategy.entry 必须是字符串。单价保留原意，例如 "62400附近"；区间入场统一为 "62000-62500"；分批/多档入场用 "/" 分隔。
+- 如果原文同时出现市价/现价入场和具体入场点位，例如 "Eth(市价进场)" 与 "进场点位：1730附近"，strategy.entry 必须输出 "市价进场/1730附近"，不能只输出 "市价进场"；strategy.order_type 可单独输出 "market" 或 "market+limit"。
 - strategy.stop_loss 必须是字符串。只输出止损价或无效价本身，不要输出解释性长句。
 - strategy.take_profit 必须是字符串。单个止盈输出单价；分批止盈统一用 "/" 分隔，例如 "63600/64800/66000"。
 - 不要把 entry、stop_loss、take_profit 输出成数组或对象；不要补全原文没有给出的价格。
@@ -147,6 +148,13 @@ DEFAULT_MIMO_DIRECT_PROMPT = """
   "confidence": 0.0
 }
 """.strip()
+
+
+MARKET_ENTRY_WITH_PRICE_INSTRUCTION = (
+    '- 如果原文同时出现市价/现价入场和具体入场点位，例如 "Eth(市价进场)" 与 '
+    '"进场点位：1730附近"，strategy.entry 必须输出 "市价进场/1730附近"，不能只输出 '
+    '"市价进场"；strategy.order_type 可单独输出 "market" 或 "market+limit"。'
+)
 
 
 @dataclass(frozen=True)
@@ -228,7 +236,9 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
 
     path = Path(config_path)
     if not path.exists():
-        return AiRecognitionConfig()
+        return AiRecognitionConfig(
+            mimo_direct_prompt=_with_market_entry_with_price_instruction(DEFAULT_MIMO_DIRECT_PROMPT)
+        )
 
     raw_data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw_data, dict):
@@ -238,7 +248,9 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
         str(raw_data.get("recognition_prompt") or DEFAULT_RECOGNITION_PROMPT)
     )
     lifecycle_event_prompt = str(raw_data.get("lifecycle_event_prompt") or DEFAULT_LIFECYCLE_EVENT_PROMPT)
-    mimo_direct_prompt = str(raw_data.get("mimo_direct_prompt") or DEFAULT_MIMO_DIRECT_PROMPT)
+    mimo_direct_prompt = _with_market_entry_with_price_instruction(
+        str(raw_data.get("mimo_direct_prompt") or DEFAULT_MIMO_DIRECT_PROMPT)
+    )
     mode = str(raw_data.get("mode") or "local_rule_parser")
     raw_text_provider = _load_provider_config(raw_data.get("text_provider"))
     raw_image_provider = _load_provider_config(raw_data.get("image_provider"))
@@ -304,7 +316,9 @@ def save_ai_recognition_config(
             config.recognition_prompt.strip() or DEFAULT_RECOGNITION_PROMPT
         ),
         lifecycle_event_prompt=config.lifecycle_event_prompt.strip() or DEFAULT_LIFECYCLE_EVENT_PROMPT,
-        mimo_direct_prompt=config.mimo_direct_prompt.strip() or DEFAULT_MIMO_DIRECT_PROMPT,
+        mimo_direct_prompt=_with_market_entry_with_price_instruction(
+            config.mimo_direct_prompt.strip() or DEFAULT_MIMO_DIRECT_PROMPT
+        ),
         mode=_resolve_mode(config),
         text_provider=text_model.provider if text_model else _normalize_provider_config(config.text_provider),
         image_provider=image_model.provider if image_model else _normalize_provider_config(config.image_provider),
@@ -481,8 +495,17 @@ def _resolve_mode(config: AiRecognitionConfig) -> str:
 def _with_normalized_strategy_output_instructions(prompt: str) -> str:
     prompt = prompt.strip()
     if "【策略字段统一格式】" in prompt:
+        if MARKET_ENTRY_WITH_PRICE_INSTRUCTION not in prompt:
+            return f"{prompt}\n{MARKET_ENTRY_WITH_PRICE_INSTRUCTION}"
         return prompt
     return f"{prompt}\n\n{NORMALIZED_STRATEGY_OUTPUT_INSTRUCTIONS.strip()}"
+
+
+def _with_market_entry_with_price_instruction(prompt: str) -> str:
+    prompt = prompt.strip()
+    if MARKET_ENTRY_WITH_PRICE_INSTRUCTION in prompt:
+        return prompt
+    return f"{prompt}\n\n{MARKET_ENTRY_WITH_PRICE_INSTRUCTION}"
 
 
 def _provider_to_payload(config: AiProviderConfig) -> dict[str, Any]:

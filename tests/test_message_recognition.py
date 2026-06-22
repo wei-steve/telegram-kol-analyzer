@@ -149,6 +149,99 @@ def test_ai_strategy_payload_normalizes_targets_and_backfills_lifecycle(tmp_path
         assert lifecycle.take_profit == "63600/64800"
 
 
+def test_ai_text_recognition_preserves_labeled_entry_price_when_model_returns_market_only(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    source_text = (
+        "\U0001f3c6 \u300e1000u\u51b2\u523a100w\u5343\u500d\u7ffb\u4ed3\u300f \U0001f3c6\n"
+        "\u4ea4\u6613\u6807\u7684\uff1aEth(\u5e02\u4ef7\u8fdb\u573a)\n"
+        "\u8fdb\u573a\u65b9\u5411\uff1a\u7a7a\n"
+        "\u8fdb\u573a\u70b9\u4f4d\uff1a1730\u9644\u8fd1\n"
+        "\u6b62\u76c8\u9884\u8ba1\uff1a1650\n"
+        "\u6b62\u635f\u9884\u8ba1\uff1a1765"
+    )
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=2167,
+            posted_at=datetime(2026, 6, 22, 11, 2, tzinfo=UTC),
+            text=source_text,
+        )
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    payload = {
+        "recognition_result": "\u662f\u7b56\u7565",
+        "reason": "\u660e\u786e\u4ea4\u6613\u6807\u7684ETH\u3001\u505a\u7a7a\u65b9\u5411\u3001\u5e02\u4ef7\u8fdb\u573a\u3001\u6b62\u635f1765\u3001\u6b62\u76c81650",
+        "strategy": {
+            "symbol": "ETH",
+            "side": "short",
+            "entry": "\u5e02\u4ef7\u8fdb\u573a",
+            "stop_loss": "1765",
+            "take_profit": "1650",
+            "leverage": None,
+            "order_type": "market",
+        },
+        "confidence": 0.95,
+    }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json, headers):
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": __import__("json").dumps(payload, ensure_ascii=False)
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr("telegram_kol_research.message_recognition.httpx.Client", FakeClient)
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    expected_entry = "\u5e02\u4ef7\u8fdb\u573a/1730\u9644\u8fd1"
+    assert result.status == "\u662f\u7b56\u7565"
+    assert f"Entry {expected_entry}" in (result.summary or "")
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+        recognition = session.query(MessageRecognition).one()
+
+    assert candidate.entry_text == expected_entry
+    assert lifecycle.entry_range_low == 1730
+    assert lifecycle.entry_range_high == 1730
+    assert f"Entry {expected_entry}" in (recognition.summary or "")
+
+
 def test_ensure_lifecycle_record_deduplicates_recent_active_same_strategy(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     first_payload = {
