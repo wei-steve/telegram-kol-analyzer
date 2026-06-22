@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi.testclient import TestClient
 
 from telegram_kol_research.web_app import create_web_app
@@ -62,3 +64,31 @@ def test_web_app_runs_first_reconcile_shortly_after_startup_by_default(tmp_path)
     )
 
     assert app.state.reconcile_startup_delay_seconds == 15
+
+
+def test_monitor_status_reports_reconcile_auth_failure(tmp_path):
+    async def fake_live_listener_runner(**kwargs):
+        await asyncio.Event().wait()
+
+    async def failing_reconcile_runner(**kwargs):
+        raise RuntimeError(
+            "The authorization key (session file) was used under two different IP addresses simultaneously"
+        )
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        live_target_titles={"Demo Group"},
+        live_listener_runner=fake_live_listener_runner,
+        reconcile_runner=failing_reconcile_runner,
+        reconcile_startup_delay_seconds=0,
+        telegram_client=object(),
+    )
+
+    with TestClient(app) as client:
+        first = client.get("/api/monitor-status")
+        second = client.get("/api/monitor-status")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["state"] == "disconnected"
+    assert "authorization key" in second.json()["detail"].lower()

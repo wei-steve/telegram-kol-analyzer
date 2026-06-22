@@ -393,6 +393,8 @@ def create_web_app(
                     await reconcile_task
                 except asyncio.CancelledError:
                     pass
+                except Exception:
+                    pass
                 app.state.reconcile_task = None
             app.state.live_update_broker.close()
 
@@ -498,6 +500,7 @@ def create_web_app(
     def build_monitor_status() -> dict[str, Any]:
         synced_group_count = len(app.state.live_target_titles)
         task = app.state.live_listener_task
+        reconcile_task = app.state.reconcile_task
         if synced_group_count == 0:
             return {
                 "state": "idle",
@@ -520,17 +523,18 @@ def create_web_app(
                 "monitored_group_count": synced_group_count,
             }
         if task.done():
-            detail = "Telegram 同步监听任务已停止"
-            if task.cancelled():
-                detail = "Telegram 同步监听任务已取消"
-            else:
-                try:
-                    exception = task.exception()
-                except asyncio.CancelledError:
-                    exception = None
-                    detail = "Telegram 同步监听任务已取消"
-                if exception is not None:
-                    detail = str(exception)
+            detail = _task_failure_detail(task, default="Telegram 同步监听任务已停止")
+            return {
+                "state": "disconnected",
+                "label": "已断开",
+                "detail": detail,
+                "monitored_group_count": synced_group_count,
+            }
+        if reconcile_task is not None and reconcile_task.done():
+            detail = _task_failure_detail(
+                reconcile_task,
+                default="Telegram 周期同步任务已停止",
+            )
             return {
                 "state": "disconnected",
                 "label": "已断开",
@@ -1099,7 +1103,11 @@ def create_web_app(
     @app.get("/api/monitor-status")
     async def api_monitor_status():
         status = build_monitor_status()
-        if status["state"] == "disconnected" and app.state.live_target_titles:
+        if (
+            status["state"] == "disconnected"
+            and app.state.live_target_titles
+            and not _is_telegram_auth_duplicated_error(status.get("detail"))
+        ):
             await ensure_live_tasks_match_targets()
             status = build_monitor_status()
         return status
@@ -1385,6 +1393,23 @@ async def _run_reconcile_after_startup_delay(
     if startup_delay_seconds > 0:
         await asyncio.sleep(startup_delay_seconds)
     await runner(**kwargs)
+
+
+def _task_failure_detail(task: asyncio.Task, *, default: str) -> str:
+    if task.cancelled():
+        return default.replace("已停止", "已取消")
+    try:
+        exception = task.exception()
+    except asyncio.CancelledError:
+        return default.replace("已停止", "已取消")
+    if exception is None:
+        return default
+    return str(exception)
+
+
+def _is_telegram_auth_duplicated_error(message: Any) -> bool:
+    lowered = str(message or "").lower()
+    return "authorization key" in lowered and "used under two different" in lowered
 
 
 def _parse_optional_datetime(value: Any) -> datetime | None:
