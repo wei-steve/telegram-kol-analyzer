@@ -578,6 +578,8 @@ def test_strategy_mid_panel_shows_cancelled_order_lifecycle(tmp_path):
     assert "#376" in response.text
     assert "pending_entry → cancelled" in response.text
     assert "取消限价，等我后续信号！" in response.text
+    assert "离场确认时间" in response.text
+    assert "2026-06-19 17:24:00 UTC+8" in response.text
 
 
 def test_strategy_mid_panel_shows_market_entry_confirmation_event(tmp_path):
@@ -644,6 +646,12 @@ def test_strategy_mid_panel_shows_market_entry_confirmation_event(tmp_path):
     assert "#377" in response.text
     assert "入场确认" in response.text
     assert "BTC 现价 63320 入场" in response.text
+    assert "策略消息接收时间" in response.text
+    assert "策略创建/识别时间" in response.text
+    assert "入场确认时间" in response.text
+    assert "最新事件时间" in response.text
+    assert "2026-06-19 12:29:00 UTC+8" in response.text
+    assert "2026-06-19 17:40:00 UTC+8" in response.text
 
 
 def test_strategy_mid_panel_shows_position_management_event(tmp_path):
@@ -710,3 +718,5 @@ def test_strategy_mid_panel_shows_position_management_event(tmp_path):
     assert "#1400" in response.text
     assert "提前止盈一半带保护" in response.text
     assert "持仓中" in response.text
+    assert "最新事件时间" in response.text
+    assert "2026-06-18 16:36:00 UTC+8" in response.text

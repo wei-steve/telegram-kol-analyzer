@@ -868,6 +868,34 @@ body {
   padding-top: 6px;
 }
 
+.position-time-grid {
+  display: grid;
+  gap: 4px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(148, 163, 184, 0.08);
+  color: #8aa0bd;
+  font-size: 0.74rem;
+}
+
+.position-time-row {
+  display: grid;
+  grid-template-columns: minmax(8.4em, auto) minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+}
+
+.position-time-row span {
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.position-time-row time {
+  min-width: 0;
+  color: #cbd5e1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  overflow-wrap: anywhere;
+}
+
 .position-lifecycle {
   display: grid;
   gap: 5px;

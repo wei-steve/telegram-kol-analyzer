@@ -17,6 +17,40 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
 
+STRATEGY_TIME_DISPLAY_FIELDS = (
+    "posted_at",
+    "signal_at",
+    "entered_at",
+    "exited_at",
+    "last_checked_at",
+    "original_posted_at",
+    "latest_event_at",
+)
+
+
+def _format_strategy_time(value: object) -> str | None:
+    if value is None or not isinstance(value, datetime):
+        return None
+    local_value = utc_naive_to_local(value)
+    if local_value is None:
+        return None
+    offset = local_value.strftime("%z")
+    timezone_label = "UTC"
+    if offset:
+        sign = offset[0]
+        hours = int(offset[1:3])
+        minutes = int(offset[3:5])
+        timezone_label = f"UTC{sign}{hours}"
+        if minutes:
+            timezone_label = f"{timezone_label}:{minutes:02d}"
+    return f"{local_value:%Y-%m-%d %H:%M:%S} {timezone_label}"
+
+
+def _add_strategy_time_display_fields(row: dict[str, object]) -> dict[str, object]:
+    for field_name in STRATEGY_TIME_DISPLAY_FIELDS:
+        row[f"{field_name}_display"] = _format_strategy_time(row.get(field_name))
+    return row
+
 
 def load_group_rows(
     session_factory: sessionmaker,
@@ -698,6 +732,7 @@ def _apply_lifecycle_display_fields(
             ),
         }
     )
+    _add_strategy_time_display_fields(row)
     return row
 
 
@@ -1115,7 +1150,7 @@ def list_exited_strategies(
                 continue
             if key is not None:
                 seen_signal_keys.add(key)
-            results.append({
+            row = {
                 "chat_id": eb.chat_id,
                 "message_id": eb.message_id,
                 "symbol": eb.symbol,
@@ -1126,7 +1161,8 @@ def list_exited_strategies(
                 "entered_at": utc_naive_to_local(eb.created_at),
                 "exited_at": utc_naive_to_local(eb.updated_at),
                 "sender_name": eb.kol_id,
-            })
+            }
+            results.append(_add_strategy_time_display_fields(row))
 
         # ── 3. TradeIdea (closed) ──
         closed_trade_ids = set()
@@ -1181,7 +1217,7 @@ def list_exited_strategies(
                 row["sender_name"] = raw_msg.sender_name
                 row["message_id"] = raw_msg.message_id
                 row["posted_at"] = utc_naive_to_local(raw_msg.posted_at)
-            results.append(row)
+            results.append(_add_strategy_time_display_fields(row))
 
     results.sort(
         key=lambda r: str(r.get("exited_at") or r.get("entered_at") or ""),

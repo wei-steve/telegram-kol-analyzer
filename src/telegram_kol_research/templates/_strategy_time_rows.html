@@ -1,0 +1,18 @@
+{% set time_ns = namespace(has_rows=false) %}
+{% for label, value in time_rows %}
+  {% if value %}
+    {% set time_ns.has_rows = true %}
+  {% endif %}
+{% endfor %}
+{% if time_ns.has_rows %}
+  <div class="position-time-grid">
+    {% for label, value in time_rows %}
+      {% if value %}
+        <div class="position-time-row">
+          <span>{{ label }}</span>
+          <time>{{ value }}</time>
+        </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+{% endif %}

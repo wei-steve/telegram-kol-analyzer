@@ -76,21 +76,28 @@
                 </div>
                 <div class="position-source">
                   {% if h.sender_name %}<span>{{ h.sender_name }}</span>{% endif %}
-                  {% if h.entered_at %}<span>{{ h.entered_at }}</span>{% endif %}
                 </div>
+                {% set time_rows = [
+                  ('策略消息接收时间', h.original_posted_at_display or h.posted_at_display),
+                  ('策略创建/识别时间', h.signal_at_display),
+                  ('入场确认时间', h.entered_at_display),
+                  ('最新事件时间', h.latest_event_at_display),
+                  ('最近价格检查时间', h.last_checked_at_display)
+                ] %}
+                {% include "_strategy_time_rows.html" %}
                 {% if h.original_message_id or h.latest_event_message_id or h.status_detail %}
                   <div class="position-lifecycle">
                     <div class="position-lifecycle-row">
                       <span>原策略</span>
                       {% if h.original_message_id %}<code>#{{ h.original_message_id }}</code>{% endif %}
-                      {% if h.original_posted_at %}<time>{{ h.original_posted_at }}</time>{% endif %}
+                      {% if h.original_posted_at_display %}<time>接收时间 {{ h.original_posted_at_display }}</time>{% endif %}
                     </div>
                     {% if h.original_text_excerpt %}<p>{{ h.original_text_excerpt }}</p>{% endif %}
                     <div class="position-lifecycle-row">
                       <span>最新事件</span>
                       <strong>{{ h.latest_event_label or h.current_status_label }}</strong>
                       {% if h.latest_event_message_id %}<code>#{{ h.latest_event_message_id }}</code>{% endif %}
-                      {% if h.latest_event_at %}<time>{{ h.latest_event_at }}</time>{% endif %}
+                      {% if h.latest_event_at_display %}<time>事件时间 {{ h.latest_event_at_display }}</time>{% endif %}
                       {% if h.transition_text %}<code>{{ h.transition_text }}</code>{% endif %}
                     </div>
                     {% if h.latest_event_text_excerpt %}<p>{{ h.latest_event_text_excerpt }}</p>{% endif %}
@@ -139,19 +146,26 @@
                     {% endfor %}
                   {% endif %}
                 </div>
+                {% set time_rows = [
+                  ('策略消息接收时间', item.original_posted_at_display or item.posted_at_display),
+                  ('策略创建/识别时间', item.signal_at_display),
+                  ('最新事件时间', item.latest_event_at_display),
+                  ('最近价格检查时间', item.last_checked_at_display)
+                ] %}
+                {% include "_strategy_time_rows.html" %}
                 {% if item.original_message_id or item.latest_event_message_id or item.status_detail %}
                   <div class="position-lifecycle">
                     <div class="position-lifecycle-row">
                       <span>原策略</span>
                       {% if item.original_message_id %}<code>#{{ item.original_message_id }}</code>{% endif %}
-                      {% if item.original_posted_at %}<time>{{ item.original_posted_at }}</time>{% endif %}
+                      {% if item.original_posted_at_display %}<time>接收时间 {{ item.original_posted_at_display }}</time>{% endif %}
                     </div>
                     {% if item.original_text_excerpt %}<p>{{ item.original_text_excerpt }}</p>{% endif %}
                     <div class="position-lifecycle-row">
                       <span>最新事件</span>
                       <strong>{{ item.latest_event_label or item.current_status_label }}</strong>
                       {% if item.latest_event_message_id %}<code>#{{ item.latest_event_message_id }}</code>{% endif %}
-                      {% if item.latest_event_at %}<time>{{ item.latest_event_at }}</time>{% endif %}
+                      {% if item.latest_event_at_display %}<time>事件时间 {{ item.latest_event_at_display }}</time>{% endif %}
                       {% if item.transition_text %}<code>{{ item.transition_text }}</code>{% endif %}
                     </div>
                     {% if item.latest_event_text_excerpt %}<p>{{ item.latest_event_text_excerpt }}</p>{% endif %}
@@ -208,22 +222,28 @@
                 </div>
                 <div class="position-source">
                   {% if ex.sender_name %}<span>{{ ex.sender_name }}</span>{% endif %}
-                  {% if ex.entered_at %}<span>入场: {{ ex.entered_at }}</span>{% endif %}
-                  {% if ex.exited_at %}<span>离场: {{ ex.exited_at }}</span>{% endif %}
                 </div>
+                {% set time_rows = [
+                  ('策略消息接收时间', ex.original_posted_at_display or ex.posted_at_display),
+                  ('策略创建/识别时间', ex.signal_at_display),
+                  ('入场确认时间', ex.entered_at_display),
+                  ('离场确认时间', ex.exited_at_display),
+                  ('最新事件时间', ex.latest_event_at_display)
+                ] %}
+                {% include "_strategy_time_rows.html" %}
                 {% if ex.original_message_id or ex.latest_event_message_id or ex.status_detail %}
                   <div class="position-lifecycle">
                     <div class="position-lifecycle-row">
                       <span>原策略</span>
                       {% if ex.original_message_id %}<code>#{{ ex.original_message_id }}</code>{% endif %}
-                      {% if ex.original_posted_at %}<time>{{ ex.original_posted_at }}</time>{% endif %}
+                      {% if ex.original_posted_at_display %}<time>接收时间 {{ ex.original_posted_at_display }}</time>{% endif %}
                     </div>
                     {% if ex.original_text_excerpt %}<p>{{ ex.original_text_excerpt }}</p>{% endif %}
                     <div class="position-lifecycle-row">
                       <span>最新事件</span>
                       <strong>{{ ex.latest_event_label or ex.current_status_label }}</strong>
                       {% if ex.latest_event_message_id %}<code>#{{ ex.latest_event_message_id }}</code>{% endif %}
-                      {% if ex.latest_event_at %}<time>{{ ex.latest_event_at }}</time>{% endif %}
+                      {% if ex.latest_event_at_display %}<time>事件时间 {{ ex.latest_event_at_display }}</time>{% endif %}
                       {% if ex.transition_text %}<code>{{ ex.transition_text }}</code>{% endif %}
                     </div>
                     {% if ex.latest_event_text_excerpt %}<p>{{ ex.latest_event_text_excerpt }}</p>{% endif %}
