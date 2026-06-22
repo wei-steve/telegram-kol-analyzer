@@ -363,6 +363,7 @@ class LifecycleMonitor:
                 .all()
             )
 
+            duplicate_marked = 0
             for ti, cand, raw_msg in orphan_trades:
                 if not cand.symbol or not cand.side:
                     continue
@@ -383,6 +384,30 @@ class LifecycleMonitor:
                     cand.entry_text
                 )
                 stop_loss = _parse_single_float(cand.stop_loss_text)
+                from telegram_kol_research.message_recognition import (
+                    DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS,
+                    _find_duplicate_active_lifecycle,
+                )
+
+                duplicate = _find_duplicate_active_lifecycle(
+                    session,
+                    raw_message=raw_msg,
+                    candidate=cand,
+                    entry_low=entry_low,
+                    entry_high=entry_high,
+                    stop_loss=stop_loss,
+                    window_hours=DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS,
+                )
+                if duplicate is not None:
+                    cand.event_type = "duplicate_entry_signal"
+                    cand.review_note = (
+                        f"Duplicate active strategy lifecycle #{duplicate.id}; "
+                        f"original message #{duplicate.message_id}."
+                    )
+                    cand.confidence = max(cand.confidence or 0.0, 0.9)
+                    ti.status = "duplicate"
+                    duplicate_marked += 1
+                    continue
 
                 # If there's a parsed entry range, start as pending_entry
                 # so the monitor checks candles to confirm actual entry.
@@ -408,8 +433,14 @@ class LifecycleMonitor:
                 session.add(lc)
                 created += 1
 
-            if created:
+            if created or duplicate_marked:
                 session.commit()
+            if duplicate_marked:
+                logger.info(
+                    "Marked %d orphan TradeIdeas as duplicate active strategies",
+                    duplicate_marked,
+                )
+            if created:
                 logger.info(
                     "Backfilled %d StrategyLifecycle records from TradeIdeas",
                     created,

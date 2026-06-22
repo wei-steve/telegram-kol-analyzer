@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.lifecycle_monitor import LifecycleMonitor, StateTransition
 from telegram_kol_research.live_updates import LiveUpdateBroker
-from telegram_kol_research.models import RawMessage, StrategyLifecycle
+from telegram_kol_research.models import RawMessage, SignalCandidate, StrategyLifecycle, TradeIdea
 
 
 def test_lifecycle_monitor_rejects_entry_before_signal_time(tmp_path):
@@ -76,6 +76,74 @@ def test_lifecycle_backfill_keeps_entered_record_with_entry_evidence(tmp_path):
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.entered_at == datetime(2026, 6, 19, 11, 32, 47)
     assert lifecycle.entry_price_actual == 62486.1
+
+
+def test_lifecycle_backfill_skips_duplicate_active_trade_idea_from_repost(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        existing = StrategyLifecycle(
+            chat_id=88,
+            message_id=6609,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 20, 0, 34, 55, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 22, 13, 36, tzinfo=UTC),
+            entry_price_actual=1775,
+            entry_range_low=1775,
+            entry_range_high=1775,
+            stop_loss=1800,
+            take_profit="1755/1740/1715",
+        )
+        repost = RawMessage(
+            chat_id=88,
+            message_id=6618,
+            posted_at=datetime(2026, 6, 21, 3, 20, 7, tzinfo=UTC),
+            text="以太币 委托1775 附近 开空\n止损：1800\n止盈：1755-1740-1715",
+        )
+        session.add_all([existing, repost])
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=repost.id,
+            symbol="ETH",
+            side="short",
+            event_type="entry_signal",
+            entry_text="1775附近",
+            stop_loss_text="1800",
+            take_profit_text="1755/1740/1715",
+            parse_source="text_ai",
+            confidence=0.95,
+        )
+        session.add(candidate)
+        session.flush()
+        trade_idea = TradeIdea(
+            primary_signal_candidate_id=candidate.id,
+            chat_id=88,
+            symbol="ETH",
+            side="short",
+            status="open",
+            confidence=0.95,
+            opened_at=repost.posted_at,
+            created_at=repost.posted_at,
+        )
+        session.add(trade_idea)
+        session.commit()
+        candidate_id = candidate.id
+        trade_idea_id = trade_idea.id
+
+    monitor = LifecycleMonitor(session_factory, LiveUpdateBroker())
+
+    assert monitor.backfill_from_trade_ideas() == 0
+
+    with session_factory() as session:
+        candidate = session.get(SignalCandidate, candidate_id)
+        trade_idea = session.get(TradeIdea, trade_idea_id)
+        lifecycles = session.query(StrategyLifecycle).all()
+
+    assert len(lifecycles) == 1
+    assert candidate.event_type == "duplicate_entry_signal"
+    assert "Duplicate active strategy lifecycle" in candidate.review_note
+    assert trade_idea.status == "duplicate"
 
 
 def test_lifecycle_monitor_rejects_protective_stop_before_management_signal(tmp_path):

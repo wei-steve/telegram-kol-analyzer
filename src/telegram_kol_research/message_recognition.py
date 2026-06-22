@@ -41,6 +41,8 @@ BLOCKED_SYMBOLS = {
     "HTTPS",
 }
 
+DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS = 72
+
 ENTRY_TERMS = [
     "建仓",
     "入场",
@@ -1881,7 +1883,7 @@ def _find_duplicate_active_lifecycle(
     entry_low: float | None,
     entry_high: float | None,
     stop_loss: float | None,
-    window_hours: int = 24,
+    window_hours: int = DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS,
 ) -> StrategyLifecycle | None:
     signal_at = raw_message.posted_at or utc_now()
     symbol = (candidate.symbol or "").upper()
