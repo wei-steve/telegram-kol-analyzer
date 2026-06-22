@@ -599,6 +599,8 @@ LIFECYCLE_EVENT_PROMPT = """
   "side": null,
   "entry_price": null,
   "exit_price": null,
+  "stop_loss": null,
+  "take_profit": null,
   "management_action": null,
   "confidence": 0.0,
   "reason": "一句话说明判断依据"
@@ -850,6 +852,11 @@ def _apply_lifecycle_event_decision(
     if event_type == "position_update" and target.lifecycle_status == "entered":
         management_action = str(decision.get("management_action") or "").strip() or "position_update"
         management_note = str(decision.get("reason") or "").strip() or None
+        explicit_stop_loss = _number_or_none(decision.get("stop_loss"))
+        explicit_take_profit = _normalize_strategy_text(
+            decision.get("take_profit"),
+            separator="/",
+        )
         protective_stop = (
             _protective_stop_price(target)
             if _should_move_stop_to_protect(
@@ -859,10 +866,16 @@ def _apply_lifecycle_event_decision(
             )
             else None
         )
-        if protective_stop is not None:
+        if explicit_stop_loss is not None:
+            target.stop_loss = explicit_stop_loss
+            stop_note = f"止损已按 KOL 明确指令调整为 {explicit_stop_loss:g}。"
+            management_note = f"{management_note} {stop_note}" if management_note else stop_note
+        elif protective_stop is not None:
             target.stop_loss = protective_stop
-            protect_note = f"止损已调整到成本保护价 {protective_stop:g}。"
+            protect_note = f"收到推保护价指令，止损已调整到成本保护价 {protective_stop:g}。"
             management_note = f"{management_note} {protect_note}" if management_note else protect_note
+        if explicit_take_profit:
+            target.take_profit = explicit_take_profit
         target.management_signal_message_id = raw_message.message_id
         target.management_action = management_action
         target.management_note = management_note
@@ -884,10 +897,28 @@ def _should_move_stop_to_protect(
     decision: dict[str, Any],
     management_action: str,
 ) -> bool:
-    # Vague phrases such as "带保护" or "推保护" do not define a concrete
-    # stop price. Treat them as management notes only; otherwise the monitor
-    # may stop out a still-active KOL position at an assumed breakeven price.
-    return False
+    text = " ".join(
+        str(part or "")
+        for part in (
+            current_text,
+            decision.get("reason"),
+            decision.get("management_action"),
+            management_action,
+        )
+    ).lower()
+    protect_terms = [
+        "带保护",
+        "保护止损",
+        "推保护",
+        "上推保护",
+        "保护价",
+        "保本",
+        "成本保护",
+        "move_stop_to_protect",
+        "breakeven",
+        "break even",
+    ]
+    return any(term in text for term in protect_terms)
 
 
 def _protective_stop_price(lifecycle: StrategyLifecycle) -> float | None:
