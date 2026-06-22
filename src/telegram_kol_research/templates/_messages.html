@@ -143,12 +143,18 @@
             {% if strategy_related %}open{% endif %}
           >
             <summary class="message-ai-summary">
-              <span>AI识别结果：{{ detection.status if detection else '待识别' }}</span>
-              {% if detection and detection.summary %}
-                <strong>{{ detection.summary }}</strong>
-              {% elif detection and detection.reason %}
-                <small>{{ detection.reason }}</small>
-              {% endif %}
+              <span class="message-ai-summary-status">AI识别结果：{{ detection.status if detection else '待识别' }}</span>
+              <span class="message-ai-summary-text">
+                {% if detection and detection.summary %}
+                  <strong>{{ detection.summary }}</strong>
+                {% elif detection and detection.reason %}
+                  <small>{{ detection.reason }}</small>
+                {% endif %}
+              </span>
+              <span class="message-ai-toggle" aria-hidden="true">
+                <span class="message-ai-toggle-collapsed">展开AI分析</span>
+                <span class="message-ai-toggle-open">收起AI分析</span>
+              </span>
             </summary>
             <div class="message-ai-details">
               <div class="message-ai-result {{ ai_panel_class }}">

@@ -336,6 +336,7 @@ def test_group_messages_route_shows_ai_strategy_detection_results(tmp_path):
     assert "视频消息默认跳过" in response.text
     assert response.text.count('data-message-ai-insights') == 3
     assert response.text.count('data-message-ai-insights\n            open') == 1
+    assert response.text.count('class="message-ai-toggle"') == 3
 
 
 def test_group_messages_route_shows_recognition_comparison_results(tmp_path):
