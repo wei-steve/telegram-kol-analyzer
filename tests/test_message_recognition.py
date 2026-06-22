@@ -305,6 +305,193 @@ def test_ensure_lifecycle_record_deduplicates_recent_active_same_strategy(tmp_pa
         assert "Duplicate active strategy lifecycle" in duplicate_candidate.review_note
 
 
+def test_ensure_lifecycle_record_applies_active_entry_correction(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_payload = {
+        "symbol": "BTC",
+        "side": "short",
+        "entry": "64600-69000",
+        "stop_loss": "66100",
+        "take_profit": "62300/61200",
+    }
+    correction_payload = {
+        "symbol": "BTC",
+        "side": "short",
+        "entry": "64600-64900",
+        "stop_loss": "66100",
+        "take_profit": "62300/61200",
+    }
+
+    with session_factory() as session:
+        first_message = RawMessage(
+            chat_id=88,
+            message_id=9079,
+            posted_at=datetime(2026, 6, 22, 11, 57, 47, tzinfo=UTC),
+            text="BTC 64600-69000附近做空 止损66100 止盈62300/61200",
+        )
+        correction_message = RawMessage(
+            chat_id=88,
+            message_id=9080,
+            posted_at=datetime(2026, 6, 22, 12, 18, 46, tzinfo=UTC),
+            text="BTC 64600-64900附近做空 止损66100 止盈62300/61200",
+        )
+        session.add_all([first_message, correction_message])
+        session.flush()
+        first_candidate = _upsert_ai_signal_candidate(
+            session,
+            first_message,
+            strategy=first_payload,
+            confidence=0.95,
+            parse_source="glm_ocr_image",
+        )
+        first_lifecycle = _ensure_lifecycle_record(session, first_message, first_candidate)
+        first_lifecycle.lifecycle_status = "entered"
+        first_lifecycle.entered_at = first_message.posted_at
+        correction_candidate = _upsert_ai_signal_candidate(
+            session,
+            correction_message,
+            strategy=correction_payload,
+            confidence=0.95,
+            parse_source="glm_ocr_image",
+        )
+        correction_lifecycle = _ensure_lifecycle_record(
+            session,
+            correction_message,
+            correction_candidate,
+        )
+        session.flush()
+
+        assert correction_lifecycle.id == first_lifecycle.id
+        assert session.query(StrategyLifecycle).count() == 1
+        assert first_lifecycle.entry_range_low == 64600
+        assert first_lifecycle.entry_range_high == 64900
+        assert first_lifecycle.management_signal_message_id == 9080
+        assert first_lifecycle.management_action == "strategy_correction"
+        assert "64600-69000" in (first_lifecycle.management_note or "")
+        assert "64600-64900" in (first_lifecycle.management_note or "")
+        assert correction_candidate.event_type == "strategy_correction"
+        assert "Strategy correction" in (correction_candidate.review_note or "")
+
+
+def test_ensure_lifecycle_record_allows_reentry_after_exit(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    payload = {
+        "symbol": "BTC",
+        "side": "short",
+        "entry": "64900",
+        "stop_loss": "66100",
+        "take_profit": "62300/61200",
+    }
+
+    with session_factory() as session:
+        first_message = RawMessage(
+            chat_id=88,
+            message_id=9080,
+            posted_at=datetime(2026, 6, 22, 12, 18, 46, tzinfo=UTC),
+            text="BTC 64900做空 止损66100 止盈62300/61200",
+        )
+        reentry_message = RawMessage(
+            chat_id=88,
+            message_id=9090,
+            posted_at=datetime(2026, 6, 22, 15, 0, tzinfo=UTC),
+            text="价格又反弹到64900 继续空 止损66100 止盈62300/61200",
+        )
+        session.add_all([first_message, reentry_message])
+        session.flush()
+        first_candidate = _upsert_ai_signal_candidate(
+            session,
+            first_message,
+            strategy=payload,
+            confidence=0.95,
+            parse_source="text_ai",
+        )
+        first_lifecycle = _ensure_lifecycle_record(session, first_message, first_candidate)
+        first_lifecycle.lifecycle_status = "exited"
+        first_lifecycle.exit_reason = "take_profit"
+        first_lifecycle.entered_at = first_message.posted_at
+        first_lifecycle.exited_at = datetime(2026, 6, 22, 13, 0, tzinfo=UTC)
+        session.flush()
+        reentry_candidate = _upsert_ai_signal_candidate(
+            session,
+            reentry_message,
+            strategy=payload,
+            confidence=0.95,
+            parse_source="text_ai",
+        )
+        reentry_lifecycle = _ensure_lifecycle_record(
+            session,
+            reentry_message,
+            reentry_candidate,
+        )
+        session.flush()
+
+        assert reentry_lifecycle.id != first_lifecycle.id
+        assert session.query(StrategyLifecycle).count() == 2
+        assert reentry_lifecycle.lifecycle_status == "pending_entry"
+        assert reentry_candidate.event_type == "entry_signal"
+        assert reentry_candidate.review_note is None
+
+
+def test_ensure_lifecycle_record_keeps_distinct_active_entry_range(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    with session_factory() as session:
+        first_message = RawMessage(
+            chat_id=88,
+            message_id=9100,
+            posted_at=datetime(2026, 6, 22, 12, 0, tzinfo=UTC),
+            text="BTC 64600-64900做空 止损66100 止盈62300/61200",
+        )
+        second_message = RawMessage(
+            chat_id=88,
+            message_id=9101,
+            posted_at=datetime(2026, 6, 22, 12, 30, tzinfo=UTC),
+            text="BTC 65000-65300做空 止损66100 止盈62300/61200",
+        )
+        session.add_all([first_message, second_message])
+        session.flush()
+        first_candidate = _upsert_ai_signal_candidate(
+            session,
+            first_message,
+            strategy={
+                "symbol": "BTC",
+                "side": "short",
+                "entry": "64600-64900",
+                "stop_loss": "66100",
+                "take_profit": "62300/61200",
+            },
+            confidence=0.95,
+            parse_source="text_ai",
+        )
+        first_lifecycle = _ensure_lifecycle_record(session, first_message, first_candidate)
+        first_lifecycle.lifecycle_status = "entered"
+        first_lifecycle.entered_at = first_message.posted_at
+        second_candidate = _upsert_ai_signal_candidate(
+            session,
+            second_message,
+            strategy={
+                "symbol": "BTC",
+                "side": "short",
+                "entry": "65000-65300",
+                "stop_loss": "66100",
+                "take_profit": "62300/61200",
+            },
+            confidence=0.95,
+            parse_source="text_ai",
+        )
+        second_lifecycle = _ensure_lifecycle_record(
+            session,
+            second_message,
+            second_candidate,
+        )
+        session.flush()
+
+        assert second_lifecycle.id != first_lifecycle.id
+        assert session.query(StrategyLifecycle).count() == 2
+        assert second_candidate.event_type == "entry_signal"
+        assert second_candidate.review_note is None
+
+
 def test_recognize_message_now_marks_plain_text_as_not_strategy(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

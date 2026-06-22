@@ -629,6 +629,8 @@ def _management_action_label(action: str | None) -> str:
         return "部分止盈"
     if action == "move_stop_to_protect":
         return "保护止损"
+    if action == "strategy_correction":
+        return "策略修正"
     if action == "risk_update":
         return "风控更新"
     if action == "hold_update":

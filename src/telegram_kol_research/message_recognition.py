@@ -1853,6 +1853,25 @@ def _ensure_lifecycle_record(
         candidate.confidence = max(candidate.confidence or 0.0, 0.9)
         return duplicate
 
+    correction = _find_active_lifecycle_entry_correction(
+        session,
+        raw_message=raw_message,
+        candidate=candidate,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        stop_loss=stop_loss,
+    )
+    if correction is not None:
+        _apply_entry_correction_to_lifecycle(
+            correction,
+            raw_message=raw_message,
+            candidate=candidate,
+            entry_low=entry_low,
+            entry_high=entry_high,
+            stop_loss=stop_loss,
+        )
+        return correction
+
     lc = StrategyLifecycle(
         signal_candidate_id=candidate.id,
         chat_id=raw_message.chat_id,
@@ -1873,6 +1892,156 @@ def _ensure_lifecycle_record(
         session.rollback()
         return None
     return lc
+
+
+def _find_active_lifecycle_entry_correction(
+    session,
+    *,
+    raw_message: RawMessage,
+    candidate: SignalCandidate,
+    entry_low: float | None,
+    entry_high: float | None,
+    stop_loss: float | None,
+    window_hours: int = DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS,
+) -> StrategyLifecycle | None:
+    signal_at = raw_message.posted_at or utc_now()
+    symbol = (candidate.symbol or "").upper()
+    side = (candidate.side or "").lower()
+    if not symbol or not side:
+        return None
+
+    candidate_entry = (entry_low, entry_high)
+    if not any(value is not None for value in candidate_entry):
+        return None
+
+    candidate_tp_values = _strategy_price_values(
+        candidate.take_profit_text,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        stop_loss=stop_loss,
+    )
+    if stop_loss is None and not candidate_tp_values:
+        return None
+
+    query = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.chat_id == raw_message.chat_id)
+        .filter(StrategyLifecycle.lifecycle_status.in_(["pending_entry", "entered"]))
+        .filter(StrategyLifecycle.symbol == symbol)
+        .filter(StrategyLifecycle.side == side)
+        .filter(StrategyLifecycle.signal_at <= signal_at)
+        .filter(StrategyLifecycle.signal_at >= signal_at - timedelta(hours=window_hours))
+        .order_by(StrategyLifecycle.signal_at.desc(), StrategyLifecycle.id.desc())
+    )
+    for lifecycle in query.all():
+        lifecycle_entry = (lifecycle.entry_range_low, lifecycle.entry_range_high)
+        if _same_optional_float_pair(lifecycle_entry, candidate_entry):
+            continue
+        if not _looks_like_entry_correction(
+            old_entry=lifecycle_entry,
+            new_entry=candidate_entry,
+            side=side,
+            stop_loss=stop_loss,
+        ):
+            continue
+        if not _same_optional_float(lifecycle.stop_loss, stop_loss):
+            continue
+        lifecycle_tp_values = _strategy_price_values(
+            lifecycle.take_profit,
+            entry_low=lifecycle.entry_range_low,
+            entry_high=lifecycle.entry_range_high,
+            stop_loss=lifecycle.stop_loss,
+        )
+        if lifecycle_tp_values and candidate_tp_values and lifecycle_tp_values != candidate_tp_values:
+            continue
+        return lifecycle
+    return None
+
+
+def _looks_like_entry_correction(
+    *,
+    old_entry: tuple[float | None, float | None],
+    new_entry: tuple[float | None, float | None],
+    side: str,
+    stop_loss: float | None,
+) -> bool:
+    old_values = sorted(value for value in old_entry if value is not None)
+    new_values = sorted(value for value in new_entry if value is not None)
+    if not old_values or not new_values:
+        return False
+    old_low, old_high = old_values[0], old_values[-1]
+    new_low, new_high = new_values[0], new_values[-1]
+    overlaps = old_low <= new_high and new_low <= old_high
+    if not overlaps:
+        return False
+    old_contains_new = old_low <= new_low and new_high <= old_high
+    new_contains_old = new_low <= old_low and old_high <= new_high
+    if old_contains_new or new_contains_old:
+        return True
+    old_plausible = _entry_range_plausible_for_side(
+        entry_low=old_low,
+        entry_high=old_high,
+        side=side,
+        stop_loss=stop_loss,
+    )
+    new_plausible = _entry_range_plausible_for_side(
+        entry_low=new_low,
+        entry_high=new_high,
+        side=side,
+        stop_loss=stop_loss,
+    )
+    return not old_plausible and new_plausible
+
+
+def _entry_range_plausible_for_side(
+    *,
+    entry_low: float,
+    entry_high: float,
+    side: str,
+    stop_loss: float | None,
+) -> bool:
+    if stop_loss is None:
+        return True
+    if side == "short":
+        return entry_high < stop_loss
+    if side == "long":
+        return entry_low > stop_loss
+    return True
+
+
+def _apply_entry_correction_to_lifecycle(
+    lifecycle: StrategyLifecycle,
+    *,
+    raw_message: RawMessage,
+    candidate: SignalCandidate,
+    entry_low: float | None,
+    entry_high: float | None,
+    stop_loss: float | None,
+) -> None:
+    old_entry = _format_lifecycle_entry_pair(
+        lifecycle.entry_range_low,
+        lifecycle.entry_range_high,
+    )
+    new_entry = _format_lifecycle_entry_pair(entry_low, entry_high)
+    lifecycle.entry_range_low = entry_low
+    lifecycle.entry_range_high = entry_high
+    if stop_loss is not None:
+        lifecycle.stop_loss = stop_loss
+    if candidate.take_profit_text:
+        lifecycle.take_profit = candidate.take_profit_text
+    lifecycle.management_signal_message_id = raw_message.message_id
+    lifecycle.management_action = "strategy_correction"
+    lifecycle.management_note = (
+        f"后续策略修正：入场区间由 {old_entry or '-'} 调整为 {new_entry or '-'}；"
+        f"修正消息 #{raw_message.message_id}。"
+    )
+    lifecycle.updated_at = utc_now()
+    candidate.review_note = (
+        f"Strategy correction for active lifecycle #{lifecycle.id}; "
+        f"entry {old_entry or '-'} -> {new_entry or '-'}."
+    )
+    candidate.event_type = "strategy_correction"
+    candidate.confidence = max(candidate.confidence or 0.0, 0.9)
 
 
 def _find_duplicate_active_lifecycle(
@@ -1942,6 +2111,22 @@ def _same_optional_float_pair(
     if len(left_values) != len(right_values):
         return False
     return all(_same_optional_float(a, b) for a, b in zip(left_values, right_values))
+
+
+def _format_lifecycle_entry_pair(
+    entry_low: float | None,
+    entry_high: float | None,
+) -> str | None:
+    if entry_low is None and entry_high is None:
+        return None
+    if _same_optional_float(entry_low, entry_high):
+        return _format_number(entry_low)
+    values = [value for value in (entry_low, entry_high) if value is not None]
+    if not values:
+        return None
+    if len(values) == 1:
+        return _format_number(values[0])
+    return f"{_format_number(min(values))}-{_format_number(max(values))}"
 
 
 def _strategy_price_values(

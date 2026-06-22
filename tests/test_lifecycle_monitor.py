@@ -146,6 +146,76 @@ def test_lifecycle_backfill_skips_duplicate_active_trade_idea_from_repost(tmp_pa
     assert trade_idea.status == "duplicate"
 
 
+def test_lifecycle_backfill_applies_entry_correction_from_orphan_trade_idea(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        existing = StrategyLifecycle(
+            chat_id=88,
+            message_id=9079,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 22, 11, 57, 47, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 22, 11, 58, tzinfo=UTC),
+            entry_range_low=64600,
+            entry_range_high=69000,
+            stop_loss=66100,
+            take_profit="62300/61200",
+        )
+        correction = RawMessage(
+            chat_id=88,
+            message_id=9080,
+            posted_at=datetime(2026, 6, 22, 12, 18, 46, tzinfo=UTC),
+            text="BTC 64600-64900附近做空 止损66100 止盈62300/61200",
+        )
+        session.add_all([existing, correction])
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=correction.id,
+            symbol="BTC",
+            side="short",
+            event_type="entry_signal",
+            entry_text="64600-64900",
+            stop_loss_text="66100",
+            take_profit_text="62300/61200",
+            parse_source="glm_ocr_image",
+            confidence=0.95,
+        )
+        session.add(candidate)
+        session.flush()
+        trade_idea = TradeIdea(
+            primary_signal_candidate_id=candidate.id,
+            chat_id=88,
+            symbol="BTC",
+            side="short",
+            status="open",
+            confidence=0.95,
+            opened_at=correction.posted_at,
+            created_at=correction.posted_at,
+        )
+        session.add(trade_idea)
+        session.commit()
+        candidate_id = candidate.id
+        trade_idea_id = trade_idea.id
+
+    monitor = LifecycleMonitor(session_factory, LiveUpdateBroker())
+
+    assert monitor.backfill_from_trade_ideas() == 0
+
+    with session_factory() as session:
+        candidate = session.get(SignalCandidate, candidate_id)
+        trade_idea = session.get(TradeIdea, trade_idea_id)
+        lifecycles = session.query(StrategyLifecycle).all()
+
+    assert len(lifecycles) == 1
+    assert lifecycles[0].entry_range_low == 64600
+    assert lifecycles[0].entry_range_high == 64900
+    assert lifecycles[0].management_signal_message_id == 9080
+    assert lifecycles[0].management_action == "strategy_correction"
+    assert candidate.event_type == "strategy_correction"
+    assert trade_idea.status == "duplicate"
+
+
 def test_lifecycle_monitor_rejects_protective_stop_before_management_signal(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

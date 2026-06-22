@@ -386,6 +386,8 @@ class LifecycleMonitor:
                 stop_loss = _parse_single_float(cand.stop_loss_text)
                 from telegram_kol_research.message_recognition import (
                     DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS,
+                    _apply_entry_correction_to_lifecycle,
+                    _find_active_lifecycle_entry_correction,
                     _find_duplicate_active_lifecycle,
                 )
 
@@ -405,6 +407,28 @@ class LifecycleMonitor:
                         f"original message #{duplicate.message_id}."
                     )
                     cand.confidence = max(cand.confidence or 0.0, 0.9)
+                    ti.status = "duplicate"
+                    duplicate_marked += 1
+                    continue
+
+                correction = _find_active_lifecycle_entry_correction(
+                    session,
+                    raw_message=raw_msg,
+                    candidate=cand,
+                    entry_low=entry_low,
+                    entry_high=entry_high,
+                    stop_loss=stop_loss,
+                    window_hours=DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS,
+                )
+                if correction is not None:
+                    _apply_entry_correction_to_lifecycle(
+                        correction,
+                        raw_message=raw_msg,
+                        candidate=cand,
+                        entry_low=entry_low,
+                        entry_high=entry_high,
+                        stop_loss=stop_loss,
+                    )
                     ti.status = "duplicate"
                     duplicate_marked += 1
                     continue
