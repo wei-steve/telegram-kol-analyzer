@@ -704,28 +704,12 @@ def create_web_app(
 
     @app.get("/groups/{chat_id}/detail")
     def group_detail(request: Request, chat_id: int):
-        """Return the right-panel strategy detail fragment for a group.
-        
-        Loads holding, pending, exited strategies + messages. All three
-        strategy sections are visible simultaneously (stacked).
-        """
+        """Return the right-panel message detail fragment for a group."""
         selected_group = _lookup_single_group(
             app.state.session_factory,
             chat_id=chat_id,
             group_labels_by_title=app.state.group_labels_by_title,
             configured_groups=app.state.group_config.groups,
-        )
-        holding_positions = list_holding_strategies(
-            app.state.session_factory, chat_id=chat_id, limit=50
-        )
-        pending_entry_signals = list_pending_strategies(
-            app.state.session_factory,
-            chat_id=chat_id,
-            limit=50,
-            symbol_whitelist_by_chat_id=_symbol_whitelist_by_chat_id(app.state.group_config),
-        )
-        exited_positions = list_exited_strategies(
-            app.state.session_factory, chat_id=chat_id, limit=50
         )
         messages = load_group_messages(
             app.state.session_factory, chat_id=chat_id, limit=50
@@ -741,9 +725,6 @@ def create_web_app(
             {
                 "selected_group": selected_group,
                 "selected_chat_id": chat_id,
-                "holding_positions": holding_positions,
-                "pending_entry_signals": pending_entry_signals,
-                "exited_positions": exited_positions,
                 "messages": messages,
                 "monitor_status": monitor_status,
                 "live_listener_enabled": monitor_status["state"] == "monitoring",

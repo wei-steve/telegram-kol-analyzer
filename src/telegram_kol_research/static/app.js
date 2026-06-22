@@ -740,16 +740,25 @@ function bindGroupLinks() {
     element.addEventListener('click', async () => {
       const chatId = Number(element.dataset.chatId);
       syncSelectedGroupState(chatId, { focus: true });
-      // Load detail panel (messages)
       const detailPanel = document.querySelector('[data-detail-panel]');
-      const nextContent = await fetchDetailPanel(chatId);
+      const strategyPanel = document.querySelector('[data-strategy-panel]');
+      const filterInput = document.querySelector('[data-strategy-filter-input]');
+      const filter = filterInput ? filterInput.value : 'holding';
+      const [nextContent, nextStrategyContent] = await Promise.all([
+        fetchDetailPanel(chatId),
+        strategyPanel ? fetchStrategyMidPanel(chatId, filter) : Promise.resolve(null),
+      ]);
       if (detailPanel && nextContent) {
         detailPanel.innerHTML = '';
         detailPanel.appendChild(nextContent);
         bindDetailPanelControls();
       }
-      // Load strategy mid panel
-      await refreshStrategyMidPanel();
+      if (strategyPanel && nextStrategyContent) {
+        strategyPanel.innerHTML = '';
+        strategyPanel.appendChild(nextStrategyContent);
+        bindStrategyFilterBadges();
+        bindDetailPanelControls();
+      }
       syncSelectedGroupState(chatId);
       setAiStatus('');
       applyGroupPromptToEditor(String(chatId));
