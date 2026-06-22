@@ -6,6 +6,7 @@ import pytest
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_recognition import (
+    _apply_lifecycle_event_decision,
     _ensure_lifecycle_record,
     _result_from_ai_payload,
     _upsert_ai_signal_candidate,
@@ -1068,6 +1069,59 @@ def test_ai_lifecycle_event_explicit_stop_overrides_protection_price(tmp_path, m
     assert candidate.event_type == "position_update"
     assert candidate.stop_loss_text == "1725"
     assert candidate.take_profit_text == "1845"
+
+
+def test_lifecycle_event_ignores_stop_update_after_protective_stop_exit(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=2176,
+            symbol="ETH",
+            side="long",
+            lifecycle_status="exited",
+            exit_reason="stop_loss",
+            signal_at=datetime(2026, 6, 22, 12, 54, 36, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 22, 12, 54, 41, tzinfo=UTC),
+            exited_at=datetime(2026, 6, 22, 14, 20, tzinfo=UTC),
+            entry_price_actual=1760,
+            exit_price_actual=1760,
+            stop_loss=1760,
+            take_profit="1845",
+            management_action="partial_take_profit, move_stop_to_protect",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=2182,
+            posted_at=datetime(2026, 6, 22, 15, 50, 42, tzinfo=UTC),
+            text="设置好止盈止损持仓过夜！止盈位：1845！！！止损位：1725！！！",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.flush()
+
+        applied = _apply_lifecycle_event_decision(
+            session,
+            raw_message,
+            {
+                "event_type": "position_update",
+                "target_lifecycle_id": lifecycle.id,
+                "symbol": "ETH",
+                "side": "long",
+                "stop_loss": "1725",
+                "take_profit": "1845",
+                "management_action": "risk_update",
+                "confidence": 0.94,
+                "reason": "当前消息明确要求设置止盈1845、止损1725并持仓过夜",
+            },
+        )
+
+        assert applied is False
+        assert lifecycle.lifecycle_status == "exited"
+        assert lifecycle.exit_reason == "stop_loss"
+        assert lifecycle.stop_loss == 1760
+        assert lifecycle.exited_at == datetime(2026, 6, 22, 14, 20, tzinfo=UTC)
+        assert lifecycle.management_signal_message_id is None
+        assert session.query(SignalCandidate).count() == 0
 
 
 def test_ai_lifecycle_event_records_scaled_take_profit_percentage_update(tmp_path, monkeypatch):
