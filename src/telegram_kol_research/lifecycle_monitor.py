@@ -25,7 +25,13 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.live_updates import LiveUpdateBroker
-from telegram_kol_research.models import RawMessage, StrategyLifecycle, TradeIdea, utc_now
+from telegram_kol_research.models import (
+    RawMessage,
+    SignalCandidate,
+    StrategyLifecycle,
+    TradeIdea,
+    utc_now,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +84,32 @@ def _parse_single_float(text: str | None) -> float | None:
     if not text:
         return None
     values = re.findall(r"\d+(?:\.\d+)?", text)
+    return float(values[0]) if values else None
+
+
+def _looks_like_market_entry_text(entry_text: str | None) -> bool:
+    if not entry_text:
+        return False
+    normalized = entry_text.lower()
+    return any(
+        keyword in normalized
+        for keyword in (
+            "市价",
+            "现价",
+            "当前价",
+            "地板",
+            "直接",
+            "立即",
+            "马上",
+            "market",
+        )
+    )
+
+
+def _first_entry_reference_price(entry_text: str | None) -> float | None:
+    if not entry_text:
+        return None
+    values = re.findall(r"\d+(?:\.\d+)?", entry_text)
     return float(values[0]) if values else None
 
 
@@ -177,6 +209,7 @@ class LifecycleMonitorConfig:
     max_age_days: int = 7  # how far back to load active signals
     candle_per_page: int = 1000
     http_timeout_seconds: float = 10.0
+    market_entry_tolerance_ratio: float = 0.0015
 
 
 # ── monitor ──────────────────────────────────────────────────────────
@@ -519,6 +552,7 @@ class LifecycleMonitor:
                 .all()
             )
             self._attach_management_event_times(session, signals)
+            self._attach_entry_texts(session, signals)
             return signals
 
     @staticmethod
@@ -548,6 +582,26 @@ class LifecycleMonitor:
                 by_key.get((sig.chat_id, sig.management_signal_message_id)),
             )
 
+    @staticmethod
+    def _attach_entry_texts(session, signals: list[StrategyLifecycle]) -> None:
+        candidate_ids = {
+            sig.signal_candidate_id
+            for sig in signals
+            if sig.signal_candidate_id is not None
+        }
+        if not candidate_ids:
+            return
+        rows = (
+            session.query(SignalCandidate.id, SignalCandidate.entry_text)
+            .filter(SignalCandidate.id.in_(candidate_ids))
+            .all()
+        )
+        by_id = {candidate_id: entry_text for candidate_id, entry_text in rows}
+        for sig in signals:
+            if sig.signal_candidate_id is None:
+                continue
+            setattr(sig, "_entry_text", by_id.get(sig.signal_candidate_id))
+
     # ── contract scan ──────────────────────────────────────────────
 
     async def _scan_contract(
@@ -565,6 +619,12 @@ class LifecycleMonitor:
         if not candles:
             logger.warning("No candles for %s, skipping", contract)
             return []
+        current_price = None
+        if any(
+            _looks_like_market_entry_text(getattr(sig, "_entry_text", None))
+            for sig in signals
+        ):
+            current_price = await self._fetch_current_price(contract)
 
         signals_sorted = sorted(signals, key=lambda s: s.signal_at)
 
@@ -634,6 +694,19 @@ class LifecycleMonitor:
             check = active.get(sig.id)
             if check is None:
                 continue
+            if (
+                check.status == "pending_entry"
+                and self._market_entry_close_enough(sig, current_price)
+            ):
+                check.status = "entered"
+                transitions.append(StateTransition(
+                    signal_id=sig.id,
+                    from_status="pending_entry",
+                    to_status="entered",
+                    trigger_price=current_price,
+                    occurred_at=now,
+                ))
+                continue
             if check.status == "pending_entry" and self._is_expired(sig, now):
                 transitions.append(StateTransition(
                     signal_id=sig.id,
@@ -698,6 +771,30 @@ class LifecycleMonitor:
 
         return all_candles
 
+    async def _fetch_current_price(self, contract: str) -> float | None:
+        try:
+            response = await self._http.get(
+                f"{self._base_url}/api/v4/futures/{self._settle}/tickers",
+                params={"contract": contract},
+                timeout=self._config.http_timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            first = payload[0] if isinstance(payload, list) and payload else payload
+            if not isinstance(first, dict):
+                return None
+            price = first.get("last") or first.get("mark_price") or first.get("index_price")
+            return float(price) if price not in (None, "") else None
+        except httpx.HTTPStatusError as e:
+            logger.warning(
+                "Current price fetch failed for %s: HTTP %s",
+                contract,
+                e.response.status_code,
+            )
+        except Exception:
+            logger.exception("Current price fetch failed for %s", contract)
+        return None
+
     # ── entry / exit checks ────────────────────────────────────────
 
     @staticmethod
@@ -711,6 +808,20 @@ class LifecycleMonitor:
         overlap_low = max(c.low, sig.entry_range_low or 0)
         overlap_high = min(c.high, sig.entry_range_high or 0)
         return (overlap_low + overlap_high) / 2.0
+
+    def _market_entry_close_enough(
+        self, sig: StrategyLifecycle, current_price: float | None
+    ) -> bool:
+        if current_price is None or current_price <= 0:
+            return False
+        entry_text = getattr(sig, "_entry_text", None)
+        if not _looks_like_market_entry_text(entry_text):
+            return False
+        reference_price = _first_entry_reference_price(entry_text)
+        if reference_price is None or reference_price <= 0:
+            return False
+        tolerance = abs(reference_price) * self._config.market_entry_tolerance_ratio
+        return abs(current_price - reference_price) <= tolerance
 
     @staticmethod
     def _has_exit_conditions(sig: StrategyLifecycle) -> bool:

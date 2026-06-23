@@ -1,7 +1,13 @@
+import asyncio
 from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.lifecycle_monitor import LifecycleMonitor, StateTransition
+from telegram_kol_research.lifecycle_monitor import (
+    LifecycleMonitor,
+    LifecycleMonitorConfig,
+    PriceCandle,
+    StateTransition,
+)
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.models import RawMessage, SignalCandidate, StrategyLifecycle, TradeIdea
 
@@ -265,3 +271,77 @@ def test_lifecycle_monitor_rejects_protective_stop_before_management_signal(tmp_
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.exited_at is None
     assert lifecycle.exit_reason is None
+
+
+def test_lifecycle_monitor_enters_market_signal_when_current_price_is_near_reference(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    signal_at = datetime(2026, 6, 23, 7, 30, 25, tzinfo=UTC)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=12944,
+            posted_at=signal_at,
+            text="ETH 做空 1695市价直接地板空 1765挂单 止损1830 止盈1673/1638",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="ETH",
+            side="short",
+            event_type="entry_signal",
+            entry_text="1695市价/1765挂单",
+            stop_loss_text="1830",
+            take_profit_text="1673/1638",
+            parse_source="text_ai",
+            confidence=0.95,
+        )
+        session.add(candidate)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=88,
+            message_id=12944,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=signal_at,
+            entry_range_low=1695,
+            entry_range_high=1765,
+            stop_loss=1830,
+            take_profit="1673/1638",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    class FakeLifecycleMonitor(LifecycleMonitor):
+        async def _fetch_candles_full(self, contract, from_, to_):
+            return [
+                PriceCandle(
+                    opened_at=datetime(2026, 6, 23, 7, 31, tzinfo=UTC),
+                    high=1694,
+                    low=1692,
+                )
+            ]
+
+        async def _fetch_current_price(self, contract):
+            return 1693.2
+
+    monitor = FakeLifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        config=LifecycleMonitorConfig(market_entry_tolerance_ratio=0.0015),
+        now_provider=lambda: datetime(2026, 6, 23, 7, 32, tzinfo=UTC),
+    )
+
+    transitions = asyncio.run(monitor.run_once())
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert transitions[0]["from"] == "pending_entry"
+    assert transitions[0]["to"] == "entered"
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.entry_price_actual == 1693.2
+    assert lifecycle.entered_at == datetime(2026, 6, 23, 7, 32)
