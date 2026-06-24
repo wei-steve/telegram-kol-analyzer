@@ -101,7 +101,31 @@ def _looks_like_market_entry_text(entry_text: str | None) -> bool:
             "直接",
             "立即",
             "马上",
+            "市价进",
+            "进场灵活",
+            "灵活进场",
+            "不必踩点",
+            "不用踩点",
+            "无需踩点",
+            "进场零花",
             "market",
+        )
+    )
+
+
+def _looks_like_flexible_entry_text(entry_text: str | None) -> bool:
+    if not entry_text:
+        return False
+    normalized = entry_text.lower()
+    return any(
+        keyword in normalized
+        for keyword in (
+            "进场灵活",
+            "灵活进场",
+            "不必踩点",
+            "不用踩点",
+            "无需踩点",
+            "进场零花",
         )
     )
 
@@ -589,18 +613,39 @@ class LifecycleMonitor:
             for sig in signals
             if sig.signal_candidate_id is not None
         }
-        if not candidate_ids:
-            return
-        rows = (
-            session.query(SignalCandidate.id, SignalCandidate.entry_text)
-            .filter(SignalCandidate.id.in_(candidate_ids))
+        by_id: dict[int, str | None] = {}
+        if candidate_ids:
+            rows = (
+                session.query(SignalCandidate.id, SignalCandidate.entry_text)
+                .filter(SignalCandidate.id.in_(candidate_ids))
+                .all()
+            )
+            by_id = {candidate_id: entry_text for candidate_id, entry_text in rows}
+
+        message_keys = {(sig.chat_id, sig.message_id) for sig in signals}
+        chat_ids = {chat_id for chat_id, _ in message_keys}
+        message_ids = {message_id for _, message_id in message_keys}
+        message_rows = (
+            session.query(RawMessage)
+            .filter(RawMessage.chat_id.in_(chat_ids))
+            .filter(RawMessage.message_id.in_(message_ids))
             .all()
+            if message_keys
+            else []
         )
-        by_id = {candidate_id: entry_text for candidate_id, entry_text in rows}
+        message_text_by_key = {
+            (row.chat_id, row.message_id): row.text for row in message_rows
+        }
         for sig in signals:
             if sig.signal_candidate_id is None:
-                continue
-            setattr(sig, "_entry_text", by_id.get(sig.signal_candidate_id))
+                setattr(sig, "_entry_text", None)
+            else:
+                setattr(sig, "_entry_text", by_id.get(sig.signal_candidate_id))
+            setattr(
+                sig,
+                "_original_message_text",
+                message_text_by_key.get((sig.chat_id, sig.message_id)),
+            )
 
     # ── contract scan ──────────────────────────────────────────────
 
@@ -621,7 +666,7 @@ class LifecycleMonitor:
             return []
         current_price = None
         if any(
-            _looks_like_market_entry_text(getattr(sig, "_entry_text", None))
+            self._looks_like_market_entry_signal(sig)
             for sig in signals
         ):
             current_price = await self._fetch_current_price(contract)
@@ -814,14 +859,38 @@ class LifecycleMonitor:
     ) -> bool:
         if current_price is None or current_price <= 0:
             return False
-        entry_text = getattr(sig, "_entry_text", None)
-        if not _looks_like_market_entry_text(entry_text):
+        if not self._looks_like_market_entry_signal(sig):
             return False
+        original_text = getattr(sig, "_original_message_text", None)
+        entry_text = getattr(sig, "_entry_text", None)
+        combined_text = " ".join(str(part or "") for part in (entry_text, original_text))
+        if (
+            _looks_like_flexible_entry_text(combined_text)
+            and sig.entry_range_low is not None
+            and sig.entry_range_high is not None
+        ):
+            lower, upper = sorted((sig.entry_range_low, sig.entry_range_high))
+            tolerance = min(abs(lower), abs(upper)) * self._config.market_entry_tolerance_ratio
+            return lower - tolerance <= current_price <= upper + tolerance
         reference_price = _first_entry_reference_price(entry_text)
+        if reference_price is None:
+            reference_price = _first_entry_reference_price(original_text)
         if reference_price is None or reference_price <= 0:
             return False
         tolerance = abs(reference_price) * self._config.market_entry_tolerance_ratio
         return abs(current_price - reference_price) <= tolerance
+
+    @staticmethod
+    def _looks_like_market_entry_signal(sig: StrategyLifecycle) -> bool:
+        return _looks_like_market_entry_text(
+            " ".join(
+                str(part or "")
+                for part in (
+                    getattr(sig, "_entry_text", None),
+                    getattr(sig, "_original_message_text", None),
+                )
+            )
+        )
 
     @staticmethod
     def _has_exit_conditions(sig: StrategyLifecycle) -> bool:

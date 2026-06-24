@@ -345,3 +345,80 @@ def test_lifecycle_monitor_enters_market_signal_when_current_price_is_near_refer
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.entry_price_actual == 1693.2
     assert lifecycle.entered_at == datetime(2026, 6, 23, 7, 32)
+
+
+def test_lifecycle_monitor_enters_flexible_entry_range_at_current_price(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    signal_at = datetime(2026, 6, 24, 7, 25, 10, tzinfo=UTC)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=3833,
+            posted_at=signal_at,
+            text=(
+                "币姐\nEth\n方向：空\n建仓：1675-1700\n止损：1720\n"
+                "止盈：1655-1635-1615\n进场灵活，不必踩点。轻仓，太横盘了，怕突然来一下"
+            ),
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="ETH",
+            side="short",
+            event_type="entry_signal",
+            entry_text="1675-1700",
+            stop_loss_text="1720",
+            take_profit_text="1655/1635/1615",
+            parse_source="text_ai",
+            confidence=0.95,
+        )
+        session.add(candidate)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=88,
+            message_id=3833,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=signal_at,
+            entry_range_low=1675,
+            entry_range_high=1700,
+            stop_loss=1720,
+            take_profit="1655/1635/1615",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    class FakeLifecycleMonitor(LifecycleMonitor):
+        async def _fetch_candles_full(self, contract, from_, to_):
+            return [
+                PriceCandle(
+                    opened_at=datetime(2026, 6, 24, 7, 26, tzinfo=UTC),
+                    high=1710,
+                    low=1705,
+                )
+            ]
+
+        async def _fetch_current_price(self, contract):
+            return 1694.0
+
+    monitor = FakeLifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        config=LifecycleMonitorConfig(market_entry_tolerance_ratio=0.0015),
+        now_provider=lambda: datetime(2026, 6, 24, 7, 27, tzinfo=UTC),
+    )
+
+    transitions = asyncio.run(monitor.run_once())
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert transitions[0]["from"] == "pending_entry"
+    assert transitions[0]["to"] == "entered"
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.entry_price_actual == 1694.0
+    assert lifecycle.entered_at == datetime(2026, 6, 24, 7, 27)
