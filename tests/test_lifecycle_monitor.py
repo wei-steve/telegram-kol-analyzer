@@ -343,8 +343,8 @@ def test_lifecycle_monitor_enters_market_signal_when_current_price_is_near_refer
     assert transitions[0]["from"] == "pending_entry"
     assert transitions[0]["to"] == "entered"
     assert lifecycle.lifecycle_status == "entered"
-    assert lifecycle.entry_price_actual == 1693.2
-    assert lifecycle.entered_at == datetime(2026, 6, 23, 7, 32)
+    assert lifecycle.entry_price_actual == 1693.22875
+    assert lifecycle.entered_at == datetime(2026, 6, 23, 7, 31)
 
 
 def test_lifecycle_monitor_enters_flexible_entry_range_at_current_price(tmp_path):
@@ -397,13 +397,13 @@ def test_lifecycle_monitor_enters_flexible_entry_range_at_current_price(tmp_path
             return [
                 PriceCandle(
                     opened_at=datetime(2026, 6, 24, 7, 26, tzinfo=UTC),
-                    high=1710,
-                    low=1705,
+                    high=1673.8,
+                    low=1672.0,
                 )
             ]
 
         async def _fetch_current_price(self, contract):
-            return 1694.0
+            return 1670.0
 
     monitor = FakeLifecycleMonitor(
         session_factory,
@@ -420,5 +420,5 @@ def test_lifecycle_monitor_enters_flexible_entry_range_at_current_price(tmp_path
     assert transitions[0]["from"] == "pending_entry"
     assert transitions[0]["to"] == "entered"
     assert lifecycle.lifecycle_status == "entered"
-    assert lifecycle.entry_price_actual == 1694.0
-    assert lifecycle.entered_at == datetime(2026, 6, 24, 7, 27)
+    assert lifecycle.entry_price_actual == 1673.14375
+    assert lifecycle.entered_at == datetime(2026, 6, 24, 7, 26)

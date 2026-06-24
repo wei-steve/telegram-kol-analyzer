@@ -720,6 +720,21 @@ class LifecycleMonitor:
                             trigger_price=check.entry_price,
                             occurred_at=ct,
                         ))
+                    elif self._market_entry_candle_triggered(sig, c):
+                        check.status = "entered"
+                        check.entry_triggered_at = ct
+                        check.entry_price = self._resolve_market_entry_price(sig, c)
+
+                        if not self._has_exit_conditions(sig):
+                            check.status = "done"
+
+                        transitions.append(StateTransition(
+                            signal_id=sig.id,
+                            from_status="pending_entry",
+                            to_status="entered",
+                            trigger_price=check.entry_price,
+                            occurred_at=ct,
+                        ))
 
                 elif check.status == "entered":
                     exit_result = self._check_exit(sig, c)
@@ -859,6 +874,24 @@ class LifecycleMonitor:
     ) -> bool:
         if current_price is None or current_price <= 0:
             return False
+        return self._price_interval_overlaps_market_entry(
+            sig,
+            low=current_price,
+            high=current_price,
+        )
+
+    def _market_entry_candle_triggered(
+        self, sig: StrategyLifecycle, c: PriceCandle
+    ) -> bool:
+        return self._price_interval_overlaps_market_entry(sig, low=c.low, high=c.high)
+
+    def _price_interval_overlaps_market_entry(
+        self,
+        sig: StrategyLifecycle,
+        *,
+        low: float,
+        high: float,
+    ) -> bool:
         if not self._looks_like_market_entry_signal(sig):
             return False
         original_text = getattr(sig, "_original_message_text", None)
@@ -871,14 +904,38 @@ class LifecycleMonitor:
         ):
             lower, upper = sorted((sig.entry_range_low, sig.entry_range_high))
             tolerance = min(abs(lower), abs(upper)) * self._config.market_entry_tolerance_ratio
-            return lower - tolerance <= current_price <= upper + tolerance
+            return low <= upper + tolerance and high >= lower - tolerance
         reference_price = _first_entry_reference_price(entry_text)
         if reference_price is None:
             reference_price = _first_entry_reference_price(original_text)
         if reference_price is None or reference_price <= 0:
             return False
         tolerance = abs(reference_price) * self._config.market_entry_tolerance_ratio
-        return abs(current_price - reference_price) <= tolerance
+        return low <= reference_price + tolerance and high >= reference_price - tolerance
+
+    def _resolve_market_entry_price(self, sig: StrategyLifecycle, c: PriceCandle) -> float:
+        original_text = getattr(sig, "_original_message_text", None)
+        entry_text = getattr(sig, "_entry_text", None)
+        combined_text = " ".join(str(part or "") for part in (entry_text, original_text))
+        if (
+            _looks_like_flexible_entry_text(combined_text)
+            and sig.entry_range_low is not None
+            and sig.entry_range_high is not None
+        ):
+            lower, upper = sorted((sig.entry_range_low, sig.entry_range_high))
+            tolerance = min(abs(lower), abs(upper)) * self._config.market_entry_tolerance_ratio
+            overlap_low = max(c.low, lower - tolerance)
+            overlap_high = min(c.high, upper + tolerance)
+            return (overlap_low + overlap_high) / 2.0
+        reference_price = _first_entry_reference_price(entry_text)
+        if reference_price is None:
+            reference_price = _first_entry_reference_price(original_text)
+        if reference_price is None:
+            return (c.low + c.high) / 2.0
+        tolerance = abs(reference_price) * self._config.market_entry_tolerance_ratio
+        overlap_low = max(c.low, reference_price - tolerance)
+        overlap_high = min(c.high, reference_price + tolerance)
+        return (overlap_low + overlap_high) / 2.0
 
     @staticmethod
     def _looks_like_market_entry_signal(sig: StrategyLifecycle) -> bool:
