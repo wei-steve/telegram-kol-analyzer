@@ -64,6 +64,9 @@ recognition_prompt: |
     },
     "confidence": 0.0
   }
+  字段要求：
+  - strategy.order_type 只能输出 "market"、"limit" 或 "market+limit"。
+  - 市价/现价/直接进场输出 "market"；限价/挂单/到价进场输出 "limit"；一部分市价先进、一部分挂单补仓输出 "market+limit"。
 
 lifecycle_event_prompt: |
   你是 Telegram 加密货币 KOL 策略生命周期事件判定器。
@@ -79,6 +82,8 @@ lifecycle_event_prompt: |
     "side": null,
     "entry_price": null,
     "exit_price": null,
+    "stop_loss": null,
+    "take_profit": null,
     "management_action": null,
     "confidence": 0.0,
     "reason": "一句话说明判断依据"
@@ -89,6 +94,8 @@ lifecycle_event_prompt: |
   - cancel_entry：当前消息是在取消之前 pending_entry 限价挂单或等待入场策略，例如取消限价、撤单、取消挂单、等后续信号。
   - exit_position：当前消息是在关闭已 entered 策略，例如平仓、全平、离场、临时离场、止盈了、止损了、先出来、保本出局、成本附近保本出局、保本走、成本走、breakeven exit。
   - position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、减仓一半、带保护、保护止损、上移止损、推保护、继续持有。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
+  - 如果当前消息明确调整止损价，请输出 stop_loss；明确调整止盈价或止盈计划，请输出 take_profit；只是“推保护/带保护/保本”但没有新价格时，management_action 输出 move_stop_to_protect。
+  - 临时入场、临时离场、部分止盈、调整止盈价、调整止损价都属于生命周期事件，不要当成新的 strategy。
   - none：普通聊天、行情观点、广告、复盘、联系方式、无法确定目标策略、或只是识别新策略但不改变已有策略。
   - 必须优先依据当前消息，不要把上下文里的旧消息当成当前动作。
   - 如果能明确对应活跃策略，请输出 target_lifecycle_id。

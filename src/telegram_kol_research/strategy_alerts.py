@@ -50,6 +50,8 @@ class StrategyAlertEvent:
     reason_short: str
     symbol: str | None
     side: str | None
+    order_type: str | None
+    management_action: str | None
     entry_price: str | None
     take_profit: str | None
     stop_loss: str | None
@@ -226,24 +228,36 @@ def format_structured_strategy_alert_message(
         (event.side or "").lower(),
         event.side or "-",
     )
+    order_type_text = _format_order_type_label(event.order_type)
+    management_action_text = _format_management_action_label(event.management_action)
+    confidence_text = f"{event.confidence:.2f}" if event.confidence else "-"
     text = event.original_text.strip() or "-"
-    return "\n".join(
+    lines = [
+        "【KOL策略提醒】",
+        f"信号类型: {event.alert_type}",
+        f"策略类别: {event.strategy_kind}",
+        f"群组: {chat_title}",
+        f"时间: {time_text}",
+        "",
+        f"交易对: {event.symbol or '-'}",
+        f"方向: {side_text}",
+        f"入场方式: {order_type_text}",
+        f"入场价格: {event.entry_price or '-'}",
+        f"止盈价格: {event.take_profit or '-'}",
+        f"止损价格: {event.stop_loss or '-'}",
+    ]
+    if management_action_text != "-":
+        lines.append(f"管理动作: {management_action_text}")
+    lines.extend(
         [
-            "【KOL策略提醒】",
-            f"类型: {event.alert_type}",
-            f"群组: {chat_title}",
-            f"时间: {time_text}",
-            f"交易对: {event.symbol or '-'}",
-            f"方向: {side_text}",
-            f"入场价格: {event.entry_price or '-'}",
-            f"止盈价格: {event.take_profit or '-'}",
-            f"止损价格: {event.stop_loss or '-'}",
+            f"置信度: {confidence_text}",
             f"消息ID: {message_id}",
             "",
             "原文:",
             text,
         ]
     )
+    return "\n".join(lines)
 
 
 def build_strategy_alert_event_from_recognition(
@@ -262,13 +276,26 @@ def build_strategy_alert_event_from_recognition(
 
     event_type = candidate.event_type or ""
     parse_source = candidate.parse_source or ""
+    ai_payload = getattr(recognition_result, "ai_payload", None) or {}
+    strategy_payload = ai_payload.get("strategy") if isinstance(ai_payload.get("strategy"), dict) else {}
+    order_type = _resolve_order_type(
+        strategy_payload.get("order_type") if strategy_payload else None,
+        candidate.entry_text,
+        event_type=event_type,
+        parse_source=parse_source,
+    )
+    management_action = lifecycle.management_action if lifecycle is not None else None
     strategy_kind = _strategy_kind_for_candidate(candidate, lifecycle)
-    alert_type = _alert_type_for_candidate(candidate, lifecycle)
+    alert_type = _alert_type_for_candidate(
+        candidate,
+        lifecycle,
+        order_type=order_type,
+        management_action=management_action,
+    )
     if alert_type is None:
         return None
 
     confidence = float(candidate.confidence or 0.0)
-    ai_payload = getattr(recognition_result, "ai_payload", None) or {}
     reason = str(ai_payload.get("reason") or getattr(recognition_result, "reason", None) or "").strip()
 
     entry_price = candidate.entry_text
@@ -296,6 +323,8 @@ def build_strategy_alert_event_from_recognition(
         reason_short=reason,
         symbol=candidate.symbol or (lifecycle.symbol if lifecycle is not None else None),
         side=candidate.side or (lifecycle.side if lifecycle is not None else None),
+        order_type=order_type,
+        management_action=management_action,
         entry_price=entry_price,
         take_profit=take_profit,
         stop_loss=stop_loss,
@@ -588,17 +617,22 @@ def _find_related_lifecycle(
 def _alert_type_for_candidate(
     candidate: SignalCandidate,
     lifecycle: StrategyLifecycle | None,
+    *,
+    order_type: str | None,
+    management_action: str | None,
 ) -> str | None:
     if candidate.event_type == "entry_signal":
         if candidate.parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
-            return "入场"
-        return "新策略"
+            return "临时入场"
+        return _entry_alert_type(order_type)
     if candidate.event_type == "close_signal":
         if lifecycle is not None and lifecycle.exit_reason == "cancelled":
             return "取消挂单"
-        return "离场"
+        return "临时离场"
     if candidate.event_type == "position_update":
-        return "突发消息"
+        return _management_alert_type(management_action)
+    if candidate.event_type == "strategy_correction":
+        return "策略参数调整"
     return None
 
 
@@ -629,6 +663,92 @@ def _format_number(value: float | None) -> str | None:
     if value is None:
         return None
     return f"{value:g}"
+
+
+def _entry_alert_type(order_type: str | None) -> str:
+    if order_type == "market":
+        return "市价入场"
+    if order_type == "market+limit":
+        return "市价+限价入场"
+    if order_type == "limit":
+        return "限价入场"
+    return "策略入场"
+
+
+def _management_alert_type(management_action: str | None) -> str:
+    normalized = (management_action or "").strip().lower()
+    if "partial_take_profit" in normalized:
+        return "部分止盈"
+    if "move_stop_to_protect" in normalized:
+        return "临时调整止损"
+    if "risk_update" in normalized:
+        return "调整止盈止损"
+    if "hold_update" in normalized:
+        return "持仓更新"
+    if "strategy_correction" in normalized:
+        return "策略参数调整"
+    return "仓位管理"
+
+
+def _format_management_action_label(management_action: str | None) -> str:
+    if not management_action:
+        return "-"
+    label = _management_alert_type(management_action)
+    return f"{label} ({management_action})"
+
+
+def _format_order_type_label(order_type: str | None) -> str:
+    return {
+        "market": "市价",
+        "limit": "限价",
+        "market+limit": "市价+限价",
+    }.get(order_type or "", "-")
+
+
+def _resolve_order_type(
+    raw_order_type: Any,
+    entry_text: str | None,
+    *,
+    event_type: str,
+    parse_source: str,
+) -> str | None:
+    normalized = _normalize_order_type(raw_order_type)
+    if normalized is not None:
+        return normalized
+    if event_type == "entry_signal" and parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
+        return "market"
+    return _infer_order_type_from_entry(entry_text)
+
+
+def _normalize_order_type(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip().lower().replace("_", "-")
+    text = text.replace(" ", "")
+    if any(token in text for token in ["market+limit", "market/limit", "市价+限价", "市价/限价"]):
+        return "market+limit"
+    if any(token in text for token in ["market", "市价", "现价", "直接"]):
+        if any(token in text for token in ["limit", "挂单", "限价"]):
+            return "market+limit"
+        return "market"
+    if any(token in text for token in ["limit", "挂单", "限价"]):
+        return "limit"
+    return None
+
+
+def _infer_order_type_from_entry(entry_text: str | None) -> str | None:
+    if not entry_text:
+        return None
+    text = entry_text.strip().lower()
+    has_market = any(token in text for token in ["market", "市价", "现价", "直接"])
+    has_limit = any(token in text for token in ["limit", "挂单", "限价"])
+    if has_market and has_limit:
+        return "market+limit"
+    if has_market:
+        return "market"
+    if has_limit or "-" in text or "/" in text:
+        return "limit"
+    return None
 
 
 async def _retry_async(callback: Callable[[], Awaitable[Any]], *, attempts: int) -> Any:

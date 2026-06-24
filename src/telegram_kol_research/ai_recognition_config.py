@@ -72,7 +72,8 @@ NORMALIZED_STRATEGY_OUTPUT_INSTRUCTIONS = """
 - strategy.symbol 输出大写币种简称，例如 "BTC"、"ETH"。
 - strategy.side 只能输出 "long" 或 "short"；中文做多/开多统一为 "long"，做空/开空统一为 "short"。
 - strategy.entry 必须是字符串。单价保留原意，例如 "62400附近"；区间入场统一为 "62000-62500"；分批/多档入场用 "/" 分隔。
-- 如果原文同时出现市价/现价入场和具体入场点位，例如 "Eth(市价进场)" 与 "进场点位：1730附近"，strategy.entry 必须输出 "市价进场/1730附近"，不能只输出 "市价进场"；strategy.order_type 可单独输出 "market" 或 "market+limit"。
+- strategy.order_type 只能输出 "market"、"limit" 或 "market+limit"。市价/现价/直接进场输出 "market"；限价/挂单/到价进场输出 "limit"；一部分市价先进、一部分挂单补仓输出 "market+limit"。
+- 如果原文同时出现市价/现价入场和具体入场点位，例如 "Eth(市价进场)" 与 "进场点位：1730附近"，strategy.entry 必须输出 "市价进场/1730附近"，不能只输出 "市价进场"；strategy.order_type 必须输出 "market" 或 "market+limit"。
 - strategy.stop_loss 必须是字符串。只输出止损价或无效价本身，不要输出解释性长句。
 - strategy.take_profit 必须是字符串。单个止盈输出单价；分批止盈统一用 "/" 分隔，例如 "63600/64800/66000"。
 - 不要把 entry、stop_loss、take_profit 输出成数组或对象；不要补全原文没有给出的价格。
@@ -93,6 +94,8 @@ DEFAULT_LIFECYCLE_EVENT_PROMPT = """
   "side": null,
   "entry_price": null,
   "exit_price": null,
+  "stop_loss": null,
+  "take_profit": null,
   "management_action": null,
   "confidence": 0.0,
   "reason": "一句话说明判断依据"
@@ -103,6 +106,8 @@ DEFAULT_LIFECYCLE_EVENT_PROMPT = """
 - cancel_entry：当前消息是在取消之前 pending_entry 限价挂单或等待入场策略，例如取消限价、撤单、取消挂单、等后续信号。
 - exit_position：当前消息是在关闭已 entered 策略，例如平仓、全平、离场、临时离场、止盈了、止损了、先出来、保本出局、成本附近保本出局、保本走、成本走、breakeven exit。
 - position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、分批止盈30%、按比例止盈、减仓一半、减仓30%、持仓收益达到100%后分批止盈、带保护、保护止损、上移止损、推保护、继续持有。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
+- 如果当前消息明确调整止损价，请输出 stop_loss；明确调整止盈价或止盈计划，请输出 take_profit；只是“推保护/带保护/保本”但没有新价格时，management_action 输出 move_stop_to_protect。
+- 临时入场、临时离场、部分止盈、调整止盈价、调整止损价都属于生命周期事件，不要当成新的 strategy。
 - none：普通聊天、行情观点、广告、复盘、联系方式、无法确定目标策略、或只是识别新策略但不改变已有策略。
 - 必须优先依据当前消息，不要把上下文里的旧消息当成当前动作。
 - 如果能明确对应活跃策略，请输出 target_lifecycle_id。

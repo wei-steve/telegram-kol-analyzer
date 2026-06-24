@@ -314,25 +314,19 @@ def test_process_strategy_alert_uses_recognition_candidate_for_unified_strategy_
     )
 
     assert result["status"] == "sent"
-    assert sent_messages == [
-        "\n".join(
-            [
-                "【KOL策略提醒】",
-                "类型: 新策略",
-                "群组: VIP BTC Room",
-                "时间: 2026-05-10 16:00:00 Asia/Shanghai",
-                "交易对: BTC",
-                "方向: 多",
-                "入场价格: 68000-68200",
-                "止盈价格: 69000/70000",
-                "止损价格: 67500",
-                "消息ID: 55",
-                "",
-                "原文:",
-                "BTC long 68000-68200 SL 67500 TP 69000/70000",
-            ]
-        )
-    ]
+    assert len(sent_messages) == 1
+    assert "【KOL策略提醒】" in sent_messages[0]
+    assert "信号类型: 限价入场" in sent_messages[0]
+    assert "策略类别: entry" in sent_messages[0]
+    assert "群组: VIP BTC Room" in sent_messages[0]
+    assert "交易对: BTC" in sent_messages[0]
+    assert "方向: 多" in sent_messages[0]
+    assert "入场方式: 限价" in sent_messages[0]
+    assert "入场价格: 68000-68200" in sent_messages[0]
+    assert "止盈价格: 69000/70000" in sent_messages[0]
+    assert "止损价格: 67500" in sent_messages[0]
+    assert "置信度: 0.91" in sent_messages[0]
+    assert "原文:\nBTC long 68000-68200 SL 67500 TP 69000/70000" in sent_messages[0]
     with session_factory() as session:
         stored = session.query(StrategyAlert).one()
     assert stored.status == "sent"
@@ -342,13 +336,14 @@ def test_process_strategy_alert_uses_recognition_candidate_for_unified_strategy_
 
 def test_process_strategy_alert_formats_lifecycle_events(tmp_path):
     cases = [
-        ("entry_signal", "lifecycle_ai", "entered", None, "入场", "entry"),
-        ("close_signal", "lifecycle_ai", "exited", "kol_signal", "离场", "exit"),
-        ("close_signal", "lifecycle_ai", "exited", "cancelled", "取消挂单", "cancel_entry"),
-        ("position_update", "lifecycle_ai", "entered", None, "突发消息", "position_update"),
+        ("entry_signal", "lifecycle_ai", "entered", None, None, "临时入场", "entry"),
+        ("close_signal", "lifecycle_ai", "exited", "kol_signal", None, "临时离场", "exit"),
+        ("close_signal", "lifecycle_ai", "exited", "cancelled", None, "取消挂单", "cancel_entry"),
+        ("position_update", "lifecycle_ai", "entered", None, "partial_take_profit", "部分止盈", "position_update"),
+        ("strategy_correction", "text_ai", "entered", None, "strategy_correction", "策略参数调整", "strategy_correction"),
     ]
 
-    for index, (event_type, parse_source, lifecycle_status, exit_reason, alert_type, strategy_kind) in enumerate(cases, start=1):
+    for index, (event_type, parse_source, lifecycle_status, exit_reason, management_action, alert_type, strategy_kind) in enumerate(cases, start=1):
         session_factory = create_session_factory(tmp_path / f"research_{index}.db")
         record = _record(text=f"event {index}")
         record.message_id = 100 + index
@@ -382,12 +377,13 @@ def test_process_strategy_alert_formats_lifecycle_events(tmp_path):
                 take_profit="2200",
                 entry_price_actual=2330,
             )
-            if alert_type == "入场":
+            if event_type == "entry_signal":
                 lifecycle.entry_signal_message_id = record.message_id
-            elif alert_type in {"离场", "取消挂单"}:
+            elif event_type == "close_signal":
                 lifecycle.exit_signal_message_id = record.message_id
             else:
                 lifecycle.management_signal_message_id = record.message_id
+                lifecycle.management_action = management_action
             session.add(lifecycle)
             session.commit()
         sent_messages: list[str] = []
@@ -412,7 +408,7 @@ def test_process_strategy_alert_formats_lifecycle_events(tmp_path):
         )
 
         assert result["status"] == "sent"
-        assert f"类型: {alert_type}" in sent_messages[0]
+        assert f"信号类型: {alert_type}" in sent_messages[0]
         assert "方向: 空" in sent_messages[0]
         assert "交易对: ETH" in sent_messages[0]
         with session_factory() as session:
