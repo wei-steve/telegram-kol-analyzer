@@ -853,6 +853,10 @@ def _apply_lifecycle_event_decision(
         management_action = str(decision.get("management_action") or "").strip() or "position_update"
         management_note = str(decision.get("reason") or "").strip() or None
         explicit_stop_loss = _number_or_none(decision.get("stop_loss"))
+        if explicit_stop_loss is None:
+            explicit_stop_loss = _extract_explicit_stop_loss_from_management_text(
+                raw_message.text
+            )
         explicit_take_profit = _normalize_strategy_text(
             decision.get("take_profit"),
             separator="/",
@@ -930,6 +934,45 @@ def _protective_stop_price(lifecycle: StrategyLifecycle) -> float | None:
         return lifecycle.entry_range_low
     if lifecycle.entry_range_high is not None:
         return lifecycle.entry_range_high
+    return None
+
+
+def _extract_explicit_stop_loss_from_management_text(text: str | None) -> float | None:
+    if not text:
+        return None
+    normalized = str(text)
+    lowered = normalized.lower()
+    has_stop_term = (
+        any(term in normalized for term in ("止损", "损位", "保护价"))
+        or "stop" in lowered
+        or "sl" in lowered
+    )
+    has_adjust_term = any(
+        term in normalized
+        for term in (
+            "修改",
+            "改",
+            "调整",
+            "移",
+            "推",
+            "上移",
+            "下移",
+            "设置",
+            "设",
+            "放",
+        )
+    ) or any(term in lowered for term in ("move", "adjust", "set"))
+    if not has_stop_term or not has_adjust_term:
+        return None
+
+    patterns = [
+        r"(?:止损|损位|保护价|stop\s*loss|stop|sl)[^0-9]{0,20}([0-9]+(?:\.\d+)?)",
+        r"([0-9]+(?:\.\d+)?)[^0-9]{0,8}(?:附近)?[^0-9]{0,12}(?:止损|损位|保护价)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            return float(match.group(1))
     return None
 
 

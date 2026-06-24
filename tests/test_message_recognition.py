@@ -1071,6 +1071,77 @@ def test_ai_lifecycle_event_explicit_stop_overrides_protection_price(tmp_path, m
     assert candidate.take_profit_text == "1845"
 
 
+def test_ai_lifecycle_event_extracts_explicit_stop_from_management_text(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=9118,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 23, 8, 20, 54, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 23, 8, 24, tzinfo=UTC),
+            entry_price_actual=62214,
+            stop_loss=62214,
+            take_profit="66500",
+            management_action="partial_take_profit, move_stop_to_protect",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9123,
+            posted_at=datetime(2026, 6, 23, 16, 11, 37, tzinfo=UTC),
+            text="目前已经东八区凌晨12点，做短线收益700点可以全部止盈出局，剩余仓位过夜持仓做好成本保护，止损修改入场价62000附近。",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "position_update",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "BTC",
+            "side": "long",
+            "entry_price": None,
+            "exit_price": None,
+            "stop_loss": None,
+            "take_profit": None,
+            "management_action": "risk_update",
+            "confidence": 0.94,
+            "reason": "当前消息要求剩余仓位继续持有并做成本保护，属于持仓风险更新。",
+        },
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.parse_source == "lifecycle_ai"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.management_signal_message_id == 9123
+    assert lifecycle.management_action == "risk_update"
+    assert lifecycle.stop_loss == 62000
+    assert candidate.event_type == "position_update"
+    assert candidate.stop_loss_text == "62000"
+
+
 def test_lifecycle_event_ignores_stop_update_after_protective_stop_exit(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
