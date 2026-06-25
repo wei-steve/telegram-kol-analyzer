@@ -6,7 +6,6 @@
   data-latest-message-id="{{ messages[0].message_id if messages else 0 }}"
 >
   <div class="messages-panel-header" data-message-sticky-header>
-    <h2>{{ selected_group.title if selected_group else "Messages" }}</h2>
     <div class="message-sync-meta">
       <span>
         最后入库时间：{{ selected_group.last_posted_at.strftime('%Y-%m-%d %H:%M') if selected_group and selected_group.last_posted_at else '暂无数据' }}
