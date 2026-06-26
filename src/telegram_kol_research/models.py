@@ -34,6 +34,9 @@ class Source(Base):
 
 class RawMessage(Base):
     __tablename__ = "raw_messages"
+    __table_args__ = (
+        Index("ix_raw_messages_chat_posted_message", "chat_id", "posted_at", "message_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chat_id: Mapped[int] = mapped_column(Integer, index=True)
@@ -297,6 +300,9 @@ class StrategyLifecycle(Base):
         ),
         Index("ix_strategy_lifecycles_status", "lifecycle_status"),
         Index("ix_strategy_lifecycles_symbol", "symbol"),
+        Index("ix_strategy_lifecycles_chat_status_signal", "chat_id", "lifecycle_status", "signal_at"),
+        Index("ix_strategy_lifecycles_chat_status_entered", "chat_id", "lifecycle_status", "entered_at"),
+        Index("ix_strategy_lifecycles_chat_status_exited", "chat_id", "lifecycle_status", "exited_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

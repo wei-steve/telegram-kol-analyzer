@@ -81,6 +81,59 @@ def test_message_recognition_api_updates_message_result(tmp_path):
     assert "BTC long" in refreshed.text
 
 
+def test_strategy_mid_panel_loads_only_visible_strategy_list(tmp_path, monkeypatch):
+    calls: list[str] = []
+
+    def fake_holding(*args, **kwargs):
+        calls.append("holding")
+        return [
+            {
+                "chat_id": 88,
+                "symbol": "BTC",
+                "side": "long",
+                "entry_text": "68000",
+                "stop_loss_text": "67500",
+                "take_profit_text": "69000",
+            }
+        ]
+
+    def fake_pending(*args, **kwargs):
+        calls.append("pending")
+        return []
+
+    def fake_exited(*args, **kwargs):
+        calls.append("exited")
+        return []
+
+    monkeypatch.setattr("telegram_kol_research.web_app.list_holding_strategies", fake_holding)
+    monkeypatch.setattr("telegram_kol_research.web_app.list_pending_strategies", fake_pending)
+    monkeypatch.setattr("telegram_kol_research.web_app.list_exited_strategies", fake_exited)
+    monkeypatch.setattr(
+        "telegram_kol_research.web_app.load_lifecycle_counts",
+        lambda *args, **kwargs: {"entered": 1, "pending_entry": 0, "exited": 0},
+    )
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    client = TestClient(app)
+
+    response = client.get("/groups/88/strategy-mid-panel?filter=holding")
+
+    assert response.status_code == 200
+    assert calls == ["holding"]
+
+    calls.clear()
+    response = client.get("/groups/88/strategy-mid-panel?filter=exited")
+
+    assert response.status_code == 200
+    assert calls == ["exited"]
+
+    calls.clear()
+    response = client.get("/groups/88/strategy-mid-panel?filter=pending")
+
+    assert response.status_code == 200
+    assert calls == ["pending"]
+
+
 def test_ai_recognition_config_api_saves_prompt(tmp_path):
     config_path = tmp_path / "ai_recognition.yaml"
     app = create_web_app(

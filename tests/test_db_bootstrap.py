@@ -133,3 +133,25 @@ def test_database_bootstrap_enables_sqlite_busy_timeout(tmp_path):
         busy_timeout = session.execute(text("PRAGMA busy_timeout")).scalar_one()
 
     assert busy_timeout >= 30000
+
+
+def test_database_bootstrap_backfills_web_performance_indexes(tmp_path):
+    database_path = tmp_path / "research.db"
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    raw_message_indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(raw_messages)").fetchall()
+    }
+    lifecycle_indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(strategy_lifecycles)").fetchall()
+    }
+    conn.close()
+
+    assert "ix_raw_messages_chat_posted_message" in raw_message_indexes
+    assert "ix_strategy_lifecycles_chat_status_signal" in lifecycle_indexes
+    assert "ix_strategy_lifecycles_chat_status_entered" in lifecycle_indexes
+    assert "ix_strategy_lifecycles_chat_status_exited" in lifecycle_indexes

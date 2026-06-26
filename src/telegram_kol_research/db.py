@@ -68,6 +68,25 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
     },
 }
 
+SQLITE_COMPAT_INDEXES: dict[str, str] = {
+    "ix_raw_messages_chat_posted_message": (
+        "CREATE INDEX IF NOT EXISTS ix_raw_messages_chat_posted_message "
+        "ON raw_messages (chat_id, posted_at, message_id)"
+    ),
+    "ix_strategy_lifecycles_chat_status_signal": (
+        "CREATE INDEX IF NOT EXISTS ix_strategy_lifecycles_chat_status_signal "
+        "ON strategy_lifecycles (chat_id, lifecycle_status, signal_at)"
+    ),
+    "ix_strategy_lifecycles_chat_status_entered": (
+        "CREATE INDEX IF NOT EXISTS ix_strategy_lifecycles_chat_status_entered "
+        "ON strategy_lifecycles (chat_id, lifecycle_status, entered_at)"
+    ),
+    "ix_strategy_lifecycles_chat_status_exited": (
+        "CREATE INDEX IF NOT EXISTS ix_strategy_lifecycles_chat_status_exited "
+        "ON strategy_lifecycles (chat_id, lifecycle_status, exited_at)"
+    ),
+}
+
 
 def init_db(engine: Engine) -> None:
     """Create all database tables if they do not already exist."""
@@ -75,6 +94,7 @@ def init_db(engine: Engine) -> None:
     _configure_sqlite(engine)
     Base.metadata.create_all(engine)
     _backfill_sqlite_columns(engine)
+    _backfill_sqlite_indexes(engine)
 
 
 def _configure_sqlite(engine: Engine) -> None:
@@ -108,6 +128,23 @@ def _backfill_sqlite_columns(engine: Engine) -> None:
             for column_name, alter_sql in required_columns.items():
                 if column_name not in existing_columns:
                     connection.execute(text(alter_sql))
+
+
+def _backfill_sqlite_indexes(engine: Engine) -> None:
+    if engine.dialect.name != "sqlite":
+        return
+
+    with engine.begin() as connection:
+        existing_tables = {
+            row[0]
+            for row in connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).fetchall()
+        }
+        for create_index_sql in SQLITE_COMPAT_INDEXES.values():
+            table_name = create_index_sql.rsplit(" ON ", 1)[1].split(" ", 1)[0]
+            if table_name in existing_tables:
+                connection.execute(text(create_index_sql))
 
 
 def create_session_factory(database_path: str | Path) -> sessionmaker:

@@ -225,8 +225,12 @@ def _build_strategy_kpi_counts(
     selected_holding = [item for item in holding_positions if belongs_to_selected(item)]
     selected_pending = [item for item in pending_entry_signals if belongs_to_selected(item)]
     if lifecycle_counts is not None:
+        holding_count = lifecycle_counts.get("entered", 0)
+        pending_count = lifecycle_counts.get("pending_entry", len(selected_pending))
         exited_count = lifecycle_counts.get("exited", 0) + lifecycle_counts.get("expired", 0)
     else:
+        holding_count = len(selected_holding)
+        pending_count = len(selected_pending)
         selected_exited = [
             item for item in (exited_positions or []) if belongs_to_selected(item)
         ]
@@ -237,8 +241,8 @@ def _build_strategy_kpi_counts(
         if not item.get("deepcoin_order_draft", {}).get("blocking_reason_codes")
     )
     return {
-        "holding_count": len(selected_holding),
-        "pending_count": len(selected_pending),
+        "holding_count": holding_count,
+        "pending_count": pending_count,
         "exited_count": exited_count,
         "ready_count": ready_count,
     }
@@ -817,21 +821,31 @@ def create_web_app(
     @app.get("/groups/{chat_id}/strategy-mid-panel")
     def group_strategy_mid_panel(request: Request, chat_id: int, filter: str = "holding"):
         """Return the middle strategy panel fragment for a group."""
-        holding_positions = list_holding_strategies(
-            app.state.session_factory, chat_id=chat_id, limit=50
-        )
-        exited_positions = list_exited_strategies(
-            app.state.session_factory, chat_id=chat_id, limit=50
-        )
-        pending_entry_signals = list_pending_strategies(
-            app.state.session_factory,
-            chat_id=chat_id,
-            limit=50,
-            symbol_whitelist_by_chat_id=_symbol_whitelist_by_chat_id(app.state.group_config),
-        )
+        filter = filter if filter in {"holding", "pending", "exited"} else "holding"
         lifecycle_counts = load_lifecycle_counts(
             app.state.session_factory,
             chat_id=chat_id,
+        )
+
+        holding_positions = (
+            list_holding_strategies(app.state.session_factory, chat_id=chat_id, limit=50)
+            if filter == "holding"
+            else []
+        )
+        pending_entry_signals = (
+            list_pending_strategies(
+                app.state.session_factory,
+                chat_id=chat_id,
+                limit=50,
+                symbol_whitelist_by_chat_id=_symbol_whitelist_by_chat_id(app.state.group_config),
+            )
+            if filter == "pending"
+            else []
+        )
+        exited_positions = (
+            list_exited_strategies(app.state.session_factory, chat_id=chat_id, limit=50)
+            if filter == "exited"
+            else []
         )
         strategy_kpi = _build_strategy_kpi_counts(
             selected_chat_id=chat_id,
@@ -844,7 +858,7 @@ def create_web_app(
             "holding": holding_positions,
             "pending": pending_entry_signals,
             "exited": exited_positions,
-        }.get(filter, holding_positions)
+        }[filter]
         return templates.TemplateResponse(
             request,
             "_strategy_mid_panel.html",

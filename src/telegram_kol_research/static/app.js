@@ -1,5 +1,6 @@
 let latestFreshnessSnapshot = null;
 let currentSelectedChatId = null;
+let groupSwitchRequestId = 0;
 
 function escapeHtml(value) {
   return value
@@ -739,30 +740,47 @@ function bindGroupLinks() {
     element.dataset.groupLinkBound = 'true';
     element.addEventListener('click', async () => {
       const chatId = Number(element.dataset.chatId);
+      const requestId = ++groupSwitchRequestId;
       syncSelectedGroupState(chatId, { focus: true });
       const detailPanel = document.querySelector('[data-detail-panel]');
       const strategyPanel = document.querySelector('[data-strategy-panel]');
       const filterInput = document.querySelector('[data-strategy-filter-input]');
       const filter = filterInput ? filterInput.value : 'holding';
-      const [nextContent, nextStrategyContent] = await Promise.all([
-        fetchDetailPanel(chatId),
-        strategyPanel ? fetchStrategyMidPanel(chatId, filter) : Promise.resolve(null),
-      ]);
-      if (detailPanel && nextContent) {
-        detailPanel.innerHTML = '';
-        detailPanel.appendChild(nextContent);
-        bindDetailPanelControls();
-      }
-      if (strategyPanel && nextStrategyContent) {
-        strategyPanel.innerHTML = '';
-        strategyPanel.appendChild(nextStrategyContent);
-        bindStrategyFilterBadges();
-        bindDetailPanelControls();
-      }
-      syncSelectedGroupState(chatId);
       setAiStatus('');
       applyGroupPromptToEditor(String(chatId));
       renderConversationHistory();
+
+      fetchDetailPanel(chatId)
+        .then((nextContent) => {
+          if (requestId !== groupSwitchRequestId || !detailPanel || !nextContent) {
+            return;
+          }
+          detailPanel.innerHTML = '';
+          detailPanel.appendChild(nextContent);
+          bindDetailPanelControls();
+          syncSelectedGroupState(chatId);
+        })
+        .catch(() => {
+          if (requestId === groupSwitchRequestId) {
+            setAiStatus('消息列表加载失败，请重试。', true);
+          }
+        });
+
+      if (strategyPanel) {
+        fetchStrategyMidPanel(chatId, filter)
+          .then((nextStrategyContent) => {
+            if (requestId !== groupSwitchRequestId || !nextStrategyContent) {
+              return;
+            }
+            strategyPanel.innerHTML = '';
+            strategyPanel.appendChild(nextStrategyContent);
+            bindStrategyFilterBadges();
+            bindDetailPanelControls();
+          })
+          .catch(() => {
+            // Keep the current strategy panel visible if the slower side panel fails.
+          });
+      }
     });
   });
 }
