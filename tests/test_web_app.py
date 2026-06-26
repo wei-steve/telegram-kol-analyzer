@@ -148,7 +148,7 @@ def test_group_detail_logs_route_timings(tmp_path, caplog):
         )
         session.commit()
 
-    caplog.set_level("INFO", logger="telegram_kol_research.web_app")
+    caplog.set_level("INFO", logger="uvicorn.error")
     client = TestClient(app)
 
     response = client.get("/groups/88/detail")
@@ -161,7 +161,7 @@ def test_group_detail_logs_route_timings(tmp_path, caplog):
 
 def test_strategy_mid_panel_logs_route_timings(tmp_path, caplog):
     app = create_web_app(database_path=tmp_path / "research.db")
-    caplog.set_level("INFO", logger="telegram_kol_research.web_app")
+    caplog.set_level("INFO", logger="uvicorn.error")
     client = TestClient(app)
 
     response = client.get("/groups/88/strategy-mid-panel?filter=holding")

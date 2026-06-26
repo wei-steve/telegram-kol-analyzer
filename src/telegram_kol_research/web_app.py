@@ -90,7 +90,7 @@ from telegram_kol_research.telegram_session_lock import (
 
 REFRESH_TIMEOUT_SECONDS = 180
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 
 def _elapsed_ms(started_at: float) -> float:
