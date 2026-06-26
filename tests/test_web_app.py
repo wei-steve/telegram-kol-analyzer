@@ -134,6 +134,45 @@ def test_strategy_mid_panel_loads_only_visible_strategy_list(tmp_path, monkeypat
     assert calls == ["pending"]
 
 
+def test_group_detail_logs_route_timings(tmp_path, caplog):
+    database_path = tmp_path / "research.db"
+    app = create_web_app(database_path=database_path)
+    with app.state.session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=88,
+                message_id=1,
+                sender_name="Demo",
+                text="BTC long",
+            )
+        )
+        session.commit()
+
+    caplog.set_level("INFO", logger="telegram_kol_research.web_app")
+    client = TestClient(app)
+
+    response = client.get("/groups/88/detail")
+
+    assert response.status_code == 200
+    assert "web_perf route=/groups/{chat_id}/detail chat_id=88" in caplog.text
+    assert "messages_ms=" in caplog.text
+    assert "template_ms=" in caplog.text
+
+
+def test_strategy_mid_panel_logs_route_timings(tmp_path, caplog):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    caplog.set_level("INFO", logger="telegram_kol_research.web_app")
+    client = TestClient(app)
+
+    response = client.get("/groups/88/strategy-mid-panel?filter=holding")
+
+    assert response.status_code == 200
+    assert "web_perf route=/groups/{chat_id}/strategy-mid-panel chat_id=88" in caplog.text
+    assert "filter=holding" in caplog.text
+    assert "lifecycle_counts_ms=" in caplog.text
+    assert "holding_ms=" in caplog.text
+
+
 def test_ai_recognition_config_api_saves_prompt(tmp_path):
     config_path = tmp_path / "ai_recognition.yaml"
     app = create_web_app(

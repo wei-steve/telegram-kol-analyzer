@@ -7,7 +7,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 import asyncio
+import logging
 import re
+import time
 
 import httpx
 from sqlalchemy import func
@@ -88,6 +90,11 @@ from telegram_kol_research.telegram_session_lock import (
 
 REFRESH_TIMEOUT_SECONDS = 180
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
+logger = logging.getLogger(__name__)
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 1)
 
 
 def _build_trader_dashboard_state(
@@ -709,21 +716,31 @@ def create_web_app(
     @app.get("/groups/{chat_id}/detail")
     def group_detail(request: Request, chat_id: int):
         """Return the right-panel message detail fragment for a group."""
+        route_started_at = time.perf_counter()
+        step_started_at = time.perf_counter()
         selected_group = _lookup_single_group(
             app.state.session_factory,
             chat_id=chat_id,
             group_labels_by_title=app.state.group_labels_by_title,
             configured_groups=app.state.group_config.groups,
         )
+        lookup_group_ms = _elapsed_ms(step_started_at)
+        step_started_at = time.perf_counter()
         messages = load_group_messages(
             app.state.session_factory, chat_id=chat_id, limit=50
         )
+        messages_ms = _elapsed_ms(step_started_at)
+        step_started_at = time.perf_counter()
         monitor_status = build_monitor_status()
+        monitor_status_ms = _elapsed_ms(step_started_at)
+        step_started_at = time.perf_counter()
         freshness = load_database_freshness(
             app.state.session_factory,
             now=app.state.now_provider(),
         )
-        return templates.TemplateResponse(
+        freshness_ms = _elapsed_ms(step_started_at)
+        step_started_at = time.perf_counter()
+        response = templates.TemplateResponse(
             request,
             "_strategy_detail.html",
             {
@@ -744,6 +761,21 @@ def create_web_app(
                 "sender_name": "",
             },
         )
+        template_ms = _elapsed_ms(step_started_at)
+        logger.info(
+            "web_perf route=/groups/{chat_id}/detail chat_id=%s total_ms=%.1f "
+            "lookup_group_ms=%.1f messages_ms=%.1f monitor_status_ms=%.1f "
+            "freshness_ms=%.1f template_ms=%.1f message_count=%s",
+            chat_id,
+            _elapsed_ms(route_started_at),
+            lookup_group_ms,
+            messages_ms,
+            monitor_status_ms,
+            freshness_ms,
+            template_ms,
+            len(messages),
+        )
+        return response
 
     @app.get("/groups/{chat_id}/detail/tab/pending")
     def group_detail_tab_pending(request: Request, chat_id: int):
@@ -821,17 +853,27 @@ def create_web_app(
     @app.get("/groups/{chat_id}/strategy-mid-panel")
     def group_strategy_mid_panel(request: Request, chat_id: int, filter: str = "holding"):
         """Return the middle strategy panel fragment for a group."""
+        route_started_at = time.perf_counter()
         filter = filter if filter in {"holding", "pending", "exited"} else "holding"
+        step_started_at = time.perf_counter()
         lifecycle_counts = load_lifecycle_counts(
             app.state.session_factory,
             chat_id=chat_id,
         )
+        lifecycle_counts_ms = _elapsed_ms(step_started_at)
 
+        holding_ms = 0.0
+        pending_ms = 0.0
+        exited_ms = 0.0
+        step_started_at = time.perf_counter()
         holding_positions = (
             list_holding_strategies(app.state.session_factory, chat_id=chat_id, limit=50)
             if filter == "holding"
             else []
         )
+        if filter == "holding":
+            holding_ms = _elapsed_ms(step_started_at)
+        step_started_at = time.perf_counter()
         pending_entry_signals = (
             list_pending_strategies(
                 app.state.session_factory,
@@ -842,11 +884,17 @@ def create_web_app(
             if filter == "pending"
             else []
         )
+        if filter == "pending":
+            pending_ms = _elapsed_ms(step_started_at)
+        step_started_at = time.perf_counter()
         exited_positions = (
             list_exited_strategies(app.state.session_factory, chat_id=chat_id, limit=50)
             if filter == "exited"
             else []
         )
+        if filter == "exited":
+            exited_ms = _elapsed_ms(step_started_at)
+        step_started_at = time.perf_counter()
         strategy_kpi = _build_strategy_kpi_counts(
             selected_chat_id=chat_id,
             holding_positions=holding_positions,
@@ -859,7 +907,9 @@ def create_web_app(
             "pending": pending_entry_signals,
             "exited": exited_positions,
         }[filter]
-        return templates.TemplateResponse(
+        kpi_ms = _elapsed_ms(step_started_at)
+        step_started_at = time.perf_counter()
+        response = templates.TemplateResponse(
             request,
             "_strategy_mid_panel.html",
             {
@@ -872,6 +922,27 @@ def create_web_app(
                 "items": items,
             },
         )
+        template_ms = _elapsed_ms(step_started_at)
+        logger.info(
+            "web_perf route=/groups/{chat_id}/strategy-mid-panel chat_id=%s "
+            "filter=%s total_ms=%.1f lifecycle_counts_ms=%.1f holding_ms=%.1f "
+            "pending_ms=%.1f exited_ms=%.1f kpi_ms=%.1f template_ms=%.1f "
+            "holding_count=%s pending_count=%s exited_count=%s item_count=%s",
+            chat_id,
+            filter,
+            _elapsed_ms(route_started_at),
+            lifecycle_counts_ms,
+            holding_ms,
+            pending_ms,
+            exited_ms,
+            kpi_ms,
+            template_ms,
+            len(holding_positions),
+            len(pending_entry_signals),
+            len(exited_positions),
+            len(items),
+        )
+        return response
 
     @app.post("/api/groups/{chat_id}/automation")
     async def update_group_automation(chat_id: int, payload: dict[str, Any]):
