@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import shutil
 from enum import Enum
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ from telegram_kol_research.llm_adjudication import (
 )
 from telegram_kol_research.llm_import import import_llm_adjudication_results
 from telegram_kol_research.media_retention import cleanup_media_files
+from telegram_kol_research.media_dedupe import dedupe_media_assets
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import SyncCheckpoint
 from telegram_kol_research.reporting import load_leaderboard_rows, write_report
@@ -843,6 +845,40 @@ def media_cleanup(
     typer.echo(f"Deleted files: {result.deleted_files}")
     typer.echo(f"Cleared local paths: {result.cleared_local_paths}")
     typer.echo(f"Freed bytes: {result.freed_bytes}")
+
+
+@app.command("media-dedupe")
+def media_dedupe(
+    database_path: Path = Path("data/research.db"),
+    media_root: Path = Path("data/media"),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview duplicate media row cleanup by default; pass --apply to delete rows.",
+    ),
+) -> None:
+    """Remove duplicate media rows while keeping message history and best media metadata."""
+
+    backup_path = None
+    if not dry_run:
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        backup_path = database_path.with_name(f"{database_path.name}.bak-{timestamp}")
+        shutil.copy2(database_path, backup_path)
+
+    session_factory = create_session_factory(database_path)
+    result = dedupe_media_assets(
+        session_factory,
+        media_root=media_root,
+        dry_run=dry_run,
+    )
+    mode_label = "dry-run" if dry_run else "applied"
+    typer.echo(f"Media dedupe {mode_label}")
+    if backup_path is not None:
+        typer.echo(f"Database backup: {backup_path}")
+    typer.echo(f"Duplicate message groups: {result.duplicate_message_groups}")
+    typer.echo(f"Scanned assets: {result.scanned_assets}")
+    typer.echo(f"Kept assets: {result.kept_assets}")
+    typer.echo(f"Deleted assets: {result.deleted_assets}")
 
 
 def main() -> None:

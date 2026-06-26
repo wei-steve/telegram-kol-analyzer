@@ -36,6 +36,44 @@ def test_load_group_messages_includes_media_and_orders_newest_first_within_page(
     assert rows[0]["media_assets"][0]["local_path"] == "data/media/9/2.jpg"
 
 
+def test_load_group_messages_limits_excessive_media_assets_per_message(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=9,
+            message_id=1,
+            posted_at=datetime(2026, 4, 1, tzinfo=UTC),
+            text="many images",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add_all(
+            [
+                MediaAsset(raw_message_id=raw_message.id, kind="photo"),
+                MediaAsset(
+                    raw_message_id=raw_message.id,
+                    kind="photo",
+                    local_path="data/media/9/with-path.jpg",
+                ),
+                MediaAsset(
+                    raw_message_id=raw_message.id,
+                    kind="photo",
+                    ocr_text="BTC long",
+                ),
+                MediaAsset(raw_message_id=raw_message.id, kind="photo"),
+                MediaAsset(raw_message_id=raw_message.id, kind="photo"),
+            ]
+        )
+        session.commit()
+
+    rows = load_group_messages(session_factory, chat_id=9, limit=10)
+
+    media_assets = rows[0]["media_assets"]
+    assert len(media_assets) == 3
+    assert any(asset["ocr_text"] == "BTC long" for asset in media_assets)
+    assert any(asset["local_path"] == "data/media/9/with-path.jpg" for asset in media_assets)
+
+
 def test_load_group_messages_returns_posted_at_in_local_display_timezone(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

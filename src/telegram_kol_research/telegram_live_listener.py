@@ -309,15 +309,12 @@ async def run_reconcile_once(
                 .join(MediaAsset, MediaAsset.raw_message_id == RawMessage.id)
                 .filter(
                     RawMessage.chat_id == dialog_id,
+                    RawMessage.message_id > replay_floor,
                     MediaAsset.local_path.is_(None),
                 )
                 .all()
             )
         orphan_msg_ids = {row.message_id for row in orphan_rows}
-        if orphan_msg_ids:
-            lowest_orphan = min(orphan_msg_ids)
-            if lowest_orphan > 0:
-                replay_floor = min(replay_floor, max(0, lowest_orphan - 1))
 
         payloads = [
             payload

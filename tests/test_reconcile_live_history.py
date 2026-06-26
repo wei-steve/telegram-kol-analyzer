@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import RawMessage, SyncCheckpoint
+from telegram_kol_research.models import MediaAsset, RawMessage, SyncCheckpoint
 from telegram_kol_research.telegram_live_listener import run_live_listener, run_reconcile_once
 
 
@@ -90,6 +90,85 @@ def test_run_reconcile_once_persists_only_messages_newer_than_checkpoint(tmp_pat
     assert stats["inserted_messages"] == 1
     assert [message.message_id for message in raw_messages] == [78]
     assert checkpoint.last_message_id == 78
+
+
+def test_run_reconcile_once_does_not_expand_window_for_old_missing_media(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        old_message = RawMessage(
+            chat_id=9001,
+            message_id=10,
+            text="old cached image",
+            posted_at=datetime(2026, 4, 1, 8, 30),
+        )
+        session.add(old_message)
+        session.flush()
+        session.add(MediaAsset(raw_message_id=old_message.id, kind="photo", local_path=None))
+        session.add(
+            RawMessage(
+                chat_id=9001,
+                message_id=77,
+                text="checkpoint message",
+                posted_at=datetime(2026, 4, 10, 8, 30),
+            )
+        )
+        session.add(
+            SyncCheckpoint(
+                chat_id=9001,
+                sync_kind="history",
+                last_message_id=77,
+                last_message_at=datetime(2026, 4, 10, 8, 30),
+            )
+        )
+        session.commit()
+
+    processed = []
+
+    async def fake_fetch_dialog_messages(client, dialog, limit, media_root="data/media"):
+        return [
+            {
+                "chat_id": 9001,
+                "message_id": 10,
+                "sender_id": 501,
+                "sender_name": "VIP BTC Room",
+                "text": "old cached image replay",
+                "posted_at": "2026-04-01T08:30:00+00:00",
+                "media": {"kind": "photo", "path": "media/10.jpg"},
+            },
+            {
+                "chat_id": 9001,
+                "message_id": 78,
+                "sender_id": 501,
+                "sender_name": "VIP BTC Room",
+                "text": "fresh message",
+                "posted_at": "2026-04-10T08:45:00+00:00",
+                "media": None,
+            },
+        ]
+
+    async def fake_strategy_alert_processor(**kwargs):
+        processed.append(kwargs["record"].message_id)
+        return {"status": "sent"}
+
+    stats = __import__("asyncio").run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            strategy_alert_config=object(),
+            strategy_alert_processor=fake_strategy_alert_processor,
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=fake_fetch_dialog_messages,
+        )
+    )
+
+    with session_factory() as session:
+        old_message = session.query(RawMessage).filter(RawMessage.message_id == 10).one()
+
+    assert stats["inserted_messages"] == 1
+    assert old_message.text == "old cached image"
+    assert processed == [78]
 
 
 def test_run_reconcile_once_triggers_strategy_alert_processor_for_fresh_messages(tmp_path):

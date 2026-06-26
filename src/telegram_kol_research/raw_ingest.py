@@ -81,6 +81,7 @@ def persist_normalized_messages(
 
     inserted_messages = 0
     inserted_media_assets = 0
+    deduplicated_media_assets = 0
     inserted_message_keys: list[tuple[int, int]] = []
 
     with session_factory() as session:
@@ -124,16 +125,22 @@ def persist_normalized_messages(
                 raw_message.edit_date = record.edit_date
 
             if record.media_kind:
-                media_asset = (
+                media_assets = (
                     session.query(MediaAsset)
-                    .filter(
-                        MediaAsset.raw_message_id == raw_message.id,
-                        MediaAsset.kind == record.media_kind,
-                        MediaAsset.local_path == record.media_path,
-                    )
-                    .one_or_none()
+                    .filter(MediaAsset.raw_message_id == raw_message.id)
+                    .order_by(MediaAsset.id.asc())
+                    .all()
                 )
-                if media_asset is None:
+                if media_assets:
+                    media_asset = media_assets[0]
+                    media_asset.kind = record.media_kind
+                    if record.media_path:
+                        media_asset.local_path = record.media_path
+                    if len(media_assets) > 1:
+                        for duplicate_asset in media_assets[1:]:
+                            session.delete(duplicate_asset)
+                        deduplicated_media_assets += len(media_assets) - 1
+                else:
                     session.add(
                         MediaAsset(
                             raw_message_id=raw_message.id,
@@ -173,6 +180,7 @@ def persist_normalized_messages(
     return {
         "inserted_messages": inserted_messages,
         "inserted_media_assets": inserted_media_assets,
+        "deduplicated_media_assets": deduplicated_media_assets,
         "processed_records": len(records),
         "inserted_message_keys": inserted_message_keys,
     }

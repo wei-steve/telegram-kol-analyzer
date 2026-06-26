@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import MediaAsset, RawMessage
 from telegram_kol_research.raw_ingest import (
     NormalizedMessageRecord,
     persist_normalized_messages,
@@ -51,3 +51,46 @@ def test_replaying_same_chat_and_message_id_updates_existing_row_without_duplica
 
     assert len(rows) == 1
     assert rows[0].text == "edited"
+
+
+def test_replaying_media_message_updates_single_media_asset(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first = NormalizedMessageRecord(
+        chat_id=1,
+        message_id=10,
+        sender_id=None,
+        sender_name="Alice",
+        text="first",
+        reply_to_message_id=None,
+        media_kind="messagemediaphoto",
+        media_path="1/10-a.jpg",
+        media_payload=None,
+        archived_target_group=True,
+        posted_at=datetime(2026, 4, 17, 8, 0, tzinfo=UTC),
+        edit_date=None,
+        raw_payload="{}",
+    )
+    replayed = NormalizedMessageRecord(
+        chat_id=1,
+        message_id=10,
+        sender_id=None,
+        sender_name="Alice",
+        text="first",
+        reply_to_message_id=None,
+        media_kind="messagemediaphoto",
+        media_path="1/10-b.jpg",
+        media_payload=None,
+        archived_target_group=True,
+        posted_at=datetime(2026, 4, 17, 8, 0, tzinfo=UTC),
+        edit_date=None,
+        raw_payload="{}",
+    )
+
+    persist_normalized_messages(session_factory, [first])
+    persist_normalized_messages(session_factory, [replayed])
+
+    with session_factory() as session:
+        media_assets = session.query(MediaAsset).all()
+
+    assert len(media_assets) == 1
+    assert media_assets[0].local_path == "1/10-b.jpg"

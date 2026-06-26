@@ -26,6 +26,7 @@ STRATEGY_TIME_DISPLAY_FIELDS = (
     "original_posted_at",
     "latest_event_at",
 )
+MAX_MEDIA_ASSETS_PER_MESSAGE = 3
 
 
 def _format_strategy_time(value: object) -> str | None:
@@ -254,10 +255,28 @@ def _serialize_raw_messages(
     raw_message_ids = [msg.id for msg in raw_messages]
 
     # ── Bulk-load media assets ──
+    ranked_media = (
+        session.query(
+            MediaAsset.id.label("id"),
+            func.row_number()
+            .over(
+                partition_by=MediaAsset.raw_message_id,
+                order_by=[
+                    MediaAsset.ocr_text.is_(None),
+                    MediaAsset.local_path.is_(None),
+                    MediaAsset.id.asc(),
+                ],
+            )
+            .label("rn"),
+        )
+        .filter(MediaAsset.raw_message_id.in_(raw_message_ids))
+        .subquery()
+    )
     all_media = (
         session.query(MediaAsset)
-        .filter(MediaAsset.raw_message_id.in_(raw_message_ids))
-        .order_by(MediaAsset.raw_message_id.asc(), MediaAsset.id.asc())
+        .join(ranked_media, MediaAsset.id == ranked_media.c.id)
+        .filter(ranked_media.c.rn <= MAX_MEDIA_ASSETS_PER_MESSAGE)
+        .order_by(MediaAsset.raw_message_id.asc(), ranked_media.c.rn.asc())
         .all()
     )
     media_by_msg_id: dict[int, list[MediaAsset]] = {}
