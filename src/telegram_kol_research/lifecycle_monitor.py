@@ -108,6 +108,10 @@ def _looks_like_market_entry_text(entry_text: str | None) -> bool:
             "不用踩点",
             "无需踩点",
             "进场零花",
+            "附近",
+            "左右",
+            "一带",
+            "around",
             "market",
         )
     )

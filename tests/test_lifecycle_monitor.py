@@ -347,6 +347,72 @@ def test_lifecycle_monitor_enters_market_signal_when_current_price_is_near_refer
     assert lifecycle.entered_at == datetime(2026, 6, 23, 7, 31)
 
 
+def test_lifecycle_monitor_enters_nearby_entry_price_with_tolerance(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    signal_at = datetime(2026, 6, 26, 2, 25, 42, tzinfo=UTC)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=421,
+            posted_at=signal_at,
+            text=(
+                "米娅BTC短线合约交易策略\n"
+                "做多\n"
+                "进场点位：58300附近\n"
+                "止损点位：57300\n"
+                "止盈点位：60600"
+            ),
+        )
+        session.add(raw_message)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=421,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=signal_at,
+            entry_range_low=58300,
+            entry_range_high=58300,
+            stop_loss=57300,
+            take_profit="60600",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    class FakeLifecycleMonitor(LifecycleMonitor):
+        async def _fetch_candles_full(self, contract, from_, to_):
+            return [
+                PriceCandle(
+                    opened_at=datetime(2026, 6, 26, 2, 26, tzinfo=UTC),
+                    high=58360,
+                    low=58340,
+                )
+            ]
+
+        async def _fetch_current_price(self, contract):
+            return 58350
+
+    monitor = FakeLifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        config=LifecycleMonitorConfig(market_entry_tolerance_ratio=0.0015),
+        now_provider=lambda: datetime(2026, 6, 26, 2, 27, tzinfo=UTC),
+    )
+
+    transitions = asyncio.run(monitor.run_once())
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert transitions[0]["from"] == "pending_entry"
+    assert transitions[0]["to"] == "entered"
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.entry_price_actual == 58350
+    assert lifecycle.entered_at == datetime(2026, 6, 26, 2, 26)
+
+
 def test_lifecycle_monitor_enters_flexible_entry_range_at_current_price(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     signal_at = datetime(2026, 6, 24, 7, 25, 10, tzinfo=UTC)
