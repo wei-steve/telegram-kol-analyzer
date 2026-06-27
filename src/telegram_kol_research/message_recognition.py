@@ -70,6 +70,17 @@ POSITION_MANAGEMENT_TERMS = [
     "不要逆势加仓",
 ]
 
+OCR_RECAP_REFERENCE_TERMS = [
+    "盈利",
+    "已盈利",
+    "已经盈利",
+    "会员空单盈利",
+    "会员多单盈利",
+    "参考",
+    "复盘",
+    "所长分享",
+]
+
 
 @dataclass(frozen=True)
 class MessageRecognitionResult:
@@ -436,6 +447,24 @@ def _recognize_with_glm_ocr(
             merged_text=merged_text,
             config=config,
         )
+        if (
+            caption
+            and ocr_parts
+            and result.status == "是策略"
+            and _caption_looks_like_ocr_recap_reference(caption)
+        ):
+            result = MessageRecognitionResult(
+                raw_message_id=raw_message.id,
+                status="非策略",
+                reason=(
+                    "图文消息正文是盈利/参考/复盘语境，且正文自身不构成完整新开仓策略；"
+                    "图片 OCR 中的策略文字按历史截图处理，不创建新策略。"
+                ),
+                ai_payload=result.ai_payload,
+                parse_source="image_ai",
+            )
+            _upsert_recognition(session, result, engine=config.text_provider.model)
+            return result
         if caption and ocr_parts and result.status != "是策略":
             try:
                 text_only_result = _recognize_text_with_ai_provider(
@@ -1390,6 +1419,19 @@ def _has_entry_instruction(text: str, parsed) -> bool:
 
 def _looks_like_position_management(text: str) -> bool:
     return any(term in text for term in POSITION_MANAGEMENT_TERMS)
+
+
+def _caption_looks_like_ocr_recap_reference(caption: str) -> bool:
+    caption = caption.strip()
+    if not caption:
+        return False
+    if not any(term in caption for term in OCR_RECAP_REFERENCE_TERMS):
+        return False
+    parsed = parse_signal_text(caption)
+    caption_has_complete_plan = parsed.entry_range is not None and (
+        parsed.stop_loss is not None or bool(parsed.take_profits)
+    )
+    return not caption_has_complete_plan
 
 
 def _apply_lifecycle_transition_signal_if_matched(

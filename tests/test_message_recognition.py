@@ -1553,6 +1553,126 @@ def test_glm_ocr_caption_message_falls_back_to_text_strategy(tmp_path, monkeypat
     assert media_asset.ocr_text.startswith("<table>")
 
 
+def test_glm_ocr_recap_caption_does_not_import_old_screenshot_strategy(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    image_path = tmp_path / "hype.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+    source_text = (
+        "💵💵 HYPE 会员空单 盈利 各位也可以做个参考，"
+        "目前看四小时这个阴线只要无法突破，那么三日线传导的双顶部"
+        "是还有可能继续下跌的。"
+    )
+    seen_chat_inputs: list[str] = []
+
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=6694,
+            sender_name="币圈所长会员群-11分组",
+            posted_at=datetime(2026, 6, 26, 13, 31, 23, tzinfo=UTC),
+            text=source_text,
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            MediaAsset(
+                raw_message_id=raw_message.id,
+                kind="messagemediaphoto",
+                local_path=str(image_path),
+                mime_type="image/jpeg",
+            )
+        )
+        session.commit()
+        raw_message_id = raw_message.id
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json, headers):
+            if url.endswith("/layout_parsing"):
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", url),
+                    json={
+                        "md_results": (
+                            "HYPE 现在63.6附近开空\n"
+                            "止损：站上65.5\n"
+                            "止盈；62-60-58-56"
+                        )
+                    },
+                )
+            seen_chat_inputs.append(json["messages"][1]["content"])
+            payload = {
+                "recognition_result": "是策略",
+                "reason": "合并文本包含 HYPE 做空、入场、止损和止盈",
+                "strategy": {
+                    "symbol": "HYPE",
+                    "side": "short",
+                    "entry": "63.6附近",
+                    "stop_loss": "65.5",
+                    "take_profit": "62/60/58/56",
+                    "order_type": "market",
+                },
+                "confidence": 0.95,
+            }
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": __import__("json").dumps(
+                                    payload,
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr("telegram_kol_research.message_recognition.httpx.Client", FakeClient)
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=AiProviderConfig(
+                base_url="http://deepseek.test",
+                model="deepseek-chat",
+                timeout_seconds=10,
+            ),
+            image_provider=AiProviderConfig(
+                base_url="http://glm.test",
+                model="glm-ocr",
+                timeout_seconds=10,
+            ),
+        ),
+    )
+
+    assert result.status == "非策略"
+    assert "历史截图" in (result.reason or "")
+    assert len(seen_chat_inputs) == 1
+    with session_factory() as session:
+        assert session.query(SignalCandidate).count() == 0
+        assert session.query(StrategyLifecycle).count() == 0
+        recognition = session.query(MessageRecognition).one()
+        media_asset = session.query(MediaAsset).one()
+
+    assert recognition.status == "非策略"
+    assert "HYPE 现在63.6附近开空" in (media_asset.ocr_text or "")
+
+
 def test_recognize_message_now_raises_for_missing_message(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
 
