@@ -1,0 +1,36 @@
+{% if strategy.lifecycle_events %}
+  <div class="position-lifecycle">
+    <div class="position-lifecycle-title">事件时间线</div>
+    {% for event in strategy.lifecycle_events %}
+      <div class="position-lifecycle-event position-lifecycle-event--{{ event.kind }}">
+        <div class="position-lifecycle-row">
+          <strong>{{ event.label }}</strong>
+          {% if event.message_id %}<code>#{{ event.message_id }}</code>{% endif %}
+          {% if event.at_display %}<time>{{ event.at_display }}</time>{% endif %}
+          {% if event.transition %}<code>{{ event.transition }}</code>{% endif %}
+        </div>
+        {% if event.detail %}<p class="position-lifecycle-detail">{{ event.detail }}</p>{% endif %}
+        {% if event.text_excerpt %}<p>{{ event.text_excerpt }}</p>{% endif %}
+      </div>
+    {% endfor %}
+  </div>
+{% elif strategy.original_message_id or strategy.latest_event_message_id or strategy.status_detail %}
+  <div class="position-lifecycle">
+    <div class="position-lifecycle-row">
+      <span>原策略</span>
+      {% if strategy.original_message_id %}<code>#{{ strategy.original_message_id }}</code>{% endif %}
+      {% if strategy.original_posted_at_display %}<time>接收时间 {{ strategy.original_posted_at_display }}</time>{% endif %}
+    </div>
+    {% if strategy.original_text_excerpt %}<p>{{ strategy.original_text_excerpt }}</p>{% endif %}
+    <div class="position-lifecycle-row">
+      <span>最新事件</span>
+      <strong>{{ strategy.latest_event_label or strategy.current_status_label }}</strong>
+      {% if strategy.latest_event_message_id %}<code>#{{ strategy.latest_event_message_id }}</code>{% endif %}
+      {% if strategy.latest_event_at_display %}<time>事件时间 {{ strategy.latest_event_at_display }}</time>{% endif %}
+      {% if strategy.transition_text %}<code>{{ strategy.transition_text }}</code>{% endif %}
+    </div>
+    {% if strategy.latest_event_text_excerpt %}<p>{{ strategy.latest_event_text_excerpt }}</p>{% endif %}
+    {% if strategy.management_note %}<p class="position-lifecycle-detail">{{ strategy.management_note }}</p>{% endif %}
+    {% if strategy.status_detail %}<p class="position-lifecycle-detail">{{ strategy.status_detail }}</p>{% endif %}
+  </div>
+{% endif %}

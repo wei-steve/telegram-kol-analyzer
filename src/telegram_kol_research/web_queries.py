@@ -603,6 +603,12 @@ def _message_excerpt(text: str | None, *, limit: int = 96) -> str | None:
     return compact[: limit - 1] + "..."
 
 
+def _format_price_number(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f"{float(value):g}"
+
+
 def _lifecycle_status_label(status: str | None, exit_reason: str | None = None) -> str:
     if status == "pending_entry":
         return "待入场"
@@ -696,6 +702,7 @@ def _apply_lifecycle_display_fields(
     lifecycle,
     original_message=None,
     latest_event_message=None,
+    session=None,
 ) -> dict[str, object]:
     latest_at = lifecycle.exited_at or lifecycle.entered_at or lifecycle.signal_at
     if lifecycle.lifecycle_status == "pending_entry":
@@ -753,8 +760,177 @@ def _apply_lifecycle_display_fields(
             ),
         }
     )
+    if session is not None:
+        row["lifecycle_events"] = _build_lifecycle_event_timeline(
+            session,
+            lifecycle,
+            original_message=original_message,
+            latest_event_message=latest_event_message,
+        )
     _add_strategy_time_display_fields(row)
     return row
+
+
+def _build_lifecycle_event_timeline(
+    session,
+    lifecycle,
+    *,
+    original_message=None,
+    latest_event_message=None,
+) -> list[dict[str, object]]:
+    from telegram_kol_research.models import RawMessage, SignalCandidate, utc_now
+
+    events: list[dict[str, object]] = []
+    seen: set[tuple[str, int | None]] = set()
+
+    def add_event(
+        *,
+        kind: str,
+        label: str,
+        at,
+        message_id: int | None = None,
+        text: str | None = None,
+        detail: str | None = None,
+        transition: str | None = None,
+    ) -> None:
+        key = (kind, int(message_id) if message_id is not None else None)
+        if key in seen:
+            return
+        seen.add(key)
+        events.append(
+            {
+                "kind": kind,
+                "label": label,
+                "at": utc_naive_to_local(at),
+                "message_id": message_id,
+                "text_excerpt": _message_excerpt(text),
+                "detail": detail,
+                "transition": transition,
+            }
+        )
+
+    add_event(
+        kind="entry_signal",
+        label="原策略",
+        at=original_message.posted_at if original_message is not None else lifecycle.signal_at,
+        message_id=lifecycle.message_id,
+        text=original_message.text if original_message is not None else None,
+        transition="entry_signal → pending_entry",
+    )
+
+    if lifecycle.entered_at is not None:
+        entry_message = None
+        if getattr(lifecycle, "entry_signal_message_id", None) is not None:
+            entry_message = (
+                session.query(RawMessage)
+                .filter(RawMessage.chat_id == lifecycle.chat_id)
+                .filter(RawMessage.message_id == lifecycle.entry_signal_message_id)
+                .one_or_none()
+            )
+        add_event(
+            kind="entry_confirm",
+            label="入场确认",
+            at=entry_message.posted_at if entry_message is not None else lifecycle.entered_at,
+            message_id=(
+                lifecycle.entry_signal_message_id
+                if getattr(lifecycle, "entry_signal_message_id", None) is not None
+                else None
+            ),
+            text=entry_message.text if entry_message is not None else None,
+            detail=(
+                f"入场价 {_format_price_number(lifecycle.entry_price_actual)}"
+                if lifecycle.entry_price_actual is not None
+                else None
+            ),
+            transition="pending_entry → entered",
+        )
+
+    start_at = lifecycle.signal_at
+    end_at = lifecycle.exited_at or utc_now()
+    management_rows = (
+        session.query(SignalCandidate, RawMessage)
+        .join(RawMessage, SignalCandidate.raw_message_id == RawMessage.id)
+        .filter(RawMessage.chat_id == lifecycle.chat_id)
+        .filter(RawMessage.posted_at >= start_at)
+        .filter(RawMessage.posted_at <= end_at)
+        .filter(SignalCandidate.event_type.in_(["position_update", "strategy_correction"]))
+        .filter(SignalCandidate.symbol == lifecycle.symbol)
+        .filter(SignalCandidate.side == lifecycle.side)
+        .order_by(RawMessage.posted_at.asc(), RawMessage.message_id.asc())
+        .all()
+    )
+    for candidate, message in management_rows:
+        action = getattr(candidate, "event_type", None)
+        label = (
+            _management_action_label(getattr(lifecycle, "management_action", None))
+            if message.message_id == getattr(lifecycle, "management_signal_message_id", None)
+            else _management_action_label(action)
+        )
+        if candidate.event_type == "strategy_correction":
+            label = "策略修正"
+        add_event(
+            kind=candidate.event_type,
+            label=label,
+            at=message.posted_at,
+            message_id=message.message_id,
+            text=message.text,
+            detail=_format_candidate_event_detail(candidate),
+        )
+
+    if getattr(lifecycle, "management_signal_message_id", None) is not None:
+        management_message = (
+            session.query(RawMessage)
+            .filter(RawMessage.chat_id == lifecycle.chat_id)
+            .filter(RawMessage.message_id == lifecycle.management_signal_message_id)
+            .one_or_none()
+        )
+        if management_message is not None:
+            add_event(
+                kind="position_update",
+                label=_management_action_label(getattr(lifecycle, "management_action", None)),
+                at=management_message.posted_at,
+                message_id=management_message.message_id,
+                text=management_message.text,
+                detail=getattr(lifecycle, "management_note", None),
+            )
+
+    if lifecycle.lifecycle_status in {"exited", "expired"} or lifecycle.exited_at is not None:
+        exit_message = latest_event_message
+        if lifecycle.exit_signal_message_id is not None:
+            exit_message = (
+                session.query(RawMessage)
+                .filter(RawMessage.chat_id == lifecycle.chat_id)
+                .filter(RawMessage.message_id == lifecycle.exit_signal_message_id)
+                .one_or_none()
+            )
+        add_event(
+            kind="exit",
+            label=_latest_event_label(lifecycle.lifecycle_status, lifecycle.exit_reason),
+            at=exit_message.posted_at if exit_message is not None else lifecycle.exited_at,
+            message_id=lifecycle.exit_signal_message_id,
+            text=exit_message.text if exit_message is not None else None,
+            detail=(
+                f"离场价 {_format_price_number(lifecycle.exit_price_actual)}"
+                if getattr(lifecycle, "exit_price_actual", None) is not None
+                else None
+            ),
+            transition=_transition_text(lifecycle.lifecycle_status, lifecycle.exit_reason),
+        )
+
+    events.sort(key=lambda item: (str(item.get("at") or ""), int(item.get("message_id") or 0)))
+    for event in events:
+        event_at = event.get("at")
+        event["at_display"] = _format_strategy_time(event_at)
+    return events
+
+
+def _format_candidate_event_detail(candidate) -> str | None:
+    parts: list[str] = []
+    if candidate.stop_loss_text:
+        parts.append(f"SL {candidate.stop_loss_text}")
+    if candidate.take_profit_text:
+        parts.append(f"TP {candidate.take_profit_text}")
+    return " / ".join(parts) or None
 
 
 def load_lifecycle_counts(
@@ -956,6 +1132,16 @@ def list_holding_strategies(
         if raw_msg is not None:
             row["sender_name"] = raw_msg.sender_name
             row["posted_at"] = utc_naive_to_local(raw_msg.posted_at)
+        else:
+            raw_msg = (
+                session.query(RawMessage)
+                .filter(RawMessage.chat_id == lc.chat_id)
+                .filter(RawMessage.message_id == lc.message_id)
+                .one_or_none()
+            )
+            if raw_msg is not None:
+                row["sender_name"] = raw_msg.sender_name
+                row["posted_at"] = utc_naive_to_local(raw_msg.posted_at)
         latest_event_msg = None
         if getattr(lc, "management_signal_message_id", None) is not None:
             latest_event_msg = (
@@ -971,7 +1157,7 @@ def list_holding_strategies(
                 .filter(RawMessage.message_id == lc.entry_signal_message_id)
                 .one_or_none()
             )
-        _apply_lifecycle_display_fields(row, lc, raw_msg, latest_event_msg)
+        _apply_lifecycle_display_fields(row, lc, raw_msg, latest_event_msg, session=session)
         results.append(row)
 
     return results
@@ -1069,7 +1255,17 @@ def list_pending_strategies(
         if raw_msg is not None:
             row["sender_name"] = raw_msg.sender_name
             row["posted_at"] = utc_naive_to_local(raw_msg.posted_at)
-        _apply_lifecycle_display_fields(row, lc, raw_msg)
+        else:
+            raw_msg = (
+                session.query(RawMessage)
+                .filter(RawMessage.chat_id == lc.chat_id)
+                .filter(RawMessage.message_id == lc.message_id)
+                .one_or_none()
+            )
+            if raw_msg is not None:
+                row["sender_name"] = raw_msg.sender_name
+                row["posted_at"] = utc_naive_to_local(raw_msg.posted_at)
+        _apply_lifecycle_display_fields(row, lc, raw_msg, session=session)
         results.append(row)
         if len(results) >= limit:
             break
@@ -1178,6 +1374,16 @@ def list_exited_strategies(
             if raw_msg is not None:
                 row["sender_name"] = raw_msg.sender_name
                 row["posted_at"] = utc_naive_to_local(raw_msg.posted_at)
+            else:
+                raw_msg = (
+                    session.query(RawMessage)
+                    .filter(RawMessage.chat_id == lc.chat_id)
+                    .filter(RawMessage.message_id == lc.message_id)
+                    .one_or_none()
+                )
+                if raw_msg is not None:
+                    row["sender_name"] = raw_msg.sender_name
+                    row["posted_at"] = utc_naive_to_local(raw_msg.posted_at)
             latest_event_msg = None
             if lc.exit_signal_message_id is not None:
                 latest_event_msg = (
@@ -1186,7 +1392,7 @@ def list_exited_strategies(
                     .filter(RawMessage.message_id == lc.exit_signal_message_id)
                     .one_or_none()
                 )
-            _apply_lifecycle_display_fields(row, lc, raw_msg, latest_event_msg)
+            _apply_lifecycle_display_fields(row, lc, raw_msg, latest_event_msg, session=session)
             results.append(row)
 
         # ── 2. ExecutionBinding (closed / cancelled) ──

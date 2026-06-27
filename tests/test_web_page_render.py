@@ -720,3 +720,109 @@ def test_strategy_mid_panel_shows_position_management_event(tmp_path):
     assert "持仓中" in response.text
     assert "最新事件时间" in response.text
     assert "2026-06-18 16:36:00 UTC+8" in response.text
+
+
+def test_strategy_mid_panel_shows_chronological_lifecycle_events(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        original_message = RawMessage(
+            chat_id=100,
+            message_id=2225,
+            posted_at=datetime(2026, 6, 26, 3, 42, 37, tzinfo=UTC),
+            sender_name="ouyang",
+            text="ETH 市价进场 1535 止损 1500 止盈 1615",
+        )
+        partial_message = RawMessage(
+            chat_id=100,
+            message_id=2229,
+            posted_at=datetime(2026, 6, 26, 3, 52, 14, tzinfo=UTC),
+            sender_name="ouyang",
+            text="现目前多单盈利18个点，分批止盈30%，多单继续持有！",
+        )
+        hold_message = RawMessage(
+            chat_id=100,
+            message_id=2233,
+            posted_at=datetime(2026, 6, 26, 6, 18, 46, tzinfo=UTC),
+            sender_name="ouyang",
+            text="现目前多单获利11点，多单继续持有，等待拉升！",
+        )
+        session.add_all([original_message, partial_message, hold_message])
+        session.flush()
+        entry_candidate = SignalCandidate(
+            raw_message_id=original_message.id,
+            symbol="ETH",
+            side="long",
+            event_type="entry_signal",
+            entry_text="1535",
+            stop_loss_text="1500",
+            take_profit_text="1615",
+            parse_source="text_ai",
+            confidence=0.95,
+            review_status="pending",
+        )
+        partial_candidate = SignalCandidate(
+            raw_message_id=partial_message.id,
+            symbol="ETH",
+            side="long",
+            event_type="position_update",
+            stop_loss_text="1500",
+            take_profit_text="1615",
+            parse_source="lifecycle_ai",
+            confidence=0.85,
+            review_status="pending",
+        )
+        hold_candidate = SignalCandidate(
+            raw_message_id=hold_message.id,
+            symbol="ETH",
+            side="long",
+            event_type="position_update",
+            stop_loss_text="1500",
+            take_profit_text="1615",
+            parse_source="lifecycle_ai",
+            confidence=0.85,
+            review_status="pending",
+        )
+        session.add_all([entry_candidate, partial_candidate, hold_candidate])
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=entry_candidate.id,
+                chat_id=100,
+                message_id=2225,
+                symbol="ETH",
+                side="long",
+                lifecycle_status="exited",
+                exit_reason="stop_loss",
+                signal_at=original_message.posted_at,
+                entered_at=datetime(2026, 6, 26, 3, 43, tzinfo=UTC),
+                exited_at=datetime(2026, 6, 26, 12, 39, tzinfo=UTC),
+                entry_range_low=1535,
+                entry_range_high=1535,
+                entry_price_actual=1535,
+                exit_price_actual=1535,
+                stop_loss=1535,
+                take_profit="1615",
+                management_signal_message_id=2229,
+                management_action="partial_take_profit",
+                management_note="分批止盈30%，多单继续持有",
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/100/strategy-mid-panel?filter=exited")
+
+    assert response.status_code == 200
+    assert "事件时间线" in response.text
+    assert "原策略" in response.text
+    assert "入场确认" in response.text
+    assert "分批止盈30%" in response.text
+    assert "多单继续持有，等待拉升" in response.text
+    assert "止损触发" in response.text
+    assert (
+        response.text.index("#2225")
+        < response.text.index("分批止盈30%")
+        < response.text.index("多单继续持有，等待拉升")
+        < response.text.index("止损触发")
+    )
