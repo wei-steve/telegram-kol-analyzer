@@ -453,6 +453,14 @@ def _build_strategy_detection(
     candidate: SignalCandidate | None,
     media_assets: list[MediaAsset],
 ) -> dict[str, str | None]:
+    if candidate is not None and candidate.event_type != "entry_signal":
+        return {
+            "status": _candidate_event_status(candidate.event_type),
+            "status_class": "is-strategy",
+            "summary": _format_signal_candidate_summary(candidate),
+            "reason": candidate.review_note or (recognition.reason if recognition is not None else None),
+        }
+
     if recognition is not None:
         return {
             "status": recognition.status,
@@ -483,6 +491,17 @@ def _build_strategy_detection(
         "summary": None,
         "reason": None,
     }
+
+
+def _candidate_event_status(event_type: str | None) -> str:
+    return {
+        "entry_confirm": "入场确认",
+        "cancel_entry": "取消入场",
+        "exit_position": "离场信号",
+        "position_update": "仓位管理",
+        "strategy_correction": "策略调整",
+        "duplicate_entry_signal": "重复策略",
+    }.get(event_type or "", "策略事件")
 
 
 def _recognition_status_class(status: str) -> str:

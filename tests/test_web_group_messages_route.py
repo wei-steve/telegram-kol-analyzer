@@ -339,6 +339,52 @@ def test_group_messages_route_shows_ai_strategy_detection_results(tmp_path):
     assert response.text.count('class="message-ai-toggle"') == 3
 
 
+def test_group_messages_route_labels_lifecycle_event_detection(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=3869,
+            sender_name="大镖客 11分组",
+            posted_at=datetime(2026, 6, 27, 13, 5, 27, tzinfo=UTC),
+            text="周末震荡，时间太久注意保护成本，只浮盈100点",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            MessageRecognition(
+                raw_message_id=raw_message.id,
+                status="非策略",
+                reason="当前消息建议保护成本，属于移动止损到保护位置。",
+                engine="deepseek-v4-flash",
+            )
+        )
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw_message.id,
+                source_id=None,
+                symbol="BTC",
+                side="short",
+                stop_loss_text="60410.9",
+                take_profit_text="59800/59100/58400",
+                event_type="position_update",
+                parse_source="lifecycle_ai",
+                confidence=0.9,
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/88/messages")
+
+    assert response.status_code == 200
+    assert "AI识别结果：仓位管理" in response.text
+    assert "主结果：仓位管理" in response.text
+    assert "当前消息建议保护成本" in response.text
+    assert "AI识别结果：非策略" not in response.text
+
+
 def test_group_messages_route_shows_recognition_comparison_results(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
