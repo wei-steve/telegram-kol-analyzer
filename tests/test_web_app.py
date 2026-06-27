@@ -1,7 +1,9 @@
+import re
 from datetime import datetime
 
 from fastapi.testclient import TestClient
 
+from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
@@ -15,6 +17,7 @@ from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import StrategyLifecycle
 
 
 def test_root_page_renders_successfully(tmp_path):
@@ -132,6 +135,88 @@ def test_strategy_mid_panel_loads_only_visible_strategy_list(tmp_path, monkeypat
 
     assert response.status_code == 200
     assert calls == ["pending"]
+
+
+def test_strategy_mid_panel_pending_kpi_matches_actionable_list(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add_all(
+            [
+                StrategyLifecycle(
+                    chat_id=88,
+                    message_id=1,
+                    symbol="QQ",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=datetime(2026, 6, 12, 8, 0),
+                ),
+                StrategyLifecycle(
+                    chat_id=88,
+                    message_id=2,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=datetime(2026, 6, 12, 8, 1),
+                ),
+                StrategyLifecycle(
+                    chat_id=88,
+                    message_id=3,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=datetime(2026, 6, 12, 8, 2),
+                    entry_range_low=6.22,
+                    entry_range_high=6.27,
+                ),
+                StrategyLifecycle(
+                    chat_id=88,
+                    message_id=4,
+                    symbol="ETH",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=datetime(2026, 6, 12, 8, 3),
+                    entry_range_low=3200,
+                    entry_range_high=3220,
+                ),
+                StrategyLifecycle(
+                    chat_id=89,
+                    message_id=5,
+                    symbol="SOL",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=datetime(2026, 6, 12, 8, 4),
+                    entry_range_low=180,
+                    entry_range_high=181,
+                ),
+            ]
+        )
+        session.commit()
+
+    app = create_web_app(
+        database_path=database_path,
+        group_config=GroupConfig(
+            groups=[
+                TargetGroupConfig(
+                    chat_title="Demo",
+                    chat_id=88,
+                    symbol_whitelist=["BTC"],
+                )
+            ]
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.get("/groups/88/strategy-mid-panel?filter=pending")
+
+    assert response.status_code == 200
+    assert re.search(
+        r'class="kpi-badge kpi-pending[^"]*"[^>]*>\s*<strong>0</strong>',
+        response.text,
+    )
+    assert re.search(r'class="strategy-section-count">\s*0\s*</span>', response.text)
+    assert "ETH" not in response.text
+    assert "BTC" not in response.text
 
 
 def test_group_detail_logs_route_timings(tmp_path, caplog):

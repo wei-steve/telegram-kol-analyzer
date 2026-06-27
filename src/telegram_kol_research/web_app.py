@@ -607,8 +607,11 @@ def create_web_app(
             symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
         )
         # ── lifecycle data ──
-        lifecycle_counts = load_lifecycle_counts(app.state.session_factory)
         lifecycle_counts_by_chat_id = load_lifecycle_counts_by_chat_id(
+            app.state.session_factory,
+            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
+        )
+        lifecycle_counts = load_lifecycle_counts(
             app.state.session_factory,
             symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
         )
@@ -859,6 +862,9 @@ def create_web_app(
         lifecycle_counts = load_lifecycle_counts(
             app.state.session_factory,
             chat_id=chat_id,
+            symbol_whitelist_by_chat_id=_symbol_whitelist_by_chat_id(
+                app.state.group_config
+            ),
         )
         lifecycle_counts_ms = _elapsed_ms(step_started_at)
 

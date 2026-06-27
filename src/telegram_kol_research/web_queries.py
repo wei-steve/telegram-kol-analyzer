@@ -757,11 +757,44 @@ def _apply_lifecycle_display_fields(
     return row
 
 
-def load_lifecycle_counts(session_factory, *, chat_id: int | None = None) -> dict[str, int]:
+def load_lifecycle_counts(
+    session_factory,
+    *,
+    chat_id: int | None = None,
+    symbol_whitelist_by_chat_id: dict[int, set[str]] | None = None,
+) -> dict[str, int]:
     """Return counts for each lifecycle status (KPI cards)."""
     from telegram_kol_research.models import StrategyLifecycle
 
     with session_factory() as session:
+        if symbol_whitelist_by_chat_id is not None:
+            query = session.query(
+                StrategyLifecycle.lifecycle_status,
+                StrategyLifecycle.chat_id,
+                StrategyLifecycle.symbol,
+                StrategyLifecycle.entry_range_low,
+                StrategyLifecycle.entry_range_high,
+            )
+            if chat_id is not None:
+                query = query.filter(StrategyLifecycle.chat_id == chat_id)
+            rows = query.all()
+            counts: dict[str, int] = {}
+            for status, row_chat_id, symbol, entry_low, entry_high in rows:
+                allowed_symbols = (
+                    symbol_whitelist_by_chat_id.get(int(row_chat_id))
+                    if row_chat_id is not None
+                    else None
+                )
+                if status == "pending_entry" and not _is_actionable_pending_entry(
+                    symbol=symbol,
+                    entry_low=entry_low,
+                    entry_high=entry_high,
+                    allowed_symbols=allowed_symbols,
+                ):
+                    continue
+                counts[str(status)] = counts.get(str(status), 0) + 1
+            return counts
+
         query = session.query(
             StrategyLifecycle.lifecycle_status,
             func.count(StrategyLifecycle.id),
