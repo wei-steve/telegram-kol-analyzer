@@ -25,6 +25,13 @@
       >
         {{ monitor_status.label if monitor_status else ('监控中' if live_listener_enabled else '已断开') }}
       </span>
+      <button
+        type="button"
+        class="new-messages-button"
+        data-new-messages-button
+        title="Show newest messages"
+        hidden
+      >↑</button>
       {% if not live_listener_enabled and live_listener_status_reason %}
         <span>{{ live_listener_status_reason }}</span>
         {% if session_lock_owner_pid %}

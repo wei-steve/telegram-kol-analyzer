@@ -1073,6 +1073,7 @@ body {
   min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
+  position: relative;
 }
 
 .messages-panel-header {
@@ -1096,6 +1097,31 @@ body {
   font-size: 0.80rem;
   color: #94a3b8;
   min-width: 0;
+}
+
+.new-messages-button {
+  position: absolute;
+  top: 48px;
+  right: 24px;
+  z-index: 7;
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  border-radius: 999px;
+  border-color: rgba(56, 189, 248, 0.58);
+  background: rgba(14, 165, 233, 0.95);
+  color: #f8fafc;
+  font-size: 1rem;
+  font-weight: 900;
+  line-height: 1;
+  box-shadow: 0 8px 18px rgba(2, 6, 23, 0.36);
+}
+.new-messages-button:hover {
+  background: rgba(2, 132, 199, 0.98);
+}
+.new-messages-button[hidden] {
+  display: none;
 }
 
 .message-filter-panel {

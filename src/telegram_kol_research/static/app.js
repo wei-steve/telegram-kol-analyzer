@@ -1,6 +1,9 @@
 let latestFreshnessSnapshot = null;
 let currentSelectedChatId = null;
 let groupSwitchRequestId = 0;
+let hasDeferredMessageRefresh = false;
+
+const MESSAGE_TOP_THRESHOLD = 24;
 
 function escapeHtml(value) {
   return value
@@ -294,11 +297,31 @@ function getLatestMessageId(panel = getMessagePanel()) {
   return Number(panel.dataset.latestMessageId || '0');
 }
 
-function scrollMessagePanelToTop(panel = getMessagePanel()) {
-  if (!panel) {
+function getMessageScrollContainer(panel = getMessagePanel()) {
+  return panel ? panel.querySelector('[data-message-list]') : null;
+}
+
+function isMessagePanelAtTop(panel = getMessagePanel()) {
+  const scrollContainer = getMessageScrollContainer(panel);
+  return !scrollContainer || scrollContainer.scrollTop <= MESSAGE_TOP_THRESHOLD;
+}
+
+function setNewMessagesButtonVisible(panel = getMessagePanel(), visible = false) {
+  const button = panel ? panel.querySelector('[data-new-messages-button]') : null;
+  if (!button) {
     return;
   }
-  panel.scrollTo({ top: 0, behavior: 'auto' });
+  button.hidden = !visible;
+  button.classList.toggle('is-visible', Boolean(visible));
+}
+
+function scrollMessagePanelToTop(panel = getMessagePanel()) {
+  const scrollContainer = getMessageScrollContainer(panel);
+  if (!scrollContainer) {
+    return;
+  }
+  scrollContainer.scrollTo({ top: 0, behavior: 'auto' });
+  setNewMessagesButtonVisible(panel, false);
 }
 
 function resetInitialMessagePanelScroll() {
@@ -582,6 +605,47 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
   if (!panel) {
     return;
   }
+
+  const scrollContainer = getMessageScrollContainer(panel);
+  if (scrollContainer && scrollContainer.dataset.messageScrollBound !== 'true') {
+    scrollContainer.dataset.messageScrollBound = 'true';
+    scrollContainer.addEventListener('scroll', () => {
+      if (isMessagePanelAtTop(panel) && hasDeferredMessageRefresh) {
+        hasDeferredMessageRefresh = false;
+        setNewMessagesButtonVisible(panel, false);
+        refreshCurrentGroupPanel({
+          force: true,
+          scrollToTopAfterRefresh: true,
+          showStatus: false,
+        });
+      } else if (isMessagePanelAtTop(panel)) {
+        setNewMessagesButtonVisible(panel, false);
+      } else if (hasDeferredMessageRefresh) {
+        setNewMessagesButtonVisible(panel, true);
+      }
+    });
+  }
+
+  const newMessagesButton = panel.querySelector('[data-new-messages-button]');
+  if (newMessagesButton && newMessagesButton.dataset.newMessagesBound !== 'true') {
+    newMessagesButton.dataset.newMessagesBound = 'true';
+    newMessagesButton.addEventListener('click', async () => {
+      newMessagesButton.disabled = true;
+      try {
+        hasDeferredMessageRefresh = false;
+        setNewMessagesButtonVisible(panel, false);
+        await refreshCurrentGroupPanel({
+          force: true,
+          scrollToTopAfterRefresh: true,
+          showStatus: false,
+        });
+        await refreshGroupList();
+      } finally {
+        newMessagesButton.disabled = false;
+      }
+    });
+  }
+
   const filterForm = panel.querySelector('[data-message-filters]');
   if (filterForm) {
     filterForm.addEventListener('submit', async (event) => {
@@ -658,7 +722,9 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
           setAiStatus(detail, true);
           return;
         }
-        await refreshCurrentGroupPanel();
+        await refreshCurrentGroupPanel({
+          deferIfMessageListAwayFromTop: Number(payload.inserted_messages || 0) > 0,
+        });
         await refreshGroupList();
         setAiStatus(`Refresh complete. Inserted ${payload.inserted_messages || 0} new message(s).`);
       } catch {
@@ -741,6 +807,7 @@ function bindGroupLinks() {
     element.addEventListener('click', async () => {
       const chatId = Number(element.dataset.chatId);
       const requestId = ++groupSwitchRequestId;
+      hasDeferredMessageRefresh = false;
       syncSelectedGroupState(chatId, { focus: true });
       const detailPanel = document.querySelector('[data-detail-panel]');
       const strategyPanel = document.querySelector('[data-strategy-panel]');
@@ -1470,12 +1537,41 @@ async function refreshCurrentGroupPanel(options = {}) {
   const detailPanel = document.querySelector('[data-detail-panel]');
   if (!detailPanel) return;
 
+  const currentMessagePanel = getMessagePanel();
+  if (
+    options.deferIfMessageListAwayFromTop &&
+    currentMessagePanel &&
+    !isMessagePanelAtTop(currentMessagePanel)
+  ) {
+    hasDeferredMessageRefresh = true;
+    setNewMessagesButtonVisible(currentMessagePanel, true);
+    return;
+  }
+  hasDeferredMessageRefresh = false;
+
+  const currentScrollContainer = getMessageScrollContainer(currentMessagePanel);
+  const previousMessageScrollTop = currentScrollContainer ? currentScrollContainer.scrollTop : 0;
+
   const nextContent = await fetchDetailPanel(chatId);
   if (!nextContent) return;
 
   detailPanel.innerHTML = '';
   detailPanel.appendChild(nextContent);
   bindDetailPanelControls();
+
+  const nextMessagePanel = getMessagePanel();
+  if (options.scrollToTopAfterRefresh) {
+    scrollMessagePanelToTop(nextMessagePanel);
+    hasDeferredMessageRefresh = false;
+  } else if (nextMessagePanel && options.preserveMessageScroll !== false) {
+    const nextScrollContainer = getMessageScrollContainer(nextMessagePanel);
+    if (nextScrollContainer) {
+      nextScrollContainer.scrollTop = previousMessageScrollTop;
+    }
+  }
+  if (nextMessagePanel && isMessagePanelAtTop(nextMessagePanel)) {
+    setNewMessagesButtonVisible(nextMessagePanel, false);
+  }
 
   // Also refresh the strategy mid panel
   await refreshStrategyMidPanel();
@@ -1506,6 +1602,16 @@ function snapshotKey(snapshot, scope) {
   ].join(':');
 }
 
+function hasNewerSelectedMessage(snapshot, previousSnapshot) {
+  const current = snapshot && snapshot.selected ? snapshot.selected : {};
+  const previous = previousSnapshot && previousSnapshot.selected ? previousSnapshot.selected : {};
+  const currentMessageId = Number(current.message_id || 0);
+  const previousMessageId = Number(previous.message_id || 0);
+  const currentRawMessageId = Number(current.raw_message_id || 0);
+  const previousRawMessageId = Number(previous.raw_message_id || 0);
+  return currentMessageId > previousMessageId || currentRawMessageId > previousRawMessageId;
+}
+
 async function refreshFromDatabaseChanges(options = {}) {
   let snapshot = null;
   try {
@@ -1532,13 +1638,17 @@ async function refreshFromDatabaseChanges(options = {}) {
     snapshotKey(snapshot, 'global') !== snapshotKey(latestFreshnessSnapshot, 'global');
   const selectedChanged =
     snapshotKey(snapshot, 'selected') !== snapshotKey(latestFreshnessSnapshot, 'selected');
+  const selectedHasNewerMessage = hasNewerSelectedMessage(snapshot, latestFreshnessSnapshot);
   latestFreshnessSnapshot = snapshot;
 
   if (globalChanged || options.force) {
     await refreshGroupList();
   }
   if (selectedChanged || options.force) {
-    await refreshCurrentGroupPanel({ force: true });
+    await refreshCurrentGroupPanel({
+      force: true,
+      deferIfMessageListAwayFromTop: selectedHasNewerMessage,
+    });
   }
 }
 
@@ -1558,7 +1668,7 @@ function connectLiveUpdates() {
       if (Number(payload.chat_id || 0) !== currentChatId) {
         return;
       }
-      await refreshCurrentGroupPanel();
+      await refreshCurrentGroupPanel({ deferIfMessageListAwayFromTop: true });
     });
     let sseWasDisconnected = false;
     source.onerror = () => {
