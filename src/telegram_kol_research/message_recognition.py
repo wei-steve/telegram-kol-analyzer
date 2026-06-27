@@ -436,6 +436,23 @@ def _recognize_with_glm_ocr(
             merged_text=merged_text,
             config=config,
         )
+        if caption and ocr_parts and result.status != "是策略":
+            try:
+                text_only_result = _recognize_text_with_ai_provider(
+                    raw_message=raw_message,
+                    merged_text=caption,
+                    config=config,
+                )
+            except Exception:
+                text_only_result = None
+            if text_only_result is not None and text_only_result.status == "是策略":
+                _persist_ai_result(
+                    session,
+                    raw_message,
+                    text_only_result,
+                    engine=config.text_provider.model,
+                )
+                return text_only_result
         _persist_ai_result(
             session, raw_message, result, engine=config.text_provider.model,
         )

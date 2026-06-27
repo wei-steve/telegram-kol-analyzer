@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
+from telegram_kol_research.ai_recognition_config import AiProviderConfig, AiRecognitionConfig
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_recognition import (
     _apply_lifecycle_event_decision,
@@ -1420,6 +1420,137 @@ def test_recognize_message_now_keeps_image_pending_for_later_ocr(tmp_path):
 
     assert result.status == "待识别"
     assert result.reason == "图片识别等待 OCR/AI 接入"
+
+
+def test_glm_ocr_caption_message_falls_back_to_text_strategy(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    image_path = tmp_path / "chart.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+    source_text = (
+        "以太币 1555-1535 这里 可以考虑做多\n"
+        "止损：15分钟有效跌破1520\n"
+        "止盈：1575-1600-1625-1640-1675\n"
+        "今天策略已经都盈利了，正常所长就不做单了，给各位一个参考"
+    )
+    seen_chat_inputs: list[str] = []
+
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=6699,
+            sender_name="币圈所长会员群-11分组",
+            posted_at=datetime(2026, 6, 26, 14, 4, 27, tzinfo=UTC),
+            text=source_text,
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            MediaAsset(
+                raw_message_id=raw_message.id,
+                kind="messagemediaphoto",
+                local_path=str(image_path),
+                mime_type="image/jpeg",
+            )
+        )
+        session.commit()
+        raw_message_id = raw_message.id
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json, headers):
+            if url.endswith("/layout_parsing"):
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", url),
+                    json={
+                        "md_results": (
+                            "<table><tr><td>1641.54</td></tr>"
+                            "<tr><td>1624.78</td></tr></table>"
+                        )
+                    },
+                )
+            seen_chat_inputs.append(json["messages"][1]["content"])
+            if len(seen_chat_inputs) == 1:
+                payload = {
+                    "recognition_result": "非策略",
+                    "reason": "OCR 表格缺少方向和完整入场说明",
+                    "strategy": {},
+                    "confidence": 0.3,
+                }
+            else:
+                payload = {
+                    "recognition_result": "是策略",
+                    "reason": "caption 含 ETH 做多、入场、止损和止盈",
+                    "strategy": {
+                        "symbol": "ETH",
+                        "side": "long",
+                        "entry": "1555-1535",
+                        "stop_loss": "1520",
+                        "take_profit": "1575/1600/1625/1640/1675",
+                        "order_type": "limit",
+                    },
+                    "confidence": 0.91,
+                }
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": __import__("json").dumps(
+                                    payload,
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr("telegram_kol_research.message_recognition.httpx.Client", FakeClient)
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=AiProviderConfig(
+                base_url="http://deepseek.test",
+                model="deepseek-chat",
+                timeout_seconds=10,
+            ),
+            image_provider=AiProviderConfig(
+                base_url="http://glm.test",
+                model="glm-ocr",
+                timeout_seconds=10,
+            ),
+        ),
+    )
+
+    assert result.status == "是策略"
+    assert result.parse_source == "text_ai"
+    assert len(seen_chat_inputs) == 2
+    assert "<table>" in seen_chat_inputs[0]
+    assert seen_chat_inputs[1] == source_text
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        recognition = session.query(MessageRecognition).one()
+        media_asset = session.query(MediaAsset).one()
+
+    assert candidate.symbol == "ETH"
+    assert candidate.side == "long"
+    assert candidate.entry_text == "1555-1535"
+    assert candidate.parse_source == "text_ai"
+    assert recognition.status == "是策略"
+    assert media_asset.ocr_text.startswith("<table>")
 
 
 def test_recognize_message_now_raises_for_missing_message(tmp_path):

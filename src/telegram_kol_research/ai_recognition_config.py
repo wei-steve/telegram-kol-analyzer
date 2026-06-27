@@ -161,6 +161,12 @@ MARKET_ENTRY_WITH_PRICE_INSTRUCTION = (
     '"市价进场"；strategy.order_type 可单独输出 "market" 或 "market+limit"。'
 )
 
+REFERENCE_STRATEGY_INSTRUCTION = (
+    '- 如果同一条消息已经给出完整的新开仓参数（标的、方向、入场区间或价格、止损、止盈），'
+    '不要仅因为出现“可以考虑”“参考”“正常我不做单”等弱提示就判为非策略；'
+    '只有明确要求用户不要进场、取消该单、已经错过入场，或只是在复盘既有仓位时，才判为非策略。'
+)
+
 
 @dataclass(frozen=True)
 class AiProviderConfig:
@@ -501,9 +507,18 @@ def _with_normalized_strategy_output_instructions(prompt: str) -> str:
     prompt = prompt.strip()
     if "【策略字段统一格式】" in prompt:
         if MARKET_ENTRY_WITH_PRICE_INSTRUCTION not in prompt:
-            return f"{prompt}\n{MARKET_ENTRY_WITH_PRICE_INSTRUCTION}"
+            prompt = f"{prompt}\n{MARKET_ENTRY_WITH_PRICE_INSTRUCTION}"
+        return _with_reference_strategy_instruction(prompt)
+    return _with_reference_strategy_instruction(
+        f"{prompt}\n\n{NORMALIZED_STRATEGY_OUTPUT_INSTRUCTIONS.strip()}"
+    )
+
+
+def _with_reference_strategy_instruction(prompt: str) -> str:
+    prompt = prompt.strip()
+    if REFERENCE_STRATEGY_INSTRUCTION in prompt:
         return prompt
-    return f"{prompt}\n\n{NORMALIZED_STRATEGY_OUTPUT_INSTRUCTIONS.strip()}"
+    return f"{prompt}\n{REFERENCE_STRATEGY_INSTRUCTION}"
 
 
 def _with_market_entry_with_price_instruction(prompt: str) -> str:
