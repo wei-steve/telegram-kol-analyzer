@@ -106,7 +106,7 @@ def run_mimo_direct_experiment(
                 .order_by(MediaAsset.id.asc())
                 .all()
             )
-            actual_input_kind = _resolve_input_kind(raw_message, media_assets)
+            actual_input_kind = _resolve_input_kind(raw_message, media_assets, media_root=media_root)
             if actual_input_kind == "empty":
                 stats = _replace(stats, skipped_no_input=stats.skipped_no_input + 1)
                 continue
@@ -115,7 +115,7 @@ def run_mimo_direct_experiment(
                     raw_message=raw_message,
                     media_assets=media_assets,
                     model_config=model_config,
-                    prompt=config.mimo_direct_prompt,
+                    prompt=_build_mimo_experiment_prompt(config),
                     media_root=media_root,
                 )
                 _upsert_experiment_result(
@@ -139,6 +139,61 @@ def run_mimo_direct_experiment(
                 stats = _replace(stats, failed=stats.failed + 1)
             session.commit()
     return stats
+
+
+def run_mimo_direct_for_message(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    ai_recognition_config: AiRecognitionConfig | None = None,
+    ai_recognition_config_path: str | Path = "config/ai_recognition.yaml",
+    media_root: str | Path = "data/media",
+) -> RecognitionExperiment | None:
+    config = ai_recognition_config or load_ai_recognition_config(ai_recognition_config_path)
+    model_config = _find_mimo_model(config)
+    if model_config is None or not model_config.provider.is_configured:
+        return None
+
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, raw_message_id)
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        media_assets = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.raw_message_id == raw_message.id)
+            .order_by(MediaAsset.id.asc())
+            .all()
+        )
+        input_kind = _resolve_input_kind(raw_message, media_assets, media_root=media_root)
+        if input_kind == "empty":
+            return None
+        try:
+            payload = _call_mimo_direct_model(
+                raw_message=raw_message,
+                media_assets=media_assets,
+                model_config=model_config,
+                prompt=_build_mimo_experiment_prompt(config),
+                media_root=media_root,
+            )
+            result = _upsert_experiment_result(
+                session,
+                raw_message=raw_message,
+                model_config=model_config,
+                input_kind=input_kind,
+                payload=payload,
+                error_message=None,
+            )
+        except Exception as exc:
+            result = _upsert_experiment_result(
+                session,
+                raw_message=raw_message,
+                model_config=model_config,
+                input_kind=input_kind,
+                payload={},
+                error_message=str(exc),
+            )
+        session.commit()
+        return result
 
 
 def _load_experiment_messages(
@@ -291,9 +346,14 @@ def _media_asset_to_data_url(media_asset: MediaAsset, *, media_root: str | Path 
     return f"data:{mime_type};base64,{encoded}"
 
 
-def _resolve_input_kind(raw_message: RawMessage, media_assets: list[MediaAsset]) -> str:
+def _resolve_input_kind(
+    raw_message: RawMessage,
+    media_assets: list[MediaAsset],
+    *,
+    media_root: str | Path = "data/media",
+) -> str:
     has_text = bool((raw_message.text or "").strip())
-    has_image = any(_media_asset_to_data_url(asset) for asset in media_assets)
+    has_image = any(_media_asset_to_data_url(asset, media_root=media_root) for asset in media_assets)
     if has_text and has_image:
         return "text+image"
     if has_image:
@@ -301,6 +361,26 @@ def _resolve_input_kind(raw_message: RawMessage, media_assets: list[MediaAsset])
     if has_text:
         return "text"
     return "empty"
+
+
+def _build_mimo_experiment_prompt(config: AiRecognitionConfig) -> str:
+    text_prompt = config.recognition_prompt.strip()
+    image_prompt = config.mimo_direct_prompt.strip()
+    if not text_prompt:
+        return image_prompt
+    if not image_prompt or image_prompt in text_prompt:
+        return text_prompt
+    return "\n\n".join(
+        [
+            text_prompt,
+            (
+                "MiMo 对照实验要求：请按上面的文字策略识别规则判断。"
+                "如果有图片，必须结合文字/caption 语境与图片内容整体判断；"
+                "如果没有图片，就只根据当前文字判断。"
+            ),
+            image_prompt,
+        ]
+    )
 
 
 def _find_mimo_model(config: AiRecognitionConfig) -> AiModelConfig | None:

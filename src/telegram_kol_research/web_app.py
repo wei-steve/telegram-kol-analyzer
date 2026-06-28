@@ -42,6 +42,7 @@ from telegram_kol_research.group_config import update_group_automation_settings
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.message_recognition import recognize_message_now
 from telegram_kol_research.models import RawMessage
+from telegram_kol_research.recognition_experiments import run_mimo_direct_for_message
 from telegram_kol_research.llm_chat import (
     build_proxy_chat_payload,
     build_scope_context,
@@ -986,12 +987,17 @@ def create_web_app(
     @app.post("/api/messages/{raw_message_id}/recognize")
     def recognize_message(raw_message_id: int):
         try:
+            ai_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
             result = app.state.message_recognizer(
                 app.state.session_factory,
                 raw_message_id=raw_message_id,
-                ai_recognition_config=load_ai_recognition_config(
-                    app.state.ai_recognition_config_path
-                ),
+                ai_recognition_config=ai_config,
+            )
+            run_mimo_direct_for_message(
+                app.state.session_factory,
+                raw_message_id=raw_message_id,
+                ai_recognition_config=ai_config,
+                media_root=app.state.media_root,
             )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

@@ -1,7 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 
-from telegram_kol_research.ai_recognition_config import AiRecognitionConfig, save_ai_recognition_config
+from telegram_kol_research.ai_recognition_config import AiModelConfig, AiRecognitionConfig, save_ai_recognition_config
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.models import RawMessage
@@ -138,3 +138,61 @@ def test_persist_live_message_event_loads_ai_config_path_per_message(tmp_path, m
 
     assert seen_prompts[0].startswith("First prompt.")
     assert seen_prompts[1].startswith("Second prompt.")
+
+
+def test_persist_live_message_event_runs_mimo_side_channel(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    broker = LiveUpdateBroker()
+    config = AiRecognitionConfig(
+        recognition_prompt="DeepSeek rules.",
+        mimo_direct_prompt="MiMo rules.",
+        ai_models=[
+            AiModelConfig(
+                id="mimo-v2.5",
+                label="MiMo V2.5",
+                base_url="https://api.xiaomimimo.com/v1",
+                api_key="mimo-key",
+                model="mimo-v2.5",
+                supports_text=True,
+                supports_image=True,
+            )
+        ],
+    )
+    recognized: list[int] = []
+    compared: list[tuple[int, str]] = []
+
+    def fake_recognize_message_now(session_factory, *, raw_message_id, ai_recognition_config):
+        recognized.append(raw_message_id)
+        return None
+
+    def fake_run_mimo_direct_for_message(
+        session_factory,
+        *,
+        raw_message_id,
+        ai_recognition_config,
+        media_root,
+    ):
+        compared.append((raw_message_id, ai_recognition_config.mimo_direct_prompt))
+        return None
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.recognize_message_now",
+        fake_recognize_message_now,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.run_mimo_direct_for_message",
+        fake_run_mimo_direct_for_message,
+    )
+
+    asyncio.run(
+        persist_live_message_event(
+            event=_FakeEvent(),
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            ai_recognition_config=config,
+        )
+    )
+
+    assert len(recognized) == 1
+    assert compared == [(recognized[0], "MiMo rules.")]

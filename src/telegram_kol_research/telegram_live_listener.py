@@ -17,6 +17,7 @@ from telegram_kol_research.message_recognition import (
 from telegram_kol_research.models import MediaAsset, RawMessage
 from telegram_kol_research.raw_ingest import normalize_message_payload, persist_normalized_messages
 from telegram_kol_research.raw_ingest import repair_history_checkpoints
+from telegram_kol_research.recognition_experiments import run_mimo_direct_for_message
 from telegram_kol_research.strategy_alerts import process_strategy_alert_for_record
 from telegram_kol_research.telegram_client import (
     _download_media_if_present,
@@ -115,6 +116,13 @@ async def persist_live_message_event(
                 session_factory,
                 raw_message_id=raw_message.id,
                 ai_recognition_config=live_ai_config,
+            )
+            await asyncio.to_thread(
+                run_mimo_direct_for_message,
+                session_factory,
+                raw_message_id=raw_message.id,
+                ai_recognition_config=live_ai_config,
+                media_root=media_root,
             )
             # ── exit signal → lifecycle monitor ──
             if lifecycle_monitor is not None and recog_result is not None:
