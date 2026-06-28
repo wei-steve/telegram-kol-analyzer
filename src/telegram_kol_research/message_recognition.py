@@ -567,7 +567,7 @@ def _recognize_text_with_ai_provider(
 
     with httpx.Client(timeout=provider.timeout_seconds) as client:
         response = client.post(
-            f"{provider.base_url.rstrip('/')}/v1/chat/completions",
+            _chat_completions_url(provider.base_url),
             json=payload,
             headers=headers,
         )
@@ -613,7 +613,7 @@ def _recognize_with_ai_provider(
         headers["Authorization"] = f"Bearer {provider.api_key}"
     with httpx.Client(timeout=provider.timeout_seconds) as client:
         response = client.post(
-            f"{provider.base_url.rstrip('/')}/v1/chat/completions",
+            _chat_completions_url(provider.base_url),
             json=payload,
             headers=headers,
         )
@@ -683,6 +683,13 @@ def _build_ai_recognition_payload(
         ],
         "temperature": 0,
     }
+
+
+def _chat_completions_url(base_url: str) -> str:
+    normalized = base_url.strip().rstrip("/")
+    if normalized.endswith("/v1"):
+        return f"{normalized}/chat/completions"
+    return f"{normalized}/v1/chat/completions"
 
 
 LIFECYCLE_EVENT_PROMPT = """
@@ -872,7 +879,7 @@ def _call_lifecycle_event_ai(
         headers["Authorization"] = f"Bearer {provider.api_key}"
     with httpx.Client(timeout=provider.timeout_seconds) as client:
         response = client.post(
-            f"{provider.base_url.rstrip('/')}/v1/chat/completions",
+            _chat_completions_url(provider.base_url),
             json=payload,
             headers=headers,
         )

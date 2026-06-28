@@ -7,6 +7,7 @@ from telegram_kol_research.ai_recognition_config import AiProviderConfig, AiReco
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_recognition import (
     _apply_lifecycle_event_decision,
+    _chat_completions_url,
     _ensure_lifecycle_record,
     _result_from_ai_payload,
     _upsert_ai_signal_candidate,
@@ -51,6 +52,17 @@ def _mock_deepseek_lifecycle_event(monkeypatch, payload, *, seen_requests=None):
             )
 
     monkeypatch.setattr("telegram_kol_research.message_recognition.httpx.Client", FakeClient)
+
+
+def test_chat_completions_url_does_not_duplicate_v1_path():
+    assert (
+        _chat_completions_url("https://api.xiaomimimo.com/v1")
+        == "https://api.xiaomimimo.com/v1/chat/completions"
+    )
+    assert (
+        _chat_completions_url("https://api.deepseek.com")
+        == "https://api.deepseek.com/v1/chat/completions"
+    )
 
 
 def test_recognize_message_now_persists_text_strategy_candidate(tmp_path):
