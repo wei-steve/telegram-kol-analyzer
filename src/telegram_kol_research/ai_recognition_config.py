@@ -250,7 +250,7 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
     path = Path(config_path)
     if not path.exists():
         return AiRecognitionConfig(
-            mimo_direct_prompt=_with_market_entry_with_price_instruction(DEFAULT_MIMO_DIRECT_PROMPT)
+            mimo_direct_prompt=_with_mimo_direct_instructions(DEFAULT_MIMO_DIRECT_PROMPT)
         )
 
     raw_data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -261,7 +261,7 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
         str(raw_data.get("recognition_prompt") or DEFAULT_RECOGNITION_PROMPT)
     )
     lifecycle_event_prompt = str(raw_data.get("lifecycle_event_prompt") or DEFAULT_LIFECYCLE_EVENT_PROMPT)
-    mimo_direct_prompt = _with_market_entry_with_price_instruction(
+    mimo_direct_prompt = _with_mimo_direct_instructions(
         str(raw_data.get("mimo_direct_prompt") or DEFAULT_MIMO_DIRECT_PROMPT)
     )
     mode = str(raw_data.get("mode") or "local_rule_parser")
@@ -329,7 +329,7 @@ def save_ai_recognition_config(
             config.recognition_prompt.strip() or DEFAULT_RECOGNITION_PROMPT
         ),
         lifecycle_event_prompt=config.lifecycle_event_prompt.strip() or DEFAULT_LIFECYCLE_EVENT_PROMPT,
-        mimo_direct_prompt=_with_market_entry_with_price_instruction(
+        mimo_direct_prompt=_with_mimo_direct_instructions(
             config.mimo_direct_prompt.strip() or DEFAULT_MIMO_DIRECT_PROMPT
         ),
         mode=_resolve_mode(config),
@@ -528,6 +528,12 @@ def _with_market_entry_with_price_instruction(prompt: str) -> str:
     if MARKET_ENTRY_WITH_PRICE_INSTRUCTION in prompt:
         return prompt
     return f"{prompt}\n\n{MARKET_ENTRY_WITH_PRICE_INSTRUCTION}"
+
+
+def _with_mimo_direct_instructions(prompt: str) -> str:
+    return _with_reference_strategy_instruction(
+        _with_market_entry_with_price_instruction(prompt)
+    )
 
 
 def _provider_to_payload(config: AiProviderConfig) -> dict[str, Any]:

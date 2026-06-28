@@ -601,7 +601,7 @@ def _recognize_with_ai_provider(
     payload = _build_ai_recognition_payload(
         raw_message=raw_message,
         media_assets=media_assets,
-        prompt=config.recognition_prompt,
+        prompt=config.mimo_direct_prompt if media_assets else config.recognition_prompt,
         model=provider.model,
     )
     headers = {"Content-Type": "application/json"}

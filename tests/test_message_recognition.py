@@ -1760,6 +1760,106 @@ def test_glm_ocr_recap_caption_does_not_import_old_screenshot_strategy(
     assert "HYPE 现在63.6附近开空" in (media_asset.ocr_text or "")
 
 
+def test_mimo_image_recognition_uses_caption_and_raw_image_without_ocr(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    image_path = tmp_path / "old-strategy.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+    source_text = "\u8fd9\u4e2a\u7b56\u7565\u5df2\u7ecf\u76c8\u5229\uff0c\u505a\u4e2a\u590d\u76d8\u53c2\u8003"
+    seen_requests: list[dict] = []
+
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9189,
+            sender_name="\u6bd4\u7279\u5e01\u9648\u54e5\u4f1a\u5458\u7fa4-11\u5206\u7ec4",
+            text=source_text,
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            MediaAsset(
+                raw_message_id=raw_message.id,
+                kind="messagemediaphoto",
+                local_path=str(image_path),
+                mime_type="image/jpeg",
+            )
+        )
+        session.commit()
+        raw_message_id = raw_message.id
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json, headers):
+            seen_requests.append(json)
+            payload = {
+                "recognition_result": "\u975e\u7b56\u7565",
+                "input_reading": {
+                    "observed_text": "\u914d\u6587\u8bf4\u5df2\u7ecf\u76c8\u5229\uff0c\u56fe\u7247\u662f\u5386\u53f2\u7b56\u7565\u622a\u56fe",
+                    "image_quality": "clear",
+                },
+                "reason": "\u540c\u6761\u6d88\u606f\u662f\u76c8\u5229\u590d\u76d8\uff0c\u4e0d\u662f\u65b0\u5f00\u4ed3\u7b56\u7565",
+                "strategy": {},
+                "confidence": 0.2,
+            }
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": __import__("json").dumps(
+                                    payload,
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr("telegram_kol_research.message_recognition.httpx.Client", FakeClient)
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            mimo_direct_prompt="Use MiMo direct prompt.",
+            image_provider=AiProviderConfig(
+                base_url="https://api.xiaomimimo.com/v1",
+                model="mimo-v2.5",
+                timeout_seconds=10,
+            ),
+        ),
+    )
+
+    assert result.status == "\u975e\u7b56\u7565"
+    assert result.parse_source == "image_ai"
+    assert len(seen_requests) == 1
+    request = seen_requests[0]
+    assert request["model"] == "mimo-v2.5"
+    assert request["messages"][0]["content"] == "Use MiMo direct prompt."
+    user_content = request["messages"][1]["content"]
+    assert isinstance(user_content, list)
+    assert source_text in user_content[0]["text"]
+    assert user_content[1]["type"] == "image_url"
+    assert user_content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    with session_factory() as session:
+        assert session.query(SignalCandidate).count() == 0
+        media_asset = session.query(MediaAsset).one()
+    assert media_asset.ocr_text is None
+
+
 def test_recognize_message_now_raises_for_missing_message(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
 
