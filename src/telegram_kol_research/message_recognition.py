@@ -601,7 +601,11 @@ def _recognize_with_ai_provider(
     payload = _build_ai_recognition_payload(
         raw_message=raw_message,
         media_assets=media_assets,
-        prompt=config.mimo_direct_prompt if media_assets else config.recognition_prompt,
+        prompt=(
+            _build_multimodal_recognition_prompt(config)
+            if media_assets
+            else config.recognition_prompt
+        ),
         model=provider.model,
     )
     headers = {"Content-Type": "application/json"}
@@ -622,6 +626,27 @@ def _recognize_with_ai_provider(
         raw_message_id=raw_message.id,
         payload=parsed,
         parse_source=parse_source,
+    )
+
+
+def _build_multimodal_recognition_prompt(config: AiRecognitionConfig) -> str:
+    text_prompt = config.recognition_prompt.strip()
+    image_prompt = config.mimo_direct_prompt.strip()
+    if not text_prompt:
+        return image_prompt
+    if not image_prompt or image_prompt in text_prompt:
+        return text_prompt
+    return "\n\n".join(
+        [
+            text_prompt,
+            (
+                "多模态补充要求：当前消息可能同时包含文字/caption 和图片。"
+                "必须结合文字语境与图片内容整体判断，不要只识别图片中的文字；"
+                "如果文字说明这是盈利、复盘、参考或历史截图，而图片里是旧策略，"
+                "应按非策略处理。"
+            ),
+            image_prompt,
+        ]
     )
 
 

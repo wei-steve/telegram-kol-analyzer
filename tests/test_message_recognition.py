@@ -1834,6 +1834,7 @@ def test_mimo_image_recognition_uses_caption_and_raw_image_without_ocr(
         session_factory,
         raw_message_id=raw_message_id,
         ai_recognition_config=AiRecognitionConfig(
+            recognition_prompt="Use strict DeepSeek text rules.",
             mimo_direct_prompt="Use MiMo direct prompt.",
             image_provider=AiProviderConfig(
                 base_url="https://api.xiaomimimo.com/v1",
@@ -1848,7 +1849,10 @@ def test_mimo_image_recognition_uses_caption_and_raw_image_without_ocr(
     assert len(seen_requests) == 1
     request = seen_requests[0]
     assert request["model"] == "mimo-v2.5"
-    assert request["messages"][0]["content"] == "Use MiMo direct prompt."
+    system_prompt = request["messages"][0]["content"]
+    assert "Use strict DeepSeek text rules." in system_prompt
+    assert "Use MiMo direct prompt." in system_prompt
+    assert "\u5fc5\u987b\u7ed3\u5408\u6587\u5b57\u8bed\u5883\u4e0e\u56fe\u7247\u5185\u5bb9\u6574\u4f53\u5224\u65ad" in system_prompt
     user_content = request["messages"][1]["content"]
     assert isinstance(user_content, list)
     assert source_text in user_content[0]["text"]
