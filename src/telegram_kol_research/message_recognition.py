@@ -41,6 +41,35 @@ BLOCKED_SYMBOLS = {
     "HTTPS",
 }
 
+EXIT_SYMBOL_ALIASES = {
+    "BTCUSDT": "BTC",
+    "BTC": "BTC",
+    "XBT": "BTC",
+    "大饼": "BTC",
+    "比特币": "BTC",
+    "ETHUSDT": "ETH",
+    "ETH": "ETH",
+    "以太币": "ETH",
+    "以太": "ETH",
+    "SOLUSDT": "SOL",
+    "SOL": "SOL",
+    "SOLANA": "SOL",
+    "HYPEUSDT": "HYPE",
+    "HYPE": "HYPE",
+    "DOGEUSDT": "DOGE",
+    "DOGE": "DOGE",
+    "BNBUSDT": "BNB",
+    "BNB": "BNB",
+    "XRPUSDT": "XRP",
+    "XRP": "XRP",
+    "ADAUSDT": "ADA",
+    "ADA": "ADA",
+    "SUIUSDT": "SUI",
+    "SUI": "SUI",
+    "LINKUSDT": "LINK",
+    "LINK": "LINK",
+}
+
 DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS = 72
 
 ENTRY_TERMS = [
@@ -842,6 +871,9 @@ def _apply_lifecycle_event_decision(
 
     target = _resolve_lifecycle_event_target(session, raw_message, decision)
     if target is None:
+        return False
+    explicit_symbol = _extract_exit_symbol(raw_message.text or "")
+    if explicit_symbol is not None and target.symbol != explicit_symbol:
         return False
 
     event_at = raw_message.posted_at or utc_now()
@@ -1830,17 +1862,11 @@ def _datetime_after(left, right) -> bool:
 
 
 def _extract_exit_symbol(text: str) -> str | None:
-    for alias, symbol in {
-        "BTC": "BTC",
-        "BTCUSDT": "BTC",
-        "XBT": "BTC",
-        "大饼": "BTC",
-        "比特币": "BTC",
-        "ETH": "ETH",
-        "ETHUSDT": "ETH",
-        "以太": "ETH",
-    }.items():
-        if re.search(rf"\b{re.escape(alias)}\b", text, flags=re.IGNORECASE) or alias in text:
+    for alias, symbol in EXIT_SYMBOL_ALIASES.items():
+        if alias.isascii():
+            if re.search(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", text, flags=re.IGNORECASE):
+                return symbol
+        elif alias in text:
             return symbol
     return None
 

@@ -1195,6 +1195,93 @@ def test_lifecycle_event_ignores_stop_update_after_protective_stop_exit(tmp_path
         assert session.query(SignalCandidate).count() == 0
 
 
+def test_lifecycle_event_rejects_target_with_different_explicit_symbol(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=9181,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 28, 1, 0, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 28, 1, 10, tzinfo=UTC),
+            entry_range_low=60300,
+            entry_range_high=60600,
+            stop_loss=60300,
+            take_profit="58400/57000",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9188,
+            posted_at=datetime(2026, 6, 28, 5, 29, 38, tzinfo=UTC),
+            text="一对一指导SOL空单，市价70全部止盈出局。",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.flush()
+
+        applied = _apply_lifecycle_event_decision(
+            session,
+            raw_message,
+            {
+                "event_type": "exit_position",
+                "target_lifecycle_id": lifecycle.id,
+                "symbol": "BTC",
+                "side": "short",
+                "confidence": 0.9,
+                "reason": "模型误把 SOL 消息指向 BTC 策略",
+            },
+        )
+        session.flush()
+
+        assert applied is False
+        assert lifecycle.lifecycle_status == "entered"
+        assert lifecycle.exit_signal_message_id is None
+        assert session.query(SignalCandidate).count() == 0
+
+
+def test_exit_heuristic_does_not_close_btc_when_message_names_sol(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        btc_lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=9181,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 28, 1, 0, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 28, 1, 10, tzinfo=UTC),
+            entry_range_low=60300,
+            entry_range_high=60600,
+            stop_loss=60300,
+            take_profit="58400/57000",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9188,
+            posted_at=datetime(2026, 6, 28, 5, 29, 38, tzinfo=UTC),
+            text="一对一指导SOL空单，市价70全部止盈出局。",
+        )
+        session.add_all([btc_lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = btc_lifecycle.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+        assert lifecycle.lifecycle_status == "entered"
+        assert lifecycle.exit_signal_message_id is None
+        assert session.query(SignalCandidate).count() == 0
+
+
 def test_ai_lifecycle_event_records_scaled_take_profit_percentage_update(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
