@@ -518,7 +518,14 @@ def _candidate_event_status(event_type: str | None) -> str:
 
 
 def _recognition_status_class(status: str) -> str:
-    if status == "是策略":
+    if status in {
+        "是策略",
+        "入场确认",
+        "取消入场",
+        "离场信号",
+        "仓位管理",
+        "策略调整",
+    }:
         return "is-strategy"
     if status == "非策略":
         return "is-not-strategy"

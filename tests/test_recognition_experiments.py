@@ -342,6 +342,7 @@ def test_run_mimo_direct_for_message_omits_empty_strategy_json(tmp_path, monkeyp
     run_mimo_direct_for_message(
         session_factory,
         raw_message_id=raw_message_id,
+        media_root=tmp_path,
         ai_recognition_config=AiRecognitionConfig(
             ai_models=[
                 AiModelConfig(
@@ -361,6 +362,109 @@ def test_run_mimo_direct_for_message_omits_empty_strategy_json(tmp_path, monkeyp
         experiment = session.query(RecognitionExperiment).one()
         assert experiment.status == "\u975e\u7b56\u7565"
         assert experiment.strategy_json is None
+
+
+def test_run_mimo_direct_for_message_accepts_position_management_status(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    image_path = tmp_path / "eth-position.jpg"
+    image_path.write_bytes(b"\xff\xd8\xff\xd9")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=10,
+            sender_name="Trader",
+            posted_at=datetime(2026, 6, 1, tzinfo=UTC),
+            text="\u7b2c\u4e00\u6b62\u76c8\u70b9\u6765\u4e86",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            MediaAsset(
+                raw_message_id=raw_message.id,
+                kind="messagemediaphoto",
+                local_path=str(image_path),
+                mime_type="image/jpeg",
+            )
+        )
+        session.commit()
+        raw_message_id = raw_message.id
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "recognition_result": "\u4ed3\u4f4d\u7ba1\u7406",
+                                    "input_reading": {
+                                        "observed_text": "\u7b2c\u4e00\u6b62\u76c8\u70b9\u6765\u4e86\uff1bETHUSDT \u591a\u5355\u6301\u4ed3\u6536\u76ca\u622a\u56fe",
+                                        "image_quality": "clear",
+                                    },
+                                    "reason": "\u5df2\u6709 ETH \u591a\u5355\u8fbe\u5230\u7b2c\u4e00\u6b62\u76c8\uff0c\u5c5e\u4e8e\u90e8\u5206\u6b62\u76c8\u7ba1\u7406\u3002",
+                                    "strategy": {
+                                        "symbol": "ETH",
+                                        "side": "long",
+                                        "take_profit": "\u7b2c\u4e00\u6b62\u76c8",
+                                    },
+                                    "confidence": 0.86,
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json, headers):
+            system_prompt = json["messages"][0]["content"]
+            assert "\u7b2c\u4e00\u6b62\u76c8\u70b9\u6765\u4e86" in system_prompt
+            assert "\u4ed3\u4f4d\u7ba1\u7406" in system_prompt
+            return FakeResponse()
+
+    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", FakeClient)
+
+    run_mimo_direct_for_message(
+        session_factory,
+        raw_message_id=raw_message_id,
+        media_root=tmp_path,
+        ai_recognition_config=AiRecognitionConfig(
+            ai_models=[
+                AiModelConfig(
+                    id="mimo-v2.5",
+                    label="MiMo V2.5",
+                    base_url="https://api.xiaomimimo.com/v1",
+                    api_key="mimo-key",
+                    model="mimo-v2.5",
+                    supports_text=True,
+                    supports_image=True,
+                )
+            ],
+        ),
+    )
+
+    with session_factory() as session:
+        experiment = session.query(RecognitionExperiment).one()
+        assert experiment.status == "\u4ed3\u4f4d\u7ba1\u7406"
+        assert experiment.input_kind == "text+image"
+        assert experiment.strategy_json is not None
 
 
 def test_run_mimo_direct_experiment_persists_http_error_response_body(tmp_path, monkeypatch):

@@ -24,6 +24,16 @@ from telegram_kol_research.models import MediaAsset, RawMessage, RecognitionExpe
 
 MIMO_DIRECT_EXPERIMENT_NAME = "mimo_direct_v1"
 MIMO_DIRECT_PROMPT_VERSION = "mimo_direct_v1"
+MIMO_EXPERIMENT_STATUSES = {
+    "是策略",
+    "非策略",
+    "识别失败",
+    "入场确认",
+    "取消入场",
+    "离场信号",
+    "仓位管理",
+    "策略调整",
+}
 
 MIMO_DIRECT_PROMPT = """
 你是 Telegram 加密货币 KOL 消息的多模态交易策略识别器。
@@ -317,7 +327,7 @@ def _upsert_experiment_result(
     input_reading = payload.get("input_reading") if isinstance(payload.get("input_reading"), dict) else {}
     strategy = payload.get("strategy") if isinstance(payload.get("strategy"), dict) else {}
     status = str(payload.get("recognition_result") or ("识别失败" if error_message else "识别失败")).strip()
-    if status not in {"是策略", "非策略", "识别失败"}:
+    if status not in MIMO_EXPERIMENT_STATUSES:
         status = "识别失败"
     existing.model = model_config.model
     existing.prompt_version = MIMO_DIRECT_PROMPT_VERSION
@@ -381,6 +391,14 @@ def _build_mimo_experiment_prompt(config: AiRecognitionConfig) -> str:
                 "MiMo 对照实验要求：请按上面的文字策略识别规则判断。"
                 "如果有图片，必须结合文字/caption 语境与图片内容整体判断；"
                 "如果没有图片，就只根据当前文字判断。"
+                "除了识别新的开仓策略，也要识别已有策略的生命周期事件。"
+                "当消息出现“第一止盈点来了”“止盈点来了”“已到第一目标”“减仓”“部分止盈”"
+                "并且文字或图片显示已有持仓、收益率、开仓均价、最新价、交易对或多空方向时，"
+                "应判定为“仓位管理”，不要判定为“非策略”。"
+                "当消息表示全部止盈、平仓、离场、止损时，判定为“离场信号”；"
+                "当消息表示现在进场、已进场、入场了，判定为“入场确认”；"
+                "当消息表示取消挂单、取消策略、不进了，判定为“取消入场”。"
+                "recognition_result 只能输出：是策略、非策略、识别失败、入场确认、取消入场、离场信号、仓位管理、策略调整。"
             ),
             image_prompt,
         ]
