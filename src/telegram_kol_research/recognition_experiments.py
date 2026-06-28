@@ -325,7 +325,11 @@ def _upsert_experiment_result(
     existing.status = status
     existing.reason = str(payload.get("reason") or "").strip() or None
     existing.observed_text = str(input_reading.get("observed_text") or "").strip() or None
-    existing.strategy_json = json.dumps(strategy, ensure_ascii=False, sort_keys=True) if strategy else None
+    existing.strategy_json = (
+        json.dumps(strategy, ensure_ascii=False, sort_keys=True)
+        if _has_meaningful_strategy_fields(strategy)
+        else None
+    )
     existing.confidence = float(payload.get("confidence") or 0.0)
     existing.raw_response_json = json.dumps(payload, ensure_ascii=False, sort_keys=True) if payload else None
     existing.error_message = error_message
@@ -381,6 +385,10 @@ def _build_mimo_experiment_prompt(config: AiRecognitionConfig) -> str:
             image_prompt,
         ]
     )
+
+
+def _has_meaningful_strategy_fields(strategy: dict[str, Any]) -> bool:
+    return any(value not in (None, "", [], {}) for value in strategy.values())
 
 
 def _find_mimo_model(config: AiRecognitionConfig) -> AiModelConfig | None:

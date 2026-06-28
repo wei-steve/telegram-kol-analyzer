@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Iterable
 
@@ -416,7 +417,7 @@ def _serialize_mimo_experiment(experiment: RecognitionExperiment | None) -> dict
     if experiment is None:
         return _not_run()
     summary = experiment.observed_text
-    if experiment.strategy_json:
+    if _has_meaningful_strategy_json(experiment.strategy_json):
         summary = f"{summary or ''}\n{experiment.strategy_json}".strip()
     return {
         "status": experiment.status,
@@ -425,6 +426,18 @@ def _serialize_mimo_experiment(experiment: RecognitionExperiment | None) -> dict
         "engine": experiment.model,
         "status_class": _recognition_status_class(experiment.status),
     }
+
+
+def _has_meaningful_strategy_json(strategy_json: str | None) -> bool:
+    if not strategy_json:
+        return False
+    try:
+        payload = json.loads(strategy_json)
+    except json.JSONDecodeError:
+        return True
+    if not isinstance(payload, dict):
+        return True
+    return any(value not in (None, "", [], {}) for value in payload.values())
 
 
 def _not_run() -> dict[str, str | None]:

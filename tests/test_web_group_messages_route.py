@@ -438,6 +438,48 @@ def test_group_messages_route_shows_recognition_comparison_results(tmp_path):
     assert "BTC long 68000 SL 67000 TP 70000" in response.text
 
 
+def test_group_messages_route_hides_empty_mimo_strategy_json(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    empty_strategy_json = (
+        '{"entry": null, "side": null, "stop_loss": null, '
+        '"symbol": null, "take_profit": null}'
+    )
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=5,
+            sender_name="Alice",
+            posted_at=datetime(2026, 4, 4, tzinfo=UTC),
+            text="Join the VIP channel.",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            RecognitionExperiment(
+                raw_message_id=raw_message.id,
+                experiment_name="mimo_direct_v1",
+                model="mimo-v2.5",
+                prompt_version="mimo_direct_v1",
+                input_kind="text",
+                status="\u975e\u7b56\u7565",
+                reason="Advertisement.",
+                observed_text="Join the VIP channel.",
+                strategy_json=empty_strategy_json,
+                confidence=0.1,
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/88/messages")
+
+    assert response.status_code == 200
+    assert "MiMo text" in response.text
+    assert "Join the VIP channel." in response.text
+    assert empty_strategy_json not in response.text
+
+
 def test_group_messages_route_renders_immediate_recognition_button(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

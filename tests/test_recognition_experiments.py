@@ -279,6 +279,90 @@ def test_run_mimo_direct_for_message_persists_text_side_channel(tmp_path, monkey
         assert session.query(SignalCandidate).count() == 0
 
 
+def test_run_mimo_direct_for_message_omits_empty_strategy_json(tmp_path, monkeypatch):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=9,
+            sender_name="Trader",
+            posted_at=datetime(2026, 6, 1, tzinfo=UTC),
+            text="Join the VIP channel.",
+        )
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "recognition_result": "\u975e\u7b56\u7565",
+                                    "input_reading": {"observed_text": "Join the VIP channel."},
+                                    "reason": "Advertisement.",
+                                    "strategy": {
+                                        "symbol": None,
+                                        "side": None,
+                                        "entry": None,
+                                        "stop_loss": None,
+                                        "take_profit": None,
+                                    },
+                                    "confidence": 0.1,
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json, headers):
+            return FakeResponse()
+
+    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", FakeClient)
+
+    run_mimo_direct_for_message(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            ai_models=[
+                AiModelConfig(
+                    id="mimo-v2.5",
+                    label="MiMo V2.5",
+                    base_url="https://api.xiaomimimo.com/v1",
+                    api_key="mimo-key",
+                    model="mimo-v2.5",
+                    supports_text=True,
+                    supports_image=True,
+                )
+            ],
+        ),
+    )
+
+    with session_factory() as session:
+        experiment = session.query(RecognitionExperiment).one()
+        assert experiment.status == "\u975e\u7b56\u7565"
+        assert experiment.strategy_json is None
+
+
 def test_run_mimo_direct_experiment_persists_http_error_response_body(tmp_path, monkeypatch):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
