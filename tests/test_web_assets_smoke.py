@@ -78,12 +78,25 @@ def test_app_js_defaults_message_panel_to_latest_messages_at_top(tmp_path):
 
     assert response.status_code == 200
     assert "function scrollMessagePanelToTop" in response.text
-    assert "panel.scrollTo({ top: 0, behavior: 'auto' });" in response.text
+    assert "scrollContainer.scrollTo({ top: 0, behavior: 'auto' });" in response.text
     assert "function resetInitialMessagePanelScroll" in response.text
     assert "window.requestAnimationFrame" in response.text
     assert "resetInitialMessagePanelScroll();" in response.text
     assert "scrollMessagePanelToTop();" in response.text
     assert "scrollMessagePanelToBottom" not in response.text
+
+
+def test_app_js_refreshes_message_panel_after_manual_recognition_without_jumping(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "async function refreshSelectedGroupPanel" in response.text
+    assert "const previousMessageScrollTop = currentScrollContainer ? currentScrollContainer.scrollTop : 0;" in response.text
+    assert "const nextPanel = await fetchMessagePanel(chatId, {" in response.text
+    assert "currentMessagePanel.replaceWith(nextPanel);" in response.text
+    assert "nextScrollContainer.scrollTop = previousMessageScrollTop;" in response.text
 
 
 def test_app_js_appends_loaded_history_below_current_messages(tmp_path):

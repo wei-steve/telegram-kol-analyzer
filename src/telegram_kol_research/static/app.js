@@ -777,7 +777,34 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
 async function refreshSelectedGroupPanel() {
   const chatId = getSelectedChatId();
   if (!chatId) return;
-  await refreshCurrentGroupPanel({ force: true });
+  const currentMessagePanel = getMessagePanel();
+  const currentScrollContainer = getMessageScrollContainer(currentMessagePanel);
+  const previousMessageScrollTop = currentScrollContainer ? currentScrollContainer.scrollTop : 0;
+  const filterState = getMessageFilterState(currentMessagePanel);
+
+  try {
+    const nextPanel = await fetchMessagePanel(chatId, {
+      searchText: filterState.searchText,
+      senderName: filterState.senderName,
+    });
+    if (nextPanel && currentMessagePanel) {
+      currentMessagePanel.replaceWith(nextPanel);
+      bindMessagePanelControls(nextPanel);
+      const nextScrollContainer = getMessageScrollContainer(nextPanel);
+      if (nextScrollContainer) {
+        nextScrollContainer.scrollTop = previousMessageScrollTop;
+      }
+      if (isMessagePanelAtTop(nextPanel)) {
+        setNewMessagesButtonVisible(nextPanel, false);
+      }
+      await refreshStrategyMidPanel();
+      return;
+    }
+  } catch {
+    // Fall back to the full detail refresh path below.
+  }
+
+  await refreshCurrentGroupPanel({ force: true, preserveMessageScroll: true });
 }
 
 async function refreshStrategyPanels(chatId) {
