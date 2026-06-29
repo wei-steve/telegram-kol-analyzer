@@ -153,6 +153,16 @@ def recognize_message_now(
             return result
 
         text = raw_message.text or ""
+        if text.strip() and _looks_like_trading_education_content(text):
+            result = MessageRecognitionResult(
+                raw_message_id=raw_message.id,
+                status="非策略",
+                reason="交易教学/经验总结内容，不作为策略信号处理。",
+            )
+            _upsert_recognition(session, result)
+            session.commit()
+            return result
+
         if text.strip() and config.text_provider.is_configured:
             ai_event_result = _apply_ai_lifecycle_event_if_matched(
                 session,
@@ -899,6 +909,8 @@ def _apply_lifecycle_event_decision(
     except (TypeError, ValueError):
         confidence = 0.0
     if event_type == "none" or confidence < 0.7:
+        return False
+    if _looks_like_trading_education_content(raw_message.text or ""):
         return False
 
     target = _resolve_lifecycle_event_target(session, raw_message, decision)
@@ -1783,6 +1795,8 @@ def _parse_explicit_exit_signal(text: str) -> tuple[str | None, str | None] | No
     normalized = (text or "").strip()
     if not normalized:
         return None
+    if _looks_like_trading_education_content(normalized):
+        return None
 
     lowered = normalized.lower()
     has_exit_term = (
@@ -1910,6 +1924,53 @@ def _extract_exit_side(text: str) -> str | None:
     if any(term in text for term in ["多单", "做多", "开多"]) or "long" in lowered:
         return "long"
     return None
+
+
+def _looks_like_trading_education_content(text: str) -> bool:
+    normalized = " ".join((text or "").split())
+    if len(normalized) < 120:
+        return False
+
+    operational_terms = [
+        "全部止盈",
+        "全平",
+        "平仓",
+        "临时离场",
+        "先离场",
+        "先出来",
+        "止盈出局",
+        "保本出局",
+        "成本走",
+        "止损修改",
+        "调整止损",
+        "推保护",
+        "带保护",
+        "撤单",
+        "取消挂单",
+    ]
+    if any(term in normalized for term in operational_terms):
+        return False
+
+    lowered = normalized.lower()
+    if any(term in lowered for term in ["close now", "exit now", "take profit now"]):
+        return False
+
+    education_terms = [
+        "知识点",
+        "举个例子",
+        "很多人",
+        "新手",
+        "一直强调",
+        "交易不是",
+        "长期盈利",
+        "方向一样",
+        "真正决定",
+        "经验",
+        "教学",
+        "盈亏比",
+        "位置决定风险",
+    ]
+    return sum(1 for term in education_terms if term in normalized) >= 2
 
 
 def _upsert_recognition(

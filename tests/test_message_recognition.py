@@ -1479,6 +1479,128 @@ def test_recognize_message_now_rejects_trading_education_content(tmp_path):
         assert session.query(SignalCandidate).count() == 0
 
 
+def test_exit_heuristic_ignores_long_trading_education_article(tmp_path):
+    education_text = (
+        "亲爱的朋友们：\n"
+        "今天讲一个合约短线交易中最容易被忽略的知识点——开仓位置，比方向更重要。\n"
+        "很多人总是在研究：做多还是做空？但真正决定一笔交易盈亏的，往往不是方向，而是你的进场位置。\n"
+        "举个例子。同样都是看涨。有人追高进场，止损很大，盈亏比很差。\n"
+        "有人等回踩支撑再进，止损很小，盈亏比却很好。两个人方向一样，结果却完全不同。\n"
+        "陈哥一直强调：宁可错过，也不要追价。等你离场之后，行情又按原来的方向走了。\n"
+        "交易不是比谁判断方向最准，而是比谁能够在最有优势的位置出手。位置决定风险，风险决定利润。"
+    )
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=9210,
+            symbol="SOL",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 29, 5, 0, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 29, 5, 5, tzinfo=UTC),
+            entry_range_low=73.02,
+            entry_range_high=73.02,
+            stop_loss=77,
+            take_profit="64",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9220,
+            posted_at=datetime(2026, 6, 29, 6, 38, 5, tzinfo=UTC),
+            text=education_text,
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+        assert lifecycle.lifecycle_status == "entered"
+        assert lifecycle.exit_signal_message_id is None
+        assert session.query(SignalCandidate).count() == 0
+
+
+def test_ai_lifecycle_event_ignores_long_trading_education_article(tmp_path, monkeypatch):
+    education_text = (
+        "亲爱的朋友们：今天讲一个合约短线交易中最容易被忽略的知识点——开仓位置，比方向更重要。\n"
+        "很多人总是在研究：做多还是做空？但真正决定一笔交易盈亏的，往往不是方向，而是你的进场位置。\n"
+        "举个例子，有人追高进场，止损很大，盈亏比很差；有人等回踩支撑再进，止损很小。\n"
+        "陈哥一直强调，宁可错过，也不要追价。等你离场之后，行情又按原来的方向走了。\n"
+        "交易不是比谁判断方向最准，而是比谁能够在最有优势的位置出手。位置决定风险，风险决定利润。"
+    )
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=9210,
+            symbol="SOL",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 29, 5, 0, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 29, 5, 5, tzinfo=UTC),
+            entry_range_low=73.02,
+            entry_range_high=73.02,
+            stop_loss=77,
+            take_profit="64",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9220,
+            posted_at=datetime(2026, 6, 29, 6, 38, 5, tzinfo=UTC),
+            text=education_text,
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "exit_position",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "SOL",
+            "side": "short",
+            "entry_price": None,
+            "exit_price": None,
+            "confidence": 0.9,
+            "reason": "模型误把教学长文里的离场词当成临时离场",
+        },
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+        assert lifecycle.lifecycle_status == "entered"
+        assert lifecycle.exit_signal_message_id is None
+        assert session.query(SignalCandidate).count() == 0
+
+
 def test_recognize_message_now_skips_video_media(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
