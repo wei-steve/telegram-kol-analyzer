@@ -958,7 +958,7 @@ function bindTradingSettingsForm() {
       submitButton.disabled = true;
     }
     if (status) {
-      status.textContent = 'Saving...';
+      status.textContent = '正在保存...';
       status.classList.remove('is-error');
     }
     const formData = new FormData(form);
@@ -988,17 +988,17 @@ function bindTradingSettingsForm() {
       const result = await response.json();
       if (!response.ok) {
         if (status) {
-          status.textContent = result.detail || 'Save failed';
+          status.textContent = result.detail || '保存失败';
           status.classList.add('is-error');
         }
         return;
       }
       if (status) {
-        status.textContent = `Saved. Default risk ${result.default_max_loss_usdt} USDT`;
+        status.textContent = `已保存，默认单笔最大亏损 ${result.default_max_loss_usdt} USDT`;
       }
     } catch {
       if (status) {
-        status.textContent = 'Save failed. Check service status.';
+        status.textContent = '保存失败，请检查服务状态';
         status.classList.add('is-error');
       }
     } finally {

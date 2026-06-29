@@ -29,7 +29,7 @@
           <button type="button" class="settings-menu-item" data-dashboard-tab="prompt">AI识别提示词</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="config">AI配置</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="model-selection">AI模型选择</button>
-          <button type="button" class="settings-menu-item" data-dashboard-tab="trading-settings">Trading</button>
+          <button type="button" class="settings-menu-item" data-dashboard-tab="trading-settings">交易设置</button>
         </nav>
       </details>
     </div>
@@ -211,42 +211,42 @@
     <section class="panel ai-recognition-panel trading-settings-panel" data-trading-settings>
       <div class="panel-heading">
         <div>
-          <h2>Trading Settings</h2>
-          <p class="ai-helper-text">Global risk defaults used before per-KOL overrides. Changes are saved to the local database.</p>
+          <h2>交易设置</h2>
+          <p class="ai-helper-text">这里配置全局风控默认值；单个 KOL 的配置会优先生效。修改后会保存到服务器本地数据库。</p>
         </div>
-        <button type="button" class="secondary-button" data-dashboard-tab="main">Back</button>
+        <button type="button" class="secondary-button" data-dashboard-tab="main">返回</button>
       </div>
       <form class="ai-recognition-prompt-form trading-settings-form" data-trading-settings-form>
         <div class="trading-settings-grid">
           <label class="trading-toggle-row">
             <input type="checkbox" name="auto_trade_enabled" {% if trading_settings.auto_trade_enabled %}checked{% endif %} />
-            <span>Enable global auto trading</span>
+            <span>开启全局自动交易</span>
           </label>
-          <label>Default max loss USDT<input name="default_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.default_max_loss_usdt }}" /></label>
-          <label>Daily max loss USDT<input name="daily_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.daily_max_loss_usdt }}" /></label>
-          <label>Max concurrent positions<input name="max_concurrent_positions" type="number" min="1" step="1" value="{{ trading_settings.max_concurrent_positions }}" /></label>
-          <label>Market entry deviation %<input name="max_market_entry_deviation_pct" type="number" min="0.01" step="0.01" value="{{ trading_settings.max_market_entry_deviation_pct }}" /></label>
-          <label>Min AI confidence<input name="min_ai_confidence" type="number" min="0" max="1" step="0.01" value="{{ trading_settings.min_ai_confidence }}" /></label>
-          <label>Allowed symbols<input name="allowed_symbols" value="{{ trading_settings.allowed_symbols|join(',') }}" /></label>
+          <label>默认单笔最大亏损 USDT<input name="default_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.default_max_loss_usdt }}" /></label>
+          <label>每日最大亏损 USDT<input name="daily_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.daily_max_loss_usdt }}" /></label>
+          <label>最大同时持仓数<input name="max_concurrent_positions" type="number" min="1" step="1" value="{{ trading_settings.max_concurrent_positions }}" /></label>
+          <label>现价入场最大偏离 %<input name="max_market_entry_deviation_pct" type="number" min="0.01" step="0.01" value="{{ trading_settings.max_market_entry_deviation_pct }}" /></label>
+          <label>最低 AI 置信度<input name="min_ai_confidence" type="number" min="0" max="1" step="0.01" value="{{ trading_settings.min_ai_confidence }}" /></label>
+          <label>允许交易币种<input name="allowed_symbols" value="{{ trading_settings.allowed_symbols|join(',') }}" /></label>
           <label>
-            Entry range style
+            区间入场方式
             <select name="entry_range_order_style">
-              <option value="conservative" {% if trading_settings.entry_range_order_style == 'conservative' %}selected{% endif %}>Conservative midpoint + better edge</option>
-              <option value="eager" {% if trading_settings.entry_range_order_style == 'eager' %}selected{% endif %}>Eager midpoint + easy-fill edge</option>
+              <option value="conservative" {% if trading_settings.entry_range_order_style == 'conservative' %}selected{% endif %}>保守：中点 + 更优价格边界</option>
+              <option value="eager" {% if trading_settings.entry_range_order_style == 'eager' %}selected{% endif %}>积极：中点 + 更易成交边界</option>
             </select>
           </label>
-          <label>TP allocations %<input name="take_profit_allocations" value="{{ trading_settings.take_profit_allocations|join(',') }}" /></label>
+          <label>多止盈分配比例 %<input name="take_profit_allocations" value="{{ trading_settings.take_profit_allocations|join(',') }}" /></label>
           <label class="trading-toggle-row">
             <input type="checkbox" name="move_stop_to_breakeven_after_tp1" {% if trading_settings.move_stop_to_breakeven_after_tp1 %}checked{% endif %} />
-            <span>Move stop to breakeven after TP1</span>
+            <span>TP1 成交后移动止损到成本价</span>
           </label>
           <label class="trading-toggle-row">
             <input type="checkbox" name="allow_vision_auto_trade" {% if trading_settings.allow_vision_auto_trade %}checked{% endif %} />
-            <span>Allow vision/OCR auto trading</span>
+            <span>允许图片/OCR 信号自动交易</span>
           </label>
         </div>
         <div class="prompt-actions">
-          <button type="submit">Save trading settings</button>
+          <button type="submit">保存交易设置</button>
           <span class="ai-recognition-save-status" data-trading-settings-save-status aria-live="polite"></span>
         </div>
       </form>
