@@ -29,6 +29,7 @@
           <button type="button" class="settings-menu-item" data-dashboard-tab="prompt">AI识别提示词</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="config">AI配置</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="model-selection">AI模型选择</button>
+          <button type="button" class="settings-menu-item" data-dashboard-tab="trading-settings">Trading</button>
         </nav>
       </details>
     </div>
@@ -201,6 +202,52 @@
         <div class="prompt-actions">
           <button type="submit">Save active models</button>
           <span class="ai-recognition-save-status" data-ai-model-selection-save-status aria-live="polite"></span>
+        </div>
+      </form>
+    </section>
+  </section>
+
+  <section class="dashboard-tab-panel" data-dashboard-panel="trading-settings">
+    <section class="panel ai-recognition-panel trading-settings-panel" data-trading-settings>
+      <div class="panel-heading">
+        <div>
+          <h2>Trading Settings</h2>
+          <p class="ai-helper-text">Global risk defaults used before per-KOL overrides. Changes are saved to the local database.</p>
+        </div>
+        <button type="button" class="secondary-button" data-dashboard-tab="main">Back</button>
+      </div>
+      <form class="ai-recognition-prompt-form trading-settings-form" data-trading-settings-form>
+        <div class="trading-settings-grid">
+          <label class="trading-toggle-row">
+            <input type="checkbox" name="auto_trade_enabled" {% if trading_settings.auto_trade_enabled %}checked{% endif %} />
+            <span>Enable global auto trading</span>
+          </label>
+          <label>Default max loss USDT<input name="default_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.default_max_loss_usdt }}" /></label>
+          <label>Daily max loss USDT<input name="daily_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.daily_max_loss_usdt }}" /></label>
+          <label>Max concurrent positions<input name="max_concurrent_positions" type="number" min="1" step="1" value="{{ trading_settings.max_concurrent_positions }}" /></label>
+          <label>Market entry deviation %<input name="max_market_entry_deviation_pct" type="number" min="0.01" step="0.01" value="{{ trading_settings.max_market_entry_deviation_pct }}" /></label>
+          <label>Min AI confidence<input name="min_ai_confidence" type="number" min="0" max="1" step="0.01" value="{{ trading_settings.min_ai_confidence }}" /></label>
+          <label>Allowed symbols<input name="allowed_symbols" value="{{ trading_settings.allowed_symbols|join(',') }}" /></label>
+          <label>
+            Entry range style
+            <select name="entry_range_order_style">
+              <option value="conservative" {% if trading_settings.entry_range_order_style == 'conservative' %}selected{% endif %}>Conservative midpoint + better edge</option>
+              <option value="eager" {% if trading_settings.entry_range_order_style == 'eager' %}selected{% endif %}>Eager midpoint + easy-fill edge</option>
+            </select>
+          </label>
+          <label>TP allocations %<input name="take_profit_allocations" value="{{ trading_settings.take_profit_allocations|join(',') }}" /></label>
+          <label class="trading-toggle-row">
+            <input type="checkbox" name="move_stop_to_breakeven_after_tp1" {% if trading_settings.move_stop_to_breakeven_after_tp1 %}checked{% endif %} />
+            <span>Move stop to breakeven after TP1</span>
+          </label>
+          <label class="trading-toggle-row">
+            <input type="checkbox" name="allow_vision_auto_trade" {% if trading_settings.allow_vision_auto_trade %}checked{% endif %} />
+            <span>Allow vision/OCR auto trading</span>
+          </label>
+        </div>
+        <div class="prompt-actions">
+          <button type="submit">Save trading settings</button>
+          <span class="ai-recognition-save-status" data-trading-settings-save-status aria-live="polite"></span>
         </div>
       </form>
     </section>

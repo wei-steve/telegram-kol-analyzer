@@ -945,6 +945,70 @@ function bindDashboardTabs() {
   });
 }
 
+function bindTradingSettingsForm() {
+  const form = document.querySelector('[data-trading-settings-form]');
+  if (!form) {
+    return;
+  }
+  const status = form.querySelector('[data-trading-settings-save-status]');
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const submitButton = form.querySelector('button[type="submit"]');
+    if (submitButton) {
+      submitButton.disabled = true;
+    }
+    if (status) {
+      status.textContent = 'Saving...';
+      status.classList.remove('is-error');
+    }
+    const formData = new FormData(form);
+    const numericValue = (name, fallback) => {
+      const parsed = Number(formData.get(name));
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+    };
+    const payload = {
+      auto_trade_enabled: Boolean(form.querySelector('[name="auto_trade_enabled"]')?.checked),
+      default_max_loss_usdt: numericValue('default_max_loss_usdt', 100),
+      daily_max_loss_usdt: numericValue('daily_max_loss_usdt', 500),
+      max_concurrent_positions: numericValue('max_concurrent_positions', 3),
+      max_market_entry_deviation_pct: numericValue('max_market_entry_deviation_pct', 0.15),
+      min_ai_confidence: Number(formData.get('min_ai_confidence') || 0.75),
+      allowed_symbols: String(formData.get('allowed_symbols') || 'BTC,ETH'),
+      entry_range_order_style: String(formData.get('entry_range_order_style') || 'conservative'),
+      take_profit_allocations: String(formData.get('take_profit_allocations') || '50,30,20'),
+      move_stop_to_breakeven_after_tp1: Boolean(form.querySelector('[name="move_stop_to_breakeven_after_tp1"]')?.checked),
+      allow_vision_auto_trade: Boolean(form.querySelector('[name="allow_vision_auto_trade"]')?.checked),
+    };
+    try {
+      const response = await fetch('/api/trading-settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        if (status) {
+          status.textContent = result.detail || 'Save failed';
+          status.classList.add('is-error');
+        }
+        return;
+      }
+      if (status) {
+        status.textContent = `Saved. Default risk ${result.default_max_loss_usdt} USDT`;
+      }
+    } catch {
+      if (status) {
+        status.textContent = 'Save failed. Check service status.';
+        status.classList.add('is-error');
+      }
+    } finally {
+      if (submitButton) {
+        submitButton.disabled = false;
+      }
+    }
+  });
+}
+
 function bindAiRecognitionPromptForm() {
   const form = document.querySelector('[data-ai-recognition-prompt-form]');
   if (!form) {
@@ -1736,6 +1800,7 @@ window.addEventListener('DOMContentLoaded', () => {
   bindGroupAutomationToggles();
   bindDetailPanelControls();
   bindDashboardTabs();
+  bindTradingSettingsForm();
   bindStrategyFilterBadges();
   bindAiRecognitionPromptForm();
   bindAiModelSelectionForm();

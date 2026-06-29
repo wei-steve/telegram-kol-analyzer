@@ -199,6 +199,18 @@ class StrategyAlert(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class TradingSetting(Base):
+    __tablename__ = "trading_settings"
+    __table_args__ = (
+        UniqueConstraint("key", name="uq_trading_settings_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    value_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class ExecutionBinding(Base):
     __tablename__ = "execution_bindings"
     __table_args__ = (

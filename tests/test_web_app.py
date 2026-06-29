@@ -60,6 +60,37 @@ def test_group_automation_api_updates_config_file(tmp_path):
     assert reloaded.trading_mode == "auto_trade"
 
 
+def test_trading_settings_api_persists_runtime_risk_defaults(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 150,
+            "daily_max_loss_usdt": 600,
+            "max_concurrent_positions": 5,
+            "max_market_entry_deviation_pct": 0.2,
+            "min_ai_confidence": 0.8,
+            "allowed_symbols": "BTC,ETH,SOL",
+            "entry_range_order_style": "conservative",
+            "take_profit_allocations": "50,30,20",
+            "move_stop_to_breakeven_after_tp1": True,
+            "allow_vision_auto_trade": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["default_max_loss_usdt"] == 150.0
+    assert response.json()["allowed_symbols"] == ["BTC", "ETH", "SOL"]
+
+    reloaded = client.get("/api/trading-settings")
+    assert reloaded.status_code == 200
+    assert reloaded.json()["auto_trade_enabled"] is True
+    assert reloaded.json()["take_profit_allocations"] == [50.0, 30.0, 20.0]
+
+
 def test_message_recognition_api_updates_message_result(tmp_path):
     database_path = tmp_path / "research.db"
     app = create_web_app(database_path=database_path)
@@ -519,7 +550,7 @@ def test_recovery_execution_queue_api_returns_payload_preview_only(tmp_path):
     assert response.json()["items"][0]["payload_preview"]["contract"] == "BTC-USDT"
     assert response.json()["items"][0]["deepcoin_order_draft"]["instrument_id"] == "BTC-USDT-SWAP"
     assert response.json()["items"][0]["deepcoin_order_draft"]["blocking_reason_codes"] == ["contract_size_unverified"]
-    assert response.json()["items"][0]["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 0.071429
+    assert response.json()["items"][0]["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 0.083333
     assert response.json()["items"][0]["contract_spec_status"] == {
         "code": "missing",
         "label": "缺少规格校验",
@@ -593,7 +624,7 @@ def test_recovery_execution_queue_api_applies_configured_contract_specs(tmp_path
         "quantity_unit": "contracts",
     }
     assert draft["blocking_reason_codes"] == []
-    assert draft["order_legs"][0]["quantity"] == 71.0
+    assert draft["order_legs"][0]["quantity"] == 83.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
 
 

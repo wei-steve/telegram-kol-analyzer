@@ -85,6 +85,10 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
         "CREATE INDEX IF NOT EXISTS ix_strategy_lifecycles_chat_status_exited "
         "ON strategy_lifecycles (chat_id, lifecycle_status, exited_at)"
     ),
+    "ix_trading_settings_key": (
+        "CREATE INDEX IF NOT EXISTS ix_trading_settings_key "
+        "ON trading_settings (key)"
+    ),
 }
 
 

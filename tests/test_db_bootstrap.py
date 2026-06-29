@@ -17,6 +17,19 @@ def test_database_bootstrap_creates_tables(tmp_path):
     assert engine is not None
 
 
+def test_database_bootstrap_creates_trading_settings_table(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    engine = session_factory.kw["bind"]
+
+    with engine.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(text("PRAGMA table_info(trading_settings)")).fetchall()
+        }
+
+    assert {"key", "value_json", "updated_at"}.issubset(columns)
+
+
 def test_database_bootstrap_backfills_missing_sqlite_columns(tmp_path):
     database_path = tmp_path / "research.db"
     conn = sqlite3.connect(database_path)

@@ -91,6 +91,7 @@ def test_recovery_execution_preview_lists_approved_limit_orders_only(tmp_path):
                 "position_side": "long",
                 "entry_range": "68000-68200",
                 "stop_loss": "67500",
+                "take_profit": None,
                 "risk_budget_usdt": 100.0,
                 "source": {
                     "kol_id": "alice",
@@ -112,21 +113,22 @@ def test_recovery_execution_preview_lists_approved_limit_orders_only(tmp_path):
                         "side": "buy",
                         "position_side": "long",
                         "order_type": "limit",
-                        "price": 68200.0,
+                        "price": 68100.0,
                         "allocation_pct": 50.0,
-                        "quantity": 0.071429,
+                        "quantity": 0.083333,
                         "quantity_unit": "base_asset_estimate",
                     },
                     {
                         "side": "buy",
                         "position_side": "long",
                         "order_type": "limit",
-                        "price": 68100.0,
+                        "price": 68000.0,
                         "allocation_pct": 50.0,
-                        "quantity": 0.083333,
+                        "quantity": 0.1,
                         "quantity_unit": "base_asset_estimate",
                     },
                 ],
+                "take_profit_legs": [],
                 "risk_budget_usdt": 100.0,
                 "source": {
                     "kol_id": "alice",
@@ -216,6 +218,6 @@ def test_recovery_execution_preview_applies_contract_specs_when_available(tmp_pa
     }
     assert draft["blocking_reason_codes"] == []
     assert draft["contract_spec"]["instrument_id"] == "BTC-USDT-SWAP"
-    assert draft["order_legs"][0]["quantity"] == 71.0
+    assert draft["order_legs"][0]["quantity"] == 83.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
-    assert draft["order_legs"][1]["quantity"] == 83.0
+    assert draft["order_legs"][1]["quantity"] == 100.0

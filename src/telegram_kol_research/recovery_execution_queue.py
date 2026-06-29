@@ -80,6 +80,7 @@ def _preview_row(
         "position_side": side,
         "entry_range": row.entry_range_text,
         "stop_loss": row.stop_loss_text,
+        "take_profit": take_profit_text,
         "risk_budget_usdt": row.max_loss_usdt,
         "source": {
             "kol_id": row.kol_id,

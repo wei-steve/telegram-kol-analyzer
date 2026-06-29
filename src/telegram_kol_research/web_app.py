@@ -63,6 +63,10 @@ from telegram_kol_research.strategy_alerts import (
     load_strategy_alert_config,
     strategy_alerts_enabled,
 )
+from telegram_kol_research.trading_settings import (
+    load_trading_settings,
+    save_trading_settings,
+)
 from telegram_kol_research.web_queries import (
     load_database_freshness,
     load_group_messages,
@@ -654,6 +658,7 @@ def create_web_app(
         ai_recognition_config = load_ai_recognition_config(
             app.state.ai_recognition_config_path
         )
+        trading_settings = load_trading_settings(app.state.session_factory)
         return templates.TemplateResponse(
             request,
             "index.html",
@@ -679,6 +684,7 @@ def create_web_app(
                 "trader_dashboard": trader_dashboard,
                 "strategy_kpi": strategy_kpi,
                 "ai_recognition_config": ai_recognition_config,
+                "trading_settings": trading_settings,
             },
         )
 
@@ -983,6 +989,18 @@ def create_web_app(
             "ai_strategy_enabled": group.ai_strategy_enabled,
             "auto_trade_enabled": group.trading_mode == "auto_trade",
         }
+
+    @app.get("/api/trading-settings")
+    def get_trading_settings():
+        return load_trading_settings(app.state.session_factory).to_dict()
+
+    @app.post("/api/trading-settings")
+    def update_trading_settings(payload: dict[str, Any]):
+        return save_trading_settings(
+            app.state.session_factory,
+            payload,
+            updated_at=app.state.now_provider(),
+        ).to_dict()
 
     @app.post("/api/messages/{raw_message_id}/recognize")
     def recognize_message(raw_message_id: int):

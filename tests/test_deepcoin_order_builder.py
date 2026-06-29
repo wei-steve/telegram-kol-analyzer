@@ -12,6 +12,7 @@ def _payload_preview(**overrides):
         "position_side": "long",
         "entry_range": "68000-68200",
         "stop_loss": "67500",
+        "take_profit": "69000-70000-71000",
         "risk_budget_usdt": 100.0,
         "source": {
             "kol_id": "alice",
@@ -40,19 +41,39 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
                 "side": "buy",
                 "position_side": "long",
                 "order_type": "limit",
-                "price": 68200.0,
+                "price": 68100.0,
                 "allocation_pct": 50.0,
-                "quantity": 0.071429,
+                "quantity": 0.083333,
                 "quantity_unit": "base_asset_estimate",
             },
             {
                 "side": "buy",
                 "position_side": "long",
                 "order_type": "limit",
-                "price": 68100.0,
+                "price": 68000.0,
                 "allocation_pct": 50.0,
-                "quantity": 0.083333,
+                "quantity": 0.1,
                 "quantity_unit": "base_asset_estimate",
+            },
+        ],
+        "take_profit_legs": [
+            {
+                "index": 1,
+                "price": 69000.0,
+                "allocation_pct": 50.0,
+                "order_type": "market_on_trigger",
+            },
+            {
+                "index": 2,
+                "price": 70000.0,
+                "allocation_pct": 30.0,
+                "order_type": "market_on_trigger",
+            },
+            {
+                "index": 3,
+                "price": 71000.0,
+                "allocation_pct": 20.0,
+                "order_type": "market_on_trigger",
             },
         ],
         "risk_budget_usdt": 100.0,
@@ -70,7 +91,7 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
     }
 
 
-def test_build_deepcoin_order_draft_uses_lower_edge_for_short_limit_orders():
+def test_build_deepcoin_order_draft_uses_upper_edge_for_conservative_short_limit_orders():
     draft = build_deepcoin_order_draft(
         _payload_preview(
             open_side="sell",
@@ -79,8 +100,8 @@ def test_build_deepcoin_order_draft_uses_lower_edge_for_short_limit_orders():
         )
     )
 
-    assert draft["order_legs"][0]["price"] == 68000.0
-    assert draft["order_legs"][1]["price"] == 68100.0
+    assert draft["order_legs"][0]["price"] == 68100.0
+    assert draft["order_legs"][1]["price"] == 68200.0
     assert draft["order_legs"][0]["side"] == "sell"
     assert draft["order_legs"][0]["position_side"] == "short"
 
@@ -108,6 +129,7 @@ def test_build_deepcoin_order_draft_blocks_quantity_when_stop_loss_is_missing():
 
     assert draft["blocking_reason_codes"] == ["missing_stop_loss"]
     assert draft["order_legs"][0]["quantity"] is None
+    assert draft["take_profit_legs"][0]["allocation_pct"] == 50.0
     assert draft["notes"] == [
         "offline_constructor_only",
         "quantity_requires_stop_loss_or_manual_sizing",
@@ -135,12 +157,12 @@ def test_build_deepcoin_order_draft_converts_base_estimate_with_contract_spec():
         "min_quantity": 1.0,
         "price_tick": 0.1,
     }
-    assert draft["order_legs"][0]["price"] == 68200.0
-    assert draft["order_legs"][0]["quantity"] == 71.0
+    assert draft["order_legs"][0]["price"] == 68100.0
+    assert draft["order_legs"][0]["quantity"] == 83.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
-    assert draft["order_legs"][0]["base_asset_estimate"] == 0.071429
-    assert draft["order_legs"][1]["price"] == 68100.0
-    assert draft["order_legs"][1]["quantity"] == 83.0
+    assert draft["order_legs"][0]["base_asset_estimate"] == 0.083333
+    assert draft["order_legs"][1]["price"] == 68000.0
+    assert draft["order_legs"][1]["quantity"] == 100.0
     assert draft["order_legs"][1]["quantity_unit"] == "contracts"
     assert "contract_spec_applied" in draft["notes"]
     assert "quantity_rounded_down_to_step" in draft["notes"]
@@ -162,7 +184,7 @@ def test_build_deepcoin_order_draft_blocks_when_contract_quantity_is_below_minim
     assert draft["blocking_reason_codes"] == ["quantity_below_minimum"]
     assert draft["order_legs"][0]["quantity"] == 0.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
-    assert draft["order_legs"][0]["base_asset_estimate"] == 0.071429
+    assert draft["order_legs"][0]["base_asset_estimate"] == 0.083333
 
 
 def test_build_deepcoin_order_draft_rejects_mismatched_contract_spec():

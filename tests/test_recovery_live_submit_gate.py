@@ -99,7 +99,7 @@ def test_recovery_live_submit_gate_returns_would_submit_when_all_checks_pass(tmp
         "no_active_binding": True,
         "order_draft_ready": True,
     }
-    assert result["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 71.0
+    assert result["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 83.0
 
 
 def test_recovery_live_submit_gate_blocks_without_ready_confirmation(tmp_path):

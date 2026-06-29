@@ -1,0 +1,171 @@
+"""Runtime trading settings persisted in the local database."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy.orm import sessionmaker
+
+from telegram_kol_research.models import TradingSetting
+
+
+TRADING_SETTINGS_KEY = "global"
+
+
+@dataclass(slots=True)
+class TradingSettings:
+    auto_trade_enabled: bool = False
+    default_max_loss_usdt: float = 100.0
+    daily_max_loss_usdt: float = 500.0
+    max_concurrent_positions: int = 3
+    max_market_entry_deviation_pct: float = 0.15
+    min_ai_confidence: float = 0.75
+    allowed_symbols: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
+    entry_range_order_style: str = "conservative"
+    take_profit_allocations: list[float] = field(default_factory=lambda: [50.0, 30.0, 20.0])
+    move_stop_to_breakeven_after_tp1: bool = True
+    allow_vision_auto_trade: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def load_trading_settings(session_factory: sessionmaker) -> TradingSettings:
+    """Load global trading settings, returning safe defaults when absent."""
+
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(TradingSetting.key == TRADING_SETTINGS_KEY)
+            .one_or_none()
+        )
+        if row is None:
+            return TradingSettings()
+        try:
+            payload = json.loads(row.value_json)
+        except json.JSONDecodeError:
+            return TradingSettings()
+    return trading_settings_from_payload(payload)
+
+
+def save_trading_settings(
+    session_factory: sessionmaker,
+    payload: dict[str, Any],
+    *,
+    updated_at: datetime | None = None,
+) -> TradingSettings:
+    """Validate and persist global trading settings."""
+
+    settings = trading_settings_from_payload(payload)
+    value_json = json.dumps(settings.to_dict(), ensure_ascii=False, sort_keys=True)
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(TradingSetting.key == TRADING_SETTINGS_KEY)
+            .one_or_none()
+        )
+        if row is None:
+            row = TradingSetting(key=TRADING_SETTINGS_KEY, value_json=value_json)
+            session.add(row)
+        else:
+            row.value_json = value_json
+        row.updated_at = updated_at or datetime.now(UTC)
+        session.commit()
+    return settings
+
+
+def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSettings:
+    raw = payload or {}
+    defaults = TradingSettings()
+    allowed_symbols = _parse_symbol_list(raw.get("allowed_symbols"), defaults.allowed_symbols)
+    take_profit_allocations = _parse_allocations(
+        raw.get("take_profit_allocations"),
+        defaults.take_profit_allocations,
+    )
+    style = str(raw.get("entry_range_order_style") or defaults.entry_range_order_style)
+    if style not in {"conservative", "eager"}:
+        style = defaults.entry_range_order_style
+    return TradingSettings(
+        auto_trade_enabled=bool(raw.get("auto_trade_enabled", defaults.auto_trade_enabled)),
+        default_max_loss_usdt=_positive_float(
+            raw.get("default_max_loss_usdt"),
+            defaults.default_max_loss_usdt,
+        ),
+        daily_max_loss_usdt=_positive_float(
+            raw.get("daily_max_loss_usdt"),
+            defaults.daily_max_loss_usdt,
+        ),
+        max_concurrent_positions=max(
+            1,
+            int(_positive_float(raw.get("max_concurrent_positions"), defaults.max_concurrent_positions)),
+        ),
+        max_market_entry_deviation_pct=_positive_float(
+            raw.get("max_market_entry_deviation_pct"),
+            defaults.max_market_entry_deviation_pct,
+        ),
+        min_ai_confidence=max(
+            0.0,
+            min(1.0, _positive_float(raw.get("min_ai_confidence"), defaults.min_ai_confidence)),
+        ),
+        allowed_symbols=allowed_symbols,
+        entry_range_order_style=style,
+        take_profit_allocations=take_profit_allocations,
+        move_stop_to_breakeven_after_tp1=bool(
+            raw.get(
+                "move_stop_to_breakeven_after_tp1",
+                defaults.move_stop_to_breakeven_after_tp1,
+            )
+        ),
+        allow_vision_auto_trade=bool(
+            raw.get("allow_vision_auto_trade", defaults.allow_vision_auto_trade)
+        ),
+    )
+
+
+def _positive_float(value: Any, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    if parsed <= 0:
+        return float(fallback)
+    return parsed
+
+
+def _parse_symbol_list(value: Any, fallback: list[str]) -> list[str]:
+    if isinstance(value, str):
+        raw_items = value.replace("，", ",").split(",")
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = fallback
+    symbols = []
+    for item in raw_items:
+        symbol = str(item).strip().upper()
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    return symbols or fallback.copy()
+
+
+def _parse_allocations(value: Any, fallback: list[float]) -> list[float]:
+    if isinstance(value, str):
+        raw_items = value.replace("/", ",").replace("-", ",").split(",")
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = fallback
+    allocations: list[float] = []
+    for item in raw_items:
+        try:
+            parsed = float(item)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            allocations.append(parsed)
+    if not allocations:
+        return fallback.copy()
+    total = sum(allocations)
+    return [round(item * 100 / total, 8) for item in allocations]

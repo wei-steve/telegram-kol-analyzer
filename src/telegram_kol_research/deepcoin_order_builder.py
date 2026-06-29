@@ -48,22 +48,35 @@ def build_deepcoin_order_draft(
     if contract_spec is not None and contract_spec.instrument_id.upper() != instrument_id:
         raise DeepcoinOrderDraftError("contract_spec instrument_id mismatch")
 
-    edge_price = _normalize_price(entry_high if position_side == "long" else entry_low, contract_spec)
-    midpoint = _normalize_price((entry_low + entry_high) / 2, contract_spec)
     source = payload_preview.get("source") or {}
     risk_budget = float(_require_value(payload_preview, "risk_budget_usdt"))
     stop_loss = _parse_optional_price(payload_preview.get("stop_loss"))
+    entry_range_order_style = str(
+        payload_preview.get("entry_range_order_style") or "conservative"
+    ).lower()
+    take_profit_prices = _parse_take_profit_prices(payload_preview.get("take_profit"))
+    take_profit_allocations = _normalize_take_profit_allocations(
+        payload_preview.get("take_profit_allocations"),
+        len(take_profit_prices),
+    )
+    first_price, second_price = _entry_leg_prices(
+        position_side=position_side,
+        low=entry_low,
+        high=entry_high,
+        style=entry_range_order_style,
+        contract_spec=contract_spec,
+    )
 
     order_legs = [
         _order_leg(
             side=open_side,
             position_side=position_side,
             order_type=order_type,
-            price=edge_price,
+            price=first_price,
             quantity=_estimate_leg_quantity(
                 risk_budget=risk_budget,
                 allocation_pct=50.0,
-                entry_price=edge_price,
+                entry_price=first_price,
                 stop_loss=stop_loss,
             ),
             contract_spec=contract_spec,
@@ -72,11 +85,11 @@ def build_deepcoin_order_draft(
             side=open_side,
             position_side=position_side,
             order_type=order_type,
-            price=midpoint,
+            price=second_price,
             quantity=_estimate_leg_quantity(
                 risk_budget=risk_budget,
                 allocation_pct=50.0,
-                entry_price=midpoint,
+                entry_price=second_price,
                 stop_loss=stop_loss,
             ),
             contract_spec=contract_spec,
@@ -99,6 +112,11 @@ def build_deepcoin_order_draft(
         "margin_mode": "isolated",
         "position_mode": "split",
         "order_legs": order_legs,
+        "take_profit_legs": _take_profit_legs(
+            prices=take_profit_prices,
+            allocations=take_profit_allocations,
+            contract_spec=contract_spec,
+        ),
         "risk_budget_usdt": risk_budget,
         "source": {
             "kol_id": source.get("kol_id"),
@@ -154,6 +172,68 @@ def _parse_optional_price(value: Any) -> float | None:
         if price > 0:
             return price
     raise DeepcoinOrderDraftError("stop_loss must contain a numeric price")
+
+
+def _parse_take_profit_prices(value: Any) -> list[float]:
+    if value in (None, ""):
+        return []
+    text = str(value)
+    for separator in ["/", ",", "，", " ", "~"]:
+        text = text.replace(separator, "-")
+    prices: list[float] = []
+    for part in text.split("-"):
+        stripped = part.strip()
+        if not stripped:
+            continue
+        try:
+            price = float(stripped)
+        except ValueError:
+            continue
+        if price > 0:
+            prices.append(price)
+    return prices
+
+
+def _normalize_take_profit_allocations(value: Any, count: int) -> list[float]:
+    if count <= 0:
+        return []
+    raw_items: list[Any]
+    if isinstance(value, str):
+        raw_items = value.replace("/", ",").replace("-", ",").split(",")
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = [50, 30, 20] if count == 3 else []
+    allocations: list[float] = []
+    for item in raw_items[:count]:
+        try:
+            parsed = float(item)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            allocations.append(parsed)
+    if len(allocations) < count:
+        allocations = [100 / count for _ in range(count)]
+    total = sum(allocations)
+    return [round(item * 100 / total, 8) for item in allocations[:count]]
+
+
+def _entry_leg_prices(
+    *,
+    position_side: str,
+    low: float,
+    high: float,
+    style: str,
+    contract_spec: DeepcoinContractSpec | None,
+) -> tuple[float, float]:
+    midpoint = (low + high) / 2
+    if style == "eager":
+        edge = high if position_side == "long" else low
+    else:
+        edge = low if position_side == "long" else high
+    first = _normalize_price(midpoint, contract_spec)
+    second = _normalize_price(edge, contract_spec)
+    return first, second
 
 
 def _estimate_leg_quantity(
@@ -220,6 +300,26 @@ def _order_leg(
             )
             leg["quantity_unit"] = "contracts"
     return leg
+
+
+def _take_profit_legs(
+    *,
+    prices: list[float],
+    allocations: list[float],
+    contract_spec: DeepcoinContractSpec | None,
+) -> list[dict[str, Any]]:
+    legs: list[dict[str, Any]] = []
+    for index, price in enumerate(prices):
+        allocation = allocations[index] if index < len(allocations) else 100 / len(prices)
+        legs.append(
+            {
+                "index": index + 1,
+                "price": float(f"{_normalize_price(price, contract_spec):g}"),
+                "allocation_pct": allocation,
+                "order_type": "market_on_trigger",
+            }
+        )
+    return legs
 
 
 def _blocking_reason_codes(
