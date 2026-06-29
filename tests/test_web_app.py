@@ -802,18 +802,33 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
     class FakeDeepcoinClient:
         def __init__(self):
             self.payloads = []
+            self.trigger_payloads = []
             self.protection_payloads = []
 
         def place_order(self, order_payload):
             self.payloads.append(order_payload)
             return {"code": "0", "data": {"ordId": f"order-{len(self.payloads)}"}}
 
+        def trigger_order(self, order_payload):
+            self.trigger_payloads.append(order_payload)
+            return {"code": "0", "data": {"ordId": f"trigger-{len(self.trigger_payloads)}"}}
+
+        def set_position_sltp(self, protection_payload):
+            self.protection_payloads.append(protection_payload)
+            return {"code": "0", "data": {"ordId": "sltp-1"}}
+
         def replace_order_sltp(self, protection_payload):
             self.protection_payloads.append(protection_payload)
-            return {"code": "0", "data": {"OrderSysID": protection_payload["OrderSysID"]}}
+            return {"code": "0", "data": {"orderSysID": protection_payload["orderSysID"]}}
 
         def cancel_order(self, cancel_payload):
             return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
+
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def get_ticker_price(self, *, inst_id):
+            return 68100.0
 
     fake_client = FakeDeepcoinClient()
     app = create_web_app(
@@ -883,29 +898,43 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
     assert response.status_code == 200
     assert response.json()["submitted"] is True
     assert response.json()["order_count"] == 2
-    assert fake_client.payloads[0]["clOrdId"].isalnum()
-    assert len(fake_client.payloads[0]["clOrdId"]) <= 20
-    assert fake_client.payloads[0]["mrgPosition"] == "split"
-    assert fake_client.protection_payloads[0]["tpTriggerPx"] == "69000.0"
-    assert fake_client.protection_payloads[0]["slTriggerPx"] == "67500.0"
+    assert fake_client.payloads == []
+    assert fake_client.trigger_payloads[0]["mrgPosition"] == "split"
+    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0
+    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
 
 
 def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
     class FakeDeepcoinClient:
         def __init__(self):
             self.payloads = []
+            self.trigger_payloads = []
             self.protection_payloads = []
 
         def place_order(self, order_payload):
             self.payloads.append(order_payload)
             return {"code": "0", "data": {"ordId": f"order-{len(self.payloads)}"}}
 
+        def trigger_order(self, order_payload):
+            self.trigger_payloads.append(order_payload)
+            return {"code": "0", "data": {"ordId": f"trigger-{len(self.trigger_payloads)}"}}
+
+        def set_position_sltp(self, protection_payload):
+            self.protection_payloads.append(protection_payload)
+            return {"code": "0", "data": {"ordId": "sltp-1"}}
+
         def replace_order_sltp(self, protection_payload):
             self.protection_payloads.append(protection_payload)
-            return {"code": "0", "data": {"OrderSysID": protection_payload["OrderSysID"]}}
+            return {"code": "0", "data": {"orderSysID": protection_payload["orderSysID"]}}
 
         def cancel_order(self, cancel_payload):
             return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
+
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def get_ticker_price(self, *, inst_id):
+            return 68100.0
 
     fake_client = FakeDeepcoinClient()
     app = create_web_app(
@@ -978,5 +1007,5 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
     assert process_response.status_code == 200
     assert process_response.json()["processed"] is True
     assert process_response.json()["result"]["signal_id"] == signal.id
-    assert fake_client.payloads[0]["tdMode"] == "cross"
-    assert fake_client.protection_payloads[0]["OrderSysID"] == "order-1"
+    assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
+    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0

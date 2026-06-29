@@ -31,7 +31,7 @@ def list_recovery_execution_previews(
             .all()
         )
         active_binding_keys = _load_active_binding_keys(session)
-        take_profit_by_key = _load_take_profit_texts(session, rows)
+        candidate_text_by_key = _load_candidate_texts(session, rows)
         trading_settings = load_trading_settings(session_factory)
         previews = []
         for row in rows:
@@ -42,7 +42,7 @@ def list_recovery_execution_previews(
                 _preview_row(
                     row,
                     contract_spec_provider=contract_spec_provider,
-                    take_profit_text=take_profit_by_key.get(key),
+                    candidate_text=candidate_text_by_key.get(key, {}),
                     entry_range_order_style=trading_settings.entry_range_order_style,
                     take_profit_allocations=trading_settings.take_profit_allocations,
                 )
@@ -72,23 +72,29 @@ def _preview_row(
     row: RecoveryDecisionRecord,
     *,
     contract_spec_provider: DeepcoinContractSpecProvider | None,
-    take_profit_text: str | None,
+    candidate_text: dict[str, str],
     entry_range_order_style: str,
     take_profit_allocations: list[float],
 ) -> dict[str, object]:
     side = row.side.lower()
     contract = _to_deepcoin_contract(row.symbol)
+    order_type = _infer_order_type(
+        candidate_text.get("entry_text"),
+        row.entry_range_text,
+        candidate_text.get("message_text"),
+    )
+    entry_range_text = row.entry_range_text or candidate_text.get("entry_text")
     payload_preview = {
         "venue": "deepcoin",
         "contract": contract,
-        "order_type": "limit",
+        "order_type": order_type,
         "open_side": _open_side(side),
         "position_side": side,
         "margin_mode": "cross",
         "position_mode": "split",
-        "entry_range": row.entry_range_text,
+        "entry_range": entry_range_text,
         "stop_loss": row.stop_loss_text,
-        "take_profit": take_profit_text,
+        "take_profit": candidate_text.get("take_profit_text"),
         "take_profit_allocations": take_profit_allocations,
         "entry_range_order_style": entry_range_order_style,
         "risk_budget_usdt": row.max_loss_usdt,
@@ -114,9 +120,9 @@ def _preview_row(
         "message_id": row.message_id,
         "symbol": row.symbol,
         "side": side,
-        "entry_range_text": row.entry_range_text,
+        "entry_range_text": entry_range_text,
         "stop_loss_text": row.stop_loss_text,
-        "take_profit_text": take_profit_text,
+        "take_profit_text": candidate_text.get("take_profit_text"),
         "max_loss_usdt": row.max_loss_usdt,
         "action": row.action,
         "review_status": row.review_status,
@@ -127,10 +133,10 @@ def _preview_row(
     }
 
 
-def _load_take_profit_texts(
+def _load_candidate_texts(
     session,
     rows: list[RecoveryDecisionRecord],
-) -> dict[tuple[int, int, str, str], str]:
+) -> dict[tuple[int, int, str, str], dict[str, str]]:
     if not rows:
         return {}
     message_keys = {(row.chat_id, row.message_id) for row in rows}
@@ -141,11 +147,10 @@ def _load_take_profit_texts(
         .join(RawMessage, SignalCandidate.raw_message_id == RawMessage.id)
         .filter(RawMessage.chat_id.in_(chat_ids))
         .filter(RawMessage.message_id.in_(message_ids))
-        .filter(SignalCandidate.take_profit_text.isnot(None))
         .order_by(SignalCandidate.confidence.desc(), SignalCandidate.id.asc())
         .all()
     )
-    result: dict[tuple[int, int, str, str], str] = {}
+    result: dict[tuple[int, int, str, str], dict[str, str]] = {}
     for candidate, raw_message in candidates:
         if not candidate.symbol or not candidate.side or not candidate.take_profit_text:
             continue
@@ -158,8 +163,35 @@ def _load_take_profit_texts(
         if key in result:
             continue
         if (raw_message.chat_id, raw_message.message_id) in message_keys:
-            result[key] = candidate.take_profit_text
+            result[key] = {
+                "entry_text": candidate.entry_text or "",
+                "take_profit_text": candidate.take_profit_text or "",
+                "message_text": raw_message.text or "",
+            }
     return result
+
+
+def _infer_order_type(
+    entry_text: str | None,
+    entry_range_text: str | None,
+    message_text: str | None,
+) -> str:
+    text = " ".join(
+        str(part or "") for part in (entry_text, entry_range_text, message_text)
+    ).lower()
+    has_market = any(
+        token in text
+        for token in ["market", "市价", "现价", "直接", "马上", "立即"]
+    )
+    has_limit = any(
+        token in text
+        for token in ["limit", "限价", "挂单", "到价", "接", "-"]
+    )
+    if has_market:
+        return "market"
+    if has_limit or entry_range_text:
+        return "limit"
+    return "limit"
 
 
 def _to_deepcoin_contract(symbol: str) -> str:

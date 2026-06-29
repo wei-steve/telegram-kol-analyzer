@@ -23,21 +23,44 @@ class _StaticContractSpecProvider:
 class _FakeDeepcoinClient:
     def __init__(self):
         self.orders = []
+        self.trigger_orders = []
         self.protections = []
+        self.positions = []
 
     def place_order(self, order_payload):
         self.orders.append(order_payload)
         return {"code": "0", "data": {"ordId": f"order-{len(self.orders)}"}}
 
+    def trigger_order(self, order_payload):
+        self.trigger_orders.append(order_payload)
+        return {"code": "0", "data": {"ordId": f"trigger-{len(self.trigger_orders)}"}}
+
+    def set_position_sltp(self, protection_payload):
+        self.protections.append(protection_payload)
+        return {"code": "0", "data": {"ordId": "sltp-1"}}
+
     def replace_order_sltp(self, protection_payload):
         self.protections.append(protection_payload)
-        return {"code": "0", "data": {"OrderSysID": protection_payload["OrderSysID"]}}
+        return {"code": "0", "data": {"orderSysID": protection_payload["orderSysID"]}}
 
     def cancel_order(self, cancel_payload):
         return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
 
+    def list_positions(self, *, inst_id=None):
+        return self.positions
 
-def _persist_candidate(session_factory, *, confidence=0.91, with_media=False):
+    def get_ticker_price(self, *, inst_id):
+        return 68100.0
+
+
+def _persist_candidate(
+    session_factory,
+    *,
+    confidence=0.91,
+    with_media=False,
+    text="BTC long 68000-68200 SL 67500 TP 69000/70000",
+    entry_text="68000-68200",
+):
     with session_factory() as session:
         raw = RawMessage(
             chat_id=100,
@@ -45,7 +68,7 @@ def _persist_candidate(session_factory, *, confidence=0.91, with_media=False):
             sender_id=200,
             sender_name="Alice",
             posted_at=datetime(2026, 6, 12, 8, 0),
-            text="BTC long 68000-68200 SL 67500 TP 69000/70000",
+            text=text,
             archived_target_group=True,
         )
         session.add(raw)
@@ -56,7 +79,7 @@ def _persist_candidate(session_factory, *, confidence=0.91, with_media=False):
                 symbol="BTC",
                 side="long",
                 event_type="entry_signal",
-                entry_text="68000-68200",
+                entry_text=entry_text,
                 stop_loss_text="67500",
                 take_profit_text="69000 / 70000",
                 parse_source="mimo_direct" if with_media else "text_ai",
@@ -113,10 +136,11 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     )
 
     assert result["status"] == "submitted"
-    assert len(fake_client.orders) == 2
-    assert len(fake_client.protections) == 2
-    assert fake_client.protections[0]["tpTriggerPx"] == "69000.0"
-    assert fake_client.protections[0]["slTriggerPx"] == "67500.0"
+    assert result["entry_execution_type"] == "limit"
+    assert len(fake_client.trigger_orders) == 2
+    assert len(fake_client.protections) == 0
+    assert fake_client.trigger_orders[0]["tpTriggerPx"] == 69000.0
+    assert fake_client.trigger_orders[0]["slTriggerPx"] == 67500.0
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
@@ -143,6 +167,51 @@ def test_auto_process_message_trade_signal_blocks_media_when_vision_auto_trade_d
 
     assert result == {"status": "skipped", "reason": "vision_auto_trade_disabled"}
     assert fake_client.orders == []
+
+
+def test_auto_process_message_trade_signal_submits_market_order_then_position_sltp(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="BTC 现价开多 SL 67500 TP 69000",
+        entry_text="现价入场",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.positions = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "long",
+            "pos": "33",
+            "mrgPosition": "split",
+            "mgnMode": "cross",
+            "uTime": "1",
+        }
+    ]
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 6, 12, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert result["entry_execution_type"] == "market"
+    assert fake_client.orders[0]["ordType"] == "market"
+    assert fake_client.protections[0]["posId"] == "pos-1"
+    assert fake_client.protections[0]["tpTriggerPx"] == "69000.0"
+    assert fake_client.protections[0]["slTriggerPx"] == "67500.0"
 
 
 def test_auto_process_message_trade_signal_blocks_low_confidence(tmp_path):

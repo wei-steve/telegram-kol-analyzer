@@ -65,6 +65,22 @@ def auto_process_message_trade_signal(
     if has_media and not settings.allow_vision_auto_trade:
         return {"status": "skipped", "reason": "vision_auto_trade_disabled"}
 
+    entry_execution_type = _infer_entry_execution_type(
+        candidate.entry_text,
+        raw_message.text,
+        candidate.parse_source,
+    )
+    entry_range = _parse_entry_range(candidate.entry_text)
+    if entry_execution_type == "market":
+        market_price = deepcoin_client.get_ticker_price(
+            inst_id=_to_deepcoin_swap_instrument(symbol)
+        )
+        if market_price is None:
+            return {"status": "skipped", "reason": "market_price_unavailable"}
+        entry_range = (market_price, market_price)
+    if entry_range is None:
+        return {"status": "skipped", "reason": "missing_entry_range"}
+
     signal = RecoverySignal(
         kol_id=str(runtime_config["kol_id"]),
         chat_id=raw_message.chat_id,
@@ -72,7 +88,7 @@ def auto_process_message_trade_signal(
         posted_at=raw_message.posted_at or now,
         symbol=symbol,
         side=side,
-        entry_range=_parse_entry_range(candidate.entry_text),
+        entry_range=entry_range,
         stop_loss_text=candidate.stop_loss_text,
         take_profit_text=candidate.take_profit_text,
         parse_source=candidate.parse_source,
@@ -83,7 +99,7 @@ def auto_process_message_trade_signal(
     )
     decision = RecoveryDecision(
         action="eligible_for_recovery_limit_order",
-        reason_codes=["live_signal_auto_trade"],
+        reason_codes=[f"live_signal_auto_trade_{entry_execution_type}"],
         entry_range=signal.entry_range,
         max_loss_usdt=signal.max_loss_usdt,
     )
@@ -121,8 +137,9 @@ def auto_process_message_trade_signal(
         deepcoin_client=deepcoin_client,
         contract_spec_provider=contract_spec_provider,
         submitted_at=now,
+        max_order_legs=1 if entry_execution_type == "market" else None,
     )
-    return {"status": "submitted", "result": submit_result}
+    return {"status": "submitted", "entry_execution_type": entry_execution_type, "result": submit_result}
 
 
 def _load_best_entry_candidate(
@@ -154,3 +171,27 @@ def _load_best_entry_candidate(
         if source is not None:
             session.expunge(source)
         return raw_message, candidate, source, has_media
+
+
+def _infer_entry_execution_type(
+    entry_text: str | None,
+    message_text: str | None,
+    parse_source: str | None,
+) -> str:
+    if parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
+        return "market"
+    text = " ".join(str(part or "") for part in (entry_text, message_text)).lower()
+    if any(token in text for token in ["market", "市价", "现价", "直接", "马上", "立即"]):
+        return "market"
+    return "limit"
+
+
+def _to_deepcoin_swap_instrument(symbol: str) -> str:
+    normalized = symbol.upper().replace("_", "-")
+    if normalized.endswith("-SWAP"):
+        return normalized
+    if normalized.endswith("-USDT"):
+        return f"{normalized}-SWAP"
+    if normalized.endswith("USDT"):
+        return f"{normalized[:-4]}-USDT-SWAP"
+    return f"{normalized}-USDT-SWAP"

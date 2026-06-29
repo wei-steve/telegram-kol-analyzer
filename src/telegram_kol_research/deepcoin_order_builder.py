@@ -30,7 +30,7 @@ def build_deepcoin_order_draft(
         raise DeepcoinOrderDraftError("unsupported venue")
 
     order_type = str(_require_value(payload_preview, "order_type")).lower()
-    if order_type != "limit":
+    if order_type not in {"limit", "market"}:
         raise DeepcoinOrderDraftError(f"unsupported order_type: {order_type}")
 
     contract = str(_require_value(payload_preview, "contract")).upper()
@@ -76,50 +76,74 @@ def build_deepcoin_order_draft(
         payload_preview.get("take_profit_allocations"),
         len(take_profit_prices),
     )
-    first_price, second_price = _entry_leg_prices(
-        position_side=position_side,
-        low=entry_low,
-        high=entry_high,
-        style=entry_range_order_style,
-        contract_spec=contract_spec,
-    )
-
-    order_legs = [
-        _order_leg(
-            side=open_side,
+    if order_type == "market":
+        reference_price = _normalize_price((entry_low + entry_high) / 2, contract_spec)
+        order_legs = [
+            _order_leg(
+                side=open_side,
+                position_side=position_side,
+                order_type=order_type,
+                price=reference_price,
+                client_order_id=build_client_order_id(
+                    strategy_instance_id=strategy_instance_id,
+                    leg_index=1,
+                ),
+                allocation_pct=100.0,
+                quantity=_estimate_leg_quantity(
+                    risk_budget=risk_budget,
+                    allocation_pct=100.0,
+                    entry_price=reference_price,
+                    stop_loss=stop_loss,
+                ),
+                contract_spec=contract_spec,
+            ),
+        ]
+    else:
+        first_price, second_price = _entry_leg_prices(
             position_side=position_side,
-            order_type=order_type,
-            price=first_price,
-            client_order_id=build_client_order_id(
-                strategy_instance_id=strategy_instance_id,
-                leg_index=1,
-            ),
-            quantity=_estimate_leg_quantity(
-                risk_budget=risk_budget,
-                allocation_pct=50.0,
-                entry_price=first_price,
-                stop_loss=stop_loss,
-            ),
+            low=entry_low,
+            high=entry_high,
+            style=entry_range_order_style,
             contract_spec=contract_spec,
-        ),
-        _order_leg(
-            side=open_side,
-            position_side=position_side,
-            order_type=order_type,
-            price=second_price,
-            client_order_id=build_client_order_id(
-                strategy_instance_id=strategy_instance_id,
-                leg_index=2,
-            ),
-            quantity=_estimate_leg_quantity(
-                risk_budget=risk_budget,
+        )
+        order_legs = [
+            _order_leg(
+                side=open_side,
+                position_side=position_side,
+                order_type=order_type,
+                price=first_price,
+                client_order_id=build_client_order_id(
+                    strategy_instance_id=strategy_instance_id,
+                    leg_index=1,
+                ),
                 allocation_pct=50.0,
-                entry_price=second_price,
-                stop_loss=stop_loss,
+                quantity=_estimate_leg_quantity(
+                    risk_budget=risk_budget,
+                    allocation_pct=50.0,
+                    entry_price=first_price,
+                    stop_loss=stop_loss,
+                ),
+                contract_spec=contract_spec,
             ),
-            contract_spec=contract_spec,
-        ),
-    ]
+            _order_leg(
+                side=open_side,
+                position_side=position_side,
+                order_type=order_type,
+                price=second_price,
+                client_order_id=build_client_order_id(
+                    strategy_instance_id=strategy_instance_id,
+                    leg_index=2,
+                ),
+                allocation_pct=50.0,
+                quantity=_estimate_leg_quantity(
+                    risk_budget=risk_budget,
+                    allocation_pct=50.0,
+                    entry_price=second_price,
+                    stop_loss=stop_loss,
+                ),
+                contract_spec=contract_spec,
+            ),
+        ]
     blocking_reason_codes = _blocking_reason_codes(
         stop_loss=stop_loss,
         contract_spec=contract_spec,
@@ -315,6 +339,7 @@ def _order_leg(
     order_type: str,
     price: float,
     client_order_id: str,
+    allocation_pct: float,
     quantity: float | None,
     contract_spec: DeepcoinContractSpec | None,
 ) -> dict[str, Any]:
@@ -323,7 +348,7 @@ def _order_leg(
         "position_side": position_side,
         "order_type": order_type,
         "price": float(f"{price:g}"),
-        "allocation_pct": 50.0,
+        "allocation_pct": allocation_pct,
         "client_order_id": client_order_id,
         "quantity": quantity,
     }

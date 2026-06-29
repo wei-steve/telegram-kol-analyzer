@@ -112,13 +112,23 @@ def test_build_deepcoin_order_draft_uses_upper_edge_for_conservative_short_limit
     assert draft["order_legs"][0]["position_side"] == "short"
 
 
-def test_build_deepcoin_order_draft_rejects_unsupported_market_order_preview():
-    try:
-        build_deepcoin_order_draft(_payload_preview(order_type="market"))
-    except DeepcoinOrderDraftError as exc:
-        assert "unsupported order_type" in str(exc)
-    else:
-        raise AssertionError("expected unsupported order type to fail")
+def test_build_deepcoin_order_draft_builds_single_market_order_leg():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(order_type="market"),
+        contract_spec=DeepcoinContractSpec(
+            instrument_id="BTC-USDT-SWAP",
+            contract_value=0.001,
+            quantity_step=1,
+            min_quantity=1,
+            price_tick=0.1,
+        ),
+    )
+
+    assert draft["blocking_reason_codes"] == []
+    assert len(draft["order_legs"]) == 1
+    assert draft["order_legs"][0]["order_type"] == "market"
+    assert draft["order_legs"][0]["allocation_pct"] == 100.0
+    assert draft["order_legs"][0]["quantity_unit"] == "contracts"
 
 
 def test_build_deepcoin_order_draft_rejects_missing_entry_range():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -36,6 +37,7 @@ def submit_recovery_order_live(
     deepcoin_client: DeepcoinTradingClientProtocol,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     submitted_at: datetime | None = None,
+    max_order_legs: int | None = None,
 ) -> dict[str, Any]:
     """Enqueue and execute a confirmed recovery signal through the trade queue."""
 
@@ -58,6 +60,7 @@ def submit_recovery_order_live(
         deepcoin_client=deepcoin_client,
         contract_spec_provider=contract_spec_provider,
         processed_at=submitted_at,
+        max_order_legs=max_order_legs,
     )
 
 
@@ -121,6 +124,7 @@ def process_trade_signal_live(
     deepcoin_client: DeepcoinTradingClientProtocol,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     processed_at: datetime | None = None,
+    max_order_legs: int | None = None,
 ) -> dict[str, Any]:
     """Receive and execute one pending trade signal."""
 
@@ -138,6 +142,7 @@ def process_trade_signal_live(
             deepcoin_client=deepcoin_client,
             contract_spec_provider=contract_spec_provider,
             submitted_at=processed_at,
+            max_order_legs=max_order_legs,
         )
     except Exception as exc:
         mark_trade_signal_failed(
@@ -162,6 +167,7 @@ def process_next_trade_signal_live(
     deepcoin_client: DeepcoinTradingClientProtocol,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     processed_at: datetime | None = None,
+    max_order_legs: int | None = None,
 ) -> dict[str, Any] | None:
     """Receive and execute the oldest pending Deepcoin trade signal."""
 
@@ -174,6 +180,7 @@ def process_next_trade_signal_live(
         deepcoin_client=deepcoin_client,
         contract_spec_provider=contract_spec_provider,
         processed_at=processed_at,
+        max_order_legs=max_order_legs,
     )
 
 
@@ -184,6 +191,7 @@ def _submit_recovery_signal_direct(
     deepcoin_client: DeepcoinTradingClientProtocol,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     submitted_at: datetime | None = None,
+    max_order_legs: int | None = None,
 ) -> dict[str, Any]:
     gate = validate_recovery_live_submit_gate(
         session_factory,
@@ -211,44 +219,63 @@ def _submit_recovery_signal_direct(
     symbol_key = str(draft.get("symbol") or trade_signal.symbol).upper()
     side_key = trade_signal.side.lower()
 
-    for index, leg in enumerate(order_legs, start=1):
+    selected_order_legs = order_legs[:max_order_legs] if max_order_legs else order_legs
+    for index, leg in enumerate(selected_order_legs, start=1):
         if not isinstance(leg, dict):
             raise RecoveryLiveSubmitError("invalid_order_leg")
-        order_payload = build_deepcoin_place_order_payload(draft, leg)
-        try:
-            response = deepcoin_client.place_order(order_payload)
-        except DeepcoinClientError:
-            raise
-        except Exception as exc:  # pragma: no cover - defensive boundary
-            raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
+        order_type = str(leg.get("order_type") or "").lower()
+        if order_type == "market":
+            order_payload = build_deepcoin_market_order_payload(draft, leg)
+            try:
+                response = deepcoin_client.place_order(order_payload)
+            except DeepcoinClientError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
 
-        order_id = _extract_order_id(response)
-        if not order_id:
-            raise DeepcoinClientError("Deepcoin order response missing order id")
-        pos_id = _extract_position_id(response)
-        client_order_id = str(leg.get("client_order_id") or order_payload.get("clOrdId") or "")
-        protection_payload = build_deepcoin_order_sltp_payload(draft, order_id=order_id)
-        try:
-            protection_response = deepcoin_client.replace_order_sltp(protection_payload)
-        except DeepcoinClientError:
-            _cancel_unprotected_order(
+            order_id = _extract_order_id(response)
+            if not order_id:
+                raise DeepcoinClientError("Deepcoin order response missing order id")
+            client_order_id = str(leg.get("client_order_id") or order_payload.get("clOrdId") or "")
+            pos_id = _extract_position_id(response) or _find_open_position_id(
                 deepcoin_client,
                 draft=draft,
-                order_id=order_id,
-                client_order_id=client_order_id,
+                side=side_key,
             )
-            raise
-        except Exception as exc:  # pragma: no cover - defensive boundary
-            _cancel_unprotected_order(
-                deepcoin_client,
-                draft=draft,
-                order_id=order_id,
-                client_order_id=client_order_id,
+            protection_payload = build_deepcoin_position_sltp_payload(
+                draft,
+                pos_id=pos_id,
             )
-            raise DeepcoinClientError(f"Deepcoin protection request failed: {exc}") from exc
+            try:
+                protection_response = deepcoin_client.set_position_sltp(protection_payload)
+            except DeepcoinClientError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                raise DeepcoinClientError(f"Deepcoin position protection failed: {exc}") from exc
+        else:
+            order_payload = build_deepcoin_trigger_order_payload(draft, leg)
+            try:
+                response = deepcoin_client.trigger_order(order_payload)
+            except DeepcoinClientError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
+
+            order_id = _extract_order_id(response)
+            if not order_id:
+                raise DeepcoinClientError("Deepcoin trigger order response missing order id")
+            pos_id = _extract_position_id(response)
+            client_order_id = str(leg.get("client_order_id") or "")
+            protection_payload = {
+                key: order_payload[key]
+                for key in ("tpTriggerPx", "slTriggerPx", "tpOrdPx", "slOrdPx")
+                if key in order_payload
+            }
+            protection_response = {"code": "0", "data": {"attached_on_trigger_order": True}}
         submitted_orders.append(
             {
                 "leg_index": index,
+                "execution_type": order_type or "limit",
                 "client_order_id": client_order_id,
                 "order_id": order_id,
                 "pos_id": pos_id,
@@ -325,6 +352,63 @@ def build_deepcoin_place_order_payload(
     }
 
 
+def build_deepcoin_market_order_payload(
+    draft: dict[str, Any],
+    leg: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert one internal market leg to Deepcoin's place-order payload."""
+
+    quantity = leg.get("quantity")
+    if not isinstance(quantity, int | float) or quantity <= 0:
+        raise RecoveryLiveSubmitError("non_positive_quantity")
+
+    return {
+        "instId": str(draft["instrument_id"]),
+        "tdMode": _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross")),
+        "side": str(leg["side"]).lower(),
+        "posSide": str(leg["position_side"]).lower(),
+        "ordType": "market",
+        "sz": str(quantity),
+        "clOrdId": str(leg.get("client_order_id") or ""),
+        "mrgPosition": _deepcoin_position_mode(str(draft.get("position_mode") or "split")),
+    }
+
+
+def build_deepcoin_trigger_order_payload(
+    draft: dict[str, Any],
+    leg: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert one internal limit leg to Deepcoin's trigger-order payload."""
+
+    quantity = leg.get("quantity")
+    if not isinstance(quantity, int | float) or quantity <= 0:
+        raise RecoveryLiveSubmitError("non_positive_quantity")
+    price = leg.get("price")
+    if not isinstance(price, int | float) or price <= 0:
+        raise RecoveryLiveSubmitError("non_positive_price")
+
+    payload: dict[str, Any] = {
+        "instId": str(draft["instrument_id"]),
+        "productGroup": "Swap",
+        "sz": str(quantity),
+        "side": str(leg["side"]).lower(),
+        "posSide": str(leg["position_side"]).lower(),
+        "price": str(price),
+        "isCrossMargin": (
+            "1"
+            if _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross")) == "cross"
+            else "0"
+        ),
+        "orderType": "limit",
+        "triggerPrice": str(price),
+        "triggerPxType": "last",
+        "mrgPosition": _deepcoin_position_mode(str(draft.get("position_mode") or "split")),
+        "tdMode": _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross")),
+    }
+    payload.update(_deepcoin_embedded_sltp_fields(draft))
+    return payload
+
+
 def build_deepcoin_order_sltp_payload(
     draft: dict[str, Any],
     *,
@@ -349,9 +433,61 @@ def build_deepcoin_order_sltp_payload(
 
     return {
         "instId": str(draft["instrument_id"]),
-        "OrderSysID": str(order_id),
+        "orderSysID": str(order_id),
         "tpTriggerPx": str(take_profit_price),
         "slTriggerPx": str(stop_loss),
+    }
+
+
+def build_deepcoin_position_sltp_payload(
+    draft: dict[str, Any],
+    *,
+    pos_id: str | None,
+) -> dict[str, Any]:
+    """Convert an internal draft to Deepcoin's position TP/SL payload."""
+
+    stop_loss = draft.get("stop_loss")
+    if not isinstance(stop_loss, int | float) or stop_loss <= 0:
+        raise RecoveryLiveSubmitError("missing_stop_loss_for_protection")
+    take_profit_legs = draft.get("take_profit_legs")
+    if not isinstance(take_profit_legs, list) or not take_profit_legs:
+        raise RecoveryLiveSubmitError("missing_take_profit_for_protection")
+    first_take_profit = take_profit_legs[0]
+    if not isinstance(first_take_profit, dict):
+        raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
+    take_profit_price = first_take_profit.get("price")
+    if not isinstance(take_profit_price, int | float) or take_profit_price <= 0:
+        raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
+
+    payload: dict[str, Any] = {
+        "instType": "SWAP",
+        "instId": str(draft["instrument_id"]),
+        "posSide": _position_side_from_draft(draft),
+        "mrgPosition": _deepcoin_position_mode(str(draft.get("position_mode") or "split")),
+        "tdMode": _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross")),
+        "tpTriggerPx": str(take_profit_price),
+        "tpTriggerPxType": "last",
+        "tpOrdPx": "-1",
+        "slTriggerPx": str(stop_loss),
+        "slTriggerPxType": "last",
+        "slOrdPx": "-1",
+    }
+    if payload["mrgPosition"] == "split":
+        if not pos_id:
+            raise RecoveryLiveSubmitError("missing_pos_id_for_split_position_sltp")
+        payload["posId"] = str(pos_id)
+    return payload
+
+
+def _deepcoin_embedded_sltp_fields(draft: dict[str, Any]) -> dict[str, Any]:
+    protection = build_deepcoin_position_sltp_payload(draft, pos_id="placeholder")
+    return {
+        "tpTriggerPx": float(protection["tpTriggerPx"]),
+        "tpTriggerPxType": protection["tpTriggerPxType"],
+        "tpOrdPx": -1,
+        "slTriggerPx": float(protection["slTriggerPx"]),
+        "slTriggerPxType": protection["slTriggerPxType"],
+        "slOrdPx": -1,
     }
 
 
@@ -360,6 +496,16 @@ def _protection_warnings(draft: dict[str, Any]) -> list[str]:
     if isinstance(take_profit_legs, list) and len(take_profit_legs) > 1:
         return ["only_first_take_profit_submitted_for_order_sltp"]
     return []
+
+
+def _position_side_from_draft(draft: dict[str, Any]) -> str:
+    order_legs = draft.get("order_legs")
+    if isinstance(order_legs, list):
+        for leg in order_legs:
+            if isinstance(leg, dict) and leg.get("position_side"):
+                return str(leg["position_side"]).lower()
+    source_side = str((draft.get("source") or {}).get("side") or "").lower()
+    return source_side if source_side in {"long", "short"} else "long"
 
 
 def _deepcoin_margin_mode(value: str) -> str:
@@ -391,6 +537,77 @@ def _cancel_unprotected_order(
         raise DeepcoinClientError(
             f"Deepcoin protection failed and cancel also failed: {exc}"
         ) from exc
+
+
+def _find_open_position_id(
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    *,
+    draft: dict[str, Any],
+    side: str,
+    attempts: int = 5,
+    delay_seconds: float = 0.5,
+) -> str | None:
+    for attempt in range(attempts):
+        try:
+            positions = deepcoin_client.list_positions(inst_id=str(draft["instrument_id"]))
+        except Exception:
+            positions = []
+        position = _select_matching_position(positions, draft=draft, side=side)
+        pos_id = _first_payload_string(position, "posId", "pos_id", "id") if position else None
+        if pos_id:
+            return pos_id
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
+    return None
+
+
+def _select_matching_position(
+    positions: list[dict[str, Any]],
+    *,
+    draft: dict[str, Any],
+    side: str,
+) -> dict[str, Any] | None:
+    instrument_id = str(draft["instrument_id"]).upper()
+    margin_mode = _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross"))
+    position_mode = _deepcoin_position_mode(str(draft.get("position_mode") or "split"))
+    matches = []
+    for position in positions:
+        if str(position.get("instId") or "").upper() != instrument_id:
+            continue
+        if str(position.get("posSide") or "").lower() != side.lower():
+            continue
+        if str(position.get("mrgPosition") or position.get("posMode") or "").lower() not in {
+            "",
+            position_mode,
+        }:
+            continue
+        if str(position.get("mgnMode") or position.get("tdMode") or "").lower() not in {
+            "",
+            margin_mode,
+        }:
+            continue
+        try:
+            size = abs(float(position.get("pos") or position.get("size") or 0))
+        except (TypeError, ValueError):
+            size = 0
+        if size <= 0:
+            continue
+        matches.append(position)
+    if not matches:
+        return None
+    return sorted(
+        matches,
+        key=lambda item: int(float(item.get("uTime") or item.get("cTime") or 0)),
+        reverse=True,
+    )[0]
+
+
+def _first_payload_string(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
 
 
 def _extract_order_id(response: dict[str, Any]) -> str | None:

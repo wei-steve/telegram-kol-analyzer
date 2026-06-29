@@ -1,14 +1,16 @@
 from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.models import ExecutionBinding, RawMessage, SignalCandidate
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
+from telegram_kol_research.recovery_live_submit import build_deepcoin_market_order_payload
 from telegram_kol_research.recovery_live_submit import build_deepcoin_order_sltp_payload
 from telegram_kol_research.recovery_live_submit import build_deepcoin_place_order_payload
+from telegram_kol_research.recovery_live_submit import build_deepcoin_position_sltp_payload
+from telegram_kol_research.recovery_live_submit import build_deepcoin_trigger_order_payload
 from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_signal
 from telegram_kol_research.recovery_live_submit import process_next_trade_signal_live
 from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
@@ -33,20 +35,36 @@ class _StaticContractSpecProvider:
 class _FakeDeepcoinClient:
     def __init__(self):
         self.payloads = []
+        self.trigger_payloads = []
         self.protection_payloads = []
         self.cancel_payloads = []
+        self.positions = []
 
     def place_order(self, order_payload):
         self.payloads.append(order_payload)
         return {"code": "0", "data": {"ordId": f"order-{len(self.payloads)}"}}
 
+    def trigger_order(self, order_payload):
+        self.trigger_payloads.append(order_payload)
+        return {"code": "0", "data": {"ordId": f"trigger-{len(self.trigger_payloads)}"}}
+
+    def set_position_sltp(self, protection_payload):
+        self.protection_payloads.append(protection_payload)
+        return {"code": "0", "data": {"ordId": "sltp-1"}}
+
     def replace_order_sltp(self, protection_payload):
         self.protection_payloads.append(protection_payload)
-        return {"code": "0", "data": {"OrderSysID": protection_payload["OrderSysID"]}}
+        return {"code": "0", "data": {"orderSysID": protection_payload["orderSysID"]}}
 
     def cancel_order(self, cancel_payload):
         self.cancel_payloads.append(cancel_payload)
         return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
+
+    def list_positions(self, *, inst_id=None):
+        return self.positions
+
+    def get_ticker_price(self, *, inst_id):
+        return 68100.0
 
 
 def _persist_ready_item(session_factory):
@@ -166,10 +184,63 @@ def test_build_deepcoin_order_sltp_payload_uses_first_take_profit_and_stop_loss(
 
     assert payload == {
         "instId": "BTC-USDT-SWAP",
-        "OrderSysID": "order-1",
+        "orderSysID": "order-1",
         "tpTriggerPx": "69000.0",
         "slTriggerPx": "67500.0",
     }
+
+
+def test_build_deepcoin_trigger_order_payload_embeds_take_profit_and_stop_loss():
+    payload = build_deepcoin_trigger_order_payload(
+        {
+            "instrument_id": "BTC-USDT-SWAP",
+            "margin_mode": "cross",
+            "position_mode": "split",
+            "stop_loss": 67500.0,
+            "take_profit_legs": [{"price": 69000.0, "allocation_pct": 100.0}],
+            "order_legs": [{"position_side": "long"}],
+        },
+        {
+            "side": "buy",
+            "position_side": "long",
+            "price": 68100.0,
+            "quantity": 83.0,
+        },
+    )
+
+    assert payload["orderType"] == "limit"
+    assert payload["triggerPrice"] == "68100.0"
+    assert payload["tpTriggerPx"] == 69000.0
+    assert payload["slTriggerPx"] == 67500.0
+    assert payload["mrgPosition"] == "split"
+
+
+def test_build_deepcoin_market_order_and_position_sltp_payloads():
+    draft = {
+        "instrument_id": "BTC-USDT-SWAP",
+        "margin_mode": "cross",
+        "position_mode": "split",
+        "stop_loss": 67500.0,
+        "take_profit_legs": [{"price": 69000.0, "allocation_pct": 100.0}],
+        "order_legs": [{"position_side": "long"}],
+    }
+
+    order_payload = build_deepcoin_market_order_payload(
+        draft,
+        {
+            "side": "buy",
+            "position_side": "long",
+            "quantity": 83.0,
+            "client_order_id": "client-1",
+        },
+    )
+    protection_payload = build_deepcoin_position_sltp_payload(draft, pos_id="pos-1")
+
+    assert order_payload["ordType"] == "market"
+    assert "px" not in order_payload
+    assert protection_payload["posId"] == "pos-1"
+    assert protection_payload["tpOrdPx"] == "-1"
+    assert protection_payload["slOrdPx"] == "-1"
 
 
 def test_submit_recovery_order_live_blocks_when_auto_trade_is_disabled(tmp_path):
@@ -211,69 +282,19 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
 
     assert result["submitted"] is True
     assert result["order_count"] == 2
-    assert fake_client.payloads[0]["tdMode"] == "cross"
-    assert fake_client.payloads[0]["clOrdId"].isalnum()
-    assert len(fake_client.payloads[0]["clOrdId"]) <= 20
-    assert fake_client.payloads[0]["mrgPosition"] == "split"
-    assert fake_client.protection_payloads == [
-        {
-            "instId": "BTC-USDT-SWAP",
-            "OrderSysID": "order-1",
-            "tpTriggerPx": "69000.0",
-            "slTriggerPx": "67500.0",
-        },
-        {
-            "instId": "BTC-USDT-SWAP",
-            "OrderSysID": "order-2",
-            "tpTriggerPx": "69000.0",
-            "slTriggerPx": "67500.0",
-        },
-    ]
+    assert fake_client.payloads == []
+    assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
+    assert fake_client.trigger_payloads[0]["mrgPosition"] == "split"
+    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0
+    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
+    assert fake_client.protection_payloads == []
     assert result["warnings"] == ["only_first_take_profit_submitted_for_order_sltp"]
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
     assert binding.status == "open"
-    assert binding.order_id == "order-1,order-2"
-    assert binding.client_order_id == ",".join(
-        payload["clOrdId"] for payload in fake_client.payloads
-    )
+    assert binding.order_id == "trigger-1,trigger-2"
+    assert binding.client_order_id == "TK649760E806ACF61,TK729D11F4739D2A2"
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
-
-
-def test_submit_recovery_order_live_cancels_order_when_protection_fails(tmp_path):
-    class FailingProtectionClient(_FakeDeepcoinClient):
-        def replace_order_sltp(self, protection_payload):
-            self.protection_payloads.append(protection_payload)
-            raise DeepcoinClientError("protection rejected")
-
-    session_factory = create_session_factory(tmp_path / "research.db")
-    _persist_ready_item(session_factory)
-    save_trading_settings(session_factory, {"auto_trade_enabled": True})
-    fake_client = FailingProtectionClient()
-
-    try:
-        submit_recovery_order_live(
-            session_factory,
-            chat_id=100,
-            message_id=55,
-            symbol="BTC",
-            side="long",
-            deepcoin_client=fake_client,
-            contract_spec_provider=_StaticContractSpecProvider(),
-        )
-    except DeepcoinClientError as exc:
-        assert "protection rejected" in str(exc)
-    else:
-        raise AssertionError("expected protection failure")
-
-    assert fake_client.cancel_payloads == [
-        {
-            "instId": "BTC-USDT-SWAP",
-            "mrgPosition": "split",
-            "ordId": "order-1",
-            "clOrdId": fake_client.payloads[0]["clOrdId"],
-        }
-    ]
 
 
 def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):

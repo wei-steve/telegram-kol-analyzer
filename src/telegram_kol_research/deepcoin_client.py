@@ -21,6 +21,10 @@ DEEPCOIN_BASE_URL = "https://api.deepcoin.com"
 DEEPCOIN_PLACE_ORDER_PATH = "/deepcoin/trade/order"
 DEEPCOIN_CANCEL_ORDER_PATH = "/deepcoin/trade/cancel-order"
 DEEPCOIN_REPLACE_ORDER_SLTP_PATH = "/deepcoin/trade/replace-order-sltp"
+DEEPCOIN_TRIGGER_ORDER_PATH = "/deepcoin/trade/trigger-order"
+DEEPCOIN_SET_POSITION_SLTP_PATH = "/deepcoin/trade/set-position-sltp"
+DEEPCOIN_ACCOUNT_POSITIONS_PATH = "/deepcoin/account/positions"
+DEEPCOIN_MARKET_TICKERS_PATH = "/deepcoin/market/tickers"
 
 
 class DeepcoinClientError(RuntimeError):
@@ -40,11 +44,23 @@ class DeepcoinTradingClientProtocol(Protocol):
     def place_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
         """Submit one live order and return the raw Deepcoin response."""
 
+    def trigger_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
+        """Submit one trigger order with optional open-position TP/SL."""
+
+    def set_position_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
+        """Set take-profit / stop-loss protection for an existing position."""
+
     def replace_order_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
         """Attach or replace take-profit / stop-loss protection for an open limit order."""
 
     def cancel_order(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
         """Cancel one live order."""
+
+    def list_positions(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
+        """Return account positions, optionally filtered by instrument."""
+
+    def get_ticker_price(self, *, inst_id: str) -> float | None:
+        """Return the latest ticker price for one instrument."""
 
 
 def load_deepcoin_credentials(
@@ -95,11 +111,42 @@ class DeepcoinRestClient:
     def place_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_PLACE_ORDER_PATH, order_payload)
 
+    def trigger_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", DEEPCOIN_TRIGGER_ORDER_PATH, order_payload)
+
+    def set_position_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", DEEPCOIN_SET_POSITION_SLTP_PATH, protection_payload)
+
     def replace_order_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_REPLACE_ORDER_SLTP_PATH, protection_payload)
 
     def cancel_order(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_CANCEL_ORDER_PATH, cancel_payload)
+
+    def list_positions(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
+        query = "instType=SWAP"
+        if inst_id:
+            query += f"&instId={inst_id}"
+        payload = self._request("GET", f"{DEEPCOIN_ACCOUNT_POSITIONS_PATH}?{query}")
+        data = payload.get("data")
+        return data if isinstance(data, list) else []
+
+    def get_ticker_price(self, *, inst_id: str) -> float | None:
+        payload = self._request("GET", f"{DEEPCOIN_MARKET_TICKERS_PATH}?instType=SWAP")
+        for item in _iter_deepcoin_payload_items(payload.get("data")):
+            if str(item.get("instId") or "").upper() != inst_id.upper():
+                continue
+            for key in ("last", "lastPx", "markPx", "askPx", "bidPx"):
+                value = item.get(key)
+                if value in (None, ""):
+                    continue
+                try:
+                    price = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    return price
+        return None
 
     def _request(
         self,
