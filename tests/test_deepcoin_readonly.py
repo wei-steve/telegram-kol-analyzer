@@ -53,7 +53,7 @@ def test_map_deepcoin_open_orders_returns_bound_open_orders_only():
         [
             {
                 "instId": "BTC-USDT-SWAP",
-                "ordId": "order-1",
+                "clOrdId": "client-1",
                 "posSide": "long",
                 "state": "live",
             },
@@ -77,7 +77,7 @@ def test_map_deepcoin_open_orders_returns_bound_open_orders_only():
                 source_message_id=55,
                 symbol="BTC",
                 side="long",
-                order_id="order-1",
+                client_order_id="client-1",
             )
         ],
     )
@@ -88,7 +88,7 @@ def test_map_deepcoin_open_orders_returns_bound_open_orders_only():
     assert orders[0].source_message_id == 55
     assert orders[0].symbol == "BTC"
     assert orders[0].side == "long"
-    assert orders[0].order_id == "order-1"
+    assert orders[0].order_id == "client-1"
 
 
 def test_deepcoin_readonly_account_state_uses_injected_client_and_bindings():

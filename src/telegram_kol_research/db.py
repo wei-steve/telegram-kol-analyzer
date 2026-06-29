@@ -42,7 +42,14 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "updated_at": "ALTER TABLE strategy_alerts ADD COLUMN updated_at DATETIME",
     },
     "execution_bindings": {
+        "strategy_instance_id": "ALTER TABLE execution_bindings ADD COLUMN strategy_instance_id VARCHAR(255)",
         "pos_id": "ALTER TABLE execution_bindings ADD COLUMN pos_id VARCHAR(255)",
+        "client_order_id": "ALTER TABLE execution_bindings ADD COLUMN client_order_id VARCHAR(255)",
+        "margin_mode": "ALTER TABLE execution_bindings ADD COLUMN margin_mode VARCHAR(32) NOT NULL DEFAULT 'cross'",
+        "position_mode": "ALTER TABLE execution_bindings ADD COLUMN position_mode VARCHAR(32) NOT NULL DEFAULT 'split'",
+        "payload_json": "ALTER TABLE execution_bindings ADD COLUMN payload_json TEXT",
+        "last_exchange_status": "ALTER TABLE execution_bindings ADD COLUMN last_exchange_status VARCHAR(64)",
+        "recovered_at": "ALTER TABLE execution_bindings ADD COLUMN recovered_at DATETIME",
         "status": "ALTER TABLE execution_bindings ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'open'",
         "updated_at": "ALTER TABLE execution_bindings ADD COLUMN updated_at DATETIME",
     },
@@ -88,6 +95,14 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
     "ix_trading_settings_key": (
         "CREATE INDEX IF NOT EXISTS ix_trading_settings_key "
         "ON trading_settings (key)"
+    ),
+    "ix_execution_bindings_strategy_instance": (
+        "CREATE INDEX IF NOT EXISTS ix_execution_bindings_strategy_instance "
+        "ON execution_bindings (strategy_instance_id)"
+    ),
+    "ix_execution_bindings_client_order": (
+        "CREATE INDEX IF NOT EXISTS ix_execution_bindings_client_order "
+        "ON execution_bindings (client_order_id)"
     ),
 }
 

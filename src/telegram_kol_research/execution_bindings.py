@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy.orm import sessionmaker
 
@@ -24,8 +26,55 @@ class ExecutionBindingRecord:
     side: str
     venue: str = "deepcoin"
     order_id: str | None = None
+    client_order_id: str | None = None
     pos_id: str | None = None
+    margin_mode: str = "cross"
+    position_mode: str = "split"
+    payload: dict[str, Any] | None = None
+    last_exchange_status: str | None = None
     status: str = "open"
+    strategy_instance_id: str | None = None
+
+
+@dataclass(slots=True)
+class ExecutionReconciliationResult:
+    active: int = 0
+    open: int = 0
+    stale: int = 0
+    updated: int = 0
+
+
+def build_strategy_instance_id(
+    *,
+    venue: str,
+    chat_id: int,
+    message_id: int,
+    symbol: str,
+    side: str,
+) -> str:
+    """Build a stable local strategy key used across restart recovery."""
+
+    return (
+        f"{venue.lower()}:{int(chat_id)}:{int(message_id)}:"
+        f"{symbol.upper()}:{side.lower()}"
+    )
+
+
+def build_client_order_id(
+    *,
+    strategy_instance_id: str,
+    leg_index: int = 1,
+    purpose: str = "entry",
+) -> str:
+    """Build a deterministic client order id that remains stable after restarts."""
+
+    normalized = (
+        strategy_instance_id.replace(":", "-")
+        .replace("_", "-")
+        .lower()
+    )
+    client_order_id = f"tkol-{normalized}-{purpose}-{leg_index}"
+    return client_order_id[:64]
 
 
 def upsert_execution_binding(
@@ -37,6 +86,18 @@ def upsert_execution_binding(
     symbol = record.symbol.upper()
     side = record.side.lower()
     venue = record.venue.lower()
+    strategy_instance_id = record.strategy_instance_id or build_strategy_instance_id(
+        venue=venue,
+        chat_id=record.chat_id,
+        message_id=record.message_id,
+        symbol=symbol,
+        side=side,
+    )
+    payload_json = (
+        json.dumps(record.payload, ensure_ascii=False, sort_keys=True)
+        if record.payload is not None
+        else None
+    )
 
     with session_factory() as session:
         binding = (
@@ -62,9 +123,15 @@ def upsert_execution_binding(
             session.add(binding)
             session.flush()
 
+        binding.strategy_instance_id = strategy_instance_id
         binding.kol_id = record.kol_id
         binding.order_id = record.order_id
+        binding.client_order_id = record.client_order_id
         binding.pos_id = record.pos_id
+        binding.margin_mode = _normalize_margin_mode(record.margin_mode)
+        binding.position_mode = _normalize_position_mode(record.position_mode)
+        binding.payload_json = payload_json
+        binding.last_exchange_status = record.last_exchange_status
         binding.status = record.status
         binding.updated_at = datetime.now(UTC)
         binding_id = binding.id
@@ -96,9 +163,83 @@ def load_deepcoin_order_bindings(
                 side=row.side,
                 pos_id=row.pos_id,
                 order_id=row.order_id,
+                client_order_id=row.client_order_id,
             )
             for row in rows
         ]
+
+
+def reconcile_deepcoin_execution_bindings(
+    session_factory: sessionmaker,
+    *,
+    client: DeepcoinReadOnlyClient,
+    recovered_at: datetime | None = None,
+) -> ExecutionReconciliationResult:
+    """Refresh persisted Deepcoin bindings against exchange open orders/positions.
+
+    This is intentionally read-only against Deepcoin: on process restart it
+    marks locally known strategies as active/open/stale using the exchange's
+    current state, so later close/TP/SL handling can continue from durable data.
+    """
+
+    now = recovered_at or datetime.now(UTC)
+    positions = client.list_positions()
+    orders = client.list_open_orders()
+    positions_by_pos_id = {
+        _first_string(position, "posId", "pos_id", "id"): position
+        for position in positions
+        if _first_string(position, "posId", "pos_id", "id")
+    }
+    orders_by_order_id = {
+        _first_string(order, "ordId", "orderId", "order_id", "id"): order
+        for order in orders
+        if _first_string(order, "ordId", "orderId", "order_id", "id")
+    }
+    orders_by_client_order_id = {
+        _first_string(order, "clOrdId", "clientOrderId", "client_order_id"): order
+        for order in orders
+        if _first_string(order, "clOrdId", "clientOrderId", "client_order_id")
+    }
+
+    result = ExecutionReconciliationResult()
+    with session_factory() as session:
+        rows = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .filter(ExecutionBinding.status.in_(["open", "active", "unknown"]))
+            .order_by(ExecutionBinding.id.asc())
+            .all()
+        )
+        for row in rows:
+            row.strategy_instance_id = row.strategy_instance_id or build_strategy_instance_id(
+                venue=row.venue,
+                chat_id=row.chat_id,
+                message_id=row.message_id,
+                symbol=row.symbol,
+                side=row.side,
+            )
+            position = positions_by_pos_id.get(row.pos_id or "")
+            order = orders_by_order_id.get(row.order_id or "")
+            if order is None:
+                order = orders_by_client_order_id.get(row.client_order_id or "")
+
+            if position is not None and _has_nonzero_size(position):
+                row.status = "active"
+                row.last_exchange_status = "position_active"
+                result.active += 1
+            elif order is not None and _is_open_order_state(order):
+                row.status = "open"
+                row.last_exchange_status = "order_open"
+                result.open += 1
+            else:
+                row.status = "stale"
+                row.last_exchange_status = "not_found_on_exchange"
+                result.stale += 1
+            row.recovered_at = now
+            row.updated_at = now
+            result.updated += 1
+        session.commit()
+    return result
 
 
 def build_deepcoin_account_state(
@@ -158,8 +299,13 @@ def list_active_positions(
                 "side": row.side,
                 "venue": row.venue,
                 "order_id": row.order_id,
+                "client_order_id": row.client_order_id,
                 "pos_id": row.pos_id,
+                "strategy_instance_id": row.strategy_instance_id,
+                "margin_mode": row.margin_mode,
+                "position_mode": row.position_mode,
                 "status": row.status,
+                "last_exchange_status": row.last_exchange_status,
                 "entry_text": None,
                 "stop_loss_text": None,
                 "take_profit_text": None,
@@ -262,3 +408,46 @@ def list_active_positions(
             already_covered.add(key)
 
     return results[:limit]
+
+
+def _normalize_margin_mode(value: str | None) -> str:
+    text = str(value or "cross").lower()
+    if text in {"cross", "crossed", "full", "全仓"}:
+        return "cross"
+    if text in {"isolated", "fixed", "逐仓"}:
+        return "isolated"
+    return "cross"
+
+
+def _normalize_position_mode(value: str | None) -> str:
+    text = str(value or "split").lower()
+    if text in {"split", "hedge", "long_short", "分仓"}:
+        return "split"
+    if text in {"net", "merged", "one_way", "合仓"}:
+        return "net"
+    return "split"
+
+
+def _first_string(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _has_nonzero_size(position: dict[str, Any]) -> bool:
+    size = position.get("pos")
+    if size in (None, ""):
+        size = position.get("size")
+    try:
+        return abs(float(size or 0)) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_open_order_state(order: dict[str, Any]) -> bool:
+    state = str(order.get("state") or order.get("status") or "").lower()
+    if not state:
+        return True
+    return state in {"live", "open", "partially_filled", "partial"}

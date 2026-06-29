@@ -18,6 +18,8 @@ from telegram_kol_research.recovery_scan import (
     evaluate_recovery_signals_with_market_data,
     load_recovery_signals_from_db,
 )
+from telegram_kol_research.trading_settings import apply_trading_settings_to_group_config
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 class RecoveryDryRunProviderMissingError(RuntimeError):
@@ -47,9 +49,13 @@ def run_recovery_dry_run(
         raise RecoveryDryRunProviderMissingError("market data provider is not configured")
 
     start_at, end_at = build_recovery_window(now=now, lookback_hours=lookback_hours)
+    runtime_group_config = apply_trading_settings_to_group_config(
+        group_config,
+        load_trading_settings(session_factory),
+    )
     signals = load_recovery_signals_from_db(
         session_factory,
-        group_config=group_config,
+        group_config=runtime_group_config,
         start_at=start_at,
         end_at=end_at,
     )

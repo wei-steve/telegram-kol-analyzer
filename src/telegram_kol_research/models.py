@@ -223,9 +223,12 @@ class ExecutionBinding(Base):
             name="uq_execution_bindings_signal",
         ),
         Index("ix_execution_bindings_venue_status", "venue", "status"),
+        Index("ix_execution_bindings_strategy_instance", "strategy_instance_id"),
+        Index("ix_execution_bindings_client_order", "client_order_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_instance_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     kol_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
@@ -233,7 +236,13 @@ class ExecutionBinding(Base):
     side: Mapped[str] = mapped_column(String(16), nullable=False)
     venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
     order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    client_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     pos_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    margin_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="cross")
+    position_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="split")
+    payload_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_exchange_status: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    recovered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)

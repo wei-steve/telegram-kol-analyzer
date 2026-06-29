@@ -10,6 +10,8 @@ import math
 from typing import Any
 
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.execution_bindings import build_client_order_id
+from telegram_kol_research.execution_bindings import build_strategy_instance_id
 
 
 class DeepcoinOrderDraftError(ValueError):
@@ -49,8 +51,23 @@ def build_deepcoin_order_draft(
         raise DeepcoinOrderDraftError("contract_spec instrument_id mismatch")
 
     source = payload_preview.get("source") or {}
+    source_kol_id = source.get("kol_id")
+    source_chat_id = int(source.get("chat_id") or 0)
+    source_message_id = int(source.get("message_id") or 0)
     risk_budget = float(_require_value(payload_preview, "risk_budget_usdt"))
     stop_loss = _parse_optional_price(payload_preview.get("stop_loss"))
+    margin_mode = _normalize_margin_mode(payload_preview.get("margin_mode"))
+    position_mode = _normalize_position_mode(payload_preview.get("position_mode"))
+    strategy_instance_id = str(
+        payload_preview.get("strategy_instance_id")
+        or build_strategy_instance_id(
+            venue="deepcoin",
+            chat_id=source_chat_id,
+            message_id=source_message_id,
+            symbol=_symbol_from_contract(contract),
+            side=position_side,
+        )
+    )
     entry_range_order_style = str(
         payload_preview.get("entry_range_order_style") or "conservative"
     ).lower()
@@ -73,6 +90,10 @@ def build_deepcoin_order_draft(
             position_side=position_side,
             order_type=order_type,
             price=first_price,
+            client_order_id=build_client_order_id(
+                strategy_instance_id=strategy_instance_id,
+                leg_index=1,
+            ),
             quantity=_estimate_leg_quantity(
                 risk_budget=risk_budget,
                 allocation_pct=50.0,
@@ -86,6 +107,10 @@ def build_deepcoin_order_draft(
             position_side=position_side,
             order_type=order_type,
             price=second_price,
+            client_order_id=build_client_order_id(
+                strategy_instance_id=strategy_instance_id,
+                leg_index=2,
+            ),
             quantity=_estimate_leg_quantity(
                 risk_budget=risk_budget,
                 allocation_pct=50.0,
@@ -107,10 +132,11 @@ def build_deepcoin_order_draft(
         "dry_run_only": True,
         "executable": False,
         "blocking_reason_codes": blocking_reason_codes,
+        "strategy_instance_id": strategy_instance_id,
         "symbol": _symbol_from_contract(contract),
         "instrument_id": instrument_id,
-        "margin_mode": "isolated",
-        "position_mode": "split",
+        "margin_mode": margin_mode,
+        "position_mode": position_mode,
         "order_legs": order_legs,
         "take_profit_legs": _take_profit_legs(
             prices=take_profit_prices,
@@ -119,11 +145,16 @@ def build_deepcoin_order_draft(
         ),
         "risk_budget_usdt": risk_budget,
         "source": {
-            "kol_id": source.get("kol_id"),
-            "chat_id": source.get("chat_id"),
-            "message_id": source.get("message_id"),
+            "kol_id": source_kol_id,
+            "chat_id": source_chat_id,
+            "message_id": source_message_id,
         },
-        "notes": ["offline_constructor_only", *quantity_notes],
+        "notes": [
+            "offline_constructor_only",
+            "default_cross_margin_split_position",
+            "strategy_instance_id_required_for_exit_matching",
+            *quantity_notes,
+        ],
     }
     if contract_spec is not None:
         draft["contract_spec"] = contract_spec.to_dict()
@@ -278,6 +309,7 @@ def _order_leg(
     position_side: str,
     order_type: str,
     price: float,
+    client_order_id: str,
     quantity: float | None,
     contract_spec: DeepcoinContractSpec | None,
 ) -> dict[str, Any]:
@@ -287,6 +319,7 @@ def _order_leg(
         "order_type": order_type,
         "price": float(f"{price:g}"),
         "allocation_pct": 50.0,
+        "client_order_id": client_order_id,
         "quantity": quantity,
     }
     if quantity is not None:
@@ -369,3 +402,17 @@ def _normalize_price(price: float, contract_spec: DeepcoinContractSpec | None) -
     if contract_spec is None:
         return price
     return _round_down_to_step(price, contract_spec.price_tick)
+
+
+def _normalize_margin_mode(value: Any) -> str:
+    text = str(value or "cross").lower()
+    if text in {"isolated", "fixed", "逐仓"}:
+        return "isolated"
+    return "cross"
+
+
+def _normalize_position_mode(value: Any) -> str:
+    text = str(value or "split").lower()
+    if text in {"net", "merged", "one_way", "合仓"}:
+        return "net"
+    return "split"

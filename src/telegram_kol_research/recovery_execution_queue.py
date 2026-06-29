@@ -10,6 +10,7 @@ from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import RecoveryDecisionRecord
 from telegram_kol_research.models import SignalCandidate
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 def list_recovery_execution_previews(
@@ -31,6 +32,7 @@ def list_recovery_execution_previews(
         )
         active_binding_keys = _load_active_binding_keys(session)
         take_profit_by_key = _load_take_profit_texts(session, rows)
+        trading_settings = load_trading_settings(session_factory)
         previews = []
         for row in rows:
             key = (row.chat_id, row.message_id, row.symbol.upper(), row.side.lower())
@@ -41,6 +43,8 @@ def list_recovery_execution_previews(
                     row,
                     contract_spec_provider=contract_spec_provider,
                     take_profit_text=take_profit_by_key.get(key),
+                    entry_range_order_style=trading_settings.entry_range_order_style,
+                    take_profit_allocations=trading_settings.take_profit_allocations,
                 )
             )
         return previews
@@ -69,6 +73,8 @@ def _preview_row(
     *,
     contract_spec_provider: DeepcoinContractSpecProvider | None,
     take_profit_text: str | None,
+    entry_range_order_style: str,
+    take_profit_allocations: list[float],
 ) -> dict[str, object]:
     side = row.side.lower()
     contract = _to_deepcoin_contract(row.symbol)
@@ -78,9 +84,13 @@ def _preview_row(
         "order_type": "limit",
         "open_side": _open_side(side),
         "position_side": side,
+        "margin_mode": "cross",
+        "position_mode": "split",
         "entry_range": row.entry_range_text,
         "stop_loss": row.stop_loss_text,
         "take_profit": take_profit_text,
+        "take_profit_allocations": take_profit_allocations,
+        "entry_range_order_style": entry_range_order_style,
         "risk_budget_usdt": row.max_loss_usdt,
         "source": {
             "kol_id": row.kol_id,

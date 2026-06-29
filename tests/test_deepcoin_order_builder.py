@@ -32,9 +32,10 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
         "dry_run_only": True,
         "executable": False,
         "blocking_reason_codes": ["contract_size_unverified"],
+        "strategy_instance_id": "deepcoin:100:55:BTC:long",
         "symbol": "BTC",
         "instrument_id": "BTC-USDT-SWAP",
-        "margin_mode": "isolated",
+        "margin_mode": "cross",
         "position_mode": "split",
         "order_legs": [
             {
@@ -43,6 +44,7 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
                 "order_type": "limit",
                 "price": 68100.0,
                 "allocation_pct": 50.0,
+                "client_order_id": "tkol-deepcoin-100-55-btc-long-entry-1",
                 "quantity": 0.083333,
                 "quantity_unit": "base_asset_estimate",
             },
@@ -52,6 +54,7 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
                 "order_type": "limit",
                 "price": 68000.0,
                 "allocation_pct": 50.0,
+                "client_order_id": "tkol-deepcoin-100-55-btc-long-entry-2",
                 "quantity": 0.1,
                 "quantity_unit": "base_asset_estimate",
             },
@@ -84,6 +87,8 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
         },
         "notes": [
             "offline_constructor_only",
+            "default_cross_margin_split_position",
+            "strategy_instance_id_required_for_exit_matching",
             "quantity_uses_linear_price_risk_estimate",
             "limit_edge_selection_side_aware_default",
             "contract_size_must_be_verified_before_live_order",
@@ -132,6 +137,8 @@ def test_build_deepcoin_order_draft_blocks_quantity_when_stop_loss_is_missing():
     assert draft["take_profit_legs"][0]["allocation_pct"] == 50.0
     assert draft["notes"] == [
         "offline_constructor_only",
+        "default_cross_margin_split_position",
+        "strategy_instance_id_required_for_exit_matching",
         "quantity_requires_stop_loss_or_manual_sizing",
         "limit_edge_selection_side_aware_default",
     ]

@@ -22,6 +22,7 @@ class DeepcoinOrderBinding:
     side: str
     pos_id: str | None = None
     order_id: str | None = None
+    client_order_id: str | None = None
 
 
 class DeepcoinReadOnlyClient(Protocol):
@@ -101,12 +102,21 @@ def map_deepcoin_open_orders(
         for binding in bindings
         if binding.order_id
     }
+    bindings_by_client_order_id = {
+        binding.client_order_id: binding
+        for binding in bindings
+        if binding.client_order_id
+    }
     open_orders: list[OpenOrder] = []
     for order in orders:
         order_id = _first_string(order, "ordId", "orderId", "order_id", "id")
-        if not order_id:
+        client_order_id = _first_string(order, "clOrdId", "clientOrderId", "client_order_id")
+        if not order_id and not client_order_id:
             continue
-        binding = bindings_by_order_id.get(order_id)
+        binding = (
+            bindings_by_order_id.get(order_id or "")
+            or bindings_by_client_order_id.get(client_order_id or "")
+        )
         if binding is None or not _is_open_order_state(order):
             continue
         open_orders.append(
@@ -116,7 +126,7 @@ def map_deepcoin_open_orders(
                 source_message_id=binding.source_message_id,
                 symbol=binding.symbol.upper() or _symbol_from_inst_id(order.get("instId")),
                 side=binding.side.lower() or _side_from_payload(order),
-                order_id=order_id,
+                order_id=order_id or client_order_id or "",
             )
         )
     return open_orders

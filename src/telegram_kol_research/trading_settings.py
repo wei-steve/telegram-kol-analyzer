@@ -9,6 +9,8 @@ from typing import Any
 
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.group_config import GroupConfig
+from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.models import TradingSetting
 
 
@@ -75,6 +77,32 @@ def save_trading_settings(
         row.updated_at = updated_at or datetime.now(UTC)
         session.commit()
     return settings
+
+
+def apply_trading_settings_to_group_config(
+    group_config: GroupConfig,
+    settings: TradingSettings,
+) -> GroupConfig:
+    """Apply global Web risk defaults while preserving sender-level overrides."""
+
+    return GroupConfig(
+        groups=[
+            TargetGroupConfig(
+                chat_title=group.chat_title,
+                chat_id=group.chat_id,
+                enabled=group.enabled,
+                tracked_senders=group.tracked_senders,
+                custom_group_label=group.custom_group_label,
+                sync_start_date=group.sync_start_date,
+                sync_end_date=group.sync_end_date,
+                ai_strategy_enabled=group.ai_strategy_enabled,
+                trading_mode=group.trading_mode,
+                max_loss_usdt=settings.default_max_loss_usdt,
+                symbol_whitelist=settings.allowed_symbols.copy(),
+            )
+            for group in group_config.groups
+        ]
+    )
 
 
 def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSettings:
