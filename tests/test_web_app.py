@@ -14,6 +14,7 @@ from telegram_kol_research.recovery_runner import RecoveryDryRunResult
 from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
+from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.models import RawMessage
@@ -765,3 +766,82 @@ def test_recovery_live_submit_gate_api_returns_would_submit_after_ready_confirma
     assert response.json()["dry_run_only"] is True
     assert response.json()["checks"]["ready_confirmation"] is True
     assert response.json()["checks"]["order_draft_ready"] is True
+
+
+def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
+    class FakeDeepcoinClient:
+        def __init__(self):
+            self.payloads = []
+
+        def place_order(self, order_payload):
+            self.payloads.append(order_payload)
+            return {"code": "0", "data": {"ordId": f"order-{len(self.payloads)}"}}
+
+    fake_client = FakeDeepcoinClient()
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=_StaticContractSpecProvider(),
+        deepcoin_client_factory=lambda: fake_client,
+    )
+    save_trading_settings(app.state.session_factory, {"auto_trade_enabled": True})
+    persist_recovery_evaluations(
+        app.state.session_factory,
+        [
+            RecoveryEvaluation(
+                signal=RecoverySignal(
+                    kol_id="alice",
+                    chat_id=100,
+                    message_id=55,
+                    posted_at=datetime(2026, 6, 12, 8, 0),
+                    symbol="BTC",
+                    side="long",
+                    entry_range=(68000.0, 68200.0),
+                    stop_loss_text="67500",
+                    take_profit_text="69000 / 70000",
+                    trading_mode="auto_trade",
+                    max_loss_usdt=100.0,
+                ),
+                decision=RecoveryDecision(
+                    action="eligible_for_recovery_limit_order",
+                    reason_codes=["recovery_checks_passed"],
+                    entry_range=(68000.0, 68200.0),
+                    max_loss_usdt=100.0,
+                ),
+            )
+        ],
+        run_at=datetime(2026, 6, 12, 18, 0),
+    )
+    apply_recovery_review_decision(
+        app.state.session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        review_status="approved_for_order",
+        reviewed_at=datetime(2026, 6, 12, 19, 0),
+    )
+    client = TestClient(app)
+    client.post(
+        "/api/recovery-order-confirm-dry-run",
+        json={
+            "chat_id": 100,
+            "message_id": 55,
+            "symbol": "BTC",
+            "side": "long",
+        },
+    )
+
+    response = client.post(
+        "/api/recovery-live-submit",
+        json={
+            "chat_id": 100,
+            "message_id": 55,
+            "symbol": "BTC",
+            "side": "long",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted"] is True
+    assert response.json()["order_count"] == 2
+    assert fake_client.payloads[0]["clOrdId"] == "tkol-deepcoin-100-55-btc-long-entry-1"

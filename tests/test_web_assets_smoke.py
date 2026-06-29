@@ -154,3 +154,14 @@ def test_app_js_binds_recovery_live_submit_gate_simulation(tmp_path):
     assert "/api/recovery-live-submit-gate" in response.text
     assert "would_submit" in response.text
     assert "data-recovery-submit-gate-status" in response.text
+
+
+def test_app_js_binds_recovery_live_submit(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "data-live-recovery-submit" in response.text
+    assert "/api/recovery-live-submit" in response.text
+    assert "实盘提交" in response.text

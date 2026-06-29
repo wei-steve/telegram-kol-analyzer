@@ -594,6 +594,42 @@ function bindDetailPanelControls() {
     });
   });
 
+  document.querySelectorAll('[data-live-recovery-submit]').forEach((button) => {
+    if (button.dataset.liveSubmitBound === 'true') {
+      return;
+    }
+    button.dataset.liveSubmitBound = 'true';
+    button.addEventListener('click', async () => {
+      const chatId = Number(button.dataset.chatId || '0');
+      const messageId = Number(button.dataset.messageId || '0');
+      const symbol = button.dataset.symbol || '';
+      const side = button.dataset.side || '';
+      const status = button.parentElement.querySelector('[data-recovery-submit-gate-status]');
+      if (!window.confirm(`确认实盘提交 ${symbol} ${side} 策略？`)) {
+        return;
+      }
+      button.disabled = true;
+      if (status) { status.textContent = '实盘提交中...'; status.classList.remove('is-error', 'is-ready'); }
+      try {
+        const response = await fetch('/api/recovery-live-submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, message_id: messageId, symbol, side }),
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          if (status) { status.textContent = result.detail || '实盘提交失败'; status.classList.add('is-error'); }
+          return;
+        }
+        if (status) { status.textContent = `已提交 ${result.order_count || 0} 笔`; status.classList.add('is-ready'); }
+      } catch {
+        if (status) { status.textContent = '实盘提交失败，请检查服务状态'; status.classList.add('is-error'); }
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+
   // Bind message panel controls (always visible in lower section)
   const messagesPanel = document.querySelector('[data-messages-panel]');
   if (messagesPanel) {

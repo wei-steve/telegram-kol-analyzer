@@ -36,6 +36,8 @@ from telegram_kol_research.ai_recognition_config import (
     save_ai_recognition_config,
 )
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
+from telegram_kol_research.deepcoin_client import DeepcoinClientError
+from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
@@ -55,6 +57,8 @@ from telegram_kol_research.execution_bindings import list_active_positions
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import list_recovery_decisions
 from telegram_kol_research.recovery_execution_queue import list_recovery_execution_previews
+from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
+from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_runner import run_recovery_dry_run
@@ -308,6 +312,7 @@ def create_web_app(
     recovery_runner=None,
     recovery_market_data_factory=None,
     deepcoin_contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    deepcoin_client_factory=None,
     message_recognizer=None,
     ai_recognition_config_path: str | Path | None = None,
 ) -> FastAPI:
@@ -446,6 +451,9 @@ def create_web_app(
         recovery_market_data_factory or GateMarketDataProvider
     )
     app.state.deepcoin_contract_spec_provider = deepcoin_contract_spec_provider
+    app.state.deepcoin_client_factory = (
+        deepcoin_client_factory or build_deepcoin_client_from_env
+    )
     app.state.message_recognizer = message_recognizer or recognize_message_now
     app.state.ai_recognition_config_path = (
         Path(ai_recognition_config_path)
@@ -1462,6 +1470,38 @@ def create_web_app(
                 side=str(payload["side"]),
                 contract_spec_provider=app.state.deepcoin_contract_spec_provider,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/recovery-live-submit")
+    def recovery_live_submit(payload: dict[str, Any]):
+        required_fields = ["chat_id", "message_id", "symbol", "side"]
+        missing_fields = [
+            field_name
+            for field_name in required_fields
+            if payload.get(field_name) in (None, "")
+        ]
+        if missing_fields:
+            raise HTTPException(
+                status_code=422,
+                detail=f"missing required fields: {', '.join(missing_fields)}",
+            )
+        try:
+            deepcoin_client = app.state.deepcoin_client_factory()
+            return submit_recovery_order_live(
+                app.state.session_factory,
+                chat_id=int(payload["chat_id"]),
+                message_id=int(payload["message_id"]),
+                symbol=str(payload["symbol"]),
+                side=str(payload["side"]),
+                deepcoin_client=deepcoin_client,
+                contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                submitted_at=app.state.now_provider(),
+            )
+        except RecoveryLiveSubmitError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except DeepcoinClientError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
