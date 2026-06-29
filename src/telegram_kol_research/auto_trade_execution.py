@@ -1,0 +1,156 @@
+"""Automatic live execution bridge for freshly recognized strategy signals."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy.orm import sessionmaker
+
+from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
+from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
+from telegram_kol_research.group_config import GroupConfig
+from telegram_kol_research.models import MediaAsset, RawMessage, SignalCandidate, Source
+from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
+from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
+from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
+from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
+from telegram_kol_research.recovery_scan import RecoveryDecision
+from telegram_kol_research.recovery_scan import RecoveryEvaluation
+from telegram_kol_research.recovery_scan import RecoverySignal
+from telegram_kol_research.recovery_scan import _parse_entry_range
+from telegram_kol_research.recovery_scan import _resolve_runtime_config
+from telegram_kol_research.trading_settings import apply_trading_settings_to_group_config
+from telegram_kol_research.trading_settings import load_trading_settings
+
+
+def auto_process_message_trade_signal(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    group_config: GroupConfig,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    processed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Turn one fresh entry SignalCandidate into a queued and submitted live order."""
+
+    now = processed_at or datetime.now(UTC)
+    settings = load_trading_settings(session_factory)
+    if not settings.auto_trade_enabled:
+        return {"status": "skipped", "reason": "auto_trade_disabled"}
+
+    loaded = _load_best_entry_candidate(session_factory, raw_message_id=raw_message_id)
+    if loaded is None:
+        return {"status": "skipped", "reason": "no_entry_signal_candidate"}
+    raw_message, candidate, source, has_media = loaded
+
+    runtime_group_config = apply_trading_settings_to_group_config(group_config, settings)
+    runtime_config = _resolve_runtime_config(
+        runtime_group_config,
+        raw_message=raw_message,
+        source=source,
+    )
+    if runtime_config is None:
+        return {"status": "skipped", "reason": "group_not_configured_for_auto_trade"}
+    if runtime_config["trading_mode"] != "auto_trade":
+        return {"status": "skipped", "reason": "kol_or_group_auto_trade_disabled"}
+
+    symbol = (candidate.symbol or "").upper()
+    side = (candidate.side or "").lower()
+    if not symbol or symbol not in {item.upper() for item in settings.allowed_symbols}:
+        return {"status": "skipped", "reason": "symbol_not_allowed", "symbol": symbol}
+    if candidate.confidence < settings.min_ai_confidence:
+        return {"status": "skipped", "reason": "confidence_below_minimum"}
+    if has_media and not settings.allow_vision_auto_trade:
+        return {"status": "skipped", "reason": "vision_auto_trade_disabled"}
+
+    signal = RecoverySignal(
+        kol_id=str(runtime_config["kol_id"]),
+        chat_id=raw_message.chat_id,
+        message_id=raw_message.message_id,
+        posted_at=raw_message.posted_at or now,
+        symbol=symbol,
+        side=side,
+        entry_range=_parse_entry_range(candidate.entry_text),
+        stop_loss_text=candidate.stop_loss_text,
+        take_profit_text=candidate.take_profit_text,
+        parse_source=candidate.parse_source,
+        confidence=candidate.confidence,
+        trading_mode="auto_trade",
+        max_loss_usdt=float(runtime_config["max_loss_usdt"]),
+        symbol_whitelist=[str(item).upper() for item in runtime_config["symbol_whitelist"]],
+    )
+    decision = RecoveryDecision(
+        action="eligible_for_recovery_limit_order",
+        reason_codes=["live_signal_auto_trade"],
+        entry_range=signal.entry_range,
+        max_loss_usdt=signal.max_loss_usdt,
+    )
+    persist_recovery_evaluations(
+        session_factory,
+        [RecoveryEvaluation(signal=signal, decision=decision)],
+        run_at=now,
+    )
+    apply_recovery_review_decision(
+        session_factory,
+        chat_id=signal.chat_id,
+        message_id=signal.message_id,
+        symbol=symbol,
+        side=side,
+        review_status="approved_for_order",
+        note="auto_trade_live_signal",
+        reviewed_at=now,
+    )
+    confirm_recovery_order_dry_run(
+        session_factory,
+        chat_id=signal.chat_id,
+        message_id=signal.message_id,
+        symbol=symbol,
+        side=side,
+        contract_spec_provider=contract_spec_provider,
+        persist_ready_confirmation=True,
+        confirmed_at=now,
+    )
+    submit_result = submit_recovery_order_live(
+        session_factory,
+        chat_id=signal.chat_id,
+        message_id=signal.message_id,
+        symbol=symbol,
+        side=side,
+        deepcoin_client=deepcoin_client,
+        contract_spec_provider=contract_spec_provider,
+        submitted_at=now,
+    )
+    return {"status": "submitted", "result": submit_result}
+
+
+def _load_best_entry_candidate(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+) -> tuple[RawMessage, SignalCandidate, Source | None, bool] | None:
+    with session_factory() as session:
+        row = (
+            session.query(RawMessage, SignalCandidate, Source)
+            .join(SignalCandidate, SignalCandidate.raw_message_id == RawMessage.id)
+            .outerjoin(Source, SignalCandidate.source_id == Source.id)
+            .filter(RawMessage.id == raw_message_id)
+            .filter(SignalCandidate.event_type == "entry_signal")
+            .order_by(SignalCandidate.confidence.desc(), SignalCandidate.id.asc())
+            .first()
+        )
+        if row is None:
+            return None
+        raw_message, candidate, source = row
+        has_media = (
+            session.query(MediaAsset.id)
+            .filter(MediaAsset.raw_message_id == raw_message.id)
+            .first()
+            is not None
+        )
+        session.expunge(raw_message)
+        session.expunge(candidate)
+        if source is not None:
+            session.expunge(source)
+        return raw_message, candidate, source, has_media

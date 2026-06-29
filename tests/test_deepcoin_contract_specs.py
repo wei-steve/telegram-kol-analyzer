@@ -30,6 +30,28 @@ def test_load_deepcoin_contract_specs_returns_provider_for_yaml_entries(tmp_path
     assert provider.get_contract_spec("ETH-USDT-SWAP") is None
 
 
+def test_project_deepcoin_contract_specs_include_verified_btc_and_eth_minimums():
+    provider = load_deepcoin_contract_specs(Path("config/deepcoin_contract_specs.yaml"))
+
+    btc = provider.get_contract_spec("BTC-USDT-SWAP")
+    eth = provider.get_contract_spec("ETH-USDT-SWAP")
+
+    assert btc == DeepcoinContractSpec(
+        instrument_id="BTC-USDT-SWAP",
+        contract_value=0.001,
+        quantity_step=1,
+        min_quantity=1,
+        price_tick=0.1,
+    )
+    assert eth == DeepcoinContractSpec(
+        instrument_id="ETH-USDT-SWAP",
+        contract_value=0.1,
+        quantity_step=0.1,
+        min_quantity=0.1,
+        price_tick=0.01,
+    )
+
+
 def test_load_deepcoin_contract_specs_allows_missing_optional_file(tmp_path):
     provider = load_deepcoin_contract_specs(
         tmp_path / "missing.yaml",

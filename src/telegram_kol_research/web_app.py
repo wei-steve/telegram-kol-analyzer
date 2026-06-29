@@ -28,6 +28,7 @@ except (
     ) from exc
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
 from telegram_kol_research.ai_recognition_config import (
     AiModelConfig,
     AiProviderConfig,
@@ -297,6 +298,22 @@ def _group_ai_strategy_enabled(group_config: GroupConfig, chat_title: str) -> bo
     )
 
 
+def _run_auto_trade_executor(app: FastAPI, *, raw_message_id: int) -> dict[str, Any]:
+    try:
+        deepcoin_client = app.state.deepcoin_client_factory()
+        return auto_process_message_trade_signal(
+            app.state.session_factory,
+            raw_message_id=raw_message_id,
+            group_config=app.state.group_config,
+            deepcoin_client=deepcoin_client,
+            contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+            processed_at=app.state.now_provider(),
+        )
+    except Exception:
+        logger.exception("automatic Deepcoin trade execution failed")
+        return {"status": "failed", "reason": "auto_trade_executor_error"}
+
+
 def create_web_app(
     database_path: str | Path,
     media_root: str | Path | None = None,
@@ -361,6 +378,7 @@ def create_web_app(
                 strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
                 ai_recognition_config_path=app.state.ai_recognition_config_path,
                 lifecycle_monitor=app.state.lifecycle_monitor,
+                auto_trade_executor=app.state.auto_trade_executor,
             )
             app.state.reconcile_task = asyncio.create_task(
                 _run_reconcile_after_startup_delay(
@@ -456,6 +474,10 @@ def create_web_app(
     app.state.deepcoin_client_factory = (
         deepcoin_client_factory or build_deepcoin_client_from_env
     )
+    app.state.auto_trade_executor = lambda raw_message_id: _run_auto_trade_executor(
+        app,
+        raw_message_id=raw_message_id,
+    )
     app.state.message_recognizer = message_recognizer or recognize_message_now
     app.state.ai_recognition_config_path = (
         Path(ai_recognition_config_path)
@@ -504,6 +526,7 @@ def create_web_app(
                 strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
                 ai_recognition_config_path=app.state.ai_recognition_config_path,
                 lifecycle_monitor=app.state.lifecycle_monitor,
+                auto_trade_executor=app.state.auto_trade_executor,
             )
         reconcile_task = app.state.reconcile_task
         if reconcile_task is None or reconcile_task.done():

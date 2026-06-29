@@ -59,6 +59,7 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
                 "quantity_unit": "base_asset_estimate",
             },
         ],
+        "stop_loss": 67500.0,
         "take_profit_legs": [
             {
                 "index": 1,
@@ -171,6 +172,7 @@ def test_build_deepcoin_order_draft_converts_base_estimate_with_contract_spec():
     assert draft["order_legs"][1]["price"] == 68000.0
     assert draft["order_legs"][1]["quantity"] == 100.0
     assert draft["order_legs"][1]["quantity_unit"] == "contracts"
+    assert draft["stop_loss"] == 67500.0
     assert "contract_spec_applied" in draft["notes"]
     assert "quantity_rounded_down_to_step" in draft["notes"]
     assert "price_rounded_to_tick" in draft["notes"]

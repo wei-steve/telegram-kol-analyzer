@@ -19,6 +19,7 @@ from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 
 
@@ -573,6 +574,34 @@ class _StaticContractSpecProvider:
         )
 
 
+def _persist_execution_candidate(session_factory):
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=55,
+            sender_name="alice",
+            posted_at=datetime(2026, 6, 12, 8, 0),
+            text="BTC long 68000-68200 SL 67500 TP 69000 / 70000",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="long",
+                event_type="entry_signal",
+                entry_text="68000-68200",
+                stop_loss_text="67500",
+                take_profit_text="69000 / 70000",
+                parse_source="text",
+                confidence=0.9,
+            )
+        )
+        session.commit()
+
+
 def test_recovery_execution_queue_api_applies_configured_contract_specs(tmp_path):
     app = create_web_app(
         database_path=tmp_path / "research.db",
@@ -773,10 +802,15 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
     class FakeDeepcoinClient:
         def __init__(self):
             self.payloads = []
+            self.protection_payloads = []
 
         def place_order(self, order_payload):
             self.payloads.append(order_payload)
             return {"code": "0", "data": {"ordId": f"order-{len(self.payloads)}"}}
+
+        def replace_order_sltp(self, protection_payload):
+            self.protection_payloads.append(protection_payload)
+            return {"code": "0", "data": {"orderSysID": protection_payload["orderSysID"]}}
 
     fake_client = FakeDeepcoinClient()
     app = create_web_app(
@@ -785,6 +819,7 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
         deepcoin_client_factory=lambda: fake_client,
     )
     save_trading_settings(app.state.session_factory, {"auto_trade_enabled": True})
+    _persist_execution_candidate(app.state.session_factory)
     persist_recovery_evaluations(
         app.state.session_factory,
         [
@@ -846,16 +881,23 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
     assert response.json()["submitted"] is True
     assert response.json()["order_count"] == 2
     assert fake_client.payloads[0]["clOrdId"] == "tkol-deepcoin-100-55-btc-long-entry-1"
+    assert fake_client.protection_payloads[0]["tpTriggerPx"] == "69000.0"
+    assert fake_client.protection_payloads[0]["slTriggerPx"] == "67500.0"
 
 
 def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
     class FakeDeepcoinClient:
         def __init__(self):
             self.payloads = []
+            self.protection_payloads = []
 
         def place_order(self, order_payload):
             self.payloads.append(order_payload)
             return {"code": "0", "data": {"ordId": f"order-{len(self.payloads)}"}}
+
+        def replace_order_sltp(self, protection_payload):
+            self.protection_payloads.append(protection_payload)
+            return {"code": "0", "data": {"orderSysID": protection_payload["orderSysID"]}}
 
     fake_client = FakeDeepcoinClient()
     app = create_web_app(
@@ -864,6 +906,7 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
         deepcoin_client_factory=lambda: fake_client,
     )
     save_trading_settings(app.state.session_factory, {"auto_trade_enabled": True})
+    _persist_execution_candidate(app.state.session_factory)
     persist_recovery_evaluations(
         app.state.session_factory,
         [
@@ -928,3 +971,4 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
     assert process_response.json()["processed"] is True
     assert process_response.json()["result"]["signal_id"] == signal.id
     assert fake_client.payloads[0]["tdMode"] == "cross"
+    assert fake_client.protection_payloads[0]["orderSysID"] == "order-1"

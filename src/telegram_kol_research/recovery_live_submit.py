@@ -225,6 +225,13 @@ def _submit_recovery_signal_direct(
         order_id = _extract_order_id(response)
         pos_id = _extract_position_id(response)
         client_order_id = str(leg.get("client_order_id") or order_payload.get("clOrdId") or "")
+        protection_payload = build_deepcoin_order_sltp_payload(draft, order_id=order_id)
+        try:
+            protection_response = deepcoin_client.replace_order_sltp(protection_payload)
+        except DeepcoinClientError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            raise DeepcoinClientError(f"Deepcoin protection request failed: {exc}") from exc
         submitted_orders.append(
             {
                 "leg_index": index,
@@ -233,6 +240,8 @@ def _submit_recovery_signal_direct(
                 "pos_id": pos_id,
                 "request": order_payload,
                 "response": response,
+                "protection_request": protection_payload,
+                "protection_response": protection_response,
             }
         )
 
@@ -272,7 +281,7 @@ def _submit_recovery_signal_direct(
         "order_count": len(submitted_orders),
         "orders": submitted_orders,
         "deepcoin_order_draft": draft,
-        "warnings": ["protection_not_submitted_verify_stop_loss_take_profit_manually"],
+        "warnings": _protection_warnings(draft),
     }
 
 
@@ -299,6 +308,43 @@ def build_deepcoin_place_order_payload(
         "sz": str(quantity),
         "clOrdId": str(leg.get("client_order_id") or ""),
     }
+
+
+def build_deepcoin_order_sltp_payload(
+    draft: dict[str, Any],
+    *,
+    order_id: str | None,
+) -> dict[str, Any]:
+    """Convert an internal draft to Deepcoin's order TP/SL protection payload."""
+
+    if not order_id:
+        raise RecoveryLiveSubmitError("missing_order_id_for_protection")
+    stop_loss = draft.get("stop_loss")
+    if not isinstance(stop_loss, int | float) or stop_loss <= 0:
+        raise RecoveryLiveSubmitError("missing_stop_loss_for_protection")
+    take_profit_legs = draft.get("take_profit_legs")
+    if not isinstance(take_profit_legs, list) or not take_profit_legs:
+        raise RecoveryLiveSubmitError("missing_take_profit_for_protection")
+    first_take_profit = take_profit_legs[0]
+    if not isinstance(first_take_profit, dict):
+        raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
+    take_profit_price = first_take_profit.get("price")
+    if not isinstance(take_profit_price, int | float) or take_profit_price <= 0:
+        raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
+
+    return {
+        "instId": str(draft["instrument_id"]),
+        "orderSysID": str(order_id),
+        "tpTriggerPx": str(take_profit_price),
+        "slTriggerPx": str(stop_loss),
+    }
+
+
+def _protection_warnings(draft: dict[str, Any]) -> list[str]:
+    take_profit_legs = draft.get("take_profit_legs")
+    if isinstance(take_profit_legs, list) and len(take_profit_legs) > 1:
+        return ["only_first_take_profit_submitted_for_order_sltp"]
+    return []
 
 
 def _deepcoin_margin_mode(value: str) -> str:

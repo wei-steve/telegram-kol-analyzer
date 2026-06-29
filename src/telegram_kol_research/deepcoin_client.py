@@ -19,6 +19,7 @@ from telegram_kol_research.telegram_client import _load_env_file_values
 
 DEEPCOIN_BASE_URL = "https://api.deepcoin.com"
 DEEPCOIN_PLACE_ORDER_PATH = "/deepcoin/trade/order"
+DEEPCOIN_REPLACE_ORDER_SLTP_PATH = "/deepcoin/trade/replace-order-sltp"
 
 
 class DeepcoinClientError(RuntimeError):
@@ -37,6 +38,9 @@ class DeepcoinCredentials:
 class DeepcoinTradingClientProtocol(Protocol):
     def place_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
         """Submit one live order and return the raw Deepcoin response."""
+
+    def replace_order_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
+        """Attach or replace take-profit / stop-loss protection for an open limit order."""
 
 
 def load_deepcoin_credentials(
@@ -86,6 +90,9 @@ class DeepcoinRestClient:
 
     def place_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_PLACE_ORDER_PATH, order_payload)
+
+    def replace_order_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", DEEPCOIN_REPLACE_ORDER_SLTP_PATH, protection_payload)
 
     def _request(
         self,

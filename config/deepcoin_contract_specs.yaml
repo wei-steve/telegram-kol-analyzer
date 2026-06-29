@@ -6,3 +6,8 @@ contracts:
     quantity_step: 1
     min_quantity: 1
     price_tick: 0.1
+  - instrument_id: "ETH-USDT-SWAP"
+    contract_value: 0.1
+    quantity_step: 0.1
+    min_quantity: 0.1
+    price_tick: 0.01

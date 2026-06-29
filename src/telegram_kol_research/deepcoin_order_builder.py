@@ -138,6 +138,11 @@ def build_deepcoin_order_draft(
         "margin_mode": margin_mode,
         "position_mode": position_mode,
         "order_legs": order_legs,
+        "stop_loss": (
+            float(f"{_normalize_price(stop_loss, contract_spec):g}")
+            if stop_loss is not None
+            else None
+        ),
         "take_profit_legs": _take_profit_legs(
             prices=take_profit_prices,
             allocations=take_profit_allocations,

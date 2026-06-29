@@ -43,6 +43,7 @@ async def persist_live_message_event(
     ai_recognition_config: AiRecognitionConfig | None = None,
     ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
+    auto_trade_executor: Callable[[int], Any] | None = None,
 ) -> dict[str, int]:
     """Normalize and persist one live Telegram event into the existing raw ingest flow.
 
@@ -125,6 +126,8 @@ async def persist_live_message_event(
                 media_root=media_root,
             )
             # ── exit signal → lifecycle monitor ──
+            if auto_trade_executor is not None:
+                await asyncio.to_thread(auto_trade_executor, raw_message.id)
             if lifecycle_monitor is not None and recog_result is not None:
                 ai_payload = recog_result.ai_payload or {}
                 strategy_kind = ai_payload.get("strategy_kind")
@@ -170,6 +173,7 @@ async def run_live_listener(
     ai_recognition_config: AiRecognitionConfig | None = None,
     ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
+    auto_trade_executor: Callable[[int], Any] | None = None,
 ) -> None:
     """Attach Telethon new-message handlers and keep the client alive."""
 
@@ -196,6 +200,7 @@ async def run_live_listener(
             ai_recognition_config=ai_recognition_config,
             ai_recognition_config_path=ai_recognition_config_path,
             lifecycle_monitor=lifecycle_monitor,
+            auto_trade_executor=auto_trade_executor,
         )
 
     add_event_handler = getattr(client, "add_event_handler", None)
@@ -225,6 +230,7 @@ def launch_live_listener_task(
     ai_recognition_config: AiRecognitionConfig | None = None,
     ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
+    auto_trade_executor: Callable[[int], Any] | None = None,
 ) -> asyncio.Task[None]:
     """Schedule the realtime listener in the current event loop."""
 
@@ -241,6 +247,7 @@ def launch_live_listener_task(
             "ai_recognition_config": ai_recognition_config,
             "ai_recognition_config_path": ai_recognition_config_path,
             "lifecycle_monitor": lifecycle_monitor,
+            "auto_trade_executor": auto_trade_executor,
         },
     )
     return asyncio.create_task(runner(**kwargs))
