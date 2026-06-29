@@ -7,6 +7,8 @@ from telegram_kol_research.recovery_decisions import apply_recovery_review_decis
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import build_deepcoin_place_order_payload
+from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_signal
+from telegram_kol_research.recovery_live_submit import process_next_trade_signal_live
 from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_scan import RecoveryDecision
@@ -161,3 +163,40 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
         "tkol-deepcoin-100-55-btc-long-entry-2"
     )
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
+
+
+def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    fake_client = _FakeDeepcoinClient()
+
+    result = process_next_trade_signal_live(
+        session_factory,
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert result["signal_id"] == signal.id
+    assert result["order_count"] == 2
+    with session_factory() as session:
+        assert session.query(ExecutionBinding).count() == 1
+
+
+def test_process_next_trade_signal_live_returns_none_without_pending_signal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+
+    assert process_next_trade_signal_live(
+        session_factory,
+        deepcoin_client=_FakeDeepcoinClient(),
+        contract_spec_provider=_StaticContractSpecProvider(),
+    ) is None

@@ -73,6 +73,13 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
     "recognition_experiments": {
         "updated_at": "ALTER TABLE recognition_experiments ADD COLUMN updated_at DATETIME",
     },
+    "trade_signals": {
+        "strategy_instance_id": "ALTER TABLE trade_signals ADD COLUMN strategy_instance_id VARCHAR(255)",
+        "result_json": "ALTER TABLE trade_signals ADD COLUMN result_json TEXT",
+        "last_error": "ALTER TABLE trade_signals ADD COLUMN last_error TEXT",
+        "attempts": "ALTER TABLE trade_signals ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+        "processed_at": "ALTER TABLE trade_signals ADD COLUMN processed_at DATETIME",
+    },
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
@@ -103,6 +110,14 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
     "ix_execution_bindings_client_order": (
         "CREATE INDEX IF NOT EXISTS ix_execution_bindings_client_order "
         "ON execution_bindings (client_order_id)"
+    ),
+    "ix_trade_signals_status_created": (
+        "CREATE INDEX IF NOT EXISTS ix_trade_signals_status_created "
+        "ON trade_signals (status, created_at)"
+    ),
+    "ix_trade_signals_strategy_instance": (
+        "CREATE INDEX IF NOT EXISTS ix_trade_signals_strategy_instance "
+        "ON trade_signals (strategy_instance_id)"
     ),
 }
 

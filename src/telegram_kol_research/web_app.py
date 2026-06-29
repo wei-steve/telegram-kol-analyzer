@@ -58,6 +58,7 @@ from telegram_kol_research.recovery_decisions import apply_recovery_review_decis
 from telegram_kol_research.recovery_decisions import list_recovery_decisions
 from telegram_kol_research.recovery_execution_queue import list_recovery_execution_previews
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
+from telegram_kol_research.recovery_live_submit import process_next_trade_signal_live
 from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
@@ -71,6 +72,7 @@ from telegram_kol_research.trading_settings import (
     load_trading_settings,
     save_trading_settings,
 )
+from telegram_kol_research.trade_signals import list_pending_trade_signals
 from telegram_kol_research.web_queries import (
     load_database_freshness,
     load_group_messages,
@@ -1504,6 +1506,52 @@ def create_web_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/trade-signals")
+    def trade_signals(limit: int = 50):
+        items = list_pending_trade_signals(
+            app.state.session_factory,
+            venue="deepcoin",
+            limit=max(1, min(int(limit), 200)),
+        )
+        return {
+            "items": [
+                {
+                    "id": item.id,
+                    "signal_uid": item.signal_uid,
+                    "strategy_instance_id": item.strategy_instance_id,
+                    "source_type": item.source_type,
+                    "venue": item.venue,
+                    "kol_id": item.kol_id,
+                    "chat_id": item.chat_id,
+                    "message_id": item.message_id,
+                    "symbol": item.symbol,
+                    "side": item.side,
+                    "action": item.action,
+                    "status": item.status,
+                    "attempts": item.attempts,
+                    "last_error": item.last_error,
+                    "payload": item.payload,
+                }
+                for item in items
+            ]
+        }
+
+    @app.post("/api/trade-signals/process-next")
+    def trade_signals_process_next():
+        try:
+            deepcoin_client = app.state.deepcoin_client_factory()
+            result = process_next_trade_signal_live(
+                app.state.session_factory,
+                deepcoin_client=deepcoin_client,
+                contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                processed_at=app.state.now_provider(),
+            )
+            return {"processed": result is not None, "result": result}
+        except RecoveryLiveSubmitError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except DeepcoinClientError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/api/events")
     def events():

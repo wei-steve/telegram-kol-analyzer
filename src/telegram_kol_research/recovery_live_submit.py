@@ -13,6 +13,12 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecPr
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import upsert_execution_binding
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
+from telegram_kol_research.trade_signals import TradeSignalRecord
+from telegram_kol_research.trade_signals import enqueue_trade_signal
+from telegram_kol_research.trade_signals import list_pending_trade_signals
+from telegram_kol_research.trade_signals import load_trade_signal
+from telegram_kol_research.trade_signals import mark_trade_signal_failed
+from telegram_kol_research.trade_signals import mark_trade_signal_submitted
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -31,11 +37,41 @@ def submit_recovery_order_live(
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     submitted_at: datetime | None = None,
 ) -> dict[str, Any]:
-    """Submit live Deepcoin limit entry orders for a confirmed recovery item."""
+    """Enqueue and execute a confirmed recovery signal through the trade queue."""
 
     settings = load_trading_settings(session_factory)
     if not settings.auto_trade_enabled:
         raise RecoveryLiveSubmitError("auto_trade_disabled")
+
+    trade_signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=chat_id,
+        message_id=message_id,
+        symbol=symbol,
+        side=side,
+        contract_spec_provider=contract_spec_provider,
+        enqueued_at=submitted_at,
+    )
+    return process_trade_signal_live(
+        session_factory,
+        signal_id=trade_signal.id,
+        deepcoin_client=deepcoin_client,
+        contract_spec_provider=contract_spec_provider,
+        processed_at=submitted_at,
+    )
+
+
+def enqueue_recovery_trade_signal(
+    session_factory: sessionmaker,
+    *,
+    chat_id: int,
+    message_id: int,
+    symbol: str,
+    side: str,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    enqueued_at: datetime | None = None,
+) -> TradeSignalRecord:
+    """Send one confirmed recovery strategy into the durable trade-signal queue."""
 
     gate = validate_recovery_live_submit_gate(
         session_factory,
@@ -47,9 +83,120 @@ def submit_recovery_order_live(
     )
     if not gate["would_submit"]:
         raise RecoveryLiveSubmitError(
-            "live_submit_blocked:" + ",".join(str(code) for code in gate["reason_codes"])
+            "signal_enqueue_blocked:" + ",".join(str(code) for code in gate["reason_codes"])
         )
 
+    draft = gate["deepcoin_order_draft"]
+    if not isinstance(draft, dict):
+        raise RecoveryLiveSubmitError("missing_deepcoin_order_draft")
+    source = draft.get("source") if isinstance(draft.get("source"), dict) else {}
+    return enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="recovery",
+        kol_id=str(source.get("kol_id") or "unknown"),
+        chat_id=chat_id,
+        message_id=message_id,
+        symbol=str(draft.get("symbol") or symbol),
+        side=side,
+        action="open_position",
+        payload={
+            "source": {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "symbol": str(draft.get("symbol") or symbol).upper(),
+                "side": side.lower(),
+            },
+            "deepcoin_order_draft": draft,
+        },
+        strategy_instance_id=str(draft.get("strategy_instance_id") or ""),
+        enqueued_at=enqueued_at,
+    )
+
+
+def process_trade_signal_live(
+    session_factory: sessionmaker,
+    *,
+    signal_id: int,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    processed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Receive and execute one pending trade signal."""
+
+    settings = load_trading_settings(session_factory)
+    if not settings.auto_trade_enabled:
+        raise RecoveryLiveSubmitError("auto_trade_disabled")
+
+    trade_signal = load_trade_signal(session_factory, signal_id)
+    if trade_signal.status != "pending":
+        raise RecoveryLiveSubmitError(f"trade_signal_not_pending:{trade_signal.status}")
+    try:
+        result = _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=trade_signal,
+            deepcoin_client=deepcoin_client,
+            contract_spec_provider=contract_spec_provider,
+            submitted_at=processed_at,
+        )
+    except Exception as exc:
+        mark_trade_signal_failed(
+            session_factory,
+            signal_id=signal_id,
+            error=str(exc),
+            failed_at=processed_at,
+        )
+        raise
+    mark_trade_signal_submitted(
+        session_factory,
+        signal_id=signal_id,
+        result=result,
+        processed_at=processed_at,
+    )
+    return result
+
+
+def process_next_trade_signal_live(
+    session_factory: sessionmaker,
+    *,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    processed_at: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Receive and execute the oldest pending Deepcoin trade signal."""
+
+    pending = list_pending_trade_signals(session_factory, venue="deepcoin", limit=1)
+    if not pending:
+        return None
+    return process_trade_signal_live(
+        session_factory,
+        signal_id=pending[0].id,
+        deepcoin_client=deepcoin_client,
+        contract_spec_provider=contract_spec_provider,
+        processed_at=processed_at,
+    )
+
+
+def _submit_recovery_signal_direct(
+    session_factory: sessionmaker,
+    *,
+    trade_signal: TradeSignalRecord,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    submitted_at: datetime | None = None,
+) -> dict[str, Any]:
+    gate = validate_recovery_live_submit_gate(
+        session_factory,
+        chat_id=trade_signal.chat_id,
+        message_id=trade_signal.message_id,
+        symbol=trade_signal.symbol,
+        side=trade_signal.side,
+        contract_spec_provider=contract_spec_provider,
+    )
+    if not gate["would_submit"]:
+        raise RecoveryLiveSubmitError(
+            "live_submit_blocked:" + ",".join(str(code) for code in gate["reason_codes"])
+        )
     draft = gate["deepcoin_order_draft"]
     if not isinstance(draft, dict):
         raise RecoveryLiveSubmitError("missing_deepcoin_order_draft")
@@ -61,8 +208,8 @@ def submit_recovery_order_live(
     now = submitted_at or datetime.now(UTC)
     source = draft.get("source") if isinstance(draft.get("source"), dict) else {}
     kol_id = str(source.get("kol_id") or "unknown")
-    symbol_key = str(draft.get("symbol") or symbol).upper()
-    side_key = side.lower()
+    symbol_key = str(draft.get("symbol") or trade_signal.symbol).upper()
+    side_key = trade_signal.side.lower()
 
     for index, leg in enumerate(order_legs, start=1):
         if not isinstance(leg, dict):
@@ -93,8 +240,8 @@ def submit_recovery_order_live(
         session_factory,
         ExecutionBindingRecord(
             kol_id=kol_id,
-            chat_id=int(source.get("chat_id") or chat_id),
-            message_id=int(source.get("message_id") or message_id),
+            chat_id=int(source.get("chat_id") or trade_signal.chat_id),
+            message_id=int(source.get("message_id") or trade_signal.message_id),
             symbol=symbol_key,
             side=side_key,
             venue="deepcoin",
@@ -113,10 +260,12 @@ def submit_recovery_order_live(
     return {
         "submitted": True,
         "venue": "deepcoin",
+        "signal_id": trade_signal.id,
+        "signal_uid": trade_signal.signal_uid,
         "submitted_at": now.isoformat(),
         "source": {
-            "chat_id": chat_id,
-            "message_id": message_id,
+            "chat_id": trade_signal.chat_id,
+            "message_id": trade_signal.message_id,
             "symbol": symbol_key,
             "side": side_key,
         },

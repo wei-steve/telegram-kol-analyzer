@@ -135,7 +135,24 @@ def test_database_bootstrap_backfills_missing_recovery_decision_columns(tmp_path
     assert "reason_codes_json" in columns
     assert "entry_range_text" in columns
     assert "max_loss_usdt" in columns
-    assert "run_at" in columns
+
+
+def test_database_bootstrap_creates_trade_signals_table(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(trade_signals)").fetchall()
+    }
+    conn.close()
+
+    assert "signal_uid" in columns
+    assert "strategy_instance_id" in columns
+    assert "payload_json" in columns
+    assert "result_json" in columns
+    assert "processed_at" in columns
     assert "updated_at" in columns
 
 

@@ -248,6 +248,44 @@ class ExecutionBinding(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class TradeSignal(Base):
+    __tablename__ = "trade_signals"
+    __table_args__ = (
+        UniqueConstraint(
+            "venue",
+            "source_type",
+            "chat_id",
+            "message_id",
+            "symbol",
+            "side",
+            "action",
+            name="uq_trade_signals_source_action",
+        ),
+        Index("ix_trade_signals_status_created", "status", "created_at"),
+        Index("ix_trade_signals_strategy_instance", "strategy_instance_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_uid: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    strategy_instance_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False, default="recovery")
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    kol_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, default="open_position", index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class RecoveryDecisionRecord(Base):
     __tablename__ = "recovery_decisions"
     __table_args__ = (
