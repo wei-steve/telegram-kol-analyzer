@@ -57,7 +57,7 @@ def test_auto_enabled_btc_signal_with_stop_loss_is_eligible_for_auto_trade():
 
     assert decision.action == "eligible_for_auto_trade"
     assert decision.reason_codes == ["risk_checks_passed"]
-    assert decision.max_loss_usdt == 100.0
+    assert decision.max_loss_usdt == 20.0
 
 
 def test_existing_same_kol_position_requires_manual_review():

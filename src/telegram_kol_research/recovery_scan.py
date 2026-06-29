@@ -33,7 +33,7 @@ class RecoverySignal:
     parse_source: str = "text"
     confidence: float = 0.0
     trading_mode: str = "notify_only"
-    max_loss_usdt: float = 100.0
+    max_loss_usdt: float = 20.0
     symbol_whitelist: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
 
 
@@ -59,7 +59,7 @@ class RecoveryDecision:
     action: str
     reason_codes: list[str]
     entry_range: tuple[float, float] | None = None
-    max_loss_usdt: float = 100.0
+    max_loss_usdt: float = 20.0
 
 
 class MarketDataProvider(Protocol):

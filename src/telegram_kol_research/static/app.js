@@ -968,7 +968,7 @@ function bindTradingSettingsForm() {
     };
     const payload = {
       auto_trade_enabled: Boolean(form.querySelector('[name="auto_trade_enabled"]')?.checked),
-      default_max_loss_usdt: numericValue('default_max_loss_usdt', 100),
+      default_max_loss_usdt: numericValue('default_max_loss_usdt', 20),
       daily_max_loss_usdt: numericValue('daily_max_loss_usdt', 500),
       max_concurrent_positions: numericValue('max_concurrent_positions', 3),
       max_market_entry_deviation_pct: numericValue('max_market_entry_deviation_pct', 0.15),

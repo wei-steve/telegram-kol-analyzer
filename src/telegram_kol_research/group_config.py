@@ -32,7 +32,7 @@ class TargetGroupConfig:
     sync_end_date: date | None = None
     ai_strategy_enabled: bool = False
     trading_mode: str = "notify_only"
-    max_loss_usdt: float = 100.0
+    max_loss_usdt: float = 20.0
     symbol_whitelist: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
 
 
@@ -89,7 +89,7 @@ def load_group_config(config_path: str | Path) -> GroupConfig:
                 sync_end_date=_parse_optional_date(group_data.get("sync_end_date")),
                 ai_strategy_enabled=bool(group_data.get("ai_strategy_enabled", False)),
                 trading_mode=group_data.get("trading_mode", "notify_only"),
-                max_loss_usdt=float(group_data.get("max_loss_usdt", 100.0)),
+                max_loss_usdt=float(group_data.get("max_loss_usdt", 20.0)),
                 symbol_whitelist=(
                     _parse_symbol_whitelist(group_data.get("symbol_whitelist"))
                     or ["BTC", "ETH"]

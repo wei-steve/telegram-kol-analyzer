@@ -20,7 +20,7 @@ TRADING_SETTINGS_KEY = "global"
 @dataclass(slots=True)
 class TradingSettings:
     auto_trade_enabled: bool = False
-    default_max_loss_usdt: float = 100.0
+    default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
     max_concurrent_positions: int = 3
     max_market_entry_deviation_pct: float = 0.15

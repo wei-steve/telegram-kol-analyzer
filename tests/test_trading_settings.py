@@ -14,7 +14,7 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     settings = load_trading_settings(session_factory)
 
     assert settings.auto_trade_enabled is False
-    assert settings.default_max_loss_usdt == 100.0
+    assert settings.default_max_loss_usdt == 20.0
     assert settings.allowed_symbols == ["BTC", "ETH"]
     assert settings.entry_range_order_style == "conservative"
     assert settings.take_profit_allocations == [50.0, 30.0, 20.0]

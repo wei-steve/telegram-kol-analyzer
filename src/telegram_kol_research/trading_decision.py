@@ -21,7 +21,7 @@ class TradingDecisionInput:
     parse_source: str = "text"
     confidence: float = 0.0
     trading_mode: str = "notify_only"
-    max_loss_usdt: float = 100.0
+    max_loss_usdt: float = 20.0
     symbol_whitelist: list[str] = field(default_factory=lambda: DEFAULT_SYMBOL_WHITELIST.copy())
 
 

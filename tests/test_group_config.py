@@ -31,7 +31,7 @@ def test_group_config_defaults_to_notify_only_trading_mode(tmp_path):
     sender = group.tracked_senders[0]
     assert group.trading_mode == "notify_only"
     assert group.ai_strategy_enabled is False
-    assert group.max_loss_usdt == 100.0
+    assert group.max_loss_usdt == 20.0
     assert group.symbol_whitelist == ["BTC", "ETH"]
     assert sender.trading_mode == "notify_only"
     assert sender.max_loss_usdt is None
