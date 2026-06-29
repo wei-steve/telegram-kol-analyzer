@@ -223,14 +223,28 @@ def _submit_recovery_signal_direct(
             raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
 
         order_id = _extract_order_id(response)
+        if not order_id:
+            raise DeepcoinClientError("Deepcoin order response missing order id")
         pos_id = _extract_position_id(response)
         client_order_id = str(leg.get("client_order_id") or order_payload.get("clOrdId") or "")
         protection_payload = build_deepcoin_order_sltp_payload(draft, order_id=order_id)
         try:
             protection_response = deepcoin_client.replace_order_sltp(protection_payload)
         except DeepcoinClientError:
+            _cancel_unprotected_order(
+                deepcoin_client,
+                draft=draft,
+                order_id=order_id,
+                client_order_id=client_order_id,
+            )
             raise
         except Exception as exc:  # pragma: no cover - defensive boundary
+            _cancel_unprotected_order(
+                deepcoin_client,
+                draft=draft,
+                order_id=order_id,
+                client_order_id=client_order_id,
+            )
             raise DeepcoinClientError(f"Deepcoin protection request failed: {exc}") from exc
         submitted_orders.append(
             {
@@ -307,6 +321,7 @@ def build_deepcoin_place_order_payload(
         "px": str(price),
         "sz": str(quantity),
         "clOrdId": str(leg.get("client_order_id") or ""),
+        "mrgPosition": _deepcoin_position_mode(str(draft.get("position_mode") or "split")),
     }
 
 
@@ -334,7 +349,7 @@ def build_deepcoin_order_sltp_payload(
 
     return {
         "instId": str(draft["instrument_id"]),
-        "orderSysID": str(order_id),
+        "OrderSysID": str(order_id),
         "tpTriggerPx": str(take_profit_price),
         "slTriggerPx": str(stop_loss),
     }
@@ -351,9 +366,36 @@ def _deepcoin_margin_mode(value: str) -> str:
     return "cross" if value.lower() in {"cross", "crossed", "full", "全仓"} else "isolated"
 
 
+def _deepcoin_position_mode(value: str) -> str:
+    return "split" if value.lower() in {"split", "hedge", "long_short", "分仓"} else "merge"
+
+
+def _cancel_unprotected_order(
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    *,
+    draft: dict[str, Any],
+    order_id: str | None,
+    client_order_id: str | None,
+) -> None:
+    payload: dict[str, Any] = {
+        "instId": str(draft["instrument_id"]),
+        "mrgPosition": _deepcoin_position_mode(str(draft.get("position_mode") or "split")),
+    }
+    if order_id:
+        payload["ordId"] = str(order_id)
+    if client_order_id:
+        payload["clOrdId"] = str(client_order_id)
+    try:
+        deepcoin_client.cancel_order(payload)
+    except Exception as exc:  # pragma: no cover - best-effort exchange cleanup
+        raise DeepcoinClientError(
+            f"Deepcoin protection failed and cancel also failed: {exc}"
+        ) from exc
+
+
 def _extract_order_id(response: dict[str, Any]) -> str | None:
     for payload in _response_payloads(response):
-        for key in ("ordId", "orderId", "order_id", "id"):
+        for key in ("ordId", "orderId", "order_id", "id", "orderSysID", "OrderSysID"):
             value = payload.get(key)
             if value not in (None, ""):
                 return str(value)

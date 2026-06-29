@@ -6,6 +6,7 @@ from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinCredentials
 from telegram_kol_research.deepcoin_client import build_deepcoin_auth_headers
 from telegram_kol_research.deepcoin_client import load_deepcoin_credentials
+from telegram_kol_research.deepcoin_client import _raise_for_deepcoin_business_error
 
 
 def test_build_deepcoin_auth_headers_signs_timestamp_method_path_and_body():
@@ -63,3 +64,15 @@ def test_load_deepcoin_credentials_reads_env_values():
     assert credentials.api_secret == "secret"
     assert credentials.passphrase == "pass"
     assert credentials.base_url == "https://example.test"
+
+
+def test_deepcoin_business_error_checks_nested_scode():
+    try:
+        _raise_for_deepcoin_business_error(
+            {"code": "0", "data": {"sCode": "36", "sMsg": "InsufficientMoney"}}
+        )
+    except DeepcoinClientError as exc:
+        assert "36" in str(exc)
+        assert "InsufficientMoney" in str(exc)
+    else:
+        raise AssertionError("expected nested sCode failure")

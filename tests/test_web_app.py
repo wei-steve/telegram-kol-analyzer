@@ -810,7 +810,10 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
 
         def replace_order_sltp(self, protection_payload):
             self.protection_payloads.append(protection_payload)
-            return {"code": "0", "data": {"orderSysID": protection_payload["orderSysID"]}}
+            return {"code": "0", "data": {"OrderSysID": protection_payload["OrderSysID"]}}
+
+        def cancel_order(self, cancel_payload):
+            return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
 
     fake_client = FakeDeepcoinClient()
     app = create_web_app(
@@ -880,7 +883,9 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
     assert response.status_code == 200
     assert response.json()["submitted"] is True
     assert response.json()["order_count"] == 2
-    assert fake_client.payloads[0]["clOrdId"] == "tkol-deepcoin-100-55-btc-long-entry-1"
+    assert fake_client.payloads[0]["clOrdId"].isalnum()
+    assert len(fake_client.payloads[0]["clOrdId"]) <= 20
+    assert fake_client.payloads[0]["mrgPosition"] == "split"
     assert fake_client.protection_payloads[0]["tpTriggerPx"] == "69000.0"
     assert fake_client.protection_payloads[0]["slTriggerPx"] == "67500.0"
 
@@ -897,7 +902,10 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
 
         def replace_order_sltp(self, protection_payload):
             self.protection_payloads.append(protection_payload)
-            return {"code": "0", "data": {"orderSysID": protection_payload["orderSysID"]}}
+            return {"code": "0", "data": {"OrderSysID": protection_payload["OrderSysID"]}}
+
+        def cancel_order(self, cancel_payload):
+            return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
 
     fake_client = FakeDeepcoinClient()
     app = create_web_app(
@@ -971,4 +979,4 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
     assert process_response.json()["processed"] is True
     assert process_response.json()["result"]["signal_id"] == signal.id
     assert fake_client.payloads[0]["tdMode"] == "cross"
-    assert fake_client.protection_payloads[0]["orderSysID"] == "order-1"
+    assert fake_client.protection_payloads[0]["OrderSysID"] == "order-1"

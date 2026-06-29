@@ -158,9 +158,10 @@ def test_build_stable_strategy_and_client_order_ids():
     )
 
     assert strategy_id == "deepcoin:100:55:BTC:long"
-    assert build_client_order_id(strategy_instance_id=strategy_id, leg_index=2) == (
-        "tkol-deepcoin-100-55-btc-long-entry-2"
-    )
+    client_order_id = build_client_order_id(strategy_instance_id=strategy_id, leg_index=2)
+    assert client_order_id == "TK729D11F4739D2A2"
+    assert client_order_id.isalnum()
+    assert len(client_order_id) <= 20
 
 
 def test_reconcile_deepcoin_execution_bindings_marks_restart_state(tmp_path):

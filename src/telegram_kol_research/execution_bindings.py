@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -68,13 +69,9 @@ def build_client_order_id(
 ) -> str:
     """Build a deterministic client order id that remains stable after restarts."""
 
-    normalized = (
-        strategy_instance_id.replace(":", "-")
-        .replace("_", "-")
-        .lower()
-    )
-    client_order_id = f"tkol-{normalized}-{purpose}-{leg_index}"
-    return client_order_id[:64]
+    raw = f"{strategy_instance_id}:{purpose}:{int(leg_index)}"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:14].upper()
+    return f"TK{digest}{int(leg_index)}"[:20]
 
 
 def upsert_execution_binding(

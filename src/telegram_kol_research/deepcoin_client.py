@@ -19,6 +19,7 @@ from telegram_kol_research.telegram_client import _load_env_file_values
 
 DEEPCOIN_BASE_URL = "https://api.deepcoin.com"
 DEEPCOIN_PLACE_ORDER_PATH = "/deepcoin/trade/order"
+DEEPCOIN_CANCEL_ORDER_PATH = "/deepcoin/trade/cancel-order"
 DEEPCOIN_REPLACE_ORDER_SLTP_PATH = "/deepcoin/trade/replace-order-sltp"
 
 
@@ -41,6 +42,9 @@ class DeepcoinTradingClientProtocol(Protocol):
 
     def replace_order_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
         """Attach or replace take-profit / stop-loss protection for an open limit order."""
+
+    def cancel_order(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
+        """Cancel one live order."""
 
 
 def load_deepcoin_credentials(
@@ -94,6 +98,9 @@ class DeepcoinRestClient:
     def replace_order_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_REPLACE_ORDER_SLTP_PATH, protection_payload)
 
+    def cancel_order(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", DEEPCOIN_CANCEL_ORDER_PATH, cancel_payload)
+
     def _request(
         self,
         method: str,
@@ -134,6 +141,7 @@ class DeepcoinRestClient:
             raise DeepcoinClientError(
                 f"Deepcoin API error {payload.get('code')}: {payload.get('msg')}"
             )
+        _raise_for_deepcoin_business_error(payload)
         return payload
 
 
@@ -162,6 +170,24 @@ def build_deepcoin_auth_headers(
 
 def build_deepcoin_client_from_env() -> DeepcoinRestClient:
     return DeepcoinRestClient(load_deepcoin_credentials())
+
+
+def _raise_for_deepcoin_business_error(payload: dict[str, Any]) -> None:
+    for item in _iter_deepcoin_payload_items(payload.get("data")):
+        s_code = str(item.get("sCode", "0"))
+        if s_code not in {"0", ""}:
+            raise DeepcoinClientError(
+                f"Deepcoin API error {s_code}: {item.get('sMsg') or item.get('msg')}"
+            )
+
+
+def _iter_deepcoin_payload_items(value: Any):
+    if isinstance(value, dict):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                yield item
 
 
 def _utc_timestamp_ms() -> str:

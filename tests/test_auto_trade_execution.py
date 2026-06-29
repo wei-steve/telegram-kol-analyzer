@@ -31,7 +31,10 @@ class _FakeDeepcoinClient:
 
     def replace_order_sltp(self, protection_payload):
         self.protections.append(protection_payload)
-        return {"code": "0", "data": {"orderSysID": protection_payload["orderSysID"]}}
+        return {"code": "0", "data": {"OrderSysID": protection_payload["OrderSysID"]}}
+
+    def cancel_order(self, cancel_payload):
+        return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
 
 
 def _persist_candidate(session_factory, *, confidence=0.91, with_media=False):
