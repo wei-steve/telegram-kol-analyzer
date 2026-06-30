@@ -169,6 +169,16 @@ REFERENCE_STRATEGY_INSTRUCTION = (
     '应按历史策略截图或复盘参考处理为非策略，不要创建新的开仓策略。'
 )
 
+PRICE_SHORTHAND_NORMALIZATION_INSTRUCTION = """
+- 价格简写必须按币种语境归一化为交易所绝对价格后再输出。尤其是 BTC/比特币：
+  - 原文 "5.89-5.93附近"、"5.89万-5.93万"、"5.89-5.93w" 表示 "58900-59300"，不要输出 "5.89-5.93"。
+  - 原文 "5.78" 表示 "57800"，例如止损 5.78 应输出 "57800"。
+  - 原文 "6万/6.07/6.23" 表示 "60000/60700/62300"。
+  - 对 BTC，如果价格数字明显低于当前 BTC 价格量级，且上下文是点位/入场/止盈/止损，应按“万位简写”理解。
+  - ETH 等其他币种不要套用 BTC 万位规则，除非原文明确带 "万"。
+- entry、stop_loss、take_profit、entry_price、exit_price 字段都必须遵守这个规则。
+""".strip()
+
 
 @dataclass(frozen=True)
 class AiProviderConfig:
@@ -250,19 +260,29 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
     path = Path(config_path)
     if not path.exists():
         return AiRecognitionConfig(
-            mimo_direct_prompt=_with_mimo_direct_instructions(DEFAULT_MIMO_DIRECT_PROMPT)
+            recognition_prompt=_with_price_shorthand_instruction(DEFAULT_RECOGNITION_PROMPT),
+            lifecycle_event_prompt=_with_lifecycle_event_instructions(
+                DEFAULT_LIFECYCLE_EVENT_PROMPT
+            ),
+            mimo_direct_prompt=_with_mimo_direct_instructions(DEFAULT_MIMO_DIRECT_PROMPT),
         )
 
     raw_data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw_data, dict):
         return AiRecognitionConfig()
 
-    recognition_prompt = _with_normalized_strategy_output_instructions(
-        str(raw_data.get("recognition_prompt") or DEFAULT_RECOGNITION_PROMPT)
+    recognition_prompt = _with_price_shorthand_instruction(
+        _with_normalized_strategy_output_instructions(
+            str(raw_data.get("recognition_prompt") or DEFAULT_RECOGNITION_PROMPT)
+        )
     )
-    lifecycle_event_prompt = str(raw_data.get("lifecycle_event_prompt") or DEFAULT_LIFECYCLE_EVENT_PROMPT)
-    mimo_direct_prompt = _with_mimo_direct_instructions(
-        str(raw_data.get("mimo_direct_prompt") or DEFAULT_MIMO_DIRECT_PROMPT)
+    lifecycle_event_prompt = _with_lifecycle_event_instructions(
+        str(raw_data.get("lifecycle_event_prompt") or DEFAULT_LIFECYCLE_EVENT_PROMPT)
+    )
+    mimo_direct_prompt = _with_price_shorthand_instruction(
+        _with_mimo_direct_instructions(
+            str(raw_data.get("mimo_direct_prompt") or DEFAULT_MIMO_DIRECT_PROMPT)
+        )
     )
     mode = str(raw_data.get("mode") or "local_rule_parser")
     raw_text_provider = _load_provider_config(raw_data.get("text_provider"))
@@ -325,12 +345,18 @@ def save_ai_recognition_config(
         fallback_provider=config.image_provider,
     )
     normalized = AiRecognitionConfig(
-        recognition_prompt=_with_normalized_strategy_output_instructions(
-            config.recognition_prompt.strip() or DEFAULT_RECOGNITION_PROMPT
+        recognition_prompt=_with_price_shorthand_instruction(
+            _with_normalized_strategy_output_instructions(
+                config.recognition_prompt.strip() or DEFAULT_RECOGNITION_PROMPT
+            )
         ),
-        lifecycle_event_prompt=config.lifecycle_event_prompt.strip() or DEFAULT_LIFECYCLE_EVENT_PROMPT,
-        mimo_direct_prompt=_with_mimo_direct_instructions(
-            config.mimo_direct_prompt.strip() or DEFAULT_MIMO_DIRECT_PROMPT
+        lifecycle_event_prompt=_with_lifecycle_event_instructions(
+            config.lifecycle_event_prompt.strip() or DEFAULT_LIFECYCLE_EVENT_PROMPT
+        ),
+        mimo_direct_prompt=_with_price_shorthand_instruction(
+            _with_mimo_direct_instructions(
+                config.mimo_direct_prompt.strip() or DEFAULT_MIMO_DIRECT_PROMPT
+            )
         ),
         mode=_resolve_mode(config),
         text_provider=text_model.provider if text_model else _normalize_provider_config(config.text_provider),
@@ -530,9 +556,22 @@ def _with_market_entry_with_price_instruction(prompt: str) -> str:
     return f"{prompt}\n\n{MARKET_ENTRY_WITH_PRICE_INSTRUCTION}"
 
 
+def _with_price_shorthand_instruction(prompt: str) -> str:
+    prompt = prompt.strip()
+    if PRICE_SHORTHAND_NORMALIZATION_INSTRUCTION in prompt:
+        return prompt
+    return f"{prompt}\n\n{PRICE_SHORTHAND_NORMALIZATION_INSTRUCTION}"
+
+
+def _with_lifecycle_event_instructions(prompt: str) -> str:
+    return _with_price_shorthand_instruction(prompt)
+
+
 def _with_mimo_direct_instructions(prompt: str) -> str:
-    return _with_reference_strategy_instruction(
-        _with_market_entry_with_price_instruction(prompt)
+    return _with_price_shorthand_instruction(
+        _with_reference_strategy_instruction(
+            _with_market_entry_with_price_instruction(prompt)
+        )
     )
 
 

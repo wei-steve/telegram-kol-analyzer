@@ -14,11 +14,16 @@ def test_load_ai_recognition_config_uses_defaults_when_file_is_missing(tmp_path)
     config = load_ai_recognition_config(tmp_path / "missing.yaml")
 
     assert config.mode == "local_rule_parser"
-    assert config.recognition_prompt == DEFAULT_RECOGNITION_PROMPT
-    assert config.lifecycle_event_prompt == DEFAULT_LIFECYCLE_EVENT_PROMPT
+    assert config.recognition_prompt.startswith(DEFAULT_RECOGNITION_PROMPT)
+    assert config.lifecycle_event_prompt.startswith(DEFAULT_LIFECYCLE_EVENT_PROMPT)
     assert config.mimo_direct_prompt.startswith(DEFAULT_MIMO_DIRECT_PROMPT)
     assert "\u5e02\u4ef7\u8fdb\u573a/1730\u9644\u8fd1" in config.mimo_direct_prompt
     assert "\u5386\u53f2\u7b56\u7565\u622a\u56fe" in config.mimo_direct_prompt
+    assert "5.89-5.93" in config.recognition_prompt
+    assert "58900-59300" in config.recognition_prompt
+    assert "5.78" in config.lifecycle_event_prompt
+    assert "57800" in config.lifecycle_event_prompt
+    assert "6万/6.07/6.23" in config.mimo_direct_prompt
 
 
 def test_save_and_load_ai_recognition_config_round_trips_prompt(tmp_path):
@@ -36,10 +41,12 @@ def test_save_and_load_ai_recognition_config_round_trips_prompt(tmp_path):
     config = load_ai_recognition_config(config_path)
 
     assert config.recognition_prompt.startswith("只识别明确包含进场、止损、止盈的消息。")
-    assert config.lifecycle_event_prompt == "Decide lifecycle events from context."
+    assert config.lifecycle_event_prompt.startswith("Decide lifecycle events from context.")
     assert config.mimo_direct_prompt.startswith("Read images directly.")
     assert "\u5e02\u4ef7\u8fdb\u573a/1730\u9644\u8fd1" in config.mimo_direct_prompt
     assert "\u5386\u53f2\u7b56\u7565\u622a\u56fe" in config.mimo_direct_prompt
+    assert "58900-59300" in config.recognition_prompt
+    assert "57800" in config.lifecycle_event_prompt
     assert config.mode == "local_rule_parser"
 
 
@@ -61,6 +68,7 @@ def test_load_ai_recognition_config_upgrades_existing_normalized_prompt(tmp_path
     config = load_ai_recognition_config(config_path)
 
     assert "\u5e02\u4ef7\u8fdb\u573a/1730\u9644\u8fd1" in config.recognition_prompt
+    assert "58900-59300" in config.recognition_prompt
 
 
 def test_load_ai_recognition_config_upgrades_mimo_prompt(tmp_path):
@@ -72,6 +80,7 @@ def test_load_ai_recognition_config_upgrades_mimo_prompt(tmp_path):
     assert config.mimo_direct_prompt.startswith("Read images directly.")
     assert "\u5e02\u4ef7\u8fdb\u573a/1730\u9644\u8fd1" in config.mimo_direct_prompt
     assert "\u5386\u53f2\u7b56\u7565\u622a\u56fe" in config.mimo_direct_prompt
+    assert "58900-59300" in config.mimo_direct_prompt
 
 
 def test_load_ai_recognition_config_seeds_models_from_legacy_providers(tmp_path):
