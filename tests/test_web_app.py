@@ -223,6 +223,62 @@ def test_execution_dashboard_defaults_to_deepcoin_live_positions(tmp_path):
     assert "绑定" in response.text
 
 
+def test_execution_dashboard_uses_pending_tpsl_orders_for_live_protection(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-protected",
+                    "posSide": "short",
+                    "pos": "5",
+                    "avgPx": "59604.5",
+                    "cTime": "1782801429000",
+                    "slTriggerPx": "61500",
+                    "tpTriggerPx": "57300",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-unprotected",
+                    "posSide": "short",
+                    "pos": "9",
+                    "avgPx": "59761.2",
+                    "cTime": "1782785675000",
+                    "slTriggerPx": "61500",
+                    "tpTriggerPx": "57300",
+                },
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            assert inst_id == "BTC-USDT-SWAP"
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "short",
+                    "sz": "5",
+                    "cTime": "1782801429000",
+                    "triggerOrderType": "TPSL",
+                    "slTriggerPrice": "61500",
+                    "tpTriggerPrice": "57300",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+    )
+
+    client = TestClient(app)
+    response = client.get("/execution")
+
+    assert response.status_code == 200
+    assert response.text.count("止损: 61500") == 1
+    assert response.text.count("止盈: 57300") == 1
+    assert "pos-protected" in response.text
+    assert "pos-unprotected" in response.text
+    assert response.text.count("无保护单") == 1
+
+
 def test_manual_close_api_marks_lifecycle_and_binding_closed(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
     with app.state.session_factory() as session:

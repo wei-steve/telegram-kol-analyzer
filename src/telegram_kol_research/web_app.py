@@ -303,7 +303,8 @@ def _load_deepcoin_live_position_rows(
     group_label_by_chat_id: dict[int, str],
 ) -> list[dict[str, object]]:
     try:
-        positions = deepcoin_client_factory().list_positions()
+        deepcoin_client = deepcoin_client_factory()
+        positions = deepcoin_client.list_positions()
     except Exception:
         logger.exception("Deepcoin live position load failed")
         return []
@@ -313,6 +314,10 @@ def _load_deepcoin_live_position_rows(
     ]
     if not active_positions:
         return []
+    tpsl_orders_by_position_key = _load_deepcoin_tpsl_orders_by_position_key(
+        deepcoin_client,
+        active_positions,
+    )
 
     with session_factory() as session:
         bindings = (
@@ -329,6 +334,9 @@ def _load_deepcoin_live_position_rows(
         rows: list[dict[str, object]] = []
         for position in active_positions:
             pos_id = _first_position_string(position, "posId", "pos_id", "id")
+            tpsl_order = tpsl_orders_by_position_key.get(
+                _deepcoin_position_protection_key(position)
+            )
             binding = bindings_by_pos_id.get(pos_id or "")
             lifecycle = None
             if binding is not None:
@@ -366,8 +374,13 @@ def _load_deepcoin_live_position_rows(
                     "status": "live",
                     "lifecycle_status": lifecycle.lifecycle_status if lifecycle is not None else None,
                     "entry_price_actual": _float_or_none(position.get("avgPx")),
-                    "stop_loss_text": _position_text_value(position.get("slTriggerPx")),
-                    "take_profit_text": _position_text_value(position.get("tpTriggerPx")),
+                    "stop_loss_text": _position_text_value(
+                        tpsl_order.get("slTriggerPrice") if tpsl_order else None
+                    ),
+                    "take_profit_text": _position_text_value(
+                        tpsl_order.get("tpTriggerPrice") if tpsl_order else None
+                    ),
+                    "protection_status": "protected" if tpsl_order else "unprotected",
                     "execution_status": binding.status if binding is not None else "unbound_live_position",
                     "exchange_status": "position_active",
                     "pos_id": pos_id,
@@ -391,6 +404,61 @@ def _load_deepcoin_live_position_rows(
                 }
             )
         return rows
+
+
+def _load_deepcoin_tpsl_orders_by_position_key(
+    deepcoin_client,
+    positions: list[dict[str, Any]],
+) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+    if not hasattr(deepcoin_client, "list_trigger_orders_pending"):
+        return {}
+    orders_by_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    instrument_ids = {
+        str(position.get("instId") or "")
+        for position in positions
+        if str(position.get("instId") or "")
+    }
+    for inst_id in instrument_ids:
+        try:
+            orders = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
+        except Exception:
+            logger.exception("Deepcoin pending trigger order load failed for %s", inst_id)
+            continue
+        for order in orders:
+            if str(order.get("triggerOrderType") or "").upper() != "TPSL":
+                continue
+            key = _deepcoin_tpsl_order_position_key(order)
+            if key is not None:
+                orders_by_key[key] = order
+    return orders_by_key
+
+
+def _deepcoin_position_protection_key(position: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(position.get("instId") or "").upper(),
+        str(position.get("posSide") or "").lower(),
+        _normalize_position_amount(position.get("pos")),
+        str(position.get("cTime") or position.get("uTime") or ""),
+    )
+
+
+def _deepcoin_tpsl_order_position_key(order: dict[str, Any]) -> tuple[str, str, str, str] | None:
+    ctime = str(order.get("cTime") or order.get("uTime") or "")
+    if not ctime:
+        return None
+    return (
+        str(order.get("instId") or "").upper(),
+        str(order.get("posSide") or "").lower(),
+        _normalize_position_amount(order.get("sz")),
+        ctime,
+    )
+
+
+def _normalize_position_amount(value: Any) -> str:
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value or "").strip()
 
 
 def _load_live_position_attribution_candidates(

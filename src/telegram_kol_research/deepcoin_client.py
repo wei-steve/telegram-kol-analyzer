@@ -22,6 +22,7 @@ DEEPCOIN_PLACE_ORDER_PATH = "/deepcoin/trade/order"
 DEEPCOIN_CANCEL_ORDER_PATH = "/deepcoin/trade/cancel-order"
 DEEPCOIN_REPLACE_ORDER_SLTP_PATH = "/deepcoin/trade/replace-order-sltp"
 DEEPCOIN_TRIGGER_ORDER_PATH = "/deepcoin/trade/trigger-order"
+DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH = "/deepcoin/trade/trigger-orders-pending"
 DEEPCOIN_SET_POSITION_SLTP_PATH = "/deepcoin/trade/set-position-sltp"
 DEEPCOIN_ACCOUNT_POSITIONS_PATH = "/deepcoin/account/positions"
 DEEPCOIN_MARKET_TICKERS_PATH = "/deepcoin/market/tickers"
@@ -58,6 +59,9 @@ class DeepcoinTradingClientProtocol(Protocol):
 
     def list_positions(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return account positions, optionally filtered by instrument."""
+
+    def list_trigger_orders_pending(self, *, inst_id: str) -> list[dict[str, Any]]:
+        """Return pending trigger / TPSL orders for one instrument."""
 
     def get_ticker_price(self, *, inst_id: str) -> float | None:
         """Return the latest ticker price for one instrument."""
@@ -128,6 +132,14 @@ class DeepcoinRestClient:
         if inst_id:
             query += f"&instId={inst_id}"
         payload = self._request("GET", f"{DEEPCOIN_ACCOUNT_POSITIONS_PATH}?{query}")
+        data = payload.get("data")
+        return data if isinstance(data, list) else []
+
+    def list_trigger_orders_pending(self, *, inst_id: str) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            f"{DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH}?instType=SWAP&instId={inst_id}",
+        )
         data = payload.get("data")
         return data if isinstance(data, list) else []
 

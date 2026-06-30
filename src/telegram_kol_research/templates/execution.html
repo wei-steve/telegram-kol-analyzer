@@ -72,6 +72,7 @@
           {% if item.entry_price_actual %}<span>实际入场: {{ item.entry_price_actual|round(4) }}</span>{% endif %}
           {% if item.stop_loss_text %}<span>止损: {{ item.stop_loss_text }}</span>{% endif %}
           {% if item.take_profit_text %}<span>止盈: {{ item.take_profit_text }}</span>{% endif %}
+          {% if selected_status == 'live' and item.protection_status == 'unprotected' %}<span>无保护单</span>{% endif %}
           {% if item.exit_price_actual %}<span>离场价: {{ item.exit_price_actual|round(4) }}</span>{% endif %}
           {% if item.exit_reason %}<span>离场原因: {{ item.exit_reason }}</span>{% endif %}
           {% if item.position_size_text %}<span>数量: {{ item.position_size_text }}</span>{% endif %}
