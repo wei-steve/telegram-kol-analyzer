@@ -44,6 +44,8 @@ def auto_process_message_trade_signal(
     if loaded is None:
         return {"status": "skipped", "reason": "no_entry_signal_candidate"}
     raw_message, candidate, source, has_media = loaded
+    if candidate.parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
+        return {"status": "skipped", "reason": "lifecycle_event_not_new_entry"}
 
     runtime_group_config = apply_trading_settings_to_group_config(group_config, settings)
     runtime_config = _resolve_runtime_config(

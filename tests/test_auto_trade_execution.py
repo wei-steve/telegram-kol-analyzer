@@ -214,6 +214,71 @@ def test_auto_process_message_trade_signal_submits_market_order_then_position_sl
     assert fake_client.protections[0]["slTriggerPx"] == "67500.0"
 
 
+def test_auto_process_message_trade_signal_accepts_nearby_single_entry_price(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="BTC短线做多 进场点位：59500附近 止损点位：58100 止盈点位：61800",
+        entry_text="59500附近",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 6, 30, 11, 57, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert result["entry_execution_type"] == "limit"
+    assert len(fake_client.trigger_orders) == 2
+
+
+def test_auto_process_message_trade_signal_skips_lifecycle_entry_confirmation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="兄弟们，跟上节奏，直接进场",
+        entry_text=None,
+    )
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        candidate.parse_source = "lifecycle_ai"
+        session.commit()
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert result == {"status": "skipped", "reason": "lifecycle_event_not_new_entry"}
+    assert fake_client.orders == []
+    assert fake_client.trigger_orders == []
+
+
 def test_auto_process_message_trade_signal_blocks_low_confidence(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_message_id = _persist_candidate(session_factory, confidence=0.5)

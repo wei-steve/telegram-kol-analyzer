@@ -369,6 +369,9 @@ def _parse_entry_range(entry_text: str | None) -> tuple[float, float] | None:
     if not entry_text:
         return None
     values = re.findall(r"\d+(?:\.\d+)?", entry_text)
+    if len(values) == 1:
+        price = float(values[0])
+        return price, price
     if len(values) < 2:
         return None
     return float(values[0]), float(values[1])

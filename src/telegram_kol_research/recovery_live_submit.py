@@ -496,22 +496,16 @@ def build_deepcoin_order_sltp_payload(
     stop_loss = draft.get("stop_loss")
     if not isinstance(stop_loss, int | float) or stop_loss <= 0:
         raise RecoveryLiveSubmitError("missing_stop_loss_for_protection")
-    take_profit_legs = draft.get("take_profit_legs")
-    if not isinstance(take_profit_legs, list) or not take_profit_legs:
-        raise RecoveryLiveSubmitError("missing_take_profit_for_protection")
-    first_take_profit = take_profit_legs[0]
-    if not isinstance(first_take_profit, dict):
-        raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
-    take_profit_price = first_take_profit.get("price")
-    if not isinstance(take_profit_price, int | float) or take_profit_price <= 0:
-        raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
+    take_profit_price = _first_take_profit_price(draft)
 
-    return {
+    payload: dict[str, Any] = {
         "instId": str(draft["instrument_id"]),
         "orderSysID": str(order_id),
-        "tpTriggerPx": str(take_profit_price),
         "slTriggerPx": str(stop_loss),
     }
+    if take_profit_price is not None:
+        payload["tpTriggerPx"] = str(take_profit_price)
+    return payload
 
 
 def build_deepcoin_position_sltp_payload(
@@ -524,15 +518,7 @@ def build_deepcoin_position_sltp_payload(
     stop_loss = draft.get("stop_loss")
     if not isinstance(stop_loss, int | float) or stop_loss <= 0:
         raise RecoveryLiveSubmitError("missing_stop_loss_for_protection")
-    take_profit_legs = draft.get("take_profit_legs")
-    if not isinstance(take_profit_legs, list) or not take_profit_legs:
-        raise RecoveryLiveSubmitError("missing_take_profit_for_protection")
-    first_take_profit = take_profit_legs[0]
-    if not isinstance(first_take_profit, dict):
-        raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
-    take_profit_price = first_take_profit.get("price")
-    if not isinstance(take_profit_price, int | float) or take_profit_price <= 0:
-        raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
+    take_profit_price = _first_take_profit_price(draft)
 
     payload: dict[str, Any] = {
         "instType": "SWAP",
@@ -540,13 +526,18 @@ def build_deepcoin_position_sltp_payload(
         "posSide": _position_side_from_draft(draft),
         "mrgPosition": _deepcoin_position_mode(str(draft.get("position_mode") or "split")),
         "tdMode": _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross")),
-        "tpTriggerPx": str(take_profit_price),
-        "tpTriggerPxType": "last",
-        "tpOrdPx": "-1",
         "slTriggerPx": str(stop_loss),
         "slTriggerPxType": "last",
         "slOrdPx": "-1",
     }
+    if take_profit_price is not None:
+        payload.update(
+            {
+                "tpTriggerPx": str(take_profit_price),
+                "tpTriggerPxType": "last",
+                "tpOrdPx": "-1",
+            }
+        )
     if payload["mrgPosition"] == "split":
         if not pos_id:
             raise RecoveryLiveSubmitError("missing_pos_id_for_split_position_sltp")
@@ -556,14 +547,35 @@ def build_deepcoin_position_sltp_payload(
 
 def _deepcoin_embedded_sltp_fields(draft: dict[str, Any]) -> dict[str, Any]:
     protection = build_deepcoin_position_sltp_payload(draft, pos_id="placeholder")
-    return {
-        "tpTriggerPx": float(protection["tpTriggerPx"]),
-        "tpTriggerPxType": protection["tpTriggerPxType"],
-        "tpOrdPx": -1,
+    fields = {
         "slTriggerPx": float(protection["slTriggerPx"]),
         "slTriggerPxType": protection["slTriggerPxType"],
         "slOrdPx": -1,
     }
+    if "tpTriggerPx" in protection:
+        fields.update(
+            {
+                "tpTriggerPx": float(protection["tpTriggerPx"]),
+                "tpTriggerPxType": protection["tpTriggerPxType"],
+                "tpOrdPx": -1,
+            }
+        )
+    return fields
+
+
+def _first_take_profit_price(draft: dict[str, Any]) -> float | None:
+    take_profit_legs = draft.get("take_profit_legs")
+    if not isinstance(take_profit_legs, list) or not take_profit_legs:
+        return None
+    first_take_profit = take_profit_legs[0]
+    if not isinstance(first_take_profit, dict):
+        raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
+    take_profit_price = first_take_profit.get("price")
+    if take_profit_price in (None, ""):
+        return None
+    if not isinstance(take_profit_price, int | float) or take_profit_price <= 0:
+        raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
+    return float(take_profit_price)
 
 
 def _protection_warnings(draft: dict[str, Any]) -> list[str]:

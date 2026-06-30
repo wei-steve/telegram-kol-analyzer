@@ -285,6 +285,32 @@ def test_build_deepcoin_order_sltp_payload_uses_first_take_profit_and_stop_loss(
     }
 
 
+def test_build_deepcoin_position_sltp_payload_allows_stop_loss_without_take_profit():
+    payload = build_deepcoin_position_sltp_payload(
+        {
+            "instrument_id": "BTC-USDT-SWAP",
+            "margin_mode": "cross",
+            "position_mode": "split",
+            "stop_loss": 61800.0,
+            "take_profit_legs": [],
+            "order_legs": [{"position_side": "short"}],
+        },
+        pos_id="pos-btc-short",
+    )
+
+    assert payload == {
+        "instType": "SWAP",
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "short",
+        "mrgPosition": "split",
+        "tdMode": "cross",
+        "slTriggerPx": "61800.0",
+        "slTriggerPxType": "last",
+        "slOrdPx": "-1",
+        "posId": "pos-btc-short",
+    }
+
+
 def test_build_deepcoin_trigger_order_payload_embeds_take_profit_and_stop_loss():
     payload = build_deepcoin_trigger_order_payload(
         {
