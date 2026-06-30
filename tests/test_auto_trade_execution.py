@@ -154,10 +154,13 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
 
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
-    assert len(fake_client.trigger_orders) == 2
-    assert len(fake_client.protections) == 0
-    assert fake_client.trigger_orders[0]["tpTriggerPx"] == 69000.0
-    assert fake_client.trigger_orders[0]["slTriggerPx"] == 67500.0
+    assert len(fake_client.orders) == 2
+    assert fake_client.trigger_orders == []
+    assert fake_client.orders[0]["ordType"] == "limit"
+    assert fake_client.orders[0]["px"] == "68100.0"
+    assert fake_client.protections[0]["orderSysID"] == "order-1"
+    assert fake_client.protections[0]["tpTriggerPx"] == "69000.0"
+    assert fake_client.protections[0]["slTriggerPx"] == "67500.0"
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
@@ -268,7 +271,8 @@ def test_auto_process_message_trade_signal_accepts_nearby_single_entry_price(tmp
 
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
-    assert len(fake_client.trigger_orders) == 2
+    assert len(fake_client.orders) == 2
+    assert fake_client.trigger_orders == []
 
 
 def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_path):
@@ -305,9 +309,10 @@ def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_
     )
 
     assert result["status"] == "submitted"
-    assert [order["price"] for order in fake_client.trigger_orders] == ["59100.0", "58900.0"]
-    assert fake_client.trigger_orders[0]["slTriggerPx"] == 57800.0
-    assert fake_client.trigger_orders[0]["tpTriggerPx"] == 60000.0
+    assert [order["px"] for order in fake_client.orders] == ["59100.0", "58900.0"]
+    assert fake_client.trigger_orders == []
+    assert fake_client.protections[0]["slTriggerPx"] == "57800.0"
+    assert fake_client.protections[0]["tpTriggerPx"] == "60000.0"
 
 
 def test_auto_process_message_trade_signal_skips_lifecycle_entry_confirmation(tmp_path):

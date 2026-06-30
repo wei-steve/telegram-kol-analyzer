@@ -303,6 +303,49 @@ def _submit_recovery_signal_direct(
                     },
                 )
                 raise DeepcoinClientError(f"Deepcoin position protection failed: {exc}") from exc
+        elif order_type == "limit":
+            order_payload = build_deepcoin_place_order_payload(draft, leg)
+            try:
+                response = deepcoin_client.place_order(order_payload)
+            except DeepcoinClientError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
+
+            order_id = _extract_order_id(response)
+            if not order_id:
+                raise DeepcoinClientError("Deepcoin limit order response missing order id")
+            pos_id = _extract_position_id(response)
+            client_order_id = str(leg.get("client_order_id") or "")
+            protection_payload = build_deepcoin_order_sltp_payload(draft, order_id=order_id)
+            try:
+                protection_response = deepcoin_client.replace_order_sltp(protection_payload)
+            except DeepcoinClientError:
+                pos_id = pos_id or _find_open_position_id(
+                    deepcoin_client,
+                    draft=draft,
+                    side=side_key,
+                )
+                if not pos_id:
+                    raise
+                protection_payload = build_deepcoin_position_sltp_payload(
+                    draft,
+                    pos_id=pos_id,
+                )
+                protection_response = deepcoin_client.set_position_sltp(protection_payload)
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                pos_id = pos_id or _find_open_position_id(
+                    deepcoin_client,
+                    draft=draft,
+                    side=side_key,
+                )
+                if not pos_id:
+                    raise DeepcoinClientError(f"Deepcoin order protection failed: {exc}") from exc
+                protection_payload = build_deepcoin_position_sltp_payload(
+                    draft,
+                    pos_id=pos_id,
+                )
+                protection_response = deepcoin_client.set_position_sltp(protection_payload)
         else:
             order_payload = build_deepcoin_trigger_order_payload(draft, leg)
             try:
@@ -482,10 +525,11 @@ def _record_submitted_order_events(
                 )
         else:
             request = order.get("request") if isinstance(order.get("request"), dict) else {}
+            action = "create_limit_entry" if execution_type == "limit" else "create_trigger_entry"
             record_execution_event(
                 session_factory,
                 ExecutionEventRecord(
-                    action="create_trigger_entry",
+                    action=action,
                     reason="live_signal_auto_trade",
                     after=_extract_tpsl_snapshot(request),
                     request=request,

@@ -37,6 +37,7 @@ class _FakeDeepcoinClient:
         self.payloads = []
         self.trigger_payloads = []
         self.protection_payloads = []
+        self.position_protection_payloads = []
         self.cancel_payloads = []
         self.positions = []
 
@@ -49,7 +50,7 @@ class _FakeDeepcoinClient:
         return {"code": "0", "data": {"ordId": f"trigger-{len(self.trigger_payloads)}"}}
 
     def set_position_sltp(self, protection_payload):
-        self.protection_payloads.append(protection_payload)
+        self.position_protection_payloads.append(protection_payload)
         return {"code": "0", "data": {"ordId": "sltp-1"}}
 
     def replace_order_sltp(self, protection_payload):
@@ -405,29 +406,33 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
 
     assert result["submitted"] is True
     assert result["order_count"] == 2
-    assert fake_client.payloads == []
-    assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
-    assert fake_client.trigger_payloads[0]["mrgPosition"] == "split"
-    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0
-    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
-    assert fake_client.protection_payloads == []
+    assert fake_client.trigger_payloads == []
+    assert fake_client.payloads[0]["tdMode"] == "cross"
+    assert fake_client.payloads[0]["mrgPosition"] == "split"
+    assert fake_client.payloads[0]["ordType"] == "limit"
+    assert fake_client.payloads[0]["px"] == "68100.0"
+    assert fake_client.protection_payloads[0] == {
+        "instId": "BTC-USDT-SWAP",
+        "orderSysID": "order-1",
+        "tpTriggerPx": "69000.0",
+        "slTriggerPx": "67500.0",
+    }
+    assert fake_client.position_protection_payloads == []
     assert result["warnings"] == ["only_first_take_profit_submitted_for_order_sltp"]
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
     assert binding.status == "open"
-    assert binding.order_id == "trigger-1,trigger-2"
+    assert binding.order_id == "order-1,order-2"
     assert binding.client_order_id == "TK649760E806ACF61,TK729D11F4739D2A2"
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
     assert [event.action for event in events] == [
-        "create_trigger_entry",
-        "create_trigger_entry",
+        "create_limit_entry",
+        "create_limit_entry",
     ]
     assert events[0].execution_binding_id == binding.id
     assert events[0].trade_signal_id == result["signal_id"]
-    assert events[0].order_id == "trigger-1"
-    assert '"take_profit": 69000.0' in (events[0].after_json or "")
-    assert '"stop_loss": 67500.0' in (events[0].after_json or "")
+    assert events[0].order_id == "order-1"
 
 
 def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):
