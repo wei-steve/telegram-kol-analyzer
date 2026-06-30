@@ -89,6 +89,32 @@
           <p class="execution-original">{{ item.original_text }}</p>
         {% endif %}
 
+        {% if item.attribution_candidates %}
+          <div class="execution-attribution">
+            <div class="execution-attribution-title">可能归属</div>
+            {% for candidate in item.attribution_candidates %}
+              <div class="execution-attribution-row">
+                <div>
+                  <strong>{{ candidate.group_label }}</strong>
+                  <span>#{{ candidate.message_id }}</span>
+                  <code>{{ candidate.lifecycle_status }}</code>
+                  {% if candidate.entry %}<span>入场 {{ candidate.entry }}</span>{% endif %}
+                  {% if candidate.stop_loss %}<span>止损 {{ candidate.stop_loss }}</span>{% endif %}
+                  {% if candidate.take_profit %}<span>止盈 {{ candidate.take_profit }}</span>{% endif %}
+                </div>
+                <button
+                  type="button"
+                  class="secondary-button"
+                  data-bind-live-position
+                  data-pos-id="{{ item.pos_id }}"
+                  data-lifecycle-id="{{ candidate.lifecycle_id }}"
+                >绑定</button>
+              </div>
+            {% endfor %}
+            <span class="execution-action-status" data-bind-live-position-status aria-live="polite"></span>
+          </div>
+        {% endif %}
+
         {% if selected_status in ['holding', 'live'] and item.lifecycle_id %}
           <div class="execution-actions">
             <button

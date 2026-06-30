@@ -1902,6 +1902,50 @@ function bindDeepcoinPositionSync() {
   });
 }
 
+function bindLivePositionAttributionButtons() {
+  document.querySelectorAll('[data-bind-live-position]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const posId = button.dataset.posId;
+      const lifecycleId = button.dataset.lifecycleId;
+      const block = button.closest('.execution-attribution');
+      const status = block ? block.querySelector('[data-bind-live-position-status]') : null;
+      if (!posId || !lifecycleId) {
+        return;
+      }
+      const confirmed = window.confirm('确认把这个 DeepCoin 实盘仓位绑定到选中的 KOL 策略？这不会向交易所下单。');
+      if (!confirmed) {
+        return;
+      }
+      button.disabled = true;
+      if (status) {
+        status.textContent = '正在绑定...';
+        status.classList.remove('is-error');
+      }
+      try {
+        const response = await fetch('/api/execution/bind-live-position', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pos_id: posId, lifecycle_id: lifecycleId }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(payload.detail || 'bind failed');
+        }
+        if (status) {
+          status.textContent = '已绑定，正在刷新...';
+        }
+        window.setTimeout(() => window.location.reload(), 400);
+      } catch (error) {
+        button.disabled = false;
+        if (status) {
+          status.textContent = error.message || '绑定失败';
+          status.classList.add('is-error');
+        }
+      }
+    });
+  });
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   const form = document.querySelector('[data-ai-form]');
   if (form) {
@@ -1919,6 +1963,7 @@ window.addEventListener('DOMContentLoaded', () => {
   bindClearAiHistory();
   bindManualCloseButtons();
   bindDeepcoinPositionSync();
+  bindLivePositionAttributionButtons();
   renderConversationHistory();
   setAiStatus('');
   resetInitialMessagePanelScroll();

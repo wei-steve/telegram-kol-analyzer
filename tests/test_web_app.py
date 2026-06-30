@@ -195,6 +195,20 @@ def test_execution_dashboard_defaults_to_deepcoin_live_positions(tmp_path):
                 order_id="order-eth",
             )
         )
+        session.add(
+            StrategyLifecycle(
+                chat_id=99,
+                message_id=20,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 6, 30, 8, 0),
+                entered_at=datetime(2026, 6, 30, 8, 1),
+                entry_price_actual=59760,
+                stop_loss=61300,
+                take_profit="59600",
+            )
+        )
         session.commit()
 
     client = TestClient(app)
@@ -205,6 +219,8 @@ def test_execution_dashboard_defaults_to_deepcoin_live_positions(tmp_path):
     assert "<strong>2</strong>" in response.text
     assert "未绑定实盘仓位" in response.text
     assert "pos-btc" in response.text
+    assert "可能归属" in response.text
+    assert "绑定" in response.text
 
 
 def test_manual_close_api_marks_lifecycle_and_binding_closed(tmp_path):
@@ -300,6 +316,55 @@ def test_execution_sync_api_marks_missing_deepcoin_position_closed(tmp_path):
 
         assert lifecycle.lifecycle_status == "exited"
         assert lifecycle.exit_reason == "manual"
+
+
+def test_bind_live_position_api_attaches_unbound_position_to_lifecycle(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-btc",
+                    "posSide": "short",
+                    "pos": "9",
+                    "avgPx": "59761.2",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        now_provider=lambda: datetime(2026, 6, 30, 10, 0),
+    )
+    with app.state.session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 30, 9, 0),
+            entered_at=datetime(2026, 6, 30, 9, 1),
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/execution/bind-live-position",
+        json={"pos_id": "pos-btc", "lifecycle_id": lifecycle_id},
+    )
+
+    assert response.status_code == 200
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, response.json()["binding_id"])
+
+        assert binding.status == "active"
+        assert binding.pos_id == "pos-btc"
+        assert binding.last_exchange_status == "manual_bound_live_position"
+        assert lifecycle.execution_binding_id == binding.id
 
 
 def test_message_recognition_api_updates_message_result(tmp_path):

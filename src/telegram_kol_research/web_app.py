@@ -56,6 +56,7 @@ from telegram_kol_research.llm_chat import (
     load_llm_proxy_config,
     request_grounded_chat_answer,
 )
+from telegram_kol_research.execution_bindings import bind_deepcoin_position_to_lifecycle
 from telegram_kol_research.execution_bindings import list_active_positions
 from telegram_kol_research.execution_bindings import sync_manual_closed_deepcoin_positions
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
@@ -377,9 +378,66 @@ def _load_deepcoin_live_position_rows(
                         if binding is None
                         else None
                     ),
+                    "attribution_candidates": (
+                        _load_live_position_attribution_candidates(
+                            session,
+                            symbol=symbol,
+                            side=side,
+                            group_label_by_chat_id=group_label_by_chat_id,
+                        )
+                        if binding is None
+                        else []
+                    ),
                 }
             )
         return rows
+
+
+def _load_live_position_attribution_candidates(
+    session,
+    *,
+    symbol: str,
+    side: str,
+    group_label_by_chat_id: dict[int, str],
+    limit: int = 6,
+) -> list[dict[str, object]]:
+    rows = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.symbol == symbol)
+        .filter(StrategyLifecycle.side == side)
+        .filter(StrategyLifecycle.lifecycle_status.in_(["entered", "pending_entry"]))
+        .order_by(StrategyLifecycle.signal_at.desc(), StrategyLifecycle.id.desc())
+        .limit(limit)
+        .all()
+    )
+    result: list[dict[str, object]] = []
+    for lifecycle in rows:
+        result.append(
+            {
+                "lifecycle_id": lifecycle.id,
+                "group_label": group_label_by_chat_id.get(
+                    lifecycle.chat_id,
+                    str(lifecycle.chat_id),
+                ),
+                "message_id": lifecycle.message_id,
+                "lifecycle_status": lifecycle.lifecycle_status,
+                "entry": lifecycle.entry_price_actual
+                or _format_range(lifecycle.entry_range_low, lifecycle.entry_range_high),
+                "stop_loss": lifecycle.stop_loss,
+                "take_profit": lifecycle.take_profit,
+            }
+        )
+    return result
+
+
+def _format_range(low: float | None, high: float | None) -> str | None:
+    if low is None and high is None:
+        return None
+    if high is None or low == high:
+        return str(low)
+    if low is None:
+        return str(high)
+    return f"{low:g}-{high:g}"
 
 
 def _deepcoin_position_has_size(position: dict[str, Any]) -> bool:
@@ -1221,6 +1279,46 @@ def create_web_app(
             "manually_closed": result.manually_closed,
             "skipped_without_pos_id": result.skipped_without_pos_id,
         }
+
+    @app.post("/api/execution/bind-live-position")
+    async def bind_live_position(payload: dict[str, Any]):
+        pos_id = str(payload.get("pos_id") or "").strip()
+        lifecycle_id = payload.get("lifecycle_id")
+        if not pos_id:
+            raise HTTPException(status_code=400, detail="pos_id is required")
+        try:
+            lifecycle_id_int = int(lifecycle_id)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="invalid lifecycle_id") from exc
+        try:
+            client = app.state.deepcoin_client_factory()
+            positions = client.list_positions()
+        except DeepcoinClientError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        active_position = next(
+            (
+                position
+                for position in positions
+                if _first_position_string(position, "posId", "pos_id", "id") == pos_id
+                and _deepcoin_position_has_size(position)
+            ),
+            None,
+        )
+        if active_position is None:
+            raise HTTPException(status_code=404, detail="live position not found")
+        try:
+            binding_id = bind_deepcoin_position_to_lifecycle(
+                app.state.session_factory,
+                lifecycle_id=lifecycle_id_int,
+                pos_id=pos_id,
+                position_payload=active_position,
+                bound_at=app.state.now_provider(),
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"binding_id": binding_id, "lifecycle_id": lifecycle_id_int, "pos_id": pos_id}
 
     @app.post("/api/groups/{chat_id}/automation")
     async def update_group_automation(chat_id: int, payload: dict[str, Any]):

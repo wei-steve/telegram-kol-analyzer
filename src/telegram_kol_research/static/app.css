@@ -1792,6 +1792,41 @@ pre { white-space: pre-wrap; }
   font-size: 0.86rem;
 }
 
+.execution-attribution {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid rgba(251, 191, 36, 0.20);
+  border-radius: 8px;
+  background: rgba(120, 53, 15, 0.10);
+}
+.execution-attribution-title {
+  color: #fde68a;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+.execution-attribution-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  color: #cbd5e1;
+  font-size: 0.82rem;
+}
+.execution-attribution-row > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: center;
+}
+.execution-attribution-row code {
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.72);
+  color: #93c5fd;
+}
+
 .execution-actions {
   display: flex;
   align-items: center;

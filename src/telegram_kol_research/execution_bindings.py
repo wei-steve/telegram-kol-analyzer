@@ -309,6 +309,52 @@ def sync_manual_closed_deepcoin_positions(
     return result
 
 
+def bind_deepcoin_position_to_lifecycle(
+    session_factory: sessionmaker,
+    *,
+    lifecycle_id: int,
+    pos_id: str,
+    position_payload: dict[str, Any] | None = None,
+    bound_at: datetime | None = None,
+) -> int:
+    """Attach an existing live Deepcoin position to a local KOL lifecycle."""
+
+    from telegram_kol_research.models import StrategyLifecycle
+
+    now = bound_at or datetime.now(UTC)
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        if lifecycle is None:
+            raise LookupError("strategy lifecycle not found")
+        if lifecycle.lifecycle_status not in {"entered", "pending_entry"}:
+            raise ValueError("only active or pending strategies can be bound")
+        record = ExecutionBindingRecord(
+            kol_id=f"group:{lifecycle.chat_id}",
+            chat_id=lifecycle.chat_id,
+            message_id=lifecycle.message_id,
+            symbol=lifecycle.symbol,
+            side=lifecycle.side,
+            venue="deepcoin",
+            order_id=None,
+            client_order_id=None,
+            pos_id=pos_id,
+            payload={"manual_bind_position": position_payload or {}},
+            last_exchange_status="manual_bound_live_position",
+            status="active",
+        )
+    binding_id = upsert_execution_binding(session_factory, record)
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        if lifecycle is not None:
+            lifecycle.execution_binding_id = binding_id
+            if lifecycle.lifecycle_status == "pending_entry":
+                lifecycle.lifecycle_status = "entered"
+                lifecycle.entered_at = now
+            lifecycle.updated_at = now
+            session.commit()
+    return binding_id
+
+
 def build_deepcoin_account_state(
     session_factory: sessionmaker,
     *,
