@@ -439,6 +439,90 @@ def test_auto_process_message_trade_signal_closes_position_from_close_signal(tmp
     assert fake_client.orders[0]["side"] == "sell"
 
 
+def test_auto_process_message_trade_signal_partially_closes_profit_percent(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                strategy_instance_id="deepcoin:100:55:BTC:short",
+                kol_id="alice",
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="short",
+                venue="deepcoin",
+                pos_id="pos-1",
+                status="active",
+            )
+        )
+        raw = RawMessage(
+            chat_id=100,
+            message_id=56,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 6, 30, 20, 57),
+            text="走70%仓位利润，汇报 吃肉了 #BTC",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="short",
+                event_type="position_update",
+                stop_loss_text="62100",
+                take_profit_text="58388/57388",
+                parse_source="lifecycle_ai",
+                confidence=0.95,
+            )
+        )
+        session.commit()
+        raw_message_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.positions = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "short",
+            "pos": "7",
+        }
+    ]
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        processed_at=datetime(2026, 6, 30, 20, 58, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert result["management_action"] == "close_position"
+    assert fake_client.orders == [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "tdMode": "cross",
+            "side": "buy",
+            "posSide": "short",
+            "ordType": "market",
+            "sz": "4.9",
+            "mrgPosition": "split",
+            "closePosId": "pos-1",
+        }
+    ]
+    assert result["result"]["full_close"] is False
+
+
 def test_auto_process_message_trade_signal_adjusts_stop_loss_from_position_update(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
