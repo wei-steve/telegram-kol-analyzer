@@ -10,6 +10,7 @@ from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import RecoveryDecisionRecord
 from telegram_kol_research.models import SignalCandidate
+from telegram_kol_research.kol_codes import resolve_kol_code
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -84,6 +85,14 @@ def _preview_row(
         candidate_text.get("message_text"),
     )
     entry_range_text = row.entry_range_text or candidate_text.get("entry_text")
+    source_payload = {
+        "kol_id": row.kol_id,
+        "chat_id": row.chat_id,
+        "message_id": row.message_id,
+    }
+    kol_code = resolve_kol_code(chat_id=row.chat_id)
+    if kol_code:
+        source_payload["kol_code"] = kol_code
     payload_preview = {
         "venue": "deepcoin",
         "contract": contract,
@@ -98,11 +107,7 @@ def _preview_row(
         "take_profit_allocations": take_profit_allocations,
         "entry_range_order_style": entry_range_order_style,
         "risk_budget_usdt": row.max_loss_usdt,
-        "source": {
-            "kol_id": row.kol_id,
-            "chat_id": row.chat_id,
-            "message_id": row.message_id,
-        },
+        "source": source_payload,
     }
     instrument_id = _to_deepcoin_swap_instrument(contract)
     contract_spec = (

@@ -73,12 +73,35 @@ def build_client_order_id(
     strategy_instance_id: str,
     leg_index: int = 1,
     purpose: str = "entry",
+    kol_code: str | None = None,
+    message_id: int | None = None,
 ) -> str:
     """Build a deterministic client order id that remains stable after restarts."""
+
+    if kol_code and message_id:
+        prefix = f"TK{kol_code.upper()[:8]}{int(message_id)}"
+        purpose_code = _client_order_purpose_code(purpose)
+        candidate = f"{prefix}{purpose_code}{int(leg_index)}"
+        if candidate.isalnum() and len(candidate) <= 20:
+            return candidate
+        digest_raw = f"{strategy_instance_id}:{purpose}:{int(leg_index)}"
+        digest = hashlib.sha1(digest_raw.encode("utf-8")).hexdigest()[:4].upper()
+        available = max(2, 20 - len(f"TK{purpose_code}{int(leg_index)}{digest}"))
+        candidate = f"TK{kol_code.upper()[:available]}{purpose_code}{int(leg_index)}{digest}"
+        return candidate[:20]
 
     raw = f"{strategy_instance_id}:{purpose}:{int(leg_index)}"
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:14].upper()
     return f"TK{digest}{int(leg_index)}"[:20]
+
+
+def _client_order_purpose_code(purpose: str) -> str:
+    return {
+        "entry": "E",
+        "exit": "X",
+        "take_profit": "T",
+        "stop_loss": "S",
+    }.get(str(purpose or "").lower(), "O")
 
 
 def upsert_execution_binding(

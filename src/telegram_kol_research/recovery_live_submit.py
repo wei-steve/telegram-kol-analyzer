@@ -478,6 +478,8 @@ def build_deepcoin_trigger_order_payload(
         "mrgPosition": _deepcoin_position_mode(str(draft.get("position_mode") or "split")),
         "tdMode": _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross")),
     }
+    if leg.get("client_order_id"):
+        payload["clOrdId"] = str(leg.get("client_order_id"))
     payload.update(_deepcoin_embedded_sltp_fields(draft))
     return payload
 

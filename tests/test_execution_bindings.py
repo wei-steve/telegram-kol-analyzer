@@ -166,6 +166,27 @@ def test_build_stable_strategy_and_client_order_ids():
     assert len(client_order_id) <= 20
 
 
+def test_build_client_order_id_can_include_kol_code_and_message_id():
+    strategy_id = build_strategy_instance_id(
+        venue="deepcoin",
+        chat_id=-1002409877375,
+        message_id=8248,
+        symbol="btc",
+        side="short",
+    )
+
+    client_order_id = build_client_order_id(
+        strategy_instance_id=strategy_id,
+        leg_index=1,
+        kol_code="FG",
+        message_id=8248,
+    )
+
+    assert client_order_id == "TKFG8248E1"
+    assert client_order_id.isalnum()
+    assert len(client_order_id) <= 20
+
+
 def test_reconcile_deepcoin_execution_bindings_marks_restart_state(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     upsert_execution_binding(

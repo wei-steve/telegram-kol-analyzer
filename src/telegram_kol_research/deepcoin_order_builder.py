@@ -12,6 +12,7 @@ from typing import Any
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.execution_bindings import build_client_order_id
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
+from telegram_kol_research.kol_codes import resolve_kol_code
 
 
 class DeepcoinOrderDraftError(ValueError):
@@ -54,6 +55,10 @@ def build_deepcoin_order_draft(
     source_kol_id = source.get("kol_id")
     source_chat_id = int(source.get("chat_id") or 0)
     source_message_id = int(source.get("message_id") or 0)
+    source_kol_code = resolve_kol_code(
+        chat_id=source_chat_id,
+        explicit_code=source.get("kol_code"),
+    )
     risk_budget = float(_require_value(payload_preview, "risk_budget_usdt"))
     stop_loss = _parse_optional_price(payload_preview.get("stop_loss"))
     margin_mode = _normalize_margin_mode(payload_preview.get("margin_mode"))
@@ -87,6 +92,8 @@ def build_deepcoin_order_draft(
                 client_order_id=build_client_order_id(
                     strategy_instance_id=strategy_instance_id,
                     leg_index=1,
+                    kol_code=source_kol_code,
+                    message_id=source_message_id,
                 ),
                 allocation_pct=100.0,
                 quantity=_estimate_leg_quantity(
@@ -115,6 +122,8 @@ def build_deepcoin_order_draft(
                 client_order_id=build_client_order_id(
                     strategy_instance_id=strategy_instance_id,
                     leg_index=1,
+                    kol_code=source_kol_code,
+                    message_id=source_message_id,
                 ),
                 allocation_pct=50.0,
                 quantity=_estimate_leg_quantity(
@@ -133,6 +142,8 @@ def build_deepcoin_order_draft(
                 client_order_id=build_client_order_id(
                     strategy_instance_id=strategy_instance_id,
                     leg_index=2,
+                    kol_code=source_kol_code,
+                    message_id=source_message_id,
                 ),
                 allocation_pct=50.0,
                 quantity=_estimate_leg_quantity(
@@ -150,6 +161,14 @@ def build_deepcoin_order_draft(
         order_legs=order_legs,
     )
     quantity_notes = _quantity_notes(stop_loss=stop_loss, contract_spec=contract_spec)
+
+    source_payload = {
+        "kol_id": source_kol_id,
+        "chat_id": source_chat_id,
+        "message_id": source_message_id,
+    }
+    if source_kol_code:
+        source_payload["kol_code"] = source_kol_code
 
     draft = {
         "venue": "deepcoin",
@@ -173,11 +192,7 @@ def build_deepcoin_order_draft(
             contract_spec=contract_spec,
         ),
         "risk_budget_usdt": risk_budget,
-        "source": {
-            "kol_id": source_kol_id,
-            "chat_id": source_chat_id,
-            "message_id": source_message_id,
-        },
+        "source": source_payload,
         "notes": [
             "offline_constructor_only",
             "default_cross_margin_split_position",

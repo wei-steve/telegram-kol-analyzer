@@ -300,6 +300,7 @@ def test_build_deepcoin_trigger_order_payload_embeds_take_profit_and_stop_loss()
             "position_side": "long",
             "price": 68100.0,
             "quantity": 83.0,
+            "client_order_id": "TKFG8248E1",
         },
     )
 
@@ -308,6 +309,7 @@ def test_build_deepcoin_trigger_order_payload_embeds_take_profit_and_stop_loss()
     assert payload["tpTriggerPx"] == 69000.0
     assert payload["slTriggerPx"] == 67500.0
     assert payload["mrgPosition"] == "split"
+    assert payload["clOrdId"] == "TKFG8248E1"
 
 
 def test_build_deepcoin_market_order_and_position_sltp_payloads():

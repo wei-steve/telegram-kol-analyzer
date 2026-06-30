@@ -131,6 +131,36 @@ def test_build_deepcoin_order_draft_builds_single_market_order_leg():
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
 
 
+def test_build_deepcoin_order_draft_uses_configured_kol_code_for_client_order_id():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            order_type="market",
+            contract="ETH-USDT",
+            open_side="sell",
+            position_side="short",
+            entry_range="2500-2500",
+            stop_loss="2600",
+            source={
+                "kol_id": "group:-1002409877375",
+                "chat_id": -1002409877375,
+                "message_id": 8248,
+            },
+        ),
+        contract_spec=DeepcoinContractSpec(
+            instrument_id="ETH-USDT-SWAP",
+            contract_value=0.1,
+            quantity_step=0.1,
+            min_quantity=0.1,
+            price_tick=0.01,
+        ),
+    )
+
+    assert draft["source"]["kol_code"] == "FG"
+    assert draft["order_legs"][0]["client_order_id"] == "TKFG8248E1"
+    assert draft["order_legs"][0]["client_order_id"].isalnum()
+    assert len(draft["order_legs"][0]["client_order_id"]) <= 20
+
+
 def test_build_deepcoin_order_draft_rejects_missing_entry_range():
     try:
         build_deepcoin_order_draft(_payload_preview(entry_range=None))
