@@ -248,6 +248,46 @@ class ExecutionBinding(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class ExecutionEvent(Base):
+    __tablename__ = "execution_events"
+    __table_args__ = (
+        Index("ix_execution_events_strategy_created", "strategy_instance_id", "created_at"),
+        Index("ix_execution_events_binding_created", "execution_binding_id", "created_at"),
+        Index("ix_execution_events_action_created", "action", "created_at"),
+        Index("ix_execution_events_order", "order_id"),
+        Index("ix_execution_events_pos", "pos_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    execution_binding_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=True, index=True
+    )
+    trade_signal_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("trade_signals.id"), nullable=True, index=True
+    )
+    strategy_instance_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin", index=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="submitted", index=True)
+    kol_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    chat_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    source_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    symbol: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    side: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    client_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    pos_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    related_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    before_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    after_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    request_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    exchange_event_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class TradeSignal(Base):
     __tablename__ = "trade_signals"
     __table_args__ = (

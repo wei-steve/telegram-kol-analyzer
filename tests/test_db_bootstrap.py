@@ -156,6 +156,39 @@ def test_database_bootstrap_creates_trade_signals_table(tmp_path):
     assert "updated_at" in columns
 
 
+def test_database_bootstrap_creates_execution_events_table(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(execution_events)").fetchall()
+    }
+    indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(execution_events)").fetchall()
+    }
+    conn.close()
+
+    assert {
+        "strategy_instance_id",
+        "execution_binding_id",
+        "trade_signal_id",
+        "action",
+        "status",
+        "order_id",
+        "pos_id",
+        "before_json",
+        "after_json",
+        "request_json",
+        "response_json",
+        "exchange_event_time",
+    }.issubset(columns)
+    assert "ix_execution_events_strategy_created" in indexes
+    assert "ix_execution_events_order" in indexes
+
+
 def test_database_bootstrap_enables_sqlite_busy_timeout(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
 

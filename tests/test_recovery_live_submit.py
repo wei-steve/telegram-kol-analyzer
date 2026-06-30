@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
-from telegram_kol_research.models import ExecutionBinding, RawMessage, SignalCandidate
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, RawMessage, SignalCandidate
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
@@ -414,10 +414,20 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     assert result["warnings"] == ["only_first_take_profit_submitted_for_order_sltp"]
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
+        events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
     assert binding.status == "open"
     assert binding.order_id == "trigger-1,trigger-2"
     assert binding.client_order_id == "TK649760E806ACF61,TK729D11F4739D2A2"
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
+    assert [event.action for event in events] == [
+        "create_trigger_entry",
+        "create_trigger_entry",
+    ]
+    assert events[0].execution_binding_id == binding.id
+    assert events[0].trade_signal_id == result["signal_id"]
+    assert events[0].order_id == "trigger-1"
+    assert '"take_profit": 69000.0' in (events[0].after_json or "")
+    assert '"stop_loss": 67500.0' in (events[0].after_json or "")
 
 
 def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):

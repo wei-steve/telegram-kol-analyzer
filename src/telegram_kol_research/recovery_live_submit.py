@@ -11,8 +11,11 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
+from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import upsert_execution_binding
+from telegram_kol_research.execution_events import ExecutionEventRecord
+from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.trade_signals import TradeSignalRecord
 from telegram_kol_research.trade_signals import enqueue_trade_signal
@@ -136,14 +139,22 @@ def process_trade_signal_live(
     if trade_signal.status != "pending":
         raise RecoveryLiveSubmitError(f"trade_signal_not_pending:{trade_signal.status}")
     try:
-        result = _submit_recovery_signal_direct(
-            session_factory,
-            trade_signal=trade_signal,
-            deepcoin_client=deepcoin_client,
-            contract_spec_provider=contract_spec_provider,
-            submitted_at=processed_at,
-            max_order_legs=max_order_legs,
-        )
+        if trade_signal.action == "open_position":
+            result = _submit_recovery_signal_direct(
+                session_factory,
+                trade_signal=trade_signal,
+                deepcoin_client=deepcoin_client,
+                contract_spec_provider=contract_spec_provider,
+                submitted_at=processed_at,
+                max_order_legs=max_order_legs,
+            )
+        else:
+            result = execute_deepcoin_management_signal(
+                session_factory,
+                trade_signal=trade_signal,
+                deepcoin_client=deepcoin_client,
+                executed_at=processed_at,
+            )
     except Exception as exc:
         mark_trade_signal_failed(
             session_factory,
@@ -326,7 +337,7 @@ def _submit_recovery_signal_direct(
             }
         )
 
-    upsert_execution_binding(
+    binding_id = upsert_execution_binding(
         session_factory,
         ExecutionBindingRecord(
             kol_id=kol_id,
@@ -345,6 +356,18 @@ def _submit_recovery_signal_direct(
             status="open",
             strategy_instance_id=str(draft.get("strategy_instance_id") or ""),
         ),
+    )
+    _record_submitted_order_events(
+        session_factory,
+        trade_signal=trade_signal,
+        binding_id=binding_id,
+        draft=draft,
+        submitted_orders=submitted_orders,
+        kol_id=kol_id,
+        symbol_key=symbol_key,
+        side_key=side_key,
+        source=source,
+        created_at=now,
     )
 
     return {
@@ -397,6 +420,96 @@ def _upsert_protection_failed_binding(
             strategy_instance_id=str(draft.get("strategy_instance_id") or ""),
         ),
     )
+
+
+def _record_submitted_order_events(
+    session_factory: sessionmaker,
+    *,
+    trade_signal: TradeSignalRecord,
+    binding_id: int,
+    draft: dict[str, Any],
+    submitted_orders: list[dict[str, Any]],
+    kol_id: str,
+    symbol_key: str,
+    side_key: str,
+    source: dict[str, Any],
+    created_at: datetime,
+) -> None:
+    strategy_instance_id = str(draft.get("strategy_instance_id") or trade_signal.strategy_instance_id or "")
+    chat_id = int(source.get("chat_id") or trade_signal.chat_id)
+    message_id = int(source.get("message_id") or trade_signal.message_id)
+    for order in submitted_orders:
+        execution_type = str(order.get("execution_type") or "").lower()
+        base = {
+            "execution_binding_id": binding_id,
+            "trade_signal_id": trade_signal.id,
+            "strategy_instance_id": strategy_instance_id or None,
+            "kol_id": kol_id,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "source_message_id": trade_signal.message_id,
+            "symbol": symbol_key,
+            "side": side_key,
+            "order_id": str(order.get("order_id") or "") or None,
+            "client_order_id": str(order.get("client_order_id") or "") or None,
+            "pos_id": str(order.get("pos_id") or "") or None,
+            "created_at": created_at,
+        }
+        if execution_type == "market":
+            record_execution_event(
+                session_factory,
+                ExecutionEventRecord(
+                    action="open_market_position",
+                    reason="live_signal_auto_trade",
+                    request=order.get("request"),
+                    response=order.get("response"),
+                    **base,
+                ),
+            )
+            protection_request = order.get("protection_request")
+            if isinstance(protection_request, dict):
+                record_execution_event(
+                    session_factory,
+                    ExecutionEventRecord(
+                        action="set_position_tpsl",
+                        reason="entry_protection",
+                        after=_extract_tpsl_snapshot(protection_request),
+                        request=protection_request,
+                        response=order.get("protection_response"),
+                        related_order_id=base["order_id"],
+                        **base,
+                    ),
+                )
+        else:
+            request = order.get("request") if isinstance(order.get("request"), dict) else {}
+            record_execution_event(
+                session_factory,
+                ExecutionEventRecord(
+                    action="create_trigger_entry",
+                    reason="live_signal_auto_trade",
+                    after=_extract_tpsl_snapshot(request),
+                    request=request,
+                    response=order.get("response"),
+                    **base,
+                ),
+            )
+
+
+def _extract_tpsl_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    for source_key, target_key in (
+        ("tpTriggerPx", "take_profit"),
+        ("tpTriggerPrice", "take_profit"),
+        ("closeTPTriggerPrice", "take_profit"),
+        ("slTriggerPx", "stop_loss"),
+        ("slTriggerPrice", "stop_loss"),
+        ("closeSLTriggerPrice", "stop_loss"),
+    ):
+        value = payload.get(source_key)
+        if value in (None, "", "0", 0):
+            continue
+        snapshot[target_key] = value
+    return snapshot
 
 
 def build_deepcoin_place_order_payload(

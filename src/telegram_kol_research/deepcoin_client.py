@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+from urllib.parse import urlencode
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,9 +21,13 @@ from telegram_kol_research.telegram_client import _load_env_file_values
 DEEPCOIN_BASE_URL = "https://api.deepcoin.com"
 DEEPCOIN_PLACE_ORDER_PATH = "/deepcoin/trade/order"
 DEEPCOIN_CANCEL_ORDER_PATH = "/deepcoin/trade/cancel-order"
+DEEPCOIN_CANCEL_TRIGGER_ORDER_PATH = "/deepcoin/trade/cancel-trigger-order"
 DEEPCOIN_REPLACE_ORDER_SLTP_PATH = "/deepcoin/trade/replace-order-sltp"
 DEEPCOIN_TRIGGER_ORDER_PATH = "/deepcoin/trade/trigger-order"
+DEEPCOIN_ORDERS_PENDING_PATH = "/deepcoin/trade/orders-pending"
+DEEPCOIN_ORDERS_HISTORY_PATH = "/deepcoin/trade/orders-history"
 DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH = "/deepcoin/trade/trigger-orders-pending"
+DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH = "/deepcoin/trade/trigger-orders-history"
 DEEPCOIN_SET_POSITION_SLTP_PATH = "/deepcoin/trade/set-position-sltp"
 DEEPCOIN_ACCOUNT_POSITIONS_PATH = "/deepcoin/account/positions"
 DEEPCOIN_MARKET_TICKERS_PATH = "/deepcoin/market/tickers"
@@ -57,11 +62,23 @@ class DeepcoinTradingClientProtocol(Protocol):
     def cancel_order(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
         """Cancel one live order."""
 
+    def cancel_trigger_order(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
+        """Cancel one pending trigger / conditional order."""
+
     def list_positions(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return account positions, optionally filtered by instrument."""
 
+    def list_open_orders(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
+        """Return pending regular orders, optionally filtered by instrument."""
+
+    def list_order_history(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
+        """Return historical regular orders, optionally filtered by instrument."""
+
     def list_trigger_orders_pending(self, *, inst_id: str) -> list[dict[str, Any]]:
         """Return pending trigger / TPSL orders for one instrument."""
+
+    def list_trigger_order_history(self, *, inst_id: str) -> list[dict[str, Any]]:
+        """Return historical trigger / TPSL orders for one instrument."""
 
     def get_ticker_price(self, *, inst_id: str) -> float | None:
         """Return the latest ticker price for one instrument."""
@@ -73,8 +90,9 @@ def load_deepcoin_credentials(
 ) -> DeepcoinCredentials:
     """Load Deepcoin API credentials from env vars or config env files."""
 
-    env = dict(_load_env_file_values(env_file_paths or [".env", "config/telegram.env"]))
-    env.update(environ or os.environ)
+    paths = [".env", "config/telegram.env"] if env_file_paths is None else env_file_paths
+    env = {} if paths == [] else dict(_load_env_file_values(paths))
+    env.update(os.environ if environ is None else environ)
     api_key = env.get("DEEPCOIN_API_KEY", "")
     api_secret = env.get("DEEPCOIN_API_SECRET", "")
     passphrase = env.get("DEEPCOIN_API_PASSPHRASE", "")
@@ -127,21 +145,93 @@ class DeepcoinRestClient:
     def cancel_order(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_CANCEL_ORDER_PATH, cancel_payload)
 
+    def cancel_trigger_order(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", DEEPCOIN_CANCEL_TRIGGER_ORDER_PATH, cancel_payload)
+
     def list_positions(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
-        query = "instType=SWAP"
-        if inst_id:
-            query += f"&instId={inst_id}"
-        payload = self._request("GET", f"{DEEPCOIN_ACCOUNT_POSITIONS_PATH}?{query}")
+        payload = self._request(
+            "GET",
+            _path_with_query(
+                DEEPCOIN_ACCOUNT_POSITIONS_PATH,
+                {"instType": "SWAP", "instId": inst_id},
+            ),
+        )
         data = payload.get("data")
         return data if isinstance(data, list) else []
+
+    def list_open_orders(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            _path_with_query(
+                DEEPCOIN_ORDERS_PENDING_PATH,
+                {"instType": "SWAP", "instId": inst_id},
+            ),
+        )
+        data = payload.get("data")
+        return data if isinstance(data, list) else []
+
+    def list_order_history(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            _path_with_query(
+                DEEPCOIN_ORDERS_HISTORY_PATH,
+                {"instType": "SWAP", "instId": inst_id},
+            ),
+        )
+        data = payload.get("data")
+        return data if isinstance(data, list) else []
+
+    def get_order_history_by_id(
+        self,
+        *,
+        inst_id: str,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return one historical regular order by Deepcoin id or client order id."""
+
+        return _find_order_by_ids(
+            self.list_order_history(inst_id=inst_id),
+            order_id=order_id,
+            client_order_id=client_order_id,
+        )
 
     def list_trigger_orders_pending(self, *, inst_id: str) -> list[dict[str, Any]]:
         payload = self._request(
             "GET",
-            f"{DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH}?instType=SWAP&instId={inst_id}",
+            _path_with_query(
+                DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH,
+                {"instType": "SWAP", "instId": inst_id},
+            ),
         )
         data = payload.get("data")
         return data if isinstance(data, list) else []
+
+    def list_trigger_order_history(self, *, inst_id: str) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            _path_with_query(
+                DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH,
+                {"instType": "SWAP", "instId": inst_id},
+            ),
+        )
+        data = payload.get("data")
+        return data if isinstance(data, list) else []
+
+    def get_trigger_order_history_by_id(
+        self,
+        *,
+        inst_id: str,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return one historical trigger/TPSL order by Deepcoin id or client id."""
+
+        return _find_order_by_ids(
+            self.list_trigger_order_history(inst_id=inst_id),
+            order_id=order_id,
+            client_order_id=client_order_id,
+        )
 
     def get_ticker_price(self, *, inst_id: str) -> float | None:
         payload = self._request("GET", f"{DEEPCOIN_MARKET_TICKERS_PATH}?instType=SWAP")
@@ -252,3 +342,51 @@ def _iter_deepcoin_payload_items(value: Any):
 def _utc_timestamp_ms() -> str:
     value = datetime.now(UTC)
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _path_with_query(path: str, params: dict[str, Any]) -> str:
+    filtered = {
+        key: value
+        for key, value in params.items()
+        if value not in (None, "")
+    }
+    if not filtered:
+        return path
+    return f"{path}?{urlencode(filtered)}"
+
+
+def _find_order_by_ids(
+    orders: list[dict[str, Any]],
+    *,
+    order_id: str | None,
+    client_order_id: str | None,
+) -> dict[str, Any] | None:
+    for order in orders:
+        current_order_id = _first_order_string(
+            order,
+            "ordId",
+            "orderId",
+            "order_id",
+            "algoId",
+            "triggerOrderId",
+            "id",
+        )
+        current_client_order_id = _first_order_string(
+            order,
+            "clOrdId",
+            "clientOrderId",
+            "client_order_id",
+        )
+        if order_id and current_order_id == str(order_id):
+            return order
+        if client_order_id and current_client_order_id == str(client_order_id):
+            return order
+    return None
+
+
+def _first_order_string(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None

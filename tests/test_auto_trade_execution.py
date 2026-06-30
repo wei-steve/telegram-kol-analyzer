@@ -5,7 +5,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
-from telegram_kol_research.models import ExecutionBinding, MediaAsset, RawMessage, SignalCandidate
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, MediaAsset, RawMessage, SignalCandidate
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
@@ -25,7 +25,11 @@ class _FakeDeepcoinClient:
         self.orders = []
         self.trigger_orders = []
         self.protections = []
+        self.cancel_trigger_orders = []
+        self.cancel_orders = []
         self.positions = []
+        self.trigger_pending = []
+        self.open_orders = []
 
     def place_order(self, order_payload):
         self.orders.append(order_payload)
@@ -44,10 +48,21 @@ class _FakeDeepcoinClient:
         return {"code": "0", "data": {"orderSysID": protection_payload["orderSysID"]}}
 
     def cancel_order(self, cancel_payload):
+        self.cancel_orders.append(cancel_payload)
+        return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
+
+    def cancel_trigger_order(self, cancel_payload):
+        self.cancel_trigger_orders.append(cancel_payload)
         return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
 
     def list_positions(self, *, inst_id=None):
         return self.positions
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        return self.trigger_pending
+
+    def list_open_orders(self, *, inst_id=None):
+        return self.open_orders
 
     def get_ticker_price(self, *, inst_id):
         return 68100.0
@@ -212,6 +227,15 @@ def test_auto_process_message_trade_signal_submits_market_order_then_position_sl
     assert fake_client.protections[0]["posId"] == "pos-1"
     assert fake_client.protections[0]["tpTriggerPx"] == "69000.0"
     assert fake_client.protections[0]["slTriggerPx"] == "67500.0"
+    with session_factory() as session:
+        events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
+    assert [event.action for event in events] == [
+        "open_market_position",
+        "set_position_tpsl",
+    ]
+    assert events[1].pos_id == "pos-1"
+    assert '"take_profit": "69000.0"' in (events[1].after_json or "")
+    assert '"stop_loss": "67500.0"' in (events[1].after_json or "")
 
 
 def test_auto_process_message_trade_signal_accepts_nearby_single_entry_price(tmp_path):
@@ -296,3 +320,170 @@ def test_auto_process_message_trade_signal_blocks_low_confidence(tmp_path):
     )
 
     assert result == {"status": "skipped", "reason": "confidence_below_minimum"}
+
+
+def test_auto_process_message_trade_signal_closes_position_from_close_signal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                strategy_instance_id="deepcoin:100:55:BTC:long",
+                kol_id="alice",
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                pos_id="pos-1",
+                status="active",
+            )
+        )
+        raw = RawMessage(
+            chat_id=100,
+            message_id=56,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 6, 12, 8, 5),
+            text="BTC leave now",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="long",
+                event_type="close_signal",
+                parse_source="lifecycle_ai",
+                confidence=0.95,
+            )
+        )
+        session.commit()
+        raw_message_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.positions = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "long",
+            "pos": "33",
+        }
+    ]
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        processed_at=datetime(2026, 6, 12, 8, 6, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert result["management_action"] == "close_position"
+    assert fake_client.orders[0]["closePosId"] == "pos-1"
+    assert fake_client.orders[0]["side"] == "sell"
+
+
+def test_auto_process_message_trade_signal_adjusts_stop_loss_from_position_update(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                strategy_instance_id="deepcoin:100:55:BTC:long",
+                kol_id="alice",
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                pos_id="pos-1",
+                status="active",
+            )
+        )
+        raw = RawMessage(
+            chat_id=100,
+            message_id=57,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 6, 12, 8, 10),
+            text="BTC SL moved to 68050",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="long",
+                event_type="position_update",
+                stop_loss_text="68050",
+                parse_source="lifecycle_ai",
+                confidence=0.95,
+            )
+        )
+        session.commit()
+        raw_message_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.positions = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "long",
+            "pos": "33",
+            "cTime": "1000",
+        }
+    ]
+    fake_client.trigger_pending = [
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "tp-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "posId": "pos-1",
+            "tpTriggerPx": "69000",
+            "sz": "33",
+            "cTime": "1000",
+        },
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "sl-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "posId": "pos-1",
+            "slTriggerPx": "67500",
+            "sz": "33",
+            "cTime": "1000",
+        },
+    ]
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        processed_at=datetime(2026, 6, 12, 8, 11, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert result["management_action"] == "adjust_stop_loss"
+    assert [item["ordId"] for item in fake_client.cancel_trigger_orders] == ["tp-old", "sl-old"]
+    assert fake_client.protections[0]["tpTriggerPx"] == "69000.0"
+    assert fake_client.protections[0]["slTriggerPx"] == "68050.0"
