@@ -221,6 +221,53 @@ def test_process_trade_signal_live_closes_bound_position_with_close_pos_id(tmp_p
         assert binding.last_exchange_status == "close_position_submitted"
 
 
+def test_process_trade_signal_live_closes_all_bound_position_ids(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    binding_id = _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        status="active",
+    )
+    trade_signal = _signal(
+        session_factory,
+        action="close_position",
+        payload={"binding_id": binding_id},
+    )
+    client = _FakeDeepcoinClient()
+    client.positions = [
+        {
+            "posId": "pos-1",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.1",
+            "cTime": "1000",
+        },
+        {
+            "posId": "pos-2",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.2",
+            "cTime": "1001",
+        },
+    ]
+
+    result = process_trade_signal_live(
+        session_factory,
+        signal_id=trade_signal.id,
+        deepcoin_client=client,
+    )
+
+    assert [payload["closePosId"] for payload in client.order_payloads] == ["pos-1", "pos-2"]
+    assert [payload["sz"] for payload in client.order_payloads] == ["0.1", "0.2"]
+    assert result["pos_id"] == "pos-1,pos-2"
+    assert result["close_size"] == 0.30000000000000004
+    assert result["full_close"] is True
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        assert binding.status == "closed"
+
+
 def test_process_trade_signal_live_cancels_bound_trigger_entry(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})

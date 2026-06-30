@@ -211,53 +211,67 @@ def close_position_market(
     now = executed_at or datetime.now(UTC)
     binding = _load_binding_for_signal(session_factory, trade_signal)
     inst_id = _to_deepcoin_swap_instrument(binding.symbol)
-    position = _select_bound_position(
+    positions = _select_bound_positions(
         deepcoin_client.list_positions(inst_id=inst_id),
         binding=binding,
         inst_id=inst_id,
     )
-    current_size = _position_size(position)
-    close_size = _resolve_close_size(trade_signal.payload, current_size)
-    if close_size <= 0:
-        raise DeepcoinExecutionActionError("non_positive_close_size")
-    payload = {
-        "instId": inst_id,
-        "tdMode": _deepcoin_margin_mode(binding.margin_mode),
-        "side": "sell" if binding.side.lower() == "long" else "buy",
-        "posSide": binding.side.lower(),
-        "ordType": "market",
-        "sz": f"{close_size:g}",
-        "mrgPosition": _deepcoin_position_mode(binding.position_mode),
-        "closePosId": str(_first_string(position, "posId", "pos_id", "id") or ""),
-    }
-    if not payload["closePosId"]:
-        raise DeepcoinExecutionActionError("missing_close_pos_id")
-    response = deepcoin_client.place_order(payload)
-    order_id = _extract_order_id(response)
-    full_close = close_size >= current_size * 0.999
-    record_execution_event(
-        session_factory,
-        ExecutionEventRecord(
-            execution_binding_id=binding.id,
-            trade_signal_id=trade_signal.id,
-            strategy_instance_id=binding.strategy_instance_id,
-            kol_id=binding.kol_id,
-            chat_id=binding.chat_id,
-            message_id=binding.message_id,
-            source_message_id=trade_signal.message_id,
-            symbol=binding.symbol,
-            side=binding.side,
-            action="close_position_market",
-            order_id=order_id,
-            pos_id=payload["closePosId"],
-            reason=trade_signal.action,
-            before={"position_size": current_size},
-            after={"close_size": close_size, "full_close": full_close},
-            request=payload,
-            response=response,
-            created_at=now,
-        ),
-    )
+    submitted_orders: list[dict[str, Any]] = []
+    full_close = True
+    for position in positions:
+        current_size = _position_size(position)
+        close_size = _resolve_close_size(trade_signal.payload, current_size)
+        if close_size <= 0:
+            raise DeepcoinExecutionActionError("non_positive_close_size")
+        payload = {
+            "instId": inst_id,
+            "tdMode": _deepcoin_margin_mode(binding.margin_mode),
+            "side": "sell" if binding.side.lower() == "long" else "buy",
+            "posSide": binding.side.lower(),
+            "ordType": "market",
+            "sz": f"{close_size:g}",
+            "mrgPosition": _deepcoin_position_mode(binding.position_mode),
+            "closePosId": str(_first_string(position, "posId", "pos_id", "id") or ""),
+        }
+        if not payload["closePosId"]:
+            raise DeepcoinExecutionActionError("missing_close_pos_id")
+        response = deepcoin_client.place_order(payload)
+        order_id = _extract_order_id(response)
+        position_full_close = close_size >= current_size * 0.999
+        full_close = full_close and position_full_close
+        submitted_orders.append(
+            {
+                "order_id": order_id,
+                "pos_id": payload["closePosId"],
+                "close_size": close_size,
+                "full_close": position_full_close,
+                "request": payload,
+                "response": response,
+            }
+        )
+        record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                execution_binding_id=binding.id,
+                trade_signal_id=trade_signal.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                kol_id=binding.kol_id,
+                chat_id=binding.chat_id,
+                message_id=binding.message_id,
+                source_message_id=trade_signal.message_id,
+                symbol=binding.symbol,
+                side=binding.side,
+                action="close_position_market",
+                order_id=order_id,
+                pos_id=payload["closePosId"],
+                reason=trade_signal.action,
+                before={"position_size": current_size},
+                after={"close_size": close_size, "full_close": position_full_close},
+                request=payload,
+                response=response,
+                created_at=now,
+            ),
+        )
     _update_binding_status(
         session_factory,
         binding.id,
@@ -271,12 +285,11 @@ def close_position_market(
         "signal_id": trade_signal.id,
         "action": trade_signal.action,
         "binding_id": binding.id,
-        "order_id": order_id,
-        "pos_id": payload["closePosId"],
-        "close_size": close_size,
+        "order_id": ",".join(item["order_id"] for item in submitted_orders if item["order_id"]),
+        "pos_id": ",".join(item["pos_id"] for item in submitted_orders if item["pos_id"]),
+        "close_size": sum(float(item["close_size"]) for item in submitted_orders),
         "full_close": full_close,
-        "request": payload,
-        "response": response,
+        "closed_positions": submitted_orders,
         "executed_at": now.isoformat(),
     }
 
@@ -524,6 +537,18 @@ def _select_bound_position(
     binding: _LoadedBinding,
     inst_id: str,
 ) -> dict[str, Any]:
+    matches = _select_bound_positions(positions, binding=binding, inst_id=inst_id)
+    if len(matches) == 1:
+        return matches[0]
+    raise DeepcoinExecutionActionError("ambiguous_bound_position")
+
+
+def _select_bound_positions(
+    positions: list[dict[str, Any]],
+    *,
+    binding: _LoadedBinding,
+    inst_id: str,
+) -> list[dict[str, Any]]:
     pos_ids = set(_split_ids(binding.pos_id))
     matches: list[dict[str, Any]] = []
     for position in positions:
@@ -536,11 +561,9 @@ def _select_bound_position(
         if _position_size(position) <= 0:
             continue
         matches.append(position)
-    if len(matches) == 1:
-        return matches[0]
     if not matches:
         raise DeepcoinExecutionActionError("bound_position_not_found")
-    raise DeepcoinExecutionActionError("ambiguous_bound_position")
+    return matches
 
 
 def _select_bound_order(

@@ -315,7 +315,14 @@ def _submit_recovery_signal_direct(
             order_id = _extract_order_id(response)
             if not order_id:
                 raise DeepcoinClientError("Deepcoin limit order response missing order id")
-            pos_id = _extract_position_id(response)
+            pos_id = _extract_position_id(response) or _find_open_position_id(
+                deepcoin_client,
+                draft=draft,
+                side=side_key,
+                preferred_pos_id=order_id,
+                attempts=1,
+                delay_seconds=0,
+            )
             client_order_id = str(leg.get("client_order_id") or "")
             protection_payload = build_deepcoin_order_sltp_payload(draft, order_id=order_id)
             try:
@@ -788,6 +795,7 @@ def _find_open_position_id(
     *,
     draft: dict[str, Any],
     side: str,
+    preferred_pos_id: str | None = None,
     attempts: int = 5,
     delay_seconds: float = 0.5,
 ) -> str | None:
@@ -796,7 +804,12 @@ def _find_open_position_id(
             positions = deepcoin_client.list_positions(inst_id=str(draft["instrument_id"]))
         except Exception:
             positions = []
-        position = _select_matching_position(positions, draft=draft, side=side)
+        position = _select_matching_position(
+            positions,
+            draft=draft,
+            side=side,
+            preferred_pos_id=preferred_pos_id,
+        )
         pos_id = _first_payload_string(position, "posId", "pos_id", "id") if position else None
         if pos_id:
             return pos_id
@@ -810,6 +823,7 @@ def _select_matching_position(
     *,
     draft: dict[str, Any],
     side: str,
+    preferred_pos_id: str | None = None,
 ) -> dict[str, Any] | None:
     instrument_id = str(draft["instrument_id"]).upper()
     margin_mode = _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross"))
@@ -839,6 +853,10 @@ def _select_matching_position(
         matches.append(position)
     if not matches:
         return None
+    if preferred_pos_id:
+        for match in matches:
+            if _first_payload_string(match, "posId", "pos_id", "id") == str(preferred_pos_id):
+                return match
     return sorted(
         matches,
         key=lambda item: int(float(item.get("uTime") or item.get("cTime") or 0)),
