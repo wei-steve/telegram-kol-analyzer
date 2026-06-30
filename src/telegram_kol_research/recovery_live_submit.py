@@ -242,15 +242,55 @@ def _submit_recovery_signal_direct(
                 draft=draft,
                 side=side_key,
             )
-            protection_payload = build_deepcoin_position_sltp_payload(
-                draft,
-                pos_id=pos_id,
-            )
             try:
+                protection_payload = build_deepcoin_position_sltp_payload(
+                    draft,
+                    pos_id=pos_id,
+                )
                 protection_response = deepcoin_client.set_position_sltp(protection_payload)
             except DeepcoinClientError:
+                _upsert_protection_failed_binding(
+                    session_factory,
+                    trade_signal=trade_signal,
+                    draft=draft,
+                    source=source,
+                    kol_id=kol_id,
+                    symbol_key=symbol_key,
+                    side_key=side_key,
+                    order={
+                        "leg_index": index,
+                        "execution_type": order_type or "market",
+                        "client_order_id": client_order_id,
+                        "order_id": order_id,
+                        "pos_id": pos_id,
+                        "request": order_payload,
+                        "response": response,
+                        "protection_request": locals().get("protection_payload"),
+                        "protection_response": {"error": "Deepcoin protection request failed"},
+                    },
+                )
                 raise
             except Exception as exc:  # pragma: no cover - defensive boundary
+                _upsert_protection_failed_binding(
+                    session_factory,
+                    trade_signal=trade_signal,
+                    draft=draft,
+                    source=source,
+                    kol_id=kol_id,
+                    symbol_key=symbol_key,
+                    side_key=side_key,
+                    order={
+                        "leg_index": index,
+                        "execution_type": order_type or "market",
+                        "client_order_id": client_order_id,
+                        "order_id": order_id,
+                        "pos_id": pos_id,
+                        "request": order_payload,
+                        "response": response,
+                        "protection_request": locals().get("protection_payload"),
+                        "protection_response": {"error": str(exc)},
+                    },
+                )
                 raise DeepcoinClientError(f"Deepcoin position protection failed: {exc}") from exc
         else:
             order_payload = build_deepcoin_trigger_order_payload(draft, leg)
@@ -324,6 +364,39 @@ def _submit_recovery_signal_direct(
         "deepcoin_order_draft": draft,
         "warnings": _protection_warnings(draft),
     }
+
+
+def _upsert_protection_failed_binding(
+    session_factory: sessionmaker,
+    *,
+    trade_signal: TradeSignalRecord,
+    draft: dict[str, Any],
+    source: dict[str, Any],
+    kol_id: str,
+    symbol_key: str,
+    side_key: str,
+    order: dict[str, Any],
+) -> None:
+    upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id=kol_id,
+            chat_id=int(source.get("chat_id") or trade_signal.chat_id),
+            message_id=int(source.get("message_id") or trade_signal.message_id),
+            symbol=symbol_key,
+            side=side_key,
+            venue="deepcoin",
+            order_id=str(order.get("order_id") or ""),
+            client_order_id=str(order.get("client_order_id") or ""),
+            pos_id=str(order.get("pos_id") or ""),
+            margin_mode=str(draft.get("margin_mode") or "cross"),
+            position_mode=str(draft.get("position_mode") or "split"),
+            payload={"draft": draft, "submitted_orders": [order]},
+            last_exchange_status="position_active_protection_failed",
+            status="active",
+            strategy_instance_id=str(draft.get("strategy_instance_id") or ""),
+        ),
+    )
 
 
 def build_deepcoin_place_order_payload(

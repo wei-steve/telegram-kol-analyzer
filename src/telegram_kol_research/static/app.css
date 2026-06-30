@@ -59,6 +59,25 @@ body {
   flex-shrink: 0;
 }
 
+.header-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  border-radius: 6px;
+  background: rgba(37, 99, 235, 0.12);
+  color: #bfdbfe;
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.header-link:hover {
+  background: rgba(37, 99, 235, 0.22);
+  color: #dbeafe;
+}
+
 /* ── KPI strip ── */
 .trader-kpi-strip {
   display: flex;
@@ -178,6 +197,24 @@ body {
 .icon-button:hover {
   background: rgba(30, 41, 59, 0.9);
   color: #e5e7eb;
+}
+
+.danger-button {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  border-radius: 6px;
+  background: rgba(127, 29, 29, 0.28);
+  color: #fecaca;
+  font-weight: 700;
+  cursor: pointer;
+}
+.danger-button:hover {
+  background: rgba(153, 27, 27, 0.36);
+}
+.danger-button:disabled {
+  cursor: wait;
+  opacity: 0.7;
 }
 
 /* ── Settings dropdown ── */
@@ -1628,6 +1665,155 @@ pre { white-space: pre-wrap; }
   margin: 4px 0 0;
 }
 
+/* ── Execution dashboard ── */
+.execution-layout {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-height: 100vh;
+  height: 100vh;
+  padding: 10px 14px;
+  box-sizing: border-box;
+  gap: 10px;
+  overflow: hidden;
+}
+
+.execution-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.execution-filter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 48px;
+  padding: 8px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.78);
+  color: #cbd5e1;
+  text-decoration: none;
+}
+.execution-filter strong {
+  color: #e0f2fe;
+  font-size: 1.4rem;
+}
+.execution-filter span {
+  color: #94a3b8;
+  font-size: 0.86rem;
+}
+.execution-filter.is-active {
+  border-color: rgba(56, 189, 248, 0.58);
+  background: rgba(14, 116, 144, 0.18);
+}
+
+.execution-list {
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  padding-right: 4px;
+}
+
+.execution-card {
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.78);
+  padding: 12px;
+}
+.execution-card--holding {
+  border-left: 3px solid #38bdf8;
+}
+.execution-card--pending {
+  border-left: 3px solid #fbbf24;
+}
+.execution-card--exited {
+  border-left: 3px solid #64748b;
+}
+
+.execution-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.execution-source {
+  margin-top: 5px;
+  color: #94a3b8;
+  font-size: 0.86rem;
+}
+
+.execution-binding-state {
+  display: grid;
+  gap: 3px;
+  justify-items: end;
+  color: #bae6fd;
+  font-size: 0.78rem;
+}
+.execution-binding-state span {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(14, 165, 233, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.22);
+}
+.execution-binding-state small {
+  color: #64748b;
+  max-width: 220px;
+  text-align: right;
+}
+
+.execution-metrics,
+.execution-times {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  color: #cbd5e1;
+  font-size: 0.86rem;
+}
+.execution-metrics span,
+.execution-times span {
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: rgba(30, 41, 59, 0.72);
+}
+.execution-times {
+  color: #94a3b8;
+  font-size: 0.78rem;
+}
+
+.execution-original {
+  margin: 10px 0 0;
+  color: #cbd5e1;
+  line-height: 1.55;
+  font-size: 0.86rem;
+}
+
+.execution-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+.execution-action-status {
+  color: #93c5fd;
+  font-size: 0.82rem;
+}
+.execution-action-status.is-error {
+  color: #fecaca;
+}
+
+.execution-empty {
+  border: 1px dashed rgba(148, 163, 184, 0.22);
+  border-radius: 8px;
+  padding: 24px;
+  text-align: center;
+  color: #94a3b8;
+}
+
 /* ── Responsive ── */
 @media (max-width: 900px) {
   .trader-shell {
@@ -1638,6 +1824,7 @@ pre { white-space: pre-wrap; }
     height: auto;
   }
   .trader-layout { height: auto; overflow: visible; }
+  .execution-layout { height: auto; overflow: visible; }
 }
 
 @media (max-width: 600px) {
@@ -1645,4 +1832,7 @@ pre { white-space: pre-wrap; }
   .header-center { display: none; }
   .trader-desk-header { flex-wrap: wrap; }
   .detail-tabs { overflow-x: auto; }
+  .execution-summary { grid-template-columns: 1fr; }
+  .execution-card-head { display: grid; }
+  .execution-binding-state { justify-items: start; }
 }

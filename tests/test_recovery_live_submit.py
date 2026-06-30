@@ -67,6 +67,27 @@ class _FakeDeepcoinClient:
         return 68100.0
 
 
+class _ProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
+    def __init__(self):
+        super().__init__()
+        self.positions = [
+            {
+                "posId": "pos-market-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "9",
+            }
+        ]
+
+    def place_order(self, order_payload):
+        self.payloads.append(order_payload)
+        return {"code": "0", "data": {"ordId": "order-market-1"}}
+
+    def set_position_sltp(self, protection_payload):
+        self.protection_payloads.append(protection_payload)
+        raise RuntimeError("missing_take_profit_for_protection")
+
+
 def _persist_ready_item(session_factory):
     with session_factory() as session:
         raw = RawMessage(
@@ -138,6 +159,80 @@ def _persist_ready_item(session_factory):
         contract_spec_provider=_StaticContractSpecProvider(),
         persist_ready_confirmation=True,
         confirmed_at=datetime(2026, 6, 12, 20, 0, tzinfo=UTC),
+    )
+
+
+def _persist_ready_market_item(session_factory):
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=200,
+            message_id=66,
+            sender_name="bob",
+            posted_at=datetime(2026, 6, 30, 8, 0),
+            text="BTC 现价做空 59800 止损 61800 止盈 59000",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="short",
+                event_type="entry_signal",
+                entry_text="现价 59800",
+                stop_loss_text="61800",
+                take_profit_text="59000",
+                parse_source="text_ai",
+                confidence=0.95,
+            )
+        )
+        session.commit()
+    persist_recovery_evaluations(
+        session_factory,
+        [
+            RecoveryEvaluation(
+                signal=RecoverySignal(
+                    kol_id="bob",
+                    chat_id=200,
+                    message_id=66,
+                    posted_at=datetime(2026, 6, 30, 8, 0),
+                    symbol="BTC",
+                    side="short",
+                    entry_range=(59800.0, 59800.0),
+                    stop_loss_text="61800",
+                    take_profit_text="59000",
+                    trading_mode="auto_trade",
+                    max_loss_usdt=20.0,
+                ),
+                decision=RecoveryDecision(
+                    action="eligible_for_recovery_limit_order",
+                    reason_codes=["live_signal_auto_trade_market"],
+                    entry_range=(59800.0, 59800.0),
+                    max_loss_usdt=20.0,
+                ),
+            )
+        ],
+        run_at=datetime(2026, 6, 30, 8, 0, tzinfo=UTC),
+    )
+    apply_recovery_review_decision(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+        review_status="approved_for_order",
+        reviewed_at=datetime(2026, 6, 30, 8, 1, tzinfo=UTC),
+    )
+    confirm_recovery_order_dry_run(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+        contract_spec_provider=_StaticContractSpecProvider(),
+        persist_ready_confirmation=True,
+        confirmed_at=datetime(2026, 6, 30, 8, 2, tzinfo=UTC),
     )
 
 
@@ -321,6 +416,37 @@ def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):
     assert result["order_count"] == 2
     with session_factory() as session:
         assert session.query(ExecutionBinding).count() == 1
+
+
+def test_market_submit_persists_binding_when_position_protection_fails(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_market_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    fake_client = _ProtectionFailingDeepcoinClient()
+
+    try:
+        submit_recovery_order_live(
+            session_factory,
+            chat_id=200,
+            message_id=66,
+            symbol="BTC",
+            side="short",
+            deepcoin_client=fake_client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=datetime(2026, 6, 30, 8, 3, tzinfo=UTC),
+        )
+    except Exception as exc:
+        assert "missing_take_profit_for_protection" in str(exc)
+    else:
+        raise AssertionError("expected protection setup failure")
+
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+
+    assert binding.status == "active"
+    assert binding.last_exchange_status == "position_active_protection_failed"
+    assert binding.order_id == "order-market-1"
+    assert binding.pos_id == "pos-market-1"
 
 
 def test_process_next_trade_signal_live_returns_none_without_pending_signal(tmp_path):

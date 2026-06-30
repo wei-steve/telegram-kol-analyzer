@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+
+{% block title %}执行中策略{% endblock %}
+
+{% block body %}
+<main class="execution-layout" data-execution-dashboard>
+  <header class="trader-desk-header">
+    <div class="header-left">
+      <h1>执行中策略</h1>
+      <a class="header-link" href="/">交易执行台</a>
+    </div>
+    <div class="header-right">
+      <button type="button" class="secondary-button" data-sync-deepcoin-positions>同步 DeepCoin 仓位</button>
+      <span class="execution-action-status" data-sync-deepcoin-status aria-live="polite"></span>
+      <span
+        class="message-sync-state{% if monitor_status and monitor_status.state == 'monitoring' %} is-live{% elif monitor_status and monitor_status.state == 'idle' %} is-idle{% else %} is-disconnected{% endif %}"
+        data-monitor-status
+        data-monitor-state="{{ monitor_status.state if monitor_status else 'disconnected' }}"
+        title="{{ monitor_status.detail if monitor_status else '' }}"
+      >
+        {{ monitor_status.label if monitor_status else '已断开' }}
+      </span>
+      {% if database_stale_hours is not none %}
+        <span class="freshness-badge" title="数据新鲜度">{{ "%.1fh"|format(database_stale_hours) }}</span>
+      {% endif %}
+    </div>
+  </header>
+
+  <section class="execution-summary">
+    <a class="execution-filter{% if selected_status == 'holding' %} is-active{% endif %}" href="/execution?status=holding">
+      <strong>{{ overview["counts"].holding }}</strong>
+      <span>已入场 / 持仓</span>
+    </a>
+    <a class="execution-filter{% if selected_status == 'pending' %} is-active{% endif %}" href="/execution?status=pending">
+      <strong>{{ overview["counts"].pending }}</strong>
+      <span>待入场</span>
+    </a>
+    <a class="execution-filter{% if selected_status == 'exited' %} is-active{% endif %}" href="/execution?status=exited">
+      <strong>{{ overview["counts"].exited }}</strong>
+      <span>已离场</span>
+    </a>
+  </section>
+
+  <section class="execution-list" aria-live="polite">
+    {% for item in overview["items"] %}
+      <article class="execution-card execution-card--{{ selected_status }}" data-execution-card>
+        <div class="execution-card-head">
+          <div>
+            <div class="position-symbol-row">
+              <strong>{{ item.symbol }}</strong>
+              <span class="side-badge side-{{ item.side }}">{{ "多" if item.side == "long" else "空" if item.side == "short" else item.side }}</span>
+              <code class="position-status">
+                {% if selected_status == 'holding' %}持仓中{% elif selected_status == 'pending' %}待入场{% else %}已离场{% endif %}
+              </code>
+            </div>
+            <div class="execution-source">{{ item.group_label }} · #{{ item.message_id }}</div>
+          </div>
+          <div class="execution-binding-state">
+            <span>{{ item.execution_status }}</span>
+            {% if item.exchange_status %}<small>{{ item.exchange_status }}</small>{% endif %}
+          </div>
+        </div>
+
+        <div class="execution-metrics">
+          {% if item.entry_text %}<span>计划入场: {{ item.entry_text }}</span>{% endif %}
+          {% if item.entry_price_actual %}<span>实际入场: {{ item.entry_price_actual|round(4) }}</span>{% endif %}
+          {% if item.stop_loss_text %}<span>止损: {{ item.stop_loss_text }}</span>{% endif %}
+          {% if item.take_profit_text %}<span>止盈: {{ item.take_profit_text }}</span>{% endif %}
+          {% if item.exit_price_actual %}<span>离场价: {{ item.exit_price_actual|round(4) }}</span>{% endif %}
+          {% if item.exit_reason %}<span>离场原因: {{ item.exit_reason }}</span>{% endif %}
+          {% if item.position_size_text %}<span>数量: {{ item.position_size_text }}</span>{% endif %}
+        </div>
+
+        <div class="execution-times">
+          {% if item.signal_at_display %}<span>策略: {{ item.signal_at_display }}</span>{% endif %}
+          {% if item.entered_at_display %}<span>入场: {{ item.entered_at_display }}</span>{% endif %}
+          {% if item.exited_at_display %}<span>离场: {{ item.exited_at_display }}</span>{% endif %}
+          {% if item.last_checked_at_display %}<span>检查: {{ item.last_checked_at_display }}</span>{% endif %}
+        </div>
+
+        {% if item.original_text %}
+          <p class="execution-original">{{ item.original_text }}</p>
+        {% endif %}
+
+        {% if selected_status == 'holding' %}
+          <div class="execution-actions">
+            <button
+              type="button"
+              class="danger-button"
+              data-manual-close-lifecycle
+              data-lifecycle-id="{{ item.lifecycle_id }}"
+            >标记已手动平仓</button>
+            <span class="execution-action-status" data-manual-close-status aria-live="polite"></span>
+          </div>
+        {% endif %}
+      </article>
+    {% else %}
+      <div class="execution-empty">
+        当前筛选下没有策略。
+      </div>
+    {% endfor %}
+  </section>
+</main>
+{% endblock %}

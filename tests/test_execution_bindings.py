@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
@@ -8,9 +9,10 @@ from telegram_kol_research.execution_bindings import (
     build_strategy_instance_id,
     load_deepcoin_order_bindings,
     reconcile_deepcoin_execution_bindings,
+    sync_manual_closed_deepcoin_positions,
     upsert_execution_binding,
 )
-from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
 
 
 def _binding(**overrides):
@@ -212,3 +214,45 @@ def test_reconcile_deepcoin_execution_bindings_marks_restart_state(tmp_path):
     assert rows[0].strategy_instance_id == "deepcoin:100:55:BTC:long"
     assert rows[1].status == "stale"
     assert rows[1].last_exchange_status == "not_found_on_exchange"
+
+
+def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    upsert_execution_binding(
+        session_factory,
+        _binding(pos_id="pos-closed", status="active"),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+                entered_at=datetime(2026, 6, 30, 9, 1),
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return []
+
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=FakeClient(),
+        synced_at=datetime(2026, 6, 30, 10, 0),
+    )
+
+    assert result.checked == 1
+    assert result.manually_closed == 1
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+
+    assert binding.status == "closed"
+    assert binding.last_exchange_status == "manual_closed_or_not_found_on_exchange"
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "manual"

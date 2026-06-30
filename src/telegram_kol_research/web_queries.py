@@ -15,6 +15,7 @@ from telegram_kol_research.models import (
     RawMessage,
     RecognitionExperiment,
     SignalCandidate,
+    utc_now,
 )
 from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
 
@@ -1523,3 +1524,281 @@ def list_exited_strategies(
         reverse=True,
     )
     return results[:limit]
+
+
+def list_execution_strategy_overview(
+    session_factory,
+    *,
+    status: str = "holding",
+    limit: int = 200,
+    group_label_by_chat_id: dict[int, str] | None = None,
+    symbol_whitelist_by_chat_id: dict[int, set[str]] | None = None,
+) -> dict[str, object]:
+    """Return a global execution-centric strategy dashboard."""
+
+    selected_status = status if status in {"holding", "pending", "exited"} else "holding"
+    labels = group_label_by_chat_id or {}
+    whitelist_map = symbol_whitelist_by_chat_id or {}
+    with session_factory() as session:
+        items = _load_execution_strategy_items(
+            session,
+            selected_status=selected_status,
+            limit=limit,
+            labels=labels,
+            whitelist_map=whitelist_map,
+        )
+        counts = {
+            "holding": _count_execution_lifecycles(
+                session,
+                "entered",
+                whitelist_map=whitelist_map,
+            ),
+            "pending": _count_execution_lifecycles(
+                session,
+                "pending_entry",
+                whitelist_map=whitelist_map,
+            ),
+            "exited": _count_execution_lifecycles(
+                session,
+                "exited",
+                whitelist_map=whitelist_map,
+            ),
+        }
+    return {"status": selected_status, "items": items, "counts": counts}
+
+
+def mark_strategy_lifecycle_manual_close(
+    session_factory,
+    *,
+    lifecycle_id: int,
+    closed_at=None,
+    exit_price: float | None = None,
+    note: str | None = None,
+) -> dict[str, object]:
+    """Mark one active lifecycle as manually closed outside the system."""
+
+    from telegram_kol_research.models import (
+        ExecutionBinding,
+        StrategyLifecycle,
+        TradeIdea,
+    )
+
+    now = closed_at or utc_now()
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        if lifecycle is None:
+            raise LookupError("strategy lifecycle not found")
+        if lifecycle.lifecycle_status != "entered":
+            raise ValueError("only entered strategies can be marked manually closed")
+
+        lifecycle.lifecycle_status = "exited"
+        lifecycle.exit_reason = "manual"
+        lifecycle.exited_at = now
+        lifecycle.exit_price_actual = exit_price
+        lifecycle.updated_at = now
+
+        if lifecycle.trade_idea_id is not None:
+            trade_idea = session.get(TradeIdea, lifecycle.trade_idea_id)
+            if trade_idea is not None and trade_idea.status == "open":
+                trade_idea.status = "closed"
+                trade_idea.closed_at = now
+
+        binding = None
+        if lifecycle.execution_binding_id is not None:
+            binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        if binding is None:
+            binding = (
+                session.query(ExecutionBinding)
+                .filter(ExecutionBinding.chat_id == lifecycle.chat_id)
+                .filter(ExecutionBinding.message_id == lifecycle.message_id)
+                .filter(ExecutionBinding.symbol == lifecycle.symbol)
+                .filter(ExecutionBinding.side == lifecycle.side)
+                .order_by(ExecutionBinding.id.desc())
+                .first()
+            )
+        if binding is not None:
+            binding.status = "closed"
+            binding.last_exchange_status = (
+                "manual_closed_by_user"
+                if not note
+                else f"manual_closed_by_user: {note}"[:64]
+            )
+            binding.updated_at = now
+
+        result = {
+            "lifecycle_id": lifecycle.id,
+            "chat_id": lifecycle.chat_id,
+            "message_id": lifecycle.message_id,
+            "symbol": lifecycle.symbol,
+            "side": lifecycle.side,
+            "lifecycle_status": lifecycle.lifecycle_status,
+            "exit_reason": lifecycle.exit_reason,
+        }
+        session.commit()
+        return result
+
+
+def _load_execution_strategy_items(
+    session,
+    *,
+    selected_status: str,
+    limit: int,
+    labels: dict[int, str],
+    whitelist_map: dict[int, set[str]],
+) -> list[dict[str, object]]:
+    from telegram_kol_research.models import (
+        ExecutionBinding,
+        RawMessage,
+        SignalCandidate,
+        StrategyLifecycle,
+    )
+
+    lifecycle_status = {
+        "holding": "entered",
+        "pending": "pending_entry",
+        "exited": "exited",
+    }[selected_status]
+    q = (
+        session.query(StrategyLifecycle, SignalCandidate, RawMessage)
+        .outerjoin(SignalCandidate, StrategyLifecycle.signal_candidate_id == SignalCandidate.id)
+        .outerjoin(RawMessage, SignalCandidate.raw_message_id == RawMessage.id)
+        .filter(StrategyLifecycle.lifecycle_status == lifecycle_status)
+    )
+    if selected_status == "pending":
+        q = q.filter(~StrategyLifecycle.symbol.in_(["", "?", "QQ"]))
+    order_column = {
+        "holding": StrategyLifecycle.entered_at.desc().nullslast(),
+        "pending": StrategyLifecycle.signal_at.desc(),
+        "exited": StrategyLifecycle.exited_at.desc().nullslast(),
+    }[selected_status]
+    rows = q.order_by(order_column, StrategyLifecycle.id.desc()).limit(limit * 3).all()
+
+    items: list[dict[str, object]] = []
+    for lc, cand, raw_msg in rows:
+        if selected_status == "pending" and not _is_actionable_pending_entry(
+            symbol=lc.symbol,
+            entry_low=lc.entry_range_low,
+            entry_high=lc.entry_range_high,
+            allowed_symbols=whitelist_map.get(int(lc.chat_id)),
+        ):
+            continue
+        if raw_msg is None:
+            raw_msg = (
+                session.query(RawMessage)
+                .filter(RawMessage.chat_id == lc.chat_id)
+                .filter(RawMessage.message_id == lc.message_id)
+                .one_or_none()
+            )
+        binding = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.chat_id == lc.chat_id)
+            .filter(ExecutionBinding.message_id == lc.message_id)
+            .filter(ExecutionBinding.symbol == lc.symbol)
+            .filter(ExecutionBinding.side == lc.side)
+            .order_by(ExecutionBinding.id.desc())
+            .first()
+        )
+        item = _execution_item_from_lifecycle(
+            lc,
+            cand,
+            raw_msg,
+            binding,
+            group_label=labels.get(int(lc.chat_id), str(lc.chat_id)),
+            selected_status=selected_status,
+        )
+        _apply_lifecycle_display_fields(item, lc, raw_msg, session=session)
+        items.append(item)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _execution_item_from_lifecycle(
+    lc,
+    cand,
+    raw_msg,
+    binding,
+    *,
+    group_label: str,
+    selected_status: str,
+) -> dict[str, object]:
+    entry_text = _format_lifecycle_entry_text(lc.entry_range_low, lc.entry_range_high)
+    stop_loss_text = f"{lc.stop_loss:g}" if lc.stop_loss is not None else None
+    take_profit_text = lc.take_profit
+    if cand is not None:
+        entry_text = cand.entry_text or entry_text
+        stop_loss_text = cand.stop_loss_text or stop_loss_text
+        take_profit_text = cand.take_profit_text or take_profit_text
+    item: dict[str, object] = {
+        "lifecycle_id": lc.id,
+        "chat_id": lc.chat_id,
+        "group_label": group_label,
+        "message_id": lc.message_id,
+        "symbol": lc.symbol,
+        "side": lc.side,
+        "status": selected_status,
+        "lifecycle_status": lc.lifecycle_status,
+        "exit_reason": lc.exit_reason,
+        "entry_text": entry_text,
+        "stop_loss_text": stop_loss_text,
+        "take_profit_text": take_profit_text,
+        "entry_price_actual": lc.entry_price_actual,
+        "exit_price_actual": lc.exit_price_actual,
+        "signal_at": utc_naive_to_local(lc.signal_at),
+        "entered_at": utc_naive_to_local(lc.entered_at),
+        "exited_at": utc_naive_to_local(lc.exited_at),
+        "last_checked_at": utc_naive_to_local(lc.last_checked_at),
+        "posted_at": utc_naive_to_local(raw_msg.posted_at) if raw_msg is not None else None,
+        "sender_name": raw_msg.sender_name if raw_msg is not None else None,
+        "original_text": _compact_strategy_text(raw_msg.text, limit=180) if raw_msg is not None else None,
+        "execution_binding_id": binding.id if binding is not None else None,
+        "execution_status": binding.status if binding is not None else "unbound",
+        "exchange_status": binding.last_exchange_status if binding is not None else None,
+        "pos_id": binding.pos_id if binding is not None else None,
+        "order_id": binding.order_id if binding is not None else None,
+        "position_size_text": _format_position_size_text(
+            symbol=lc.symbol,
+            entry_price_actual=lc.entry_price_actual,
+            entry_low=lc.entry_range_low,
+            entry_high=lc.entry_range_high,
+            stop_loss=lc.stop_loss,
+        ),
+        "position_size_risk_usdt": POSITION_SIZE_RISK_USDT,
+    }
+    return _add_strategy_time_display_fields(item)
+
+
+def _count_execution_lifecycles(
+    session,
+    lifecycle_status: str,
+    *,
+    whitelist_map: dict[int, set[str]],
+) -> int:
+    from telegram_kol_research.models import StrategyLifecycle
+
+    rows = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.lifecycle_status == lifecycle_status)
+        .all()
+    )
+    if lifecycle_status != "pending_entry":
+        return len(rows)
+    return sum(
+        1
+        for lc in rows
+        if _is_actionable_pending_entry(
+            symbol=lc.symbol,
+            entry_low=lc.entry_range_low,
+            entry_high=lc.entry_range_high,
+            allowed_symbols=whitelist_map.get(int(lc.chat_id)),
+        )
+    )
+
+
+def _compact_strategy_text(text: str | None, *, limit: int = 180) -> str | None:
+    if not text:
+        return None
+    compact = " ".join(str(text).split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1] + "..."

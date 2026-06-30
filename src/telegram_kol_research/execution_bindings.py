@@ -45,6 +45,13 @@ class ExecutionReconciliationResult:
     updated: int = 0
 
 
+@dataclass(slots=True)
+class ManualCloseSyncResult:
+    checked: int = 0
+    manually_closed: int = 0
+    skipped_without_pos_id: int = 0
+
+
 def build_strategy_instance_id(
     *,
     venue: str,
@@ -235,6 +242,69 @@ def reconcile_deepcoin_execution_bindings(
             row.recovered_at = now
             row.updated_at = now
             result.updated += 1
+        session.commit()
+    return result
+
+
+def sync_manual_closed_deepcoin_positions(
+    session_factory: sessionmaker,
+    *,
+    client: DeepcoinReadOnlyClient,
+    synced_at: datetime | None = None,
+) -> ManualCloseSyncResult:
+    """Mark bound active positions as manual-closed when they vanish on Deepcoin."""
+
+    from telegram_kol_research.models import StrategyLifecycle, TradeIdea
+
+    now = synced_at or datetime.now(UTC)
+    positions = client.list_positions()
+    active_pos_ids = {
+        _first_string(position, "posId", "pos_id", "id")
+        for position in positions
+        if _first_string(position, "posId", "pos_id", "id") and _has_nonzero_size(position)
+    }
+    result = ManualCloseSyncResult()
+    with session_factory() as session:
+        rows = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .filter(ExecutionBinding.status.in_(["open", "active"]))
+            .order_by(ExecutionBinding.id.asc())
+            .all()
+        )
+        for row in rows:
+            pos_ids = _split_ids(row.pos_id)
+            if not pos_ids:
+                result.skipped_without_pos_id += 1
+                continue
+            result.checked += 1
+            if any(pos_id in active_pos_ids for pos_id in pos_ids):
+                continue
+
+            row.status = "closed"
+            row.last_exchange_status = "manual_closed_or_not_found_on_exchange"
+            row.updated_at = now
+            result.manually_closed += 1
+
+            lifecycle = (
+                session.query(StrategyLifecycle)
+                .filter(StrategyLifecycle.chat_id == row.chat_id)
+                .filter(StrategyLifecycle.message_id == row.message_id)
+                .filter(StrategyLifecycle.symbol == row.symbol)
+                .filter(StrategyLifecycle.side == row.side)
+                .order_by(StrategyLifecycle.id.desc())
+                .first()
+            )
+            if lifecycle is not None and lifecycle.lifecycle_status == "entered":
+                lifecycle.lifecycle_status = "exited"
+                lifecycle.exit_reason = "manual"
+                lifecycle.exited_at = now
+                lifecycle.updated_at = now
+                if lifecycle.trade_idea_id is not None:
+                    trade_idea = session.get(TradeIdea, lifecycle.trade_idea_id)
+                    if trade_idea is not None and trade_idea.status == "open":
+                        trade_idea.status = "closed"
+                        trade_idea.closed_at = now
         session.commit()
     return result
 
@@ -431,6 +501,14 @@ def _first_string(payload: dict[str, Any], *keys: str) -> str | None:
         if value not in (None, ""):
             return str(value)
     return None
+
+
+def _split_ids(value: str | None) -> list[str]:
+    return [
+        item.strip()
+        for item in str(value or "").split(",")
+        if item and item.strip()
+    ]
 
 
 def _has_nonzero_size(position: dict[str, Any]) -> bool:

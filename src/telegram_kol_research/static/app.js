@@ -1827,6 +1827,81 @@ function startPollingUpdates() {
   }, 5000);
 }
 
+function bindManualCloseButtons() {
+  document.querySelectorAll('[data-manual-close-lifecycle]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const lifecycleId = button.dataset.lifecycleId;
+      const card = button.closest('[data-execution-card]');
+      const status = card ? card.querySelector('[data-manual-close-status]') : null;
+      if (!lifecycleId) {
+        return;
+      }
+      const confirmed = window.confirm('确认已经在交易所手动平仓？这只会更新项目状态，不会向 DeepCoin 下单。');
+      if (!confirmed) {
+        return;
+      }
+      button.disabled = true;
+      if (status) {
+        status.textContent = '正在标记...';
+        status.classList.remove('is-error');
+      }
+      try {
+        const response = await fetch(`/api/strategy-lifecycles/${lifecycleId}/manual-close`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ note: 'web_manual_close' }),
+        });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          throw new Error(payload.detail || 'manual close failed');
+        }
+        if (status) {
+          status.textContent = '已标记，正在刷新...';
+        }
+        window.location.reload();
+      } catch (error) {
+        button.disabled = false;
+        if (status) {
+          status.textContent = error.message || '标记失败';
+          status.classList.add('is-error');
+        }
+      }
+    });
+  });
+}
+
+function bindDeepcoinPositionSync() {
+  const button = document.querySelector('[data-sync-deepcoin-positions]');
+  const status = document.querySelector('[data-sync-deepcoin-status]');
+  if (!button) {
+    return;
+  }
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    if (status) {
+      status.textContent = '正在同步...';
+      status.classList.remove('is-error');
+    }
+    try {
+      const response = await fetch('/api/execution/sync-deepcoin', { method: 'POST' });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.detail || 'sync failed');
+      }
+      if (status) {
+        status.textContent = `已同步，手动归档 ${payload.manually_closed || 0} 笔`;
+      }
+      window.setTimeout(() => window.location.reload(), 500);
+    } catch (error) {
+      button.disabled = false;
+      if (status) {
+        status.textContent = error.message || '同步失败';
+        status.classList.add('is-error');
+      }
+    }
+  });
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   const form = document.querySelector('[data-ai-form]');
   if (form) {
@@ -1842,6 +1917,8 @@ window.addEventListener('DOMContentLoaded', () => {
   bindAiModelSelectionForm();
   bindGroupPromptEditor();
   bindClearAiHistory();
+  bindManualCloseButtons();
+  bindDeepcoinPositionSync();
   renderConversationHistory();
   setAiStatus('');
   resetInitialMessagePanelScroll();

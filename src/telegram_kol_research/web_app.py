@@ -55,6 +55,7 @@ from telegram_kol_research.llm_chat import (
     request_grounded_chat_answer,
 )
 from telegram_kol_research.execution_bindings import list_active_positions
+from telegram_kol_research.execution_bindings import sync_manual_closed_deepcoin_positions
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import list_recovery_decisions
 from telegram_kol_research.recovery_execution_queue import list_recovery_execution_previews
@@ -78,10 +79,12 @@ from telegram_kol_research.web_queries import (
     load_database_freshness,
     load_group_messages,
     load_group_rows,
+    list_execution_strategy_overview,
     load_lifecycle_counts,
     load_lifecycle_counts_by_chat_id,
     list_exited_strategies,
     list_holding_strategies,
+    mark_strategy_lifecycle_manual_close,
     list_pending_strategies,
     load_messages_in_time_window,
     load_selected_messages,
@@ -280,6 +283,14 @@ def _symbol_whitelist_by_chat_id(group_config: GroupConfig) -> dict[int, set[str
         if symbols:
             result[int(item.chat_id)] = symbols
     return result
+
+
+def _group_label_by_chat_id(group_config: GroupConfig) -> dict[int, str]:
+    return {
+        int(item.chat_id): item.custom_group_label or item.chat_title
+        for item in group_config.groups
+        if item.chat_id is not None
+    }
 
 
 def _extract_session_lock_owner_pid(reason: str | None) -> int | None:
@@ -721,6 +732,35 @@ def create_web_app(
             },
         )
 
+    @app.get("/execution")
+    def execution_dashboard(request: Request, status: str = "holding"):
+        monitor_status = build_monitor_status()
+        live_listener_enabled = monitor_status["state"] == "monitoring"
+        overview = list_execution_strategy_overview(
+            app.state.session_factory,
+            status=status,
+            limit=200,
+            group_label_by_chat_id=_group_label_by_chat_id(app.state.group_config),
+            symbol_whitelist_by_chat_id=_symbol_whitelist_by_chat_id(app.state.group_config),
+        )
+        freshness = load_database_freshness(
+            app.state.session_factory,
+            now=app.state.now_provider(),
+        )
+        return templates.TemplateResponse(
+            request,
+            "execution.html",
+            {
+                "asset_version": app.state.asset_version,
+                "monitor_status": monitor_status,
+                "live_listener_enabled": live_listener_enabled,
+                "database_latest_message_at": freshness["latest_message_at"],
+                "database_stale_hours": freshness["stale_hours"],
+                "overview": overview,
+                "selected_status": overview["status"],
+            },
+        )
+
     @app.get("/groups")
     def groups_partial(request: Request, selected_chat_id: int | None = None):
         groups = load_group_rows(
@@ -989,6 +1029,52 @@ def create_web_app(
             len(items),
         )
         return response
+
+    @app.post("/api/strategy-lifecycles/{lifecycle_id}/manual-close")
+    async def manual_close_strategy_lifecycle(
+        lifecycle_id: int,
+        payload: dict[str, Any] | None = None,
+    ):
+        data = payload or {}
+        exit_price = data.get("exit_price")
+        parsed_exit_price = None
+        if exit_price not in (None, ""):
+            try:
+                parsed_exit_price = float(exit_price)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="invalid exit_price") from exc
+        try:
+            result = mark_strategy_lifecycle_manual_close(
+                app.state.session_factory,
+                lifecycle_id=lifecycle_id,
+                exit_price=parsed_exit_price,
+                note=str(data.get("note") or "").strip() or None,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return result
+
+    @app.post("/api/execution/sync-deepcoin")
+    async def sync_deepcoin_execution_state():
+        try:
+            client = app.state.deepcoin_client_factory()
+            result = sync_manual_closed_deepcoin_positions(
+                app.state.session_factory,
+                client=client,
+                synced_at=app.state.now_provider(),
+            )
+        except DeepcoinClientError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Deepcoin execution sync failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {
+            "checked": result.checked,
+            "manually_closed": result.manually_closed,
+            "skipped_without_pos_id": result.skipped_without_pos_id,
+        }
 
     @app.post("/api/groups/{chat_id}/automation")
     async def update_group_automation(chat_id: int, payload: dict[str, Any]):

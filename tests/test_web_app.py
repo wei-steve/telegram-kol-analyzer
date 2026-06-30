@@ -19,6 +19,7 @@ from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 
@@ -92,6 +93,164 @@ def test_trading_settings_api_persists_runtime_risk_defaults(tmp_path):
     assert reloaded.status_code == 200
     assert reloaded.json()["auto_trade_enabled"] is True
     assert reloaded.json()["take_profit_allocations"] == [50.0, 30.0, 20.0]
+
+
+def test_execution_dashboard_lists_global_strategy_states(tmp_path):
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        group_config=GroupConfig(
+            groups=[
+                TargetGroupConfig(
+                    chat_title="Demo Auto Group",
+                    chat_id=88,
+                    custom_group_label="演示群",
+                    symbol_whitelist=["BTC", "ETH"],
+                )
+            ]
+        ),
+    )
+    with app.state.session_factory() as session:
+        raw = RawMessage(
+            chat_id=88,
+            message_id=10,
+            sender_name="Alice",
+            posted_at=datetime(2026, 6, 30, 9, 0),
+            text="BTC short 60000 SL 61000 TP 59000",
+        )
+        session.add(raw)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="BTC",
+            side="short",
+            event_type="entry_signal",
+            entry_text="60000",
+            stop_loss_text="61000",
+            take_profit_text="59000",
+            confidence=0.9,
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=88,
+                message_id=10,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+                entered_at=datetime(2026, 6, 30, 9, 1),
+                entry_price_actual=60000,
+                stop_loss=61000,
+                take_profit="59000",
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get("/execution?status=holding")
+
+    assert response.status_code == 200
+    assert "执行中策略" in response.text
+    assert "演示群 · #10" in response.text
+    assert "BTC" in response.text
+    assert "标记已手动平仓" in response.text
+
+
+def test_manual_close_api_marks_lifecycle_and_binding_closed(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=10, text="BTC short 60000 SL 61000")
+        session.add(raw)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 30, 9, 0),
+            entered_at=datetime(2026, 6, 30, 9, 1),
+        )
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="short",
+            status="active",
+            pos_id="pos-1",
+            order_id="order-1",
+            last_exchange_status="position_active",
+        )
+        session.add_all([lifecycle, binding])
+        session.commit()
+        lifecycle_id = lifecycle.id
+        binding_id = binding.id
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/strategy-lifecycles/{lifecycle_id}/manual-close",
+        json={"exit_price": 59500, "note": "test"},
+    )
+
+    assert response.status_code == 200
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, binding_id)
+
+        assert lifecycle.lifecycle_status == "exited"
+        assert lifecycle.exit_reason == "manual"
+        assert lifecycle.exit_price_actual == 59500
+        assert binding.status == "closed"
+        assert binding.last_exchange_status.startswith("manual_closed_by_user")
+
+
+def test_execution_sync_api_marks_missing_deepcoin_position_closed(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return []
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        now_provider=lambda: datetime(2026, 6, 30, 10, 0),
+    )
+    with app.state.session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 30, 9, 0),
+            entered_at=datetime(2026, 6, 30, 9, 1),
+        )
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="short",
+            status="active",
+            pos_id="pos-missing",
+            order_id="order-1",
+        )
+        session.add_all([lifecycle, binding])
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    client = TestClient(app)
+    response = client.post("/api/execution/sync-deepcoin")
+
+    assert response.status_code == 200
+    assert response.json()["manually_closed"] == 1
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+        assert lifecycle.lifecycle_status == "exited"
+        assert lifecycle.exit_reason == "manual"
 
 
 def test_message_recognition_api_updates_message_result(tmp_path):
