@@ -334,8 +334,16 @@ def _load_deepcoin_live_position_rows(
         rows: list[dict[str, object]] = []
         for position in active_positions:
             pos_id = _first_position_string(position, "posId", "pos_id", "id")
+            protection_key = _deepcoin_position_protection_key(position)
             tpsl_order = tpsl_orders_by_position_key.get(
-                _deepcoin_position_protection_key(position)
+                protection_key
+            ) or tpsl_orders_by_position_key.get(
+                (
+                    protection_key[0],
+                    protection_key[1],
+                    "*",
+                    protection_key[3],
+                )
             )
             binding = bindings_by_pos_id.get(pos_id or "")
             lifecycle = None
@@ -375,10 +383,10 @@ def _load_deepcoin_live_position_rows(
                     "lifecycle_status": lifecycle.lifecycle_status if lifecycle is not None else None,
                     "entry_price_actual": _float_or_none(position.get("avgPx")),
                     "stop_loss_text": _position_text_value(
-                        tpsl_order.get("slTriggerPrice") if tpsl_order else None
+                        _deepcoin_tpsl_price(tpsl_order, "sl") if tpsl_order else None
                     ),
                     "take_profit_text": _position_text_value(
-                        tpsl_order.get("tpTriggerPrice") if tpsl_order else None
+                        _deepcoin_tpsl_price(tpsl_order, "tp") if tpsl_order else None
                     ),
                     "protection_status": "protected" if tpsl_order else "unprotected",
                     "execution_status": binding.status if binding is not None else "unbound_live_position",
@@ -427,9 +435,9 @@ def _load_deepcoin_tpsl_orders_by_position_key(
         for order in orders:
             if str(order.get("triggerOrderType") or "").upper() != "TPSL":
                 continue
-            key = _deepcoin_tpsl_order_position_key(order)
-            if key is not None:
-                orders_by_key[key] = order
+            for key in _deepcoin_tpsl_order_position_keys(order):
+                current = orders_by_key.get(key)
+                orders_by_key[key] = _merge_deepcoin_tpsl_orders(current, order)
     return orders_by_key
 
 
@@ -442,16 +450,39 @@ def _deepcoin_position_protection_key(position: dict[str, Any]) -> tuple[str, st
     )
 
 
-def _deepcoin_tpsl_order_position_key(order: dict[str, Any]) -> tuple[str, str, str, str] | None:
+def _deepcoin_tpsl_order_position_keys(order: dict[str, Any]) -> list[tuple[str, str, str, str]]:
     ctime = str(order.get("cTime") or order.get("uTime") or "")
     if not ctime:
-        return None
-    return (
+        return []
+    base = (
         str(order.get("instId") or "").upper(),
         str(order.get("posSide") or "").lower(),
-        _normalize_position_amount(order.get("sz")),
-        ctime,
     )
+    size = _normalize_position_amount(order.get("sz"))
+    keys = [(*base, size, ctime)]
+    if size == "0":
+        keys.append((*base, "*", ctime))
+    return keys
+
+
+def _merge_deepcoin_tpsl_orders(
+    first: dict[str, Any] | None,
+    second: dict[str, Any],
+) -> dict[str, Any]:
+    if first is None:
+        return dict(second)
+    merged = dict(first)
+    for key in ("slTriggerPrice", "tpTriggerPrice", "closeSLTriggerPrice", "closeTPTriggerPrice"):
+        if _is_nonzero_price(second.get(key)):
+            merged[key] = second.get(key)
+    return merged
+
+
+def _is_nonzero_price(value: Any) -> bool:
+    try:
+        return float(value) != 0
+    except (TypeError, ValueError):
+        return bool(str(value or "").strip())
 
 
 def _normalize_position_amount(value: Any) -> str:
@@ -459,6 +490,21 @@ def _normalize_position_amount(value: Any) -> str:
         return f"{float(value):g}"
     except (TypeError, ValueError):
         return str(value or "").strip()
+
+
+def _deepcoin_tpsl_price(order: dict[str, Any] | None, kind: str) -> Any:
+    if not order:
+        return None
+    keys = (
+        ("slTriggerPrice", "closeSLTriggerPrice")
+        if kind == "sl"
+        else ("tpTriggerPrice", "closeTPTriggerPrice")
+    )
+    for key in keys:
+        value = order.get(key)
+        if _is_nonzero_price(value):
+            return value
+    return None
 
 
 def _load_live_position_attribution_candidates(

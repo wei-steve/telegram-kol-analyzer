@@ -279,6 +279,57 @@ def test_execution_dashboard_uses_pending_tpsl_orders_for_live_protection(tmp_pa
     assert response.text.count("无保护单") == 1
 
 
+def test_execution_dashboard_matches_zero_size_tpsl_orders_by_position_time(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-eth",
+                    "posSide": "long",
+                    "pos": "5.2",
+                    "avgPx": "1592.88",
+                    "cTime": "1782788831000",
+                },
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            assert inst_id == "ETH-USDT-SWAP"
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posSide": "long",
+                    "sz": "0",
+                    "cTime": "1782788831000",
+                    "triggerOrderType": "TPSL",
+                    "slTriggerPrice": "0",
+                    "tpTriggerPrice": "1680",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posSide": "long",
+                    "sz": "0",
+                    "cTime": "1782788831000",
+                    "triggerOrderType": "TPSL",
+                    "slTriggerPrice": "1555",
+                    "tpTriggerPrice": "0",
+                },
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+    )
+
+    client = TestClient(app)
+    response = client.get("/execution")
+
+    assert response.status_code == 200
+    assert "止损: 1555" in response.text
+    assert "止盈: 1680" in response.text
+    assert "无保护单" not in response.text
+
+
 def test_manual_close_api_marks_lifecycle_and_binding_closed(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
     with app.state.session_factory() as session:
