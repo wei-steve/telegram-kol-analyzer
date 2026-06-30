@@ -104,12 +104,17 @@ def build_deepcoin_order_draft(
                     message_id=source_message_id,
                 ),
                 allocation_pct=100.0,
+                risk_budget_usdt=_leg_risk_budget(
+                    risk_budget=risk_budget,
+                    allocation_pct=100.0,
+                ),
                 quantity=_estimate_leg_quantity(
                     risk_budget=risk_budget,
                     allocation_pct=100.0,
                     entry_price=reference_price,
                     stop_loss=stop_loss,
                 ),
+                stop_loss=stop_loss,
                 contract_spec=contract_spec,
             ),
         ]
@@ -134,12 +139,17 @@ def build_deepcoin_order_draft(
                     message_id=source_message_id,
                 ),
                 allocation_pct=50.0,
+                risk_budget_usdt=_leg_risk_budget(
+                    risk_budget=risk_budget,
+                    allocation_pct=50.0,
+                ),
                 quantity=_estimate_leg_quantity(
                     risk_budget=risk_budget,
                     allocation_pct=50.0,
                     entry_price=first_price,
                     stop_loss=stop_loss,
                 ),
+                stop_loss=stop_loss,
                 contract_spec=contract_spec,
             ),
             _order_leg(
@@ -154,12 +164,17 @@ def build_deepcoin_order_draft(
                     message_id=source_message_id,
                 ),
                 allocation_pct=50.0,
+                risk_budget_usdt=_leg_risk_budget(
+                    risk_budget=risk_budget,
+                    allocation_pct=50.0,
+                ),
                 quantity=_estimate_leg_quantity(
                     risk_budget=risk_budget,
                     allocation_pct=50.0,
                     entry_price=second_price,
                     stop_loss=stop_loss,
                 ),
+                stop_loss=stop_loss,
                 contract_spec=contract_spec,
             ),
         ]
@@ -323,6 +338,14 @@ def _estimate_leg_quantity(
     return round(leg_risk / price_risk, 6)
 
 
+def _leg_risk_budget(
+    *,
+    risk_budget: float,
+    allocation_pct: float,
+) -> float:
+    return float(f"{risk_budget * allocation_pct / 100:g}")
+
+
 def _to_deepcoin_swap_instrument(contract: str) -> str:
     normalized = contract.upper().replace("_", "-")
     if normalized.endswith("-SWAP"):
@@ -351,7 +374,9 @@ def _order_leg(
     price: float,
     client_order_id: str,
     allocation_pct: float,
+    risk_budget_usdt: float,
     quantity: float | None,
+    stop_loss: float | None,
     contract_spec: DeepcoinContractSpec | None,
 ) -> dict[str, Any]:
     leg = {
@@ -360,6 +385,7 @@ def _order_leg(
         "order_type": order_type,
         "price": float(f"{price:g}"),
         "allocation_pct": allocation_pct,
+        "risk_budget_usdt": risk_budget_usdt,
         "client_order_id": client_order_id,
         "quantity": quantity,
     }
@@ -373,7 +399,39 @@ def _order_leg(
                 contract_spec.quantity_step,
             )
             leg["quantity_unit"] = "contracts"
+    estimated_loss = _estimated_stop_loss_usdt(
+        entry_price=price,
+        stop_loss=stop_loss,
+        quantity=leg.get("quantity"),
+        quantity_unit=leg.get("quantity_unit"),
+        contract_spec=contract_spec,
+    )
+    if estimated_loss is not None:
+        leg["estimated_stop_loss_usdt"] = estimated_loss
     return leg
+
+
+def _estimated_stop_loss_usdt(
+    *,
+    entry_price: float,
+    stop_loss: float | None,
+    quantity: Any,
+    quantity_unit: Any,
+    contract_spec: DeepcoinContractSpec | None,
+) -> float | None:
+    if stop_loss is None or quantity in (None, ""):
+        return None
+    price_risk = abs(float(entry_price) - float(stop_loss))
+    if price_risk <= 0:
+        return None
+    quantity_float = float(quantity)
+    if quantity_unit == "contracts":
+        if contract_spec is None:
+            return None
+        loss = price_risk * quantity_float * contract_spec.contract_value
+    else:
+        loss = price_risk * quantity_float
+    return float(f"{loss:.6g}")
 
 
 def _take_profit_legs(

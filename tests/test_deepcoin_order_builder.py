@@ -54,9 +54,11 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
                 "order_type": "limit",
                 "price": 68100.0,
                 "allocation_pct": 50.0,
+                "risk_budget_usdt": 50.0,
                 "client_order_id": "TK649760E806ACF61",
                 "quantity": 0.083333,
                 "quantity_unit": "base_asset_estimate",
+                "estimated_stop_loss_usdt": 49.9998,
             },
             {
                 "side": "buy",
@@ -64,9 +66,11 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
                 "order_type": "limit",
                 "price": 68000.0,
                 "allocation_pct": 50.0,
+                "risk_budget_usdt": 50.0,
                 "client_order_id": "TK729D11F4739D2A2",
                 "quantity": 0.1,
                 "quantity_unit": "base_asset_estimate",
+                "estimated_stop_loss_usdt": 50.0,
             },
         ],
         "stop_loss": 67500.0,
@@ -227,12 +231,15 @@ def test_build_deepcoin_order_draft_expands_btc_wan_shorthand_prices():
         _payload_preview(
             entry_range="5.89-5.93附近",
             stop_loss="5.78",
+            risk_budget_usdt=20.0,
             take_profit="6万附近 / 6.07附近 / 6.23",
         ),
         contract_spec=_btc_contract_spec(),
     )
 
     assert [leg["price"] for leg in draft["order_legs"]] == [59100.0, 58900.0]
+    assert [leg["risk_budget_usdt"] for leg in draft["order_legs"]] == [10.0, 10.0]
+    assert [leg["estimated_stop_loss_usdt"] for leg in draft["order_legs"]] == [9.1, 9.9]
     assert draft["stop_loss"] == 57800.0
     assert [leg["price"] for leg in draft["take_profit_legs"]] == [
         60000.0,
