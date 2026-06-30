@@ -315,24 +315,17 @@ def _submit_recovery_signal_direct(
             order_id = _extract_order_id(response)
             if not order_id:
                 raise DeepcoinClientError("Deepcoin limit order response missing order id")
-            pos_id = _extract_position_id(response) or _find_open_position_id(
+            pos_id = _extract_position_id(response) or _find_exact_open_position_id(
                 deepcoin_client,
                 draft=draft,
                 side=side_key,
-                preferred_pos_id=order_id,
-                attempts=1,
-                delay_seconds=0,
+                pos_id=order_id,
             )
             client_order_id = str(leg.get("client_order_id") or "")
             protection_payload = build_deepcoin_order_sltp_payload(draft, order_id=order_id)
             try:
                 protection_response = deepcoin_client.replace_order_sltp(protection_payload)
             except DeepcoinClientError:
-                pos_id = pos_id or _find_open_position_id(
-                    deepcoin_client,
-                    draft=draft,
-                    side=side_key,
-                )
                 if not pos_id:
                     raise
                 protection_payload = build_deepcoin_position_sltp_payload(
@@ -341,11 +334,6 @@ def _submit_recovery_signal_direct(
                 )
                 protection_response = deepcoin_client.set_position_sltp(protection_payload)
             except Exception as exc:  # pragma: no cover - defensive boundary
-                pos_id = pos_id or _find_open_position_id(
-                    deepcoin_client,
-                    draft=draft,
-                    side=side_key,
-                )
                 if not pos_id:
                     raise DeepcoinClientError(f"Deepcoin order protection failed: {exc}") from exc
                 protection_payload = build_deepcoin_position_sltp_payload(
@@ -815,6 +803,51 @@ def _find_open_position_id(
             return pos_id
         if attempt + 1 < attempts:
             time.sleep(delay_seconds)
+    return None
+
+
+def _find_exact_open_position_id(
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    *,
+    draft: dict[str, Any],
+    side: str,
+    pos_id: str,
+) -> str | None:
+    """Return a position only when its id exactly matches the submitted order id."""
+
+    if not pos_id:
+        return None
+    try:
+        positions = deepcoin_client.list_positions(inst_id=str(draft["instrument_id"]))
+    except Exception:
+        return None
+    instrument_id = str(draft["instrument_id"]).upper()
+    margin_mode = _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross"))
+    position_mode = _deepcoin_position_mode(str(draft.get("position_mode") or "split"))
+    for position in positions:
+        current_pos_id = _first_payload_string(position, "posId", "pos_id", "id")
+        if current_pos_id != str(pos_id):
+            continue
+        if str(position.get("instId") or "").upper() != instrument_id:
+            continue
+        if str(position.get("posSide") or "").lower() != side.lower():
+            continue
+        if str(position.get("mrgPosition") or position.get("posMode") or "").lower() not in {
+            "",
+            position_mode,
+        }:
+            continue
+        if str(position.get("mgnMode") or position.get("tdMode") or "").lower() not in {
+            "",
+            margin_mode,
+        }:
+            continue
+        try:
+            size = abs(float(position.get("pos") or position.get("size") or 0))
+        except (TypeError, ValueError):
+            size = 0
+        if size > 0:
+            return current_pos_id
     return None
 
 

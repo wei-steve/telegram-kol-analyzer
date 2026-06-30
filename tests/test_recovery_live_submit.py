@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, RawMessage, SignalCandidate
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
@@ -87,6 +88,25 @@ class _ProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
     def set_position_sltp(self, protection_payload):
         self.protection_payloads.append(protection_payload)
         raise RuntimeError("missing_take_profit_for_protection")
+
+
+class _OrderProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
+    def __init__(self):
+        super().__init__()
+        self.positions = [
+            {
+                "posId": "unrelated-pos",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "pos": "7",
+                "mrgPosition": "split",
+                "mgnMode": "cross",
+            }
+        ]
+
+    def replace_order_sltp(self, protection_payload):
+        self.protection_payloads.append(protection_payload)
+        raise DeepcoinClientError("order_not_open")
 
 
 def _persist_ready_item(session_factory):
@@ -490,6 +510,35 @@ def test_market_submit_persists_binding_when_position_protection_fails(tmp_path)
     assert binding.last_exchange_status == "position_active_protection_failed"
     assert binding.order_id == "order-market-1"
     assert binding.pos_id == "pos-market-1"
+
+
+def test_limit_submit_does_not_attach_protection_to_unrelated_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    fake_client = _OrderProtectionFailingDeepcoinClient()
+
+    try:
+        submit_recovery_order_live(
+            session_factory,
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="long",
+            deepcoin_client=fake_client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=datetime(2026, 6, 12, 21, 0, tzinfo=UTC),
+        )
+    except DeepcoinClientError as exc:
+        assert "order_not_open" in str(exc)
+    else:
+        raise AssertionError("expected order protection failure")
+
+    assert fake_client.payloads[0]["ordType"] == "limit"
+    assert fake_client.protection_payloads[0]["orderSysID"] == "order-1"
+    assert fake_client.position_protection_payloads == []
+    with session_factory() as session:
+        assert session.query(ExecutionBinding).count() == 0
 
 
 def test_process_next_trade_signal_live_returns_none_without_pending_signal(tmp_path):
