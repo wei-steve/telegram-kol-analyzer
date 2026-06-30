@@ -44,7 +44,9 @@ from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.message_recognition import recognize_message_now
+from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.recognition_experiments import run_mimo_direct_for_message
 from telegram_kol_research.llm_chat import (
     build_proxy_chat_payload,
@@ -291,6 +293,139 @@ def _group_label_by_chat_id(group_config: GroupConfig) -> dict[int, str]:
         for item in group_config.groups
         if item.chat_id is not None
     }
+
+
+def _load_deepcoin_live_position_rows(
+    session_factory,
+    *,
+    deepcoin_client_factory,
+    group_label_by_chat_id: dict[int, str],
+) -> list[dict[str, object]]:
+    try:
+        positions = deepcoin_client_factory().list_positions()
+    except Exception:
+        logger.exception("Deepcoin live position load failed")
+        return []
+
+    active_positions = [
+        position for position in positions if _deepcoin_position_has_size(position)
+    ]
+    if not active_positions:
+        return []
+
+    with session_factory() as session:
+        bindings = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .filter(ExecutionBinding.status.in_(["open", "active"]))
+            .all()
+        )
+        bindings_by_pos_id: dict[str, ExecutionBinding] = {}
+        for binding in bindings:
+            for pos_id in _split_binding_ids(binding.pos_id):
+                bindings_by_pos_id[pos_id] = binding
+
+        rows: list[dict[str, object]] = []
+        for position in active_positions:
+            pos_id = _first_position_string(position, "posId", "pos_id", "id")
+            binding = bindings_by_pos_id.get(pos_id or "")
+            lifecycle = None
+            if binding is not None:
+                lifecycle = (
+                    session.query(StrategyLifecycle)
+                    .filter(StrategyLifecycle.chat_id == binding.chat_id)
+                    .filter(StrategyLifecycle.message_id == binding.message_id)
+                    .filter(StrategyLifecycle.symbol == binding.symbol)
+                    .filter(StrategyLifecycle.side == binding.side)
+                    .order_by(StrategyLifecycle.id.desc())
+                    .first()
+                )
+            symbol = (
+                binding.symbol
+                if binding is not None
+                else _symbol_from_deepcoin_inst_id(position.get("instId"))
+            )
+            side = (
+                binding.side
+                if binding is not None
+                else str(position.get("posSide") or position.get("side") or "").lower()
+            )
+            rows.append(
+                {
+                    "lifecycle_id": lifecycle.id if lifecycle is not None else None,
+                    "chat_id": binding.chat_id if binding is not None else None,
+                    "group_label": (
+                        group_label_by_chat_id.get(binding.chat_id, str(binding.chat_id))
+                        if binding is not None
+                        else "未绑定实盘仓位"
+                    ),
+                    "message_id": binding.message_id if binding is not None else None,
+                    "symbol": symbol,
+                    "side": side,
+                    "status": "live",
+                    "lifecycle_status": lifecycle.lifecycle_status if lifecycle is not None else None,
+                    "entry_price_actual": _float_or_none(position.get("avgPx")),
+                    "stop_loss_text": _position_text_value(position.get("slTriggerPx")),
+                    "take_profit_text": _position_text_value(position.get("tpTriggerPx")),
+                    "execution_status": binding.status if binding is not None else "unbound_live_position",
+                    "exchange_status": "position_active",
+                    "pos_id": pos_id,
+                    "order_id": binding.order_id if binding is not None else None,
+                    "position_size_text": _position_size_label(position),
+                    "original_text": (
+                        "这个交易所仓位没有本地 KOL 绑定，请人工确认归因。"
+                        if binding is None
+                        else None
+                    ),
+                }
+            )
+        return rows
+
+
+def _deepcoin_position_has_size(position: dict[str, Any]) -> bool:
+    try:
+        return abs(float(position.get("pos") or position.get("size") or 0)) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _first_position_string(position: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = position.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _split_binding_ids(value: str | None) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _symbol_from_deepcoin_inst_id(value: Any) -> str:
+    text = str(value or "").upper()
+    if text.endswith("-USDT-SWAP"):
+        return text[: -len("-USDT-SWAP")]
+    return text.split("-")[0] if text else "?"
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _position_text_value(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _position_size_label(position: dict[str, Any]) -> str | None:
+    size = _position_text_value(position.get("pos") or position.get("size"))
+    inst_id = str(position.get("instId") or "")
+    if not size:
+        return None
+    return f"{size} contracts {inst_id}".strip()
 
 
 def _extract_session_lock_owner_pid(reason: str | None) -> int | None:
@@ -733,16 +868,27 @@ def create_web_app(
         )
 
     @app.get("/execution")
-    def execution_dashboard(request: Request, status: str = "holding"):
+    def execution_dashboard(request: Request, status: str = "live"):
         monitor_status = build_monitor_status()
         live_listener_enabled = monitor_status["state"] == "monitoring"
+        selected_status = status if status in {"live", "holding", "pending", "exited"} else "live"
+        lifecycle_status = "holding" if selected_status == "live" else selected_status
         overview = list_execution_strategy_overview(
             app.state.session_factory,
-            status=status,
+            status=lifecycle_status,
             limit=200,
             group_label_by_chat_id=_group_label_by_chat_id(app.state.group_config),
             symbol_whitelist_by_chat_id=_symbol_whitelist_by_chat_id(app.state.group_config),
         )
+        live_positions = _load_deepcoin_live_position_rows(
+            app.state.session_factory,
+            deepcoin_client_factory=app.state.deepcoin_client_factory,
+            group_label_by_chat_id=_group_label_by_chat_id(app.state.group_config),
+        )
+        overview["counts"]["live"] = len(live_positions)
+        if selected_status == "live":
+            overview["status"] = "live"
+            overview["items"] = live_positions
         freshness = load_database_freshness(
             app.state.session_factory,
             now=app.state.now_provider(),
@@ -757,7 +903,7 @@ def create_web_app(
                 "database_latest_message_at": freshness["latest_message_at"],
                 "database_stale_hours": freshness["stale_hours"],
                 "overview": overview,
-                "selected_status": overview["status"],
+                "selected_status": selected_status,
             },
         )
 

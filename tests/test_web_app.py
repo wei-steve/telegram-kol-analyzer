@@ -158,6 +158,55 @@ def test_execution_dashboard_lists_global_strategy_states(tmp_path):
     assert "标记已手动平仓" in response.text
 
 
+def test_execution_dashboard_defaults_to_deepcoin_live_positions(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-btc",
+                    "posSide": "short",
+                    "pos": "9",
+                    "avgPx": "59761.2",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-eth",
+                    "posSide": "long",
+                    "pos": "5.2",
+                    "avgPx": "1592.8",
+                },
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+    )
+    with app.state.session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                kol_id="group:88",
+                chat_id=88,
+                message_id=10,
+                symbol="ETH",
+                side="long",
+                status="active",
+                pos_id="pos-eth",
+                order_id="order-eth",
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get("/execution")
+
+    assert response.status_code == 200
+    assert "实盘持仓" in response.text
+    assert "<strong>2</strong>" in response.text
+    assert "未绑定实盘仓位" in response.text
+    assert "pos-btc" in response.text
+
+
 def test_manual_close_api_marks_lifecycle_and_binding_closed(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
     with app.state.session_factory() as session:
