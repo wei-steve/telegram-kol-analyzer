@@ -812,42 +812,47 @@ def _find_exact_open_position_id(
     draft: dict[str, Any],
     side: str,
     pos_id: str,
+    attempts: int = 5,
+    delay_seconds: float = 0.5,
 ) -> str | None:
     """Return a position only when its id exactly matches the submitted order id."""
 
     if not pos_id:
         return None
-    try:
-        positions = deepcoin_client.list_positions(inst_id=str(draft["instrument_id"]))
-    except Exception:
-        return None
     instrument_id = str(draft["instrument_id"]).upper()
     margin_mode = _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross"))
     position_mode = _deepcoin_position_mode(str(draft.get("position_mode") or "split"))
-    for position in positions:
-        current_pos_id = _first_payload_string(position, "posId", "pos_id", "id")
-        if current_pos_id != str(pos_id):
-            continue
-        if str(position.get("instId") or "").upper() != instrument_id:
-            continue
-        if str(position.get("posSide") or "").lower() != side.lower():
-            continue
-        if str(position.get("mrgPosition") or position.get("posMode") or "").lower() not in {
-            "",
-            position_mode,
-        }:
-            continue
-        if str(position.get("mgnMode") or position.get("tdMode") or "").lower() not in {
-            "",
-            margin_mode,
-        }:
-            continue
+    for attempt in range(attempts):
         try:
-            size = abs(float(position.get("pos") or position.get("size") or 0))
-        except (TypeError, ValueError):
-            size = 0
-        if size > 0:
-            return current_pos_id
+            positions = deepcoin_client.list_positions(inst_id=str(draft["instrument_id"]))
+        except Exception:
+            positions = []
+        for position in positions:
+            current_pos_id = _first_payload_string(position, "posId", "pos_id", "id")
+            if current_pos_id != str(pos_id):
+                continue
+            if str(position.get("instId") or "").upper() != instrument_id:
+                continue
+            if str(position.get("posSide") or "").lower() != side.lower():
+                continue
+            if str(position.get("mrgPosition") or position.get("posMode") or "").lower() not in {
+                "",
+                position_mode,
+            }:
+                continue
+            if str(position.get("mgnMode") or position.get("tdMode") or "").lower() not in {
+                "",
+                margin_mode,
+            }:
+                continue
+            try:
+                size = abs(float(position.get("pos") or position.get("size") or 0))
+            except (TypeError, ValueError):
+                size = 0
+            if size > 0:
+                return current_pos_id
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
     return None
 
 

@@ -109,6 +109,28 @@ class _OrderProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
         raise DeepcoinClientError("order_not_open")
 
 
+class _DelayedExactPositionDeepcoinClient(_OrderProtectionFailingDeepcoinClient):
+    def __init__(self):
+        super().__init__()
+        self.position_calls = 0
+
+    def list_positions(self, *, inst_id=None):
+        self.position_calls += 1
+        if self.position_calls == 1:
+            return self.positions
+        return [
+            *self.positions,
+            {
+                "posId": "order-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "pos": "7",
+                "mrgPosition": "split",
+                "mgnMode": "cross",
+            },
+        ]
+
+
 def _persist_ready_item(session_factory):
     with session_factory() as session:
         raw = RawMessage(
@@ -539,6 +561,33 @@ def test_limit_submit_does_not_attach_protection_to_unrelated_position(tmp_path)
     assert fake_client.position_protection_payloads == []
     with session_factory() as session:
         assert session.query(ExecutionBinding).count() == 0
+
+
+def test_limit_submit_waits_for_exact_filled_position_before_position_sltp(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    fake_client = _DelayedExactPositionDeepcoinClient()
+
+    result = submit_recovery_order_live(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        submitted_at=datetime(2026, 6, 12, 21, 0, tzinfo=UTC),
+        max_order_legs=1,
+    )
+
+    assert result["submitted"] is True
+    assert fake_client.protection_payloads[0]["orderSysID"] == "order-1"
+    assert fake_client.position_protection_payloads[0]["posId"] == "order-1"
+    assert fake_client.position_calls == 2
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+    assert binding.pos_id == "order-1"
 
 
 def test_process_next_trade_signal_live_returns_none_without_pending_signal(tmp_path):
