@@ -1494,6 +1494,7 @@ def create_web_app(
                 ai_recognition_config=ai_config,
                 media_root=app.state.media_root,
             )
+            auto_trade_result = app.state.auto_trade_executor(raw_message_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
@@ -1503,6 +1504,7 @@ def create_web_app(
             "status": result.status,
             "summary": result.summary,
             "reason": result.reason,
+            "auto_trade": auto_trade_result,
         }
 
     @app.post("/api/ai-recognition-config")

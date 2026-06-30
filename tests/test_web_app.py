@@ -498,6 +498,35 @@ def test_message_recognition_api_updates_message_result(tmp_path):
     assert "BTC long" in refreshed.text
 
 
+def test_message_recognition_api_runs_auto_trade_executor_after_recognition(tmp_path):
+    database_path = tmp_path / "research.db"
+    app = create_web_app(database_path=database_path)
+    calls = []
+    app.state.auto_trade_executor = lambda raw_message_id: (
+        calls.append(raw_message_id)
+        or {"status": "submitted", "management_action": "close_position"}
+    )
+    with app.state.session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=2,
+            text="BTC short profit all out",
+        )
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    client = TestClient(app)
+    response = client.post(f"/api/messages/{raw_message_id}/recognize")
+
+    assert response.status_code == 200
+    assert calls == [raw_message_id]
+    assert response.json()["auto_trade"] == {
+        "status": "submitted",
+        "management_action": "close_position",
+    }
+
+
 def test_strategy_mid_panel_loads_only_visible_strategy_list(tmp_path, monkeypatch):
     calls: list[str] = []
 
