@@ -75,6 +75,8 @@ def _persist_candidate(
     with_media=False,
     text="BTC long 68000-68200 SL 67500 TP 69000/70000",
     entry_text="68000-68200",
+    stop_loss_text="67500",
+    take_profit_text="69000 / 70000",
 ):
     with session_factory() as session:
         raw = RawMessage(
@@ -95,8 +97,8 @@ def _persist_candidate(
                 side="long",
                 event_type="entry_signal",
                 entry_text=entry_text,
-                stop_loss_text="67500",
-                take_profit_text="69000 / 70000",
+                stop_loss_text=stop_loss_text,
+                take_profit_text=take_profit_text,
                 parse_source="mimo_direct" if with_media else "text_ai",
                 confidence=confidence,
             )
@@ -267,6 +269,45 @@ def test_auto_process_message_trade_signal_accepts_nearby_single_entry_price(tmp
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
     assert len(fake_client.trigger_orders) == 2
+
+
+def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text=(
+            "比特币\n方向：做多\n入场：5.89-5.93附近入场\n"
+            "止盈：点位1：6万附近 点位2：6.07附近 点位3：6.23\n"
+            "止损：小幅跌破前低5.78一点。"
+        ),
+        entry_text="5.89-5.93附近",
+        stop_loss_text="5.78",
+        take_profit_text="6万附近 / 6.07附近 / 6.23",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.get_ticker_price = lambda *, inst_id: 59195.0
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 6, 30, 18, 10, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert [order["price"] for order in fake_client.trigger_orders] == ["59100.0", "58900.0"]
+    assert fake_client.trigger_orders[0]["slTriggerPx"] == 57800.0
+    assert fake_client.trigger_orders[0]["tpTriggerPx"] == 60000.0
 
 
 def test_auto_process_message_trade_signal_skips_lifecycle_entry_confirmation(tmp_path):

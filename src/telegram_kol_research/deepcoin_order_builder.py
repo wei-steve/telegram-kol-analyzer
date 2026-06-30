@@ -13,6 +13,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.execution_bindings import build_client_order_id
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
 from telegram_kol_research.kol_codes import resolve_kol_code
+from telegram_kol_research.price_normalization import extract_normalized_prices
 
 
 class DeepcoinOrderDraftError(ValueError):
@@ -46,10 +47,14 @@ def build_deepcoin_order_draft(
     ):
         raise DeepcoinOrderDraftError("open_side does not match position_side")
 
-    entry_low, entry_high = _parse_entry_range(payload_preview.get("entry_range"))
     instrument_id = _to_deepcoin_swap_instrument(contract)
     if contract_spec is not None and contract_spec.instrument_id.upper() != instrument_id:
         raise DeepcoinOrderDraftError("contract_spec instrument_id mismatch")
+    symbol = _symbol_from_contract(contract)
+    entry_low, entry_high = _parse_entry_range(
+        payload_preview.get("entry_range"),
+        symbol=symbol,
+    )
 
     source = payload_preview.get("source") or {}
     source_kol_id = source.get("kol_id")
@@ -60,7 +65,7 @@ def build_deepcoin_order_draft(
         explicit_code=source.get("kol_code"),
     )
     risk_budget = float(_require_value(payload_preview, "risk_budget_usdt"))
-    stop_loss = _parse_optional_price(payload_preview.get("stop_loss"))
+    stop_loss = _parse_optional_price(payload_preview.get("stop_loss"), symbol=symbol)
     margin_mode = _normalize_margin_mode(payload_preview.get("margin_mode"))
     position_mode = _normalize_position_mode(payload_preview.get("position_mode"))
     strategy_instance_id = str(
@@ -69,14 +74,17 @@ def build_deepcoin_order_draft(
             venue="deepcoin",
             chat_id=source_chat_id,
             message_id=source_message_id,
-            symbol=_symbol_from_contract(contract),
+            symbol=symbol,
             side=position_side,
         )
     )
     entry_range_order_style = str(
         payload_preview.get("entry_range_order_style") or "conservative"
     ).lower()
-    take_profit_prices = _parse_take_profit_prices(payload_preview.get("take_profit"))
+    take_profit_prices = _parse_take_profit_prices(
+        payload_preview.get("take_profit"),
+        symbol=symbol,
+    )
     take_profit_allocations = _normalize_take_profit_allocations(
         payload_preview.get("take_profit_allocations"),
         len(take_profit_prices),
@@ -176,7 +184,7 @@ def build_deepcoin_order_draft(
         "executable": False,
         "blocking_reason_codes": blocking_reason_codes,
         "strategy_instance_id": strategy_instance_id,
-        "symbol": _symbol_from_contract(contract),
+        "symbol": symbol,
         "instrument_id": instrument_id,
         "margin_mode": margin_mode,
         "position_mode": position_mode,
@@ -212,17 +220,14 @@ def _require_value(payload: dict[str, Any], key: str) -> Any:
     return value
 
 
-def _parse_entry_range(value: Any) -> tuple[float, float]:
+def _parse_entry_range(value: Any, *, symbol: str | None = None) -> tuple[float, float]:
     if value in (None, ""):
         raise DeepcoinOrderDraftError("entry_range is required")
-    parts = str(value).replace("~", "-").split("-")
-    if len(parts) != 2:
+    prices = extract_normalized_prices(value, symbol=symbol)
+    if len(prices) != 2:
         raise DeepcoinOrderDraftError("entry_range must be low-high")
-    try:
-        low = float(parts[0].strip())
-        high = float(parts[1].strip())
-    except ValueError as exc:
-        raise DeepcoinOrderDraftError("entry_range must contain numeric prices") from exc
+    low = float(prices[0])
+    high = float(prices[1])
     if low <= 0 or high <= 0:
         raise DeepcoinOrderDraftError("entry_range prices must be positive")
     if low > high:
@@ -230,28 +235,19 @@ def _parse_entry_range(value: Any) -> tuple[float, float]:
     return low, high
 
 
-def _parse_optional_price(value: Any) -> float | None:
+def _parse_optional_price(value: Any, *, symbol: str | None = None) -> float | None:
     if value in (None, ""):
         return None
-    text = str(value)
-    for separator in ["/", ",", " "]:
-        text = text.replace(separator, "-")
-    for part in text.split("-"):
-        stripped = part.strip()
-        if not stripped:
-            continue
-        try:
-            price = float(stripped)
-        except ValueError:
-            continue
-        if price > 0:
-            return price
+    prices = extract_normalized_prices(value, symbol=symbol)
+    if prices:
+        return prices[0]
     raise DeepcoinOrderDraftError("stop_loss must contain a numeric price")
 
 
-def _parse_take_profit_prices(value: Any) -> list[float]:
+def _parse_take_profit_prices(value: Any, *, symbol: str | None = None) -> list[float]:
     if value in (None, ""):
         return []
+    return extract_normalized_prices(value, symbol=symbol)
     text = str(value)
     for separator in ["/", ",", "，", " ", "~"]:
         text = text.replace(separator, "-")

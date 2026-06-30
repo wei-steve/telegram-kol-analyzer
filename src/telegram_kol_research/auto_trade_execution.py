@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -12,6 +11,7 @@ from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.models import ExecutionBinding, MediaAsset, RawMessage, SignalCandidate, Source
+from telegram_kol_research.price_normalization import extract_normalized_prices
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
@@ -77,16 +77,20 @@ def auto_process_message_trade_signal(
     if has_media and not settings.allow_vision_auto_trade:
         return {"status": "skipped", "reason": "vision_auto_trade_disabled"}
 
+    instrument_id = _to_deepcoin_swap_instrument(symbol)
+    reference_price = _safe_ticker_price(deepcoin_client, inst_id=instrument_id)
     entry_execution_type = _infer_entry_execution_type(
         candidate.entry_text,
         raw_message.text,
         candidate.parse_source,
     )
-    entry_range = _parse_entry_range(candidate.entry_text)
+    entry_range = _parse_entry_range(
+        candidate.entry_text,
+        symbol=symbol,
+        reference_price=reference_price,
+    )
     if entry_execution_type == "market":
-        market_price = deepcoin_client.get_ticker_price(
-            inst_id=_to_deepcoin_swap_instrument(symbol)
-        )
+        market_price = reference_price
         if market_price is None:
             return {"status": "skipped", "reason": "market_price_unavailable"}
         entry_range = (market_price, market_price)
@@ -199,8 +203,20 @@ def _auto_process_management_signal(
     if candidate.event_type == "close_signal":
         action = "close_position" if binding.pos_id else "cancel_entry"
     else:
-        stop_loss = _first_number(candidate.stop_loss_text)
-        take_profit = _first_number(candidate.take_profit_text)
+        reference_price = _safe_ticker_price(
+            deepcoin_client,
+            inst_id=_to_deepcoin_swap_instrument(symbol),
+        )
+        stop_loss = _first_price(
+            candidate.stop_loss_text,
+            symbol=symbol,
+            reference_price=reference_price,
+        )
+        take_profit = _first_price(
+            candidate.take_profit_text,
+            symbol=symbol,
+            reference_price=reference_price,
+        )
         if stop_loss is not None:
             action_payload["stop_loss"] = stop_loss
         if take_profit is not None:
@@ -360,10 +376,26 @@ def _to_deepcoin_swap_instrument(symbol: str) -> str:
     return f"{normalized}-USDT-SWAP"
 
 
-def _first_number(text: str | None) -> float | None:
-    if not text:
+def _safe_ticker_price(
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    *,
+    inst_id: str,
+) -> float | None:
+    try:
+        return deepcoin_client.get_ticker_price(inst_id=inst_id)
+    except Exception:
         return None
-    match = re.search(r"\d+(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?", text)
-    if match is None:
-        return None
-    return float(match.group(0).replace(",", ""))
+
+
+def _first_price(
+    text: str | None,
+    *,
+    symbol: str | None = None,
+    reference_price: float | None = None,
+) -> float | None:
+    prices = extract_normalized_prices(
+        text,
+        symbol=symbol,
+        reference_price=reference_price,
+    )
+    return prices[0] if prices else None

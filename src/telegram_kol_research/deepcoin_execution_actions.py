@@ -293,58 +293,67 @@ def cancel_entry_order(
     now = executed_at or datetime.now(UTC)
     binding = _load_binding_for_signal(session_factory, trade_signal)
     inst_id = _to_deepcoin_swap_instrument(binding.symbol)
-    trigger_order = _select_bound_order(
+    trigger_orders = _select_bound_orders(
         deepcoin_client.list_trigger_orders_pending(inst_id=inst_id),
         binding=binding,
     )
-    regular_order = None
-    if trigger_order is None:
-        regular_order = _select_bound_order(
+    regular_orders: list[dict[str, Any]] = []
+    if not trigger_orders:
+        regular_orders = _select_bound_orders(
             deepcoin_client.list_open_orders(inst_id=inst_id),
             binding=binding,
         )
-    if trigger_order is None and regular_order is None:
+    if not trigger_orders and not regular_orders:
         raise DeepcoinExecutionActionError("no_bound_pending_entry_order")
 
-    order = trigger_order or regular_order or {}
-    order_id = _first_string(order, "ordId", "orderId", "order_id", "id")
-    client_order_id = _first_string(order, "clOrdId", "clientOrderId", "client_order_id")
-    if not order_id and not client_order_id:
-        raise DeepcoinExecutionActionError("missing_cancel_order_id")
-    cancel_payload: dict[str, Any] = {"instId": inst_id}
-    if order_id:
-        cancel_payload["ordId"] = order_id
-    if client_order_id:
-        cancel_payload["clOrdId"] = client_order_id
-    if trigger_order is not None:
-        response = deepcoin_client.cancel_trigger_order(cancel_payload)
-        event_action = "cancel_trigger_entry"
-    else:
-        cancel_payload["mrgPosition"] = _deepcoin_position_mode(binding.position_mode)
-        response = deepcoin_client.cancel_order(cancel_payload)
-        event_action = "cancel_regular_entry"
-    record_execution_event(
-        session_factory,
-        ExecutionEventRecord(
-            execution_binding_id=binding.id,
-            trade_signal_id=trade_signal.id,
-            strategy_instance_id=binding.strategy_instance_id,
-            kol_id=binding.kol_id,
-            chat_id=binding.chat_id,
-            message_id=binding.message_id,
-            source_message_id=trade_signal.message_id,
-            symbol=binding.symbol,
-            side=binding.side,
-            action=event_action,
-            order_id=order_id,
-            client_order_id=client_order_id,
-            reason=trade_signal.action,
-            before=order,
-            request=cancel_payload,
-            response=response,
-            created_at=now,
-        ),
-    )
+    cancelled_orders: list[dict[str, Any]] = []
+    event_action = "cancel_trigger_entry" if trigger_orders else "cancel_regular_entry"
+    cancel_type = "trigger" if trigger_orders else "regular"
+    for order in trigger_orders or regular_orders:
+        order_id = _first_string(order, "ordId", "orderId", "order_id", "id")
+        client_order_id = _first_string(order, "clOrdId", "clientOrderId", "client_order_id")
+        if not order_id and not client_order_id:
+            raise DeepcoinExecutionActionError("missing_cancel_order_id")
+        cancel_payload: dict[str, Any] = {"instId": inst_id}
+        if order_id:
+            cancel_payload["ordId"] = order_id
+        if client_order_id:
+            cancel_payload["clOrdId"] = client_order_id
+        if trigger_orders:
+            response = deepcoin_client.cancel_trigger_order(cancel_payload)
+        else:
+            cancel_payload["mrgPosition"] = _deepcoin_position_mode(binding.position_mode)
+            response = deepcoin_client.cancel_order(cancel_payload)
+        cancelled_orders.append(
+            {
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "request": cancel_payload,
+                "response": response,
+            }
+        )
+        record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                execution_binding_id=binding.id,
+                trade_signal_id=trade_signal.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                kol_id=binding.kol_id,
+                chat_id=binding.chat_id,
+                message_id=binding.message_id,
+                source_message_id=trade_signal.message_id,
+                symbol=binding.symbol,
+                side=binding.side,
+                action=event_action,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                reason=trade_signal.action,
+                before=order,
+                request=cancel_payload,
+                response=response,
+                created_at=now,
+            ),
+        )
     _update_binding_status(
         session_factory,
         binding.id,
@@ -358,11 +367,12 @@ def cancel_entry_order(
         "signal_id": trade_signal.id,
         "action": trade_signal.action,
         "binding_id": binding.id,
-        "order_id": order_id,
-        "client_order_id": client_order_id,
-        "cancel_type": "trigger" if trigger_order is not None else "regular",
-        "request": cancel_payload,
-        "response": response,
+        "order_id": ",".join(item["order_id"] for item in cancelled_orders if item["order_id"]),
+        "client_order_id": ",".join(
+            item["client_order_id"] for item in cancelled_orders if item["client_order_id"]
+        ),
+        "cancel_type": cancel_type,
+        "cancelled_orders": cancelled_orders,
         "executed_at": now.isoformat(),
     }
 
@@ -538,6 +548,17 @@ def _select_bound_order(
     *,
     binding: _LoadedBinding,
 ) -> dict[str, Any] | None:
+    matches = _select_bound_orders(orders, binding=binding)
+    if len(matches) > 1:
+        raise DeepcoinExecutionActionError("ambiguous_bound_order")
+    return matches[0] if matches else None
+
+
+def _select_bound_orders(
+    orders: list[dict[str, Any]],
+    *,
+    binding: _LoadedBinding,
+) -> list[dict[str, Any]]:
     order_ids = set(_split_ids(binding.order_id))
     client_order_ids = set(_split_ids(binding.client_order_id))
     matches = []
@@ -549,9 +570,7 @@ def _select_bound_order(
             continue
         if client_order_id and client_order_id in client_order_ids:
             matches.append(order)
-    if len(matches) > 1:
-        raise DeepcoinExecutionActionError("ambiguous_bound_order")
-    return matches[0] if matches else None
+    return matches
 
 
 def _resolve_adjusted_tpsl_snapshot(

@@ -9,6 +9,7 @@ from telegram_kol_research.recovery_scan import (
     evaluate_recovery_signal,
     evaluate_recovery_signals_with_market_data,
     load_recovery_signals_from_db,
+    _parse_entry_range,
     select_recovery_signals,
 )
 from telegram_kol_research.trading_decision import ActivePosition
@@ -44,6 +45,10 @@ def test_build_recovery_window_defaults_to_previous_48_hours_as_utc_naive():
 
     assert start_at == datetime(2026, 6, 10, 18, 0)
     assert end_at == datetime(2026, 6, 12, 18, 0)
+
+
+def test_parse_entry_range_expands_btc_wan_shorthand():
+    assert _parse_entry_range("5.89-5.93附近入场", symbol="BTC") == (58900.0, 59300.0)
 
 
 def test_recovery_skips_notify_only_kol():

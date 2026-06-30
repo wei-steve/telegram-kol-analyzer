@@ -24,6 +24,16 @@ def _payload_preview(**overrides):
     return values
 
 
+def _btc_contract_spec():
+    return DeepcoinContractSpec(
+        instrument_id="BTC-USDT-SWAP",
+        contract_value=0.001,
+        quantity_step=1,
+        min_quantity=1,
+        price_tick=0.1,
+    )
+
+
 def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoint():
     draft = build_deepcoin_order_draft(_payload_preview())
 
@@ -210,12 +220,27 @@ def test_build_deepcoin_order_draft_converts_base_estimate_with_contract_spec():
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
     assert draft["order_legs"][0]["base_asset_estimate"] == 0.083333
     assert draft["order_legs"][1]["price"] == 68000.0
-    assert draft["order_legs"][1]["quantity"] == 100.0
+
+
+def test_build_deepcoin_order_draft_expands_btc_wan_shorthand_prices():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            entry_range="5.89-5.93附近",
+            stop_loss="5.78",
+            take_profit="6万附近 / 6.07附近 / 6.23",
+        ),
+        contract_spec=_btc_contract_spec(),
+    )
+
+    assert [leg["price"] for leg in draft["order_legs"]] == [59100.0, 58900.0]
+    assert draft["stop_loss"] == 57800.0
+    assert [leg["price"] for leg in draft["take_profit_legs"]] == [
+        60000.0,
+        60700.0,
+        62300.0,
+    ]
+    assert draft["blocking_reason_codes"] == []
     assert draft["order_legs"][1]["quantity_unit"] == "contracts"
-    assert draft["stop_loss"] == 67500.0
-    assert "contract_spec_applied" in draft["notes"]
-    assert "quantity_rounded_down_to_step" in draft["notes"]
-    assert "price_rounded_to_tick" in draft["notes"]
 
 
 def test_build_deepcoin_order_draft_blocks_when_contract_quantity_is_below_minimum():

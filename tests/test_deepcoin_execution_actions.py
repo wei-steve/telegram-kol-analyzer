@@ -253,6 +253,57 @@ def test_process_trade_signal_live_cancels_bound_trigger_entry(tmp_path):
         assert session.get(ExecutionBinding, binding_id).status == "cancelled"
 
 
+def test_process_trade_signal_live_cancels_all_bound_trigger_entry_legs(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    binding_id = _binding(
+        session_factory,
+        order_id="trigger-1,trigger-2",
+        client_order_id="client-1,client-2",
+        pos_id=None,
+        status="open",
+    )
+    trade_signal = _signal(
+        session_factory,
+        action="cancel_entry",
+        payload={"binding_id": binding_id},
+    )
+    client = _FakeDeepcoinClient()
+    client.trigger_pending = [
+        {
+            "triggerOrderType": "NORMAL",
+            "ordId": "trigger-1",
+            "clOrdId": "client-1",
+            "instId": "ETH-USDT-SWAP",
+            "side": "buy",
+            "posSide": "long",
+        },
+        {
+            "triggerOrderType": "NORMAL",
+            "ordId": "trigger-2",
+            "clOrdId": "client-2",
+            "instId": "ETH-USDT-SWAP",
+            "side": "buy",
+            "posSide": "long",
+        },
+    ]
+
+    result = process_trade_signal_live(
+        session_factory,
+        signal_id=trade_signal.id,
+        deepcoin_client=client,
+    )
+
+    assert [item["ordId"] for item in client.cancel_trigger_payloads] == [
+        "trigger-1",
+        "trigger-2",
+    ]
+    assert result["order_id"] == "trigger-1,trigger-2"
+    assert len(result["cancelled_orders"]) == 2
+    events = list_execution_events(session_factory, execution_binding_id=binding_id)
+    assert [event.order_id for event in events] == ["trigger-2", "trigger-1"]
+
+
 def test_process_trade_signal_live_recreates_trigger_entry_to_adjust_tpsl(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})

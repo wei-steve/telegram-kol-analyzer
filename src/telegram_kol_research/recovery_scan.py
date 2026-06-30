@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-import re
 from typing import Protocol
 
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig, TrackedSenderConfig
 from telegram_kol_research.models import RawMessage, SignalCandidate, Source
+from telegram_kol_research.price_normalization import extract_normalized_prices
 from telegram_kol_research.time_utils import normalize_to_utc_naive
 from telegram_kol_research.trading_decision import (
     ActivePosition,
@@ -233,7 +233,10 @@ def load_recovery_signals_from_db(
                     posted_at=raw_message.posted_at,
                     symbol=candidate.symbol,
                     side=candidate.side,
-                    entry_range=_parse_entry_range(candidate.entry_text),
+                    entry_range=_parse_entry_range(
+                        candidate.entry_text,
+                        symbol=candidate.symbol,
+                    ),
                     stop_loss_text=candidate.stop_loss_text,
                     take_profit_text=candidate.take_profit_text,
                     parse_source=candidate.parse_source,
@@ -365,10 +368,19 @@ def _match_sender(
     return None
 
 
-def _parse_entry_range(entry_text: str | None) -> tuple[float, float] | None:
+def _parse_entry_range(
+    entry_text: str | None,
+    *,
+    symbol: str | None = None,
+    reference_price: float | None = None,
+) -> tuple[float, float] | None:
     if not entry_text:
         return None
-    values = re.findall(r"\d+(?:\.\d+)?", entry_text)
+    values = extract_normalized_prices(
+        entry_text,
+        symbol=symbol,
+        reference_price=reference_price,
+    )
     if len(values) == 1:
         price = float(values[0])
         return price, price
