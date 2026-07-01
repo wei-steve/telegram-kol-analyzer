@@ -11,6 +11,8 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_draft
+from telegram_kol_research.execution_events import ExecutionEventRecord
+from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
 from telegram_kol_research.deepcoin_execution_actions import recover_missing_position_protections
 from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
@@ -60,7 +62,13 @@ def auto_process_message_trade_signal(
         )
     raw_message, candidate, source, has_media = loaded
     if candidate.parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
-        return {"status": "skipped", "reason": "lifecycle_event_not_new_entry"}
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason="lifecycle_event_not_new_entry",
+            processed_at=now,
+        )
 
     runtime_group_config = apply_trading_settings_to_group_config(group_config, settings)
     runtime_config = _resolve_runtime_config(
@@ -69,18 +77,53 @@ def auto_process_message_trade_signal(
         source=source,
     )
     if runtime_config is None:
-        return {"status": "skipped", "reason": "group_not_configured_for_auto_trade"}
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason="group_not_configured_for_auto_trade",
+            processed_at=now,
+        )
     if runtime_config["trading_mode"] != "auto_trade":
-        return {"status": "skipped", "reason": "kol_or_group_auto_trade_disabled"}
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason="kol_or_group_auto_trade_disabled",
+            runtime_kol_id=str(runtime_config.get("kol_id") or ""),
+            processed_at=now,
+        )
 
     symbol = (candidate.symbol or "").upper()
     side = (candidate.side or "").lower()
     if not symbol or symbol not in {item.upper() for item in settings.allowed_symbols}:
-        return {"status": "skipped", "reason": "symbol_not_allowed", "symbol": symbol}
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason="symbol_not_allowed",
+            runtime_kol_id=str(runtime_config.get("kol_id") or ""),
+            processed_at=now,
+            extra={"symbol": symbol},
+        )
     if candidate.confidence < settings.min_ai_confidence:
-        return {"status": "skipped", "reason": "confidence_below_minimum"}
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason="confidence_below_minimum",
+            runtime_kol_id=str(runtime_config.get("kol_id") or ""),
+            processed_at=now,
+        )
     if has_media and not settings.allow_vision_auto_trade:
-        return {"status": "skipped", "reason": "vision_auto_trade_disabled"}
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason="vision_auto_trade_disabled",
+            runtime_kol_id=str(runtime_config.get("kol_id") or ""),
+            processed_at=now,
+        )
 
     instrument_id = _to_deepcoin_swap_instrument(symbol)
     reference_price = _safe_ticker_price(deepcoin_client, inst_id=instrument_id)
@@ -97,10 +140,24 @@ def auto_process_message_trade_signal(
     if entry_execution_type == "market":
         market_price = reference_price
         if market_price is None:
-            return {"status": "skipped", "reason": "market_price_unavailable"}
+            return _record_entry_auto_trade_skip(
+                session_factory,
+                raw_message=raw_message,
+                candidate=candidate,
+                reason="market_price_unavailable",
+                runtime_kol_id=str(runtime_config.get("kol_id") or ""),
+                processed_at=now,
+            )
         entry_range = (market_price, market_price)
     if entry_range is None:
-        return {"status": "skipped", "reason": "missing_entry_range"}
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason="missing_entry_range",
+            runtime_kol_id=str(runtime_config.get("kol_id") or ""),
+            processed_at=now,
+        )
 
     signal = RecoverySignal(
         kol_id=str(runtime_config["kol_id"]),
@@ -211,6 +268,50 @@ def auto_process_message_trade_signal(
             max_order_legs=1 if entry_execution_type == "market" else None,
         )
     return {"status": "submitted", "entry_execution_type": entry_execution_type, "result": submit_result}
+
+
+def _record_entry_auto_trade_skip(
+    session_factory: sessionmaker,
+    *,
+    raw_message: RawMessage,
+    candidate: SignalCandidate,
+    reason: str,
+    runtime_kol_id: str | None = None,
+    processed_at: datetime,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    symbol = (candidate.symbol or "").upper() or None
+    side = (candidate.side or "").lower() or None
+    payload = {
+        "candidate_id": candidate.id,
+        "parse_source": candidate.parse_source,
+        "confidence": candidate.confidence,
+        "event_type": candidate.event_type,
+        "entry_text": candidate.entry_text,
+        "stop_loss_text": candidate.stop_loss_text,
+        "take_profit_text": candidate.take_profit_text,
+    }
+    if extra:
+        payload.update(extra)
+    record_execution_event(
+        session_factory,
+        ExecutionEventRecord(
+            action="auto_trade_skipped",
+            status="skipped",
+            kol_id=runtime_kol_id,
+            chat_id=raw_message.chat_id,
+            message_id=raw_message.message_id,
+            symbol=symbol,
+            side=side,
+            reason=reason,
+            request=payload,
+            created_at=processed_at,
+        ),
+    )
+    result: dict[str, Any] = {"status": "skipped", "reason": reason}
+    if extra:
+        result.update(extra)
+    return result
 
 
 def _auto_process_management_signal(

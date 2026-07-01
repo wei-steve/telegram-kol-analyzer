@@ -252,6 +252,15 @@ def test_auto_process_message_trade_signal_blocks_media_when_vision_auto_trade_d
 
     assert result == {"status": "skipped", "reason": "vision_auto_trade_disabled"}
     assert fake_client.orders == []
+    with session_factory() as session:
+        event = session.query(ExecutionEvent).one()
+    assert event.action == "auto_trade_skipped"
+    assert event.status == "skipped"
+    assert event.reason == "vision_auto_trade_disabled"
+    assert event.chat_id == 100
+    assert event.message_id == 55
+    assert event.symbol == "BTC"
+    assert event.side == "long"
 
 
 def test_auto_process_message_trade_signal_submits_market_order_then_position_sltp(tmp_path):
