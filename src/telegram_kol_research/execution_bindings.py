@@ -295,12 +295,43 @@ def reconcile_deepcoin_execution_bindings(
                 else:
                     row.status = "stale"
                     row.last_exchange_status = "not_found_on_exchange"
+                    if not _split_ids(row.pos_id):
+                        _cancel_missing_entry_lifecycle(session, row, now)
                     result.stale += 1
             row.recovered_at = now
             row.updated_at = now
             result.updated += 1
         session.commit()
     return result
+
+
+def _cancel_missing_entry_lifecycle(session, row: ExecutionBinding, cancelled_at: datetime) -> None:
+    """Archive a bound entry order that disappeared before any position was known."""
+
+    from telegram_kol_research.models import StrategyLifecycle, TradeIdea
+
+    lifecycle = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.chat_id == row.chat_id)
+        .filter(StrategyLifecycle.message_id == row.message_id)
+        .filter(StrategyLifecycle.symbol == row.symbol)
+        .filter(StrategyLifecycle.side == row.side)
+        .filter(StrategyLifecycle.lifecycle_status.in_(["pending_entry", "entered"]))
+        .order_by(StrategyLifecycle.id.desc())
+        .first()
+    )
+    if lifecycle is None:
+        return
+
+    lifecycle.lifecycle_status = "exited"
+    lifecycle.exit_reason = "cancelled"
+    lifecycle.exited_at = cancelled_at
+    lifecycle.updated_at = cancelled_at
+    if lifecycle.trade_idea_id is not None:
+        trade_idea = session.get(TradeIdea, lifecycle.trade_idea_id)
+        if trade_idea is not None and trade_idea.status == "open":
+            trade_idea.status = "closed"
+            trade_idea.closed_at = cancelled_at
 
 
 def sync_manual_closed_deepcoin_positions(

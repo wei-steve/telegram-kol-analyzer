@@ -206,6 +206,19 @@ def test_reconcile_deepcoin_execution_bindings_marks_restart_state(tmp_path):
             status="open",
         ),
     )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=101,
+                message_id=66,
+                symbol="ETH",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+                entered_at=datetime(2026, 6, 30, 9, 1),
+            )
+        )
+        session.commit()
 
     class FakeClient:
         def list_positions(self):
@@ -235,6 +248,11 @@ def test_reconcile_deepcoin_execution_bindings_marks_restart_state(tmp_path):
     assert rows[0].strategy_instance_id == "deepcoin:100:55:BTC:long"
     assert rows[1].status == "stale"
     assert rows[1].last_exchange_status == "not_found_on_exchange"
+    with session_factory() as session:
+        lifecycle = session.query(StrategyLifecycle).filter_by(chat_id=101).one()
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "cancelled"
+    assert lifecycle.exited_at is not None
 
 
 def test_reconcile_recovers_filled_order_position_id_when_unique(tmp_path):
