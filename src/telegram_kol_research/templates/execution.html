@@ -99,9 +99,11 @@
                   <strong>{{ candidate.group_label }}</strong>
                   <span>#{{ candidate.message_id }}</span>
                   <code>{{ candidate.lifecycle_status }}</code>
+                  <span>匹配 {{ candidate.match_score }}%</span>
                   {% if candidate.entry %}<span>入场 {{ candidate.entry }}</span>{% endif %}
                   {% if candidate.stop_loss %}<span>止损 {{ candidate.stop_loss }}</span>{% endif %}
                   {% if candidate.take_profit %}<span>止盈 {{ candidate.take_profit }}</span>{% endif %}
+                  {% if candidate.match_reasons %}<span>{{ candidate.match_reasons|join(" / ") }}</span>{% endif %}
                 </div>
                 <button
                   type="button"
@@ -109,7 +111,8 @@
                   data-bind-live-position
                   data-pos-id="{{ item.pos_id }}"
                   data-lifecycle-id="{{ candidate.lifecycle_id }}"
-                >绑定</button>
+                  {% if not candidate.bindable %}disabled title="归属不唯一或置信度不足，禁止一键绑定"{% endif %}
+                >{% if candidate.bindable %}绑定{% else %}需核对{% endif %}</button>
               </div>
             {% endfor %}
             <span class="execution-action-status" data-bind-live-position-status aria-live="polite"></span>

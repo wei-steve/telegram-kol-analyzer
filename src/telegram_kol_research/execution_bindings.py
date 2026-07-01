@@ -217,6 +217,7 @@ def reconcile_deepcoin_execution_bindings(
         for position in positions
         if _first_string(position, "posId", "pos_id", "id")
     }
+    active_positions = [position for position in positions if _has_nonzero_size(position)]
     orders_by_order_id = {
         _first_string(order, "ordId", "orderId", "order_id", "id"): order
         for order in orders
@@ -237,6 +238,13 @@ def reconcile_deepcoin_execution_bindings(
             .order_by(ExecutionBinding.id.asc())
             .all()
         )
+        bound_pos_ids = {
+            pos_id
+            for binding in rows
+            for pos_id in _split_ids(binding.pos_id)
+        }
+        order_history_cache: dict[str, list[dict[str, Any]]] = {}
+        trade_fills_cache: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             row.strategy_instance_id = row.strategy_instance_id or build_strategy_instance_id(
                 venue=row.venue,
@@ -245,10 +253,10 @@ def reconcile_deepcoin_execution_bindings(
                 symbol=row.symbol,
                 side=row.side,
             )
-            position = positions_by_pos_id.get(row.pos_id or "")
-            order = orders_by_order_id.get(row.order_id or "")
+            position = _lookup_position_by_any_id(positions_by_pos_id, row.pos_id)
+            order = _lookup_order_by_any_id(orders_by_order_id, row.order_id)
             if order is None:
-                order = orders_by_client_order_id.get(row.client_order_id or "")
+                order = _lookup_order_by_any_id(orders_by_client_order_id, row.client_order_id)
 
             if position is not None and _has_nonzero_size(position):
                 row.status = "active"
@@ -259,9 +267,35 @@ def reconcile_deepcoin_execution_bindings(
                 row.last_exchange_status = "order_open"
                 result.open += 1
             else:
-                row.status = "stale"
-                row.last_exchange_status = "not_found_on_exchange"
-                result.stale += 1
+                recovered_position = _select_position_from_order_evidence(
+                    row,
+                    client=client,
+                    active_positions=active_positions,
+                    bound_pos_ids=bound_pos_ids,
+                    order_history_cache=order_history_cache,
+                    trade_fills_cache=trade_fills_cache,
+                )
+                recovered_status = "position_active_recovered_from_filled_order"
+                if recovered_position is None:
+                    recovered_position = _select_recovered_position_for_unbound_binding(
+                        row,
+                        rows=rows,
+                        active_positions=active_positions,
+                        bound_pos_ids=bound_pos_ids,
+                    )
+                    recovered_status = "position_active_recovered_without_pos_id"
+                if recovered_position is not None:
+                    recovered_pos_id = _first_string(recovered_position, "posId", "pos_id", "id")
+                    row.pos_id = recovered_pos_id
+                    row.status = "active"
+                    row.last_exchange_status = recovered_status
+                    bound_pos_ids.add(str(recovered_pos_id))
+                    result.active += 1
+                    _attach_binding_to_lifecycle(session, row, now)
+                else:
+                    row.status = "stale"
+                    row.last_exchange_status = "not_found_on_exchange"
+                    result.stale += 1
             row.recovered_at = now
             row.updated_at = now
             result.updated += 1
@@ -595,3 +629,285 @@ def _is_open_order_state(order: dict[str, Any]) -> bool:
     if not state:
         return True
     return state in {"live", "open", "partially_filled", "partial"}
+
+
+def _lookup_position_by_any_id(
+    positions_by_pos_id: dict[str, dict[str, Any]],
+    raw_ids: str | None,
+) -> dict[str, Any] | None:
+    for item_id in _split_ids(raw_ids):
+        position = positions_by_pos_id.get(item_id)
+        if position is not None:
+            return position
+    return None
+
+
+def _lookup_order_by_any_id(
+    orders_by_id: dict[str, dict[str, Any]],
+    raw_ids: str | None,
+) -> dict[str, Any] | None:
+    for item_id in _split_ids(raw_ids):
+        order = orders_by_id.get(item_id)
+        if order is not None:
+            return order
+    return None
+
+
+def _select_position_from_order_evidence(
+    row: ExecutionBinding,
+    *,
+    client: DeepcoinReadOnlyClient,
+    active_positions: list[dict[str, Any]],
+    bound_pos_ids: set[str],
+    order_history_cache: dict[str, list[dict[str, Any]]],
+    trade_fills_cache: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    if _split_ids(row.pos_id):
+        return None
+    order_ids = set(_split_ids(row.order_id)) | set(_split_ids(row.client_order_id))
+    if not order_ids:
+        return None
+
+    target_symbol = str(row.symbol or "").upper()
+    target_side = str(row.side or "").lower()
+    instrument_id = f"{target_symbol}-USDT-SWAP"
+    candidates = [
+        position
+        for position in active_positions
+        if _first_string(position, "posId", "pos_id", "id") not in bound_pos_ids
+        and _symbol_from_inst_id(position.get("instId")) == target_symbol
+        and _normalize_position_side(
+            str(position.get("posSide") or position.get("side") or "")
+        )
+        == target_side
+    ]
+    if not candidates:
+        return None
+
+    evidence = _load_order_evidence(
+        client,
+        instrument_id=instrument_id,
+        order_ids=order_ids,
+        order_history_cache=order_history_cache,
+        trade_fills_cache=trade_fills_cache,
+    )
+    if not evidence:
+        return None
+
+    matches: list[dict[str, Any]] = []
+    for position in candidates:
+        if any(_position_matches_order_evidence(position, item) for item in evidence):
+            matches.append(position)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _load_order_evidence(
+    client: DeepcoinReadOnlyClient,
+    *,
+    instrument_id: str,
+    order_ids: set[str],
+    order_history_cache: dict[str, list[dict[str, Any]]],
+    trade_fills_cache: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    history_rows = _cached_client_rows(
+        client,
+        method_name="list_order_history",
+        instrument_id=instrument_id,
+        cache=order_history_cache,
+    )
+    fill_rows = _cached_client_rows(
+        client,
+        method_name="list_trade_fills",
+        instrument_id=instrument_id,
+        cache=trade_fills_cache,
+    )
+    for row in [*history_rows, *fill_rows]:
+        row_order_ids = {
+            value
+            for value in (
+                _first_string(row, "ordId", "orderId", "order_id", "id"),
+                _first_string(row, "clOrdId", "clientOrderId", "client_order_id"),
+            )
+            if value
+        }
+        if not row_order_ids.intersection(order_ids):
+            continue
+        if _is_history_fill_evidence(row):
+            evidence.append(row)
+    return evidence
+
+
+def _cached_client_rows(
+    client: DeepcoinReadOnlyClient,
+    *,
+    method_name: str,
+    instrument_id: str,
+    cache: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    if instrument_id in cache:
+        return cache[instrument_id]
+    method = getattr(client, method_name, None)
+    if method is None:
+        cache[instrument_id] = []
+        return []
+    try:
+        rows = method(inst_id=instrument_id)
+    except TypeError:
+        rows = method()
+    except Exception:
+        rows = []
+    if not isinstance(rows, list):
+        rows = []
+    cache[instrument_id] = [row for row in rows if isinstance(row, dict)]
+    return cache[instrument_id]
+
+
+def _is_history_fill_evidence(row: dict[str, Any]) -> bool:
+    state = str(row.get("state") or row.get("status") or "").lower()
+    if state and state not in {"filled", "partially_filled", "partial_filled", "done"}:
+        return False
+    return any(
+        _to_float(row.get(key)) is not None
+        for key in ("fillPx", "avgPx", "fillSz", "sz")
+    )
+
+
+def _position_matches_order_evidence(position: dict[str, Any], evidence: dict[str, Any]) -> bool:
+    matched_fields = 0
+    evidence_size = _to_float(
+        evidence.get("fillSz")
+        or evidence.get("accFillSz")
+        or evidence.get("sz")
+        or evidence.get("size")
+    )
+    if evidence_size is not None:
+        position_size = _to_float(position.get("pos") or position.get("size"))
+        if position_size is None or not _close_number(position_size, evidence_size, rel_tol=0.001):
+            return False
+        matched_fields += 1
+
+    evidence_price = _to_float(
+        evidence.get("fillPx")
+        or evidence.get("avgPx")
+        or evidence.get("avgPrice")
+        or evidence.get("px")
+        or evidence.get("price")
+    )
+    if evidence_price is not None:
+        position_price = _to_float(position.get("avgPx") or position.get("avgPrice") or position.get("openAvgPx"))
+        if position_price is None or not _close_number(position_price, evidence_price, rel_tol=0.001):
+            return False
+        matched_fields += 1
+
+    evidence_time = _to_int(
+        evidence.get("fillTime")
+        or evidence.get("uTime")
+        or evidence.get("ts")
+        or evidence.get("cTime")
+    )
+    if evidence_time is not None:
+        position_time = _to_int(position.get("uTime") or position.get("cTime"))
+        if position_time is not None and abs(position_time - evidence_time) <= 120_000:
+            matched_fields += 1
+
+    return matched_fields >= 2
+
+
+def _select_recovered_position_for_unbound_binding(
+    row: ExecutionBinding,
+    *,
+    rows: list[ExecutionBinding],
+    active_positions: list[dict[str, Any]],
+    bound_pos_ids: set[str],
+) -> dict[str, Any] | None:
+    if _split_ids(row.pos_id):
+        return None
+    order_ids = set(_split_ids(row.order_id)) | set(_split_ids(row.client_order_id))
+    if not order_ids:
+        return None
+    target_symbol = str(row.symbol or "").upper()
+    target_side = str(row.side or "").lower()
+    candidates = [
+        position
+        for position in active_positions
+        if _first_string(position, "posId", "pos_id", "id") not in bound_pos_ids
+        and _symbol_from_inst_id(position.get("instId")) == target_symbol
+        and _normalize_position_side(
+            str(position.get("posSide") or position.get("side") or "")
+        )
+        == target_side
+    ]
+    if not candidates:
+        return None
+
+    competing_rows = [
+        other
+        for other in rows
+        if other.id != row.id
+        and not _split_ids(other.pos_id)
+        and str(other.symbol or "").upper() == target_symbol
+        and str(other.side or "").lower() == target_side
+        and other.status in {"open", "active", "unknown"}
+    ]
+    if not competing_rows and len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: datetime) -> None:
+    from telegram_kol_research.models import StrategyLifecycle
+
+    lifecycle = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.chat_id == row.chat_id)
+        .filter(StrategyLifecycle.message_id == row.message_id)
+        .filter(StrategyLifecycle.symbol == row.symbol)
+        .filter(StrategyLifecycle.side == row.side)
+        .order_by(StrategyLifecycle.id.desc())
+        .first()
+    )
+    if lifecycle is None:
+        return
+    lifecycle.execution_binding_id = row.id
+    if lifecycle.lifecycle_status == "pending_entry":
+        lifecycle.lifecycle_status = "entered"
+        lifecycle.entered_at = updated_at
+    lifecycle.updated_at = updated_at
+
+
+def _symbol_from_inst_id(value: Any) -> str:
+    text = str(value or "").upper()
+    if text.endswith("-USDT-SWAP"):
+        return text[: -len("-USDT-SWAP")]
+    return text.split("-")[0] if text else ""
+
+
+def _normalize_position_side(value: str) -> str:
+    side = value.lower()
+    if side == "buy":
+        return "long"
+    if side == "sell":
+        return "short"
+    return side
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value: Any) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _close_number(left: float, right: float, *, rel_tol: float) -> bool:
+    scale = max(abs(left), abs(right), 1.0)
+    return abs(left - right) <= scale * rel_tol

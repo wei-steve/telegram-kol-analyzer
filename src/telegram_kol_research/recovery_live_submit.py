@@ -16,6 +16,7 @@ from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import upsert_execution_binding
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
+from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.trade_signals import TradeSignalRecord
 from telegram_kol_research.trade_signals import enqueue_trade_signal
@@ -219,6 +220,13 @@ def _submit_recovery_signal_direct(
     draft = gate["deepcoin_order_draft"]
     if not isinstance(draft, dict):
         raise RecoveryLiveSubmitError("missing_deepcoin_order_draft")
+    queued_draft = (
+        trade_signal.payload.get("deepcoin_order_draft")
+        if isinstance(trade_signal.payload, dict)
+        else None
+    )
+    if isinstance(queued_draft, dict):
+        draft = queued_draft
     order_legs = draft.get("order_legs")
     if not isinstance(order_legs, list) or not order_legs:
         raise RecoveryLiveSubmitError("missing_order_legs")
@@ -229,6 +237,7 @@ def _submit_recovery_signal_direct(
     kol_id = str(source.get("kol_id") or "unknown")
     symbol_key = str(draft.get("symbol") or trade_signal.symbol).upper()
     side_key = trade_signal.side.lower()
+    warnings = _protection_warnings(draft)
 
     selected_order_legs = order_legs[:max_order_legs] if max_order_legs else order_legs
     for index, leg in enumerate(selected_order_legs, start=1):
@@ -236,6 +245,11 @@ def _submit_recovery_signal_direct(
             raise RecoveryLiveSubmitError("invalid_order_leg")
         order_type = str(leg.get("order_type") or "").lower()
         if order_type == "market":
+            pre_submit_position_ids = _load_matching_position_ids(
+                deepcoin_client,
+                draft=draft,
+                side=side_key,
+            )
             order_payload = build_deepcoin_market_order_payload(draft, leg)
             try:
                 response = deepcoin_client.place_order(order_payload)
@@ -252,6 +266,7 @@ def _submit_recovery_signal_direct(
                 deepcoin_client,
                 draft=draft,
                 side=side_key,
+                exclude_pos_ids=pre_submit_position_ids,
             )
             try:
                 protection_payload = build_deepcoin_position_sltp_payload(
@@ -259,51 +274,16 @@ def _submit_recovery_signal_direct(
                     pos_id=pos_id,
                 )
                 protection_response = deepcoin_client.set_position_sltp(protection_payload)
-            except DeepcoinClientError:
-                _upsert_protection_failed_binding(
-                    session_factory,
-                    trade_signal=trade_signal,
-                    draft=draft,
-                    source=source,
-                    kol_id=kol_id,
-                    symbol_key=symbol_key,
-                    side_key=side_key,
-                    order={
-                        "leg_index": index,
-                        "execution_type": order_type or "market",
-                        "client_order_id": client_order_id,
-                        "order_id": order_id,
-                        "pos_id": pos_id,
-                        "request": order_payload,
-                        "response": response,
-                        "protection_request": locals().get("protection_payload"),
-                        "protection_response": {"error": "Deepcoin protection request failed"},
-                    },
-                )
-                raise
             except Exception as exc:  # pragma: no cover - defensive boundary
-                _upsert_protection_failed_binding(
-                    session_factory,
-                    trade_signal=trade_signal,
-                    draft=draft,
-                    source=source,
-                    kol_id=kol_id,
-                    symbol_key=symbol_key,
-                    side_key=side_key,
-                    order={
-                        "leg_index": index,
-                        "execution_type": order_type or "market",
-                        "client_order_id": client_order_id,
-                        "order_id": order_id,
-                        "pos_id": pos_id,
-                        "request": order_payload,
-                        "response": response,
-                        "protection_request": locals().get("protection_payload"),
-                        "protection_response": {"error": str(exc)},
-                    },
-                )
-                raise DeepcoinClientError(f"Deepcoin position protection failed: {exc}") from exc
+                protection_payload = locals().get("protection_payload")
+                protection_response = {"error": str(exc)}
+                warnings.append("position_protection_failed_after_entry_submitted")
         elif order_type == "limit":
+            pre_submit_position_ids = _load_matching_position_ids(
+                deepcoin_client,
+                draft=draft,
+                side=side_key,
+            )
             order_payload = build_deepcoin_place_order_payload(draft, leg)
             try:
                 response = deepcoin_client.place_order(order_payload)
@@ -315,11 +295,11 @@ def _submit_recovery_signal_direct(
             order_id = _extract_order_id(response)
             if not order_id:
                 raise DeepcoinClientError("Deepcoin limit order response missing order id")
-            pos_id = _extract_position_id(response) or _find_exact_open_position_id(
+            pos_id = _extract_position_id(response) or _find_open_position_id(
                 deepcoin_client,
                 draft=draft,
                 side=side_key,
-                pos_id=order_id,
+                exclude_pos_ids=pre_submit_position_ids,
             )
             client_order_id = str(leg.get("client_order_id") or "")
             protection_payload = build_deepcoin_order_sltp_payload(draft, order_id=order_id)
@@ -327,20 +307,32 @@ def _submit_recovery_signal_direct(
                 protection_response = deepcoin_client.replace_order_sltp(protection_payload)
             except DeepcoinClientError:
                 if not pos_id:
-                    raise
-                protection_payload = build_deepcoin_position_sltp_payload(
-                    draft,
-                    pos_id=pos_id,
-                )
-                protection_response = deepcoin_client.set_position_sltp(protection_payload)
+                    protection_response = {"error": "Deepcoin order protection request failed"}
+                    warnings.append("order_protection_failed_after_entry_submitted")
+                else:
+                    protection_payload = build_deepcoin_position_sltp_payload(
+                        draft,
+                        pos_id=pos_id,
+                    )
+                    try:
+                        protection_response = deepcoin_client.set_position_sltp(protection_payload)
+                    except Exception as exc:  # pragma: no cover - defensive boundary
+                        protection_response = {"error": str(exc)}
+                        warnings.append("position_protection_failed_after_entry_submitted")
             except Exception as exc:  # pragma: no cover - defensive boundary
                 if not pos_id:
-                    raise DeepcoinClientError(f"Deepcoin order protection failed: {exc}") from exc
-                protection_payload = build_deepcoin_position_sltp_payload(
-                    draft,
-                    pos_id=pos_id,
-                )
-                protection_response = deepcoin_client.set_position_sltp(protection_payload)
+                    protection_response = {"error": str(exc)}
+                    warnings.append("order_protection_failed_after_entry_submitted")
+                else:
+                    protection_payload = build_deepcoin_position_sltp_payload(
+                        draft,
+                        pos_id=pos_id,
+                    )
+                    try:
+                        protection_response = deepcoin_client.set_position_sltp(protection_payload)
+                    except Exception as set_exc:  # pragma: no cover - defensive boundary
+                        protection_response = {"error": str(set_exc)}
+                        warnings.append("position_protection_failed_after_entry_submitted")
         else:
             order_payload = build_deepcoin_trigger_order_payload(draft, leg)
             try:
@@ -375,6 +367,17 @@ def _submit_recovery_signal_direct(
             }
         )
 
+    protection_failed = any(
+        isinstance(order.get("protection_response"), dict)
+        and order["protection_response"].get("error")
+        for order in submitted_orders
+    )
+    binding_status = "active" if _join_ids(order["pos_id"] for order in submitted_orders) else "open"
+    last_exchange_status = (
+        "position_active_protection_failed"
+        if protection_failed and binding_status == "active"
+        else "order_open_protection_failed" if protection_failed else "submitted"
+    )
     binding_id = upsert_execution_binding(
         session_factory,
         ExecutionBindingRecord(
@@ -390,10 +393,20 @@ def _submit_recovery_signal_direct(
             margin_mode=str(draft.get("margin_mode") or "cross"),
             position_mode=str(draft.get("position_mode") or "split"),
             payload={"draft": draft, "submitted_orders": submitted_orders},
-            last_exchange_status="submitted",
-            status="open",
+            last_exchange_status=last_exchange_status,
+            status=binding_status,
             strategy_instance_id=str(draft.get("strategy_instance_id") or ""),
         ),
+    )
+    _attach_lifecycle_binding(
+        session_factory,
+        chat_id=int(source.get("chat_id") or trade_signal.chat_id),
+        message_id=int(source.get("message_id") or trade_signal.message_id),
+        symbol=symbol_key,
+        side=side_key,
+        binding_id=binding_id,
+        entered=bool(_join_ids(order["pos_id"] for order in submitted_orders)),
+        updated_at=now,
     )
     _record_submitted_order_events(
         session_factory,
@@ -423,7 +436,7 @@ def _submit_recovery_signal_direct(
         "order_count": len(submitted_orders),
         "orders": submitted_orders,
         "deepcoin_order_draft": draft,
-        "warnings": _protection_warnings(draft),
+        "warnings": warnings,
     }
 
 
@@ -458,6 +471,37 @@ def _upsert_protection_failed_binding(
             strategy_instance_id=str(draft.get("strategy_instance_id") or ""),
         ),
     )
+
+
+def _attach_lifecycle_binding(
+    session_factory: sessionmaker,
+    *,
+    chat_id: int,
+    message_id: int,
+    symbol: str,
+    side: str,
+    binding_id: int,
+    entered: bool,
+    updated_at: datetime,
+) -> None:
+    with session_factory() as session:
+        lifecycle = (
+            session.query(StrategyLifecycle)
+            .filter(StrategyLifecycle.chat_id == chat_id)
+            .filter(StrategyLifecycle.message_id == message_id)
+            .filter(StrategyLifecycle.symbol == symbol)
+            .filter(StrategyLifecycle.side == side)
+            .order_by(StrategyLifecycle.id.desc())
+            .first()
+        )
+        if lifecycle is None:
+            return
+        lifecycle.execution_binding_id = binding_id
+        if entered and lifecycle.lifecycle_status == "pending_entry":
+            lifecycle.lifecycle_status = "entered"
+            lifecycle.entered_at = updated_at
+        lifecycle.updated_at = updated_at
+        session.commit()
 
 
 def _record_submitted_order_events(
@@ -784,6 +828,7 @@ def _find_open_position_id(
     draft: dict[str, Any],
     side: str,
     preferred_pos_id: str | None = None,
+    exclude_pos_ids: set[str] | None = None,
     attempts: int = 5,
     delay_seconds: float = 0.5,
 ) -> str | None:
@@ -797,6 +842,7 @@ def _find_open_position_id(
             draft=draft,
             side=side,
             preferred_pos_id=preferred_pos_id,
+            exclude_pos_ids=exclude_pos_ids,
         )
         pos_id = _first_payload_string(position, "posId", "pos_id", "id") if position else None
         if pos_id:
@@ -806,54 +852,22 @@ def _find_open_position_id(
     return None
 
 
-def _find_exact_open_position_id(
+def _load_matching_position_ids(
     deepcoin_client: DeepcoinTradingClientProtocol,
     *,
     draft: dict[str, Any],
     side: str,
-    pos_id: str,
-    attempts: int = 5,
-    delay_seconds: float = 0.5,
-) -> str | None:
-    """Return a position only when its id exactly matches the submitted order id."""
-
-    if not pos_id:
+) -> set[str] | None:
+    try:
+        positions = deepcoin_client.list_positions(inst_id=str(draft["instrument_id"]))
+    except Exception:
         return None
-    instrument_id = str(draft["instrument_id"]).upper()
-    margin_mode = _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross"))
-    position_mode = _deepcoin_position_mode(str(draft.get("position_mode") or "split"))
-    for attempt in range(attempts):
-        try:
-            positions = deepcoin_client.list_positions(inst_id=str(draft["instrument_id"]))
-        except Exception:
-            positions = []
-        for position in positions:
-            current_pos_id = _first_payload_string(position, "posId", "pos_id", "id")
-            if current_pos_id != str(pos_id):
-                continue
-            if str(position.get("instId") or "").upper() != instrument_id:
-                continue
-            if str(position.get("posSide") or "").lower() != side.lower():
-                continue
-            if str(position.get("mrgPosition") or position.get("posMode") or "").lower() not in {
-                "",
-                position_mode,
-            }:
-                continue
-            if str(position.get("mgnMode") or position.get("tdMode") or "").lower() not in {
-                "",
-                margin_mode,
-            }:
-                continue
-            try:
-                size = abs(float(position.get("pos") or position.get("size") or 0))
-            except (TypeError, ValueError):
-                size = 0
-            if size > 0:
-                return current_pos_id
-        if attempt + 1 < attempts:
-            time.sleep(delay_seconds)
-    return None
+    result: set[str] = set()
+    for position in _matching_positions(positions, draft=draft, side=side):
+        pos_id = _first_payload_string(position, "posId", "pos_id", "id")
+        if pos_id:
+            result.add(pos_id)
+    return result
 
 
 def _select_matching_position(
@@ -862,7 +876,32 @@ def _select_matching_position(
     draft: dict[str, Any],
     side: str,
     preferred_pos_id: str | None = None,
+    exclude_pos_ids: set[str] | None = None,
 ) -> dict[str, Any] | None:
+    matches = _matching_positions(positions, draft=draft, side=side)
+    if exclude_pos_ids is not None:
+        matches = [
+            match
+            for match in matches
+            if _first_payload_string(match, "posId", "pos_id", "id") not in exclude_pos_ids
+        ]
+    if not matches:
+        return None
+    if preferred_pos_id:
+        for match in matches:
+            if _first_payload_string(match, "posId", "pos_id", "id") == str(preferred_pos_id):
+                return match
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _matching_positions(
+    positions: list[dict[str, Any]],
+    *,
+    draft: dict[str, Any],
+    side: str,
+) -> list[dict[str, Any]]:
     instrument_id = str(draft["instrument_id"]).upper()
     margin_mode = _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross"))
     position_mode = _deepcoin_position_mode(str(draft.get("position_mode") or "split"))
@@ -889,17 +928,11 @@ def _select_matching_position(
         if size <= 0:
             continue
         matches.append(position)
-    if not matches:
-        return None
-    if preferred_pos_id:
-        for match in matches:
-            if _first_payload_string(match, "posId", "pos_id", "id") == str(preferred_pos_id):
-                return match
     return sorted(
         matches,
         key=lambda item: int(float(item.get("uTime") or item.get("cTime") or 0)),
         reverse=True,
-    )[0]
+    )
 
 
 def _first_payload_string(payload: dict[str, Any], *keys: str) -> str | None:

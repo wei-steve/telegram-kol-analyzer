@@ -26,6 +26,7 @@ DEEPCOIN_REPLACE_ORDER_SLTP_PATH = "/deepcoin/trade/replace-order-sltp"
 DEEPCOIN_TRIGGER_ORDER_PATH = "/deepcoin/trade/trigger-order"
 DEEPCOIN_ORDERS_PENDING_PATH = "/deepcoin/trade/orders-pending"
 DEEPCOIN_ORDERS_HISTORY_PATH = "/deepcoin/trade/orders-history"
+DEEPCOIN_TRADE_FILLS_PATH = "/deepcoin/trade/fills"
 DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH = "/deepcoin/trade/trigger-orders-pending"
 DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH = "/deepcoin/trade/trigger-orders-history"
 DEEPCOIN_SET_POSITION_SLTP_PATH = "/deepcoin/trade/set-position-sltp"
@@ -73,6 +74,9 @@ class DeepcoinTradingClientProtocol(Protocol):
 
     def list_order_history(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return historical regular orders, optionally filtered by instrument."""
+
+    def list_trade_fills(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
+        """Return recent trade fills, optionally filtered by instrument."""
 
     def list_trigger_orders_pending(self, *, inst_id: str) -> list[dict[str, Any]]:
         """Return pending trigger / TPSL orders for one instrument."""
@@ -175,6 +179,17 @@ class DeepcoinRestClient:
             "GET",
             _path_with_query(
                 DEEPCOIN_ORDERS_HISTORY_PATH,
+                {"instType": "SWAP", "instId": inst_id},
+            ),
+        )
+        data = payload.get("data")
+        return data if isinstance(data, list) else []
+
+    def list_trade_fills(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            _path_with_query(
+                DEEPCOIN_TRADE_FILLS_PATH,
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )

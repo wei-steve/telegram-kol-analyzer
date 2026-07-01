@@ -81,6 +81,10 @@ def build_deepcoin_order_draft(
     entry_range_order_style = str(
         payload_preview.get("entry_range_order_style") or "conservative"
     ).lower()
+    current_price = _parse_optional_price(payload_preview.get("current_price"), symbol=symbol)
+    market_entry_deviation_pct = _parse_optional_float(
+        payload_preview.get("max_market_entry_deviation_pct")
+    )
     take_profit_prices = _parse_take_profit_prices(
         payload_preview.get("take_profit"),
         symbol=symbol,
@@ -88,6 +92,18 @@ def build_deepcoin_order_draft(
     take_profit_allocations = _normalize_take_profit_allocations(
         payload_preview.get("take_profit_allocations"),
         len(take_profit_prices),
+    )
+    hybrid_market_price = (
+        _hybrid_market_entry_price(
+            position_side=position_side,
+            low=entry_low,
+            high=entry_high,
+            current_price=current_price,
+            max_deviation_pct=market_entry_deviation_pct,
+            contract_spec=contract_spec,
+        )
+        if order_type == "limit"
+        else None
     )
     if order_type == "market":
         reference_price = _normalize_price((entry_low + entry_high) / 2, contract_spec)
@@ -112,6 +128,60 @@ def build_deepcoin_order_draft(
                     risk_budget=risk_budget,
                     allocation_pct=100.0,
                     entry_price=reference_price,
+                    stop_loss=stop_loss,
+                ),
+                stop_loss=stop_loss,
+                contract_spec=contract_spec,
+            ),
+        ]
+    elif hybrid_market_price is not None:
+        limit_price = _normalize_price((entry_low + entry_high) / 2, contract_spec)
+        order_legs = [
+            _order_leg(
+                side=open_side,
+                position_side=position_side,
+                order_type="market",
+                price=hybrid_market_price,
+                client_order_id=build_client_order_id(
+                    strategy_instance_id=strategy_instance_id,
+                    leg_index=1,
+                    kol_code=source_kol_code,
+                    message_id=source_message_id,
+                ),
+                allocation_pct=50.0,
+                risk_budget_usdt=_leg_risk_budget(
+                    risk_budget=risk_budget,
+                    allocation_pct=50.0,
+                ),
+                quantity=_estimate_leg_quantity(
+                    risk_budget=risk_budget,
+                    allocation_pct=50.0,
+                    entry_price=hybrid_market_price,
+                    stop_loss=stop_loss,
+                ),
+                stop_loss=stop_loss,
+                contract_spec=contract_spec,
+            ),
+            _order_leg(
+                side=open_side,
+                position_side=position_side,
+                order_type="limit",
+                price=limit_price,
+                client_order_id=build_client_order_id(
+                    strategy_instance_id=strategy_instance_id,
+                    leg_index=2,
+                    kol_code=source_kol_code,
+                    message_id=source_message_id,
+                ),
+                allocation_pct=50.0,
+                risk_budget_usdt=_leg_risk_budget(
+                    risk_budget=risk_budget,
+                    allocation_pct=50.0,
+                ),
+                quantity=_estimate_leg_quantity(
+                    risk_budget=risk_budget,
+                    allocation_pct=50.0,
+                    entry_price=limit_price,
                     stop_loss=stop_loss,
                 ),
                 stop_loss=stop_loss,
@@ -221,6 +291,11 @@ def build_deepcoin_order_draft(
             "default_cross_margin_split_position",
             "strategy_instance_id_required_for_exit_matching",
             *quantity_notes,
+            *(
+                ["range_entry_hybrid_market_half_limit_half"]
+                if hybrid_market_price is not None
+                else []
+            ),
         ],
     }
     if contract_spec is not None:
@@ -257,6 +332,16 @@ def _parse_optional_price(value: Any, *, symbol: str | None = None) -> float | N
     if prices:
         return prices[0]
     raise DeepcoinOrderDraftError("stop_loss must contain a numeric price")
+
+
+def _parse_optional_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _parse_take_profit_prices(value: Any, *, symbol: str | None = None) -> list[float]:
@@ -320,6 +405,26 @@ def _entry_leg_prices(
     first = _normalize_price(midpoint, contract_spec)
     second = _normalize_price(edge, contract_spec)
     return first, second
+
+
+def _hybrid_market_entry_price(
+    *,
+    position_side: str,
+    low: float,
+    high: float,
+    current_price: float | None,
+    max_deviation_pct: float | None,
+    contract_spec: DeepcoinContractSpec | None,
+) -> float | None:
+    if current_price is None or max_deviation_pct is None:
+        return None
+    anchor = high if position_side == "long" else low
+    if anchor <= 0:
+        return None
+    deviation_pct = abs(current_price - anchor) / anchor * 100
+    if deviation_pct > max_deviation_pct:
+        return None
+    return _normalize_price(current_price, contract_spec)
 
 
 def _estimate_leg_quantity(

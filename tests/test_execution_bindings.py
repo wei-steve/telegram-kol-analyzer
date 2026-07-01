@@ -237,6 +237,181 @@ def test_reconcile_deepcoin_execution_bindings_marks_restart_state(tmp_path):
     assert rows[1].last_exchange_status == "not_found_on_exchange"
 
 
+def test_reconcile_recovers_filled_order_position_id_when_unique(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    upsert_execution_binding(
+        session_factory,
+        _binding(order_id="order-filled", client_order_id="client-filled", status="open"),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="pending_entry",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-filled",
+                    "posSide": "long",
+                    "pos": "9",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 6, 30, 10, 0),
+    )
+
+    assert result.active == 1
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+
+    assert binding.status == "active"
+    assert binding.pos_id == "pos-filled"
+    assert binding.last_exchange_status == "position_active_recovered_without_pos_id"
+    assert lifecycle.execution_binding_id == binding.id
+    assert lifecycle.lifecycle_status == "entered"
+
+
+def test_reconcile_uses_order_history_to_pick_position_when_symbol_side_ambiguous(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    upsert_execution_binding(
+        session_factory,
+        _binding(order_id="order-filled", client_order_id="client-filled", status="open"),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="pending_entry",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-correct",
+                    "posSide": "long",
+                    "pos": "9",
+                    "avgPx": "68100",
+                    "cTime": "100000",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-other",
+                    "posSide": "long",
+                    "pos": "9",
+                    "avgPx": "69000",
+                    "cTime": "100100",
+                },
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            assert inst_id == "BTC-USDT-SWAP"
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "ordId": "order-filled",
+                    "clOrdId": "",
+                    "state": "filled",
+                    "avgPx": "68100",
+                    "fillSz": "9",
+                    "fillTime": "100000",
+                }
+            ]
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 6, 30, 10, 0),
+    )
+
+    assert result.active == 1
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+
+    assert binding.status == "active"
+    assert binding.pos_id == "pos-correct"
+    assert binding.last_exchange_status == "position_active_recovered_from_filled_order"
+
+
+def test_reconcile_does_not_guess_position_id_when_ambiguous(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    upsert_execution_binding(
+        session_factory,
+        _binding(order_id="order-1", client_order_id="client-1", status="open"),
+    )
+    upsert_execution_binding(
+        session_factory,
+        _binding(
+            chat_id=101,
+            message_id=56,
+            order_id="order-2",
+            client_order_id="client-2",
+            status="open",
+        ),
+    )
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-a",
+                    "posSide": "long",
+                    "pos": "9",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-b",
+                    "posSide": "long",
+                    "pos": "9",
+                },
+            ]
+
+        def list_open_orders(self):
+            return []
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+    )
+
+    assert result.stale == 2
+    with session_factory() as session:
+        rows = session.query(ExecutionBinding).order_by(ExecutionBinding.chat_id).all()
+
+    assert [row.pos_id for row in rows] == [None, None]
+
+
 def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     upsert_execution_binding(

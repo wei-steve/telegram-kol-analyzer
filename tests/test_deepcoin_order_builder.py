@@ -145,6 +145,40 @@ def test_build_deepcoin_order_draft_builds_single_market_order_leg():
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
 
 
+def test_build_deepcoin_order_draft_hybrid_range_entry_near_upper_edge():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            contract="ETH-USDT",
+            entry_range="1565-1585",
+            stop_loss="1545",
+            take_profit="1605/1625/1645",
+            risk_budget_usdt=20.0,
+            current_price=1585.0,
+            max_market_entry_deviation_pct=0.15,
+        ),
+        contract_spec=DeepcoinContractSpec(
+            instrument_id="ETH-USDT-SWAP",
+            contract_value=0.1,
+            quantity_step=0.1,
+            min_quantity=0.1,
+            price_tick=0.01,
+        ),
+    )
+
+    assert draft["blocking_reason_codes"] == []
+    assert draft["order_legs"][0]["order_type"] == "market"
+    assert draft["order_legs"][0]["price"] == 1585.0
+    assert draft["order_legs"][0]["risk_budget_usdt"] == 10.0
+    assert draft["order_legs"][0]["quantity"] == 2.5
+    assert draft["order_legs"][0]["estimated_stop_loss_usdt"] == 10.0
+    assert draft["order_legs"][1]["order_type"] == "limit"
+    assert draft["order_legs"][1]["price"] == 1575.0
+    assert draft["order_legs"][1]["risk_budget_usdt"] == 10.0
+    assert draft["order_legs"][1]["quantity"] == 3.3
+    assert draft["order_legs"][1]["estimated_stop_loss_usdt"] == 9.9
+    assert "range_entry_hybrid_market_half_limit_half" in draft["notes"]
+
+
 def test_build_deepcoin_order_draft_uses_configured_kol_code_for_client_order_id():
     draft = build_deepcoin_order_draft(
         _payload_preview(

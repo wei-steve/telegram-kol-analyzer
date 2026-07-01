@@ -4,6 +4,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, RawMessage, SignalCandidate
+from telegram_kol_research.models import StrategyLifecycle, TradeSignal
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
@@ -83,7 +84,7 @@ class _ProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
 
     def place_order(self, order_payload):
         self.payloads.append(order_payload)
-        return {"code": "0", "data": {"ordId": "order-market-1"}}
+        return {"code": "0", "data": {"ordId": "order-market-1", "posId": "pos-market-1"}}
 
     def set_position_sltp(self, protection_payload):
         self.protection_payloads.append(protection_payload)
@@ -109,7 +110,7 @@ class _OrderProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
         raise DeepcoinClientError("order_not_open")
 
 
-class _DelayedExactPositionDeepcoinClient(_OrderProtectionFailingDeepcoinClient):
+class _DelayedFilledPositionDeepcoinClient(_OrderProtectionFailingDeepcoinClient):
     def __init__(self):
         super().__init__()
         self.position_calls = 0
@@ -121,7 +122,7 @@ class _DelayedExactPositionDeepcoinClient(_OrderProtectionFailingDeepcoinClient)
         return [
             *self.positions,
             {
-                "posId": "order-1",
+                "posId": "pos-filled-1",
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "long",
                 "pos": "7",
@@ -203,6 +204,32 @@ def _persist_ready_item(session_factory):
         persist_ready_confirmation=True,
         confirmed_at=datetime(2026, 6, 12, 20, 0, tzinfo=UTC),
     )
+
+
+def _persist_lifecycle(
+    session_factory,
+    *,
+    chat_id=100,
+    message_id=55,
+    symbol="BTC",
+    side="long",
+):
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=chat_id,
+                message_id=message_id,
+                symbol=symbol,
+                side=side,
+                lifecycle_status="pending_entry",
+                signal_at=datetime(2026, 6, 12, 8, 0),
+                entry_range_low=68000.0,
+                entry_range_high=68200.0,
+                stop_loss=67500.0,
+                take_profit="69000 / 70000",
+            )
+        )
+        session.commit()
 
 
 def _persist_ready_market_item(session_factory):
@@ -432,6 +459,7 @@ def test_submit_recovery_order_live_blocks_when_auto_trade_is_disabled(tmp_path)
 def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _persist_ready_item(session_factory)
+    _persist_lifecycle(session_factory)
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
     fake_client = _FakeDeepcoinClient()
 
@@ -464,10 +492,12 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
+        lifecycle = session.query(StrategyLifecycle).one()
     assert binding.status == "open"
     assert binding.order_id == "order-1,order-2"
     assert binding.client_order_id == "TK649760E806ACF61,TK729D11F4739D2A2"
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
+    assert lifecycle.execution_binding_id == binding.id
     assert [event.action for event in events] == [
         "create_limit_entry",
         "create_limit_entry",
@@ -501,33 +531,38 @@ def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):
     assert result["order_count"] == 2
     with session_factory() as session:
         assert session.query(ExecutionBinding).count() == 1
+        assert session.query(TradeSignal).filter_by(id=signal.id).one().status == "submitted"
 
 
 def test_market_submit_persists_binding_when_position_protection_fails(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _persist_ready_market_item(session_factory)
+    _persist_lifecycle(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+    )
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
     fake_client = _ProtectionFailingDeepcoinClient()
 
-    try:
-        submit_recovery_order_live(
-            session_factory,
-            chat_id=200,
-            message_id=66,
-            symbol="BTC",
-            side="short",
-            deepcoin_client=fake_client,
-            contract_spec_provider=_StaticContractSpecProvider(),
-            submitted_at=datetime(2026, 6, 30, 8, 3, tzinfo=UTC),
-        )
-    except Exception as exc:
-        assert "missing_take_profit_for_protection" in str(exc)
-    else:
-        raise AssertionError("expected protection setup failure")
+    result = submit_recovery_order_live(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        submitted_at=datetime(2026, 6, 30, 8, 3, tzinfo=UTC),
+    )
 
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
 
+    assert result["submitted"] is True
+    assert "position_protection_failed_after_entry_submitted" in result["warnings"]
     assert binding.status == "active"
     assert binding.last_exchange_status == "position_active_protection_failed"
     assert binding.order_id == "order-market-1"
@@ -537,37 +572,40 @@ def test_market_submit_persists_binding_when_position_protection_fails(tmp_path)
 def test_limit_submit_does_not_attach_protection_to_unrelated_position(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _persist_ready_item(session_factory)
+    _persist_lifecycle(session_factory)
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
     fake_client = _OrderProtectionFailingDeepcoinClient()
 
-    try:
-        submit_recovery_order_live(
-            session_factory,
-            chat_id=100,
-            message_id=55,
-            symbol="BTC",
-            side="long",
-            deepcoin_client=fake_client,
-            contract_spec_provider=_StaticContractSpecProvider(),
-            submitted_at=datetime(2026, 6, 12, 21, 0, tzinfo=UTC),
-        )
-    except DeepcoinClientError as exc:
-        assert "order_not_open" in str(exc)
-    else:
-        raise AssertionError("expected order protection failure")
+    result = submit_recovery_order_live(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        submitted_at=datetime(2026, 6, 12, 21, 0, tzinfo=UTC),
+    )
 
+    assert result["submitted"] is True
+    assert "order_protection_failed_after_entry_submitted" in result["warnings"]
     assert fake_client.payloads[0]["ordType"] == "limit"
     assert fake_client.protection_payloads[0]["orderSysID"] == "order-1"
     assert fake_client.position_protection_payloads == []
     with session_factory() as session:
-        assert session.query(ExecutionBinding).count() == 0
+        binding = session.query(ExecutionBinding).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+    assert binding.status == "open"
+    assert binding.order_id == "order-1,order-2"
+    assert binding.last_exchange_status == "order_open_protection_failed"
+    assert lifecycle.execution_binding_id == binding.id
 
 
-def test_limit_submit_waits_for_exact_filled_position_before_position_sltp(tmp_path):
+def test_limit_submit_uses_filled_position_id_even_when_different_from_order_id(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _persist_ready_item(session_factory)
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
-    fake_client = _DelayedExactPositionDeepcoinClient()
+    fake_client = _DelayedFilledPositionDeepcoinClient()
 
     result = submit_recovery_order_live(
         session_factory,
@@ -583,11 +621,11 @@ def test_limit_submit_waits_for_exact_filled_position_before_position_sltp(tmp_p
 
     assert result["submitted"] is True
     assert fake_client.protection_payloads[0]["orderSysID"] == "order-1"
-    assert fake_client.position_protection_payloads[0]["posId"] == "order-1"
+    assert fake_client.position_protection_payloads[0]["posId"] == "pos-filled-1"
     assert fake_client.position_calls == 2
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
-    assert binding.pos_id == "order-1"
+    assert binding.pos_id == "pos-filled-1"
 
 
 def test_process_next_trade_signal_live_returns_none_without_pending_signal(tmp_path):

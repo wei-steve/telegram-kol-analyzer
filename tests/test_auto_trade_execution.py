@@ -11,6 +11,14 @@ from telegram_kol_research.trading_settings import save_trading_settings
 
 class _StaticContractSpecProvider:
     def get_contract_spec(self, instrument_id):
+        if instrument_id == "ETH-USDT-SWAP":
+            return DeepcoinContractSpec(
+                instrument_id=instrument_id,
+                contract_value=0.1,
+                quantity_step=0.1,
+                min_quantity=0.1,
+                price_tick=0.01,
+            )
         return DeepcoinContractSpec(
             instrument_id=instrument_id,
             contract_value=0.001,
@@ -33,7 +41,10 @@ class _FakeDeepcoinClient:
 
     def place_order(self, order_payload):
         self.orders.append(order_payload)
-        return {"code": "0", "data": {"ordId": f"order-{len(self.orders)}"}}
+        data = {"ordId": f"order-{len(self.orders)}"}
+        if order_payload.get("ordType") == "market":
+            data["posId"] = f"pos-{len(self.orders)}"
+        return {"code": "0", "data": data}
 
     def trigger_order(self, order_payload):
         self.trigger_orders.append(order_payload)
@@ -65,6 +76,8 @@ class _FakeDeepcoinClient:
         return self.open_orders
 
     def get_ticker_price(self, *, inst_id):
+        if inst_id == "ETH-USDT-SWAP":
+            return 1585.0
         return 68100.0
 
 
@@ -77,6 +90,8 @@ def _persist_candidate(
     entry_text="68000-68200",
     stop_loss_text="67500",
     take_profit_text="69000 / 70000",
+    symbol="BTC",
+    side="long",
 ):
     with session_factory() as session:
         raw = RawMessage(
@@ -93,8 +108,8 @@ def _persist_candidate(
         session.add(
             SignalCandidate(
                 raw_message_id=raw.id,
-                symbol="BTC",
-                side="long",
+                symbol=symbol,
+                side=side,
                 event_type="entry_signal",
                 entry_text=entry_text,
                 stop_loss_text=stop_loss_text,
@@ -139,6 +154,7 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
             "auto_trade_enabled": True,
             "default_max_loss_usdt": 20,
             "allowed_symbols": ["BTC", "ETH"],
+            "max_market_entry_deviation_pct": 0.01,
         },
     )
     fake_client = _FakeDeepcoinClient()
@@ -166,6 +182,55 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
     assert binding.margin_mode == "cross"
     assert binding.position_mode == "split"
+
+
+def test_auto_process_range_entry_uses_half_market_half_midpoint_limit_when_near_edge(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="ETH long 1565-1585 SL 1545 TP 1605/1625/1645",
+        entry_text="1565-1585",
+        stop_loss_text="1545",
+        take_profit_text="1605/1625/1645",
+        symbol="ETH",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+            "max_market_entry_deviation_pct": 0.15,
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 1, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert len(fake_client.orders) == 2
+    assert fake_client.orders[0]["ordType"] == "market"
+    assert fake_client.orders[0]["sz"] == "2.5"
+    assert fake_client.orders[1]["ordType"] == "limit"
+    assert fake_client.orders[1]["px"] == "1575.0"
+    assert fake_client.orders[1]["sz"] == "3.3"
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
+    assert binding.symbol == "ETH"
+    assert binding.order_id == "order-1,order-2"
+    assert [event.action for event in events] == [
+        "open_market_position",
+        "set_position_tpsl",
+        "create_limit_entry",
+    ]
 
 
 def test_auto_process_message_trade_signal_blocks_media_when_vision_auto_trade_disabled(tmp_path):
@@ -437,6 +502,82 @@ def test_auto_process_message_trade_signal_closes_position_from_close_signal(tmp
     assert result["management_action"] == "close_position"
     assert fake_client.orders[0]["closePosId"] == "pos-1"
     assert fake_client.orders[0]["side"] == "sell"
+
+
+def test_auto_process_message_trade_signal_recovers_filled_binding_before_close(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                strategy_instance_id="deepcoin:100:55:BTC:long",
+                kol_id="alice",
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                order_id="order-filled",
+                client_order_id="client-filled",
+                pos_id=None,
+                status="open",
+            )
+        )
+        raw = RawMessage(
+            chat_id=100,
+            message_id=56,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 6, 12, 8, 5),
+            text="BTC leave now",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="long",
+                event_type="close_signal",
+                parse_source="lifecycle_ai",
+                confidence=0.95,
+            )
+        )
+        session.commit()
+        raw_message_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.positions = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-filled",
+            "posSide": "long",
+            "pos": "33",
+        }
+    ]
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        processed_at=datetime(2026, 6, 12, 8, 6, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert result["management_action"] == "close_position"
+    assert fake_client.orders[0]["closePosId"] == "pos-filled"
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+    assert binding.pos_id == "pos-filled"
+    assert binding.status == "closed"
 
 
 def test_auto_process_message_trade_signal_partially_closes_profit_percent(tmp_path):

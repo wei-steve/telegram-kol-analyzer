@@ -131,7 +131,7 @@ def select_position_tpsl_orders(
         if _normalize_side(str(order.get("posSide") or order.get("side") or "")) != position_side:
             continue
         order_time = _first_string(order, "cTime", "uTime", "createdTime", "created_at")
-        if not order_time or order_time != position_time:
+        if not _tpsl_time_matches_position(order_time, position_time):
             continue
         order_size = _normalize_size(order.get("sz") or order.get("size"))
         if order_size not in {position_size, "0"}:
@@ -354,13 +354,32 @@ def _has_nonzero_size(position: dict[str, Any]) -> bool:
         return False
 
 
+def _tpsl_time_matches_position(order_time: str | None, position_time: str) -> bool:
+    if not order_time:
+        return False
+    if order_time == position_time:
+        return True
+    order_ms = _to_int(order_time)
+    position_ms = _to_int(position_time)
+    if order_ms is None or position_ms is None:
+        return False
+    return 0 <= order_ms - position_ms <= 86_400_000
+
+
+def _to_int(value: Any) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def _position_tpsl_match_key(
     position: dict[str, Any],
 ) -> tuple[str | None, str, str, str, str] | None:
     inst_id = str(position.get("instId") or "").upper()
     side = _normalize_side(str(position.get("posSide") or position.get("side") or ""))
     size = _normalize_size(position.get("pos") or position.get("size"))
-    created_time = _first_string(position, "cTime", "uTime", "createdTime", "created_at")
+    created_time = _latest_time_string(position, "cTime", "uTime", "createdTime", "created_at")
     if not inst_id or not side or not size or not created_time:
         return None
     return (
@@ -370,3 +389,14 @@ def _position_tpsl_match_key(
         size,
         created_time,
     )
+
+
+def _latest_time_string(payload: dict[str, Any], *keys: str) -> str | None:
+    values = [
+        value
+        for value in (_first_string({key: payload.get(key)}, key) for key in keys)
+        if value is not None
+    ]
+    if not values:
+        return None
+    return max(values, key=lambda item: _to_int(item) or 0)

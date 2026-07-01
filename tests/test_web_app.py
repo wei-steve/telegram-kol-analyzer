@@ -452,6 +452,7 @@ def test_bind_live_position_api_attaches_unbound_position_to_lifecycle(tmp_path)
             lifecycle_status="entered",
             signal_at=datetime(2026, 6, 30, 9, 0),
             entered_at=datetime(2026, 6, 30, 9, 1),
+            entry_price_actual=59761.2,
         )
         session.add(lifecycle)
         session.commit()
@@ -474,9 +475,106 @@ def test_bind_live_position_api_attaches_unbound_position_to_lifecycle(tmp_path)
         assert lifecycle.execution_binding_id == binding.id
 
 
+def test_bind_live_position_api_rejects_wrong_attribution_candidate(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-btc",
+                    "posSide": "short",
+                    "pos": "9",
+                    "avgPx": "58100",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+    )
+    with app.state.session_factory() as session:
+        wrong_lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 30, 9, 0),
+            entered_at=datetime(2026, 6, 30, 9, 1),
+            entry_price_actual=59000,
+        )
+        session.add(wrong_lifecycle)
+        session.commit()
+        lifecycle_id = wrong_lifecycle.id
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/execution/bind-live-position",
+        json={"pos_id": "pos-btc", "lifecycle_id": lifecycle_id},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "live position does not match this KOL strategy"
+
+
+def test_execution_dashboard_disables_ambiguous_live_position_bindings(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-btc",
+                    "posSide": "long",
+                    "pos": "9",
+                    "avgPx": "58100",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+    )
+    with app.state.session_factory() as session:
+        session.add_all(
+            [
+                StrategyLifecycle(
+                    chat_id=88,
+                    message_id=10,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="entered",
+                    signal_at=datetime(2026, 6, 30, 9, 0),
+                    entered_at=datetime(2026, 6, 30, 9, 1),
+                    entry_price_actual=58100,
+                ),
+                StrategyLifecycle(
+                    chat_id=99,
+                    message_id=20,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="entered",
+                    signal_at=datetime(2026, 6, 30, 9, 5),
+                    entered_at=datetime(2026, 6, 30, 9, 6),
+                    entry_price_actual=58102,
+                ),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get("/execution")
+
+    assert response.status_code == 200
+    assert response.text.count("需核对") == 2
+    assert 'title="归属不唯一或置信度不足，禁止一键绑定"' in response.text
+
+
 def test_message_recognition_api_updates_message_result(tmp_path):
     database_path = tmp_path / "research.db"
-    app = create_web_app(database_path=database_path)
+    app = create_web_app(
+        database_path=database_path,
+        ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
+    )
     with app.state.session_factory() as session:
         raw_message = RawMessage(
             chat_id=88,
@@ -500,7 +598,10 @@ def test_message_recognition_api_updates_message_result(tmp_path):
 
 def test_message_recognition_api_runs_auto_trade_executor_after_recognition(tmp_path):
     database_path = tmp_path / "research.db"
-    app = create_web_app(database_path=database_path)
+    app = create_web_app(
+        database_path=database_path,
+        ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
+    )
     calls = []
     app.state.auto_trade_executor = lambda raw_message_id: (
         calls.append(raw_message_id)
@@ -720,7 +821,8 @@ def test_ai_recognition_config_api_saves_prompt(tmp_path):
 
     assert response.status_code == 200
     assert response.json()["recognition_prompt"].startswith("只识别明确策略。")
-    assert response.json()["lifecycle_event_prompt"] == "识别生命周期事件。"
+    assert response.json()["lifecycle_event_prompt"].startswith("识别生命周期事件。")
+    assert "价格简写" in response.json()["lifecycle_event_prompt"]
     assert response.json()["mimo_direct_prompt"].startswith("直接阅读图片和文字。")
     assert "\u5386\u53f2\u7b56\u7565\u622a\u56fe" in response.json()["mimo_direct_prompt"]
     page = client.get("/")
@@ -1307,10 +1409,11 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
     assert response.status_code == 200
     assert response.json()["submitted"] is True
     assert response.json()["order_count"] == 2
-    assert fake_client.payloads == []
-    assert fake_client.trigger_payloads[0]["mrgPosition"] == "split"
-    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0
-    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
+    assert [payload["ordType"] for payload in fake_client.payloads] == ["limit", "limit"]
+    assert fake_client.payloads[0]["tdMode"] == "cross"
+    assert fake_client.protection_payloads[0]["orderSysID"] == "order-1"
+    assert fake_client.protection_payloads[0]["tpTriggerPx"] == "69000.0"
+    assert fake_client.protection_payloads[0]["slTriggerPx"] == "67500.0"
 
 
 def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
@@ -1416,5 +1519,5 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
     assert process_response.status_code == 200
     assert process_response.json()["processed"] is True
     assert process_response.json()["result"]["signal_id"] == signal.id
-    assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
-    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0
+    assert fake_client.payloads[0]["tdMode"] == "cross"
+    assert fake_client.protection_payloads[0]["tpTriggerPx"] == "69000.0"

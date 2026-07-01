@@ -39,6 +39,7 @@ from telegram_kol_research.ai_recognition_config import (
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+from telegram_kol_research.deepcoin_execution_actions import recover_missing_position_protections
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
@@ -58,6 +59,7 @@ from telegram_kol_research.llm_chat import (
 )
 from telegram_kol_research.execution_bindings import bind_deepcoin_position_to_lifecycle
 from telegram_kol_research.execution_bindings import list_active_positions
+from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
 from telegram_kol_research.execution_bindings import sync_manual_closed_deepcoin_positions
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import list_recovery_decisions
@@ -404,6 +406,13 @@ def _load_deepcoin_live_position_rows(
                             session,
                             symbol=symbol,
                             side=side,
+                            entry_price_actual=_float_or_none(position.get("avgPx")),
+                            stop_loss=_float_or_none(
+                                _deepcoin_tpsl_price(tpsl_order, "sl") if tpsl_order else None
+                            ),
+                            take_profit=_float_or_none(
+                                _deepcoin_tpsl_price(tpsl_order, "tp") if tpsl_order else None
+                            ),
                             group_label_by_chat_id=group_label_by_chat_id,
                         )
                         if binding is None
@@ -512,6 +521,9 @@ def _load_live_position_attribution_candidates(
     *,
     symbol: str,
     side: str,
+    entry_price_actual: float | None,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
     group_label_by_chat_id: dict[int, str],
     limit: int = 6,
 ) -> list[dict[str, object]]:
@@ -520,12 +532,21 @@ def _load_live_position_attribution_candidates(
         .filter(StrategyLifecycle.symbol == symbol)
         .filter(StrategyLifecycle.side == side)
         .filter(StrategyLifecycle.lifecycle_status.in_(["entered", "pending_entry"]))
+        .filter(StrategyLifecycle.execution_binding_id.is_(None))
         .order_by(StrategyLifecycle.signal_at.desc(), StrategyLifecycle.id.desc())
-        .limit(limit)
+        .limit(max(limit * 4, 24))
         .all()
     )
     result: list[dict[str, object]] = []
     for lifecycle in rows:
+        score, reasons = _score_live_position_attribution(
+            lifecycle,
+            entry_price_actual=entry_price_actual,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        )
+        if score <= 0:
+            continue
         result.append(
             {
                 "lifecycle_id": lifecycle.id,
@@ -539,9 +560,113 @@ def _load_live_position_attribution_candidates(
                 or _format_range(lifecycle.entry_range_low, lifecycle.entry_range_high),
                 "stop_loss": lifecycle.stop_loss,
                 "take_profit": lifecycle.take_profit,
+                "match_score": score,
+                "match_reasons": reasons,
+                "bindable": False,
             }
         )
-    return result
+    result.sort(key=lambda item: (-int(item["match_score"]), str(item["group_label"])))
+    if result and _has_unique_confident_attribution(result):
+        result[0]["bindable"] = True
+    return result[:limit]
+
+
+def _has_unique_confident_attribution(candidates: list[dict[str, object]]) -> bool:
+    if not candidates:
+        return False
+    top_score = int(candidates[0].get("match_score") or 0)
+    second_score = int(candidates[1].get("match_score") or 0) if len(candidates) > 1 else 0
+    return top_score >= 70 and second_score < 70
+
+
+def _score_live_position_attribution(
+    lifecycle: StrategyLifecycle,
+    *,
+    entry_price_actual: float | None,
+    stop_loss: float | None,
+    take_profit: float | None,
+) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    entry_score = _score_entry_price_match(lifecycle, entry_price_actual)
+    if entry_score:
+        score += entry_score
+        reasons.append("入场价匹配")
+    elif entry_price_actual is not None:
+        return 0, []
+
+    if stop_loss is not None and lifecycle.stop_loss is not None:
+        if _prices_close(stop_loss, lifecycle.stop_loss, tolerance_pct=0.006):
+            score += 25
+            reasons.append("止损匹配")
+        else:
+            score -= 20
+
+    if take_profit is not None and _take_profit_matches(take_profit, lifecycle.take_profit):
+        score += 15
+        reasons.append("止盈匹配")
+
+    if lifecycle.lifecycle_status == "entered":
+        score += 10
+        reasons.append("策略已入场")
+
+    return max(score, 0), reasons
+
+
+def _score_entry_price_match(
+    lifecycle: StrategyLifecycle,
+    entry_price_actual: float | None,
+) -> int:
+    if entry_price_actual is None or entry_price_actual <= 0:
+        return 0
+    if lifecycle.entry_price_actual is not None:
+        if _prices_close(entry_price_actual, lifecycle.entry_price_actual, tolerance_pct=0.006):
+            return 65
+        if _prices_close(entry_price_actual, lifecycle.entry_price_actual, tolerance_pct=0.015):
+            return 35
+        return 0
+
+    low = lifecycle.entry_range_low
+    high = lifecycle.entry_range_high
+    if low is None and high is None:
+        return 0
+    if low is None:
+        low = high
+    if high is None:
+        high = low
+    assert low is not None and high is not None
+    lower, upper = sorted((float(low), float(high)))
+    padding = max(abs(entry_price_actual) * 0.004, 1.0)
+    if lower - padding <= entry_price_actual <= upper + padding:
+        return 65
+    nearest = lower if entry_price_actual < lower else upper
+    if _prices_close(entry_price_actual, nearest, tolerance_pct=0.012):
+        return 35
+    return 0
+
+
+def _prices_close(actual: float, expected: float, *, tolerance_pct: float) -> bool:
+    baseline = max(abs(expected), 1.0)
+    return abs(actual - expected) / baseline <= tolerance_pct
+
+
+def _take_profit_matches(actual: float, take_profit_text: str | None) -> bool:
+    for value in _extract_price_numbers(take_profit_text):
+        if _prices_close(actual, value, tolerance_pct=0.008):
+            return True
+    return False
+
+
+def _extract_price_numbers(value: str | None) -> list[float]:
+    if not value:
+        return []
+    numbers: list[float] = []
+    for match in re.findall(r"\d+(?:\.\d+)?", str(value)):
+        try:
+            numbers.append(float(match))
+        except ValueError:
+            continue
+    return numbers
 
 
 def _format_range(low: float | None, high: float | None) -> str | None:
@@ -1383,6 +1508,25 @@ def create_web_app(
                 client=client,
                 synced_at=app.state.now_provider(),
             )
+            reconcile_result = (
+                reconcile_deepcoin_execution_bindings(
+                    app.state.session_factory,
+                    client=client,
+                    recovered_at=app.state.now_provider(),
+                )
+                if hasattr(client, "list_open_orders")
+                else None
+            )
+            protection_result = (
+                recover_missing_position_protections(
+                    app.state.session_factory,
+                    deepcoin_client=client,
+                    recovered_at=app.state.now_provider(),
+                )
+                if hasattr(client, "set_position_sltp")
+                and hasattr(client, "list_trigger_orders_pending")
+                else None
+            )
         except DeepcoinClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:
@@ -1392,6 +1536,15 @@ def create_web_app(
             "checked": result.checked,
             "manually_closed": result.manually_closed,
             "skipped_without_pos_id": result.skipped_without_pos_id,
+            "reconciled_active": reconcile_result.active if reconcile_result else 0,
+            "reconciled_open": reconcile_result.open if reconcile_result else 0,
+            "reconciled_stale": reconcile_result.stale if reconcile_result else 0,
+            "protection_checked": protection_result.checked if protection_result else 0,
+            "protection_recovered": protection_result.protected if protection_result else 0,
+            "protection_skipped_existing": protection_result.skipped_existing if protection_result else 0,
+            "protection_skipped_missing_prices": (
+                protection_result.skipped_missing_prices if protection_result else 0
+            ),
         }
 
     @app.post("/api/execution/bind-live-position")
@@ -1420,6 +1573,57 @@ def create_web_app(
         )
         if active_position is None:
             raise HTTPException(status_code=404, detail="live position not found")
+        with app.state.session_factory() as session:
+            existing_binding = (
+                session.query(ExecutionBinding)
+                .filter(ExecutionBinding.venue == "deepcoin")
+                .filter(ExecutionBinding.status.in_(["open", "active"]))
+                .all()
+            )
+            if any(pos_id in _split_binding_ids(row.pos_id) for row in existing_binding):
+                raise HTTPException(status_code=409, detail="live position is already bound")
+
+            protection_key = _deepcoin_position_protection_key(active_position)
+            tpsl_order = _load_deepcoin_tpsl_orders_by_position_key(
+                client,
+                [active_position],
+            ).get(protection_key)
+            position_symbol = _symbol_from_deepcoin_inst_id(active_position.get("instId"))
+            position_side = str(
+                active_position.get("posSide") or active_position.get("side") or ""
+            ).lower()
+            candidates = _load_live_position_attribution_candidates(
+                session,
+                symbol=position_symbol,
+                side=position_side,
+                entry_price_actual=_float_or_none(active_position.get("avgPx")),
+                stop_loss=_float_or_none(
+                    _deepcoin_tpsl_price(tpsl_order, "sl") if tpsl_order else None
+                ),
+                take_profit=_float_or_none(
+                    _deepcoin_tpsl_price(tpsl_order, "tp") if tpsl_order else None
+                ),
+                group_label_by_chat_id={},
+                limit=24,
+            )
+            matched_candidate = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if int(candidate["lifecycle_id"]) == lifecycle_id_int
+                ),
+                None,
+            )
+            if matched_candidate is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="live position does not match this KOL strategy",
+                )
+            if not matched_candidate.get("bindable"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="live position attribution is ambiguous; bind from a unique high-confidence candidate",
+                )
         try:
             binding_id = bind_deepcoin_position_to_lifecycle(
                 app.state.session_factory,

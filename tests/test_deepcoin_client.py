@@ -125,10 +125,12 @@ def test_deepcoin_client_lists_order_and_trigger_history_with_swap_query():
     order_history = client.list_order_history(inst_id="ETH-USDT-SWAP")
     trigger_history = client.list_trigger_order_history(inst_id="ETH-USDT-SWAP")
     open_orders = client.list_open_orders(inst_id="ETH-USDT-SWAP")
+    trade_fills = client.list_trade_fills(inst_id="ETH-USDT-SWAP")
 
     assert order_history == [{"ordId": "order-1", "clOrdId": "client-1"}]
     assert trigger_history == [{"ordId": "order-1", "clOrdId": "client-1"}]
     assert open_orders == [{"ordId": "order-1", "clOrdId": "client-1"}]
+    assert trade_fills == [{"ordId": "order-1", "clOrdId": "client-1"}]
     assert [
         request["request_path"]
         for request in http_client.requests
@@ -136,6 +138,7 @@ def test_deepcoin_client_lists_order_and_trigger_history_with_swap_query():
         "/deepcoin/trade/orders-history?instType=SWAP&instId=ETH-USDT-SWAP",
         "/deepcoin/trade/trigger-orders-history?instType=SWAP&instId=ETH-USDT-SWAP",
         "/deepcoin/trade/orders-pending?instType=SWAP&instId=ETH-USDT-SWAP",
+        "/deepcoin/trade/fills?instType=SWAP&instId=ETH-USDT-SWAP",
     ]
 
 

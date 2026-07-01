@@ -184,7 +184,7 @@ def test_select_position_tpsl_orders_matches_deepcoin_zero_size_rows_by_position
             "instId": "ETH-USDT-SWAP",
             "posSide": "long",
             "sz": "0",
-            "cTime": "1782800000000",
+            "cTime": "1782900000000",
             "triggerOrderType": "TPSL",
             "ordId": "other-position",
             "slTriggerPrice": "1500",
@@ -198,6 +198,48 @@ def test_select_position_tpsl_orders_matches_deepcoin_zero_size_rows_by_position
         position=position,
         pending_trigger_orders=orders,
     ) == ["tp-1", "sl-1"]
+
+
+def test_select_position_tpsl_orders_matches_zero_size_rows_created_after_position():
+    position = {
+        "instId": "ETH-USDT-SWAP",
+        "posId": "1001123821237494",
+        "posSide": "long",
+        "pos": "3.3",
+        "cTime": "1782887701000",
+        "uTime": "1782887701000",
+    }
+    orders = [
+        {
+            "ordId": "1001123824502195",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "side": "sell",
+            "triggerOrderType": "TPSL",
+            "tpTriggerPx": None,
+            "slTriggerPx": None,
+            "triggerPx": "0",
+            "sz": "0",
+            "cTime": "1782889341000",
+            "posId": None,
+        },
+        {
+            "ordId": "old-other",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "side": "sell",
+            "triggerOrderType": "TPSL",
+            "triggerPx": "0",
+            "sz": "0",
+            "cTime": "1782800000000",
+            "posId": None,
+        },
+    ]
+
+    assert pending_tpsl_order_ids_for_position(
+        position=position,
+        pending_trigger_orders=orders,
+    ) == ["1001123824502195"]
 
 
 def test_select_position_tpsl_orders_deduplicates_combined_tpsl_order_id():

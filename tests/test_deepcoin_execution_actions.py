@@ -5,10 +5,11 @@ import pytest
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
 from telegram_kol_research.deepcoin_execution_actions import adjust_position_tpsl
+from telegram_kol_research.deepcoin_execution_actions import recover_missing_position_protections
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import upsert_execution_binding
 from telegram_kol_research.execution_events import list_execution_events
-from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import save_trading_settings
@@ -181,6 +182,94 @@ def test_adjust_position_tpsl_refuses_to_append_when_existing_tpsl_is_missing(tm
             trade_signal=trade_signal,
             deepcoin_client=client,
         )
+    assert client.protection_payloads == []
+
+
+def test_recover_missing_position_protection_sets_tpsl_from_lifecycle(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(
+        session_factory,
+        last_exchange_status="position_active_protection_failed",
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="ETH",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 1, 8, 0),
+                execution_binding_id=binding_id,
+                stop_loss=1545.0,
+                take_profit="1605/1625/1645",
+            )
+        )
+        session.commit()
+    client = _FakeDeepcoinClient()
+    client.trigger_pending = []
+
+    result = recover_missing_position_protections(
+        session_factory,
+        deepcoin_client=client,
+        recovered_at=datetime(2026, 7, 1, 9, 0, tzinfo=UTC),
+    )
+
+    assert result.checked == 1
+    assert result.protected == 1
+    assert client.protection_payloads == [
+        {
+            "instType": "SWAP",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "mrgPosition": "split",
+            "tdMode": "cross",
+            "posId": "pos-1",
+            "tpTriggerPx": "1605.0",
+            "tpTriggerPxType": "last",
+            "tpOrdPx": "-1",
+            "slTriggerPx": "1545.0",
+            "slTriggerPxType": "last",
+            "slOrdPx": "-1",
+        }
+    ]
+    events = list_execution_events(session_factory, execution_binding_id=binding_id)
+    assert events[0].action == "set_position_tpsl"
+    assert events[0].reason == "recover_missing_position_protection"
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+    assert binding.last_exchange_status == "position_tpsl_adjusted"
+
+
+def test_recover_missing_position_protection_skips_existing_tpsl(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="ETH",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 1, 8, 0),
+                execution_binding_id=binding_id,
+                stop_loss=1545.0,
+                take_profit="1605",
+            )
+        )
+        session.commit()
+    client = _FakeDeepcoinClient()
+
+    result = recover_missing_position_protections(
+        session_factory,
+        deepcoin_client=client,
+        recovered_at=datetime(2026, 7, 1, 9, 0, tzinfo=UTC),
+    )
+
+    assert result.checked == 1
+    assert result.protected == 0
+    assert result.skipped_existing == 1
     assert client.protection_payloads == []
 
 
