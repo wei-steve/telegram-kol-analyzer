@@ -29,7 +29,7 @@ class TradingSettings:
     entry_range_order_style: str = "conservative"
     take_profit_allocations: list[float] = field(default_factory=lambda: [50.0, 30.0, 20.0])
     move_stop_to_breakeven_after_tp1: bool = True
-    allow_vision_auto_trade: bool = False
+    allow_vision_auto_trade: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

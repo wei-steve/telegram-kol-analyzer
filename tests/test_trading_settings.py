@@ -18,6 +18,7 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.allowed_symbols == ["BTC", "ETH"]
     assert settings.entry_range_order_style == "conservative"
     assert settings.take_profit_allocations == [50.0, 30.0, 20.0]
+    assert settings.allow_vision_auto_trade is True
 
 
 def test_save_trading_settings_normalizes_user_input(tmp_path):
@@ -40,6 +41,7 @@ def test_save_trading_settings_normalizes_user_input(tmp_path):
     assert reloaded.allowed_symbols == ["BTC", "ETH", "SOL"]
     assert reloaded.take_profit_allocations == [50.0, 25.0, 25.0]
     assert reloaded.entry_range_order_style == "eager"
+    assert reloaded.allow_vision_auto_trade is True
 
 
 def test_apply_trading_settings_to_group_config_preserves_sender_overrides():
