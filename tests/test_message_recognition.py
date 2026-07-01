@@ -677,6 +677,52 @@ def test_recognize_message_now_cancels_recent_pending_limit_order(tmp_path):
     assert candidate.side == "short"
 
 
+def test_recognize_message_now_invalidates_pending_entry_from_later_context(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3888,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 30, 2, 51, tzinfo=UTC),
+            entry_range_low=60300,
+            entry_range_high=60800,
+            stop_loss=61300,
+            take_profit="59600/58900/58200",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=3903,
+            posted_at=datetime(2026, 6, 30, 8, 24, tzinfo=UTC),
+            text="BTC 59500 broke down, wait for next signal.",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "invalidated"
+    assert lifecycle.exit_reason == "context_invalidated"
+    assert lifecycle.exit_signal_message_id == 3903
+    assert candidate.event_type == "context_invalidation"
+    assert candidate.parse_source == "context_invalidation_heuristic"
+    assert candidate.symbol == "BTC"
+    assert candidate.side == "short"
+
+
 def test_ai_lifecycle_event_cancels_pending_order(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

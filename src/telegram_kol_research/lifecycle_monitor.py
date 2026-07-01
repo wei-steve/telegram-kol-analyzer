@@ -233,7 +233,7 @@ class StateTransition:
 @dataclass
 class LifecycleMonitorConfig:
     cycle_interval_seconds: int = 60
-    max_age_hours: int = 72
+    max_age_hours: int = 6
     max_age_days: int = 7  # how far back to load active signals
     candle_per_page: int = 1000
     http_timeout_seconds: float = 10.0
@@ -537,10 +537,12 @@ class LifecycleMonitor:
 
     async def _run_one_cycle(self) -> list[StateTransition]:
         now = self._now()
+        pending_expiry_transitions = self._build_pending_expiry_transitions(now)
 
         all_signals = self._load_active_signals()
         if not all_signals:
-            return []
+            self._apply_transitions(pending_expiry_transitions)
+            return pending_expiry_transitions
 
         by_contract: dict[str, list[StrategyLifecycle]] = {}
         for sig in all_signals:
@@ -553,7 +555,7 @@ class LifecycleMonitor:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        all_transitions: list[StateTransition] = []
+        all_transitions: list[StateTransition] = list(pending_expiry_transitions)
         for result in results:
             if isinstance(result, Exception):
                 logger.exception("Contract scan failed: %s", result)
@@ -567,12 +569,17 @@ class LifecycleMonitor:
 
     def _load_active_signals(self) -> list[StrategyLifecycle]:
         cutoff = self._now() - timedelta(days=self._config.max_age_days)
+        pending_cutoff = self._now() - timedelta(hours=self._config.max_age_hours)
         with self._session_factory() as session:
             signals = (
                 session.query(StrategyLifecycle)
                 .filter(
-                    StrategyLifecycle.lifecycle_status.in_(
-                        ["pending_entry", "entered"]
+                    or_(
+                        StrategyLifecycle.lifecycle_status == "entered",
+                        and_(
+                            StrategyLifecycle.lifecycle_status == "pending_entry",
+                            StrategyLifecycle.signal_at >= pending_cutoff,
+                        ),
                     ),
                     StrategyLifecycle.signal_at >= cutoff,
                 )
@@ -582,6 +589,27 @@ class LifecycleMonitor:
             self._attach_management_event_times(session, signals)
             self._attach_entry_texts(session, signals)
             return signals
+
+    def _build_pending_expiry_transitions(self, now: datetime) -> list[StateTransition]:
+        with self._session_factory() as session:
+            rows = (
+                session.query(StrategyLifecycle)
+                .filter(StrategyLifecycle.lifecycle_status == "pending_entry")
+                .all()
+            )
+        transitions: list[StateTransition] = []
+        for row in rows:
+            if self._is_expired(row, now):
+                transitions.append(
+                    StateTransition(
+                        signal_id=row.id,
+                        from_status="pending_entry",
+                        to_status="expired",
+                        exit_reason="expired",
+                        occurred_at=self._expiry_at(row),
+                    )
+                )
+        return transitions
 
     @staticmethod
     def _attach_management_event_times(session, signals: list[StrategyLifecycle]) -> None:
@@ -709,7 +737,16 @@ class LifecycleMonitor:
                     continue
 
                 if check.status == "pending_entry":
-                    if self._entry_triggered(sig, c):
+                    if self._is_expired(sig, ct):
+                        check.status = "done"
+                        transitions.append(StateTransition(
+                            signal_id=sig.id,
+                            from_status="pending_entry",
+                            to_status="expired",
+                            exit_reason="expired",
+                            occurred_at=self._expiry_at(sig),
+                        ))
+                    elif self._entry_triggered(sig, c):
                         check.status = "entered"
                         check.entry_triggered_at = ct
                         check.entry_price = self._resolve_entry_price(sig, c)
@@ -757,6 +794,15 @@ class LifecycleMonitor:
         for sig in signals_sorted:
             check = active.get(sig.id)
             if check is None:
+                continue
+            if check.status == "pending_entry" and self._is_expired(sig, now):
+                transitions.append(StateTransition(
+                    signal_id=sig.id,
+                    from_status="pending_entry",
+                    to_status="expired",
+                    exit_reason="expired",
+                    occurred_at=self._expiry_at(sig),
+                ))
                 continue
             if (
                 check.status == "pending_entry"
@@ -986,11 +1032,14 @@ class LifecycleMonitor:
     # ── expiry ─────────────────────────────────────────────────────
 
     def _is_expired(self, sig: StrategyLifecycle, now: datetime) -> bool:
+        expiry_at = self._expiry_at(sig)
+        return not _before(now, expiry_at)
+
+    def _expiry_at(self, sig: StrategyLifecycle) -> datetime:
         signal_at = sig.signal_at
         if signal_at.tzinfo is None:
             signal_at = signal_at.replace(tzinfo=UTC)
-        age = now - signal_at
-        return age > timedelta(hours=self._config.max_age_hours)
+        return signal_at + timedelta(hours=self._config.max_age_hours)
 
     # ── persistence ────────────────────────────────────────────────
 
@@ -1015,7 +1064,7 @@ class LifecycleMonitor:
                         t.occurred_at,
                     )
                     continue
-                if t.to_status in ("exited", "expired"):
+                if t.to_status in ("exited", "expired", "invalidated"):
                     reference_at = row.entered_at if row.entered_at is not None else row.signal_at
                     if t.exit_reason == "stop_loss":
                         management_at = _load_management_event_time(session, row)
@@ -1038,7 +1087,7 @@ class LifecycleMonitor:
                     if t.trigger_price is not None:
                         row.entry_price_actual = t.trigger_price
 
-                elif t.to_status in ("exited", "expired"):
+                elif t.to_status in ("exited", "expired", "invalidated"):
                     row.exited_at = t.occurred_at
                     row.exit_reason = row.exit_reason or t.exit_reason
                     if t.trigger_price is not None:

@@ -1519,6 +1519,8 @@ def _apply_lifecycle_transition_signal_if_matched(
         return True
     if _apply_entry_confirmation_signal_if_matched(session, raw_message, text):
         return True
+    if _apply_pending_entry_invalidation_if_matched(session, raw_message, text):
+        return True
     return False
 
 
@@ -1694,6 +1696,102 @@ def _apply_cancel_signal_if_matched(
         lifecycle=latest,
         parse_source="cancel_heuristic",
     )
+    return True
+
+
+def _apply_pending_entry_invalidation_if_matched(
+    session,
+    raw_message: RawMessage,
+    text: str,
+) -> bool:
+    normalized = (text or "").strip()
+    if not normalized or _looks_like_trading_education_content(normalized):
+        return False
+    if _parse_explicit_cancel_signal(normalized) is not None:
+        return False
+
+    symbol = _extract_exit_symbol(normalized)
+    if symbol is None:
+        return False
+
+    lowered = normalized.lower()
+    invalidation_terms = [
+        "没站稳",
+        "未站稳",
+        "没有站稳",
+        "跌破",
+        "破位",
+        "继续下探",
+        "继续下跌",
+        "继续回落",
+        "压力位继续下移",
+        "前方压力位继续下移",
+        "入场条件失效",
+        "策略失效",
+        "计划失效",
+        "作废",
+        "放弃",
+        "不做了",
+        "别进",
+        "不要进",
+        "等后续",
+    ]
+    english_terms = [
+        "invalidated",
+        "setup invalid",
+        "plan invalid",
+        "no entry",
+        "do not enter",
+        "skip entry",
+        "wait for next",
+        "broke down",
+    ]
+    if not any(term in normalized for term in invalidation_terms) and not any(
+        term in lowered for term in english_terms
+    ):
+        return False
+
+    query = session.query(StrategyLifecycle).filter(
+        StrategyLifecycle.chat_id == raw_message.chat_id,
+        StrategyLifecycle.symbol == symbol,
+        StrategyLifecycle.lifecycle_status == "pending_entry",
+    )
+    side = _extract_exit_side(normalized)
+    if side is not None:
+        query = query.filter(StrategyLifecycle.side == side)
+    if raw_message.posted_at is not None:
+        query = query.filter(StrategyLifecycle.signal_at <= raw_message.posted_at)
+        query = query.filter(StrategyLifecycle.signal_at >= raw_message.posted_at - timedelta(hours=24))
+
+    matches = query.order_by(
+        StrategyLifecycle.signal_at.desc(),
+        StrategyLifecycle.id.desc(),
+    ).all()
+    if not matches:
+        return False
+
+    latest = matches[0]
+    invalidated_at = raw_message.posted_at or utc_now()
+    latest.lifecycle_status = "invalidated"
+    latest.exit_reason = "context_invalidated"
+    latest.exited_at = invalidated_at
+    latest.exit_signal_message_id = raw_message.message_id
+    latest.updated_at = utc_now()
+
+    if latest.trade_idea_id is not None:
+        trade_idea = session.get(TradeIdea, latest.trade_idea_id)
+        if trade_idea is not None and trade_idea.status == "open":
+            trade_idea.status = "closed"
+            trade_idea.closed_at = invalidated_at
+
+    candidate = _upsert_close_signal_candidate(
+        session,
+        raw_message=raw_message,
+        lifecycle=latest,
+        parse_source="context_invalidation_heuristic",
+    )
+    candidate.event_type = "context_invalidation"
+    candidate.review_note = "Pending entry invalidated by later same-symbol market context."
     return True
 
 

@@ -654,6 +654,8 @@ def _lifecycle_status_label(status: str | None, exit_reason: str | None = None) 
         return "待入场"
     if status == "entered":
         return "持仓中"
+    if status == "invalidated" or exit_reason == "context_invalidated":
+        return "语境失效"
     if status == "expired" or exit_reason == "expired":
         return "过期未入场"
     if exit_reason == "cancelled":
@@ -674,6 +676,8 @@ def _lifecycle_status_detail(status: str | None, exit_reason: str | None = None)
         return "原策略已记录，等待价格触发或 KOL 后续确认。"
     if status == "entered":
         return "策略已入场，继续跟踪止盈、止损和 KOL 后续离场消息。"
+    if status == "invalidated" or exit_reason == "context_invalidated":
+        return "KOL 后续同币种消息改变了原入场语境，旧待入场策略已移出可执行列表。"
     if exit_reason == "cancelled":
         return "KOL 后续消息取消了这笔限价挂单，策略未入场。"
     if exit_reason == "kol_signal":
@@ -706,6 +710,8 @@ def _management_action_label(action: str | None) -> str:
 
 
 def _latest_event_label(status: str | None, exit_reason: str | None = None) -> str:
+    if status == "invalidated" or exit_reason == "context_invalidated":
+        return "语境失效"
     if exit_reason == "cancelled":
         return "取消挂单"
     if exit_reason == "kol_signal":
@@ -724,6 +730,8 @@ def _latest_event_label(status: str | None, exit_reason: str | None = None) -> s
 
 
 def _transition_text(status: str | None, exit_reason: str | None = None) -> str:
+    if status == "invalidated" or exit_reason == "context_invalidated":
+        return "pending_entry → invalidated"
     if exit_reason == "cancelled":
         return "pending_entry → cancelled"
     if status == "expired" or exit_reason == "expired":
@@ -1359,7 +1367,7 @@ def list_exited_strategies(
                 SignalCandidate.raw_message_id == RawMessage.id,
             )
             .filter(
-                StrategyLifecycle.lifecycle_status.in_(["exited", "expired"])
+                StrategyLifecycle.lifecycle_status.in_(["exited", "expired", "invalidated"])
             )
         )
         if chat_id is not None:
@@ -1662,8 +1670,11 @@ def _load_execution_strategy_items(
         session.query(StrategyLifecycle, SignalCandidate, RawMessage)
         .outerjoin(SignalCandidate, StrategyLifecycle.signal_candidate_id == SignalCandidate.id)
         .outerjoin(RawMessage, SignalCandidate.raw_message_id == RawMessage.id)
-        .filter(StrategyLifecycle.lifecycle_status == lifecycle_status)
     )
+    if selected_status == "exited":
+        q = q.filter(StrategyLifecycle.lifecycle_status.in_(["exited", "expired", "invalidated"]))
+    else:
+        q = q.filter(StrategyLifecycle.lifecycle_status == lifecycle_status)
     if selected_status == "pending":
         q = q.filter(~StrategyLifecycle.symbol.in_(["", "?", "QQ"]))
     order_column = {
