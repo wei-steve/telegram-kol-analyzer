@@ -480,7 +480,7 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     assert fake_client.payloads[0]["tdMode"] == "cross"
     assert fake_client.payloads[0]["mrgPosition"] == "split"
     assert fake_client.payloads[0]["ordType"] == "limit"
-    assert fake_client.payloads[0]["px"] == "68100.0"
+    assert fake_client.payloads[0]["px"] == "68200.0"
     assert fake_client.protection_payloads[0] == {
         "instId": "BTC-USDT-SWAP",
         "orderSysID": "order-1",

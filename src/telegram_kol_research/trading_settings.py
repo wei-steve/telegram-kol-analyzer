@@ -26,7 +26,7 @@ class TradingSettings:
     max_market_entry_deviation_pct: float = 0.15
     min_ai_confidence: float = 0.75
     allowed_symbols: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
-    entry_range_order_style: str = "conservative"
+    entry_range_order_style: str = "eager"
     take_profit_allocations: list[float] = field(default_factory=lambda: [50.0, 30.0, 20.0])
     move_stop_to_breakeven_after_tp1: bool = True
     allow_vision_auto_trade: bool = True

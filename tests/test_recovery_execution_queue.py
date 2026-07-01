@@ -95,7 +95,7 @@ def test_recovery_execution_preview_lists_approved_limit_orders_only(tmp_path):
                 "stop_loss": "67500",
                 "take_profit": None,
                 "take_profit_allocations": [50.0, 30.0, 20.0],
-                "entry_range_order_style": "conservative",
+                "entry_range_order_style": "eager",
                 "risk_budget_usdt": 100.0,
                 "source": {
                     "kol_id": "alice",
@@ -118,25 +118,25 @@ def test_recovery_execution_preview_lists_approved_limit_orders_only(tmp_path):
                             "side": "buy",
                             "position_side": "long",
                             "order_type": "limit",
-                            "price": 68100.0,
+                            "price": 68200.0,
                             "allocation_pct": 50.0,
                             "risk_budget_usdt": 50.0,
                             "client_order_id": "TK649760E806ACF61",
-                            "quantity": 0.083333,
+                            "quantity": 0.071429,
                             "quantity_unit": "base_asset_estimate",
-                            "estimated_stop_loss_usdt": 49.9998,
+                            "estimated_stop_loss_usdt": 50.0003,
                         },
                         {
                             "side": "buy",
                             "position_side": "long",
                             "order_type": "limit",
-                            "price": 68000.0,
+                            "price": 68100.0,
                             "allocation_pct": 50.0,
                             "risk_budget_usdt": 50.0,
                             "client_order_id": "TK729D11F4739D2A2",
-                            "quantity": 0.1,
+                            "quantity": 0.083333,
                             "quantity_unit": "base_asset_estimate",
-                            "estimated_stop_loss_usdt": 50.0,
+                            "estimated_stop_loss_usdt": 49.9998,
                         },
                 ],
                 "stop_loss": 67500.0,
@@ -232,6 +232,6 @@ def test_recovery_execution_preview_applies_contract_specs_when_available(tmp_pa
     }
     assert draft["blocking_reason_codes"] == []
     assert draft["contract_spec"]["instrument_id"] == "BTC-USDT-SWAP"
-    assert draft["order_legs"][0]["quantity"] == 83.0
+    assert draft["order_legs"][0]["quantity"] == 71.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
-    assert draft["order_legs"][1]["quantity"] == 100.0
+    assert draft["order_legs"][1]["quantity"] == 83.0
