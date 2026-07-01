@@ -155,15 +155,10 @@ def _build_trader_dashboard_state(
     )
 
     holding_counts_by_chat_id: dict[int, int] = {}
-    for pos in active_positions:
-        chat_id = pos.get("chat_id")
-        if chat_id is not None:
-            holding_counts_by_chat_id[int(chat_id)] = (
-                holding_counts_by_chat_id.get(int(chat_id), 0) + 1
-            )
-    for h in (holding_positions or []):
+    holding_count_source = holding_positions if holding_positions is not None else active_positions
+    for h in holding_count_source:
         chat_id = h.get("chat_id")
-        if chat_id is not None and int(chat_id) not in holding_counts_by_chat_id:
+        if chat_id is not None:
             holding_counts_by_chat_id[int(chat_id)] = (
                 holding_counts_by_chat_id.get(int(chat_id), 0) + 1
             )
@@ -192,11 +187,7 @@ def _build_trader_dashboard_state(
         group_lifecycle_counts = (
             lifecycle_counts_by_chat_id or {}
         ).get(group_chat_id)
-        group_holding_count = (
-            group_lifecycle_counts.get("entered", 0)
-            if group_lifecycle_counts is not None
-            else holding_counts_by_chat_id.get(group_chat_id, 0)
-        )
+        group_holding_count = holding_counts_by_chat_id.get(group_chat_id, 0)
         group_pending_count = (
             group_lifecycle_counts.get("pending_entry", 0)
             if group_lifecycle_counts is not None
@@ -252,7 +243,7 @@ def _build_strategy_kpi_counts(
     selected_holding = [item for item in holding_positions if belongs_to_selected(item)]
     selected_pending = [item for item in pending_entry_signals if belongs_to_selected(item)]
     if lifecycle_counts is not None:
-        holding_count = lifecycle_counts.get("entered", 0)
+        holding_count = len(selected_holding)
         pending_count = lifecycle_counts.get("pending_entry", len(selected_pending))
         exited_count = lifecycle_counts.get("exited", 0) + lifecycle_counts.get("expired", 0)
     else:

@@ -1,8 +1,10 @@
-﻿from datetime import UTC, datetime
+﻿import re
+from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import MediaAsset
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import SignalCandidate
@@ -358,9 +360,23 @@ def test_strategy_mid_panel_shows_take_profit_for_entered_lifecycle(tmp_path):
         )
         session.add(candidate)
         session.flush()
+        binding = ExecutionBinding(
+            kol_id="group:100",
+            chat_id=100,
+            message_id=56,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            order_id="order-56",
+            pos_id="pos-56",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
         session.add(
             StrategyLifecycle(
                 signal_candidate_id=candidate.id,
+                execution_binding_id=binding.id,
                 chat_id=100,
                 message_id=56,
                 symbol="BTC",
@@ -387,6 +403,44 @@ def test_strategy_mid_panel_shows_take_profit_for_entered_lifecycle(tmp_path):
     assert "数量" in response.text
     assert "0.625 BTC" in response.text
     assert "止损1000U" in response.text
+
+
+def test_strategy_mid_panel_hides_unbound_entered_lifecycle_from_holding(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=58,
+            posted_at=datetime(2026, 7, 1, 13, 56, tzinfo=UTC),
+            sender_name="chen",
+            text="BTC short 59400-59800 SL 60900 TP 57800/56000",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=58,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=raw_message.posted_at,
+                entered_at=raw_message.posted_at,
+                entry_range_low=59400,
+                entry_range_high=59800,
+                stop_loss=60900,
+                take_profit="57800/56000",
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/100/strategy-mid-panel?filter=holding")
+
+    assert response.status_code == 200
+    assert "BTC" not in response.text
+    assert re.search(r'class="strategy-section-count">\s*0\s*</span>', response.text)
 
 
 def test_strategy_mid_panel_shows_exited_lifecycle_filter(tmp_path):
@@ -619,9 +673,23 @@ def test_strategy_mid_panel_shows_market_entry_confirmation_event(tmp_path):
         )
         session.add(candidate)
         session.flush()
+        binding = ExecutionBinding(
+            kol_id="group:100",
+            chat_id=100,
+            message_id=374,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            order_id="order-374",
+            pos_id="pos-374",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
         session.add(
             StrategyLifecycle(
                 signal_candidate_id=candidate.id,
+                execution_binding_id=binding.id,
                 chat_id=100,
                 message_id=374,
                 symbol="BTC",
@@ -691,9 +759,23 @@ def test_strategy_mid_panel_shows_position_management_event(tmp_path):
         )
         session.add(candidate)
         session.flush()
+        binding = ExecutionBinding(
+            kol_id="group:100",
+            chat_id=100,
+            message_id=1395,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            order_id="order-1395",
+            pos_id="pos-1395",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
         session.add(
             StrategyLifecycle(
                 signal_candidate_id=candidate.id,
+                execution_binding_id=binding.id,
                 chat_id=100,
                 message_id=1395,
                 symbol="BTC",

@@ -1116,14 +1116,23 @@ def _entry_price_is_plausible(
 def list_holding_strategies(
     session_factory, *, chat_id: int | None = None, limit: int = 50
 ) -> list[dict[str, object]]:
-    """Return *entered* lifecycle records with their signal-candidate details."""
+    """Return exchange-bound *entered* lifecycle records.
+
+    A lifecycle can become ``entered`` from price monitoring alone.  The
+    holding tab is an execution view, so only strategies with a live DeepCoin
+    binding should be counted as real positions.
+    """
     from telegram_kol_research.models import (
-        SignalCandidate, RawMessage, StrategyLifecycle,
+        ExecutionBinding, SignalCandidate, RawMessage, StrategyLifecycle,
     )
 
     with session_factory() as session:
         q = (
-            session.query(StrategyLifecycle, SignalCandidate, RawMessage)
+            session.query(StrategyLifecycle, SignalCandidate, RawMessage, ExecutionBinding)
+            .join(
+                ExecutionBinding,
+                StrategyLifecycle.execution_binding_id == ExecutionBinding.id,
+            )
             .outerjoin(
                 SignalCandidate,
                 StrategyLifecycle.signal_candidate_id == SignalCandidate.id,
@@ -1133,6 +1142,8 @@ def list_holding_strategies(
                 SignalCandidate.raw_message_id == RawMessage.id,
             )
             .filter(StrategyLifecycle.lifecycle_status == "entered")
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .filter(ExecutionBinding.status.in_(["open", "active"]))
         )
         if chat_id is not None:
             q = q.filter(StrategyLifecycle.chat_id == chat_id)
@@ -1143,7 +1154,7 @@ def list_holding_strategies(
         rows = q.all()
 
     results: list[dict[str, object]] = []
-    for lc, cand, raw_msg in rows:
+    for lc, cand, raw_msg, binding in rows:
         row: dict[str, object] = {
             "lifecycle_id": lc.id,
             "chat_id": lc.chat_id,
@@ -1171,6 +1182,12 @@ def list_holding_strategies(
             "position_size_risk_usdt": POSITION_SIZE_RISK_USDT,
             "filled_tp_index": lc.filled_tp_index,
             "last_checked_at": utc_naive_to_local(lc.last_checked_at),
+            "is_live_bound": True,
+            "execution_binding_id": binding.id,
+            "execution_status": binding.status,
+            "exchange_status": binding.last_exchange_status,
+            "pos_id": binding.pos_id,
+            "order_id": binding.order_id,
         }
         if cand is not None:
             row["entry_text"] = cand.entry_text or row["entry_text"]
