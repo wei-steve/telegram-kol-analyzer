@@ -1300,6 +1300,7 @@ function getAiProviderKeyStorageKey({ target, baseUrl, model }) {
 
 function buildAiRecognitionConfigPayload() {
   const value = (selector) => document.querySelector(selector)?.value || '';
+  const promptValues = collectAiPromptValues();
   const aiModels = collectAiModelConfigs();
   const activeTextModelId = value('[data-active-text-model-id]');
   const activeImageModelId = value('[data-active-image-model-id]');
@@ -1307,15 +1308,25 @@ function buildAiRecognitionConfigPayload() {
   const activeImageModel = aiModels.find((model) => model.id === activeImageModelId) || null;
   return {
     mode: 'ai_provider',
-    recognition_prompt: value('[data-ai-recognition-prompt-input]'),
-    lifecycle_event_prompt: value('[data-ai-lifecycle-event-prompt-input]'),
-    mimo_direct_prompt: value('[data-ai-mimo-direct-prompt-input]'),
+    recognition_prompt: promptValues.recognition_prompt || value('[data-ai-recognition-prompt-input]'),
+    lifecycle_event_prompt: promptValues.lifecycle_event_prompt || value('[data-ai-lifecycle-event-prompt-input]'),
+    mimo_direct_prompt: promptValues.mimo_direct_prompt || value('[data-ai-mimo-direct-prompt-input]'),
     active_text_model_id: activeTextModelId,
     active_image_model_id: activeImageModelId,
     ai_models: aiModels,
     text_provider: modelConfigToProvider(activeTextModel),
     image_provider: modelConfigToProvider(activeImageModel),
   };
+}
+
+function collectAiPromptValues() {
+  return Array.from(document.querySelectorAll('[data-ai-prompt-input]')).reduce((prompts, input) => {
+    const key = input.getAttribute('data-ai-prompt-input') || input.name;
+    if (key) {
+      prompts[key] = input.value || '';
+    }
+    return prompts;
+  }, {});
 }
 
 function collectAiModelConfigs() {

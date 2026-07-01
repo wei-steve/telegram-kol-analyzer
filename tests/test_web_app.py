@@ -831,6 +831,54 @@ def test_ai_recognition_config_api_saves_prompt(tmp_path):
     assert "直接阅读图片和文字。" in page.text
 
 
+def test_index_page_renders_registered_ai_prompts(tmp_path):
+    config_path = tmp_path / "ai_recognition.yaml"
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        ai_recognition_config_path=config_path,
+    )
+    client = TestClient(app)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'data-ai-prompt-id="recognition_prompt"' in response.text
+    assert 'data-ai-prompt-id="lifecycle_event_prompt"' in response.text
+    assert 'data-ai-prompt-id="mimo_direct_prompt"' in response.text
+    assert 'data-ai-prompt-input="recognition_prompt"' in response.text
+    assert 'data-ai-prompt-input="lifecycle_event_prompt"' in response.text
+    assert 'data-ai-prompt-input="mimo_direct_prompt"' in response.text
+    assert 'name="recognition_prompt"' in response.text
+    assert 'name="lifecycle_event_prompt"' in response.text
+    assert 'name="mimo_direct_prompt"' in response.text
+
+
+def test_ai_recognition_config_api_returns_registered_ai_prompts(tmp_path):
+    config_path = tmp_path / "ai_recognition.yaml"
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        ai_recognition_config_path=config_path,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/ai-recognition-config",
+        json={
+            "recognition_prompt": "Only strict strategies.",
+            "lifecycle_event_prompt": "Only lifecycle events.",
+            "mimo_direct_prompt": "Only multimodal strategies.",
+        },
+    )
+
+    assert response.status_code == 200
+    prompt_ids = {item["id"] for item in response.json()["prompts"]}
+    assert {"recognition_prompt", "lifecycle_event_prompt", "mimo_direct_prompt"} <= prompt_ids
+    prompt_values = {item["id"]: item["value"] for item in response.json()["prompts"]}
+    assert prompt_values["recognition_prompt"].startswith("Only strict strategies.")
+    assert prompt_values["lifecycle_event_prompt"].startswith("Only lifecycle events.")
+    assert prompt_values["mimo_direct_prompt"].startswith("Only multimodal strategies.")
+
+
 def test_ai_recognition_config_api_saves_mimo_provider(tmp_path):
     config_path = tmp_path / "ai_recognition.yaml"
     app = create_web_app(

@@ -33,6 +33,7 @@ from telegram_kol_research.ai_recognition_config import (
     AiModelConfig,
     AiProviderConfig,
     AiRecognitionConfig,
+    build_ai_prompt_views,
     load_ai_recognition_config,
     save_ai_recognition_config,
 )
@@ -1151,6 +1152,7 @@ def create_web_app(
                 "trader_dashboard": trader_dashboard,
                 "strategy_kpi": strategy_kpi,
                 "ai_recognition_config": ai_recognition_config,
+                "ai_prompt_views": build_ai_prompt_views(ai_recognition_config),
                 "trading_settings": trading_settings,
             },
         )
@@ -1706,7 +1708,8 @@ def create_web_app(
     def update_ai_recognition_config(payload: dict[str, Any]):
         existing_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
         recognition_prompt = str(
-            payload.get("recognition_prompt") or existing_config.recognition_prompt
+            _ai_prompt_payload_value(payload, "recognition_prompt")
+            or existing_config.recognition_prompt
         ).strip()
         if not recognition_prompt:
             raise HTTPException(status_code=422, detail="recognition_prompt is required")
@@ -1715,11 +1718,11 @@ def create_web_app(
             AiRecognitionConfig(
                 recognition_prompt=recognition_prompt,
                 lifecycle_event_prompt=str(
-                    payload.get("lifecycle_event_prompt")
+                    _ai_prompt_payload_value(payload, "lifecycle_event_prompt")
                     or existing_config.lifecycle_event_prompt
                 ),
                 mimo_direct_prompt=str(
-                    payload.get("mimo_direct_prompt")
+                    _ai_prompt_payload_value(payload, "mimo_direct_prompt")
                     or existing_config.mimo_direct_prompt
                 ),
                 mode=str(payload.get("mode") or "ai_provider"),
@@ -1735,6 +1738,7 @@ def create_web_app(
             "recognition_prompt": config.recognition_prompt,
             "lifecycle_event_prompt": config.lifecycle_event_prompt,
             "mimo_direct_prompt": config.mimo_direct_prompt,
+            "prompts": build_ai_prompt_views(config),
             "active_text_model_id": config.active_text_model_id,
             "active_image_model_id": config.active_image_model_id,
             "ai_models": [_model_config_response(model) for model in config.ai_models],
@@ -2302,6 +2306,22 @@ def _provider_config_from_payload(payload: Any) -> AiProviderConfig:
         model=str(payload.get("model") or ""),
         timeout_seconds=float(payload.get("timeout_seconds") or 60),
     )
+
+
+def _ai_prompt_payload_value(payload: dict[str, Any], prompt_id: str) -> str | None:
+    if prompt_id in payload:
+        return str(payload.get(prompt_id) or "")
+    prompts = payload.get("prompts")
+    if isinstance(prompts, dict) and prompt_id in prompts:
+        return str(prompts.get(prompt_id) or "")
+    if isinstance(prompts, list):
+        for item in prompts:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or item.get("field_name") or "")
+            if item_id == prompt_id:
+                return str(item.get("value") or "")
+    return None
 
 
 def _provider_config_response(config: AiProviderConfig) -> dict[str, Any]:

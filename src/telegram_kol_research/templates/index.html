@@ -60,6 +60,28 @@
       </div>
       <form class="ai-recognition-prompt-form" data-ai-recognition-prompt-form>
         <div class="ai-prompt-grid">
+          {% for prompt in ai_prompt_views %}
+          <section class="ai-prompt-card" data-ai-prompt-id="{{ prompt.id }}">
+            <div class="ai-prompt-card-head">
+              <div>
+                <span class="ai-prompt-tag">{{ prompt.tag }}</span>
+                <h3>{{ prompt.title }}</h3>
+              </div>
+              <small>{{ prompt.status_label }}</small>
+            </div>
+            <p>{{ prompt.description }}</p>
+            <label>
+              鎻愮ず璇?              <textarea
+                name="{{ prompt.field_name }}"
+                data-ai-prompt-input="{{ prompt.field_name }}"
+                {% if prompt.field_name == 'recognition_prompt' %}data-ai-recognition-prompt-input{% endif %}
+                {% if prompt.field_name == 'lifecycle_event_prompt' %}data-ai-lifecycle-event-prompt-input{% endif %}
+                {% if prompt.field_name == 'mimo_direct_prompt' %}data-ai-mimo-direct-prompt-input{% endif %}
+              >{{ prompt.value }}</textarea>
+            </label>
+          </section>
+          {% endfor %}
+          {#
           <section class="ai-prompt-card">
             <div class="ai-prompt-card-head">
               <div>
@@ -105,6 +127,7 @@
             </label>
           </section>
 
+          #}
           <section class="ai-prompt-card is-readonly">
             <div class="ai-prompt-card-head">
               <div>

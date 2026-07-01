@@ -226,6 +226,61 @@ class AiRecognitionConfig:
     active_image_model_id: str = ""
 
 
+@dataclass(frozen=True)
+class AiPromptDefinition:
+    id: str
+    field_name: str
+    tag: str
+    title: str
+    description: str
+    status_label: str = "在线生效"
+    editable: bool = True
+
+
+AI_PROMPT_DEFINITIONS = [
+    AiPromptDefinition(
+        id="recognition_prompt",
+        field_name="recognition_prompt",
+        tag="DeepSeek / 文本策略识别",
+        title="单条消息是否为新开仓策略",
+        description="文字消息直接使用；GLM-OCR 图片转文字后也会把 OCR 文本交给这个提示词判断。",
+    ),
+    AiPromptDefinition(
+        id="lifecycle_event_prompt",
+        field_name="lifecycle_event_prompt",
+        tag="DeepSeek / 生命周期识别",
+        title="入场、撤单、平仓、仓位管理事件",
+        description="同群存在活跃策略时使用，用来判断当前消息是否改变已有策略状态。",
+    ),
+    AiPromptDefinition(
+        id="mimo_direct_prompt",
+        field_name="mimo_direct_prompt",
+        tag="MiMo / 多模态直识别",
+        title="文字和图片一起直接判断",
+        description="用于 MiMo 多模态链路；直接发送文字和原图，不复用 GLM-OCR 结果。",
+        status_label="在线生效",
+    ),
+]
+
+
+def build_ai_prompt_views(config: AiRecognitionConfig) -> list[dict[str, Any]]:
+    """Return prompt metadata and effective values for the Web prompt editor."""
+
+    return [
+        {
+            "id": definition.id,
+            "field_name": definition.field_name,
+            "tag": definition.tag,
+            "title": definition.title,
+            "description": definition.description,
+            "status_label": definition.status_label,
+            "editable": definition.editable,
+            "value": str(getattr(config, definition.field_name)),
+        }
+        for definition in AI_PROMPT_DEFINITIONS
+    ]
+
+
 DEFAULT_AI_MODELS = [
     AiModelConfig(
         id="deepseek-v4-flash",
