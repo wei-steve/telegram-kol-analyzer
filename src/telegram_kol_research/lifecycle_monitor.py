@@ -26,6 +26,7 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.models import (
+    ExecutionBinding,
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
@@ -1056,6 +1057,18 @@ class LifecycleMonitor:
                 # idempotency guard
                 if row.lifecycle_status != t.from_status:
                     continue
+                if t.to_status in ("exited", "expired", "invalidated") and _has_live_execution_binding(
+                    session,
+                    row.execution_binding_id,
+                ):
+                    logger.info(
+                        "Skipping simulated lifecycle exit for live execution binding: lifecycle_id=%s binding_id=%s to_status=%s reason=%s",
+                        row.id,
+                        row.execution_binding_id,
+                        t.to_status,
+                        t.exit_reason,
+                    )
+                    continue
                 if t.to_status == "entered" and _before(t.occurred_at, row.signal_at):
                     logger.warning(
                         "Skipping impossible entry transition: lifecycle_id=%s signal_at=%s occurred_at=%s",
@@ -1136,3 +1149,12 @@ class LifecycleMonitor:
                 "occurred_at": (row.updated_at.isoformat() if row.updated_at else None),
             },
         )
+
+
+def _has_live_execution_binding(session, binding_id: int | None) -> bool:
+    if binding_id is None:
+        return False
+    binding = session.get(ExecutionBinding, binding_id)
+    if binding is None:
+        return False
+    return binding.status in {"open", "active"}

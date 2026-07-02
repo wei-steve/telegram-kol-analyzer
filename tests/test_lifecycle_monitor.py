@@ -9,7 +9,13 @@ from telegram_kol_research.lifecycle_monitor import (
     StateTransition,
 )
 from telegram_kol_research.live_updates import LiveUpdateBroker
-from telegram_kol_research.models import RawMessage, SignalCandidate, StrategyLifecycle, TradeIdea
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    RawMessage,
+    SignalCandidate,
+    StrategyLifecycle,
+    TradeIdea,
+)
 
 
 def test_lifecycle_monitor_rejects_entry_before_signal_time(tmp_path):
@@ -50,6 +56,60 @@ def test_lifecycle_monitor_rejects_entry_before_signal_time(tmp_path):
     assert lifecycle.lifecycle_status == "pending_entry"
     assert lifecycle.entered_at is None
     assert lifecycle.entry_price_actual is None
+
+
+def test_lifecycle_monitor_skips_simulated_exit_for_live_execution_binding(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="alice",
+            chat_id=88,
+            message_id=9033,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            status="active",
+            pos_id="pos-live",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=9033,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 19, 11, 32, 47, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 19, 11, 40, tzinfo=UTC),
+            entry_price_actual=61563,
+            stop_loss=62440,
+            take_profit="59588",
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    monitor = LifecycleMonitor(session_factory, LiveUpdateBroker())
+    monitor._apply_transitions(
+        [
+            StateTransition(
+                signal_id=lifecycle_id,
+                from_status="entered",
+                to_status="exited",
+                exit_reason="stop_loss",
+                trigger_price=62440,
+                occurred_at=datetime(2026, 6, 19, 12, 0, tzinfo=UTC),
+            )
+        ]
+    )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.exit_reason is None
+    assert lifecycle.exited_at is None
 
 
 def test_lifecycle_backfill_keeps_entered_record_with_entry_evidence(tmp_path):

@@ -277,6 +277,7 @@ def reconcile_deepcoin_execution_bindings(
                     row.last_exchange_status = "position_active"
                 row.status = "active"
                 result.active += 1
+                _attach_binding_to_lifecycle(session, row, now)
             elif order is not None and _is_open_order_state(order):
                 row.status = "open"
                 row.last_exchange_status = (
@@ -1034,16 +1035,85 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
     if lifecycle is None:
         return
     lifecycle.execution_binding_id = row.id
-    if lifecycle.lifecycle_status == "pending_entry":
-        lifecycle.lifecycle_status = "entered"
-        lifecycle.entered_at = updated_at
-    elif lifecycle.lifecycle_status == "exited" and lifecycle.exit_reason == "cancelled":
+    if row.status == "active" and lifecycle.lifecycle_status != "entered":
         lifecycle.lifecycle_status = "entered"
         lifecycle.exit_reason = None
         lifecycle.exited_at = None
         if lifecycle.entered_at is None:
             lifecycle.entered_at = updated_at
+    elif row.status == "open" and lifecycle.lifecycle_status in {
+        "exited",
+        "expired",
+        "invalidated",
+        "cancelled",
+    }:
+        lifecycle.lifecycle_status = "pending_entry"
+        lifecycle.exit_reason = None
+        lifecycle.exited_at = None
+    elif lifecycle.lifecycle_status == "pending_entry":
+        lifecycle.lifecycle_status = "entered"
+        lifecycle.entered_at = updated_at
+    _refresh_lifecycle_prices_from_binding_payload(lifecycle, row)
     lifecycle.updated_at = updated_at
+
+
+def _refresh_lifecycle_prices_from_binding_payload(
+    lifecycle: Any,
+    row: ExecutionBinding,
+) -> None:
+    try:
+        payload = json.loads(row.payload_json or "{}")
+    except (TypeError, ValueError):
+        return
+    draft = payload.get("draft") if isinstance(payload, dict) else None
+    if not isinstance(draft, dict):
+        return
+    draft_stop_loss = _to_float(draft.get("stop_loss"))
+    reference_values = [
+        value
+        for value in (
+            lifecycle.entry_price_actual,
+            lifecycle.entry_range_low,
+            lifecycle.entry_range_high,
+            draft_stop_loss,
+        )
+        if value is not None and value > 0
+    ]
+    current_stop_loss = _to_float(lifecycle.stop_loss)
+    if draft_stop_loss is not None and (
+        current_stop_loss is None
+        or not _price_plausible_against_reference(current_stop_loss, reference_values)
+    ):
+        lifecycle.stop_loss = draft_stop_loss
+
+    draft_take_profit = _take_profit_text_from_draft(draft)
+    if draft_take_profit and not lifecycle.take_profit:
+        lifecycle.take_profit = draft_take_profit
+
+
+def _take_profit_text_from_draft(draft: dict[str, Any]) -> str | None:
+    legs = draft.get("take_profit_legs")
+    if not isinstance(legs, list):
+        return None
+    prices: list[str] = []
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        price = _to_float(leg.get("price"))
+        if price is None or price <= 0:
+            continue
+        prices.append(f"{price:g}")
+    return "/".join(prices) if prices else None
+
+
+def _price_plausible_against_reference(
+    value: float,
+    reference_values: list[float],
+) -> bool:
+    if value <= 0 or not reference_values:
+        return value > 0
+    reference = max(reference_values)
+    return reference * 0.2 <= value <= reference * 5
 
 
 def _symbol_from_inst_id(value: Any) -> str:

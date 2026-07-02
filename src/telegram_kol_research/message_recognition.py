@@ -979,6 +979,11 @@ def _apply_lifecycle_event_decision(
             explicit_stop_loss = _extract_explicit_stop_loss_from_management_text(
                 raw_message.text
             )
+        if explicit_stop_loss is not None and not _is_plausible_management_stop_loss(
+            target,
+            explicit_stop_loss,
+        ):
+            explicit_stop_loss = None
         explicit_take_profit = _normalize_strategy_text(
             decision.get("take_profit"),
             separator="/",
@@ -1015,6 +1020,36 @@ def _apply_lifecycle_event_decision(
         return True
 
     return False
+
+
+def _is_plausible_management_stop_loss(
+    lifecycle: StrategyLifecycle,
+    stop_loss: float,
+) -> bool:
+    if stop_loss <= 0:
+        return False
+    reference_values = [
+        value
+        for value in (
+            lifecycle.entry_price_actual,
+            lifecycle.entry_range_low,
+            lifecycle.entry_range_high,
+            lifecycle.stop_loss,
+        )
+        if value is not None and value > 0
+    ]
+    reference_values.extend(
+        _strategy_price_values(
+            lifecycle.take_profit,
+            entry_low=lifecycle.entry_range_low,
+            entry_high=lifecycle.entry_range_high,
+            stop_loss=lifecycle.stop_loss,
+        )
+    )
+    if not reference_values:
+        return True
+    reference = max(reference_values)
+    return reference * 0.2 <= stop_loss <= reference * 5
 
 
 def _should_move_stop_to_protect(
