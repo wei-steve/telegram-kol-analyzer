@@ -234,7 +234,7 @@ def reconcile_deepcoin_execution_bindings(
         rows = (
             session.query(ExecutionBinding)
             .filter(ExecutionBinding.venue == "deepcoin")
-            .filter(ExecutionBinding.status.in_(["open", "active", "unknown"]))
+            .filter(ExecutionBinding.status.in_(["open", "active", "unknown", "stale"]))
             .order_by(ExecutionBinding.id.asc())
             .all()
         )
@@ -288,7 +288,7 @@ def reconcile_deepcoin_execution_bindings(
                     order_history_cache=order_history_cache,
                     trade_fills_cache=trade_fills_cache,
                 )
-                if recovered_pos_ids:
+                if recovered_pos_ids and (_split_ids(row.pos_id) or len(recovered_pos_ids) > 1):
                     row.pos_id = _join_unique_ids([*_split_ids(row.pos_id), *recovered_pos_ids])
                     row.status = "active"
                     row.last_exchange_status = "position_active_recovered_additional_pos_id"
@@ -786,7 +786,7 @@ def _select_additional_positions_from_order_evidence(
 ) -> list[str]:
     existing_pos_ids = set(_split_ids(row.pos_id))
     order_ids = set(_split_ids(row.order_id)) | set(_split_ids(row.client_order_id))
-    if not existing_pos_ids or not order_ids:
+    if not order_ids:
         return []
 
     target_symbol = str(row.symbol or "").upper()
@@ -996,6 +996,12 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
     if lifecycle.lifecycle_status == "pending_entry":
         lifecycle.lifecycle_status = "entered"
         lifecycle.entered_at = updated_at
+    elif lifecycle.lifecycle_status == "exited" and lifecycle.exit_reason == "cancelled":
+        lifecycle.lifecycle_status = "entered"
+        lifecycle.exit_reason = None
+        lifecycle.exited_at = None
+        if lifecycle.entered_at is None:
+            lifecycle.entered_at = updated_at
     lifecycle.updated_at = updated_at
 
 
