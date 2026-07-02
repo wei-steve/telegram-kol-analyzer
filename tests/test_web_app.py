@@ -1604,11 +1604,14 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
     assert response.status_code == 200
     assert response.json()["submitted"] is True
     assert response.json()["order_count"] == 2
-    assert [payload["ordType"] for payload in fake_client.payloads] == ["limit", "limit"]
-    assert fake_client.payloads[0]["tdMode"] == "cross"
-    assert fake_client.protection_payloads[0]["orderSysID"] == "order-1"
-    assert fake_client.protection_payloads[0]["tpTriggerPx"] == "69000.0"
-    assert fake_client.protection_payloads[0]["slTriggerPx"] == "67500.0"
+    assert fake_client.payloads == []
+    assert [payload["orderType"] for payload in fake_client.trigger_payloads] == [
+        "limit",
+        "limit",
+    ]
+    assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
+    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0
+    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
 
 
 def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
@@ -1714,5 +1717,6 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
     assert process_response.status_code == 200
     assert process_response.json()["processed"] is True
     assert process_response.json()["result"]["signal_id"] == signal.id
-    assert fake_client.payloads[0]["tdMode"] == "cross"
-    assert fake_client.protection_payloads[0]["tpTriggerPx"] == "69000.0"
+    assert fake_client.payloads == []
+    assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
+    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0

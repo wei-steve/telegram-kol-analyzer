@@ -173,13 +173,13 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
 
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
-    assert len(fake_client.orders) == 2
-    assert fake_client.trigger_orders == []
-    assert fake_client.orders[0]["ordType"] == "limit"
-    assert fake_client.orders[0]["px"] == "68200.0"
-    assert fake_client.protections[0]["orderSysID"] == "order-1"
-    assert fake_client.protections[0]["tpTriggerPx"] == "69000.0"
-    assert fake_client.protections[0]["slTriggerPx"] == "67500.0"
+    assert fake_client.orders == []
+    assert len(fake_client.trigger_orders) == 2
+    assert fake_client.trigger_orders[0]["orderType"] == "limit"
+    assert fake_client.trigger_orders[0]["triggerPrice"] == "68200.0"
+    assert fake_client.trigger_orders[0]["tpTriggerPx"] == 69000.0
+    assert fake_client.trigger_orders[0]["slTriggerPx"] == 67500.0
+    assert fake_client.protections == []
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
@@ -218,21 +218,22 @@ def test_auto_process_range_entry_uses_half_market_half_midpoint_limit_when_near
     )
 
     assert result["status"] == "submitted"
-    assert len(fake_client.orders) == 2
+    assert len(fake_client.orders) == 1
+    assert len(fake_client.trigger_orders) == 1
     assert fake_client.orders[0]["ordType"] == "market"
     assert fake_client.orders[0]["sz"] == "2.5"
-    assert fake_client.orders[1]["ordType"] == "limit"
-    assert fake_client.orders[1]["px"] == "1575.0"
-    assert fake_client.orders[1]["sz"] == "3.3"
+    assert fake_client.trigger_orders[0]["orderType"] == "limit"
+    assert fake_client.trigger_orders[0]["triggerPrice"] == "1575.0"
+    assert fake_client.trigger_orders[0]["sz"] == "3.3"
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
     assert binding.symbol == "ETH"
-    assert binding.order_id == "order-1,order-2"
+    assert binding.order_id == "order-1,trigger-1"
     assert [event.action for event in events] == [
         "open_market_position",
         "set_position_tpsl",
-        "create_limit_entry",
+        "create_trigger_entry",
     ]
 
 
@@ -348,8 +349,8 @@ def test_auto_process_message_trade_signal_accepts_nearby_single_entry_price(tmp
 
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
-    assert len(fake_client.orders) == 2
-    assert fake_client.trigger_orders == []
+    assert fake_client.orders == []
+    assert len(fake_client.trigger_orders) == 2
 
 
 def test_auto_process_nearby_single_entry_uses_market_when_price_is_close(tmp_path):
@@ -426,8 +427,9 @@ def test_auto_process_nearby_single_entry_keeps_limit_when_price_is_far(tmp_path
 
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
-    assert len(fake_client.orders) == 2
-    assert [order["ordType"] for order in fake_client.orders] == ["limit", "limit"]
+    assert fake_client.orders == []
+    assert len(fake_client.trigger_orders) == 2
+    assert [order["orderType"] for order in fake_client.trigger_orders] == ["limit", "limit"]
 
 
 def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_path):
@@ -464,10 +466,14 @@ def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_
     )
 
     assert result["status"] == "submitted"
-    assert [order["px"] for order in fake_client.orders] == ["59300.0", "59100.0"]
-    assert fake_client.trigger_orders == []
-    assert fake_client.protections[0]["slTriggerPx"] == "57800.0"
-    assert fake_client.protections[0]["tpTriggerPx"] == "60000.0"
+    assert fake_client.orders == []
+    assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
+        "59300.0",
+        "59100.0",
+    ]
+    assert fake_client.protections == []
+    assert fake_client.trigger_orders[0]["slTriggerPx"] == 57800.0
+    assert fake_client.trigger_orders[0]["tpTriggerPx"] == 60000.0
 
 
 def test_auto_process_message_trade_signal_skips_lifecycle_entry_confirmation(tmp_path):

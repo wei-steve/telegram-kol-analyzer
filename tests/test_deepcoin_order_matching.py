@@ -141,16 +141,13 @@ def test_resolve_stop_loss_adjustment_target_falls_back_to_active_position_sltp(
     assert target.pos_id == "pos-1"
 
 
-def test_resolve_stop_loss_adjustment_target_falls_back_to_open_entry_order_sltp():
-    target = resolve_stop_loss_adjustment_target(
-        binding=_binding(pos_id=None, order_id="entry-1,entry-2"),
-        pending_trigger_orders=[],
-        live_positions=[],
-    )
-
-    assert target.action == "replace_order_sltp"
-    assert target.reason == "no_position_yet_replace_open_entry_order_sltp"
-    assert target.order_id == "entry-1"
+def test_resolve_stop_loss_adjustment_target_does_not_replace_open_entry_order_sltp():
+    with pytest.raises(DeepcoinOrderMatchError, match="no_deepcoin_stop_loss_adjustment_target"):
+        resolve_stop_loss_adjustment_target(
+            binding=_binding(pos_id=None, order_id="entry-1,entry-2"),
+            pending_trigger_orders=[],
+            live_positions=[],
+        )
 
 
 def test_select_position_tpsl_orders_matches_deepcoin_zero_size_rows_by_position_time():

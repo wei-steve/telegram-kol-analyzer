@@ -250,9 +250,61 @@ def test_reconcile_deepcoin_execution_bindings_marks_restart_state(tmp_path):
     assert rows[1].last_exchange_status == "not_found_on_exchange"
     with session_factory() as session:
         lifecycle = session.query(StrategyLifecycle).filter_by(chat_id=101).one()
-    assert lifecycle.lifecycle_status == "exited"
-    assert lifecycle.exit_reason == "cancelled"
-    assert lifecycle.exited_at is not None
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.exit_reason is None
+    assert lifecycle.exited_at is None
+
+
+def test_reconcile_deepcoin_execution_bindings_keeps_trigger_pending_order_open(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    upsert_execution_binding(
+        session_factory,
+        _binding(order_id="trigger-open", client_order_id="client-trigger", status="open"),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="pending_entry",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            assert inst_id == "BTC-USDT-SWAP"
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "ordId": "trigger-open",
+                    "clOrdId": "client-trigger",
+                    "state": "live",
+                }
+            ]
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+    )
+
+    assert result.open == 1
+    assert result.stale == 0
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+    assert binding.status == "open"
+    assert binding.last_exchange_status == "trigger_order_open"
+    assert lifecycle.lifecycle_status == "pending_entry"
 
 
 def test_reconcile_recovers_filled_order_position_id_when_unique(tmp_path):

@@ -218,16 +218,6 @@ def reconcile_deepcoin_execution_bindings(
         if _first_string(position, "posId", "pos_id", "id")
     }
     active_positions = [position for position in positions if _has_nonzero_size(position)]
-    orders_by_order_id = {
-        _first_string(order, "ordId", "orderId", "order_id", "id"): order
-        for order in orders
-        if _first_string(order, "ordId", "orderId", "order_id", "id")
-    }
-    orders_by_client_order_id = {
-        _first_string(order, "clOrdId", "clientOrderId", "client_order_id"): order
-        for order in orders
-        if _first_string(order, "clOrdId", "clientOrderId", "client_order_id")
-    }
 
     result = ExecutionReconciliationResult()
     with session_factory() as session:
@@ -238,6 +228,18 @@ def reconcile_deepcoin_execution_bindings(
             .order_by(ExecutionBinding.id.asc())
             .all()
         )
+        trigger_orders = _load_pending_trigger_orders(client, rows=rows)
+        all_orders = [*orders, *trigger_orders]
+        orders_by_order_id = {
+            _first_string(order, "ordId", "orderId", "order_id", "id"): order
+            for order in all_orders
+            if _first_string(order, "ordId", "orderId", "order_id", "id")
+        }
+        orders_by_client_order_id = {
+            _first_string(order, "clOrdId", "clientOrderId", "client_order_id"): order
+            for order in all_orders
+            if _first_string(order, "clOrdId", "clientOrderId", "client_order_id")
+        }
         bound_pos_ids = {
             pos_id
             for binding in rows
@@ -277,7 +279,9 @@ def reconcile_deepcoin_execution_bindings(
                 result.active += 1
             elif order is not None and _is_open_order_state(order):
                 row.status = "open"
-                row.last_exchange_status = "order_open"
+                row.last_exchange_status = (
+                    "trigger_order_open" if order in trigger_orders else "order_open"
+                )
                 result.open += 1
             else:
                 recovered_pos_ids = _select_additional_positions_from_order_evidence(
@@ -324,14 +328,51 @@ def reconcile_deepcoin_execution_bindings(
                     else:
                         row.status = "stale"
                         row.last_exchange_status = "not_found_on_exchange"
-                        if not _split_ids(row.pos_id):
-                            _cancel_missing_entry_lifecycle(session, row, now)
                         result.stale += 1
             row.recovered_at = now
             row.updated_at = now
             result.updated += 1
         session.commit()
     return result
+
+
+def _load_pending_trigger_orders(
+    client: DeepcoinReadOnlyClient,
+    *,
+    rows: list[ExecutionBinding],
+) -> list[dict[str, Any]]:
+    method = getattr(client, "list_trigger_orders_pending", None)
+    if method is None:
+        return []
+    instruments = {
+        f"{str(row.symbol or '').upper()}-USDT-SWAP"
+        for row in rows
+        if str(row.symbol or "").strip()
+    }
+    pending: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for instrument_id in sorted(instruments):
+        try:
+            rows_for_instrument = method(inst_id=instrument_id)
+        except TypeError:
+            rows_for_instrument = method()
+        except Exception:
+            rows_for_instrument = []
+        if not isinstance(rows_for_instrument, list):
+            continue
+        for order in rows_for_instrument:
+            if not isinstance(order, dict):
+                continue
+            order_id = _first_string(order, "ordId", "orderId", "order_id", "id") or ""
+            client_order_id = (
+                _first_string(order, "clOrdId", "clientOrderId", "client_order_id") or ""
+            )
+            identity = (order_id, client_order_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            pending.append(order)
+    return pending
 
 
 def _cancel_missing_entry_lifecycle(session, row: ExecutionBinding, cancelled_at: datetime) -> None:

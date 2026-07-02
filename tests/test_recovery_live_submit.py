@@ -9,7 +9,6 @@ from telegram_kol_research.recovery_decisions import apply_recovery_review_decis
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import build_deepcoin_market_order_payload
-from telegram_kol_research.recovery_live_submit import build_deepcoin_order_sltp_payload
 from telegram_kol_research.recovery_live_submit import build_deepcoin_place_order_payload
 from telegram_kol_research.recovery_live_submit import build_deepcoin_position_sltp_payload
 from telegram_kol_research.recovery_live_submit import build_deepcoin_trigger_order_payload
@@ -130,7 +129,7 @@ class _DelayedFilledPositionDeepcoinClient(_OrderProtectionFailingDeepcoinClient
             {
                 "posId": "pos-filled-1",
                 "instId": "BTC-USDT-SWAP",
-                "posSide": "long",
+                "posSide": "short",
                 "pos": "7",
                 "mrgPosition": "split",
                 "mgnMode": "cross",
@@ -340,27 +339,6 @@ def test_build_deepcoin_place_order_payload_maps_limit_leg():
     }
 
 
-def test_build_deepcoin_order_sltp_payload_uses_first_take_profit_and_stop_loss():
-    payload = build_deepcoin_order_sltp_payload(
-        {
-            "instrument_id": "BTC-USDT-SWAP",
-            "stop_loss": 67500.0,
-            "take_profit_legs": [
-                {"price": 69000.0, "allocation_pct": 50.0},
-                {"price": 70000.0, "allocation_pct": 50.0},
-            ],
-        },
-        order_id="order-1",
-    )
-
-    assert payload == {
-        "instId": "BTC-USDT-SWAP",
-        "orderSysID": "order-1",
-        "tpTriggerPx": "69000.0",
-        "slTriggerPx": "67500.0",
-    }
-
-
 def test_build_deepcoin_position_sltp_payload_allows_stop_loss_without_take_profit():
     payload = build_deepcoin_position_sltp_payload(
         {
@@ -482,17 +460,14 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
 
     assert result["submitted"] is True
     assert result["order_count"] == 2
-    assert fake_client.trigger_payloads == []
-    assert fake_client.payloads[0]["tdMode"] == "cross"
-    assert fake_client.payloads[0]["mrgPosition"] == "split"
-    assert fake_client.payloads[0]["ordType"] == "limit"
-    assert fake_client.payloads[0]["px"] == "68200.0"
-    assert fake_client.protection_payloads[0] == {
-        "instId": "BTC-USDT-SWAP",
-        "orderSysID": "order-1",
-        "tpTriggerPx": "69000.0",
-        "slTriggerPx": "67500.0",
-    }
+    assert fake_client.payloads == []
+    assert fake_client.protection_payloads == []
+    assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
+    assert fake_client.trigger_payloads[0]["mrgPosition"] == "split"
+    assert fake_client.trigger_payloads[0]["orderType"] == "limit"
+    assert fake_client.trigger_payloads[0]["triggerPrice"] == "68200.0"
+    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0
+    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
     assert fake_client.position_protection_payloads == []
     assert result["warnings"] == ["only_first_take_profit_submitted_for_order_sltp"]
     with session_factory() as session:
@@ -500,17 +475,17 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
         lifecycle = session.query(StrategyLifecycle).one()
     assert binding.status == "open"
-    assert binding.order_id == "order-1,order-2"
+    assert binding.order_id == "trigger-1,trigger-2"
     assert binding.client_order_id == "TK649760E806ACF61,TK729D11F4739D2A2"
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
     assert lifecycle.execution_binding_id == binding.id
     assert [event.action for event in events] == [
-        "create_limit_entry",
-        "create_limit_entry",
+        "create_trigger_entry",
+        "create_trigger_entry",
     ]
     assert events[0].execution_binding_id == binding.id
     assert events[0].trade_signal_id == result["signal_id"]
-    assert events[0].order_id == "order-1"
+    assert events[0].order_id == "trigger-1"
 
 
 def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):
@@ -615,7 +590,7 @@ def test_market_submit_failure_invalidates_lifecycle(tmp_path):
     assert lifecycle.exited_at is not None
 
 
-def test_limit_submit_does_not_attach_protection_to_unrelated_position(tmp_path):
+def test_limit_submit_uses_trigger_order_with_embedded_protection(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _persist_ready_item(session_factory)
     _persist_lifecycle(session_factory)
@@ -634,31 +609,34 @@ def test_limit_submit_does_not_attach_protection_to_unrelated_position(tmp_path)
     )
 
     assert result["submitted"] is True
-    assert "order_protection_failed_after_entry_submitted" in result["warnings"]
-    assert fake_client.payloads[0]["ordType"] == "limit"
-    assert fake_client.protection_payloads[0]["orderSysID"] == "order-1"
+    assert "order_protection_failed_after_entry_submitted" not in result["warnings"]
+    assert fake_client.payloads == []
+    assert fake_client.protection_payloads == []
+    assert fake_client.trigger_payloads[0]["orderType"] == "limit"
+    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0
+    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
     assert fake_client.position_protection_payloads == []
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         lifecycle = session.query(StrategyLifecycle).one()
     assert binding.status == "open"
-    assert binding.order_id == "order-1,order-2"
-    assert binding.last_exchange_status == "order_open_protection_failed"
+    assert binding.order_id == "trigger-1,trigger-2"
+    assert binding.last_exchange_status == "submitted"
     assert lifecycle.execution_binding_id == binding.id
 
 
-def test_limit_submit_uses_filled_position_id_even_when_different_from_order_id(tmp_path):
+def test_market_submit_uses_filled_position_id_even_when_different_from_order_id(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
-    _persist_ready_item(session_factory)
+    _persist_ready_market_item(session_factory)
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
     fake_client = _DelayedFilledPositionDeepcoinClient()
 
     result = submit_recovery_order_live(
         session_factory,
-        chat_id=100,
-        message_id=55,
+        chat_id=200,
+        message_id=66,
         symbol="BTC",
-        side="long",
+        side="short",
         deepcoin_client=fake_client,
         contract_spec_provider=_StaticContractSpecProvider(),
         submitted_at=datetime(2026, 6, 12, 21, 0, tzinfo=UTC),
@@ -666,7 +644,6 @@ def test_limit_submit_uses_filled_position_id_even_when_different_from_order_id(
     )
 
     assert result["submitted"] is True
-    assert fake_client.protection_payloads[0]["orderSysID"] == "order-1"
     assert fake_client.position_protection_payloads[0]["posId"] == "pos-filled-1"
     assert fake_client.position_calls == 2
     with session_factory() as session:

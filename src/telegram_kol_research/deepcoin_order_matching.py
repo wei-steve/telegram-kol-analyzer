@@ -222,14 +222,6 @@ def resolve_stop_loss_adjustment_target(
             pos_id=live_pos_id,
         )
 
-    entry_order_id = _split_ids(binding.order_id)[0] if _split_ids(binding.order_id) else None
-    if entry_order_id:
-        return StopLossAdjustmentTarget(
-            action="replace_order_sltp",
-            reason="no_position_yet_replace_open_entry_order_sltp",
-            order_id=entry_order_id,
-        )
-
     raise DeepcoinOrderMatchError("no_deepcoin_stop_loss_adjustment_target")
 
 

@@ -53,9 +53,53 @@ class DeepcoinReadOnlyAccountState:
 
     def load_open_orders(self) -> list[OpenOrder]:
         return map_deepcoin_open_orders(
-            self._client.list_open_orders(),
+            _load_all_open_orders(self._client, bindings=self._bindings),
             bindings=self._bindings,
         )
+
+
+def _load_all_open_orders(
+    client: DeepcoinReadOnlyClient,
+    *,
+    bindings: list[DeepcoinOrderBinding],
+) -> list[dict[str, Any]]:
+    orders = list(client.list_open_orders())
+    trigger_method = getattr(client, "list_trigger_orders_pending", None)
+    if trigger_method is None:
+        return orders
+    instruments = {
+        f"{binding.symbol.upper()}-USDT-SWAP"
+        for binding in bindings
+        if binding.symbol
+    }
+    seen = {
+        (
+            _first_string(order, "ordId", "orderId", "order_id", "id") or "",
+            _first_string(order, "clOrdId", "clientOrderId", "client_order_id") or "",
+        )
+        for order in orders
+    }
+    for instrument_id in sorted(instruments):
+        try:
+            trigger_orders = trigger_method(inst_id=instrument_id)
+        except TypeError:
+            trigger_orders = trigger_method()
+        except Exception:
+            trigger_orders = []
+        if not isinstance(trigger_orders, list):
+            continue
+        for order in trigger_orders:
+            if not isinstance(order, dict):
+                continue
+            identity = (
+                _first_string(order, "ordId", "orderId", "order_id", "id") or "",
+                _first_string(order, "clOrdId", "clientOrderId", "client_order_id") or "",
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            orders.append(order)
+    return orders
 
 
 def map_deepcoin_positions(
