@@ -359,7 +359,9 @@ def _load_deepcoin_live_position_rows(
             side = (
                 binding.side
                 if binding is not None
-                else str(position.get("posSide") or position.get("side") or "").lower()
+                else _normalize_deepcoin_position_side(
+                    position.get("posSide") or position.get("side")
+                )
             )
             rows.append(
                 {
@@ -445,7 +447,7 @@ def _load_deepcoin_tpsl_orders_by_position_key(
 def _deepcoin_position_protection_key(position: dict[str, Any]) -> tuple[str, str, str, str]:
     return (
         str(position.get("instId") or "").upper(),
-        str(position.get("posSide") or "").lower(),
+        _normalize_deepcoin_position_side(position.get("posSide") or position.get("side")),
         _normalize_position_amount(position.get("pos")),
         str(position.get("cTime") or position.get("uTime") or ""),
     )
@@ -457,7 +459,7 @@ def _deepcoin_tpsl_order_position_keys(order: dict[str, Any]) -> list[tuple[str,
         return []
     base = (
         str(order.get("instId") or "").upper(),
-        str(order.get("posSide") or "").lower(),
+        _normalize_deepcoin_position_side(order.get("posSide") or order.get("side")),
     )
     size = _normalize_position_amount(order.get("sz"))
     keys = [(*base, size, ctime)]
@@ -688,6 +690,15 @@ def _first_position_string(position: dict[str, Any], *keys: str) -> str | None:
 
 def _split_binding_ids(value: str | None) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _normalize_deepcoin_position_side(value: Any) -> str:
+    side = str(value or "").lower()
+    if side == "buy":
+        return "long"
+    if side == "sell":
+        return "short"
+    return side
 
 
 def _symbol_from_deepcoin_inst_id(value: Any) -> str:
@@ -1582,9 +1593,9 @@ def create_web_app(
                 [active_position],
             ).get(protection_key)
             position_symbol = _symbol_from_deepcoin_inst_id(active_position.get("instId"))
-            position_side = str(
-                active_position.get("posSide") or active_position.get("side") or ""
-            ).lower()
+            position_side = _normalize_deepcoin_position_side(
+                active_position.get("posSide") or active_position.get("side")
+            )
             candidates = _load_live_position_attribution_candidates(
                 session,
                 symbol=position_symbol,

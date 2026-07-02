@@ -478,6 +478,54 @@ def test_bind_live_position_api_attaches_unbound_position_to_lifecycle(tmp_path)
         assert lifecycle.execution_binding_id == binding.id
 
 
+def test_bind_live_position_api_normalizes_deepcoin_sell_side(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-eth",
+                    "side": "sell",
+                    "pos": "6.4",
+                    "avgPx": "1624.5",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        now_provider=lambda: datetime(2026, 7, 2, 11, 30),
+    )
+    with app.state.session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=30,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 2, 10, 0),
+            entered_at=datetime(2026, 7, 2, 10, 1),
+            entry_price_actual=1624.5,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/execution/bind-live-position",
+        json={"pos_id": "pos-eth", "lifecycle_id": lifecycle_id},
+    )
+
+    assert response.status_code == 200
+    with app.state.session_factory() as session:
+        binding = session.get(ExecutionBinding, response.json()["binding_id"])
+
+        assert binding.symbol == "ETH"
+        assert binding.side == "short"
+        assert binding.pos_id == "pos-eth"
+
+
 def test_bind_live_position_api_rejects_wrong_attribution_candidate(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):
