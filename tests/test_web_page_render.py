@@ -63,6 +63,7 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "data-ai-model-selection" in response.text
     assert "data-trading-settings-form" in response.text
     assert "默认单笔最大亏损 USDT" in response.text
+    assert "单点附近市价容忍 %" in response.text
     assert "20.0" in response.text
     assert "DeepSeek V4 Flash" in response.text
     assert "MiMo V2.5" in response.text

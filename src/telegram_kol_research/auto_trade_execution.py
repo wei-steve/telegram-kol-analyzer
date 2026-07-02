@@ -158,6 +158,19 @@ def auto_process_message_trade_signal(
             runtime_kol_id=str(runtime_config.get("kol_id") or ""),
             processed_at=now,
         )
+    if (
+        entry_execution_type == "limit"
+        and _is_nearby_single_entry_text(candidate.entry_text, raw_message.text)
+        and _is_single_price_entry_range(entry_range)
+        and _single_entry_price_is_near_market(
+            current_price=reference_price,
+            entry_range=entry_range,
+            max_deviation_pct=settings.nearby_entry_market_deviation_pct,
+        )
+    ):
+        entry_execution_type = "market"
+        if reference_price is not None:
+            entry_range = (reference_price, reference_price)
 
     signal = RecoverySignal(
         kol_id=str(runtime_config["kol_id"]),
@@ -206,14 +219,26 @@ def auto_process_message_trade_signal(
         persist_ready_confirmation=True,
         confirmed_at=now,
     )
-    hybrid_draft = None
-    if entry_execution_type == "limit" and market_price_is_near_entry_edge(
+    auto_draft = None
+    execution_plan = None
+    if entry_execution_type == "market":
+        auto_draft = _build_auto_market_deepcoin_draft(
+            signal=signal,
+            runtime_kol_id=str(runtime_config["kol_id"]),
+            reference_price=reference_price,
+            stop_loss_text=candidate.stop_loss_text,
+            take_profit_text=candidate.take_profit_text,
+            take_profit_allocations=settings.take_profit_allocations,
+            contract_spec_provider=contract_spec_provider,
+        )
+        execution_plan = "single_entry_market"
+    elif entry_execution_type == "limit" and market_price_is_near_entry_edge(
         current_price=reference_price,
         entry_range=entry_range,
         side=side,
         max_deviation_pct=settings.max_market_entry_deviation_pct,
     ):
-        hybrid_draft = _build_auto_hybrid_deepcoin_draft(
+        auto_draft = _build_auto_hybrid_deepcoin_draft(
             signal=signal,
             runtime_kol_id=str(runtime_config["kol_id"]),
             entry_execution_type=entry_execution_type,
@@ -224,7 +249,8 @@ def auto_process_message_trade_signal(
             max_market_entry_deviation_pct=settings.max_market_entry_deviation_pct,
             contract_spec_provider=contract_spec_provider,
         )
-    if hybrid_draft is not None:
+        execution_plan = "range_hybrid_market_half_limit_half"
+    if auto_draft is not None:
         trade_signal = enqueue_trade_signal(
             session_factory,
             venue="deepcoin",
@@ -242,10 +268,10 @@ def auto_process_message_trade_signal(
                     "symbol": symbol,
                     "side": side,
                 },
-                "deepcoin_order_draft": hybrid_draft,
-                "execution_plan": "range_hybrid_market_half_limit_half",
+                "deepcoin_order_draft": auto_draft,
+                "execution_plan": execution_plan,
             },
-            strategy_instance_id=str(hybrid_draft.get("strategy_instance_id") or ""),
+            strategy_instance_id=str(auto_draft.get("strategy_instance_id") or ""),
             enqueued_at=now,
         )
         submit_result = process_trade_signal_live(
@@ -459,6 +485,57 @@ def market_price_is_near_entry_edge(
     return abs(float(current_price) - anchor) / anchor * 100 <= float(max_deviation_pct)
 
 
+def _build_auto_market_deepcoin_draft(
+    *,
+    signal: RecoverySignal,
+    runtime_kol_id: str,
+    reference_price: float | None,
+    stop_loss_text: str | None,
+    take_profit_text: str | None,
+    take_profit_allocations: list[float],
+    contract_spec_provider: DeepcoinContractSpecProvider | None,
+) -> dict[str, Any] | None:
+    if reference_price is None:
+        return None
+    contract = f"{signal.symbol}-USDT"
+    instrument_id = _to_deepcoin_swap_instrument(signal.symbol)
+    contract_spec = (
+        contract_spec_provider.get_contract_spec(instrument_id)
+        if contract_spec_provider is not None
+        else None
+    )
+    strategy_instance_id = build_strategy_instance_id(
+        venue="deepcoin",
+        chat_id=signal.chat_id,
+        message_id=signal.message_id,
+        symbol=signal.symbol,
+        side=signal.side,
+    )
+    return build_deepcoin_order_draft(
+        {
+            "venue": "deepcoin",
+            "contract": contract,
+            "order_type": "market",
+            "open_side": "buy" if signal.side == "long" else "sell",
+            "position_side": signal.side,
+            "margin_mode": "cross",
+            "position_mode": "split",
+            "entry_range": f"{reference_price}-{reference_price}",
+            "stop_loss": stop_loss_text,
+            "take_profit": take_profit_text,
+            "take_profit_allocations": take_profit_allocations,
+            "risk_budget_usdt": signal.max_loss_usdt,
+            "strategy_instance_id": strategy_instance_id,
+            "source": {
+                "kol_id": runtime_kol_id,
+                "chat_id": signal.chat_id,
+                "message_id": signal.message_id,
+            },
+        },
+        contract_spec=contract_spec,
+    )
+
+
 def _build_auto_hybrid_deepcoin_draft(
     *,
     signal: RecoverySignal,
@@ -613,6 +690,31 @@ def _infer_entry_execution_type(
     if any(token in text for token in ["market", "市价", "现价", "直接", "马上", "立即"]):
         return "market"
     return "limit"
+
+
+def _is_nearby_single_entry_text(entry_text: str | None, message_text: str | None) -> bool:
+    text = " ".join(str(part or "") for part in (entry_text, message_text)).lower()
+    return any(token in text for token in ["附近", "左右", "一线", "nearby", "around"])
+
+
+def _is_single_price_entry_range(entry_range: tuple[float, float]) -> bool:
+    return abs(float(entry_range[0]) - float(entry_range[1])) < 1e-9
+
+
+def _single_entry_price_is_near_market(
+    *,
+    current_price: float | None,
+    entry_range: tuple[float, float],
+    max_deviation_pct: float,
+) -> bool:
+    if current_price is None:
+        return False
+    entry_price = float(entry_range[0])
+    if entry_price <= 0:
+        return False
+    return abs(float(current_price) - entry_price) / entry_price * 100 <= float(
+        max_deviation_pct
+    )
 
 
 def _to_deepcoin_swap_instrument(symbol: str) -> str:

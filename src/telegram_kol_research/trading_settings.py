@@ -24,6 +24,7 @@ class TradingSettings:
     daily_max_loss_usdt: float = 500.0
     max_concurrent_positions: int = 3
     max_market_entry_deviation_pct: float = 0.15
+    nearby_entry_market_deviation_pct: float = 1.5
     min_ai_confidence: float = 0.75
     allowed_symbols: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
     entry_range_order_style: str = "eager"
@@ -133,6 +134,10 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         max_market_entry_deviation_pct=_positive_float(
             raw.get("max_market_entry_deviation_pct"),
             defaults.max_market_entry_deviation_pct,
+        ),
+        nearby_entry_market_deviation_pct=_positive_float(
+            raw.get("nearby_entry_market_deviation_pct"),
+            defaults.nearby_entry_market_deviation_pct,
         ),
         min_ai_confidence=max(
             0.0,

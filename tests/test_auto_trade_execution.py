@@ -38,6 +38,7 @@ class _FakeDeepcoinClient:
         self.positions = []
         self.trigger_pending = []
         self.open_orders = []
+        self.ticker_prices = {}
 
     def place_order(self, order_payload):
         self.orders.append(order_payload)
@@ -76,6 +77,8 @@ class _FakeDeepcoinClient:
         return self.open_orders
 
     def get_ticker_price(self, *, inst_id):
+        if inst_id in self.ticker_prices:
+            return self.ticker_prices[inst_id]
         if inst_id == "ETH-USDT-SWAP":
             return 1585.0
         return 68100.0
@@ -347,6 +350,51 @@ def test_auto_process_message_trade_signal_accepts_nearby_single_entry_price(tmp
     assert result["entry_execution_type"] == "limit"
     assert len(fake_client.orders) == 2
     assert fake_client.trigger_orders == []
+
+
+def test_auto_process_nearby_single_entry_uses_market_when_price_is_close(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="米娅BTC短线合约交易策略 做多 进场点位：59600附近 止损点位：58100 止盈点位：61800",
+        entry_text="59600附近",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.ticker_prices["BTC-USDT-SWAP"] = 60300.0
+    fake_client.positions = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-nearby",
+            "posSide": "long",
+            "pos": "13",
+            "mrgPosition": "split",
+            "mgnMode": "cross",
+            "uTime": "1",
+        }
+    ]
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 2, 9, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert result["entry_execution_type"] == "market"
+    assert len(fake_client.orders) == 1
+    assert fake_client.orders[0]["ordType"] == "market"
+    assert fake_client.protections[0]["posId"] == "pos-1"
 
 
 def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_path):

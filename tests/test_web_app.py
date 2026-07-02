@@ -76,6 +76,7 @@ def test_trading_settings_api_persists_runtime_risk_defaults(tmp_path):
             "daily_max_loss_usdt": 600,
             "max_concurrent_positions": 5,
             "max_market_entry_deviation_pct": 0.2,
+            "nearby_entry_market_deviation_pct": 1.25,
             "min_ai_confidence": 0.8,
             "allowed_symbols": "BTC,ETH,SOL",
             "entry_range_order_style": "conservative",
@@ -87,11 +88,13 @@ def test_trading_settings_api_persists_runtime_risk_defaults(tmp_path):
 
     assert response.status_code == 200
     assert response.json()["default_max_loss_usdt"] == 150.0
+    assert response.json()["nearby_entry_market_deviation_pct"] == 1.25
     assert response.json()["allowed_symbols"] == ["BTC", "ETH", "SOL"]
 
     reloaded = client.get("/api/trading-settings")
     assert reloaded.status_code == 200
     assert reloaded.json()["auto_trade_enabled"] is True
+    assert reloaded.json()["nearby_entry_market_deviation_pct"] == 1.25
     assert reloaded.json()["take_profit_allocations"] == [50.0, 30.0, 20.0]
 
 
