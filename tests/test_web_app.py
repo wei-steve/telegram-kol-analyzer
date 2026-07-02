@@ -428,6 +428,102 @@ def test_execution_sync_api_marks_missing_deepcoin_position_closed(tmp_path):
         assert lifecycle.exit_reason == "manual"
 
 
+def test_execution_sync_api_recovers_second_leg_before_manual_close_check(tmp_path):
+    class FakeDeepcoinClient:
+        def __init__(self):
+            self.protection_payloads = []
+
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-limit",
+                    "posSide": "short",
+                    "pos": "6.4",
+                    "avgPx": "1624.5",
+                    "cTime": "160000",
+                }
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "order-limit",
+                    "clOrdId": "client-limit",
+                    "state": "filled",
+                    "avgPx": "1624.5",
+                    "fillSz": "6.4",
+                    "fillTime": "160000",
+                }
+            ]
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
+        def set_position_sltp(self, payload):
+            self.protection_payloads.append(payload)
+            return {"code": "0", "data": {"ordId": "tpsl-new"}}
+
+    fake_client = FakeDeepcoinClient()
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: fake_client,
+        now_provider=lambda: datetime(2026, 7, 2, 10, 5),
+    )
+    with app.state.session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=10,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 2, 10, 0),
+            entered_at=datetime(2026, 7, 2, 10, 1),
+            stop_loss=1640,
+            take_profit="1608/1600/1580",
+        )
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=10,
+            symbol="ETH",
+            side="short",
+            status="active",
+            order_id="order-market,order-limit",
+            client_order_id="client-market,client-limit",
+            pos_id="pos-market",
+        )
+        session.add_all([lifecycle, binding])
+        session.commit()
+        lifecycle_id = lifecycle.id
+        binding_id = binding.id
+
+    client = TestClient(app)
+    response = client.post("/api/execution/sync-deepcoin")
+
+    assert response.status_code == 200
+    assert response.json()["reconciled_active"] == 1
+    assert response.json()["manually_closed"] == 0
+    assert response.json()["protection_recovered"] == 1
+    assert fake_client.protection_payloads[0]["posId"] == "pos-limit"
+    assert fake_client.protection_payloads[0]["slTriggerPx"] == "1640.0"
+    assert fake_client.protection_payloads[0]["tpTriggerPx"] == "1608.0"
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, binding_id)
+
+        assert lifecycle.lifecycle_status == "entered"
+        assert binding.status == "active"
+        assert binding.pos_id == "pos-market,pos-limit"
+
+
 def test_bind_live_position_api_attaches_unbound_position_to_lifecycle(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):

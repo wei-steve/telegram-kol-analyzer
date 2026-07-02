@@ -463,6 +463,83 @@ def test_reconcile_appends_filled_second_leg_position_id(tmp_path):
     assert binding.last_exchange_status == "position_active_recovered_additional_pos_id"
 
 
+def test_reconcile_recovers_second_leg_when_first_leg_is_no_longer_active(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    upsert_execution_binding(
+        session_factory,
+        _binding(
+            symbol="ETH",
+            side="short",
+            order_id="order-market,order-limit",
+            client_order_id="client-market,client-limit",
+            pos_id="pos-market",
+            status="active",
+        ),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="ETH",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 2, 10, 0),
+                entered_at=datetime(2026, 7, 2, 10, 1),
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-limit",
+                    "posSide": "short",
+                    "pos": "6.4",
+                    "avgPx": "1624.5",
+                    "cTime": "160000",
+                },
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            assert inst_id == "ETH-USDT-SWAP"
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "order-limit",
+                    "clOrdId": "client-limit",
+                    "state": "filled",
+                    "avgPx": "1624.5",
+                    "fillSz": "6.4",
+                    "fillTime": "160000",
+                }
+            ]
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 7, 2, 10, 5),
+    )
+
+    assert result.active == 1
+    assert result.stale == 0
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+
+    assert binding.status == "active"
+    assert binding.pos_id == "pos-market,pos-limit"
+    assert lifecycle.lifecycle_status == "entered"
+
+
 def test_reconcile_does_not_guess_position_id_when_ambiguous(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     upsert_execution_binding(

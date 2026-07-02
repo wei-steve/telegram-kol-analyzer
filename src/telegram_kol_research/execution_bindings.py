@@ -280,7 +280,7 @@ def reconcile_deepcoin_execution_bindings(
                 row.last_exchange_status = "order_open"
                 result.open += 1
             else:
-                recovered_position = _select_position_from_order_evidence(
+                recovered_pos_ids = _select_additional_positions_from_order_evidence(
                     row,
                     client=client,
                     active_positions=active_positions,
@@ -288,29 +288,45 @@ def reconcile_deepcoin_execution_bindings(
                     order_history_cache=order_history_cache,
                     trade_fills_cache=trade_fills_cache,
                 )
-                recovered_status = "position_active_recovered_from_filled_order"
-                if recovered_position is None:
-                    recovered_position = _select_recovered_position_for_unbound_binding(
-                        row,
-                        rows=rows,
-                        active_positions=active_positions,
-                        bound_pos_ids=bound_pos_ids,
-                    )
-                    recovered_status = "position_active_recovered_without_pos_id"
-                if recovered_position is not None:
-                    recovered_pos_id = _first_string(recovered_position, "posId", "pos_id", "id")
-                    row.pos_id = recovered_pos_id
+                if recovered_pos_ids:
+                    row.pos_id = _join_unique_ids([*_split_ids(row.pos_id), *recovered_pos_ids])
                     row.status = "active"
-                    row.last_exchange_status = recovered_status
-                    bound_pos_ids.add(str(recovered_pos_id))
+                    row.last_exchange_status = "position_active_recovered_additional_pos_id"
+                    bound_pos_ids.update(recovered_pos_ids)
                     result.active += 1
                     _attach_binding_to_lifecycle(session, row, now)
                 else:
-                    row.status = "stale"
-                    row.last_exchange_status = "not_found_on_exchange"
-                    if not _split_ids(row.pos_id):
-                        _cancel_missing_entry_lifecycle(session, row, now)
-                    result.stale += 1
+                    recovered_position = _select_position_from_order_evidence(
+                        row,
+                        client=client,
+                        active_positions=active_positions,
+                        bound_pos_ids=bound_pos_ids,
+                        order_history_cache=order_history_cache,
+                        trade_fills_cache=trade_fills_cache,
+                    )
+                    recovered_status = "position_active_recovered_from_filled_order"
+                    if recovered_position is None:
+                        recovered_position = _select_recovered_position_for_unbound_binding(
+                            row,
+                            rows=rows,
+                            active_positions=active_positions,
+                            bound_pos_ids=bound_pos_ids,
+                        )
+                        recovered_status = "position_active_recovered_without_pos_id"
+                    if recovered_position is not None:
+                        recovered_pos_id = _first_string(recovered_position, "posId", "pos_id", "id")
+                        row.pos_id = recovered_pos_id
+                        row.status = "active"
+                        row.last_exchange_status = recovered_status
+                        bound_pos_ids.add(str(recovered_pos_id))
+                        result.active += 1
+                        _attach_binding_to_lifecycle(session, row, now)
+                    else:
+                        row.status = "stale"
+                        row.last_exchange_status = "not_found_on_exchange"
+                        if not _split_ids(row.pos_id):
+                            _cancel_missing_entry_lifecycle(session, row, now)
+                        result.stale += 1
             row.recovered_at = now
             row.updated_at = now
             result.updated += 1

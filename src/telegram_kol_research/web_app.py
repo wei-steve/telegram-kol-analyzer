@@ -1507,11 +1507,6 @@ def create_web_app(
     async def sync_deepcoin_execution_state():
         try:
             client = app.state.deepcoin_client_factory()
-            result = sync_manual_closed_deepcoin_positions(
-                app.state.session_factory,
-                client=client,
-                synced_at=app.state.now_provider(),
-            )
             reconcile_result = (
                 reconcile_deepcoin_execution_bindings(
                     app.state.session_factory,
@@ -1520,6 +1515,11 @@ def create_web_app(
                 )
                 if hasattr(client, "list_open_orders")
                 else None
+            )
+            result = sync_manual_closed_deepcoin_positions(
+                app.state.session_factory,
+                client=client,
+                synced_at=app.state.now_provider(),
             )
             protection_result = (
                 recover_missing_position_protections(
