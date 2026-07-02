@@ -48,6 +48,38 @@ def test_map_deepcoin_positions_returns_bound_active_positions_only():
     assert positions[0].pos_id == "pos-1"
 
 
+def test_map_deepcoin_positions_splits_multi_position_binding():
+    positions = map_deepcoin_positions(
+        [
+            {
+                "instId": "ETH-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "short",
+                "pos": "4.3",
+            },
+            {
+                "instId": "ETH-USDT-SWAP",
+                "posId": "pos-2",
+                "posSide": "short",
+                "pos": "6.4",
+            },
+        ],
+        bindings=[
+            DeepcoinOrderBinding(
+                kol_id="kol-a",
+                chat_id=100,
+                source_message_id=55,
+                symbol="ETH",
+                side="short",
+                pos_id="pos-1,pos-2",
+            )
+        ],
+    )
+
+    assert [position.pos_id for position in positions] == ["pos-1", "pos-2"]
+    assert {position.kol_id for position in positions} == {"kol-a"}
+
+
 def test_map_deepcoin_open_orders_returns_bound_open_orders_only():
     orders = map_deepcoin_open_orders(
         [

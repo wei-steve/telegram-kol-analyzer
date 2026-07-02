@@ -259,8 +259,21 @@ def reconcile_deepcoin_execution_bindings(
                 order = _lookup_order_by_any_id(orders_by_client_order_id, row.client_order_id)
 
             if position is not None and _has_nonzero_size(position):
+                recovered_pos_ids = _select_additional_positions_from_order_evidence(
+                    row,
+                    client=client,
+                    active_positions=active_positions,
+                    bound_pos_ids=bound_pos_ids,
+                    order_history_cache=order_history_cache,
+                    trade_fills_cache=trade_fills_cache,
+                )
+                if recovered_pos_ids:
+                    row.pos_id = _join_unique_ids([*_split_ids(row.pos_id), *recovered_pos_ids])
+                    bound_pos_ids.update(recovered_pos_ids)
+                    row.last_exchange_status = "position_active_recovered_additional_pos_id"
+                else:
+                    row.last_exchange_status = "position_active"
                 row.status = "active"
-                row.last_exchange_status = "position_active"
                 result.active += 1
             elif order is not None and _is_open_order_state(order):
                 row.status = "open"
@@ -645,6 +658,18 @@ def _split_ids(value: str | None) -> list[str]:
     ]
 
 
+def _join_unique_ids(values: list[str]) -> str:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return ",".join(result)
+
+
 def _has_nonzero_size(position: dict[str, Any]) -> bool:
     size = position.get("pos")
     if size in (None, ""):
@@ -732,6 +757,55 @@ def _select_position_from_order_evidence(
     if len(matches) == 1:
         return matches[0]
     return None
+
+
+def _select_additional_positions_from_order_evidence(
+    row: ExecutionBinding,
+    *,
+    client: DeepcoinReadOnlyClient,
+    active_positions: list[dict[str, Any]],
+    bound_pos_ids: set[str],
+    order_history_cache: dict[str, list[dict[str, Any]]],
+    trade_fills_cache: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    existing_pos_ids = set(_split_ids(row.pos_id))
+    order_ids = set(_split_ids(row.order_id)) | set(_split_ids(row.client_order_id))
+    if not existing_pos_ids or not order_ids:
+        return []
+
+    target_symbol = str(row.symbol or "").upper()
+    target_side = str(row.side or "").lower()
+    instrument_id = f"{target_symbol}-USDT-SWAP"
+    candidates = [
+        position
+        for position in active_positions
+        if _first_string(position, "posId", "pos_id", "id") not in existing_pos_ids
+        and _first_string(position, "posId", "pos_id", "id") not in bound_pos_ids
+        and _symbol_from_inst_id(position.get("instId")) == target_symbol
+        and _normalize_position_side(
+            str(position.get("posSide") or position.get("side") or "")
+        )
+        == target_side
+    ]
+    if not candidates:
+        return []
+
+    evidence = _load_order_evidence(
+        client,
+        instrument_id=instrument_id,
+        order_ids=order_ids,
+        order_history_cache=order_history_cache,
+        trade_fills_cache=trade_fills_cache,
+    )
+    if not evidence:
+        return []
+
+    recovered: list[str] = []
+    for position in candidates:
+        pos_id = _first_string(position, "posId", "pos_id", "id")
+        if pos_id and any(_position_matches_order_evidence(position, item) for item in evidence):
+            recovered.append(pos_id)
+    return recovered
 
 
 def _load_order_evidence(

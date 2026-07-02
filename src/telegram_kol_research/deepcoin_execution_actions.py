@@ -137,7 +137,6 @@ def recover_missing_position_protections(
         ]
 
     for binding, target in snapshots:
-        result.checked += 1
         if not binding.pos_id:
             result.skipped_unbound += 1
             continue
@@ -146,55 +145,57 @@ def recover_missing_position_protections(
             result.skipped_missing_prices += 1
             continue
         inst_id = _to_deepcoin_swap_instrument(binding.symbol)
-        position = _select_bound_position(
+        positions = _select_bound_positions(
             deepcoin_client.list_positions(inst_id=inst_id),
             binding=binding,
             inst_id=inst_id,
         )
         pending = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
-        old_tpsl_rows = select_position_tpsl_orders(position=position, pending_trigger_orders=pending)
-        if pending_tpsl_order_ids_for_position(position=position, pending_trigger_orders=pending):
-            result.skipped_existing += 1
-            continue
+        for position in positions:
+            result.checked += 1
+            old_tpsl_rows = select_position_tpsl_orders(position=position, pending_trigger_orders=pending)
+            if pending_tpsl_order_ids_for_position(position=position, pending_trigger_orders=pending):
+                result.skipped_existing += 1
+                continue
 
-        set_payload = _build_position_tpsl_payload(
-            binding=binding,
-            position=position,
-            inst_id=inst_id,
-            after=after,
-        )
-        set_response = deepcoin_client.set_position_sltp(set_payload)
-        record_execution_event(
-            session_factory,
-            ExecutionEventRecord(
-                execution_binding_id=binding.id,
-                trade_signal_id=None,
-                strategy_instance_id=binding.strategy_instance_id,
-                kol_id=binding.kol_id,
-                chat_id=binding.chat_id,
-                message_id=binding.message_id,
-                source_message_id=binding.message_id,
-                symbol=binding.symbol,
-                side=binding.side,
-                action="set_position_tpsl",
-                order_id=_extract_order_id(set_response),
-                pos_id=_first_string(position, "posId", "pos_id", "id"),
-                reason="recover_missing_position_protection",
-                before=_tpsl_snapshot(old_tpsl_rows) or None,
+            set_payload = _build_position_tpsl_payload(
+                binding=binding,
+                position=position,
+                inst_id=inst_id,
                 after=after,
-                request=set_payload,
-                response=set_response,
-                created_at=now,
-            ),
-        )
-        _update_binding_status(
-            session_factory,
-            binding.id,
-            status="active",
-            last_exchange_status="position_tpsl_adjusted",
-            updated_at=now,
-        )
-        result.protected += 1
+            )
+            set_response = deepcoin_client.set_position_sltp(set_payload)
+            record_execution_event(
+                session_factory,
+                ExecutionEventRecord(
+                    execution_binding_id=binding.id,
+                    trade_signal_id=None,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    kol_id=binding.kol_id,
+                    chat_id=binding.chat_id,
+                    message_id=binding.message_id,
+                    source_message_id=binding.message_id,
+                    symbol=binding.symbol,
+                    side=binding.side,
+                    action="set_position_tpsl",
+                    order_id=_extract_order_id(set_response),
+                    pos_id=_first_string(position, "posId", "pos_id", "id"),
+                    reason="recover_missing_position_protection",
+                    before=_tpsl_snapshot(old_tpsl_rows) or None,
+                    after=after,
+                    request=set_payload,
+                    response=set_response,
+                    created_at=now,
+                ),
+            )
+            _update_binding_status(
+                session_factory,
+                binding.id,
+                status="active",
+                last_exchange_status="position_tpsl_adjusted",
+                updated_at=now,
+            )
+            result.protected += 1
     return result
 
 

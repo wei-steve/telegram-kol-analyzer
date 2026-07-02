@@ -66,9 +66,9 @@ def map_deepcoin_positions(
     """Map raw Deepcoin positions to bound active-position summaries."""
 
     bindings_by_pos_id = {
-        binding.pos_id: binding
+        pos_id: binding
         for binding in bindings
-        if binding.pos_id
+        for pos_id in _split_ids(binding.pos_id)
     }
     active_positions: list[ActivePosition] = []
     for position in positions:
@@ -138,6 +138,10 @@ def _first_string(payload: dict[str, Any], *keys: str) -> str | None:
         if value not in (None, ""):
             return str(value)
     return None
+
+
+def _split_ids(value: str | None) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
 
 def _has_nonzero_size(position: dict[str, Any]) -> bool:

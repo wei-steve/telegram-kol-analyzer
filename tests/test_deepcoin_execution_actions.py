@@ -273,6 +273,70 @@ def test_recover_missing_position_protection_skips_existing_tpsl(tmp_path):
     assert client.protection_payloads == []
 
 
+def test_recover_missing_position_protection_handles_each_bound_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory, pos_id="pos-1,pos-2")
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="ETH",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 1, 8, 0),
+                execution_binding_id=binding_id,
+                stop_loss=1545.0,
+                take_profit="1605",
+            )
+        )
+        session.commit()
+    client = _FakeDeepcoinClient()
+    client.positions = [
+        {
+            "posId": "pos-1",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.1",
+            "cTime": "1000",
+        },
+        {
+            "posId": "pos-2",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.2",
+            "cTime": "2000",
+        },
+    ]
+    client.trigger_pending = [
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "pos-1-tpsl",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "posId": "pos-1",
+            "tpTriggerPx": "1605.0",
+            "slTriggerPx": "1545.0",
+            "sz": "0.1",
+            "cTime": "1000",
+        }
+    ]
+
+    result = recover_missing_position_protections(
+        session_factory,
+        deepcoin_client=client,
+        recovered_at=datetime(2026, 7, 1, 9, 0, tzinfo=UTC),
+    )
+
+    assert result.checked == 2
+    assert result.skipped_existing == 1
+    assert result.protected == 1
+    assert len(client.protection_payloads) == 1
+    assert client.protection_payloads[0]["posId"] == "pos-2"
+    assert client.protection_payloads[0]["tpTriggerPx"] == "1605.0"
+    assert client.protection_payloads[0]["slTriggerPx"] == "1545.0"
+
+
 def test_process_trade_signal_live_closes_bound_position_with_close_pos_id(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
