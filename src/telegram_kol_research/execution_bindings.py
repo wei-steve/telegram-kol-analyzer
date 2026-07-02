@@ -426,7 +426,7 @@ def sync_manual_closed_deepcoin_positions(
         rows = (
             session.query(ExecutionBinding)
             .filter(ExecutionBinding.venue == "deepcoin")
-            .filter(ExecutionBinding.status.in_(["open", "active"]))
+            .filter(ExecutionBinding.status.in_(["open", "active", "stale"]))
             .order_by(ExecutionBinding.id.asc())
             .all()
         )

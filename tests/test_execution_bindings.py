@@ -1,6 +1,8 @@
 import sqlite3
 from datetime import datetime
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
     ExecutionBindingRecord,
@@ -739,11 +741,12 @@ def test_reconcile_does_not_guess_position_id_when_ambiguous(tmp_path):
     assert [row.pos_id for row in rows] == [None, None]
 
 
-def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path):
+@pytest.mark.parametrize("binding_status", ["active", "stale"])
+def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, binding_status):
     session_factory = create_session_factory(tmp_path / "research.db")
     upsert_execution_binding(
         session_factory,
-        _binding(pos_id="pos-closed", status="active"),
+        _binding(pos_id="pos-closed", status=binding_status),
     )
     with session_factory() as session:
         session.add(
