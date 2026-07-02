@@ -656,6 +656,8 @@ def _lifecycle_status_label(status: str | None, exit_reason: str | None = None) 
         return "持仓中"
     if status == "invalidated" or exit_reason == "context_invalidated":
         return "语境失效"
+    if exit_reason == "auto_trade_failed":
+        return "自动交易失败"
     if status == "expired" or exit_reason == "expired":
         return "过期未入场"
     if exit_reason == "cancelled":
@@ -678,6 +680,8 @@ def _lifecycle_status_detail(status: str | None, exit_reason: str | None = None)
         return "策略已入场，继续跟踪止盈、止损和 KOL 后续离场消息。"
     if status == "invalidated" or exit_reason == "context_invalidated":
         return "KOL 后续同币种消息改变了原入场语境，旧待入场策略已移出可执行列表。"
+    if exit_reason == "auto_trade_failed":
+        return "交易所下单失败，策略未形成真实持仓。"
     if exit_reason == "cancelled":
         return "KOL 后续消息取消了这笔限价挂单，策略未入场。"
     if exit_reason == "kol_signal":
@@ -712,6 +716,8 @@ def _management_action_label(action: str | None) -> str:
 def _latest_event_label(status: str | None, exit_reason: str | None = None) -> str:
     if status == "invalidated" or exit_reason == "context_invalidated":
         return "语境失效"
+    if exit_reason == "auto_trade_failed":
+        return "自动交易失败"
     if exit_reason == "cancelled":
         return "取消挂单"
     if exit_reason == "kol_signal":
@@ -732,6 +738,8 @@ def _latest_event_label(status: str | None, exit_reason: str | None = None) -> s
 def _transition_text(status: str | None, exit_reason: str | None = None) -> str:
     if status == "invalidated" or exit_reason == "context_invalidated":
         return "pending_entry → invalidated"
+    if exit_reason == "auto_trade_failed":
+        return "pending_entry → auto_trade_failed"
     if exit_reason == "cancelled":
         return "pending_entry → cancelled"
     if status == "expired" or exit_reason == "expired":

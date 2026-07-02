@@ -10,6 +10,8 @@ from typing import Any
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
+from telegram_kol_research.models import StrategyLifecycle
+from telegram_kol_research.models import TradeIdea
 from telegram_kol_research.models import TradeSignal
 
 
@@ -187,7 +189,34 @@ def mark_trade_signal_failed(
         row.last_error = error
         row.attempts = int(row.attempts or 0) + 1
         row.updated_at = now
+        if row.action == "open_position":
+            _mark_lifecycle_auto_trade_failed(session, row, now)
         session.commit()
+
+
+def _mark_lifecycle_auto_trade_failed(session, row: TradeSignal, failed_at: datetime) -> None:
+    lifecycle = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.chat_id == row.chat_id)
+        .filter(StrategyLifecycle.message_id == row.message_id)
+        .filter(StrategyLifecycle.symbol == row.symbol)
+        .filter(StrategyLifecycle.side == row.side)
+        .filter(StrategyLifecycle.lifecycle_status.in_(["pending_entry", "entered"]))
+        .order_by(StrategyLifecycle.id.desc())
+        .first()
+    )
+    if lifecycle is None:
+        return
+
+    lifecycle.lifecycle_status = "invalidated"
+    lifecycle.exit_reason = "auto_trade_failed"
+    lifecycle.exited_at = failed_at
+    lifecycle.updated_at = failed_at
+    if lifecycle.trade_idea_id is not None:
+        trade_idea = session.get(TradeIdea, lifecycle.trade_idea_id)
+        if trade_idea is not None and trade_idea.status == "open":
+            trade_idea.status = "closed"
+            trade_idea.closed_at = failed_at
 
 
 def _row_to_record(row: TradeSignal) -> TradeSignalRecord:

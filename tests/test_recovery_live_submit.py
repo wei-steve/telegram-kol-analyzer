@@ -91,6 +91,12 @@ class _ProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
         raise RuntimeError("missing_take_profit_for_protection")
 
 
+class _InsufficientMoneyDeepcoinClient(_FakeDeepcoinClient):
+    def place_order(self, order_payload):
+        self.payloads.append(order_payload)
+        raise DeepcoinClientError("Deepcoin API error 36: InsufficientMoney")
+
+
 class _OrderProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
     def __init__(self):
         super().__init__()
@@ -567,6 +573,46 @@ def test_market_submit_persists_binding_when_position_protection_fails(tmp_path)
     assert binding.last_exchange_status == "position_active_protection_failed"
     assert binding.order_id == "order-market-1"
     assert binding.pos_id == "pos-market-1"
+
+
+def test_market_submit_failure_invalidates_lifecycle(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_market_item(session_factory)
+    _persist_lifecycle(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+    )
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    fake_client = _InsufficientMoneyDeepcoinClient()
+
+    try:
+        submit_recovery_order_live(
+            session_factory,
+            chat_id=200,
+            message_id=66,
+            symbol="BTC",
+            side="short",
+            deepcoin_client=fake_client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=datetime(2026, 6, 30, 8, 3, tzinfo=UTC),
+        )
+    except DeepcoinClientError:
+        pass
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("expected DeepcoinClientError")
+
+    with session_factory() as session:
+        signal = session.query(TradeSignal).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+
+    assert signal.status == "failed"
+    assert signal.last_error == "Deepcoin API error 36: InsufficientMoney"
+    assert lifecycle.lifecycle_status == "invalidated"
+    assert lifecycle.exit_reason == "auto_trade_failed"
+    assert lifecycle.exited_at is not None
 
 
 def test_limit_submit_does_not_attach_protection_to_unrelated_position(tmp_path):
