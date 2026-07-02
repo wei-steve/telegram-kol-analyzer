@@ -339,6 +339,13 @@ def _load_deepcoin_live_position_rows(
                     protection_key[3],
                 )
             )
+            stop_loss_value = _deepcoin_tpsl_price(tpsl_order, "sl")
+            if stop_loss_value is None:
+                stop_loss_value = _deepcoin_position_tpsl_price(position, "sl")
+            take_profit_value = _deepcoin_tpsl_price(tpsl_order, "tp")
+            if take_profit_value is None:
+                take_profit_value = _deepcoin_position_tpsl_price(position, "tp")
+            has_protection = stop_loss_value is not None or take_profit_value is not None
             binding = bindings_by_pos_id.get(pos_id or "")
             lifecycle = None
             if binding is not None:
@@ -378,13 +385,9 @@ def _load_deepcoin_live_position_rows(
                     "status": "live",
                     "lifecycle_status": lifecycle.lifecycle_status if lifecycle is not None else None,
                     "entry_price_actual": _float_or_none(position.get("avgPx")),
-                    "stop_loss_text": _position_text_value(
-                        _deepcoin_tpsl_price(tpsl_order, "sl") if tpsl_order else None
-                    ),
-                    "take_profit_text": _position_text_value(
-                        _deepcoin_tpsl_price(tpsl_order, "tp") if tpsl_order else None
-                    ),
-                    "protection_status": "protected" if tpsl_order else "unprotected",
+                    "stop_loss_text": _position_text_value(stop_loss_value),
+                    "take_profit_text": _position_text_value(take_profit_value),
+                    "protection_status": "protected" if has_protection else "unprotected",
                     "execution_status": binding.status if binding is not None else "unbound_live_position",
                     "exchange_status": "position_active",
                     "pos_id": pos_id,
@@ -401,12 +404,8 @@ def _load_deepcoin_live_position_rows(
                             symbol=symbol,
                             side=side,
                             entry_price_actual=_float_or_none(position.get("avgPx")),
-                            stop_loss=_float_or_none(
-                                _deepcoin_tpsl_price(tpsl_order, "sl") if tpsl_order else None
-                            ),
-                            take_profit=_float_or_none(
-                                _deepcoin_tpsl_price(tpsl_order, "tp") if tpsl_order else None
-                            ),
+                            stop_loss=_float_or_none(stop_loss_value),
+                            take_profit=_float_or_none(take_profit_value),
                             group_label_by_chat_id=group_label_by_chat_id,
                         )
                         if binding is None
@@ -505,6 +504,19 @@ def _deepcoin_tpsl_price(order: dict[str, Any] | None, kind: str) -> Any:
     )
     for key in keys:
         value = order.get(key)
+        if _is_nonzero_price(value):
+            return value
+    return None
+
+
+def _deepcoin_position_tpsl_price(position: dict[str, Any], kind: str) -> Any:
+    keys = (
+        ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+        if kind == "sl"
+        else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
+    )
+    for key in keys:
+        value = position.get(key)
         if _is_nonzero_price(value):
             return value
     return None

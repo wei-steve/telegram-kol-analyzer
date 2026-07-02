@@ -247,8 +247,6 @@ def test_execution_dashboard_uses_pending_tpsl_orders_for_live_protection(tmp_pa
                     "pos": "9",
                     "avgPx": "59761.2",
                     "cTime": "1782785675000",
-                    "slTriggerPx": "61500",
-                    "tpTriggerPx": "57300",
                 },
             ]
 
@@ -280,6 +278,40 @@ def test_execution_dashboard_uses_pending_tpsl_orders_for_live_protection(tmp_pa
     assert "pos-protected" in response.text
     assert "pos-unprotected" in response.text
     assert response.text.count("无保护单") == 1
+
+
+def test_execution_dashboard_uses_position_tpsl_fields_for_live_protection(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-with-position-fields",
+                    "posSide": "short",
+                    "pos": "11",
+                    "avgPx": "61563",
+                    "cTime": "1783004197000",
+                    "slTriggerPx": "62440",
+                    "tpTriggerPx": "59588",
+                },
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            assert inst_id == "BTC-USDT-SWAP"
+            return []
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+    )
+
+    client = TestClient(app)
+    response = client.get("/execution")
+
+    assert response.status_code == 200
+    assert "pos-with-position-fields" in response.text
+    assert "62440" in response.text
+    assert "59588" in response.text
 
 
 def test_execution_dashboard_matches_zero_size_tpsl_orders_by_position_time(tmp_path):
