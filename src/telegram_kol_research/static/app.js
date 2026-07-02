@@ -1008,7 +1008,7 @@ function bindTradingSettingsForm() {
       daily_max_loss_usdt: numericValue('daily_max_loss_usdt', 500),
       max_concurrent_positions: numericValue('max_concurrent_positions', 3),
       max_market_entry_deviation_pct: numericValue('max_market_entry_deviation_pct', 0.15),
-      nearby_entry_market_deviation_pct: numericValue('nearby_entry_market_deviation_pct', 1.5),
+      nearby_entry_market_deviation_pct: numericValue('nearby_entry_market_deviation_pct', 0.15),
       min_ai_confidence: Number(formData.get('min_ai_confidence') || 0.75),
       allowed_symbols: String(formData.get('allowed_symbols') || 'BTC,ETH'),
       entry_range_order_style: String(formData.get('entry_range_order_style') || 'conservative'),

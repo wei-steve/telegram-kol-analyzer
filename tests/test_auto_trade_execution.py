@@ -368,7 +368,7 @@ def test_auto_process_nearby_single_entry_uses_market_when_price_is_close(tmp_pa
         },
     )
     fake_client = _FakeDeepcoinClient()
-    fake_client.ticker_prices["BTC-USDT-SWAP"] = 60300.0
+    fake_client.ticker_prices["BTC-USDT-SWAP"] = 59680.0
     fake_client.positions = [
         {
             "instId": "BTC-USDT-SWAP",
@@ -395,6 +395,39 @@ def test_auto_process_nearby_single_entry_uses_market_when_price_is_close(tmp_pa
     assert len(fake_client.orders) == 1
     assert fake_client.orders[0]["ordType"] == "market"
     assert fake_client.protections[0]["posId"] == "pos-1"
+
+
+def test_auto_process_nearby_single_entry_keeps_limit_when_price_is_far(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="米娅BTC短线合约交易策略 做多 进场点位：59600附近 止损点位：58100 止盈点位：61800",
+        entry_text="59600附近",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.ticker_prices["BTC-USDT-SWAP"] = 60300.0
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 2, 9, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert result["entry_execution_type"] == "limit"
+    assert len(fake_client.orders) == 2
+    assert [order["ordType"] for order in fake_client.orders] == ["limit", "limit"]
 
 
 def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_path):
