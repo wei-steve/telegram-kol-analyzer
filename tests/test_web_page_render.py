@@ -404,6 +404,26 @@ def test_strategy_mid_panel_shows_take_profit_for_entered_lifecycle(tmp_path):
     assert "数量" in response.text
     assert "0.625 BTC" in response.text
     assert "止损1000U" in response.text
+    assert 'data-strategy-card' in response.text
+    assert 'class="strategy-card-summary"' in response.text
+    assert "strategy-card-details" in response.text
+    assert response.text.index('class="strategy-card-summary"') < response.text.index(
+        "strategy-card-details"
+    )
+    summary_match = re.search(
+        r'<summary class="strategy-card-summary">(.*?)</summary>',
+        response.text,
+        re.S,
+    )
+    assert summary_match
+    summary_html = summary_match.group(1)
+    assert "BTC" in summary_html
+    assert "62400" in summary_html
+    assert "63600/64800" in summary_html
+    assert "60800" in summary_html
+    assert "0.625 BTC" in summary_html
+    assert "止损1000U" in summary_html
+    assert "事件时间线" not in summary_html
 
 
 def test_strategy_mid_panel_hides_unbound_entered_lifecycle_from_holding(tmp_path):

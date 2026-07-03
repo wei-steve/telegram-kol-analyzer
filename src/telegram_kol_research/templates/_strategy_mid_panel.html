@@ -1,4 +1,22 @@
 {# Strategy mid-panel: KPI + list for the selected group #}
+{% macro strategy_card_summary(item, status_label='') -%}
+  <summary class="strategy-card-summary">
+    <div class="strategy-card-symbol">
+      <strong>{{ item.symbol }}</strong>
+      <span class="side-badge{% if item.side == 'long' %} side-long{% elif item.side == 'short' %} side-short{% endif %}">
+        {{ '多' if item.side == 'long' else '空' if item.side == 'short' else item.side }}
+      </span>
+      {% if status_label %}<code>{{ status_label }}</code>{% endif %}
+    </div>
+    <div class="strategy-card-summary-grid">
+      {% set entry_value = item.entry_range_text if item.entry_range_text is defined and item.entry_range_text else item.entry_text %}
+      {% if entry_value %}<span><small>入场</small><strong>{{ entry_value }}</strong></span>{% endif %}
+      {% if item.take_profit_text %}<span class="meta-tp"><small>止盈</small><strong>{{ item.take_profit_text }}</strong></span>{% endif %}
+      {% if item.stop_loss_text %}<span class="meta-sl"><small>止损</small><strong>{{ item.stop_loss_text }}</strong></span>{% endif %}
+      {% if item.position_size_text %}<span><small>数量</small><strong>{{ item.position_size_text }}</strong></span>{% endif %}
+    </div>
+  </summary>
+{%- endmacro %}
 <div class="strategy-panel-content">
   <div class="strategy-panel-toolbar">
     <div class="trader-kpi-strip" aria-label="交易执行概览">
@@ -46,10 +64,11 @@
         {% set display_items = holding_positions | selectattr("chat_id", "equalto", selected_chat_id) | list %}
         {% if display_items %}
           {% for h in display_items %}
-            <article class="position-card position-holding">
-              <div class="position-card-main">
+            <details class="position-card position-holding strategy-card" data-strategy-card>
+              {{ strategy_card_summary(h) }}
+              <div class="strategy-card-details position-card-main">
                 <div class="position-symbol-row">
-                  <strong>{{ h.symbol }}</strong>
+                  <span>{{ h.symbol }}</span>
                   <span class="side-badge{% if h.side == 'long' %} side-long{% elif h.side == 'short' %} side-short{% endif %}">
                     {{ '多' if h.side == 'long' else '空' if h.side == 'short' else h.side }}
                   </span>
@@ -88,7 +107,7 @@
                 {% set strategy = h %}
                 {% include "_strategy_lifecycle_timeline.html" %}
               </div>
-            </article>
+            </details>
           {% endfor %}
         {% else %}
           <p class="strategy-mid-empty">暂无持仓中策略</p>
@@ -97,10 +116,11 @@
         {% set display_items = pending_entry_signals | selectattr("chat_id", "equalto", selected_chat_id) | list %}
         {% if display_items %}
           {% for item in display_items %}
-            <article class="position-card position-pending">
-              <div class="position-card-main">
+            <details class="position-card position-pending strategy-card" data-strategy-card>
+              {{ strategy_card_summary(item) }}
+              <div class="strategy-card-details position-card-main">
                 <div class="position-symbol-row">
-                  <strong>{{ item.symbol }}</strong>
+                  <span>{{ item.symbol }}</span>
                   <span class="side-badge{% if item.side == 'long' %} side-long{% elif item.side == 'short' %} side-short{% endif %}">
                     {{ '多' if item.side == 'long' else '空' if item.side == 'short' else item.side }}
                   </span>
@@ -154,7 +174,7 @@
               </div>
               <pre class="recovery-payload-preview">{{ item.deepcoin_order_draft }}</pre>
               {% endif %}
-            </article>
+            </details>
           {% endfor %}
         {% else %}
           <p class="strategy-mid-empty">暂无待入场策略</p>
@@ -163,10 +183,11 @@
         {% set display_items = exited_positions | selectattr("chat_id", "equalto", selected_chat_id) | list %}
         {% if display_items %}
           {% for ex in display_items %}
-            <article class="position-card position-exited">
-              <div class="position-card-main">
+            <details class="position-card position-exited strategy-card" data-strategy-card>
+              {{ strategy_card_summary(ex) }}
+              <div class="strategy-card-details position-card-main">
                 <div class="position-symbol-row">
-                  <strong>{{ ex.symbol }}</strong>
+                  <span>{{ ex.symbol }}</span>
                   <span class="side-badge{% if ex.side == 'long' %} side-long{% elif ex.side == 'short' %} side-short{% endif %}">
                     {{ '多' if ex.side == 'long' else '空' if ex.side == 'short' else ex.side }}
                   </span>
@@ -202,7 +223,7 @@
                 {% set strategy = ex %}
                 {% include "_strategy_lifecycle_timeline.html" %}
               </div>
-            </article>
+            </details>
           {% endfor %}
         {% else %}
           <p class="strategy-mid-empty">暂无已离场策略</p>
