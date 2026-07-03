@@ -109,6 +109,14 @@
           <div class="message-heading-main">
             <span class="message-sender-name">{{ message.sender_name or "Unknown" }}</span>
             <span class="message-posted-at">{{ message.posted_at.strftime('%Y-%m-%d %H:%M') if message.posted_at else '' }}</span>
+            <div class="message-collapsed-ai-summary" data-message-collapsed-ai-summary>
+              <span class="message-collapsed-ai-status">AI识别结果：{{ detection.status if detection else '待识别' }}</span>
+              {% if detection and detection.summary %}
+                <strong>{{ detection.summary }}</strong>
+              {% elif detection and detection.reason %}
+                <small>{{ detection.reason }}</small>
+              {% endif %}
+            </div>
           </div>
           <div class="message-card-header-actions">
             <span class="message-id-badge">#{{ message.message_id }}</span>

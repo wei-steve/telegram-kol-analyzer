@@ -337,7 +337,8 @@ def test_group_messages_route_shows_ai_strategy_detection_results(tmp_path):
     response = client.get("/groups/88/messages")
 
     assert response.status_code == 200
-    assert response.text.count("AI识别结果：") == 3
+    assert response.text.count('class="message-ai-summary-status"') == 3
+    assert response.text.count('data-message-collapsed-ai-summary') == 3
     assert "AI识别结果：是策略" in response.text
     assert "策略内容：" in response.text
     assert "BTC long" in response.text
@@ -455,6 +456,15 @@ def test_group_messages_route_shows_recognition_comparison_results(tmp_path):
     assert "mimo-v2.5" in response.text
     assert "MiMo detected strategy" in response.text
     assert "BTC long 68000 SL 67000 TP 70000" in response.text
+    collapsed_summary = re.search(
+        r'<div class="message-collapsed-ai-summary"[^>]*>(.*?)</div>',
+        response.text,
+        re.S,
+    )
+    assert collapsed_summary
+    assert "AI识别结果：是策略" in collapsed_summary.group(1)
+    assert "BTC long Entry 68000 SL 67000 TP 70000" in collapsed_summary.group(1)
+    assert "MiMo detected strategy" not in collapsed_summary.group(1)
 
 
 def test_group_messages_route_hides_empty_mimo_strategy_json(tmp_path):

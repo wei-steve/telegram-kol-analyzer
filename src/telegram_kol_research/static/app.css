@@ -1330,6 +1330,13 @@ body {
   align-items: center;
 }
 
+.message-card.is-message-collapsed .message-heading-main {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  column-gap: 10px;
+  width: 100%;
+}
+
 .message-heading-main {
   display: grid;
   gap: 2px;
@@ -1346,6 +1353,44 @@ body {
 .message-posted-at {
   color: #94a3b8;
   font-size: 0.72rem;
+}
+
+.message-collapsed-ai-summary {
+  display: none;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+  color: #94a3b8;
+  font-size: 0.74rem;
+  line-height: 1.35;
+}
+
+.message-card.is-message-collapsed .message-collapsed-ai-summary {
+  display: inline-flex;
+}
+
+.message-collapsed-ai-status {
+  flex: 0 0 auto;
+  color: #cbd5e1;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.message-collapsed-ai-summary strong,
+.message-collapsed-ai-summary small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-collapsed-ai-summary strong {
+  color: #f8fafc;
+  font-weight: 700;
+}
+
+.message-collapsed-ai-summary small {
+  color: #94a3b8;
 }
 
 .message-id-badge {
