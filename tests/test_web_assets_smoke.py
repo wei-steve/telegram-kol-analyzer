@@ -111,6 +111,16 @@ def test_app_js_strategy_refresh_syncs_deepcoin_before_reloading_panels(tmp_path
     assert "await refreshStrategyPanels(chatId);" in response.text
 
 
+def test_app_js_refreshes_sidebar_when_switching_groups(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "syncSelectedGroupState(chatId, { focus: true });" in response.text
+    assert "refreshGroupList().catch(() => {" in response.text
+
+
 def test_app_js_appends_loaded_history_below_current_messages(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

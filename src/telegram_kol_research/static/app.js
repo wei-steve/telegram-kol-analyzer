@@ -878,6 +878,9 @@ function bindGroupLinks() {
       const requestId = ++groupSwitchRequestId;
       hasDeferredMessageRefresh = false;
       syncSelectedGroupState(chatId, { focus: true });
+      refreshGroupList().catch(() => {
+        // Keep switching groups responsive even if the sidebar refresh fails.
+      });
       const detailPanel = document.querySelector('[data-detail-panel]');
       const strategyPanel = document.querySelector('[data-strategy-panel]');
       const filterInput = document.querySelector('[data-strategy-filter-input]');
