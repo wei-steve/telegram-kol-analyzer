@@ -912,6 +912,21 @@ def _apply_lifecycle_event_decision(
         return False
     if _looks_like_trading_education_content(raw_message.text or ""):
         return False
+    if event_type == "exit_position" and _exit_decision_looks_like_management_update(
+        raw_message.text,
+        decision,
+    ):
+        decision = dict(decision)
+        event_type = "position_update"
+        decision["event_type"] = event_type
+        if not str(decision.get("management_action") or "").strip():
+            decision["management_action"] = _management_action_for_exit_downgrade(
+                raw_message.text,
+                decision,
+            )
+        if not decision.get("take_profit") and decision.get("exit_price"):
+            decision["take_profit"] = decision.get("exit_price")
+        decision["exit_price"] = None
 
     target = _resolve_lifecycle_event_target(session, raw_message, decision)
     if target is None:
@@ -1020,6 +1035,101 @@ def _apply_lifecycle_event_decision(
         return True
 
     return False
+
+
+def _exit_decision_looks_like_management_update(
+    text: str | None,
+    decision: dict[str, Any],
+) -> bool:
+    combined = _combined_lifecycle_text(text, decision)
+    if _has_full_exit_instruction(str(text or "").lower()):
+        return False
+    return _has_partial_take_profit_terms(combined) or _has_protective_stop_terms(combined)
+
+
+def _management_action_for_exit_downgrade(
+    text: str | None,
+    decision: dict[str, Any],
+) -> str:
+    combined = _combined_lifecycle_text(text, decision)
+    if _has_protective_stop_terms(combined):
+        return "move_stop_to_protect"
+    if _has_partial_take_profit_terms(combined):
+        return "partial_take_profit"
+    return "position_update"
+
+
+def _combined_lifecycle_text(text: str | None, decision: dict[str, Any]) -> str:
+    return " ".join(
+        str(part or "")
+        for part in (
+            text,
+            decision.get("reason"),
+            decision.get("management_action"),
+        )
+    ).lower()
+
+
+def _has_full_exit_instruction(text: str) -> bool:
+    full_exit_terms = [
+        "平仓",
+        "全平",
+        "全部平",
+        "清仓",
+        "离场",
+        "临时离场",
+        "先出来",
+        "先出",
+        "出局",
+        "保本出局",
+        "止盈出局",
+        "止损出局",
+        "全部止盈",
+        "止盈了",
+        "止损了",
+        "close position",
+        "exit position",
+        "breakeven exit",
+    ]
+    return any(term in text for term in full_exit_terms)
+
+
+def _has_partial_take_profit_terms(text: str) -> bool:
+    partial_terms = [
+        "第一止盈",
+        "第一个止盈",
+        "首个止盈",
+        "止盈位",
+        "止盈一部分",
+        "部分止盈",
+        "分批止盈",
+        "提前止盈",
+        "减仓",
+        "partial_take_profit",
+    ]
+    return any(term in text for term in partial_terms)
+
+
+def _has_protective_stop_terms(text: str) -> bool:
+    protect_terms = [
+        "移动止损",
+        "止损至成本",
+        "止损到成本",
+        "止损移到成本",
+        "止损移动到成本",
+        "成本价",
+        "成本保护",
+        "保本保护",
+        "带保护",
+        "推保护",
+        "上推保护",
+        "保护价",
+        "保护止损",
+        "move_stop_to_protect",
+        "breakeven",
+        "break even",
+    ]
+    return any(term in text for term in protect_terms)
 
 
 def _is_plausible_management_stop_loss(

@@ -105,7 +105,8 @@ DEFAULT_LIFECYCLE_EVENT_PROMPT = """
 - entry_confirm：当前消息是在通知之前 pending_entry 策略现在/现价/市价/直接入场，或明确说已经进场。
 - cancel_entry：当前消息是在取消之前 pending_entry 限价挂单或等待入场策略，例如取消限价、撤单、取消挂单、等后续信号。
 - exit_position：当前消息是在关闭已 entered 策略，例如平仓、全平、离场、临时离场、止盈了、止损了、先出来、保本出局、成本附近保本出局、保本走、成本走、breakeven exit。
-- position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、分批止盈30%、按比例止盈、减仓一半、减仓30%、持仓收益达到100%后分批止盈、带保护、保护止损、上移止损、推保护、继续持有。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
+- position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、分批止盈30%、第一止盈位/第一个止盈位、按比例止盈、减仓一半、减仓30%、持仓收益达到100%后分批止盈、移动止损至成本价、止损移动到成本价、带保护、保护止损、上移止损、推保护、继续持有。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
+- “第一止盈位 60950 移动止损至成本价”这类表达只是部分止盈并把止损推到成本保护，不是全量平仓/离场；必须判定为 position_update，不能判定为 exit_position。
 - 如果当前消息明确调整止损价，请输出 stop_loss；明确调整止盈价或止盈计划，请输出 take_profit；只是“推保护/带保护/保本”但没有新价格时，management_action 输出 move_stop_to_protect。
 - 临时入场、临时离场、部分止盈、调整止盈价、调整止损价都属于生命周期事件，不要当成新的 strategy。
 - none：普通聊天、行情观点、广告、复盘、联系方式、无法确定目标策略、或只是识别新策略但不改变已有策略。
