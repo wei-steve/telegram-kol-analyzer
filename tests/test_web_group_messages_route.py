@@ -351,6 +351,11 @@ def test_group_messages_route_shows_ai_strategy_detection_results(tmp_path):
     assert response.text.count('data-message-ai-insights') == 3
     assert response.text.count('data-message-ai-insights\n            open') == 1
     assert response.text.count('class="message-ai-toggle"') == 3
+    assert 'data-message-list-expand-all' in response.text
+    assert 'data-message-list-default' in response.text
+    assert 'data-message-list-collapse-all' in response.text
+    assert response.text.count('data-message-default-expanded="true"') == 2
+    assert response.text.count('data-message-default-expanded="false"') == 1
 
 
 def test_group_messages_route_labels_lifecycle_event_detection(tmp_path):

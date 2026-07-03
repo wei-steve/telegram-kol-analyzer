@@ -71,17 +71,57 @@
         </div>
       </form>
     </details>
+    <div class="message-list-controls" data-message-list-controls>
+      <button type="button" class="secondary-button" data-message-list-expand-all>展开全部</button>
+      <button type="button" class="secondary-button" data-message-list-default>恢复默认</button>
+      <button type="button" class="secondary-button" data-message-list-collapse-all>折叠全部</button>
+    </div>
   </div>
 
   <div class="message-list" data-message-list>
     {% for message in messages %}
-      <article class="message-card" id="message-{{ message.raw_message_id }}">
+      {% set detection = message.strategy_detection %}
+      {% set comparison = message.recognition_comparison %}
+      {% set ai_panel_class = detection.status_class if detection else 'is-pending' %}
+      {% set strategy_related = ai_panel_class == 'is-strategy' %}
+      {% if comparison %}
+        {% set strategy_ns = namespace(value=strategy_related) %}
+        {% for result in [
+          comparison.deepseek_text,
+          comparison.glm_ocr_image,
+          comparison.mimo_text,
+          comparison.mimo_image
+        ] %}
+          {% if result and result.status_class == 'is-strategy' %}
+            {% set strategy_ns.value = true %}
+          {% endif %}
+        {% endfor %}
+        {% set strategy_related = strategy_ns.value %}
+      {% endif %}
+      {% set message_default_expanded = strategy_related or ai_panel_class != 'is-not-strategy' %}
+      <article
+        class="message-card{% if not message_default_expanded %} is-message-collapsed{% endif %}"
+        id="message-{{ message.raw_message_id }}"
+        data-message-card
+        data-message-default-expanded="{{ 'true' if message_default_expanded else 'false' }}"
+      >
         <header class="message-card-header">
           <div class="message-heading-main">
             <span class="message-sender-name">{{ message.sender_name or "Unknown" }}</span>
             <span class="message-posted-at">{{ message.posted_at.strftime('%Y-%m-%d %H:%M') if message.posted_at else '' }}</span>
           </div>
-          <span class="message-id-badge">#{{ message.message_id }}</span>
+          <div class="message-card-header-actions">
+            <span class="message-id-badge">#{{ message.message_id }}</span>
+            <button
+              type="button"
+              class="message-card-toggle"
+              data-message-card-toggle
+              aria-expanded="{{ 'true' if message_default_expanded else 'false' }}"
+            >
+              <span class="message-card-toggle-collapsed" aria-hidden="true">展开</span>
+              <span class="message-card-toggle-open" aria-hidden="true">折叠</span>
+            </button>
+          </div>
         </header>
         <div class="message-card-body">
           {% if message.text %}
@@ -124,24 +164,6 @@
                 </div>
               {% endfor %}
             </div>
-          {% endif %}
-          {% set detection = message.strategy_detection %}
-          {% set comparison = message.recognition_comparison %}
-          {% set ai_panel_class = detection.status_class if detection else 'is-pending' %}
-          {% set strategy_related = ai_panel_class == 'is-strategy' %}
-          {% if comparison %}
-            {% set strategy_ns = namespace(value=strategy_related) %}
-            {% for result in [
-              comparison.deepseek_text,
-              comparison.glm_ocr_image,
-              comparison.mimo_text,
-              comparison.mimo_image
-            ] %}
-              {% if result and result.status_class == 'is-strategy' %}
-                {% set strategy_ns.value = true %}
-              {% endif %}
-            {% endfor %}
-            {% set strategy_related = strategy_ns.value %}
           {% endif %}
           <details
             class="message-ai-insights {{ ai_panel_class }}"

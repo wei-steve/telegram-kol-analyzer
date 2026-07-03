@@ -1180,6 +1180,20 @@ body {
   min-width: 0;
 }
 
+.message-list-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.message-list-controls .secondary-button {
+  min-height: 28px;
+  padding: 4px 9px;
+  font-size: 0.74rem;
+}
+
 .new-messages-button {
   position: absolute;
   top: 48px;
@@ -1302,6 +1316,20 @@ body {
   gap: 8px;
 }
 
+.message-card.is-message-collapsed {
+  padding: 5px 0;
+}
+
+.message-card.is-message-collapsed .message-card-body,
+.message-card.is-message-collapsed .message-sender-name,
+.message-card.is-message-collapsed .message-id-badge {
+  display: none;
+}
+
+.message-card.is-message-collapsed .message-card-header {
+  align-items: center;
+}
+
 .message-heading-main {
   display: grid;
   gap: 2px;
@@ -1327,6 +1355,42 @@ body {
   padding: 2px 6px;
   color: #94a3b8;
   font-size: 0.68rem;
+}
+
+.message-card-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.message-card-toggle {
+  width: auto;
+  min-height: 24px;
+  margin: 0;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border-color: rgba(148, 163, 184, 0.26);
+  background: rgba(15, 23, 42, 0.7);
+  color: #cbd5e1;
+  font-size: 0.70rem;
+  font-weight: 700;
+}
+
+.message-card-toggle:hover {
+  background: rgba(30, 41, 59, 0.92);
+}
+
+.message-card-toggle-collapsed {
+  display: none;
+}
+
+.message-card.is-message-collapsed .message-card-toggle-collapsed {
+  display: inline;
+}
+
+.message-card.is-message-collapsed .message-card-toggle-open {
+  display: none;
 }
 
 .message-card-body {

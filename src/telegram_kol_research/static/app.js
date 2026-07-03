@@ -315,6 +315,35 @@ function setNewMessagesButtonVisible(panel = getMessagePanel(), visible = false)
   button.classList.toggle('is-visible', Boolean(visible));
 }
 
+function setMessageCardCollapsed(card, collapsed) {
+  if (!card) {
+    return;
+  }
+  card.classList.toggle('is-message-collapsed', Boolean(collapsed));
+  const toggle = card.querySelector('[data-message-card-toggle]');
+  if (toggle) {
+    toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+}
+
+function setMessageCardsCollapsed(panel, collapsed) {
+  if (!panel) {
+    return;
+  }
+  panel.querySelectorAll('[data-message-card]').forEach((card) => {
+    setMessageCardCollapsed(card, collapsed);
+  });
+}
+
+function restoreDefaultMessageCardState(panel) {
+  if (!panel) {
+    return;
+  }
+  panel.querySelectorAll('[data-message-card]').forEach((card) => {
+    setMessageCardCollapsed(card, card.dataset.messageDefaultExpanded !== 'true');
+  });
+}
+
 function scrollMessagePanelToTop(panel = getMessagePanel()) {
   const scrollContainer = getMessageScrollContainer(panel);
   if (!scrollContainer) {
@@ -702,6 +731,38 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
         newMessagesButton.disabled = false;
       }
     });
+  }
+
+  panel.querySelectorAll('[data-message-card-toggle]').forEach((button) => {
+    if (button.dataset.messageCardToggleBound === 'true') {
+      return;
+    }
+    button.dataset.messageCardToggleBound = 'true';
+    button.addEventListener('click', () => {
+      const card = button.closest('[data-message-card]');
+      if (!card) {
+        return;
+      }
+      setMessageCardCollapsed(card, !card.classList.contains('is-message-collapsed'));
+    });
+  });
+
+  const expandAllButton = panel.querySelector('[data-message-list-expand-all]');
+  if (expandAllButton && expandAllButton.dataset.messageListControlBound !== 'true') {
+    expandAllButton.dataset.messageListControlBound = 'true';
+    expandAllButton.addEventListener('click', () => setMessageCardsCollapsed(panel, false));
+  }
+
+  const defaultButton = panel.querySelector('[data-message-list-default]');
+  if (defaultButton && defaultButton.dataset.messageListControlBound !== 'true') {
+    defaultButton.dataset.messageListControlBound = 'true';
+    defaultButton.addEventListener('click', () => restoreDefaultMessageCardState(panel));
+  }
+
+  const collapseAllButton = panel.querySelector('[data-message-list-collapse-all]');
+  if (collapseAllButton && collapseAllButton.dataset.messageListControlBound !== 'true') {
+    collapseAllButton.dataset.messageListControlBound = 'true';
+    collapseAllButton.addEventListener('click', () => setMessageCardsCollapsed(panel, true));
   }
 
   const filterForm = panel.querySelector('[data-message-filters]');
