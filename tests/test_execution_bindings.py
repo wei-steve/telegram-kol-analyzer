@@ -959,6 +959,119 @@ def test_reconcile_does_not_guess_position_id_when_ambiguous(tmp_path):
     assert [row.pos_id for row in rows] == [None, None]
 
 
+def test_reconcile_recovers_trigger_limit_position_from_submitted_order_payload(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    upsert_execution_binding(
+        session_factory,
+        _binding(
+            kol_id="group:-1002370796392",
+            chat_id=-1002370796392,
+            message_id=3240,
+            symbol="BTC",
+            side="short",
+            order_id="1001123853022859,1001123853022867",
+            client_order_id="TKSQ3240E1,TKSQ3240E2",
+            status="open",
+            payload={
+                "submitted_orders": [
+                    {
+                        "client_order_id": "TKSQ3240E1",
+                        "execution_type": "trigger_limit",
+                        "leg_index": 1,
+                        "order_id": "1001123853022859",
+                        "request": {
+                            "instId": "BTC-USDT-SWAP",
+                            "posSide": "short",
+                            "price": "62300.0",
+                            "triggerPrice": "62300.0",
+                            "sz": "12.0",
+                        },
+                    },
+                    {
+                        "client_order_id": "TKSQ3240E2",
+                        "execution_type": "trigger_limit",
+                        "leg_index": 2,
+                        "order_id": "1001123853022867",
+                        "request": {
+                            "instId": "BTC-USDT-SWAP",
+                            "posSide": "short",
+                            "price": "62500.0",
+                            "triggerPrice": "62500.0",
+                            "sz": "16.0",
+                        },
+                    },
+                ]
+            },
+        ),
+    )
+    upsert_execution_binding(
+        session_factory,
+        _binding(
+            chat_id=-1003825498321,
+            message_id=442,
+            symbol="BTC",
+            side="short",
+            order_id="other-order",
+            client_order_id="other-client",
+            status="open",
+        ),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=-1002370796392,
+                message_id=3240,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 2, 13, 20, 5),
+                entered_at=datetime(2026, 7, 3, 15, 51, 47),
+                entry_range_low=62300,
+                entry_range_high=62700,
+                stop_loss=63100,
+                take_profit="61500/60800/60000",
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "1001123877920316",
+                    "posSide": "short",
+                    "pos": "12",
+                    "avgPx": "62300.0",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 7, 3, 16, 0),
+    )
+
+    assert result.active == 1
+    with session_factory() as session:
+        recovered = (
+            session.query(ExecutionBinding)
+            .filter_by(chat_id=-1002370796392, message_id=3240)
+            .one()
+        )
+        other = session.query(ExecutionBinding).filter_by(message_id=442).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+
+    assert recovered.status == "active"
+    assert recovered.pos_id == "1001123877920316"
+    assert recovered.last_exchange_status == "position_active_recovered_from_submitted_order_payload"
+    assert lifecycle.execution_binding_id == recovered.id
+    assert other.pos_id is None
+
+
 @pytest.mark.parametrize("binding_status", ["active", "stale"])
 def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, binding_status):
     session_factory = create_session_factory(tmp_path / "research.db")

@@ -1,3 +1,4 @@
+import json
 import re
 from datetime import datetime
 
@@ -608,6 +609,94 @@ def test_execution_sync_api_recovers_second_leg_before_manual_close_check(tmp_pa
         assert lifecycle.lifecycle_status == "entered"
         assert binding.status == "active"
         assert binding.pos_id == "pos-market,pos-limit"
+
+
+def test_execution_sync_api_binds_trigger_limit_position_before_execution_page_render(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "1001123877920316",
+                    "posSide": "short",
+                    "pos": "12",
+                    "avgPx": "62300.0",
+                }
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        group_config=GroupConfig(
+            groups=[
+                TargetGroupConfig(
+                    chat_title="舒琴会员群-11分组",
+                    chat_id=-1002370796392,
+                    custom_group_label="舒琴会员群-11分组",
+                )
+            ]
+        ),
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        now_provider=lambda: datetime(2026, 7, 3, 16, 0),
+    )
+    with app.state.session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=-1002370796392,
+                message_id=3240,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 2, 13, 20, 5),
+                entered_at=datetime(2026, 7, 3, 15, 51, 47),
+                entry_range_low=62300,
+                entry_range_high=62700,
+                stop_loss=63100,
+                take_profit="61500/60800/60000",
+            )
+        )
+        session.add(
+            ExecutionBinding(
+                kol_id="group:-1002370796392",
+                chat_id=-1002370796392,
+                message_id=3240,
+                symbol="BTC",
+                side="short",
+                status="open",
+                order_id="1001123853022859,1001123853022867",
+                client_order_id="TKSQ3240E1,TKSQ3240E2",
+                payload_json=json.dumps(
+                    {
+                        "submitted_orders": [
+                            {
+                                "request": {
+                                    "instId": "BTC-USDT-SWAP",
+                                    "posSide": "short",
+                                    "price": "62300.0",
+                                    "triggerPrice": "62300.0",
+                                    "sz": "12.0",
+                                }
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+    sync_response = client.post("/api/execution/sync-deepcoin")
+
+    assert sync_response.status_code == 200
+    assert sync_response.json()["reconciled_active"] == 1
+    page_response = client.get("/execution")
+    assert page_response.status_code == 200
+    assert "1001123877920316" in page_response.text
+    assert "舒琴会员群-11分组" in page_response.text
+    assert "unbound_live_position" not in page_response.text
 
 
 def test_bind_live_position_api_attaches_unbound_position_to_lifecycle(tmp_path):

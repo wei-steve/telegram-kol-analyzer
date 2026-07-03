@@ -321,6 +321,13 @@ def reconcile_deepcoin_execution_bindings(
                     )
                     recovered_status = "position_active_recovered_from_filled_order"
                     if recovered_position is None:
+                        recovered_position = _select_position_from_submitted_order_payload(
+                            row,
+                            active_positions=active_positions,
+                            bound_pos_ids=bound_pos_ids,
+                        )
+                        recovered_status = "position_active_recovered_from_submitted_order_payload"
+                    if recovered_position is None:
                         recovered_position = _select_recovered_position_for_unbound_binding(
                             row,
                             rows=rows,
@@ -999,6 +1006,105 @@ def _position_matches_order_evidence(position: dict[str, Any], evidence: dict[st
         position_time = _to_int(position.get("uTime") or position.get("cTime"))
         if position_time is not None and abs(position_time - evidence_time) <= 120_000:
             matched_fields += 1
+
+    return matched_fields >= 2
+
+
+def _select_position_from_submitted_order_payload(
+    row: ExecutionBinding,
+    *,
+    active_positions: list[dict[str, Any]],
+    bound_pos_ids: set[str],
+) -> dict[str, Any] | None:
+    if _split_ids(row.pos_id):
+        return None
+    submitted_orders = _submitted_orders_from_binding_payload(row)
+    if not submitted_orders:
+        return None
+
+    target_symbol = str(row.symbol or "").upper()
+    target_side = str(row.side or "").lower()
+    candidates = [
+        position
+        for position in active_positions
+        if _first_string(position, "posId", "pos_id", "id") not in bound_pos_ids
+        and _symbol_from_inst_id(position.get("instId")) == target_symbol
+        and _normalize_position_side(
+            str(position.get("posSide") or position.get("side") or "")
+        )
+        == target_side
+    ]
+    if not candidates:
+        return None
+
+    matches: list[dict[str, Any]] = []
+    for position in candidates:
+        if any(
+            _position_matches_submitted_order_payload(position, submitted_order)
+            for submitted_order in submitted_orders
+        ):
+            matches.append(position)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _submitted_orders_from_binding_payload(row: ExecutionBinding) -> list[dict[str, Any]]:
+    if not row.payload_json:
+        return []
+    try:
+        payload = json.loads(row.payload_json)
+    except (TypeError, ValueError):
+        return []
+    submitted_orders = payload.get("submitted_orders")
+    if not isinstance(submitted_orders, list):
+        return []
+    return [item for item in submitted_orders if isinstance(item, dict)]
+
+
+def _position_matches_submitted_order_payload(
+    position: dict[str, Any],
+    submitted_order: dict[str, Any],
+) -> bool:
+    request = submitted_order.get("request")
+    if not isinstance(request, dict):
+        return False
+
+    order_symbol = _symbol_from_inst_id(request.get("instId"))
+    position_symbol = _symbol_from_inst_id(position.get("instId"))
+    if order_symbol and position_symbol and order_symbol != position_symbol:
+        return False
+
+    order_side = _normalize_position_side(
+        str(request.get("posSide") or request.get("position_side") or "")
+    )
+    position_side = _normalize_position_side(
+        str(position.get("posSide") or position.get("side") or "")
+    )
+    if order_side and position_side and order_side != position_side:
+        return False
+
+    matched_fields = 0
+    order_size = _to_float(request.get("sz") or request.get("size") or request.get("quantity"))
+    position_size = _to_float(position.get("pos") or position.get("size"))
+    if order_size is not None:
+        if position_size is None or not _close_number(position_size, order_size, rel_tol=0.001):
+            return False
+        matched_fields += 1
+
+    order_price = _to_float(
+        request.get("triggerPrice")
+        or request.get("triggerPx")
+        or request.get("price")
+        or request.get("px")
+    )
+    position_price = _to_float(
+        position.get("avgPx") or position.get("avgPrice") or position.get("openAvgPx")
+    )
+    if order_price is not None:
+        if position_price is None or not _close_number(position_price, order_price, rel_tol=0.001):
+            return False
+        matched_fields += 1
 
     return matched_fields >= 2
 
