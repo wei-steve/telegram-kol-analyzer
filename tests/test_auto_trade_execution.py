@@ -5,7 +5,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, MediaAsset, RawMessage, SignalCandidate
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, MediaAsset, RawMessage, SignalCandidate, StrategyLifecycle
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
@@ -598,6 +598,213 @@ def test_auto_process_message_trade_signal_closes_position_from_close_signal(tmp
     assert result["management_action"] == "close_position"
     assert fake_client.orders[0]["closePosId"] == "pos-1"
     assert fake_client.orders[0]["side"] == "sell"
+
+
+def test_auto_process_close_signal_recovers_unique_matching_position_before_close(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="exited",
+            exit_reason="kol_signal",
+            signal_at=datetime(2026, 7, 2, 12, 34),
+            entered_at=datetime(2026, 7, 2, 12, 34),
+            exited_at=datetime(2026, 7, 2, 13, 7),
+            entry_range_low=61351,
+            entry_range_high=61351,
+            entry_price_actual=61351,
+            stop_loss=62300,
+            take_profit="59588",
+            exit_signal_message_id=56,
+        )
+        session.add(lifecycle)
+        session.add(
+            ExecutionBinding(
+                strategy_instance_id="deepcoin:999:3888:BTC:short",
+                kol_id="wrong-kol",
+                chat_id=999,
+                message_id=3888,
+                symbol="BTC",
+                side="short",
+                venue="deepcoin",
+                pos_id="pos-sanjie",
+                status="stale",
+                last_exchange_status="expired_pending_entry_not_attributed",
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                chat_id=999,
+                message_id=3888,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="expired",
+                exit_reason="expired",
+                signal_at=datetime(2026, 6, 30, 2, 51),
+                exited_at=datetime(2026, 6, 30, 8, 51),
+                entry_range_low=60300,
+                entry_range_high=60800,
+                stop_loss=61300,
+                take_profit="59600/58900/58200",
+            )
+        )
+        raw = RawMessage(
+            chat_id=100,
+            message_id=56,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 7, 2, 13, 7),
+            text="比特币空单，提前小损200点出局！",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="short",
+                event_type="close_signal",
+                parse_source="lifecycle_ai",
+                confidence=0.95,
+            )
+        )
+        session.commit()
+        raw_message_id = raw.id
+
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.positions = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-sanjie",
+            "posSide": "short",
+            "pos": "10",
+            "avgPx": "61351",
+        }
+    ]
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        processed_at=datetime(2026, 7, 2, 13, 8, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert result["management_action"] == "close_position"
+    assert fake_client.orders == [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "tdMode": "cross",
+            "side": "buy",
+            "posSide": "short",
+            "ordType": "market",
+            "sz": "10",
+            "mrgPosition": "split",
+            "closePosId": "pos-sanjie",
+        }
+    ]
+    with session_factory() as session:
+        lifecycle = session.query(StrategyLifecycle).filter_by(chat_id=100, message_id=55).one()
+        binding = session.query(ExecutionBinding).filter_by(chat_id=100, message_id=55).one()
+        stale_binding = session.query(ExecutionBinding).filter_by(chat_id=999, message_id=3888).one()
+
+    assert lifecycle.execution_binding_id == binding.id
+    assert binding.status == "closed"
+    assert binding.last_exchange_status == "close_position_submitted"
+    assert stale_binding.status == "stale"
+
+
+def test_auto_process_close_signal_does_not_recover_ambiguous_positions(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="exited",
+                exit_reason="kol_signal",
+                signal_at=datetime(2026, 7, 2, 12, 34),
+                entered_at=datetime(2026, 7, 2, 12, 34),
+                exited_at=datetime(2026, 7, 2, 13, 7),
+                entry_price_actual=61351,
+                exit_signal_message_id=56,
+            )
+        )
+        raw = RawMessage(
+            chat_id=100,
+            message_id=56,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 7, 2, 13, 7),
+            text="比特币空单，提前小损200点出局！",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="short",
+                event_type="close_signal",
+                parse_source="lifecycle_ai",
+                confidence=0.95,
+            )
+        )
+        session.commit()
+        raw_message_id = raw.id
+
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.positions = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-a",
+            "posSide": "short",
+            "pos": "10",
+            "avgPx": "61351",
+        },
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-b",
+            "posSide": "short",
+            "pos": "10",
+            "avgPx": "61351",
+        },
+    ]
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        processed_at=datetime(2026, 7, 2, 13, 8, tzinfo=UTC),
+    )
+
+    assert result == {"status": "skipped", "reason": "no_execution_binding"}
+    assert fake_client.orders == []
 
 
 def test_auto_process_message_trade_signal_recovers_filled_binding_before_close(tmp_path):
