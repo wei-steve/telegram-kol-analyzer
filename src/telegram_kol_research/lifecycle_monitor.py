@@ -397,6 +397,8 @@ class LifecycleMonitor:
             )
             fixed = 0
             for lc in entered_bad:
+                if _has_live_execution_binding(session, lc.execution_binding_id):
+                    continue
                 if (
                     lc.entered_at is not None
                     and lc.entry_price_actual is not None

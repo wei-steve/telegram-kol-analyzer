@@ -864,6 +864,18 @@ def test_strategy_mid_panel_pending_kpi_matches_actionable_list(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
     with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="alice",
+            chat_id=88,
+            message_id=6,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            status="active",
+            pos_id="pos-live",
+        )
+        session.add(binding)
+        session.flush()
         session.add_all(
             [
                 StrategyLifecycle(
@@ -911,6 +923,17 @@ def test_strategy_mid_panel_pending_kpi_matches_actionable_list(tmp_path):
                     signal_at=datetime(2026, 6, 12, 8, 4),
                     entry_range_low=180,
                     entry_range_high=181,
+                ),
+                StrategyLifecycle(
+                    chat_id=88,
+                    message_id=6,
+                    symbol="BTC",
+                    side="short",
+                    lifecycle_status="pending_entry",
+                    signal_at=datetime(2026, 6, 12, 8, 5),
+                    entry_range_low=60300,
+                    entry_range_high=60800,
+                    execution_binding_id=binding.id,
                 ),
             ]
         )

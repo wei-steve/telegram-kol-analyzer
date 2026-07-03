@@ -10,6 +10,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
+    ExecutionBinding,
     MediaAsset,
     MessageRecognition,
     RawMessage,
@@ -999,44 +1000,39 @@ def load_lifecycle_counts(
     from telegram_kol_research.models import StrategyLifecycle
 
     with session_factory() as session:
-        if symbol_whitelist_by_chat_id is not None:
-            query = session.query(
-                StrategyLifecycle.lifecycle_status,
-                StrategyLifecycle.chat_id,
-                StrategyLifecycle.symbol,
-                StrategyLifecycle.entry_range_low,
-                StrategyLifecycle.entry_range_high,
-            )
-            if chat_id is not None:
-                query = query.filter(StrategyLifecycle.chat_id == chat_id)
-            rows = query.all()
-            counts: dict[str, int] = {}
-            for status, row_chat_id, symbol, entry_low, entry_high in rows:
-                allowed_symbols = (
-                    symbol_whitelist_by_chat_id.get(int(row_chat_id))
-                    if row_chat_id is not None
-                    else None
-                )
-                if status == "pending_entry" and not _is_actionable_pending_entry(
-                    symbol=symbol,
-                    entry_low=entry_low,
-                    entry_high=entry_high,
-                    allowed_symbols=allowed_symbols,
-                ):
-                    continue
-                counts[str(status)] = counts.get(str(status), 0) + 1
-            return counts
-
         query = session.query(
             StrategyLifecycle.lifecycle_status,
-            func.count(StrategyLifecycle.id),
+            StrategyLifecycle.chat_id,
+            StrategyLifecycle.symbol,
+            StrategyLifecycle.entry_range_low,
+            StrategyLifecycle.entry_range_high,
+            ExecutionBinding.status,
+        ).outerjoin(
+            ExecutionBinding,
+            StrategyLifecycle.execution_binding_id == ExecutionBinding.id,
         )
         if chat_id is not None:
             query = query.filter(StrategyLifecycle.chat_id == chat_id)
-        rows = query.group_by(StrategyLifecycle.lifecycle_status).all()
+        rows = query.all()
     counts: dict[str, int] = {}
-    for status, count in rows:
-        counts[str(status)] = int(count)
+    whitelist_map = symbol_whitelist_by_chat_id or {}
+    for status, row_chat_id, symbol, entry_low, entry_high, binding_status in rows:
+        allowed_symbols = (
+            whitelist_map.get(int(row_chat_id))
+            if row_chat_id is not None
+            else None
+        )
+        if status == "pending_entry":
+            if _is_live_execution_binding_status(binding_status):
+                continue
+            if not _is_actionable_pending_entry(
+                symbol=symbol,
+                entry_low=entry_low,
+                entry_high=entry_high,
+                allowed_symbols=allowed_symbols,
+            ):
+                continue
+        counts[str(status)] = counts.get(str(status), 0) + 1
     return counts
 
 
@@ -1056,23 +1052,35 @@ def load_lifecycle_counts_by_chat_id(
                 StrategyLifecycle.symbol,
                 StrategyLifecycle.entry_range_low,
                 StrategyLifecycle.entry_range_high,
+                ExecutionBinding.status,
+            )
+            .outerjoin(
+                ExecutionBinding,
+                StrategyLifecycle.execution_binding_id == ExecutionBinding.id,
             )
             .all()
         )
 
     counts_by_chat_id: dict[int, dict[str, int]] = {}
     whitelist_map = symbol_whitelist_by_chat_id or {}
-    for chat_id, status, symbol, entry_low, entry_high in rows:
-        if status == "pending_entry" and not _is_actionable_pending_entry(
-            symbol=symbol,
-            entry_low=entry_low,
-            entry_high=entry_high,
-            allowed_symbols=whitelist_map.get(int(chat_id)),
-        ):
-            continue
+    for chat_id, status, symbol, entry_low, entry_high, binding_status in rows:
+        if status == "pending_entry":
+            if _is_live_execution_binding_status(binding_status):
+                continue
+            if not _is_actionable_pending_entry(
+                symbol=symbol,
+                entry_low=entry_low,
+                entry_high=entry_high,
+                allowed_symbols=whitelist_map.get(int(chat_id)),
+            ):
+                continue
         status_counts = counts_by_chat_id.setdefault(int(chat_id), {})
         status_counts[str(status)] = status_counts.get(str(status), 0) + 1
     return counts_by_chat_id
+
+
+def _is_live_execution_binding_status(status: str | None) -> bool:
+    return str(status or "").lower() in {"open", "active"}
 
 
 def _is_actionable_pending_entry(
@@ -1245,12 +1253,12 @@ def list_pending_strategies(
 ) -> list[dict[str, object]]:
     """Return actionable *pending_entry* lifecycle records."""
     from telegram_kol_research.models import (
-        SignalCandidate, RawMessage, StrategyLifecycle,
+        ExecutionBinding, SignalCandidate, RawMessage, StrategyLifecycle,
     )
 
     with session_factory() as session:
         q = (
-            session.query(StrategyLifecycle, SignalCandidate, RawMessage)
+            session.query(StrategyLifecycle, SignalCandidate, RawMessage, ExecutionBinding)
             .outerjoin(
                 SignalCandidate,
                 StrategyLifecycle.signal_candidate_id == SignalCandidate.id,
@@ -1259,12 +1267,22 @@ def list_pending_strategies(
                 RawMessage,
                 SignalCandidate.raw_message_id == RawMessage.id,
             )
+            .outerjoin(
+                ExecutionBinding,
+                StrategyLifecycle.execution_binding_id == ExecutionBinding.id,
+            )
             .filter(StrategyLifecycle.lifecycle_status == "pending_entry")
             .filter(~StrategyLifecycle.symbol.in_(["", "?", "QQ"]))
             .filter(
                 or_(
                     StrategyLifecycle.entry_range_low.isnot(None),
                     StrategyLifecycle.entry_range_high.isnot(None),
+                )
+            )
+            .filter(
+                or_(
+                    ExecutionBinding.id.is_(None),
+                    ~ExecutionBinding.status.in_(["open", "active"]),
                 )
             )
         )
@@ -1278,7 +1296,7 @@ def list_pending_strategies(
 
     results: list[dict[str, object]] = []
     whitelist_map = symbol_whitelist_by_chat_id or {}
-    for lc, cand, raw_msg in rows:
+    for lc, cand, raw_msg, _binding in rows:
         if not _is_actionable_pending_entry(
             symbol=lc.symbol,
             entry_low=lc.entry_range_low,
@@ -1692,9 +1710,10 @@ def _load_execution_strategy_items(
         "exited": "exited",
     }[selected_status]
     q = (
-        session.query(StrategyLifecycle, SignalCandidate, RawMessage)
+        session.query(StrategyLifecycle, SignalCandidate, RawMessage, ExecutionBinding)
         .outerjoin(SignalCandidate, StrategyLifecycle.signal_candidate_id == SignalCandidate.id)
         .outerjoin(RawMessage, SignalCandidate.raw_message_id == RawMessage.id)
+        .outerjoin(ExecutionBinding, StrategyLifecycle.execution_binding_id == ExecutionBinding.id)
     )
     if selected_status == "exited":
         q = q.filter(StrategyLifecycle.lifecycle_status.in_(["exited", "expired", "invalidated"]))
@@ -1702,6 +1721,12 @@ def _load_execution_strategy_items(
         q = q.filter(StrategyLifecycle.lifecycle_status == lifecycle_status)
     if selected_status == "pending":
         q = q.filter(~StrategyLifecycle.symbol.in_(["", "?", "QQ"]))
+        q = q.filter(
+            or_(
+                ExecutionBinding.id.is_(None),
+                ~ExecutionBinding.status.in_(["open", "active"]),
+            )
+        )
     order_column = {
         "holding": StrategyLifecycle.entered_at.desc().nullslast(),
         "pending": StrategyLifecycle.signal_at.desc(),
@@ -1710,7 +1735,7 @@ def _load_execution_strategy_items(
     rows = q.order_by(order_column, StrategyLifecycle.id.desc()).limit(limit * 3).all()
 
     items: list[dict[str, object]] = []
-    for lc, cand, raw_msg in rows:
+    for lc, cand, raw_msg, _binding in rows:
         if selected_status == "pending" and not _is_actionable_pending_entry(
             symbol=lc.symbol,
             entry_low=lc.entry_range_low,
