@@ -97,6 +97,18 @@ def test_app_js_refreshes_message_panel_after_manual_recognition_without_jumping
     assert "const nextPanel = await fetchMessagePanel(chatId, {" in response.text
     assert "currentMessagePanel.replaceWith(nextPanel);" in response.text
     assert "nextScrollContainer.scrollTop = previousMessageScrollTop;" in response.text
+    assert "await refreshStrategyMidPanel();" in response.text
+    assert "await refreshGroupList();" in response.text
+
+
+def test_app_js_strategy_refresh_syncs_deepcoin_before_reloading_panels(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "await fetch('/api/execution/sync-deepcoin', { method: 'POST' });" in response.text
+    assert "await refreshStrategyPanels(chatId);" in response.text
 
 
 def test_app_js_appends_loaded_history_below_current_messages(tmp_path):

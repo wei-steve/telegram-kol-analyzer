@@ -528,6 +528,11 @@ function bindDetailPanelControls() {
       const chatId = getSelectedChatId();
       if (chatId) {
         setRecoveryStatus('正在扫描...');
+        try {
+          await fetch('/api/execution/sync-deepcoin', { method: 'POST' });
+        } catch {
+          // Keep the strategy panel refresh usable even when exchange sync is unavailable.
+        }
         await refreshStrategyPanels(chatId);
         setRecoveryStatus('扫描完成');
       }
@@ -834,6 +839,7 @@ async function refreshSelectedGroupPanel() {
         setNewMessagesButtonVisible(nextPanel, false);
       }
       await refreshStrategyMidPanel();
+      await refreshGroupList();
       return;
     }
   } catch {
