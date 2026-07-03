@@ -322,13 +322,15 @@ def _load_deepcoin_live_position_rows(
         bindings = (
             session.query(ExecutionBinding)
             .filter(ExecutionBinding.venue == "deepcoin")
-            .filter(ExecutionBinding.status.in_(["open", "active"]))
+            .filter(ExecutionBinding.pos_id.isnot(None))
             .all()
         )
         bindings_by_pos_id: dict[str, ExecutionBinding] = {}
         for binding in bindings:
             for pos_id in _split_binding_ids(binding.pos_id):
-                bindings_by_pos_id[pos_id] = binding
+                existing = bindings_by_pos_id.get(pos_id)
+                if existing is None or _is_preferred_live_position_binding(binding, existing):
+                    bindings_by_pos_id[pos_id] = binding
 
         rows: list[dict[str, object]] = []
         for position in active_positions:
@@ -352,6 +354,10 @@ def _load_deepcoin_live_position_rows(
                 take_profit_value = _deepcoin_position_tpsl_price(position, "tp")
             has_protection = stop_loss_value is not None or take_profit_value is not None
             binding = bindings_by_pos_id.get(pos_id or "")
+            binding_is_live = binding is not None and str(binding.status or "").lower() in {
+                "open",
+                "active",
+            }
             lifecycle = None
             if binding is not None:
                 lifecycle = (
@@ -393,8 +399,20 @@ def _load_deepcoin_live_position_rows(
                     "stop_loss_text": _position_text_value(stop_loss_value),
                     "take_profit_text": _position_text_value(take_profit_value),
                     "protection_status": "protected" if has_protection else "unprotected",
-                    "execution_status": binding.status if binding is not None else "unbound_live_position",
-                    "exchange_status": "position_active",
+                    "execution_status": (
+                        binding.status
+                        if binding_is_live
+                        else (
+                            "system_attribution_conflict"
+                            if binding is not None
+                            else "unbound_live_position"
+                        )
+                    ),
+                    "exchange_status": (
+                        binding.last_exchange_status
+                        if binding is not None and not binding_is_live
+                        else "position_active"
+                    ),
                     "pos_id": pos_id,
                     "order_id": binding.order_id if binding is not None else None,
                     "position_size_text": _position_size_label(position),
@@ -709,6 +727,21 @@ def _split_binding_ids(value: str | None) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
 
+def _is_preferred_live_position_binding(candidate: ExecutionBinding, existing: ExecutionBinding) -> bool:
+    live_statuses = {"open", "active"}
+    candidate_is_live = str(candidate.status or "").lower() in live_statuses
+    existing_is_live = str(existing.status or "").lower() in live_statuses
+    if candidate_is_live != existing_is_live:
+        return candidate_is_live
+    candidate_updated = candidate.updated_at or candidate.created_at
+    existing_updated = existing.updated_at or existing.created_at
+    if candidate_updated is None:
+        return False
+    if existing_updated is None:
+        return True
+    return candidate_updated > existing_updated
+
+
 def _normalize_deepcoin_position_side(value: Any) -> str:
     side = str(value or "").lower()
     if side == "buy":
@@ -795,6 +828,9 @@ def create_web_app(
     recovery_market_data_factory=None,
     deepcoin_contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     deepcoin_client_factory=None,
+    deepcoin_reconcile_runner=None,
+    deepcoin_reconcile_interval_seconds: int = 30,
+    deepcoin_reconcile_startup_delay_seconds: int = 5,
     message_recognizer=None,
     ai_recognition_config_path: str | Path | None = None,
 ) -> FastAPI:
@@ -816,6 +852,16 @@ def create_web_app(
         )
         app.state.lifecycle_monitor_task = asyncio.create_task(
             app.state.lifecycle_monitor.run_loop()
+        )
+        app.state.deepcoin_reconcile_task = asyncio.create_task(
+            _run_reconcile_after_startup_delay(
+                runner=app.state.deepcoin_reconcile_runner,
+                startup_delay_seconds=app.state.deepcoin_reconcile_startup_delay_seconds,
+                session_factory=app.state.session_factory,
+                deepcoin_client_factory=app.state.deepcoin_client_factory,
+                interval_seconds=app.state.deepcoin_reconcile_interval_seconds,
+                now_provider=app.state.now_provider,
+            )
         )
         if isinstance(app.state.strategy_alert_config, StrategyAlertConfig):
             app.state.telegram_bot_command_task = asyncio.create_task(
@@ -874,6 +920,16 @@ def create_web_app(
             if lcm_http is not None:
                 await lcm_http.aclose()
             # ── live listener shutdown ──
+            deepcoin_reconcile_task = app.state.deepcoin_reconcile_task
+            if deepcoin_reconcile_task is not None:
+                deepcoin_reconcile_task.cancel()
+                try:
+                    await deepcoin_reconcile_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.deepcoin_reconcile_task = None
             task = app.state.live_listener_task
             if task is not None:
                 task.cancel()
@@ -937,6 +993,11 @@ def create_web_app(
     app.state.deepcoin_client_factory = (
         deepcoin_client_factory or build_deepcoin_client_from_env
     )
+    app.state.deepcoin_reconcile_runner = (
+        deepcoin_reconcile_runner or run_deepcoin_execution_reconcile_loop
+    )
+    app.state.deepcoin_reconcile_interval_seconds = deepcoin_reconcile_interval_seconds
+    app.state.deepcoin_reconcile_startup_delay_seconds = deepcoin_reconcile_startup_delay_seconds
     app.state.auto_trade_executor = lambda raw_message_id: _run_auto_trade_executor(
         app,
         raw_message_id=raw_message_id,
@@ -954,6 +1015,7 @@ def create_web_app(
         else reconcile_startup_delay_seconds
     )
     app.state.reconcile_task = None
+    app.state.deepcoin_reconcile_task = None
     app.state.telegram_bot_command_task = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client
@@ -2274,6 +2336,44 @@ def create_web_app(
         )
 
     return app
+
+
+async def run_deepcoin_execution_reconcile_loop(
+    *,
+    session_factory,
+    deepcoin_client_factory,
+    interval_seconds: int = 30,
+    now_provider=None,
+) -> None:
+    while True:
+        try:
+            client = deepcoin_client_factory()
+            synced_at = now_provider() if now_provider is not None else datetime.now(UTC)
+            if hasattr(client, "list_open_orders"):
+                reconcile_deepcoin_execution_bindings(
+                    session_factory,
+                    client=client,
+                    recovered_at=synced_at,
+                )
+            sync_manual_closed_deepcoin_positions(
+                session_factory,
+                client=client,
+                synced_at=synced_at,
+            )
+            if hasattr(client, "set_position_sltp") and hasattr(
+                client,
+                "list_trigger_orders_pending",
+            ):
+                recover_missing_position_protections(
+                    session_factory,
+                    deepcoin_client=client,
+                    recovered_at=synced_at,
+                )
+        except DeepcoinClientError as exc:
+            logger.warning("Deepcoin execution reconcile skipped: %s", exc)
+        except Exception:
+            logger.exception("Deepcoin execution reconcile failed")
+        await asyncio.sleep(interval_seconds)
 
 
 async def _run_reconcile_after_startup_delay(

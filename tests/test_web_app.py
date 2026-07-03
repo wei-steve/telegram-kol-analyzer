@@ -226,6 +226,60 @@ def test_execution_dashboard_defaults_to_deepcoin_live_positions(tmp_path):
     assert "绑定" in response.text
 
 
+def test_execution_dashboard_labels_stale_system_binding_as_attribution_conflict(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-stale-system",
+                    "posSide": "short",
+                    "pos": "10",
+                    "avgPx": "61351",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+    )
+    with app.state.session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                kol_id="group:88",
+                chat_id=88,
+                message_id=10,
+                symbol="BTC",
+                side="short",
+                status="stale",
+                pos_id="pos-stale-system",
+                order_id="trigger-entry",
+                last_exchange_status="expired_pending_entry_not_attributed",
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                chat_id=88,
+                message_id=10,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="expired",
+                exit_reason="expired",
+                signal_at=datetime(2026, 6, 30, 8, 0),
+                exited_at=datetime(2026, 6, 30, 14, 0),
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get("/execution")
+
+    assert response.status_code == 200
+    assert "pos-stale-system" in response.text
+    assert "system_attribution_conflict" in response.text
+    assert "unbound_live_position" not in response.text
+
+
 def test_execution_dashboard_uses_pending_tpsl_orders_for_live_protection(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):

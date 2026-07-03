@@ -553,6 +553,106 @@ def test_reconcile_uses_order_history_to_pick_position_when_symbol_side_ambiguou
     assert binding.last_exchange_status == "position_active_recovered_from_filled_order"
 
 
+def test_reconcile_uses_trigger_history_to_pick_position_after_trigger_entry_fills(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    upsert_execution_binding(
+        session_factory,
+        _binding(
+            order_id="trigger-entry",
+            client_order_id="client-trigger",
+            side="short",
+            status="open",
+        ),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="pending_entry",
+                signal_at=datetime(2026, 7, 3, 9, 0),
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "filled-entry-order",
+                    "posSide": "short",
+                    "pos": "10",
+                    "avgPx": "61351",
+                    "cTime": "1782995766000",
+                    "uTime": "1782995766000",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "other-short",
+                    "posSide": "short",
+                    "pos": "10",
+                    "avgPx": "61688",
+                    "cTime": "1782995900000",
+                    "uTime": "1782995900000",
+                },
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "ordId": "filled-entry-order",
+                    "state": "filled",
+                    "side": "sell",
+                    "posSide": "short",
+                    "avgPx": "61351",
+                    "fillSz": "10",
+                    "fillTime": "1782995766000",
+                }
+            ]
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            assert inst_id == "BTC-USDT-SWAP"
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "ordId": "trigger-entry",
+                    "side": "sell",
+                    "posSide": "short",
+                    "sz": "10",
+                    "px": "61351",
+                    "triggerTime": "1782995766000",
+                    "uTime": "1782995766000",
+                }
+            ]
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 7, 3, 9, 5),
+    )
+
+    assert result.active == 1
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+
+    assert binding.status == "active"
+    assert binding.pos_id == "filled-entry-order"
+    assert binding.last_exchange_status == "position_active_recovered_from_filled_order"
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.execution_binding_id == binding.id
+
+
 def test_reconcile_appends_filled_second_leg_position_id(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     upsert_execution_binding(

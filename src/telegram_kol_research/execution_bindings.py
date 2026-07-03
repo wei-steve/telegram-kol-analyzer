@@ -249,6 +249,7 @@ def reconcile_deepcoin_execution_bindings(
         }
         order_history_cache: dict[str, list[dict[str, Any]]] = {}
         trade_fills_cache: dict[str, list[dict[str, Any]]] = {}
+        trigger_history_cache: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             row.strategy_instance_id = row.strategy_instance_id or build_strategy_instance_id(
                 venue=row.venue,
@@ -270,6 +271,7 @@ def reconcile_deepcoin_execution_bindings(
                     bound_pos_ids=bound_pos_ids,
                     order_history_cache=order_history_cache,
                     trade_fills_cache=trade_fills_cache,
+                    trigger_history_cache=trigger_history_cache,
                 )
                 if recovered_pos_ids:
                     row.pos_id = _join_unique_ids([*_split_ids(row.pos_id), *recovered_pos_ids])
@@ -296,6 +298,7 @@ def reconcile_deepcoin_execution_bindings(
                     bound_pos_ids=bound_pos_ids,
                     order_history_cache=order_history_cache,
                     trade_fills_cache=trade_fills_cache,
+                    trigger_history_cache=trigger_history_cache,
                 )
                 if recovered_pos_ids and (_split_ids(row.pos_id) or len(recovered_pos_ids) > 1):
                     row.pos_id = _join_unique_ids([*_split_ids(row.pos_id), *recovered_pos_ids])
@@ -314,6 +317,7 @@ def reconcile_deepcoin_execution_bindings(
                         bound_pos_ids=bound_pos_ids,
                         order_history_cache=order_history_cache,
                         trade_fills_cache=trade_fills_cache,
+                        trigger_history_cache=trigger_history_cache,
                     )
                     recovered_status = "position_active_recovered_from_filled_order"
                     if recovered_position is None:
@@ -783,6 +787,7 @@ def _select_position_from_order_evidence(
     bound_pos_ids: set[str],
     order_history_cache: dict[str, list[dict[str, Any]]],
     trade_fills_cache: dict[str, list[dict[str, Any]]],
+    trigger_history_cache: dict[str, list[dict[str, Any]]],
 ) -> dict[str, Any] | None:
     if _split_ids(row.pos_id):
         return None
@@ -812,6 +817,7 @@ def _select_position_from_order_evidence(
         order_ids=order_ids,
         order_history_cache=order_history_cache,
         trade_fills_cache=trade_fills_cache,
+        trigger_history_cache=trigger_history_cache,
     )
     if not evidence:
         return None
@@ -833,6 +839,7 @@ def _select_additional_positions_from_order_evidence(
     bound_pos_ids: set[str],
     order_history_cache: dict[str, list[dict[str, Any]]],
     trade_fills_cache: dict[str, list[dict[str, Any]]],
+    trigger_history_cache: dict[str, list[dict[str, Any]]],
 ) -> list[str]:
     existing_pos_ids = set(_split_ids(row.pos_id))
     order_ids = set(_split_ids(row.order_id)) | set(_split_ids(row.client_order_id))
@@ -862,6 +869,7 @@ def _select_additional_positions_from_order_evidence(
         order_ids=order_ids,
         order_history_cache=order_history_cache,
         trade_fills_cache=trade_fills_cache,
+        trigger_history_cache=trigger_history_cache,
     )
     if not evidence:
         return []
@@ -881,6 +889,7 @@ def _load_order_evidence(
     order_ids: set[str],
     order_history_cache: dict[str, list[dict[str, Any]]],
     trade_fills_cache: dict[str, list[dict[str, Any]]],
+    trigger_history_cache: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
     history_rows = _cached_client_rows(
@@ -895,7 +904,13 @@ def _load_order_evidence(
         instrument_id=instrument_id,
         cache=trade_fills_cache,
     )
-    for row in [*history_rows, *fill_rows]:
+    trigger_history_rows = _cached_client_rows(
+        client,
+        method_name="list_trigger_order_history",
+        instrument_id=instrument_id,
+        cache=trigger_history_cache,
+    )
+    for row in [*history_rows, *fill_rows, *trigger_history_rows]:
         row_order_ids = {
             value
             for value in (
@@ -978,6 +993,7 @@ def _position_matches_order_evidence(position: dict[str, Any], evidence: dict[st
         or evidence.get("uTime")
         or evidence.get("ts")
         or evidence.get("cTime")
+        or evidence.get("triggerTime")
     )
     if evidence_time is not None:
         position_time = _to_int(position.get("uTime") or position.get("cTime"))

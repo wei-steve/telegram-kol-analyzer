@@ -27,6 +27,20 @@ Every Deepcoin order created for a KOL signal must keep the local binding:
 - `pos_id`: Deepcoin position id once available
 - `margin_mode` and `position_mode`
 
+Limit / trigger entries are asynchronous. The initial order response may only
+confirm the pending order or trigger order, while the eventual filled entry can
+appear later as a different Deepcoin order id. The web service therefore runs a
+background Deepcoin execution reconciliation loop. It scans open bindings,
+regular order history, trade fills, trigger order history, and current
+positions. When a trigger entry has fired, the loop can use the original
+trigger order id plus filled price, size, side, and time evidence to bind the
+resulting `posId` back to the original KOL strategy binding.
+
+System-created Deepcoin orders should never be treated as anonymous KOL
+positions. If a filled order cannot be safely attributed to exactly one local
+strategy binding, it must remain an execution attribution problem rather than
+being counted as a normal KOL holding.
+
 For a later stop-loss update, resolve the target in this order:
 
 1. Pending SL trigger order with matching Deepcoin order id or `clOrdId`.

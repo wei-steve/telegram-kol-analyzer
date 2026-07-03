@@ -66,6 +66,26 @@ def test_web_app_runs_first_reconcile_shortly_after_startup_by_default(tmp_path)
     assert app.state.reconcile_startup_delay_seconds == 15
 
 
+def test_web_app_starts_deepcoin_execution_reconcile_loop(tmp_path):
+    calls: list[int] = []
+
+    async def fake_deepcoin_reconcile_runner(**kwargs):
+        calls.append(kwargs["interval_seconds"])
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_reconcile_runner=fake_deepcoin_reconcile_runner,
+        deepcoin_reconcile_startup_delay_seconds=0,
+        deepcoin_reconcile_interval_seconds=30,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert calls == [30]
+
+
 def test_monitor_status_reports_reconcile_auth_failure(tmp_path):
     async def fake_live_listener_runner(**kwargs):
         await asyncio.Event().wait()
