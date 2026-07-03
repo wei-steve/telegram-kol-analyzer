@@ -399,12 +399,29 @@ async function refreshGroupList() {
   const nextKolList = doc.querySelector('.kol-strategy-list');
   const currentKolList = document.querySelector('.kol-strategy-list');
   if (nextKolList && currentKolList) {
+    if (sidebarLooksLikeZeroRegression(currentKolList, nextKolList)) {
+      bindGroupLinks();
+      syncSelectedGroupState(selectedChatId);
+      return;
+    }
     currentKolList.replaceWith(nextKolList);
     bindGroupAutomationToggles();
   }
 
   bindGroupLinks();
   syncSelectedGroupState(selectedChatId);
+}
+
+function sidebarStrategyCountTotal(list) {
+  if (!list) return 0;
+  return [...list.querySelectorAll('.kol-status-text')].reduce((total, element) => {
+    const match = (element.textContent || '').match(/(\d+)/);
+    return total + (match ? Number(match[1]) : 0);
+  }, 0);
+}
+
+function sidebarLooksLikeZeroRegression(currentList, nextList) {
+  return sidebarStrategyCountTotal(currentList) > 0 && sidebarStrategyCountTotal(nextList) === 0;
 }
 
 async function fetchMessagePanel(chatId, options = {}) {

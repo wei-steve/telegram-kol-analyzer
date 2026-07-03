@@ -121,6 +121,17 @@ def test_app_js_refreshes_sidebar_when_switching_groups(tmp_path):
     assert "refreshGroupList().catch(() => {" in response.text
 
 
+def test_app_js_ignores_zero_sidebar_regression_from_partial_refresh(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "function sidebarStrategyCountTotal" in response.text
+    assert "function sidebarLooksLikeZeroRegression" in response.text
+    assert "sidebarLooksLikeZeroRegression(currentKolList, nextKolList)" in response.text
+
+
 def test_app_js_appends_loaded_history_below_current_messages(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
