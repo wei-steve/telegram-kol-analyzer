@@ -760,6 +760,18 @@ def test_groups_partial_uses_lifecycle_counts_for_holding_badges(tmp_path):
                 posted_at=datetime(2026, 7, 3, 10, 0),
             )
         )
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="active",
+            pos_id="pos-live",
+        )
+        session.add(binding)
+        session.flush()
         session.add(
             StrategyLifecycle(
                 chat_id=88,
@@ -769,6 +781,7 @@ def test_groups_partial_uses_lifecycle_counts_for_holding_badges(tmp_path):
                 lifecycle_status="entered",
                 signal_at=datetime(2026, 7, 3, 10, 0),
                 entered_at=datetime(2026, 7, 3, 10, 1),
+                execution_binding_id=binding.id,
             )
         )
         session.commit()

@@ -1238,11 +1238,23 @@ def create_web_app(
             app.state.session_factory,
             symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
         )
+        holding_positions = list_holding_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=500,
+        )
+        pending_entry_signals = list_pending_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=500,
+            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
+        )
         trader_dashboard = _build_trader_dashboard_state(
             groups=groups,
             group_config=app.state.group_config,
             active_positions=[],
-            pending_entry_signals=[],
+            pending_entry_signals=pending_entry_signals,
+            holding_positions=holding_positions,
             lifecycle_counts_by_chat_id=lifecycle_counts_by_chat_id,
             live_listener_enabled=monitor_status["state"] == "monitoring",
             refresh_mode_label=(

@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
+    ExecutionBinding,
     MediaAsset,
     MessageRecognition,
     RawMessage,
@@ -92,6 +93,18 @@ def test_groups_route_uses_lifecycle_counts_for_sidebar_badges(tmp_path):
                 text="group",
             )
         )
+        binding = ExecutionBinding(
+            kol_id="group:77",
+            chat_id=77,
+            message_id=10,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="active",
+            pos_id="pos-live",
+        )
+        session.add(binding)
+        session.flush()
         session.add_all(
             [
                 StrategyLifecycle(
@@ -101,6 +114,7 @@ def test_groups_route_uses_lifecycle_counts_for_sidebar_badges(tmp_path):
                     side="long",
                     lifecycle_status="entered",
                     signal_at=datetime(2026, 4, 2, tzinfo=UTC),
+                    execution_binding_id=binding.id,
                 ),
                 StrategyLifecycle(
                     chat_id=77,
