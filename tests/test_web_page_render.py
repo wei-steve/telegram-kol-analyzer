@@ -62,6 +62,11 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "data-ai-recognition-config" in response.text
     assert "data-ai-model-selection" in response.text
     assert "data-trading-settings-form" in response.text
+    assert 'data-dashboard-tab="recognition-profiles"' in response.text
+    assert 'data-dashboard-panel="recognition-profiles"' in response.text
+    assert "比特币军长-11分组" in response.text
+    assert "junzhang_profile" in response.text
+    assert "止损上移到开仓价" in response.text
     assert "默认单笔最大亏损 USDT" in response.text
     assert "单点附近市价容忍 %" in response.text
     assert "20.0" in response.text

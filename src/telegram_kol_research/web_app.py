@@ -50,6 +50,7 @@ from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.recognition_experiments import run_mimo_direct_for_message
+from telegram_kol_research.recognition_profiles import list_recognition_profiles
 from telegram_kol_research.llm_chat import (
     build_proxy_chat_payload,
     build_scope_context,
@@ -1243,6 +1244,7 @@ def create_web_app(
                 "strategy_kpi": strategy_kpi,
                 "ai_recognition_config": ai_recognition_config,
                 "ai_prompt_views": build_ai_prompt_views(ai_recognition_config),
+                "recognition_profiles": list_recognition_profiles(),
                 "trading_settings": trading_settings,
             },
         )

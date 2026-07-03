@@ -29,6 +29,7 @@ from telegram_kol_research.models import (
     utc_now,
 )
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
+from telegram_kol_research.recognition_profiles import BITCOIN_JUNZHANG_PROFILE
 from telegram_kol_research.parsing.text_parser import parse_signal_text
 
 
@@ -71,8 +72,8 @@ EXIT_SYMBOL_ALIASES = {
 }
 
 DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS = 72
-BITCOIN_JUNZHANG_CHAT_ID = -1002282384698
-BITCOIN_JUNZHANG_PARSE_SOURCE = "junzhang_profile"
+BITCOIN_JUNZHANG_CHAT_ID = BITCOIN_JUNZHANG_PROFILE.chat_id
+BITCOIN_JUNZHANG_PARSE_SOURCE = BITCOIN_JUNZHANG_PROFILE.parse_source
 
 ENTRY_TERMS = [
     "建仓",

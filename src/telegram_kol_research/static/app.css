@@ -293,7 +293,8 @@ body {
 }
 .dashboard-tab-panel[data-dashboard-panel="prompt"].is-active,
 .dashboard-tab-panel[data-dashboard-panel="config"].is-active,
-.dashboard-tab-panel[data-dashboard-panel="model-selection"].is-active {
+.dashboard-tab-panel[data-dashboard-panel="model-selection"].is-active,
+.dashboard-tab-panel[data-dashboard-panel="recognition-profiles"].is-active {
   height: 100%;
   min-height: 0;
   overflow-x: hidden;
@@ -307,7 +308,8 @@ body {
 }
 .dashboard-tab-panel[data-dashboard-panel="prompt"] .ai-recognition-panel,
 .dashboard-tab-panel[data-dashboard-panel="config"] .ai-recognition-panel,
-.dashboard-tab-panel[data-dashboard-panel="model-selection"] .ai-recognition-panel {
+.dashboard-tab-panel[data-dashboard-panel="model-selection"] .ai-recognition-panel,
+.dashboard-tab-panel[data-dashboard-panel="recognition-profiles"] .ai-recognition-panel {
   height: auto;
   min-height: 100%;
   overflow: visible;
@@ -392,6 +394,80 @@ body {
 .ai-prompt-card textarea {
   min-height: 360px;
   resize: vertical;
+}
+
+.recognition-profiles-panel {
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+.recognition-profile-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(320px, 1fr));
+  gap: 14px;
+  padding-bottom: 48px;
+}
+
+.recognition-profile-card {
+  align-content: start;
+}
+
+.recognition-profile-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.recognition-profile-meta div {
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(2, 6, 23, 0.24);
+}
+
+.recognition-profile-meta dt,
+.recognition-profile-section h4 {
+  margin: 0 0 6px;
+  color: #94a3b8;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.recognition-profile-meta dd {
+  margin: 0;
+  color: #e2e8f0;
+  line-height: 1.45;
+}
+
+.recognition-profile-section {
+  display: grid;
+  gap: 8px;
+}
+
+.recognition-profile-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.recognition-profile-tags span {
+  border: 1px solid rgba(34, 197, 94, 0.28);
+  border-radius: 999px;
+  padding: 3px 8px;
+  color: #bbf7d0;
+  background: rgba(20, 83, 45, 0.22);
+  font-size: 0.74rem;
+  font-weight: 800;
+}
+
+.recognition-profile-section ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+  color: #cbd5e1;
+  line-height: 1.5;
 }
 
 .ai-config-grid {
@@ -1201,6 +1277,11 @@ body {
 }
 
 @media (max-width: 760px) {
+  .recognition-profile-grid,
+  .recognition-profile-meta {
+    grid-template-columns: 1fr;
+  }
+
   .trading-settings-grid {
     grid-template-columns: 1fr;
   }

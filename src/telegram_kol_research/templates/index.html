@@ -30,6 +30,7 @@
           <button type="button" class="settings-menu-item" data-dashboard-tab="prompt">AI识别提示词</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="config">AI配置</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="model-selection">AI模型选择</button>
+          <button type="button" class="settings-menu-item" data-dashboard-tab="recognition-profiles">识别 Profile</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="trading-settings">交易设置</button>
         </nav>
       </details>
@@ -228,6 +229,68 @@
           <span class="ai-recognition-save-status" data-ai-model-selection-save-status aria-live="polite"></span>
         </div>
       </form>
+    </section>
+  </section>
+
+  <section class="dashboard-tab-panel" data-dashboard-panel="recognition-profiles">
+    <section class="panel ai-recognition-panel recognition-profiles-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>识别 Profile</h2>
+          <p class="ai-helper-text">查看不同 KOL 群组的专属识别格式、能力边界和风控策略。</p>
+        </div>
+        <button type="button" class="secondary-button" data-dashboard-tab="main">返回主界面</button>
+      </div>
+      <div class="recognition-profile-grid">
+        {% for profile in recognition_profiles %}
+        <article class="ai-prompt-card recognition-profile-card">
+          <div class="ai-prompt-card-head">
+            <div>
+              <span class="ai-prompt-tag">{{ profile.status }} / {{ profile.parse_source }}</span>
+              <h3>{{ profile.title }}</h3>
+            </div>
+            <small>{{ profile.chat_id }}</small>
+          </div>
+          <p>{{ profile.description }}</p>
+          <dl class="recognition-profile-meta">
+            <div>
+              <dt>格式</dt>
+              <dd>{{ profile.style }}</dd>
+            </div>
+            <div>
+              <dt>风控</dt>
+              <dd>{{ profile.risk_policy }}</dd>
+            </div>
+          </dl>
+          <div class="recognition-profile-section">
+            <h4>能力</h4>
+            <div class="recognition-profile-tags">
+              {% for capability in profile.capabilities %}
+              <span>{{ capability }}</span>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="recognition-profile-section">
+            <h4>开仓样式</h4>
+            <ul>
+              {% for pattern in profile.entry_patterns %}
+              <li>{{ pattern }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+          <div class="recognition-profile-section">
+            <h4>管理样式</h4>
+            <ul>
+              {% for pattern in profile.management_patterns %}
+              <li>{{ pattern }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+        </article>
+        {% else %}
+        <p class="ai-helper-text">暂无专属识别 Profile。</p>
+        {% endfor %}
+      </div>
     </section>
   </section>
 
