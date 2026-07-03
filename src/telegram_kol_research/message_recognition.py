@@ -71,6 +71,8 @@ EXIT_SYMBOL_ALIASES = {
 }
 
 DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS = 72
+BITCOIN_JUNZHANG_CHAT_ID = -1002282384698
+BITCOIN_JUNZHANG_PARSE_SOURCE = "junzhang_profile"
 
 ENTRY_TERMS = [
     "建仓",
@@ -173,6 +175,16 @@ def recognize_message_now(
                 _upsert_recognition(session, ai_event_result, engine=config.text_provider.model)
                 session.commit()
                 return ai_event_result
+
+        if text.strip():
+            kol_profile_result = _apply_bitcoin_junzhang_profile_if_matched(
+                session,
+                raw_message,
+            )
+            if kol_profile_result is not None:
+                _upsert_recognition(session, kol_profile_result)
+                session.commit()
+                return kol_profile_result
 
         if (
             text.strip()
@@ -1629,6 +1641,328 @@ def _is_actionable_entry_signal(text: str, parsed) -> bool:
     if _looks_like_position_management(text) and not _has_entry_instruction(text, parsed):
         return False
     return True
+
+
+def _apply_bitcoin_junzhang_profile_if_matched(
+    session,
+    raw_message: RawMessage,
+) -> MessageRecognitionResult | None:
+    if int(raw_message.chat_id) != BITCOIN_JUNZHANG_CHAT_ID:
+        return None
+    text = _clean_bitcoin_junzhang_text(raw_message.text or "")
+    if not text:
+        return None
+
+    if _apply_bitcoin_junzhang_management_if_matched(session, raw_message, text):
+        return MessageRecognitionResult(
+            raw_message_id=raw_message.id,
+            status="非策略",
+            reason="比特币军长短句 profile 识别为已有仓位管理/离场消息，已匹配生命周期。",
+            parse_source=BITCOIN_JUNZHANG_PARSE_SOURCE,
+        )
+
+    parsed_entry = _parse_bitcoin_junzhang_entry(text)
+    if parsed_entry is None:
+        return None
+    if parsed_entry["stop_loss"] is None and not parsed_entry["take_profit"]:
+        return MessageRecognitionResult(
+            raw_message_id=raw_message.id,
+            status="非策略",
+            reason="比特币军长短句 profile 命中开仓意图，但缺少止损/止盈，记录为半策略且不自动交易。",
+            parse_source=BITCOIN_JUNZHANG_PARSE_SOURCE,
+        )
+
+    candidate = _upsert_bitcoin_junzhang_entry_candidate(
+        session,
+        raw_message=raw_message,
+        parsed_entry=parsed_entry,
+    )
+    _ensure_lifecycle_record(session, raw_message, candidate)
+    return MessageRecognitionResult(
+        raw_message_id=raw_message.id,
+        status="是策略",
+        summary=_format_candidate_summary(candidate),
+        parse_source=BITCOIN_JUNZHANG_PARSE_SOURCE,
+    )
+
+
+def _clean_bitcoin_junzhang_text(text: str) -> str:
+    lines = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("---------------"):
+            break
+        if line.startswith("@Tarderfengge") or line.startswith("QQ:"):
+            continue
+        lines.append(line.strip("💰 "))
+    compact = " ".join(lines).strip()
+    compact = re.sub(r"@\S+", "", compact)
+    compact = re.sub(r"QQ[:：]?\s*\d+", "", compact, flags=re.IGNORECASE)
+    return " ".join(compact.split())
+
+
+def _parse_bitcoin_junzhang_entry(text: str) -> dict[str, Any] | None:
+    if not _junzhang_has_entry_intent(text):
+        return None
+    symbol = _extract_junzhang_symbol(text)
+    side = _extract_junzhang_side(text)
+    if symbol is None or side is None:
+        return None
+    return {
+        "symbol": symbol,
+        "side": side,
+        "entry": _extract_junzhang_entry_text(text),
+        "stop_loss": _extract_junzhang_stop_loss(text),
+        "take_profit": _extract_junzhang_take_profit(text),
+        "leverage": _extract_junzhang_leverage(text),
+    }
+
+
+def _junzhang_has_entry_intent(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        any(term in text for term in ["现价开", "现价", "开一层", "开个", "杠干"])
+        or any(term in lowered for term in ["market", "open"])
+    )
+
+
+def _extract_junzhang_symbol(text: str) -> str | None:
+    aliases = [
+        ("比特", "BTC"),
+        ("大饼", "BTC"),
+        ("BTC", "BTC"),
+        ("以太", "ETH"),
+        ("ETH", "ETH"),
+    ]
+    for alias, symbol in aliases:
+        if alias in text:
+            return symbol
+    match = re.search(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})(?![A-Za-z0-9])", text)
+    if match is None:
+        return None
+    symbol = match.group(1).upper()
+    return None if symbol in BLOCKED_SYMBOLS else symbol
+
+
+def _extract_junzhang_side(text: str) -> str | None:
+    if any(term in text for term in ["空单", "开空", "做空", "杠干空", "空"]):
+        return "short"
+    if any(term in text for term in ["多单", "开多", "做多", "杠干多", "多"]):
+        return "long"
+    return None
+
+
+def _extract_junzhang_entry_text(text: str) -> str | None:
+    range_match = re.search(r"(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)", text)
+    if range_match:
+        return f"{range_match.group(1)}-{range_match.group(2)}"
+    if "现价" in text or "开一层" in text or "开个" in text:
+        return "现价"
+    return None
+
+
+def _extract_junzhang_stop_loss(text: str) -> float | None:
+    match = re.search(r"止损(?:放|上移到|移到)?[:：]?\s*(\d+(?:\.\d+)?)", text)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def _extract_junzhang_take_profit(text: str) -> str | None:
+    match = re.search(r"止盈[:：]?\s*([0-9./\s-]+)", text)
+    if match is None:
+        return None
+    values = re.findall(r"\d+(?:\.\d+)?", match.group(1))
+    return "/".join(values) if values else None
+
+
+def _extract_junzhang_leverage(text: str) -> str | None:
+    match = re.search(r"(\d+(?:\.\d+)?)\s*倍", text)
+    if match:
+        return f"{match.group(1)}x"
+    return None
+
+
+def _upsert_bitcoin_junzhang_entry_candidate(
+    session,
+    *,
+    raw_message: RawMessage,
+    parsed_entry: dict[str, Any],
+) -> SignalCandidate:
+    candidate = (
+        session.query(SignalCandidate)
+        .filter(SignalCandidate.raw_message_id == raw_message.id)
+        .order_by(SignalCandidate.id.asc())
+        .first()
+    )
+    if candidate is None:
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            source_id=None,
+            parse_source=BITCOIN_JUNZHANG_PARSE_SOURCE,
+            review_status="pending",
+        )
+        session.add(candidate)
+    candidate.symbol = parsed_entry["symbol"]
+    candidate.side = parsed_entry["side"]
+    candidate.event_type = "entry_signal"
+    candidate.entry_text = parsed_entry["entry"]
+    candidate.stop_loss_text = _format_number(parsed_entry["stop_loss"])
+    candidate.take_profit_text = parsed_entry["take_profit"]
+    candidate.leverage_text = parsed_entry["leverage"]
+    candidate.confidence = 0.88
+    candidate.parse_source = BITCOIN_JUNZHANG_PARSE_SOURCE
+    return candidate
+
+
+def _apply_bitcoin_junzhang_management_if_matched(
+    session,
+    raw_message: RawMessage,
+    text: str,
+) -> bool:
+    if "挂单取消" in text or "取消挂单" in text:
+        return _apply_bitcoin_junzhang_cancel_if_matched(session, raw_message, text)
+    if _junzhang_is_take_profit_close(text):
+        return _apply_bitcoin_junzhang_close_if_matched(session, raw_message, text)
+    if "止损上移到开仓价" in text or "止损移到开仓价" in text:
+        return _apply_bitcoin_junzhang_stop_update_if_matched(
+            session,
+            raw_message,
+            text,
+            move_to_entry=True,
+        )
+    if re.search(r"止损(?:放|移到|上移到)?[:：]?\s*\d+(?:\.\d+)?", text):
+        return _apply_bitcoin_junzhang_stop_update_if_matched(
+            session,
+            raw_message,
+            text,
+            move_to_entry=False,
+        )
+    return False
+
+
+def _junzhang_is_take_profit_close(text: str) -> bool:
+    return "止盈" in text and any(term in text for term in ["掉", "了", "止盈"])
+
+
+def _apply_bitcoin_junzhang_cancel_if_matched(session, raw_message: RawMessage, text: str) -> bool:
+    lifecycle = _select_bitcoin_junzhang_lifecycle(
+        session,
+        raw_message=raw_message,
+        text=text,
+        statuses={"pending_entry"},
+    )
+    if lifecycle is None:
+        return False
+    lifecycle.lifecycle_status = "exited"
+    lifecycle.exit_reason = "cancelled"
+    lifecycle.exited_at = raw_message.posted_at or utc_now()
+    lifecycle.exit_signal_message_id = raw_message.message_id
+    lifecycle.updated_at = utc_now()
+    _upsert_close_signal_candidate(
+        session,
+        raw_message=raw_message,
+        lifecycle=lifecycle,
+        parse_source=BITCOIN_JUNZHANG_PARSE_SOURCE,
+    )
+    return True
+
+
+def _apply_bitcoin_junzhang_close_if_matched(session, raw_message: RawMessage, text: str) -> bool:
+    lifecycle = _select_bitcoin_junzhang_lifecycle(
+        session,
+        raw_message=raw_message,
+        text=text,
+        statuses={"entered"},
+    )
+    if lifecycle is None:
+        return False
+    lifecycle.lifecycle_status = "exited"
+    lifecycle.exit_reason = "kol_signal"
+    lifecycle.exited_at = raw_message.posted_at or utc_now()
+    lifecycle.exit_signal_message_id = raw_message.message_id
+    lifecycle.updated_at = utc_now()
+    _upsert_close_signal_candidate(
+        session,
+        raw_message=raw_message,
+        lifecycle=lifecycle,
+        parse_source=BITCOIN_JUNZHANG_PARSE_SOURCE,
+    )
+    return True
+
+
+def _apply_bitcoin_junzhang_stop_update_if_matched(
+    session,
+    raw_message: RawMessage,
+    text: str,
+    *,
+    move_to_entry: bool,
+) -> bool:
+    lifecycle = _select_bitcoin_junzhang_lifecycle(
+        session,
+        raw_message=raw_message,
+        text=text,
+        statuses={"entered"},
+    )
+    if lifecycle is None:
+        return False
+    if move_to_entry:
+        if lifecycle.entry_price_actual is None:
+            return False
+        stop_loss = lifecycle.entry_price_actual
+        action = "move_stop_to_entry"
+    else:
+        stop_loss = _extract_junzhang_stop_loss(text)
+        action = "risk_update"
+    if stop_loss is None:
+        return False
+    lifecycle.stop_loss = stop_loss
+    lifecycle.management_signal_message_id = raw_message.message_id
+    lifecycle.management_action = action
+    lifecycle.management_note = "比特币军长短句 profile 识别到止损更新。"
+    lifecycle.updated_at = utc_now()
+    _upsert_management_signal_candidate(
+        session,
+        raw_message=raw_message,
+        lifecycle=lifecycle,
+        parse_source=BITCOIN_JUNZHANG_PARSE_SOURCE,
+    )
+    return True
+
+
+def _select_bitcoin_junzhang_lifecycle(
+    session,
+    *,
+    raw_message: RawMessage,
+    text: str,
+    statuses: set[str],
+) -> StrategyLifecycle | None:
+    symbol = _extract_junzhang_symbol(text)
+    side = _extract_junzhang_side(text)
+    query = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.chat_id == raw_message.chat_id)
+        .filter(StrategyLifecycle.lifecycle_status.in_(statuses))
+    )
+    if symbol is not None:
+        query = query.filter(StrategyLifecycle.symbol == symbol)
+    if side is not None:
+        query = query.filter(StrategyLifecycle.side == side)
+    if raw_message.posted_at is not None:
+        query = query.filter(StrategyLifecycle.signal_at <= raw_message.posted_at)
+        query = query.filter(StrategyLifecycle.signal_at >= raw_message.posted_at - timedelta(days=7))
+    matches = (
+        query.order_by(
+            StrategyLifecycle.entered_at.desc().nullslast(),
+            StrategyLifecycle.signal_at.desc(),
+            StrategyLifecycle.id.desc(),
+        )
+        .limit(2)
+        .all()
+    )
+    return matches[0] if len(matches) == 1 else None
 
 
 def _has_entry_instruction(text: str, parsed) -> bool:

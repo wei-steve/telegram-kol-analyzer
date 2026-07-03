@@ -575,6 +575,160 @@ def test_recognize_message_now_rejects_position_management_update(tmp_path):
         assert session.query(SignalCandidate).count() == 0
 
 
+def test_bitcoin_junzhang_profile_recognizes_market_short_with_stop_loss(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=-1002282384698,
+            message_id=5382,
+            posted_at=datetime(2026, 6, 23, 7, 19, 13, tzinfo=UTC),
+            text="BTC现价开一层空，止损65200 @Tarderfengge QQ:158241758",
+        )
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.parse_source == "junzhang_profile"
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+
+    assert candidate.symbol == "BTC"
+    assert candidate.side == "short"
+    assert candidate.event_type == "entry_signal"
+    assert candidate.entry_text == "现价"
+    assert candidate.stop_loss_text == "65200"
+    assert candidate.parse_source == "junzhang_profile"
+    assert lifecycle.lifecycle_status == "pending_entry"
+    assert lifecycle.symbol == "BTC"
+    assert lifecycle.side == "short"
+    assert lifecycle.stop_loss == 65200
+    assert lifecycle.entry_range_low is None
+    assert lifecycle.entry_range_high is None
+
+
+def test_bitcoin_junzhang_profile_rejects_entry_without_risk_controls(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=-1002282384698,
+            message_id=5586,
+            posted_at=datetime(2026, 7, 3, 22, 34, tzinfo=UTC),
+            text="比特与以太现价开一层空单，10倍杠干，做好加一次仓的预期",
+        )
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.parse_source == "junzhang_profile"
+    assert "缺少止损/止盈" in (result.reason or "")
+    with session_factory() as session:
+        assert session.query(SignalCandidate).count() == 0
+        assert session.query(StrategyLifecycle).count() == 0
+
+
+def test_bitcoin_junzhang_profile_closes_unique_active_long_on_take_profit(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=-1002282384698,
+            message_id=5538,
+            symbol="AAVE",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 1, 9, 40, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 1, 9, 41, tzinfo=UTC),
+            entry_price_actual=85.98,
+            stop_loss=84,
+        )
+        raw_message = RawMessage(
+            chat_id=-1002282384698,
+            message_id=5576,
+            posted_at=datetime(2026, 7, 3, 19, 18, tzinfo=UTC),
+            text="多单止盈掉 @Tarderfengge QQ:158241758",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.parse_source == "junzhang_profile"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "kol_signal"
+    assert lifecycle.exit_signal_message_id == 5576
+    assert candidate.event_type == "close_signal"
+    assert candidate.symbol == "AAVE"
+    assert candidate.side == "long"
+    assert candidate.parse_source == "junzhang_profile"
+
+
+def test_bitcoin_junzhang_profile_moves_stop_loss_to_entry_price(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=-1002282384698,
+            message_id=5538,
+            symbol="AAVE",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 1, 9, 40, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 1, 9, 41, tzinfo=UTC),
+            entry_price_actual=85.98,
+            stop_loss=84,
+        )
+        raw_message = RawMessage(
+            chat_id=-1002282384698,
+            message_id=5575,
+            posted_at=datetime(2026, 7, 3, 19, 9, tzinfo=UTC),
+            text="止损上移到开仓价 @Tarderfengge QQ:158241758",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.parse_source == "junzhang_profile"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.stop_loss == 85.98
+    assert lifecycle.management_signal_message_id == 5575
+    assert lifecycle.management_action == "move_stop_to_entry"
+    assert candidate.event_type == "position_update"
+    assert candidate.stop_loss_text == "85.98"
+    assert candidate.parse_source == "junzhang_profile"
+
+
 def test_recognize_message_now_closes_matching_short_position(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
