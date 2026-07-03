@@ -262,6 +262,15 @@ def reconcile_deepcoin_execution_bindings(
             order = _lookup_order_by_any_id(orders_by_order_id, row.order_id)
             if order is None:
                 order = _lookup_order_by_any_id(orders_by_client_order_id, row.client_order_id)
+            recovered_position_from_payload = (
+                _select_position_from_submitted_order_payload(
+                    row,
+                    active_positions=active_positions,
+                    bound_pos_ids=bound_pos_ids,
+                )
+                if position is None
+                else None
+            )
 
             if position is not None and _has_nonzero_size(position):
                 recovered_pos_ids = _select_additional_positions_from_order_evidence(
@@ -280,6 +289,18 @@ def reconcile_deepcoin_execution_bindings(
                 else:
                     row.last_exchange_status = "position_active"
                 row.status = "active"
+                if _attach_binding_to_lifecycle(session, row, now):
+                    result.active += 1
+                else:
+                    result.stale += 1
+            elif recovered_position_from_payload is not None:
+                recovered_pos_id = _first_string(
+                    recovered_position_from_payload, "posId", "pos_id", "id"
+                )
+                row.pos_id = recovered_pos_id
+                row.status = "active"
+                row.last_exchange_status = "position_active_recovered_from_submitted_order_payload"
+                bound_pos_ids.add(str(recovered_pos_id))
                 if _attach_binding_to_lifecycle(session, row, now):
                     result.active += 1
                 else:
@@ -321,11 +342,7 @@ def reconcile_deepcoin_execution_bindings(
                     )
                     recovered_status = "position_active_recovered_from_filled_order"
                     if recovered_position is None:
-                        recovered_position = _select_position_from_submitted_order_payload(
-                            row,
-                            active_positions=active_positions,
-                            bound_pos_ids=bound_pos_ids,
-                        )
+                        recovered_position = recovered_position_from_payload
                         recovered_status = "position_active_recovered_from_submitted_order_payload"
                     if recovered_position is None:
                         recovered_position = _select_recovered_position_for_unbound_binding(

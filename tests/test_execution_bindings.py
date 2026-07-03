@@ -1072,6 +1072,88 @@ def test_reconcile_recovers_trigger_limit_position_from_submitted_order_payload(
     assert other.pos_id is None
 
 
+def test_reconcile_recovers_filled_trigger_leg_even_when_another_trigger_order_is_open(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    upsert_execution_binding(
+        session_factory,
+        _binding(
+            chat_id=-1002370796392,
+            message_id=3240,
+            symbol="BTC",
+            side="short",
+            order_id="filled-trigger,open-trigger",
+            client_order_id="filled-client,open-client",
+            status="open",
+            payload={
+                "submitted_orders": [
+                    {
+                        "order_id": "filled-trigger",
+                        "client_order_id": "filled-client",
+                        "request": {
+                            "instId": "BTC-USDT-SWAP",
+                            "posSide": "short",
+                            "price": "62300",
+                            "triggerPrice": "62300",
+                            "sz": "12",
+                        },
+                    },
+                    {
+                        "order_id": "open-trigger",
+                        "client_order_id": "open-client",
+                        "request": {
+                            "instId": "BTC-USDT-SWAP",
+                            "posSide": "short",
+                            "price": "62500",
+                            "triggerPrice": "62500",
+                            "sz": "16",
+                        },
+                    },
+                ]
+            },
+        ),
+    )
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "filled-pos",
+                    "posSide": "short",
+                    "pos": "12",
+                    "avgPx": "62300",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "ordId": "open-trigger",
+                    "clOrdId": "open-client",
+                    "state": "live",
+                }
+            ]
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 7, 3, 16, 5),
+    )
+
+    assert result.active == 1
+    assert result.open == 0
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+
+    assert binding.status == "active"
+    assert binding.pos_id == "filled-pos"
+    assert binding.last_exchange_status == "position_active_recovered_from_submitted_order_payload"
+
+
 @pytest.mark.parametrize("binding_status", ["active", "stale"])
 def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, binding_status):
     session_factory = create_session_factory(tmp_path / "research.db")
