@@ -360,6 +360,59 @@ def test_reconcile_recovers_filled_order_position_id_when_unique(tmp_path):
     assert lifecycle.lifecycle_status == "entered"
 
 
+def test_reconcile_does_not_revive_stale_pending_entry_as_active_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(pos_id="pos-late", status="active"),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="pending_entry",
+                signal_at=datetime(2026, 6, 30, 2, 51),
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-late",
+                    "posSide": "long",
+                    "pos": "9",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 7, 3, 3, 44),
+    )
+
+    assert result.active == 0
+    assert result.stale == 1
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = session.query(StrategyLifecycle).one()
+
+    assert binding.status == "stale"
+    assert binding.last_exchange_status == "expired_pending_entry_not_attributed"
+    assert lifecycle.lifecycle_status == "expired"
+    assert lifecycle.exit_reason == "expired"
+    assert lifecycle.entered_at is None
+    assert lifecycle.execution_binding_id is None
+
+
 def test_reconcile_revives_exited_lifecycle_when_bound_position_is_active(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(

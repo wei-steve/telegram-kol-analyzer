@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import sessionmaker
@@ -16,6 +16,8 @@ from telegram_kol_research.deepcoin_readonly import (
     DeepcoinReadOnlyClient,
 )
 from telegram_kol_research.models import ExecutionBinding
+
+PENDING_ENTRY_RECOVERY_WINDOW_HOURS = 6
 
 
 @dataclass(slots=True)
@@ -276,8 +278,10 @@ def reconcile_deepcoin_execution_bindings(
                 else:
                     row.last_exchange_status = "position_active"
                 row.status = "active"
-                result.active += 1
-                _attach_binding_to_lifecycle(session, row, now)
+                if _attach_binding_to_lifecycle(session, row, now):
+                    result.active += 1
+                else:
+                    result.stale += 1
             elif order is not None and _is_open_order_state(order):
                 row.status = "open"
                 row.last_exchange_status = (
@@ -298,8 +302,10 @@ def reconcile_deepcoin_execution_bindings(
                     row.status = "active"
                     row.last_exchange_status = "position_active_recovered_additional_pos_id"
                     bound_pos_ids.update(recovered_pos_ids)
-                    result.active += 1
-                    _attach_binding_to_lifecycle(session, row, now)
+                    if _attach_binding_to_lifecycle(session, row, now):
+                        result.active += 1
+                    else:
+                        result.stale += 1
                 else:
                     recovered_position = _select_position_from_order_evidence(
                         row,
@@ -324,8 +330,10 @@ def reconcile_deepcoin_execution_bindings(
                         row.status = "active"
                         row.last_exchange_status = recovered_status
                         bound_pos_ids.add(str(recovered_pos_id))
-                        result.active += 1
-                        _attach_binding_to_lifecycle(session, row, now)
+                        if _attach_binding_to_lifecycle(session, row, now):
+                            result.active += 1
+                        else:
+                            result.stale += 1
                     else:
                         row.status = "stale"
                         row.last_exchange_status = "not_found_on_exchange"
@@ -1020,7 +1028,7 @@ def _select_recovered_position_for_unbound_binding(
     return None
 
 
-def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: datetime) -> None:
+def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: datetime) -> bool:
     from telegram_kol_research.models import StrategyLifecycle
 
     lifecycle = (
@@ -1033,7 +1041,18 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
         .first()
     )
     if lifecycle is None:
-        return
+        return True
+    if _is_stale_unentered_lifecycle(lifecycle, updated_at):
+        lifecycle.lifecycle_status = "expired"
+        lifecycle.exit_reason = "expired"
+        lifecycle.exited_at = _pending_entry_expired_at(lifecycle)
+        lifecycle.entered_at = None
+        lifecycle.entry_price_actual = None
+        lifecycle.execution_binding_id = None
+        lifecycle.updated_at = updated_at
+        row.status = "stale"
+        row.last_exchange_status = "expired_pending_entry_not_attributed"
+        return False
     lifecycle.execution_binding_id = row.id
     if row.status == "active" and lifecycle.lifecycle_status != "entered":
         lifecycle.lifecycle_status = "entered"
@@ -1055,6 +1074,32 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
         lifecycle.entered_at = updated_at
     _refresh_lifecycle_prices_from_binding_payload(lifecycle, row)
     lifecycle.updated_at = updated_at
+    return True
+
+
+def _is_stale_unentered_lifecycle(lifecycle: Any, updated_at: datetime) -> bool:
+    if lifecycle.signal_at is None:
+        return False
+    status = str(lifecycle.lifecycle_status or "")
+    exit_reason = str(getattr(lifecycle, "exit_reason", None) or "")
+    if status == "entered":
+        return False
+    if status == "exited" and exit_reason not in {"expired", "cancelled", "invalidated"}:
+        return False
+    if status not in {"pending_entry", "expired", "invalidated", "exited"}:
+        return False
+    return _utc_naive(updated_at) > _pending_entry_expired_at(lifecycle)
+
+
+def _pending_entry_expired_at(lifecycle: Any) -> datetime:
+    signal_at = _utc_naive(lifecycle.signal_at)
+    return signal_at + timedelta(hours=PENDING_ENTRY_RECOVERY_WINDOW_HOURS)
+
+
+def _utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
 
 
 def _refresh_lifecycle_prices_from_binding_payload(
