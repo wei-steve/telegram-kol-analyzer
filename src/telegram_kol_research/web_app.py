@@ -157,6 +157,7 @@ def _build_trader_dashboard_state(
 
     holding_counts_by_chat_id: dict[int, int] = {}
     holding_count_source = holding_positions if holding_positions is not None else active_positions
+    should_use_lifecycle_holding_counts = holding_positions is None and not active_positions
     for h in holding_count_source:
         chat_id = h.get("chat_id")
         if chat_id is not None:
@@ -188,7 +189,11 @@ def _build_trader_dashboard_state(
         group_lifecycle_counts = (
             lifecycle_counts_by_chat_id or {}
         ).get(group_chat_id)
-        group_holding_count = holding_counts_by_chat_id.get(group_chat_id, 0)
+        group_holding_count = (
+            group_lifecycle_counts.get("entered", 0)
+            if group_lifecycle_counts is not None and should_use_lifecycle_holding_counts
+            else holding_counts_by_chat_id.get(group_chat_id, 0)
+        )
         group_pending_count = (
             group_lifecycle_counts.get("pending_entry", 0)
             if group_lifecycle_counts is not None

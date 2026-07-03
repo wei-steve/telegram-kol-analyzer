@@ -748,6 +748,39 @@ def test_execution_dashboard_disables_ambiguous_live_position_bindings(tmp_path)
     assert 'title="归属不唯一或置信度不足，禁止一键绑定"' in response.text
 
 
+def test_groups_partial_uses_lifecycle_counts_for_holding_badges(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=88,
+                message_id=10,
+                sender_name="Demo Group",
+                text="BTC long 60000 SL 59000 TP 61000",
+                posted_at=datetime(2026, 7, 3, 10, 0),
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                chat_id=88,
+                message_id=10,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 3, 10, 0),
+                entered_at=datetime(2026, 7, 3, 10, 1),
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get("/groups?selected_chat_id=88")
+
+    assert response.status_code == 200
+    assert re.search(r"kol-status-holding[\s\S]*?1", response.text)
+    assert re.search(r"kol-status-text[\s\S]*?1", response.text)
+
+
 def test_message_recognition_api_updates_message_result(tmp_path):
     database_path = tmp_path / "research.db"
     app = create_web_app(
