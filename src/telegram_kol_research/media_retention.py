@@ -73,6 +73,10 @@ def cleanup_media_files(
     candidates: list[MediaCleanupCandidate] = []
 
     with session_factory() as session:
+        referenced_file_paths = _load_referenced_media_paths(
+            session,
+            media_root=resolved_media_root,
+        )
         rows = (
             session.query(MediaAsset, RawMessage)
             .join(RawMessage, RawMessage.id == MediaAsset.raw_message_id)
@@ -158,6 +162,12 @@ def cleanup_media_files(
         if not dry_run:
             session.commit()
 
+    _delete_orphan_media_files(
+        resolved_media_root,
+        referenced_file_paths=referenced_file_paths,
+        result=result,
+        dry_run=dry_run,
+    )
     if not dry_run:
         _prune_empty_dirs(resolved_media_root)
 
@@ -206,6 +216,49 @@ def _load_protected_media_asset_ids(session) -> set[int]:
         .all()
     )
     return {int(row[0]) for row in rows}
+
+
+def _load_referenced_media_paths(session, *, media_root: Path) -> set[Path]:
+    paths: set[Path] = set()
+    rows = (
+        session.query(MediaAsset.local_path)
+        .filter(MediaAsset.local_path.is_not(None))
+        .all()
+    )
+    for (local_path,) in rows:
+        resolved = resolve_media_path(local_path, media_root=media_root)
+        if resolved is not None:
+            paths.add(resolved)
+    return paths
+
+
+def _delete_orphan_media_files(
+    media_root: Path,
+    *,
+    referenced_file_paths: set[Path],
+    result: MediaCleanupResult,
+    dry_run: bool,
+) -> None:
+    if not media_root.exists():
+        return
+    for file_path in media_root.rglob("*"):
+        if not file_path.is_file():
+            continue
+        resolved = file_path.resolve()
+        if resolved in referenced_file_paths:
+            continue
+        try:
+            file_size = file_path.stat().st_size
+        except OSError:
+            file_size = 0
+        if not dry_run:
+            try:
+                file_path.unlink()
+            except FileNotFoundError:
+                result.missing_files += 1
+                continue
+        result.deleted_files += 1
+        result.freed_bytes += file_size
 
 
 def _select_candidates_to_delete(

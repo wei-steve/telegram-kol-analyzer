@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.media_retention import cleanup_media_files
@@ -145,3 +145,42 @@ def test_cleanup_media_files_dry_run_leaves_files_and_db_unchanged(tmp_path):
     assert media_file.exists()
     with session_factory() as session:
         assert session.query(MediaAsset).one().local_path == "9001/3.jpg"
+
+
+def test_cleanup_media_files_deletes_orphan_files_not_referenced_by_database(tmp_path):
+    media_root = tmp_path / "media"
+    referenced = media_root / "9001" / "kept.jpg"
+    orphan = media_root / "9001" / "orphan.jpg"
+    referenced.parent.mkdir(parents=True)
+    referenced.write_bytes(b"kept-image")
+    orphan.write_bytes(b"orphan-image")
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=9001,
+            message_id=1,
+            text="image",
+            posted_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            MediaAsset(
+                raw_message_id=raw_message.id,
+                kind="photo",
+                local_path="9001/kept.jpg",
+            )
+        )
+        session.commit()
+
+    result = cleanup_media_files(
+        session_factory,
+        media_root=media_root,
+        retain_days=14,
+        dry_run=False,
+        now=datetime(2026, 1, 2, tzinfo=UTC),
+    )
+
+    assert referenced.exists()
+    assert not orphan.exists()
+    assert result.deleted_files == 1
