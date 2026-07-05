@@ -171,7 +171,9 @@ def test_app_css_allows_strategy_summary_prices_to_wrap_in_mid_panel(tmp_path):
     response = client.get("/static/app.css")
 
     assert response.status_code == 200
-    assert "grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));" in response.text
+    assert "grid-template-columns: 14px minmax(0, 1fr);" in response.text
+    assert "grid-column: 1 / -1;" in response.text
+    assert "grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));" in response.text
     assert ".strategy-card-summary-grid strong" in response.text
     assert "overflow-wrap: anywhere" in response.text
     assert "word-break: break-word" in response.text
