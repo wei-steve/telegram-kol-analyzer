@@ -1,12 +1,16 @@
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
+    build_pending_entry_expiry_review_reply_markup,
     format_pending_entry_expiry_review_message,
     load_system_operator_bot_config,
     system_operator_bot_enabled,
 )
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
-from telegram_kol_research.telegram_bot_commands import process_system_operator_command
+from telegram_kol_research.telegram_bot_commands import (
+    process_system_operator_callback_data,
+    process_system_operator_command,
+)
 from datetime import UTC, datetime
 
 
@@ -46,15 +50,60 @@ def test_format_pending_entry_expiry_review_message_includes_operator_choices():
     assert "#442" in message
     assert "BTC short" in message
     assert "62900-63200" in message
-    assert "/expiry_continue 442" in message
-    assert "/expiry_expire_cancel 442" in message
-    assert "/expiry_expire_keep 442" in message
+    assert "/expiry_continue" not in message
 
 
 def test_system_operator_bot_disabled_without_dedicated_destination():
     assert not system_operator_bot_enabled(
         SystemOperatorBotConfig(bot_token="", chat_id="", timeout_seconds=10)
     )
+
+
+def test_format_pending_entry_expiry_review_message_shows_strategy_code_and_internal_id():
+    message = format_pending_entry_expiry_review_message(
+        {
+            "lifecycle_id": 354,
+            "chat_id": -1002370796392,
+            "chat_title": "\u7c73\u5a05 VIP 11\u5206\u7ec4",
+            "message_id": 3251,
+            "symbol": "ETH",
+            "side": "short",
+            "max_age_hours": 6,
+            "signal_at": datetime(2026, 7, 4, 15, 54, 12, tzinfo=UTC),
+            "expiry_at": datetime(2026, 7, 4, 21, 54, 12, tzinfo=UTC),
+            "entry_range_low": 1830,
+            "entry_range_high": 1850,
+            "stop_loss": 1860,
+            "take_profit": "1785/1735/1670",
+        }
+    )
+
+    assert "\u7b56\u7565\u4ee3\u7801: #3251" in message
+    assert "\u5185\u90e8ID: 354" in message
+    assert "\u7fa4\u7ec4: \u7c73\u5a05 VIP 11\u5206\u7ec4" in message
+    assert "\u7fa4ID: -1002370796392" in message
+    assert "\u539f\u7b56\u7565\u65f6\u95f4: 2026-07-04 23:54:12 Asia/Shanghai" in message
+    assert "\u8d85\u65f6\u65f6\u95f4: 2026-07-05 05:54:12 Asia/Shanghai" in message
+
+
+def test_build_pending_entry_expiry_review_reply_markup_uses_lifecycle_id_callbacks():
+    markup = build_pending_entry_expiry_review_reply_markup({"lifecycle_id": 354})
+
+    assert markup == {
+        "inline_keyboard": [
+            [{"text": "\u7ee7\u7eed\u7b49\u5f85", "callback_data": "expiry_continue:354"}],
+            [
+                {
+                    "text": "\u8fc7\u671f\u5e76\u64a4\u5355",
+                    "callback_data": "expiry_expire_cancel:354",
+                },
+                {
+                    "text": "\u8fc7\u671f\u4f46\u4fdd\u7559\u6302\u5355",
+                    "callback_data": "expiry_expire_keep:354",
+                },
+            ],
+        ]
+    }
 
 
 def test_process_expiry_continue_keeps_pending_and_suppresses_repeat_review(tmp_path):
@@ -84,6 +133,64 @@ def test_process_expiry_continue_keeps_pending_and_suppresses_repeat_review(tmp_
 
     assert "继续等待" in response
     assert lifecycle.lifecycle_status == "pending_entry"
+    assert lifecycle.management_action == "expiry_review_continued"
+
+
+def test_process_expiry_continue_accepts_strategy_code_message_id(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3251,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
+            management_action="expiry_review_requested",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    response = process_system_operator_command(
+        session_factory,
+        "/expiry_continue #3251",
+        now=datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert "\u7ee7\u7eed\u7b49\u5f85" in response
+    assert lifecycle.management_action == "expiry_review_continued"
+
+
+def test_process_system_operator_callback_data_dispatches_expiry_action(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3251,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
+            management_action="expiry_review_requested",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    response = process_system_operator_callback_data(
+        session_factory,
+        f"expiry_continue:{lifecycle_id}",
+        now=datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert "\u7ee7\u7b49" in response or "\u7ee7\u7eed\u7b49\u5f85" in response
     assert lifecycle.management_action == "expiry_review_continued"
 
 

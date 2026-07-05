@@ -98,11 +98,31 @@ async def run_system_operator_bot_command_loop(
             for update in updates:
                 update_id = int(update.get("update_id") or 0)
                 offset = max(offset, update_id + 1)
+                deepcoin_client = deepcoin_client_factory() if deepcoin_client_factory else None
+                callback = update.get("callback_query") or {}
+                if callback:
+                    message = callback.get("message") or {}
+                    if not _message_is_from_alert_chat(message, chat_id):
+                        continue
+                    response_text = process_system_operator_callback_data(
+                        session_factory,
+                        str(callback.get("data") or ""),
+                        deepcoin_client=deepcoin_client,
+                    )
+                    await _answer_callback_query(
+                        client,
+                        base_url,
+                        callback_query_id=str(callback.get("id") or ""),
+                        text=response_text or "未识别的操作",
+                    )
+                    if response_text:
+                        await _send_message(client, base_url, chat_id=chat_id, text=response_text)
+                    continue
+
                 message = update.get("message") or {}
                 if not _message_is_from_alert_chat(message, chat_id):
                     continue
                 text = str(message.get("text") or "").strip()
-                deepcoin_client = deepcoin_client_factory() if deepcoin_client_factory else None
                 response_text = process_system_operator_command(
                     session_factory,
                     text,
@@ -111,6 +131,25 @@ async def run_system_operator_bot_command_loop(
                 if response_text:
                     await _send_message(client, base_url, chat_id=chat_id, text=response_text)
             await asyncio.sleep(poll_interval_seconds)
+
+
+def process_system_operator_callback_data(
+    session_factory: sessionmaker,
+    callback_data: str,
+    *,
+    now: datetime | None = None,
+    deepcoin_client=None,
+) -> str | None:
+    action, sep, identifier = callback_data.partition(":")
+    if sep != ":":
+        return None
+    return _process_expiry_action(
+        session_factory,
+        action,
+        identifier,
+        now=now,
+        deepcoin_client=deepcoin_client,
+    )
 
 
 def process_system_operator_command(
@@ -130,10 +169,26 @@ def process_system_operator_command(
     parts = text.split()
     if len(parts) < 2:
         return "请在命令后提供 lifecycle id，例如 /expiry_continue 442"
-    try:
-        lifecycle_id = int(parts[1])
-    except ValueError:
-        return "lifecycle id 必须是数字。"
+    return _process_expiry_action(
+        session_factory,
+        command,
+        parts[1],
+        now=now,
+        deepcoin_client=deepcoin_client,
+    )
+
+
+def _process_expiry_action(
+    session_factory: sessionmaker,
+    command: str,
+    identifier: str,
+    *,
+    now: datetime | None = None,
+    deepcoin_client=None,
+) -> str | None:
+    lifecycle_id = _parse_operator_lifecycle_identifier(session_factory, identifier)
+    if lifecycle_id is None:
+        return "未找到对应策略，请使用内部ID或策略代码，例如 /expiry_continue #3251。"
 
     event_at = now or utc_now()
     with session_factory() as session:
@@ -209,6 +264,29 @@ def process_system_operator_command(
         lifecycle.updated_at = event_at
         session.commit()
         return f"策略 #{lifecycle_id} 未发现本地 live 挂单，已标记过期。"
+
+
+def _parse_operator_lifecycle_identifier(
+    session_factory: sessionmaker,
+    identifier: str,
+) -> int | None:
+    value = str(identifier or "").strip()
+    if not value:
+        return None
+    if value.startswith("#"):
+        message_id_text = value[1:]
+        if not message_id_text.isdigit():
+            return None
+        message_id = int(message_id_text)
+        with session_factory() as session:
+            row = (
+                session.query(StrategyLifecycle)
+                .filter(StrategyLifecycle.message_id == message_id)
+                .order_by(StrategyLifecycle.signal_at.desc(), StrategyLifecycle.id.desc())
+                .first()
+            )
+            return int(row.id) if row is not None else None
+    return int(value) if value.isdigit() else None
 
 
 def _lifecycle_has_live_binding(session, lifecycle: StrategyLifecycle) -> bool:
@@ -425,7 +503,7 @@ async def _get_updates(client: httpx.AsyncClient, base_url: str, *, offset: int)
         params={
             "offset": offset,
             "timeout": 25,
-            "allowed_updates": '["message"]',
+            "allowed_updates": '["message","callback_query"]',
         },
     )
     response.raise_for_status()
@@ -461,6 +539,26 @@ def _is_positions_command(text: str) -> bool:
 
 def _is_pending_command(text: str) -> bool:
     return _command_name(text) == PENDING_COMMAND
+
+
+async def _answer_callback_query(
+    client: httpx.AsyncClient,
+    base_url: str,
+    *,
+    callback_query_id: str,
+    text: str,
+) -> None:
+    if not callback_query_id:
+        return
+    response = await client.post(
+        f"{base_url}/answerCallbackQuery",
+        json={
+            "callback_query_id": callback_query_id,
+            "text": text[:180],
+            "show_alert": False,
+        },
+    )
+    response.raise_for_status()
 
 
 def _command_name(text: str) -> str | None:

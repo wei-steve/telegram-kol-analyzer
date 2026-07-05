@@ -856,6 +856,9 @@ def create_web_app(
         expiry_review_notifier = None
         if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
             async def expiry_review_notifier(payload):
+                group_labels = _group_label_by_chat_id(app.state.group_config)
+                payload = dict(payload)
+                payload["chat_title"] = group_labels.get(int(payload.get("chat_id") or 0))
                 await send_pending_entry_expiry_review(
                     config=app.state.system_operator_bot_config,
                     payload=payload,
