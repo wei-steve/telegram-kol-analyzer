@@ -20,6 +20,7 @@ from telegram_kol_research.ai_recognition_config import (
     load_ai_recognition_config,
 )
 from telegram_kol_research.models import (
+    ExecutionBinding,
     MediaAsset,
     MessageRecognition,
     RawMessage,
@@ -788,13 +789,19 @@ def _load_lifecycle_event_context(session, raw_message: RawMessage) -> dict[str,
     active_rows = (
         session.query(StrategyLifecycle)
         .filter(StrategyLifecycle.chat_id == raw_message.chat_id)
-        .filter(StrategyLifecycle.lifecycle_status.in_(["pending_entry", "entered"]))
+        .filter(StrategyLifecycle.lifecycle_status.in_(["pending_entry", "entered", "expired"]))
         .filter(StrategyLifecycle.signal_at <= posted_at)
         .filter(StrategyLifecycle.signal_at >= since)
         .order_by(StrategyLifecycle.signal_at.desc(), StrategyLifecycle.id.desc())
         .limit(8)
         .all()
     )
+    active_rows = [
+        lifecycle
+        for lifecycle in active_rows
+        if lifecycle.lifecycle_status != "expired"
+        or _lifecycle_has_live_execution_binding(session, lifecycle)
+    ]
     active_strategies: list[dict[str, Any]] = []
     for lifecycle in active_rows:
         original = (
@@ -982,7 +989,13 @@ def _apply_lifecycle_event_decision(
         )
         return True
 
-    if event_type == "exit_position" and target.lifecycle_status == "entered":
+    if event_type == "exit_position" and (
+        target.lifecycle_status == "entered"
+        or (
+            target.lifecycle_status == "expired"
+            and _lifecycle_has_live_execution_binding(session, target)
+        )
+    ):
         target.lifecycle_status = "exited"
         target.exit_reason = "kol_signal"
         target.exited_at = event_at
@@ -2016,7 +2029,7 @@ def _apply_entry_confirmation_signal_if_matched(
     symbol, side, entry_price = entry_signal
     query = session.query(StrategyLifecycle).filter(
         StrategyLifecycle.chat_id == raw_message.chat_id,
-        StrategyLifecycle.lifecycle_status == "pending_entry",
+        StrategyLifecycle.lifecycle_status.in_(["pending_entry", "expired"]),
     )
     if symbol is not None:
         query = query.filter(StrategyLifecycle.symbol == symbol)
@@ -2026,10 +2039,15 @@ def _apply_entry_confirmation_signal_if_matched(
         query = query.filter(StrategyLifecycle.signal_at <= raw_message.posted_at)
         query = query.filter(StrategyLifecycle.signal_at >= raw_message.posted_at - timedelta(hours=24))
 
-    matches = query.order_by(
-        StrategyLifecycle.signal_at.desc(),
-        StrategyLifecycle.id.desc(),
-    ).all()
+    matches = [
+        item
+        for item in query.order_by(
+            StrategyLifecycle.signal_at.desc(),
+            StrategyLifecycle.id.desc(),
+        ).all()
+        if item.lifecycle_status == "pending_entry"
+        or _lifecycle_has_live_execution_binding(session, item)
+    ]
     if not matches:
         return False
 
@@ -2065,6 +2083,24 @@ def _apply_entry_confirmation_signal_if_matched(
         entry_price=entry_price,
     )
     return True
+
+
+def _lifecycle_has_live_execution_binding(session, lifecycle: StrategyLifecycle) -> bool:
+    if lifecycle.execution_binding_id is not None:
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        if binding is not None and binding.status in {"open", "active"}:
+            return True
+    return (
+        session.query(ExecutionBinding.id)
+        .filter(ExecutionBinding.venue == "deepcoin")
+        .filter(ExecutionBinding.chat_id == lifecycle.chat_id)
+        .filter(ExecutionBinding.message_id == lifecycle.message_id)
+        .filter(ExecutionBinding.symbol == lifecycle.symbol.upper())
+        .filter(ExecutionBinding.side == lifecycle.side.lower())
+        .filter(ExecutionBinding.status.in_(["open", "active"]))
+        .first()
+        is not None
+    )
 
 
 def _apply_exit_signal_if_matched(
@@ -2138,7 +2174,7 @@ def _apply_cancel_signal_if_matched(
     symbol, side = cancel_signal
     query = session.query(StrategyLifecycle).filter(
         StrategyLifecycle.chat_id == raw_message.chat_id,
-        StrategyLifecycle.lifecycle_status == "pending_entry",
+        StrategyLifecycle.lifecycle_status.in_(["pending_entry", "expired"]),
     )
     if symbol is not None:
         query = query.filter(StrategyLifecycle.symbol == symbol)
@@ -2148,10 +2184,15 @@ def _apply_cancel_signal_if_matched(
         query = query.filter(StrategyLifecycle.signal_at <= raw_message.posted_at)
         query = query.filter(StrategyLifecycle.signal_at >= raw_message.posted_at - timedelta(hours=24))
 
-    matches = query.order_by(
-        StrategyLifecycle.signal_at.desc(),
-        StrategyLifecycle.id.desc(),
-    ).all()
+    matches = [
+        item
+        for item in query.order_by(
+            StrategyLifecycle.signal_at.desc(),
+            StrategyLifecycle.id.desc(),
+        ).all()
+        if item.lifecycle_status == "pending_entry"
+        or _lifecycle_has_live_execution_binding(session, item)
+    ]
     if not matches:
         return False
 
@@ -2396,6 +2437,23 @@ def _parse_explicit_cancel_signal(text: str) -> tuple[str | None, str | None] | 
     if not normalized:
         return None
     lowered = normalized.lower()
+    if any(
+        term in normalized
+        for term in [
+            "\u53d6\u6d88\u9650\u4ef7",
+            "\u53d6\u6d88\u6302\u5355",
+            "\u53d6\u6d88\u9650\u4ef7\u6302\u5355",
+            "\u64a4\u5355",
+            "\u53d6\u6d88\u8ba2\u5355",
+            "\u6302\u5355\u53d6\u6d88",
+        ]
+    ):
+        return _extract_exit_symbol(normalized), _extract_exit_side(normalized)
+    if any(
+        term in normalized
+        for term in ["取消限价", "取消挂单", "取消限价挂单", "撤单", "取消订单", "挂单取消"]
+    ):
+        return _extract_exit_symbol(normalized), _extract_exit_side(normalized)
     has_cancel_term = (
         any(term in normalized for term in ["取消限价", "取消挂单", "撤单", "取消订单", "挂单取消"])
         or any(term in lowered for term in ["cancel limit", "cancel order", "cancel entry"])

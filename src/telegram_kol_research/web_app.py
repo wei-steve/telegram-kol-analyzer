@@ -77,6 +77,12 @@ from telegram_kol_research.strategy_alerts import (
     load_strategy_alert_config,
     strategy_alerts_enabled,
 )
+from telegram_kol_research.system_operator_bot import (
+    SystemOperatorBotConfig,
+    load_system_operator_bot_config,
+    send_pending_entry_expiry_review,
+    system_operator_bot_enabled,
+)
 from telegram_kol_research.trading_settings import (
     load_trading_settings,
     save_trading_settings,
@@ -102,7 +108,10 @@ from telegram_kol_research.lifecycle_monitor import (
 )
 from telegram_kol_research.telegram_live_listener import launch_live_listener_task, run_live_listener
 from telegram_kol_research.telegram_live_listener import run_periodic_reconcile, run_reconcile_once
-from telegram_kol_research.telegram_bot_commands import run_telegram_bot_command_loop
+from telegram_kol_research.telegram_bot_commands import (
+    run_system_operator_bot_command_loop,
+    run_telegram_bot_command_loop,
+)
 from telegram_kol_research.telegram_client import create_telegram_client, load_telegram_auth_config, maybe_await
 from telegram_kol_research.telegram_session_lock import (
     TelegramSessionLockError,
@@ -844,12 +853,20 @@ def create_web_app(
     async def lifespan(app: FastAPI):
         # ── lifecycle monitor (started first; no dependency on Telegram client) ──
         app.state.lifecycle_monitor_http = httpx.AsyncClient(timeout=10.0)
+        expiry_review_notifier = None
+        if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
+            async def expiry_review_notifier(payload):
+                await send_pending_entry_expiry_review(
+                    config=app.state.system_operator_bot_config,
+                    payload=payload,
+                )
         app.state.lifecycle_monitor = LifecycleMonitor(
             session_factory=app.state.session_factory,
             broker=app.state.live_update_broker,
             config=LifecycleMonitorConfig(),
             http_client=app.state.lifecycle_monitor_http,
             now_provider=app.state.now_provider,
+            expiry_review_notifier=expiry_review_notifier,
         )
         app.state.lifecycle_monitor_task = asyncio.create_task(
             app.state.lifecycle_monitor.run_loop()
@@ -870,6 +887,14 @@ def create_web_app(
                     config=app.state.strategy_alert_config,
                     session_factory=app.state.session_factory,
                     group_config=app.state.group_config,
+                )
+            )
+        if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
+            app.state.system_operator_bot_command_task = asyncio.create_task(
+                run_system_operator_bot_command_loop(
+                    config=app.state.system_operator_bot_config,
+                    session_factory=app.state.session_factory,
+                    deepcoin_client_factory=app.state.deepcoin_client_factory,
                 )
             )
         if (
@@ -947,6 +972,14 @@ def create_web_app(
                 except asyncio.CancelledError:
                     pass
                 app.state.telegram_bot_command_task = None
+            system_bot_command_task = app.state.system_operator_bot_command_task
+            if system_bot_command_task is not None:
+                system_bot_command_task.cancel()
+                try:
+                    await system_bot_command_task
+                except asyncio.CancelledError:
+                    pass
+                app.state.system_operator_bot_command_task = None
             reconcile_task = app.state.reconcile_task
             if reconcile_task is not None:
                 reconcile_task.cancel()
@@ -969,6 +1002,12 @@ def create_web_app(
     app.state.strategy_alert_config = (
         loaded_strategy_alert_config
         if strategy_alerts_enabled(loaded_strategy_alert_config)
+        else None
+    )
+    loaded_system_operator_bot_config = load_system_operator_bot_config()
+    app.state.system_operator_bot_config = (
+        loaded_system_operator_bot_config
+        if system_operator_bot_enabled(loaded_system_operator_bot_config)
         else None
     )
     app.state.chat_requester = request_grounded_chat_answer
@@ -1018,6 +1057,7 @@ def create_web_app(
     app.state.reconcile_task = None
     app.state.deepcoin_reconcile_task = None
     app.state.telegram_bot_command_task = None
+    app.state.system_operator_bot_command_task = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client
     app.state.reconcile_once_runner = run_reconcile_once

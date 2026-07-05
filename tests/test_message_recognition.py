@@ -9,11 +9,13 @@ from telegram_kol_research.message_recognition import (
     _apply_lifecycle_event_decision,
     _chat_completions_url,
     _ensure_lifecycle_record,
+    _load_lifecycle_event_context,
     _result_from_ai_payload,
     _upsert_ai_signal_candidate,
     recognize_message_now,
 )
 from telegram_kol_research.models import (
+    ExecutionBinding,
     MediaAsset,
     MessageRecognition,
     RawMessage,
@@ -831,6 +833,65 @@ def test_recognize_message_now_cancels_recent_pending_limit_order(tmp_path):
     assert candidate.side == "short"
 
 
+def test_recognize_message_now_cancels_expired_order_with_live_binding(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="mia",
+            chat_id=88,
+            message_id=442,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            status="open",
+            order_id="order-442",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=442,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="expired",
+            exit_reason="expired",
+            signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
+            exited_at=datetime(2026, 7, 2, 21, 14, tzinfo=UTC),
+            entry_range_low=62900,
+            entry_range_high=63200,
+            stop_loss=64200,
+            take_profit="61000",
+            execution_binding_id=binding.id,
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=443,
+            posted_at=datetime(2026, 7, 3, 1, 0, tzinfo=UTC),
+            text="BTC \u53d6\u6d88\u9650\u4ef7\u6302\u5355\uff0c\u7b49\u540e\u7eed\u901a\u77e5",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "cancelled"
+    assert lifecycle.exit_signal_message_id == 443
+    assert candidate.event_type == "close_signal"
+    assert candidate.parse_source == "cancel_heuristic"
+
+
 def test_recognize_message_now_invalidates_pending_entry_from_later_context(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
@@ -1136,6 +1197,123 @@ def test_ai_lifecycle_event_treats_breakeven_exit_as_position_exit(tmp_path, mon
     assert lifecycle.exit_signal_message_id == 9030
     assert candidate.event_type == "close_signal"
     assert candidate.parse_source == "lifecycle_ai"
+
+
+def test_ai_lifecycle_event_exits_expired_strategy_when_live_binding_exists(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="mia",
+            chat_id=88,
+            message_id=442,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            status="active",
+            pos_id="pos-442",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=442,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="expired",
+            exit_reason="expired",
+            signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
+            exited_at=datetime(2026, 7, 2, 21, 14, tzinfo=UTC),
+            entry_range_low=62900,
+            entry_range_high=63200,
+            entry_price_actual=63100,
+            stop_loss=64200,
+            take_profit="61000",
+            execution_binding_id=binding.id,
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=443,
+            posted_at=datetime(2026, 7, 3, 1, 0, tzinfo=UTC),
+            text="BTC \u4fdd\u672c\u51fa\u5c40",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, raw_message_id)
+        applied = _apply_lifecycle_event_decision(
+            session,
+            raw_message,
+            {
+                "event_type": "exit_position",
+                "target_lifecycle_id": lifecycle_id,
+                "symbol": "BTC",
+                "side": "short",
+                "exit_price": None,
+                "confidence": 0.9,
+                "reason": "KOL 要求保本出局",
+            },
+        )
+        session.commit()
+
+    assert applied
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "kol_signal"
+    assert lifecycle.exit_signal_message_id == 443
+    assert candidate.event_type == "close_signal"
+
+
+def test_lifecycle_event_context_includes_expired_strategy_with_live_binding(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="mia",
+            chat_id=88,
+            message_id=442,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            status="active",
+            pos_id="pos-442",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=442,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="expired",
+            exit_reason="expired",
+            signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
+            exited_at=datetime(2026, 7, 2, 21, 14, tzinfo=UTC),
+            entry_range_low=62900,
+            entry_range_high=63200,
+            execution_binding_id=binding.id,
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=443,
+            posted_at=datetime(2026, 7, 3, 1, 0, tzinfo=UTC),
+            text="BTC \u4fdd\u672c\u51fa\u5c40",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, raw_message_id)
+        context = _load_lifecycle_event_context(session, raw_message)
+
+    assert [item["lifecycle_id"] for item in context["active_strategies"]] == [lifecycle_id]
+    assert context["active_strategies"][0]["status"] == "expired"
 
 
 def test_ai_lifecycle_event_records_partial_take_profit_update(tmp_path, monkeypatch):

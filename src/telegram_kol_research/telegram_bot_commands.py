@@ -12,12 +12,19 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.strategy_alerts import StrategyAlertConfig
+from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.web_queries import list_holding_strategies, list_pending_strategies
+from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle, utc_now
+from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
+from telegram_kol_research.trade_signals import enqueue_trade_signal
 
 
 POSITIONS_COMMAND = "positions"
 PENDING_COMMAND = "pending"
 MAX_TELEGRAM_MESSAGE_CHARS = 3900
+EXPIRY_CONTINUE_COMMAND = "expiry_continue"
+EXPIRY_EXPIRE_CANCEL_COMMAND = "expiry_expire_cancel"
+EXPIRY_EXPIRE_KEEP_COMMAND = "expiry_expire_keep"
 
 
 async def run_telegram_bot_command_loop(
@@ -70,6 +77,159 @@ async def run_telegram_bot_command_loop(
                         ),
                     )
             await asyncio.sleep(poll_interval_seconds)
+
+
+async def run_system_operator_bot_command_loop(
+    *,
+    config: SystemOperatorBotConfig,
+    session_factory: sessionmaker,
+    deepcoin_client_factory=None,
+    poll_interval_seconds: float = 1.0,
+) -> None:
+    """Handle commands sent to the dedicated system-operator bot."""
+
+    base_url = f"https://api.telegram.org/bot{config.bot_token}"
+    chat_id = str(config.chat_id)
+    async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
+        await _delete_webhook(client, base_url)
+        offset = await _latest_update_offset(client, base_url)
+        while True:
+            updates = await _get_updates(client, base_url, offset=offset)
+            for update in updates:
+                update_id = int(update.get("update_id") or 0)
+                offset = max(offset, update_id + 1)
+                message = update.get("message") or {}
+                if not _message_is_from_alert_chat(message, chat_id):
+                    continue
+                text = str(message.get("text") or "").strip()
+                deepcoin_client = deepcoin_client_factory() if deepcoin_client_factory else None
+                response_text = process_system_operator_command(
+                    session_factory,
+                    text,
+                    deepcoin_client=deepcoin_client,
+                )
+                if response_text:
+                    await _send_message(client, base_url, chat_id=chat_id, text=response_text)
+            await asyncio.sleep(poll_interval_seconds)
+
+
+def process_system_operator_command(
+    session_factory: sessionmaker,
+    text: str,
+    *,
+    now: datetime | None = None,
+    deepcoin_client=None,
+) -> str | None:
+    command = _command_name(text)
+    if command not in {
+        EXPIRY_CONTINUE_COMMAND,
+        EXPIRY_EXPIRE_CANCEL_COMMAND,
+        EXPIRY_EXPIRE_KEEP_COMMAND,
+    }:
+        return None
+    parts = text.split()
+    if len(parts) < 2:
+        return "请在命令后提供 lifecycle id，例如 /expiry_continue 442"
+    try:
+        lifecycle_id = int(parts[1])
+    except ValueError:
+        return "lifecycle id 必须是数字。"
+
+    event_at = now or utc_now()
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        if lifecycle is None:
+            return f"未找到策略 #{lifecycle_id}。"
+
+        if command == EXPIRY_CONTINUE_COMMAND:
+            lifecycle.lifecycle_status = "pending_entry"
+            lifecycle.exit_reason = None
+            lifecycle.exited_at = None
+            lifecycle.management_action = "expiry_review_continued"
+            lifecycle.management_note = "人工确认继续等待，暂不标记过期。"
+            lifecycle.last_checked_at = event_at
+            lifecycle.updated_at = event_at
+            session.commit()
+            return f"策略 #{lifecycle_id} 已继续等待。"
+
+        if command == EXPIRY_EXPIRE_KEEP_COMMAND:
+            lifecycle.lifecycle_status = "expired"
+            lifecycle.exit_reason = "expired"
+            lifecycle.exited_at = event_at
+            lifecycle.management_action = "expiry_expired_keep_order"
+            lifecycle.management_note = "人工确认标记过期，但保留交易所挂单。"
+            lifecycle.updated_at = event_at
+            session.commit()
+            return f"策略 #{lifecycle_id} 已标记过期，交易所挂单保留。"
+
+        live_binding = _load_live_binding(session, lifecycle)
+        if live_binding is not None and deepcoin_client is not None:
+            trade_signal = enqueue_trade_signal(
+                session_factory,
+                venue="deepcoin",
+                source_type="system_operator",
+                kol_id=live_binding.kol_id,
+                chat_id=live_binding.chat_id,
+                message_id=live_binding.message_id,
+                symbol=live_binding.symbol,
+                side=live_binding.side,
+                action="cancel_entry",
+                payload={"binding_id": live_binding.id, "lifecycle_id": lifecycle.id},
+                strategy_instance_id=live_binding.strategy_instance_id,
+                enqueued_at=event_at,
+            )
+            execute_deepcoin_management_signal(
+                session_factory,
+                trade_signal=trade_signal,
+                deepcoin_client=deepcoin_client,
+                executed_at=event_at,
+            )
+            lifecycle.lifecycle_status = "expired"
+            lifecycle.exit_reason = "expired"
+            lifecycle.exited_at = event_at
+            lifecycle.management_action = "expiry_cancelled_and_expired"
+            lifecycle.management_note = "人工确认过期，交易所挂单已撤销。"
+            lifecycle.updated_at = event_at
+            session.commit()
+            return f"策略 #{lifecycle_id} 已撤销交易所挂单并标记过期。"
+
+        if live_binding is not None:
+            lifecycle.management_action = "expiry_cancel_requested"
+            lifecycle.management_note = "人工确认标记过期并撤销挂单；等待交易所撤单执行。"
+            lifecycle.last_checked_at = event_at
+            lifecycle.updated_at = event_at
+            session.commit()
+            return f"策略 #{lifecycle_id} 已请求撤销交易所挂单，撤单完成前不会标记过期。"
+
+        lifecycle.lifecycle_status = "expired"
+        lifecycle.exit_reason = "expired"
+        lifecycle.exited_at = event_at
+        lifecycle.management_action = "expiry_expired_cancel_no_live_order"
+        lifecycle.management_note = "人工确认标记过期并撤单；未发现本地 live 绑定。"
+        lifecycle.updated_at = event_at
+        session.commit()
+        return f"策略 #{lifecycle_id} 未发现本地 live 挂单，已标记过期。"
+
+
+def _lifecycle_has_live_binding(session, lifecycle: StrategyLifecycle) -> bool:
+    return _load_live_binding(session, lifecycle) is not None
+
+
+def _load_live_binding(session, lifecycle: StrategyLifecycle) -> ExecutionBinding | None:
+    if lifecycle.execution_binding_id is not None:
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        if binding is not None and binding.status in {"open", "active"}:
+            return binding
+    return (
+        session.query(ExecutionBinding)
+        .filter(ExecutionBinding.venue == "deepcoin")
+        .filter(ExecutionBinding.chat_id == lifecycle.chat_id)
+        .filter(ExecutionBinding.message_id == lifecycle.message_id)
+        .filter(ExecutionBinding.symbol == lifecycle.symbol.upper())
+        .filter(ExecutionBinding.side == lifecycle.side.lower())
+        .filter(ExecutionBinding.status.in_(["open", "active"]))
+        .first()
+    )
 
 
 def format_holding_positions_message(

@@ -18,7 +18,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 from sqlalchemy import and_, or_
@@ -35,6 +35,8 @@ from telegram_kol_research.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+ExpiryReviewNotifier = Callable[[dict[str, Any]], Awaitable[None]]
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -262,6 +264,7 @@ class LifecycleMonitor:
         base_url: str = "https://api.gateio.ws",
         settle: str = "usdt",
         now_provider=None,
+        expiry_review_notifier: ExpiryReviewNotifier | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._broker = broker
@@ -271,6 +274,7 @@ class LifecycleMonitor:
         self._base_url = base_url
         self._settle = settle
         self._now = now_provider or (lambda: datetime.now(UTC))
+        self._expiry_review_notifier = expiry_review_notifier
 
     # ── public API ────────────────────────────────────────────────
 
@@ -540,12 +544,11 @@ class LifecycleMonitor:
 
     async def _run_one_cycle(self) -> list[StateTransition]:
         now = self._now()
-        pending_expiry_transitions = self._build_pending_expiry_transitions(now)
+        await self._request_pending_expiry_reviews(now)
 
         all_signals = self._load_active_signals()
         if not all_signals:
-            self._apply_transitions(pending_expiry_transitions)
-            return pending_expiry_transitions
+            return []
 
         by_contract: dict[str, list[StrategyLifecycle]] = {}
         for sig in all_signals:
@@ -558,7 +561,7 @@ class LifecycleMonitor:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        all_transitions: list[StateTransition] = list(pending_expiry_transitions)
+        all_transitions: list[StateTransition] = []
         for result in results:
             if isinstance(result, Exception):
                 logger.exception("Contract scan failed: %s", result)
@@ -581,7 +584,10 @@ class LifecycleMonitor:
                         StrategyLifecycle.lifecycle_status == "entered",
                         and_(
                             StrategyLifecycle.lifecycle_status == "pending_entry",
-                            StrategyLifecycle.signal_at >= pending_cutoff,
+                            or_(
+                                StrategyLifecycle.signal_at >= pending_cutoff,
+                                StrategyLifecycle.management_action == "expiry_review_continued",
+                            ),
                         ),
                     ),
                     StrategyLifecycle.signal_at >= cutoff,
@@ -593,26 +599,66 @@ class LifecycleMonitor:
             self._attach_entry_texts(session, signals)
             return signals
 
-    def _build_pending_expiry_transitions(self, now: datetime) -> list[StateTransition]:
+    async def _request_pending_expiry_reviews(self, now: datetime) -> None:
+        review_payloads: list[dict[str, Any]] = []
         with self._session_factory() as session:
             rows = (
                 session.query(StrategyLifecycle)
                 .filter(StrategyLifecycle.lifecycle_status == "pending_entry")
-                .all()
-            )
-        transitions: list[StateTransition] = []
-        for row in rows:
-            if self._is_expired(row, now):
-                transitions.append(
-                    StateTransition(
-                        signal_id=row.id,
-                        from_status="pending_entry",
-                        to_status="expired",
-                        exit_reason="expired",
-                        occurred_at=self._expiry_at(row),
+                .filter(
+                    or_(
+                        StrategyLifecycle.management_action.is_(None),
+                        ~StrategyLifecycle.management_action.in_(
+                            [
+                                "expiry_review_requested",
+                                "expiry_review_continued",
+                                "expiry_cancel_requested",
+                            ]
+                        ),
                     )
                 )
-        return transitions
+                .all()
+            )
+            for row in rows:
+                if not self._is_expired(row, now):
+                    continue
+                expiry_at = self._expiry_at(row)
+                row.management_action = "expiry_review_requested"
+                row.management_note = (
+                    f"待入场策略已超过 {self._config.max_age_hours} 小时，"
+                    "需要人工确认继续等待、标记过期或撤销交易所挂单。"
+                )
+                row.last_checked_at = now
+                row.updated_at = now
+                review_payloads.append(
+                    {
+                        "lifecycle_id": row.id,
+                        "chat_id": row.chat_id,
+                        "message_id": row.message_id,
+                        "symbol": row.symbol,
+                        "side": row.side,
+                        "signal_at": row.signal_at,
+                        "expiry_at": expiry_at,
+                        "max_age_hours": self._config.max_age_hours,
+                        "entry_range_low": row.entry_range_low,
+                        "entry_range_high": row.entry_range_high,
+                        "stop_loss": row.stop_loss,
+                        "take_profit": row.take_profit,
+                    }
+                )
+            if review_payloads:
+                session.commit()
+
+        if self._expiry_review_notifier is None:
+            return
+        for payload in review_payloads:
+            try:
+                await self._expiry_review_notifier(payload)
+            except Exception:
+                logger.exception(
+                    "Pending-entry expiry review notifier failed lifecycle_id=%s",
+                    payload.get("lifecycle_id"),
+                )
 
     @staticmethod
     def _attach_management_event_times(session, signals: list[StrategyLifecycle]) -> None:
@@ -1035,6 +1081,8 @@ class LifecycleMonitor:
     # ── expiry ─────────────────────────────────────────────────────
 
     def _is_expired(self, sig: StrategyLifecycle, now: datetime) -> bool:
+        if getattr(sig, "management_action", None) == "expiry_review_continued":
+            return False
         expiry_at = self._expiry_at(sig)
         return not _before(now, expiry_at)
 
