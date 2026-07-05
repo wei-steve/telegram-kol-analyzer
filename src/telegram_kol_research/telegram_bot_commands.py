@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import defaultdict
 from datetime import datetime
 from typing import Any
@@ -25,6 +26,7 @@ MAX_TELEGRAM_MESSAGE_CHARS = 3900
 EXPIRY_CONTINUE_COMMAND = "expiry_continue"
 EXPIRY_EXPIRE_CANCEL_COMMAND = "expiry_expire_cancel"
 EXPIRY_EXPIRE_KEEP_COMMAND = "expiry_expire_keep"
+logger = logging.getLogger(__name__)
 
 
 async def run_telegram_bot_command_loop(
@@ -98,38 +100,51 @@ async def run_system_operator_bot_command_loop(
             for update in updates:
                 update_id = int(update.get("update_id") or 0)
                 offset = max(offset, update_id + 1)
-                deepcoin_client = deepcoin_client_factory() if deepcoin_client_factory else None
-                callback = update.get("callback_query") or {}
-                if callback:
-                    message = callback.get("message") or {}
+                try:
+                    callback = update.get("callback_query") or {}
+                    if callback:
+                        message = callback.get("message") or {}
+                        if not _message_is_from_alert_chat(message, chat_id):
+                            continue
+                        callback_data = str(callback.get("data") or "")
+                        deepcoin_client = (
+                            deepcoin_client_factory()
+                            if deepcoin_client_factory and callback_data.startswith("expiry_expire_cancel:")
+                            else None
+                        )
+                        response_text = process_system_operator_callback_data(
+                            session_factory,
+                            callback_data,
+                            deepcoin_client=deepcoin_client,
+                        )
+                        await _answer_callback_query(
+                            client,
+                            base_url,
+                            callback_query_id=str(callback.get("id") or ""),
+                            text=response_text or "未识别的操作",
+                        )
+                        if response_text:
+                            await _send_message(client, base_url, chat_id=chat_id, text=response_text)
+                        continue
+
+                    message = update.get("message") or {}
                     if not _message_is_from_alert_chat(message, chat_id):
                         continue
-                    response_text = process_system_operator_callback_data(
-                        session_factory,
-                        str(callback.get("data") or ""),
-                        deepcoin_client=deepcoin_client,
+                    text = str(message.get("text") or "").strip()
+                    deepcoin_client = (
+                        deepcoin_client_factory()
+                        if deepcoin_client_factory and _command_name(text) == EXPIRY_EXPIRE_CANCEL_COMMAND
+                        else None
                     )
-                    await _answer_callback_query(
-                        client,
-                        base_url,
-                        callback_query_id=str(callback.get("id") or ""),
-                        text=response_text or "未识别的操作",
+                    response_text = process_system_operator_command(
+                        session_factory,
+                        text,
+                        deepcoin_client=deepcoin_client,
                     )
                     if response_text:
                         await _send_message(client, base_url, chat_id=chat_id, text=response_text)
-                    continue
-
-                message = update.get("message") or {}
-                if not _message_is_from_alert_chat(message, chat_id):
-                    continue
-                text = str(message.get("text") or "").strip()
-                response_text = process_system_operator_command(
-                    session_factory,
-                    text,
-                    deepcoin_client=deepcoin_client,
-                )
-                if response_text:
-                    await _send_message(client, base_url, chat_id=chat_id, text=response_text)
+                except Exception:
+                    logger.exception("System operator bot failed to process update_id=%s", update_id)
             await asyncio.sleep(poll_interval_seconds)
 
 
