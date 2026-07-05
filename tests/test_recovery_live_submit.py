@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, RawMessage, SignalCandidate
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, RawMessage, SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle, TradeSignal
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
@@ -473,6 +473,7 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
+        legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.leg_index.asc()).all()
         lifecycle = session.query(StrategyLifecycle).one()
     assert binding.status == "open"
     assert binding.order_id == "trigger-1,trigger-2"
@@ -486,6 +487,12 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     assert events[0].execution_binding_id == binding.id
     assert events[0].trade_signal_id == result["signal_id"]
     assert events[0].order_id == "trigger-1"
+    assert [(leg.leg_index, leg.order_id, leg.client_order_id, leg.status) for leg in legs] == [
+        (1, "trigger-1", "TK649760E806ACF61", "open"),
+        (2, "trigger-2", "TK729D11F4739D2A2", "open"),
+    ]
+    assert {leg.execution_binding_id for leg in legs} == {binding.id}
+    assert {leg.strategy_instance_id for leg in legs} == {"deepcoin:100:55:BTC:long"}
 
 
 def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):

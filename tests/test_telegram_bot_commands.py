@@ -1,6 +1,10 @@
 from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.execution_bindings import (
+    ExecutionBindingRecord,
+    upsert_execution_binding,
+)
 from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig
 from telegram_kol_research.models import RawMessage, SignalCandidate, StrategyLifecycle
 from telegram_kol_research.telegram_bot_commands import (
@@ -12,6 +16,19 @@ from telegram_kol_research.telegram_bot_commands import (
 
 def test_format_holding_positions_message_lists_groups_and_positions(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="alice",
+            chat_id=100,
+            message_id=7,
+            symbol="BTC",
+            side="long",
+            order_id="order-1",
+            pos_id="pos-1",
+            status="active",
+        ),
+    )
     with session_factory() as session:
         raw_message = RawMessage(
             chat_id=100,
@@ -42,6 +59,7 @@ def test_format_holding_positions_message_lists_groups_and_positions(tmp_path):
                 symbol="BTC",
                 side="long",
                 lifecycle_status="entered",
+                execution_binding_id=binding_id,
                 signal_at=raw_message.posted_at,
                 entered_at=datetime(2026, 6, 20, 8, 5, tzinfo=UTC),
                 entry_range_low=68000,

@@ -189,6 +189,38 @@ def test_database_bootstrap_creates_execution_events_table(tmp_path):
     assert "ix_execution_events_order" in indexes
 
 
+def test_database_bootstrap_creates_execution_order_legs_table(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(execution_order_legs)").fetchall()
+    }
+    indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(execution_order_legs)").fetchall()
+    }
+    conn.close()
+
+    assert {
+        "execution_binding_id",
+        "strategy_instance_id",
+        "leg_index",
+        "purpose",
+        "order_kind",
+        "order_id",
+        "client_order_id",
+        "pos_id",
+        "status",
+        "request_json",
+        "response_json",
+    }.issubset(columns)
+    assert "ix_execution_order_legs_binding" in indexes
+    assert "ix_execution_order_legs_pos" in indexes
+
+
 def test_database_bootstrap_enables_sqlite_busy_timeout(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
 

@@ -392,6 +392,7 @@ def _auto_process_management_signal(
     binding = _load_active_execution_binding(
         session_factory,
         chat_id=raw_message.chat_id,
+        kol_id=str(runtime_config["kol_id"]),
         symbol=symbol,
         side=side,
     )
@@ -668,21 +669,32 @@ def _load_active_execution_binding(
     session_factory: sessionmaker,
     *,
     chat_id: int,
+    kol_id: str | None = None,
     symbol: str,
     side: str,
 ) -> ExecutionBinding | None:
     with session_factory() as session:
-        rows = (
+        base_query = (
             session.query(ExecutionBinding)
             .filter(ExecutionBinding.venue == "deepcoin")
             .filter(ExecutionBinding.chat_id == chat_id)
             .filter(ExecutionBinding.symbol == symbol.upper())
             .filter(ExecutionBinding.side == side.lower())
             .filter(ExecutionBinding.status.in_(["open", "active"]))
-            .order_by(ExecutionBinding.id.desc())
-            .limit(2)
-            .all()
         )
+        if kol_id:
+            rows = (
+                base_query.filter(ExecutionBinding.kol_id == kol_id)
+                .order_by(ExecutionBinding.id.desc())
+                .limit(2)
+                .all()
+            )
+            if len(rows) == 1:
+                session.expunge(rows[0])
+                return rows[0]
+            if len(rows) > 1:
+                return None
+        rows = base_query.order_by(ExecutionBinding.id.desc()).limit(2).all()
         if len(rows) != 1:
             return None
         session.expunge(rows[0])

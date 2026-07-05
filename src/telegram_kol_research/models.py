@@ -248,6 +248,40 @@ class ExecutionBinding(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class ExecutionOrderLeg(Base):
+    __tablename__ = "execution_order_legs"
+    __table_args__ = (
+        UniqueConstraint(
+            "execution_binding_id",
+            "purpose",
+            "leg_index",
+            name="uq_execution_order_legs_binding_purpose_leg",
+        ),
+        Index("ix_execution_order_legs_binding", "execution_binding_id"),
+        Index("ix_execution_order_legs_strategy", "strategy_instance_id"),
+        Index("ix_execution_order_legs_order", "order_id"),
+        Index("ix_execution_order_legs_client_order", "client_order_id"),
+        Index("ix_execution_order_legs_pos", "pos_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    strategy_instance_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    leg_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    purpose: Mapped[str] = mapped_column(String(64), nullable=False, default="entry")
+    order_kind: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
+    order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    client_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    pos_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="submitted", index=True)
+    request_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class ExecutionEvent(Base):
     __tablename__ = "execution_events"
     __table_args__ = (

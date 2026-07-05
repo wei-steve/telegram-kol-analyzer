@@ -7,7 +7,10 @@ from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionAc
 from telegram_kol_research.deepcoin_execution_actions import adjust_position_tpsl
 from telegram_kol_research.deepcoin_execution_actions import recover_missing_position_protections
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
+from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
+from telegram_kol_research.execution_bindings import list_execution_order_legs
 from telegram_kol_research.execution_bindings import upsert_execution_binding
+from telegram_kol_research.execution_bindings import upsert_execution_order_leg
 from telegram_kol_research.execution_events import list_execution_events
 from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
@@ -421,6 +424,97 @@ def test_process_trade_signal_live_closes_all_bound_position_ids(tmp_path):
         assert binding.status == "closed"
 
 
+def test_process_trade_signal_live_closes_only_requested_bound_position_id(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    binding_id = _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        status="active",
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:ETH:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            order_id="entry-1",
+            client_order_id="client-1",
+            pos_id="pos-1",
+            status="active",
+        ),
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:ETH:long",
+            leg_index=2,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="entry-2",
+            client_order_id="client-2",
+            pos_id="pos-2",
+            status="active",
+        ),
+    )
+    trade_signal = _signal(
+        session_factory,
+        action="close_position",
+        payload={"binding_id": binding_id, "pos_id": "pos-2", "fraction": 0.5},
+    )
+    client = _FakeDeepcoinClient()
+    client.positions = [
+        {
+            "posId": "pos-1",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.1",
+            "cTime": "1000",
+        },
+        {
+            "posId": "pos-2",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.2",
+            "cTime": "1001",
+        },
+    ]
+
+    result = process_trade_signal_live(
+        session_factory,
+        signal_id=trade_signal.id,
+        deepcoin_client=client,
+    )
+
+    assert client.order_payloads == [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "tdMode": "cross",
+            "side": "sell",
+            "posSide": "long",
+            "ordType": "market",
+            "sz": "0.1",
+            "mrgPosition": "split",
+            "closePosId": "pos-2",
+        }
+    ]
+    assert result["pos_id"] == "pos-2"
+    assert result["close_size"] == 0.1
+    assert result["full_close"] is False
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        assert binding.status == "active"
+        assert binding.last_exchange_status == "partial_close_submitted"
+    legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
+    assert [(leg.leg_index, leg.pos_id, leg.status) for leg in legs] == [
+        (1, "pos-1", "active"),
+        (2, "pos-2", "partial_closed"),
+    ]
+
+
 def test_process_trade_signal_live_cancels_bound_trigger_entry(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
@@ -463,6 +557,32 @@ def test_process_trade_signal_live_cancels_all_bound_trigger_entry_legs(tmp_path
         pos_id=None,
         status="open",
     )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:ETH:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="trigger-1",
+            client_order_id="client-1",
+            status="open",
+        ),
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:ETH:long",
+            leg_index=2,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="trigger-2",
+            client_order_id="client-2",
+            status="open",
+        ),
+    )
     trade_signal = _signal(
         session_factory,
         action="cancel_entry",
@@ -502,16 +622,39 @@ def test_process_trade_signal_live_cancels_all_bound_trigger_entry_legs(tmp_path
     assert len(result["cancelled_orders"]) == 2
     events = list_execution_events(session_factory, execution_binding_id=binding_id)
     assert [event.order_id for event in events] == ["trigger-2", "trigger-1"]
+    legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
+    assert [(leg.leg_index, leg.order_id, leg.status) for leg in legs] == [
+        (1, "trigger-1", "cancelled"),
+        (2, "trigger-2", "cancelled"),
+    ]
 
 
 def test_process_trade_signal_live_recreates_trigger_entry_to_adjust_tpsl(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
     binding_id = _binding(session_factory, order_id="trigger-old", pos_id=None, status="open")
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:ETH:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="trigger-old",
+            client_order_id="client-old",
+            status="open",
+        ),
+    )
     trade_signal = _signal(
         session_factory,
         action="adjust_trigger_entry_tpsl",
-        payload={"binding_id": binding_id, "take_profit": 1615.12, "stop_loss": 1577.04},
+        payload={
+            "binding_id": binding_id,
+            "client_order_id": "client-new",
+            "take_profit": 1615.12,
+            "stop_loss": 1577.04,
+        },
     )
     client = _FakeDeepcoinClient()
     client.trigger_pending = [
@@ -545,3 +688,7 @@ def test_process_trade_signal_live_recreates_trigger_entry_to_adjust_tpsl(tmp_pa
         binding = session.get(ExecutionBinding, binding_id)
         assert binding.order_id == "trigger-new"
         assert binding.last_exchange_status == "trigger_entry_recreated"
+    legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
+    assert [(leg.leg_index, leg.order_id, leg.client_order_id, leg.status) for leg in legs] == [
+        (1, "trigger-new", "client-new", "open")
+    ]

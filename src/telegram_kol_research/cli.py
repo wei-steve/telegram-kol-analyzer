@@ -19,6 +19,9 @@ from telegram_kol_research.message_recognition import (
 from telegram_kol_research.dataset_export import export_dataset_jsonl
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import load_deepcoin_contract_specs
+from telegram_kol_research.execution_bindings import (
+    repair_execution_order_legs_from_binding_payloads,
+)
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
 from telegram_kol_research.live_updates import LiveUpdateBroker
@@ -444,6 +447,17 @@ def recovery_dry_run(
         return
     for action, count in sorted(result.action_counts.items()):
         typer.echo(f"{action}: {count}")
+
+
+@app.command("repair-execution-order-legs")
+def repair_execution_order_legs(
+    database_path: Path = Path("data/research.db"),
+) -> None:
+    """Backfill per-order Deepcoin execution leg rows from legacy bindings."""
+
+    session_factory = create_session_factory(database_path)
+    repaired = repair_execution_order_legs_from_binding_payloads(session_factory)
+    typer.echo(f"Repaired {repaired} execution order leg(s) in {database_path}")
 
 
 def _build_recovery_market_provider(market_provider: str):

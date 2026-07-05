@@ -27,6 +27,20 @@ Every Deepcoin order created for a KOL signal must keep the local binding:
 - `pos_id`: Deepcoin position id once available
 - `margin_mode` and `position_mode`
 
+`execution_bindings` stores the strategy-level attribution. `execution_order_legs`
+stores each Deepcoin order leg separately, keyed by `execution_binding_id`,
+`purpose`, and `leg_index`. Each leg records `order_kind`, `ordId`, `clOrdId`,
+`posId`, status, and compact request/response JSON. This is the source of truth
+for later actions like partial close, temporary exit, trigger-entry cancel, and
+trigger-entry TP/SL recreation when one KOL signal created multiple Deepcoin
+orders.
+
+Legacy bindings can be backfilled with:
+
+```bash
+telegram-kol-research repair-execution-order-legs --database-path data/research.db
+```
+
 Limit / trigger entries are asynchronous. The initial order response may only
 confirm the pending order or trigger order, while the eventual filled entry can
 appear later as a different Deepcoin order id. The web service therefore runs a

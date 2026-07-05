@@ -1,6 +1,8 @@
 ﻿from datetime import UTC, datetime
 
+from telegram_kol_research.auto_trade_execution import _load_active_execution_binding
 from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
+from telegram_kol_research.execution_bindings import ExecutionBindingRecord, upsert_execution_binding
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
@@ -82,6 +84,46 @@ class _FakeDeepcoinClient:
         if inst_id == "ETH-USDT-SWAP":
             return 1585.0
         return 68100.0
+
+
+def test_load_active_execution_binding_uses_kol_id_to_disambiguate(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="group:100#alice",
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="long",
+            pos_id="pos-alice",
+            status="active",
+        ),
+    )
+    second_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="group:100#bob",
+            chat_id=100,
+            message_id=56,
+            symbol="BTC",
+            side="long",
+            pos_id="pos-bob",
+            status="active",
+        ),
+    )
+
+    selected = _load_active_execution_binding(
+        session_factory,
+        chat_id=100,
+        kol_id="group:100#bob",
+        symbol="BTC",
+        side="long",
+    )
+
+    assert selected is not None
+    assert selected.id == second_id
+    assert selected.id != first_id
 
 
 def _persist_candidate(

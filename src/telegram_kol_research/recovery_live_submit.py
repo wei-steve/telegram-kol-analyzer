@@ -13,7 +13,9 @@ from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
+from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
 from telegram_kol_research.execution_bindings import upsert_execution_binding
+from telegram_kol_research.execution_bindings import upsert_execution_order_leg
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.models import StrategyLifecycle
@@ -364,6 +366,12 @@ def _submit_recovery_signal_direct(
             strategy_instance_id=str(draft.get("strategy_instance_id") or ""),
         ),
     )
+    _record_submitted_order_legs(
+        session_factory,
+        binding_id=binding_id,
+        strategy_instance_id=str(draft.get("strategy_instance_id") or trade_signal.strategy_instance_id or ""),
+        submitted_orders=submitted_orders,
+    )
     _attach_lifecycle_binding(
         session_factory,
         chat_id=int(source.get("chat_id") or trade_signal.chat_id),
@@ -404,6 +412,34 @@ def _submit_recovery_signal_direct(
         "deepcoin_order_draft": draft,
         "warnings": warnings,
     }
+
+
+def _record_submitted_order_legs(
+    session_factory: sessionmaker,
+    *,
+    binding_id: int,
+    strategy_instance_id: str,
+    submitted_orders: list[dict[str, Any]],
+) -> None:
+    for order in submitted_orders:
+        execution_type = str(order.get("execution_type") or "unknown").lower()
+        pos_id = str(order.get("pos_id") or "") or None
+        upsert_execution_order_leg(
+            session_factory,
+            ExecutionOrderLegRecord(
+                execution_binding_id=binding_id,
+                strategy_instance_id=strategy_instance_id or None,
+                leg_index=int(order.get("leg_index") or 0),
+                purpose="entry",
+                order_kind=execution_type,
+                order_id=str(order.get("order_id") or "") or None,
+                client_order_id=str(order.get("client_order_id") or "") or None,
+                pos_id=pos_id,
+                status="active" if pos_id else "open",
+                request=order.get("request") if isinstance(order.get("request"), dict) else None,
+                response=order.get("response") if isinstance(order.get("response"), dict) else None,
+            ),
+        )
 
 
 def _upsert_protection_failed_binding(

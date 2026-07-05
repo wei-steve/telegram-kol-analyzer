@@ -6,15 +6,19 @@ import pytest
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
     ExecutionBindingRecord,
+    ExecutionOrderLegRecord,
     build_client_order_id,
     build_deepcoin_account_state,
     build_strategy_instance_id,
+    list_execution_order_legs,
     load_deepcoin_order_bindings,
     reconcile_deepcoin_execution_bindings,
+    repair_execution_order_legs_from_binding_payloads,
     sync_manual_closed_deepcoin_positions,
     upsert_execution_binding,
+    upsert_execution_order_leg,
 )
-from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
+from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg, StrategyLifecycle
 
 
 def _binding(**overrides):
@@ -80,6 +84,95 @@ def test_upsert_execution_binding_updates_existing_strategy_binding(tmp_path):
     assert stored.margin_mode == "cross"
     assert stored.position_mode == "split"
     assert stored.status == "active"
+
+
+def test_upsert_execution_order_leg_tracks_deepcoin_ids_per_leg(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(order_id="order-1,order-2", client_order_id="client-1,client-2"),
+    )
+
+    first_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:BTC:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            order_id="order-1",
+            client_order_id="client-1",
+            pos_id="pos-1",
+            status="active",
+            request={"instId": "BTC-USDT-SWAP", "sz": "5"},
+            response={"data": {"ordId": "order-1"}},
+        ),
+    )
+    second_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:BTC:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            order_id="order-1b",
+            client_order_id="client-1",
+            pos_id="pos-1",
+            status="active",
+        ),
+    )
+
+    assert first_id == second_id
+    legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
+    assert len(legs) == 1
+    assert legs[0].order_id == "order-1b"
+    assert legs[0].client_order_id == "client-1"
+    assert legs[0].pos_id == "pos-1"
+    with session_factory() as session:
+        stored = session.query(ExecutionOrderLeg).one()
+    assert stored.request_json == '{"instId":"BTC-USDT-SWAP","sz":"5"}'
+
+
+def test_repair_execution_order_legs_from_binding_payloads_backfills_legacy_rows(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            order_id="trigger-1,trigger-2",
+            client_order_id="client-1,client-2",
+            status="open",
+            payload={
+                "submitted_orders": [
+                    {
+                        "leg_index": 1,
+                        "execution_type": "trigger_limit",
+                        "order_id": "trigger-1",
+                        "client_order_id": "client-1",
+                        "request": {"instId": "BTC-USDT-SWAP", "sz": "5"},
+                        "response": {"data": {"ordId": "trigger-1"}},
+                    },
+                    {
+                        "leg_index": 2,
+                        "execution_type": "trigger_limit",
+                        "order_id": "trigger-2",
+                        "client_order_id": "client-2",
+                        "pos_id": "pos-2",
+                    },
+                ]
+            },
+        ),
+    )
+
+    repaired = repair_execution_order_legs_from_binding_payloads(session_factory)
+
+    assert repaired == 2
+    legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
+    assert [(leg.leg_index, leg.order_id, leg.client_order_id, leg.pos_id, leg.status) for leg in legs] == [
+        (1, "trigger-1", "client-1", None, "open"),
+        (2, "trigger-2", "client-2", "pos-2", "active"),
+    ]
 
 
 def test_load_deepcoin_order_bindings_returns_open_and_active_records(tmp_path):
@@ -551,6 +644,82 @@ def test_reconcile_uses_order_history_to_pick_position_when_symbol_side_ambiguou
     assert binding.status == "active"
     assert binding.pos_id == "pos-correct"
     assert binding.last_exchange_status == "position_active_recovered_from_filled_order"
+
+
+def test_reconcile_updates_matching_order_leg_with_recovered_position_id(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(order_id="order-filled", client_order_id="client-filled", status="open"),
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:BTC:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="order-filled",
+            client_order_id="client-filled",
+            status="open",
+        ),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="pending_entry",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-correct",
+                    "posSide": "long",
+                    "pos": "9",
+                    "avgPx": "68100",
+                    "cTime": "100000",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "ordId": "order-filled",
+                    "clOrdId": "client-filled",
+                    "state": "filled",
+                    "avgPx": "68100",
+                    "fillSz": "9",
+                    "fillTime": "100000",
+                }
+            ]
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 6, 30, 10, 0),
+    )
+
+    legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
+    assert [(leg.order_id, leg.client_order_id, leg.pos_id, leg.status) for leg in legs] == [
+        ("order-filled", "client-filled", "pos-correct", "active")
+    ]
 
 
 def test_reconcile_uses_trigger_history_to_pick_position_after_trigger_entry_fills(tmp_path):

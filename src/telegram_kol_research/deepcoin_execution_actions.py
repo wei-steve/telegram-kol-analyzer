@@ -17,7 +17,7 @@ from telegram_kol_research.deepcoin_order_matching import (
 )
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
-from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
+from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg, StrategyLifecycle
 from telegram_kol_research.trade_signals import TradeSignalRecord
 
 
@@ -326,10 +326,12 @@ def close_position_market(
     now = executed_at or datetime.now(UTC)
     binding = _load_binding_for_signal(session_factory, trade_signal)
     inst_id = _to_deepcoin_swap_instrument(binding.symbol)
+    requested_pos_ids = _requested_position_ids(trade_signal.payload)
     positions = _select_bound_positions(
         deepcoin_client.list_positions(inst_id=inst_id),
         binding=binding,
         inst_id=inst_id,
+        requested_pos_ids=requested_pos_ids,
     )
     submitted_orders: list[dict[str, Any]] = []
     full_close = True
@@ -394,6 +396,14 @@ def close_position_market(
         last_exchange_status="close_position_submitted" if full_close else "partial_close_submitted",
         updated_at=now,
     )
+    for submitted_order in submitted_orders:
+        _update_entry_leg_status(
+            session_factory,
+            binding.id,
+            status="closed" if submitted_order["full_close"] else "partial_closed",
+            updated_at=now,
+            pos_id=submitted_order["pos_id"],
+        )
     return {
         "submitted": True,
         "venue": "deepcoin",
@@ -489,6 +499,15 @@ def cancel_entry_order(
         last_exchange_status=event_action,
         updated_at=now,
     )
+    for cancelled_order in cancelled_orders:
+        _update_entry_leg_status(
+            session_factory,
+            binding.id,
+            status="cancelled",
+            updated_at=now,
+            order_id=cancelled_order.get("order_id"),
+            client_order_id=cancelled_order.get("client_order_id"),
+        )
     return {
         "submitted": True,
         "venue": "deepcoin",
@@ -577,6 +596,15 @@ def recreate_trigger_entry_tpsl(
         client_order_id=str(create_payload.get("clOrdId") or "") or binding.client_order_id,
         last_exchange_status="trigger_entry_recreated",
         updated_at=now,
+    )
+    _update_entry_leg_status(
+        session_factory,
+        binding.id,
+        status="open",
+        updated_at=now,
+        order_id=old_order_id,
+        new_order_id=new_order_id,
+        new_client_order_id=str(create_payload.get("clOrdId") or "") or None,
     )
     return {
         "submitted": True,
@@ -731,8 +759,13 @@ def _select_bound_positions(
     *,
     binding: _LoadedBinding,
     inst_id: str,
+    requested_pos_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     pos_ids = set(_split_ids(binding.pos_id))
+    if requested_pos_ids:
+        if not pos_ids.issuperset(requested_pos_ids):
+            raise DeepcoinExecutionActionError("requested_pos_id_not_bound")
+        pos_ids = requested_pos_ids
     matches: list[dict[str, Any]] = []
     for position in positions:
         if str(position.get("instId") or "").upper() != inst_id.upper():
@@ -942,6 +975,12 @@ def _split_ids(value: str | None) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
 
+def _requested_position_ids(payload: dict[str, Any]) -> set[str] | None:
+    raw = _first_payload_value(payload, "pos_id", "posId", "position_id", "close_pos_id", "closePosId")
+    ids = set(_split_ids(str(raw) if raw is not None else None))
+    return ids or None
+
+
 def _normalize_side(value: str) -> str:
     side = value.lower()
     if side == "buy":
@@ -1023,3 +1062,42 @@ def _update_binding_order(
             row.last_exchange_status = last_exchange_status
             row.updated_at = updated_at
             session.commit()
+
+
+def _update_entry_leg_status(
+    session_factory: sessionmaker,
+    binding_id: int,
+    *,
+    status: str,
+    updated_at: datetime,
+    order_id: str | None = None,
+    client_order_id: str | None = None,
+    pos_id: str | None = None,
+    new_order_id: str | None = None,
+    new_client_order_id: str | None = None,
+) -> None:
+    with session_factory() as session:
+        query = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == int(binding_id))
+            .filter(ExecutionOrderLeg.purpose == "entry")
+        )
+        if pos_id:
+            query = query.filter(ExecutionOrderLeg.pos_id == str(pos_id))
+        elif order_id or client_order_id:
+            matches = []
+            if order_id:
+                matches.append(ExecutionOrderLeg.order_id == str(order_id))
+            if client_order_id:
+                matches.append(ExecutionOrderLeg.client_order_id == str(client_order_id))
+            query = query.filter(matches[0] if len(matches) == 1 else matches[0] | matches[1])
+        else:
+            return
+        for leg in query.all():
+            leg.status = status
+            if new_order_id is not None:
+                leg.order_id = new_order_id
+            if new_client_order_id is not None:
+                leg.client_order_id = new_client_order_id
+            leg.updated_at = updated_at
+        session.commit()

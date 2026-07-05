@@ -111,6 +111,26 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
         "CREATE INDEX IF NOT EXISTS ix_execution_bindings_client_order "
         "ON execution_bindings (client_order_id)"
     ),
+    "ix_execution_order_legs_binding": (
+        "CREATE INDEX IF NOT EXISTS ix_execution_order_legs_binding "
+        "ON execution_order_legs (execution_binding_id)"
+    ),
+    "ix_execution_order_legs_strategy": (
+        "CREATE INDEX IF NOT EXISTS ix_execution_order_legs_strategy "
+        "ON execution_order_legs (strategy_instance_id)"
+    ),
+    "ix_execution_order_legs_order": (
+        "CREATE INDEX IF NOT EXISTS ix_execution_order_legs_order "
+        "ON execution_order_legs (order_id)"
+    ),
+    "ix_execution_order_legs_client_order": (
+        "CREATE INDEX IF NOT EXISTS ix_execution_order_legs_client_order "
+        "ON execution_order_legs (client_order_id)"
+    ),
+    "ix_execution_order_legs_pos": (
+        "CREATE INDEX IF NOT EXISTS ix_execution_order_legs_pos "
+        "ON execution_order_legs (pos_id)"
+    ),
     "ix_execution_events_strategy_created": (
         "CREATE INDEX IF NOT EXISTS ix_execution_events_strategy_created "
         "ON execution_events (strategy_instance_id, created_at)"

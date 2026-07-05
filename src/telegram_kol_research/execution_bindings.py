@@ -16,6 +16,7 @@ from telegram_kol_research.deepcoin_readonly import (
     DeepcoinReadOnlyClient,
 )
 from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import ExecutionOrderLeg
 
 PENDING_ENTRY_RECOVERY_WINDOW_HOURS = 6
 
@@ -37,6 +38,35 @@ class ExecutionBindingRecord:
     last_exchange_status: str | None = None
     status: str = "open"
     strategy_instance_id: str | None = None
+
+
+@dataclass(slots=True)
+class ExecutionOrderLegRecord:
+    execution_binding_id: int
+    leg_index: int
+    purpose: str = "entry"
+    order_kind: str = "unknown"
+    strategy_instance_id: str | None = None
+    order_id: str | None = None
+    client_order_id: str | None = None
+    pos_id: str | None = None
+    status: str = "submitted"
+    request: dict[str, Any] | None = None
+    response: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class ExecutionOrderLegSnapshot:
+    id: int
+    execution_binding_id: int
+    strategy_instance_id: str | None
+    leg_index: int
+    purpose: str
+    order_kind: str
+    order_id: str | None
+    client_order_id: str | None
+    pos_id: str | None
+    status: str
 
 
 @dataclass(slots=True)
@@ -368,6 +398,7 @@ def reconcile_deepcoin_execution_bindings(
                         result.stale += 1
             row.recovered_at = now
             row.updated_at = now
+            _refresh_order_legs_from_binding_row(session, row)
             result.updated += 1
         session.commit()
     return result
@@ -410,6 +441,32 @@ def _load_pending_trigger_orders(
             seen.add(identity)
             pending.append(order)
     return pending
+
+
+def _refresh_order_legs_from_binding_row(session, row: ExecutionBinding) -> None:
+    pos_ids = _split_ids(row.pos_id)
+    if len(pos_ids) != 1:
+        return
+    order_ids = set(_split_ids(row.order_id))
+    client_order_ids = set(_split_ids(row.client_order_id))
+    if not order_ids and not client_order_ids:
+        return
+    legs = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.execution_binding_id == row.id)
+        .filter(ExecutionOrderLeg.purpose == "entry")
+        .all()
+    )
+    for leg in legs:
+        leg_order_id = str(leg.order_id or "")
+        leg_client_order_id = str(leg.client_order_id or "")
+        if leg_order_id not in order_ids and leg_client_order_id not in client_order_ids:
+            continue
+        if leg.pos_id and leg.pos_id != pos_ids[0]:
+            continue
+        leg.pos_id = pos_ids[0]
+        leg.status = "active" if row.status == "active" else leg.status
+        leg.updated_at = row.updated_at
 
 
 def _cancel_missing_entry_lifecycle(session, row: ExecutionBinding, cancelled_at: datetime) -> None:
@@ -548,6 +605,125 @@ def bind_deepcoin_position_to_lifecycle(
             lifecycle.updated_at = now
             session.commit()
     return binding_id
+
+
+def upsert_execution_order_leg(
+    session_factory: sessionmaker,
+    record: ExecutionOrderLegRecord,
+) -> int:
+    """Create or update one per-leg Deepcoin id mapping."""
+
+    request_json = _compact_json(record.request)
+    response_json = _compact_json(record.response)
+    purpose = str(record.purpose or "entry").lower()
+    order_kind = str(record.order_kind or "unknown").lower()
+    now = datetime.now(UTC)
+
+    with session_factory() as session:
+        row = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == int(record.execution_binding_id))
+            .filter(ExecutionOrderLeg.purpose == purpose)
+            .filter(ExecutionOrderLeg.leg_index == int(record.leg_index))
+            .one_or_none()
+        )
+        if row is None:
+            row = ExecutionOrderLeg(
+                execution_binding_id=int(record.execution_binding_id),
+                purpose=purpose,
+                leg_index=int(record.leg_index),
+            )
+            session.add(row)
+            session.flush()
+
+        row.strategy_instance_id = record.strategy_instance_id
+        row.order_kind = order_kind
+        row.order_id = record.order_id
+        row.client_order_id = record.client_order_id
+        row.pos_id = record.pos_id
+        row.status = str(record.status or "submitted").lower()
+        if request_json is not None:
+            row.request_json = request_json
+        if response_json is not None:
+            row.response_json = response_json
+        row.updated_at = now
+        leg_id = int(row.id)
+        session.commit()
+    return leg_id
+
+
+def list_execution_order_legs(
+    session_factory: sessionmaker,
+    *,
+    execution_binding_id: int,
+) -> list[ExecutionOrderLegSnapshot]:
+    with session_factory() as session:
+        rows = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == int(execution_binding_id))
+            .order_by(ExecutionOrderLeg.purpose.asc(), ExecutionOrderLeg.leg_index.asc())
+            .all()
+        )
+        return [
+            ExecutionOrderLegSnapshot(
+                id=int(row.id),
+                execution_binding_id=int(row.execution_binding_id),
+                strategy_instance_id=row.strategy_instance_id,
+                leg_index=int(row.leg_index),
+                purpose=row.purpose,
+                order_kind=row.order_kind,
+                order_id=row.order_id,
+                client_order_id=row.client_order_id,
+                pos_id=row.pos_id,
+                status=row.status,
+            )
+            for row in rows
+        ]
+
+
+def repair_execution_order_legs_from_binding_payloads(
+    session_factory: sessionmaker,
+) -> int:
+    """Backfill per-leg rows from legacy binding submitted_orders payloads."""
+
+    repaired = 0
+    with session_factory() as session:
+        rows = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .filter(ExecutionBinding.payload_json.isnot(None))
+            .order_by(ExecutionBinding.id.asc())
+            .all()
+        )
+        snapshots: list[tuple[int, str | None, list[dict[str, Any]]]] = []
+        for row in rows:
+            submitted_orders = _submitted_orders_from_binding_payload(row)
+            if submitted_orders:
+                snapshots.append((int(row.id), row.strategy_instance_id, submitted_orders))
+
+    for binding_id, strategy_instance_id, submitted_orders in snapshots:
+        for index, order in enumerate(submitted_orders, start=1):
+            leg_index = int(order.get("leg_index") or index)
+            pos_id = _first_string(order, "pos_id", "posId", "position_id")
+            status = "active" if pos_id else "open"
+            upsert_execution_order_leg(
+                session_factory,
+                ExecutionOrderLegRecord(
+                    execution_binding_id=binding_id,
+                    strategy_instance_id=strategy_instance_id,
+                    leg_index=leg_index,
+                    purpose="entry",
+                    order_kind=str(order.get("execution_type") or order.get("order_kind") or "unknown"),
+                    order_id=_first_string(order, "order_id", "ordId", "orderId"),
+                    client_order_id=_first_string(order, "client_order_id", "clOrdId", "clientOrderId"),
+                    pos_id=pos_id,
+                    status=status,
+                    request=order.get("request") if isinstance(order.get("request"), dict) else None,
+                    response=order.get("response") if isinstance(order.get("response"), dict) else None,
+                ),
+            )
+            repaired += 1
+    return repaired
 
 
 def build_deepcoin_account_state(
@@ -734,6 +910,12 @@ def _normalize_position_mode(value: str | None) -> str:
     if text in {"net", "merged", "one_way", "合仓"}:
         return "net"
     return "split"
+
+
+def _compact_json(value: dict[str, Any] | None) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
 def _first_string(payload: dict[str, Any], *keys: str) -> str | None:

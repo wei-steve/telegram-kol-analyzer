@@ -64,6 +64,20 @@ The equivalent server-side command is:
 BRANCH=codex/deepcoin-auto-trading-v1 /usr/local/bin/telegram-kol-update
 ```
 
+After deploying the Deepcoin order-leg tracking update, run the one-time
+history repair on the server so legacy `execution_bindings.payload_json`
+submitted orders are copied into `execution_order_legs`:
+
+```bash
+cd /opt/telegram-kol-analyzer
+. .venv/bin/activate
+telegram-kol-research repair-execution-order-legs --database-path data/research.db
+systemctl restart telegram-kol.service
+```
+
+The repair is idempotent. Re-running it updates the same `(binding, purpose,
+leg_index)` rows instead of creating duplicates.
+
 ## Data And Secrets
 
 Do not commit runtime data or secrets to GitHub. Keep these on the server:
