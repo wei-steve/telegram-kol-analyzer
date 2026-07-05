@@ -4,6 +4,7 @@
 __pycache__/
 *.pyc
 .tmp/
+.outer_migration_backup/
 
 .venv/
 .venv313/
