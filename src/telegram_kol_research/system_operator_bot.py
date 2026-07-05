@@ -55,6 +55,7 @@ def format_pending_entry_expiry_review_message(payload: dict[str, Any]) -> str:
     side = payload.get("side") or "-"
     entry = _format_range(payload.get("entry_range_low"), payload.get("entry_range_high"))
     max_age_hours = payload.get("max_age_hours") or "-"
+    review_reason = payload.get("review_reason") or f"\u5f85\u5165\u573a\u5df2\u8d85\u8fc7 {max_age_hours} \u5c0f\u65f6"
     lines = [
         "\u3010\u5f85\u5165\u573a\u7b56\u7565\u8d85\u65f6\u590d\u6838\u3011",
         f"\u7fa4\u7ec4: {chat_title}",
@@ -64,11 +65,17 @@ def format_pending_entry_expiry_review_message(payload: dict[str, Any]) -> str:
         f"\u4ea4\u6613\u5bf9: {symbol} {side}",
         f"\u539f\u7b56\u7565\u65f6\u95f4: {_format_local_time(payload.get('signal_at'))}",
         f"\u8d85\u65f6\u65f6\u95f4: {_format_local_time(payload.get('expiry_at'))}",
+    ]
+    if payload.get("previous_review_at") is not None:
+        lines.append(
+            f"\u4e0a\u6b21\u4eba\u5de5\u7ee7\u7eed\u7b49\u5f85: {_format_local_time(payload.get('previous_review_at'))}"
+        )
+    lines.extend([
         f"\u5165\u573a\u533a\u95f4: {entry}",
         f"\u6b62\u635f: {_format_value(payload.get('stop_loss'))}",
         f"\u6b62\u76c8: {_format_value(payload.get('take_profit'))}",
-        f"\u539f\u56e0: \u5f85\u5165\u573a\u5df2\u8d85\u8fc7 {max_age_hours} \u5c0f\u65f6\uff0c\u8bf7\u786e\u8ba4\u5982\u4f55\u5904\u7406\u3002",
-    ]
+        f"\u539f\u56e0: {review_reason}\uff0c\u8bf7\u786e\u8ba4\u5982\u4f55\u5904\u7406\u3002",
+    ])
     return "\n".join(lines)
 
 

@@ -704,3 +704,53 @@ def test_lifecycle_monitor_continued_expiry_review_keeps_scanning_without_repeat
     assert review_requests == []
     assert transitions[0]["to"] == "entered"
     assert lifecycle.lifecycle_status == "entered"
+
+
+def test_lifecycle_monitor_continued_expiry_review_repeats_after_interval(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    last_review_at = datetime(2026, 6, 30, 6, 0, tzinfo=UTC)
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3889,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 30, 0, 0, tzinfo=UTC),
+            entry_range_low=60300,
+            entry_range_high=60800,
+            stop_loss=61300,
+            take_profit="59600",
+            management_action="expiry_review_continued",
+            last_checked_at=last_review_at,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    review_requests = []
+
+    async def fake_notifier(payload):
+        review_requests.append(payload)
+
+    monitor = LifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        config=LifecycleMonitorConfig(max_age_hours=6),
+        now_provider=lambda: datetime(2026, 6, 30, 12, 0, tzinfo=UTC),
+        expiry_review_notifier=fake_notifier,
+    )
+
+    transitions = asyncio.run(monitor.run_once())
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert transitions == []
+    assert lifecycle.lifecycle_status == "pending_entry"
+    assert lifecycle.management_action == "expiry_review_requested"
+    assert "上次人工选择继续等待后又超过 6 小时" in (lifecycle.management_note or "")
+    assert len(review_requests) == 1
+    assert review_requests[0]["lifecycle_id"] == lifecycle_id
+    assert review_requests[0]["previous_review_at"] == last_review_at.replace(tzinfo=None)
+    assert review_requests[0]["expiry_at"] == datetime(2026, 6, 30, 12, 0, tzinfo=UTC)

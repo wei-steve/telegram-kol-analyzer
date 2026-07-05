@@ -129,6 +129,31 @@ def test_format_pending_entry_expiry_review_message_shows_strategy_code_and_inte
     assert "\u8d85\u65f6\u65f6\u95f4: 2026-07-05 05:54:12 Asia/Shanghai" in message
 
 
+def test_format_pending_entry_expiry_review_message_shows_repeated_review_context():
+    message = format_pending_entry_expiry_review_message(
+        {
+            "lifecycle_id": 354,
+            "chat_id": -1002370796392,
+            "chat_title": "\u7c73\u5a05 VIP 11\u5206\u7ec4",
+            "message_id": 3251,
+            "symbol": "BTC",
+            "side": "short",
+            "max_age_hours": 6,
+            "signal_at": datetime(2026, 7, 4, 15, 54, 12, tzinfo=UTC),
+            "expiry_at": datetime(2026, 7, 5, 3, 54, 12, tzinfo=UTC),
+            "previous_review_at": datetime(2026, 7, 4, 21, 54, 12, tzinfo=UTC),
+            "review_reason": "\u4e0a\u6b21\u4eba\u5de5\u9009\u62e9\u7ee7\u7eed\u7b49\u5f85\u540e\u53c8\u8d85\u8fc7 6 \u5c0f\u65f6",
+            "entry_range_low": 62900,
+            "entry_range_high": 63200,
+            "stop_loss": 64200,
+            "take_profit": "61000",
+        }
+    )
+
+    assert "\u4e0a\u6b21\u4eba\u5de5\u7ee7\u7eed\u7b49\u5f85: 2026-07-05 05:54:12 Asia/Shanghai" in message
+    assert "\u539f\u56e0: \u4e0a\u6b21\u4eba\u5de5\u9009\u62e9\u7ee7\u7eed\u7b49\u5f85\u540e\u53c8\u8d85\u8fc7 6 \u5c0f\u65f6" in message
+
+
 def test_build_pending_entry_expiry_review_reply_markup_uses_lifecycle_id_callbacks():
     markup = build_pending_entry_expiry_review_reply_markup({"lifecycle_id": 354})
 

@@ -611,7 +611,6 @@ class LifecycleMonitor:
                         ~StrategyLifecycle.management_action.in_(
                             [
                                 "expiry_review_requested",
-                                "expiry_review_continued",
                                 "expiry_cancel_requested",
                             ]
                         ),
@@ -620,12 +619,14 @@ class LifecycleMonitor:
                 .all()
             )
             for row in rows:
-                if not self._is_expired(row, now):
+                if not self._expiry_review_due(row, now):
                     continue
-                expiry_at = self._expiry_at(row)
+                expiry_at = self._next_expiry_review_at(row)
+                previous_review_at = row.last_checked_at if row.management_action == "expiry_review_continued" else None
+                review_reason = self._expiry_review_reason(row)
                 row.management_action = "expiry_review_requested"
                 row.management_note = (
-                    f"待入场策略已超过 {self._config.max_age_hours} 小时，"
+                    f"{review_reason}，"
                     "需要人工确认继续等待、标记过期或撤销交易所挂单。"
                 )
                 row.last_checked_at = now
@@ -640,6 +641,8 @@ class LifecycleMonitor:
                         "signal_at": row.signal_at,
                         "expiry_at": expiry_at,
                         "max_age_hours": self._config.max_age_hours,
+                        "previous_review_at": previous_review_at,
+                        "review_reason": review_reason,
                         "entry_range_low": row.entry_range_low,
                         "entry_range_high": row.entry_range_high,
                         "stop_loss": row.stop_loss,
@@ -1091,6 +1094,23 @@ class LifecycleMonitor:
         if signal_at.tzinfo is None:
             signal_at = signal_at.replace(tzinfo=UTC)
         return signal_at + timedelta(hours=self._config.max_age_hours)
+
+    def _expiry_review_due(self, sig: StrategyLifecycle, now: datetime) -> bool:
+        review_at = self._next_expiry_review_at(sig)
+        return not _before(now, review_at)
+
+    def _next_expiry_review_at(self, sig: StrategyLifecycle) -> datetime:
+        if getattr(sig, "management_action", None) == "expiry_review_continued":
+            review_base = sig.last_checked_at or sig.updated_at or sig.signal_at
+            if review_base.tzinfo is None:
+                review_base = review_base.replace(tzinfo=UTC)
+            return review_base + timedelta(hours=self._config.max_age_hours)
+        return self._expiry_at(sig)
+
+    def _expiry_review_reason(self, sig: StrategyLifecycle) -> str:
+        if getattr(sig, "management_action", None) == "expiry_review_continued":
+            return f"上次人工选择继续等待后又超过 {self._config.max_age_hours} 小时"
+        return f"待入场策略已超过 {self._config.max_age_hours} 小时"
 
     # ── persistence ────────────────────────────────────────────────
 
