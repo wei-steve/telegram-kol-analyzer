@@ -722,6 +722,83 @@ def test_reconcile_updates_matching_order_leg_with_recovered_position_id(tmp_pat
     ]
 
 
+def test_reconcile_maps_multiple_bound_positions_back_to_matching_order_legs(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            order_id="trigger-1,trigger-2",
+            client_order_id="client-1,client-2",
+            pos_id="pos-1,pos-2",
+            status="stale",
+            payload={
+                "submitted_orders": [
+                    {
+                        "leg_index": 1,
+                        "execution_type": "trigger_limit",
+                        "order_id": "trigger-1",
+                        "client_order_id": "client-1",
+                        "request": {
+                            "instId": "BTC-USDT-SWAP",
+                            "posSide": "long",
+                            "sz": "7",
+                            "triggerPrice": "62900",
+                        },
+                    },
+                    {
+                        "leg_index": 2,
+                        "execution_type": "trigger_limit",
+                        "order_id": "trigger-2",
+                        "client_order_id": "client-2",
+                        "request": {
+                            "instId": "BTC-USDT-SWAP",
+                            "posSide": "long",
+                            "sz": "8",
+                            "triggerPrice": "63050",
+                        },
+                    },
+                ]
+            },
+        ),
+    )
+    repair_execution_order_legs_from_binding_payloads(session_factory)
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-1",
+                    "posSide": "long",
+                    "pos": "7",
+                    "avgPx": "62900",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-2",
+                    "posSide": "long",
+                    "pos": "8",
+                    "avgPx": "63050",
+                },
+            ]
+
+        def list_open_orders(self):
+            return []
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 7, 5, 12, 0),
+    )
+
+    assert result.active == 1
+    legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
+    assert [(leg.leg_index, leg.pos_id, leg.status) for leg in legs] == [
+        (1, "pos-1", "active"),
+        (2, "pos-2", "active"),
+    ]
+
+
 def test_reconcile_uses_trigger_history_to_pick_position_after_trigger_entry_fills(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     upsert_execution_binding(

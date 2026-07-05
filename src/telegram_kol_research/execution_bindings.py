@@ -398,7 +398,11 @@ def reconcile_deepcoin_execution_bindings(
                         result.stale += 1
             row.recovered_at = now
             row.updated_at = now
-            _refresh_order_legs_from_binding_row(session, row)
+            _refresh_order_legs_from_binding_row(
+                session,
+                row,
+                active_positions=active_positions,
+            )
             result.updated += 1
         session.commit()
     return result
@@ -443,9 +447,14 @@ def _load_pending_trigger_orders(
     return pending
 
 
-def _refresh_order_legs_from_binding_row(session, row: ExecutionBinding) -> None:
+def _refresh_order_legs_from_binding_row(
+    session,
+    row: ExecutionBinding,
+    *,
+    active_positions: list[dict[str, Any]] | None = None,
+) -> None:
     pos_ids = _split_ids(row.pos_id)
-    if len(pos_ids) != 1:
+    if not pos_ids:
         return
     order_ids = set(_split_ids(row.order_id))
     client_order_ids = set(_split_ids(row.client_order_id))
@@ -457,6 +466,14 @@ def _refresh_order_legs_from_binding_row(session, row: ExecutionBinding) -> None
         .filter(ExecutionOrderLeg.purpose == "entry")
         .all()
     )
+    if len(pos_ids) > 1:
+        _refresh_multi_position_order_legs(
+            legs,
+            row=row,
+            pos_ids=pos_ids,
+            active_positions=active_positions or [],
+        )
+        return
     for leg in legs:
         leg_order_id = str(leg.order_id or "")
         leg_client_order_id = str(leg.client_order_id or "")
@@ -467,6 +484,43 @@ def _refresh_order_legs_from_binding_row(session, row: ExecutionBinding) -> None
         leg.pos_id = pos_ids[0]
         leg.status = "active" if row.status == "active" else leg.status
         leg.updated_at = row.updated_at
+
+
+def _refresh_multi_position_order_legs(
+    legs: list[ExecutionOrderLeg],
+    *,
+    row: ExecutionBinding,
+    pos_ids: list[str],
+    active_positions: list[dict[str, Any]],
+) -> None:
+    positions_by_pos_id = {
+        pos_id: position
+        for position in active_positions
+        if (pos_id := _first_string(position, "posId", "pos_id", "id")) in pos_ids
+    }
+    if not positions_by_pos_id:
+        return
+    submitted_orders_by_leg_index = {
+        int(order.get("leg_index") or index): order
+        for index, order in enumerate(_submitted_orders_from_binding_payload(row), start=1)
+    }
+    used_pos_ids: set[str] = set()
+    for leg in sorted(legs, key=lambda item: int(item.leg_index or 0)):
+        submitted_order = submitted_orders_by_leg_index.get(int(leg.leg_index or 0))
+        if not submitted_order:
+            continue
+        matches = [
+            pos_id
+            for pos_id, position in positions_by_pos_id.items()
+            if pos_id not in used_pos_ids
+            and _position_matches_submitted_order_payload(position, submitted_order)
+        ]
+        if len(matches) != 1:
+            continue
+        leg.pos_id = matches[0]
+        leg.status = "active" if row.status == "active" else leg.status
+        leg.updated_at = row.updated_at
+        used_pos_ids.add(matches[0])
 
 
 def _cancel_missing_entry_lifecycle(session, row: ExecutionBinding, cancelled_at: datetime) -> None:
