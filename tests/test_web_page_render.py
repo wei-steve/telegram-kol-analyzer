@@ -70,6 +70,7 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "默认单笔最大亏损 USDT" in response.text
     assert "data-symbol-selector" in response.text
     assert "data-symbol-search" in response.text
+    assert "data-selected-symbol-list" in response.text
     assert "data-selected-symbol-risk-list" in response.text
     assert 'name="symbol_max_loss_usdt"' in response.text
     assert "单点附近市价容忍 %" in response.text

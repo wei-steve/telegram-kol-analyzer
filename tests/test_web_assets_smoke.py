@@ -165,6 +165,16 @@ def test_app_css_keeps_panels_from_forcing_mobile_horizontal_scroll(tmp_path):
     assert "overflow-wrap: anywhere" in response.text
 
 
+def test_app_css_allows_trading_settings_tab_to_scroll(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.css")
+
+    assert response.status_code == 200
+    assert '.dashboard-tab-panel[data-dashboard-panel="trading-settings"].is-active' in response.text
+    assert "overflow-y: auto" in response.text
+
+
 def test_app_js_binds_recovery_order_confirmation_dry_run(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

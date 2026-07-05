@@ -1077,6 +1077,7 @@ function initTradingSymbolSelector(form) {
   const riskInput = selector.querySelector('[data-symbol-risk-input]');
   const searchInput = selector.querySelector('[data-symbol-search]');
   const summary = selector.querySelector('[data-symbol-selector-summary]');
+  const selectedList = selector.querySelector('[data-selected-symbol-list]');
   const symbolList = selector.querySelector('[data-symbol-selector-list]');
   const riskList = selector.querySelector('[data-selected-symbol-risk-list]');
   const state = {
@@ -1141,6 +1142,37 @@ function initTradingSymbolSelector(form) {
     });
   };
 
+  const renderSelectedSymbols = () => {
+    if (!selectedList) {
+      return;
+    }
+    const selectedSymbols = Array.from(state.selected).sort();
+    selectedList.innerHTML = '';
+    if (!selectedSymbols.length) {
+      const empty = document.createElement('span');
+      empty.className = 'selected-symbol-empty';
+      empty.textContent = '当前未选择币种';
+      selectedList.appendChild(empty);
+      return;
+    }
+    selectedSymbols.forEach((symbol) => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'selected-symbol-chip';
+      chip.textContent = symbol;
+      chip.title = `移除 ${symbol}`;
+      chip.addEventListener('click', () => {
+        state.selected.delete(symbol);
+        delete state.riskBySymbol[symbol];
+        syncInputs();
+        renderSymbols();
+        renderSelectedSymbols();
+        renderRiskRows();
+      });
+      selectedList.appendChild(chip);
+    });
+  };
+
   const renderSymbols = () => {
     if (!symbolList) {
       return;
@@ -1165,6 +1197,7 @@ function initTradingSymbolSelector(form) {
         }
         syncInputs();
         renderSymbols();
+        renderSelectedSymbols();
         renderRiskRows();
       });
       const symbol = document.createElement('strong');
@@ -1187,6 +1220,7 @@ function initTradingSymbolSelector(form) {
   }
 
   syncInputs();
+  renderSelectedSymbols();
   renderRiskRows();
   fetch('/api/trading-settings/symbols')
     .then((response) => response.json())
@@ -1210,6 +1244,7 @@ function initTradingSymbolSelector(form) {
       });
       syncInputs();
       renderSymbols();
+      renderSelectedSymbols();
       renderRiskRows();
     })
     .catch(() => {
@@ -1222,6 +1257,7 @@ function initTradingSymbolSelector(form) {
         instrument_id: `${symbol}-USDT-SWAP`,
       }));
       renderSymbols();
+      renderSelectedSymbols();
     });
 }
 

@@ -294,7 +294,8 @@ body {
 .dashboard-tab-panel[data-dashboard-panel="prompt"].is-active,
 .dashboard-tab-panel[data-dashboard-panel="config"].is-active,
 .dashboard-tab-panel[data-dashboard-panel="model-selection"].is-active,
-.dashboard-tab-panel[data-dashboard-panel="recognition-profiles"].is-active {
+.dashboard-tab-panel[data-dashboard-panel="recognition-profiles"].is-active,
+.dashboard-tab-panel[data-dashboard-panel="trading-settings"].is-active {
   height: 100%;
   min-height: 0;
   overflow-x: hidden;
@@ -309,7 +310,8 @@ body {
 .dashboard-tab-panel[data-dashboard-panel="prompt"] .ai-recognition-panel,
 .dashboard-tab-panel[data-dashboard-panel="config"] .ai-recognition-panel,
 .dashboard-tab-panel[data-dashboard-panel="model-selection"] .ai-recognition-panel,
-.dashboard-tab-panel[data-dashboard-panel="recognition-profiles"] .ai-recognition-panel {
+.dashboard-tab-panel[data-dashboard-panel="recognition-profiles"] .ai-recognition-panel,
+.dashboard-tab-panel[data-dashboard-panel="trading-settings"] .ai-recognition-panel {
   height: auto;
   min-height: 100%;
   overflow: visible;
@@ -1289,6 +1291,39 @@ body {
 
 .symbol-selector-summary.is-error {
   color: #fca5a5;
+}
+
+.selected-symbol-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 32px;
+  align-items: center;
+  padding: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.42);
+}
+
+.selected-symbol-chip {
+  min-height: 26px;
+  border: 1px solid rgba(56, 189, 248, 0.32);
+  border-radius: 999px;
+  padding: 3px 9px;
+  background: rgba(14, 165, 233, 0.14);
+  color: #bae6fd;
+  font-size: 0.78rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.selected-symbol-chip:hover {
+  background: rgba(14, 165, 233, 0.24);
+}
+
+.selected-symbol-empty {
+  color: #94a3b8;
+  font-size: 0.82rem;
 }
 
 .symbol-selector-list {
