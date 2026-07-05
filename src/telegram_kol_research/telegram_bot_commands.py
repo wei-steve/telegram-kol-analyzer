@@ -132,7 +132,17 @@ async def run_system_operator_bot_command_loop(
                             text=response_text or "未识别的操作",
                         )
                         if response_text:
-                            await _send_message(client, base_url, chat_id=chat_id, text=response_text)
+                            await _edit_message_text(
+                                client,
+                                base_url,
+                                chat_id=chat_id,
+                                message_id=int(message.get("message_id") or 0),
+                                text=_format_callback_resolution_text(
+                                    callback_data=callback_data,
+                                    response_text=response_text,
+                                    operator_name=_callback_operator_name(callback),
+                                ),
+                            )
                         continue
 
                     message = update.get("message") or {}
@@ -582,6 +592,66 @@ async def _answer_callback_query(
         },
     )
     response.raise_for_status()
+
+
+async def _edit_message_text(
+    client: httpx.AsyncClient,
+    base_url: str,
+    *,
+    chat_id: str,
+    message_id: int,
+    text: str,
+) -> None:
+    if not message_id:
+        return
+    response = await client.post(
+        f"{base_url}/editMessageText",
+        json={
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        },
+    )
+    response.raise_for_status()
+
+
+def _format_callback_resolution_text(
+    *,
+    callback_data: str,
+    response_text: str,
+    operator_name: str,
+) -> str:
+    action, _, identifier = callback_data.partition(":")
+    action_label = {
+        EXPIRY_CONTINUE_COMMAND: "\u7ee7\u7eed\u7b49\u5f85",
+        EXPIRY_EXPIRE_CANCEL_COMMAND: "\u8fc7\u671f\u5e76\u64a4\u5355",
+        EXPIRY_EXPIRE_KEEP_COMMAND: "\u8fc7\u671f\u4f46\u4fdd\u7559\u6302\u5355",
+    }.get(action, "\u5df2\u5904\u7406")
+    lines = [
+        f"\u2705 \u5df2\u5904\u7406\uff1a{action_label}",
+        f"\u64cd\u4f5c\u4eba: {operator_name or '-'}",
+    ]
+    if identifier:
+        lines.append(f"\u5185\u90e8ID: {identifier}")
+    lines.append("")
+    lines.append(response_text)
+    return "\n".join(lines)
+
+
+def _callback_operator_name(callback: dict[str, Any]) -> str:
+    user = callback.get("from") or {}
+    username = str(user.get("username") or "").strip()
+    if username:
+        return username
+    return " ".join(
+        part
+        for part in [
+            str(user.get("first_name") or "").strip(),
+            str(user.get("last_name") or "").strip(),
+        ]
+        if part
+    )
 
 
 def _command_name(text: str) -> str | None:
