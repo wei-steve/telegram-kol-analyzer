@@ -307,12 +307,6 @@ async def run_reconcile_once(
     inserted_trade_ideas = 0
 
     for dialog in matched_dialogs:
-        payloads = await fetch_dialog_messages_fn(
-            client,
-            dialog,
-            limit=message_limit,
-            media_root=media_root,
-        )
         checkpoint_message_id = history_checkpoints.get(int(dialog.get("id") or 0), 0)
         replay_floor = max(0, checkpoint_message_id - checkpoint_overlap)
 
@@ -330,6 +324,16 @@ async def run_reconcile_once(
                 .all()
             )
         orphan_msg_ids = {row.message_id for row in orphan_rows}
+        fetch_kwargs = _filter_callable_kwargs(
+            fetch_dialog_messages_fn,
+            {
+                "limit": message_limit,
+                "media_root": media_root,
+                "media_download_min_message_id": checkpoint_message_id,
+                "media_download_message_ids": orphan_msg_ids,
+            },
+        )
+        payloads = await fetch_dialog_messages_fn(client, dialog, **fetch_kwargs)
 
         payloads = [
             payload

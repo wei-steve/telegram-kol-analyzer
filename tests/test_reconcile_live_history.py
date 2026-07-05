@@ -92,6 +92,60 @@ def test_run_reconcile_once_persists_only_messages_newer_than_checkpoint(tmp_pat
     assert checkpoint.last_message_id == 78
 
 
+def test_run_reconcile_once_limits_media_downloads_to_new_messages(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            SyncCheckpoint(
+                chat_id=9001,
+                sync_kind="history",
+                last_message_id=77,
+                last_message_at=datetime(2026, 4, 10, 8, 30),
+            )
+        )
+        session.commit()
+
+    captured = {}
+
+    async def fake_fetch_dialog_messages(client, dialog, **kwargs):
+        captured.update(kwargs)
+        return [
+            {
+                "chat_id": 9001,
+                "message_id": 77,
+                "sender_id": 501,
+                "sender_name": "VIP BTC Room",
+                "text": "overlap image",
+                "posted_at": "2026-04-10T08:30:00+00:00",
+                "media": {"kind": "photo", "path": None},
+            },
+            {
+                "chat_id": 9001,
+                "message_id": 78,
+                "sender_id": 501,
+                "sender_name": "VIP BTC Room",
+                "text": "fresh image",
+                "posted_at": "2026-04-10T08:45:00+00:00",
+                "media": {"kind": "photo", "path": "9001/78.jpg"},
+            },
+        ]
+
+    stats = __import__("asyncio").run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=fake_fetch_dialog_messages,
+        )
+    )
+
+    assert stats["inserted_messages"] == 1
+    assert captured["media_download_min_message_id"] == 77
+    assert captured["media_download_message_ids"] == set()
+
+
 def test_run_reconcile_once_does_not_expand_window_for_old_missing_media(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

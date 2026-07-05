@@ -253,6 +253,8 @@ async def fetch_dialog_messages(
     limit: int = 100,
     media_root: str | Path = "data/media",
     media_download_timeout_seconds: float = 30,
+    media_download_min_message_id: int | None = None,
+    media_download_message_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch recent messages for a dialog and normalize the Telegram fields we need."""
 
@@ -264,17 +266,24 @@ async def fetch_dialog_messages(
         get_sender = getattr(message, "get_sender", None)
         if callable(get_sender):
             sender = await get_sender()
-        media_path = await _download_media_if_present(
-            client,
-            dialog_id=dialog["id"],
-            message=message,
-            media_root=resolved_media_root,
-            timeout_seconds=media_download_timeout_seconds,
-        )
+        message_id = getattr(message, "id", None)
+        media_path = None
+        if _should_download_message_media(
+            message_id,
+            min_message_id=media_download_min_message_id,
+            message_ids=media_download_message_ids,
+        ):
+            media_path = await _download_media_if_present(
+                client,
+                dialog_id=dialog["id"],
+                message=message,
+                media_root=resolved_media_root,
+                timeout_seconds=media_download_timeout_seconds,
+            )
         messages.append(
             {
                 "chat_id": dialog["id"],
-                "message_id": getattr(message, "id", None),
+                "message_id": message_id,
                 "sender_id": getattr(message, "sender_id", None),
                 "sender_name": _format_sender_name(sender),
                 "text": getattr(message, "message", None),
@@ -315,6 +324,9 @@ async def _download_media_if_present(
     message_id = getattr(message, "id", None) or "unknown"
     target_dir = media_root / str(dialog_id)
     target_dir.mkdir(parents=True, exist_ok=True)
+    existing_path = _find_existing_media_file(target_dir, message_id)
+    if existing_path is not None:
+        return _relative_media_path(existing_path, media_root)
     try:
         output_path = await asyncio.wait_for(
             download_media(media, file=str(target_dir / f"{message_id}")),
@@ -324,11 +336,28 @@ async def _download_media_if_present(
         return None
     if output_path in (None, ""):
         return None
-    resolved = Path(output_path).resolve()
+    return _relative_media_path(Path(output_path), media_root)
+
+
+def _find_existing_media_file(target_dir: Path, message_id: Any) -> Path | None:
+    if not target_dir.exists():
+        return None
+    prefix = str(message_id)
+    matches = sorted(
+        path
+        for path in target_dir.iterdir()
+        if path.is_file()
+        and (path.stem == prefix or path.name.startswith(f"{prefix}."))
+    )
+    return matches[0] if matches else None
+
+
+def _relative_media_path(path: Path, media_root: Path) -> str:
+    resolved = path.resolve()
     try:
-        return str(resolved.relative_to(media_root.resolve()))
+        return resolved.relative_to(media_root.resolve()).as_posix()
     except ValueError:
-        return str(resolved)
+        return resolved.as_posix()
 
 
 def _should_download_media(message: Any) -> bool:
@@ -341,6 +370,23 @@ def _should_download_media(message: Any) -> bool:
         return True
 
     return False
+
+
+def _should_download_message_media(
+    message_id: Any,
+    *,
+    min_message_id: int | None,
+    message_ids: set[int] | None,
+) -> bool:
+    try:
+        normalized_message_id = int(message_id or 0)
+    except (TypeError, ValueError):
+        return True
+    if message_ids and normalized_message_id in message_ids:
+        return True
+    if min_message_id is not None:
+        return normalized_message_id > int(min_message_id)
+    return True
 
 
 def _format_sender_name(sender: Any) -> str | None:

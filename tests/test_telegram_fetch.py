@@ -64,6 +64,68 @@ def test_fetch_dialog_messages_downloads_media_to_local_path(tmp_path):
     assert downloaded_path.is_relative_to(media_root)
 
 
+def test_fetch_dialog_messages_skips_media_download_below_min_message_id(tmp_path):
+    class DownloadingClient(_FakeClient):
+        def __init__(self):
+            self.download_calls = 0
+
+        async def download_media(self, media, file):
+            self.download_calls += 1
+            output_path = Path(file).with_suffix(".jpg")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"image")
+            return str(output_path)
+
+    client = DownloadingClient()
+    dialog = {"id": 9001, "title": "VIP BTC Room", "archived": True}
+
+    payloads = asyncio.run(
+        fetch_dialog_messages(
+            client,
+            dialog,
+            limit=10,
+            media_root=tmp_path / "downloaded-media",
+            media_download_min_message_id=77,
+        )
+    )
+
+    assert payloads[0]["media"]["path"] is None
+    assert client.download_calls == 0
+
+
+def test_fetch_dialog_messages_reuses_existing_media_file_without_redownload(tmp_path):
+    media_root = tmp_path / "downloaded-media"
+    existing = media_root / "9001" / "77.jpg"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"already-downloaded")
+
+    class DownloadingClient(_FakeClient):
+        def __init__(self):
+            self.download_calls = 0
+
+        async def download_media(self, media, file):
+            self.download_calls += 1
+            output_path = Path(file).with_suffix(".jpg")
+            output_path.write_bytes(b"new-image")
+            return str(output_path)
+
+    client = DownloadingClient()
+    dialog = {"id": 9001, "title": "VIP BTC Room", "archived": True}
+
+    payloads = asyncio.run(
+        fetch_dialog_messages(
+            client,
+            dialog,
+            limit=10,
+            media_root=media_root,
+        )
+    )
+
+    assert payloads[0]["media"]["path"] == "9001/77.jpg"
+    assert client.download_calls == 0
+    assert existing.read_bytes() == b"already-downloaded"
+
+
 def test_fetch_dialog_messages_skips_video_download(tmp_path):
     class VideoMedia:
         pass
