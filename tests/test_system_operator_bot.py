@@ -9,6 +9,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
 from telegram_kol_research.telegram_bot_commands import (
     _bot_http_timeout,
+    _format_callback_resolution_text,
     process_system_operator_callback_data,
     process_system_operator_command,
 )
@@ -65,6 +66,40 @@ def test_bot_http_timeout_allows_long_polling_read_to_finish():
 
     assert timeout.read >= 35
     assert timeout.connect == 10
+
+
+def test_callback_resolution_text_keeps_strategy_context_after_button_click():
+    original_message = "\n".join(
+        [
+            "\u3010\u5f85\u5165\u573a\u7b56\u7565\u8d85\u65f6\u590d\u6838\u3011",
+            "\u7fa4\u7ec4: \u7c73\u5a05 VIP 11\u5206\u7ec4",
+            "\u7fa4ID: -1002370796392",
+            "\u7b56\u7565\u4ee3\u7801: #3251",
+            "\u5185\u90e8ID: 354",
+            "\u4ea4\u6613\u5bf9: BTC short",
+            "\u539f\u7b56\u7565\u65f6\u95f4: 2026-07-05 09:32:29 Asia/Shanghai",
+            "\u8d85\u65f6\u65f6\u95f4: 2026-07-05 15:32:29 Asia/Shanghai",
+            "\u5165\u573a\u533a\u95f4: 62900-63200",
+            "\u6b62\u635f: 64200",
+            "\u6b62\u76c8: 61000",
+        ]
+    )
+
+    message = _format_callback_resolution_text(
+        callback_data="expiry_continue:354",
+        response_text="\u7b56\u7565 #354 \u5df2\u7ee7\u7eed\u7b49\u5f85\u3002",
+        operator_name="weichang tan",
+        original_message_text=original_message,
+    )
+
+    assert "\u2705 \u5df2\u5904\u7406\uff1a\u7ee7\u7eed\u7b49\u5f85" in message
+    assert "\u64cd\u4f5c\u4eba: weichang tan" in message
+    assert "\u7fa4\u7ec4: \u7c73\u5a05 VIP 11\u5206\u7ec4" in message
+    assert "\u539f\u7b56\u7565\u65f6\u95f4: 2026-07-05 09:32:29 Asia/Shanghai" in message
+    assert "\u4ea4\u6613\u5bf9: BTC short" in message
+    assert "\u5165\u573a\u533a\u95f4: 62900-63200" in message
+    assert "\u6b62\u635f: 64200" in message
+    assert "\u6b62\u76c8: 61000" in message
 
 
 def test_format_pending_entry_expiry_review_message_shows_strategy_code_and_internal_id():

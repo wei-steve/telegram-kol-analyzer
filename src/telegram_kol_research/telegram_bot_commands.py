@@ -151,6 +151,7 @@ async def run_system_operator_bot_command_loop(
                                     callback_data=callback_data,
                                     response_text=response_text,
                                     operator_name=_callback_operator_name(callback),
+                                    original_message_text=str(message.get("text") or ""),
                                 ),
                             )
                         continue
@@ -642,6 +643,7 @@ def _format_callback_resolution_text(
     callback_data: str,
     response_text: str,
     operator_name: str,
+    original_message_text: str = "",
 ) -> str:
     action, _, identifier = callback_data.partition(":")
     action_label = {
@@ -653,11 +655,25 @@ def _format_callback_resolution_text(
         f"\u2705 \u5df2\u5904\u7406\uff1a{action_label}",
         f"\u64cd\u4f5c\u4eba: {operator_name or '-'}",
     ]
-    if identifier:
+    if identifier and not _text_has_line_prefix(original_message_text, "\u5185\u90e8ID:"):
         lines.append(f"\u5185\u90e8ID: {identifier}")
     lines.append("")
+    if original_message_text.strip():
+        lines.append(_trim_callback_context(original_message_text.strip(), response_text=response_text))
+        lines.append("")
     lines.append(response_text)
     return "\n".join(lines)
+
+
+def _text_has_line_prefix(text: str, prefix: str) -> bool:
+    return any(line.strip().startswith(prefix) for line in text.splitlines())
+
+
+def _trim_callback_context(text: str, *, response_text: str) -> str:
+    max_context_chars = MAX_TELEGRAM_MESSAGE_CHARS - len(response_text) - 120
+    if len(text) <= max_context_chars:
+        return text
+    return text[: max(0, max_context_chars - 20)].rstrip() + "\n..."
 
 
 def _callback_operator_name(callback: dict[str, Any]) -> str:
