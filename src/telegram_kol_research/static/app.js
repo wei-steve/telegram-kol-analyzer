@@ -1068,11 +1068,189 @@ function bindDashboardTabs() {
   });
 }
 
+function initTradingSymbolSelector(form) {
+  const selector = form.querySelector('[data-symbol-selector]');
+  if (!selector) {
+    return;
+  }
+  const allowedInput = selector.querySelector('[data-allowed-symbols-input]');
+  const riskInput = selector.querySelector('[data-symbol-risk-input]');
+  const searchInput = selector.querySelector('[data-symbol-search]');
+  const summary = selector.querySelector('[data-symbol-selector-summary]');
+  const symbolList = selector.querySelector('[data-symbol-selector-list]');
+  const riskList = selector.querySelector('[data-selected-symbol-risk-list]');
+  const state = {
+    symbols: [],
+    selected: new Set(parseSymbolList(allowedInput?.value || '')),
+    riskBySymbol: parseSymbolRiskMap(riskInput?.value || '{}'),
+    query: '',
+  };
+
+  const syncInputs = () => {
+    const selectedSymbols = Array.from(state.selected).sort();
+    if (allowedInput) {
+      allowedInput.value = selectedSymbols.join(',');
+    }
+    const riskPayload = {};
+    selectedSymbols.forEach((symbol) => {
+      const value = Number(state.riskBySymbol[symbol]);
+      if (Number.isFinite(value) && value > 0) {
+        riskPayload[symbol] = value;
+      }
+    });
+    if (riskInput) {
+      riskInput.value = JSON.stringify(riskPayload);
+    }
+  };
+
+  const renderRiskRows = () => {
+    if (!riskList) {
+      return;
+    }
+    const selectedSymbols = Array.from(state.selected).sort();
+    riskList.innerHTML = '';
+    if (!selectedSymbols.length) {
+      const empty = document.createElement('div');
+      empty.className = 'symbol-risk-empty';
+      empty.textContent = '未选择交易币种';
+      riskList.appendChild(empty);
+      return;
+    }
+    selectedSymbols.forEach((symbol) => {
+      const row = document.createElement('label');
+      row.className = 'symbol-risk-row';
+      const label = document.createElement('span');
+      label.textContent = `${symbol} 最大亏损 USDT`;
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.min = '1';
+      input.step = '1';
+      input.placeholder = '默认';
+      input.value = state.riskBySymbol[symbol] || '';
+      input.addEventListener('input', () => {
+        const value = Number(input.value);
+        if (Number.isFinite(value) && value > 0) {
+          state.riskBySymbol[symbol] = value;
+        } else {
+          delete state.riskBySymbol[symbol];
+        }
+        syncInputs();
+      });
+      row.append(label, input);
+      riskList.appendChild(row);
+    });
+  };
+
+  const renderSymbols = () => {
+    if (!symbolList) {
+      return;
+    }
+    const query = state.query.trim().toUpperCase();
+    const visible = state.symbols
+      .filter((item) => !query || item.symbol.includes(query) || item.instrument_id.includes(query))
+      .slice(0, 80);
+    symbolList.innerHTML = '';
+    visible.forEach((item) => {
+      const label = document.createElement('label');
+      label.className = 'symbol-option-row';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = state.selected.has(item.symbol);
+      checkbox.addEventListener('change', () => {
+        if (checkbox.checked) {
+          state.selected.add(item.symbol);
+        } else {
+          state.selected.delete(item.symbol);
+          delete state.riskBySymbol[item.symbol];
+        }
+        syncInputs();
+        renderSymbols();
+        renderRiskRows();
+      });
+      const symbol = document.createElement('strong');
+      symbol.textContent = item.symbol;
+      const instrument = document.createElement('span');
+      instrument.textContent = item.instrument_id;
+      label.append(checkbox, symbol, instrument);
+      symbolList.appendChild(label);
+    });
+    if (summary) {
+      summary.textContent = `已选 ${state.selected.size} 个，显示 ${visible.length} / ${state.symbols.length} 个`;
+    }
+  };
+
+  if (searchInput) {
+    searchInput.addEventListener('input', () => {
+      state.query = searchInput.value || '';
+      renderSymbols();
+    });
+  }
+
+  syncInputs();
+  renderRiskRows();
+  fetch('/api/trading-settings/symbols')
+    .then((response) => response.json())
+    .then((payload) => {
+      const symbols = Array.isArray(payload.symbols) ? payload.symbols : [];
+      state.symbols = symbols.map((item) => ({
+        symbol: String(item.symbol || '').toUpperCase(),
+        instrument_id: String(item.instrument_id || '').toUpperCase(),
+      })).filter((item) => item.symbol);
+      symbols.forEach((item) => {
+        const symbol = String(item.symbol || '').toUpperCase();
+        if (item.selected) {
+          state.selected.add(symbol);
+        }
+        if (item.max_loss_usdt !== null && item.max_loss_usdt !== undefined) {
+          const value = Number(item.max_loss_usdt);
+          if (Number.isFinite(value) && value > 0) {
+            state.riskBySymbol[symbol] = value;
+          }
+        }
+      });
+      syncInputs();
+      renderSymbols();
+      renderRiskRows();
+    })
+    .catch(() => {
+      if (summary) {
+        summary.textContent = '交易所币种加载失败，仍可保存当前已选币种';
+        summary.classList.add('is-error');
+      }
+      state.symbols = Array.from(state.selected).sort().map((symbol) => ({
+        symbol,
+        instrument_id: `${symbol}-USDT-SWAP`,
+      }));
+      renderSymbols();
+    });
+}
+
+function parseSymbolList(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean);
+}
+
+function parseSymbolRiskMap(value) {
+  try {
+    const parsed = JSON.parse(value || '{}');
+    return Object.fromEntries(
+      Object.entries(parsed)
+        .map(([symbol, loss]) => [String(symbol).toUpperCase(), Number(loss)])
+        .filter(([, loss]) => Number.isFinite(loss) && loss > 0)
+    );
+  } catch {
+    return {};
+  }
+}
+
 function bindTradingSettingsForm() {
   const form = document.querySelector('[data-trading-settings-form]');
   if (!form) {
     return;
   }
+  initTradingSymbolSelector(form);
   const status = form.querySelector('[data-trading-settings-save-status]');
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -1098,6 +1276,7 @@ function bindTradingSettingsForm() {
       nearby_entry_market_deviation_pct: numericValue('nearby_entry_market_deviation_pct', 0.15),
       min_ai_confidence: Number(formData.get('min_ai_confidence') || 0.75),
       allowed_symbols: String(formData.get('allowed_symbols') || 'BTC,ETH'),
+      symbol_max_loss_usdt: parseSymbolRiskMap(formData.get('symbol_max_loss_usdt') || '{}'),
       entry_range_order_style: String(formData.get('entry_range_order_style') || 'conservative'),
       take_profit_allocations: String(formData.get('take_profit_allocations') || '50,30,20'),
       move_stop_to_breakeven_after_tp1: Boolean(form.querySelector('[name="move_stop_to_breakeven_after_tp1"]')?.checked),

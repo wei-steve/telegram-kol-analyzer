@@ -87,6 +87,9 @@ class DeepcoinTradingClientProtocol(Protocol):
     def get_ticker_price(self, *, inst_id: str) -> float | None:
         """Return the latest ticker price for one instrument."""
 
+    def list_swap_symbols(self) -> list[dict[str, str]]:
+        """Return tradable SWAP base symbols and instrument ids."""
+
 
 def load_deepcoin_credentials(
     environ: dict[str, str] | None = None,
@@ -264,6 +267,25 @@ class DeepcoinRestClient:
                 if price > 0:
                     return price
         return None
+
+    def list_swap_symbols(self) -> list[dict[str, str]]:
+        payload = self._request("GET", f"{DEEPCOIN_MARKET_TICKERS_PATH}?instType=SWAP")
+        symbols_by_instrument: dict[str, dict[str, str]] = {}
+        for item in _iter_deepcoin_payload_items(payload.get("data")):
+            instrument_id = str(item.get("instId") or "").strip().upper()
+            if not instrument_id.endswith("-USDT-SWAP"):
+                continue
+            symbol = instrument_id.removesuffix("-USDT-SWAP")
+            if not symbol:
+                continue
+            symbols_by_instrument[instrument_id] = {
+                "symbol": symbol,
+                "instrument_id": instrument_id,
+            }
+        return sorted(
+            symbols_by_instrument.values(),
+            key=lambda item: item["symbol"],
+        )
 
     def _request(
         self,

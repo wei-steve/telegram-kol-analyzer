@@ -5,7 +5,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, MediaAsset, RawMessage, SignalCandidate, StrategyLifecycle
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, MediaAsset, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
@@ -235,6 +235,44 @@ def test_auto_process_range_entry_uses_half_market_half_midpoint_limit_when_near
         "set_position_tpsl",
         "create_trigger_entry",
     ]
+
+
+def test_auto_process_message_trade_signal_uses_symbol_specific_risk_budget(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="ETH long 1565-1585 SL 1545 TP 1605/1625/1645",
+        entry_text="1565-1585",
+        stop_loss_text="1545",
+        take_profit_text="1605/1625/1645",
+        symbol="ETH",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "symbol_max_loss_usdt": {"ETH": 15},
+            "allowed_symbols": ["BTC", "ETH"],
+            "max_market_entry_deviation_pct": 0.01,
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 1, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    with session_factory() as session:
+        decision = session.query(RecoveryDecisionRecord).one()
+    assert decision.symbol == "ETH"
+    assert decision.max_loss_usdt == 15.0
 
 
 def test_auto_process_message_trade_signal_blocks_media_when_vision_auto_trade_disabled(tmp_path):

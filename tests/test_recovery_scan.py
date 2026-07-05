@@ -200,6 +200,57 @@ def test_load_recovery_signals_from_db_uses_auto_trade_group_chat_id(tmp_path):
     assert signals[0].symbol_whitelist == ["BTC"]
 
 
+def test_load_recovery_signals_from_db_uses_symbol_specific_group_risk(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=9001,
+            message_id=77,
+            sender_id=501,
+            sender_name="Alice Trader",
+            posted_at=datetime(2026, 6, 12, 8, 0),
+            text="ETH long 2500-2520, SL 2450",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw_message.id,
+                symbol="ETH",
+                side="long",
+                event_type="entry_signal",
+                entry_text="2500-2520",
+                stop_loss_text="2450",
+                take_profit_text="2600 / 2700",
+                parse_source="text",
+                confidence=0.9,
+                review_status="confirmed",
+            )
+        )
+        session.commit()
+
+    signals = load_recovery_signals_from_db(
+        session_factory,
+        group_config=GroupConfig(
+            groups=[
+                TargetGroupConfig(
+                    chat_title="VIP Room",
+                    chat_id=9001,
+                    trading_mode="auto_trade",
+                    max_loss_usdt=20,
+                    symbol_whitelist=["BTC", "ETH"],
+                    symbol_max_loss_usdt={"ETH": 15.0},
+                )
+            ]
+        ),
+        start_at=datetime(2026, 6, 10, 8, 0),
+        end_at=datetime(2026, 6, 12, 18, 0),
+    )
+
+    assert len(signals) == 1
+    assert signals[0].max_loss_usdt == 15.0
+
+
 def test_load_recovery_signals_from_db_treats_naive_window_bounds_as_utc_storage(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
@@ -311,6 +362,72 @@ def test_load_recovery_signals_from_db_uses_auto_trade_tracked_sender_override(t
     assert signals[0].trading_mode == "auto_trade"
     assert signals[0].max_loss_usdt == 25.0
     assert signals[0].symbol_whitelist == ["ETH"]
+
+
+def test_load_recovery_signals_from_db_keeps_sender_risk_override_above_symbol_risk(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        source = Source(
+            telegram_sender_id=501,
+            chat_id=9001,
+            display_name="Alice Trader",
+        )
+        raw_message = RawMessage(
+            chat_id=9001,
+            message_id=77,
+            sender_id=501,
+            sender_name="Alice Trader",
+            posted_at=datetime(2026, 6, 12, 8, 0),
+            text="ETH short 2500-2550, SL 2600",
+        )
+        session.add_all([source, raw_message])
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw_message.id,
+                source_id=source.id,
+                symbol="ETH",
+                side="short",
+                event_type="entry_signal",
+                entry_text="2500-2550",
+                stop_loss_text="2600",
+                parse_source="text",
+                confidence=0.9,
+                review_status="confirmed",
+            )
+        )
+        session.commit()
+
+    signals = load_recovery_signals_from_db(
+        session_factory,
+        group_config=GroupConfig(
+            groups=[
+                TargetGroupConfig(
+                    chat_title="VIP Room",
+                    chat_id=9001,
+                    trading_mode="auto_trade",
+                    max_loss_usdt=20,
+                    symbol_whitelist=["BTC", "ETH"],
+                    symbol_max_loss_usdt={"ETH": 15.0},
+                    tracked_senders=[
+                        TrackedSenderConfig(
+                            display_name="Alice Trader",
+                            telegram_sender_id=501,
+                            custom_label="alice",
+                            trading_mode="auto_trade",
+                            max_loss_usdt=25,
+                            symbol_whitelist=["ETH"],
+                        )
+                    ],
+                )
+            ]
+        ),
+        start_at=datetime(2026, 6, 10, 8, 0),
+        end_at=datetime(2026, 6, 12, 18, 0),
+    )
+
+    assert len(signals) == 1
+    assert signals[0].max_loss_usdt == 25.0
 
 
 def test_evaluate_recovery_signals_with_market_data_queries_from_signal_time_to_now():

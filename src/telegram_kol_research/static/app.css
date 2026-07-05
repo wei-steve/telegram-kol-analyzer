@@ -1276,6 +1276,73 @@ body {
   min-height: auto;
 }
 
+.symbol-selector {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 10px;
+}
+
+.symbol-selector-summary {
+  color: #94a3b8;
+  font-size: 0.8rem;
+}
+
+.symbol-selector-summary.is-error {
+  color: #fca5a5;
+}
+
+.symbol-selector-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px;
+  max-height: 260px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.42);
+}
+
+.symbol-option-row {
+  grid-template-columns: 18px auto 1fr;
+  align-items: center;
+  min-height: 32px;
+  padding: 5px 7px;
+  border-radius: 6px;
+  background: rgba(30, 41, 59, 0.48);
+}
+
+.symbol-option-row input {
+  min-height: auto;
+}
+
+.symbol-option-row span {
+  color: #94a3b8;
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.selected-symbol-risk-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 8px;
+}
+
+.symbol-risk-row {
+  grid-template-columns: 1fr 92px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.5);
+}
+
+.symbol-risk-empty {
+  color: #94a3b8;
+  font-size: 0.82rem;
+}
+
 @media (max-width: 760px) {
   .recognition-profile-grid,
   .recognition-profile-meta {

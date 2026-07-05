@@ -315,7 +315,14 @@
           <label>现价入场最大偏离 %<input name="max_market_entry_deviation_pct" type="number" min="0.01" step="0.01" value="{{ trading_settings.max_market_entry_deviation_pct }}" /></label>
           <label>单点附近市价容忍 %<input name="nearby_entry_market_deviation_pct" type="number" min="0.01" step="0.01" value="{{ trading_settings.nearby_entry_market_deviation_pct }}" /></label>
           <label>最低 AI 置信度<input name="min_ai_confidence" type="number" min="0" max="1" step="0.01" value="{{ trading_settings.min_ai_confidence }}" /></label>
-          <label>允许交易币种<input name="allowed_symbols" value="{{ trading_settings.allowed_symbols|join(',') }}" /></label>
+          <div class="symbol-selector" data-symbol-selector>
+            <input type="hidden" name="allowed_symbols" value="{{ trading_settings.allowed_symbols|join(',') }}" data-allowed-symbols-input />
+            <input type="hidden" name="symbol_max_loss_usdt" value='{{ trading_settings.symbol_max_loss_usdt|tojson }}' data-symbol-risk-input />
+            <label>允许交易币种搜索<input type="search" placeholder="搜索 BTC / ETH / SOL" data-symbol-search /></label>
+            <div class="symbol-selector-summary" data-symbol-selector-summary>正在加载交易所币种...</div>
+            <div class="symbol-selector-list" data-symbol-selector-list></div>
+            <div class="selected-symbol-risk-list" data-selected-symbol-risk-list></div>
+          </div>
           <label>
             区间入场方式
             <select name="entry_range_order_style">

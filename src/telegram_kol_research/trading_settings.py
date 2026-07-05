@@ -27,6 +27,7 @@ class TradingSettings:
     nearby_entry_market_deviation_pct: float = 0.15
     min_ai_confidence: float = 0.75
     allowed_symbols: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
+    symbol_max_loss_usdt: dict[str, float] = field(default_factory=dict)
     entry_range_order_style: str = "eager"
     take_profit_allocations: list[float] = field(default_factory=lambda: [50.0, 30.0, 20.0])
     move_stop_to_breakeven_after_tp1: bool = True
@@ -34,6 +35,13 @@ class TradingSettings:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def max_loss_for_symbol(self, symbol: str | None) -> float:
+        return resolve_symbol_max_loss_usdt(
+            default_max_loss_usdt=self.default_max_loss_usdt,
+            symbol_max_loss_usdt=self.symbol_max_loss_usdt,
+            symbol=symbol,
+        )
 
 
 def load_trading_settings(session_factory: sessionmaker) -> TradingSettings:
@@ -100,6 +108,7 @@ def apply_trading_settings_to_group_config(
                 trading_mode=group.trading_mode,
                 max_loss_usdt=settings.default_max_loss_usdt,
                 symbol_whitelist=settings.allowed_symbols.copy(),
+                symbol_max_loss_usdt=settings.symbol_max_loss_usdt.copy(),
             )
             for group in group_config.groups
         ]
@@ -110,6 +119,7 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
     raw = payload or {}
     defaults = TradingSettings()
     allowed_symbols = _parse_symbol_list(raw.get("allowed_symbols"), defaults.allowed_symbols)
+    symbol_max_loss_usdt = _parse_symbol_max_loss_usdt(raw.get("symbol_max_loss_usdt"))
     take_profit_allocations = _parse_allocations(
         raw.get("take_profit_allocations"),
         defaults.take_profit_allocations,
@@ -144,6 +154,7 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             min(1.0, _positive_float(raw.get("min_ai_confidence"), defaults.min_ai_confidence)),
         ),
         allowed_symbols=allowed_symbols,
+        symbol_max_loss_usdt=symbol_max_loss_usdt,
         entry_range_order_style=style,
         take_profit_allocations=take_profit_allocations,
         move_stop_to_breakeven_after_tp1=bool(
@@ -181,6 +192,64 @@ def _parse_symbol_list(value: Any, fallback: list[str]) -> list[str]:
         if symbol and symbol not in symbols:
             symbols.append(symbol)
     return symbols or fallback.copy()
+
+
+def resolve_symbol_max_loss_usdt(
+    *,
+    default_max_loss_usdt: float,
+    symbol_max_loss_usdt: dict[str, float] | None,
+    symbol: str | None,
+) -> float:
+    normalized_symbol = str(symbol or "").strip().upper()
+    if normalized_symbol and symbol_max_loss_usdt:
+        value = symbol_max_loss_usdt.get(normalized_symbol)
+        if value is not None:
+            return _positive_float(value, default_max_loss_usdt)
+    return float(default_max_loss_usdt)
+
+
+def _parse_symbol_max_loss_usdt(value: Any) -> dict[str, float]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{"):
+            try:
+                loaded = json.loads(stripped)
+            except json.JSONDecodeError:
+                loaded = None
+            if isinstance(loaded, dict):
+                return _parse_symbol_max_loss_usdt(loaded)
+        raw_items: list[tuple[Any, Any]] = []
+        for item in stripped.replace(";", ",").split(","):
+            if ":" not in item:
+                continue
+            symbol, loss = item.split(":", 1)
+            raw_items.append((symbol, loss))
+    elif isinstance(value, dict):
+        raw_items = list(value.items())
+    elif isinstance(value, list):
+        raw_items = [
+            (
+                item.get("symbol"),
+                item.get("max_loss_usdt"),
+            )
+            for item in value
+            if isinstance(item, dict)
+        ]
+    else:
+        raw_items = []
+
+    parsed: dict[str, float] = {}
+    for raw_symbol, raw_loss in raw_items:
+        symbol = str(raw_symbol or "").strip().upper()
+        if not symbol:
+            continue
+        try:
+            loss = float(raw_loss)
+        except (TypeError, ValueError):
+            continue
+        if loss > 0:
+            parsed[symbol] = loss
+    return parsed
 
 
 def _parse_allocations(value: Any, fallback: list[float]) -> list[float]:

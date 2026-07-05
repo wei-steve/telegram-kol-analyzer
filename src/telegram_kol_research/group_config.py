@@ -34,6 +34,7 @@ class TargetGroupConfig:
     trading_mode: str = "notify_only"
     max_loss_usdt: float = 20.0
     symbol_whitelist: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
+    symbol_max_loss_usdt: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -94,6 +95,9 @@ def load_group_config(config_path: str | Path) -> GroupConfig:
                     _parse_symbol_whitelist(group_data.get("symbol_whitelist"))
                     or ["BTC", "ETH"]
                 ),
+                symbol_max_loss_usdt=_parse_symbol_max_loss_usdt(
+                    group_data.get("symbol_max_loss_usdt")
+                ),
             )
         )
 
@@ -151,6 +155,8 @@ def _group_to_yaml_dict(group: TargetGroupConfig) -> dict[str, Any]:
         "max_loss_usdt": group.max_loss_usdt,
         "symbol_whitelist": group.symbol_whitelist,
     }
+    if group.symbol_max_loss_usdt:
+        data["symbol_max_loss_usdt"] = group.symbol_max_loss_usdt
     if group.custom_group_label is not None:
         data["custom_group_label"] = group.custom_group_label
     if group.sync_start_date is not None:
@@ -162,6 +168,23 @@ def _group_to_yaml_dict(group: TargetGroupConfig) -> dict[str, Any]:
             _sender_to_yaml_dict(sender) for sender in group.tracked_senders
         ]
     return data
+
+
+def _parse_symbol_max_loss_usdt(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    parsed: dict[str, float] = {}
+    for raw_symbol, raw_loss in value.items():
+        symbol = str(raw_symbol).strip().upper()
+        if not symbol:
+            continue
+        try:
+            loss = float(raw_loss)
+        except (TypeError, ValueError):
+            continue
+        if loss > 0:
+            parsed[symbol] = loss
+    return parsed
 
 
 def _sender_to_yaml_dict(sender: TrackedSenderConfig) -> dict[str, Any]:

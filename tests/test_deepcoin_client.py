@@ -142,6 +142,34 @@ def test_deepcoin_client_lists_order_and_trigger_history_with_swap_query():
     ]
 
 
+def test_deepcoin_client_lists_swap_symbols_from_market_tickers():
+    http_client = _CapturingHttpClient(
+        {
+            "code": "0",
+            "data": [
+                {"instId": "ETH-USDT-SWAP"},
+                {"instId": "BTC-USDT-SWAP"},
+                {"instId": "ETH-USDT-SWAP"},
+                {"instId": "BTC-USDT-SPOT"},
+                {"instId": ""},
+            ],
+        }
+    )
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        timestamp_factory=lambda: "2026-06-30T00:00:00.000Z",
+    )
+
+    symbols = client.list_swap_symbols()
+
+    assert symbols == [
+        {"symbol": "BTC", "instrument_id": "BTC-USDT-SWAP"},
+        {"symbol": "ETH", "instrument_id": "ETH-USDT-SWAP"},
+    ]
+    assert http_client.requests[-1]["request_path"] == "/deepcoin/market/tickers?instType=SWAP"
+
+
 def test_deepcoin_client_finds_historical_orders_by_exchange_or_client_id():
     http_client = _CapturingHttpClient(
         {

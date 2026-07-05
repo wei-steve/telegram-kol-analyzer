@@ -29,6 +29,7 @@ from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.recovery_scan import _parse_entry_range
 from telegram_kol_research.recovery_scan import _resolve_runtime_config
+from telegram_kol_research.recovery_scan import _resolve_signal_max_loss_usdt
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import apply_trading_settings_to_group_config
 from telegram_kol_research.trading_settings import load_trading_settings
@@ -185,7 +186,7 @@ def auto_process_message_trade_signal(
         parse_source=candidate.parse_source,
         confidence=candidate.confidence,
         trading_mode="auto_trade",
-        max_loss_usdt=float(runtime_config["max_loss_usdt"]),
+        max_loss_usdt=_resolve_signal_max_loss_usdt(runtime_config, symbol=symbol),
         symbol_whitelist=[str(item).upper() for item in runtime_config["symbol_whitelist"]],
     )
     decision = RecoveryDecision(

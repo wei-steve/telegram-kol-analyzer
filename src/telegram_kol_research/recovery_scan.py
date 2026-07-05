@@ -17,6 +17,7 @@ from telegram_kol_research.trading_decision import (
     TradingDecisionInput,
     evaluate_trading_decision,
 )
+from telegram_kol_research.trading_settings import resolve_symbol_max_loss_usdt
 
 
 @dataclass(slots=True)
@@ -242,7 +243,10 @@ def load_recovery_signals_from_db(
                     parse_source=candidate.parse_source,
                     confidence=candidate.confidence,
                     trading_mode=runtime_config["trading_mode"],
-                    max_loss_usdt=runtime_config["max_loss_usdt"],
+                    max_loss_usdt=_resolve_signal_max_loss_usdt(
+                        runtime_config,
+                        symbol=candidate.symbol,
+                    ),
                     symbol_whitelist=runtime_config["symbol_whitelist"],
                 )
             )
@@ -328,22 +332,41 @@ def _resolve_runtime_config(
             continue
         sender = _match_sender(group.tracked_senders, raw_message=raw_message, source=source)
         if sender is not None:
+            sender_has_max_loss = sender.max_loss_usdt is not None
             return {
                 "kol_id": sender.custom_label or sender.display_name,
                 "trading_mode": sender.trading_mode,
                 "max_loss_usdt": sender.max_loss_usdt
-                if sender.max_loss_usdt is not None
+                if sender_has_max_loss
                 else group.max_loss_usdt,
+                "max_loss_source": "sender" if sender_has_max_loss else "group",
                 "symbol_whitelist": sender.symbol_whitelist or group.symbol_whitelist,
+                "symbol_max_loss_usdt": {}
+                if sender_has_max_loss
+                else group.symbol_max_loss_usdt,
             }
         if group.chat_id is not None and group.chat_id == raw_message.chat_id:
             return {
                 "kol_id": f"group:{group.chat_id}",
                 "trading_mode": group.trading_mode,
                 "max_loss_usdt": group.max_loss_usdt,
+                "max_loss_source": "group",
                 "symbol_whitelist": group.symbol_whitelist,
+                "symbol_max_loss_usdt": group.symbol_max_loss_usdt,
             }
     return None
+
+
+def _resolve_signal_max_loss_usdt(
+    runtime_config: dict[str, object],
+    *,
+    symbol: str | None,
+) -> float:
+    return resolve_symbol_max_loss_usdt(
+        default_max_loss_usdt=float(runtime_config["max_loss_usdt"]),
+        symbol_max_loss_usdt=runtime_config.get("symbol_max_loss_usdt") or {},
+        symbol=symbol,
+    )
 
 
 def _match_sender(

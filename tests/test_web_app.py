@@ -80,6 +80,7 @@ def test_trading_settings_api_persists_runtime_risk_defaults(tmp_path):
             "nearby_entry_market_deviation_pct": 1.25,
             "min_ai_confidence": 0.8,
             "allowed_symbols": "BTC,ETH,SOL",
+            "symbol_max_loss_usdt": {"BTC": 20, "ETH": 15, "SOL": 10},
             "entry_range_order_style": "conservative",
             "take_profit_allocations": "50,30,20",
             "move_stop_to_breakeven_after_tp1": True,
@@ -91,12 +92,97 @@ def test_trading_settings_api_persists_runtime_risk_defaults(tmp_path):
     assert response.json()["default_max_loss_usdt"] == 150.0
     assert response.json()["nearby_entry_market_deviation_pct"] == 1.25
     assert response.json()["allowed_symbols"] == ["BTC", "ETH", "SOL"]
+    assert response.json()["symbol_max_loss_usdt"] == {"BTC": 20.0, "ETH": 15.0, "SOL": 10.0}
 
     reloaded = client.get("/api/trading-settings")
     assert reloaded.status_code == 200
     assert reloaded.json()["auto_trade_enabled"] is True
     assert reloaded.json()["nearby_entry_market_deviation_pct"] == 1.25
     assert reloaded.json()["take_profit_allocations"] == [50.0, 30.0, 20.0]
+
+
+def test_trading_settings_symbols_api_lists_deepcoin_symbols_with_selection(tmp_path):
+    class FakeDeepcoinClient:
+        def list_swap_symbols(self):
+            return [
+                {"symbol": "ETH", "instrument_id": "ETH-USDT-SWAP"},
+                {"symbol": "BTC", "instrument_id": "BTC-USDT-SWAP"},
+                {"symbol": "SOL", "instrument_id": "SOL-USDT-SWAP"},
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+    )
+    save_trading_settings(
+        app.state.session_factory,
+        {
+            "allowed_symbols": ["BTC", "SOL"],
+            "symbol_max_loss_usdt": {"BTC": 20, "SOL": 10},
+        },
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/trading-settings/symbols")
+
+    assert response.status_code == 200
+    assert response.json()["symbols"] == [
+        {
+            "symbol": "BTC",
+            "instrument_id": "BTC-USDT-SWAP",
+            "selected": True,
+            "max_loss_usdt": 20.0,
+        },
+        {
+            "symbol": "ETH",
+            "instrument_id": "ETH-USDT-SWAP",
+            "selected": False,
+            "max_loss_usdt": None,
+        },
+        {
+            "symbol": "SOL",
+            "instrument_id": "SOL-USDT-SWAP",
+            "selected": True,
+            "max_loss_usdt": 10.0,
+        },
+    ]
+
+
+def test_trading_settings_symbols_api_falls_back_to_saved_symbols(tmp_path):
+    class BrokenDeepcoinClient:
+        def list_swap_symbols(self):
+            raise RuntimeError("offline")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: BrokenDeepcoinClient(),
+    )
+    save_trading_settings(
+        app.state.session_factory,
+        {
+            "allowed_symbols": ["BTC", "ETH"],
+            "symbol_max_loss_usdt": {"ETH": 15},
+        },
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/trading-settings/symbols")
+
+    assert response.status_code == 200
+    assert response.json()["symbols"] == [
+        {
+            "symbol": "BTC",
+            "instrument_id": "BTC-USDT-SWAP",
+            "selected": True,
+            "max_loss_usdt": None,
+        },
+        {
+            "symbol": "ETH",
+            "instrument_id": "ETH-USDT-SWAP",
+            "selected": True,
+            "max_loss_usdt": 15.0,
+        },
+    ]
 
 
 def test_execution_dashboard_lists_global_strategy_states(tmp_path):

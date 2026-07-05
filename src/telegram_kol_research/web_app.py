@@ -782,6 +782,48 @@ def _symbol_from_deepcoin_inst_id(value: Any) -> str:
     return text.split("-")[0] if text else "?"
 
 
+def _to_deepcoin_swap_instrument(symbol: str) -> str:
+    text = str(symbol or "").strip().upper()
+    if text.endswith("-USDT-SWAP"):
+        return text
+    return f"{text}-USDT-SWAP"
+
+
+def _build_trading_symbol_rows(
+    exchange_symbols: list[dict[str, Any]],
+    *,
+    selected_symbols: list[str],
+    symbol_max_loss_usdt: dict[str, float],
+) -> list[dict[str, Any]]:
+    selected = {str(symbol).upper() for symbol in selected_symbols}
+    rows_by_symbol: dict[str, dict[str, Any]] = {}
+    for item in exchange_symbols:
+        symbol = str(item.get("symbol") or "").strip().upper()
+        instrument_id = str(item.get("instrument_id") or "").strip().upper()
+        if not symbol:
+            instrument_id = str(item.get("instId") or "").strip().upper()
+            symbol = _symbol_from_deepcoin_inst_id(instrument_id)
+        if not symbol or symbol == "?":
+            continue
+        rows_by_symbol[symbol] = {
+            "symbol": symbol,
+            "instrument_id": instrument_id or _to_deepcoin_swap_instrument(symbol),
+            "selected": symbol in selected,
+            "max_loss_usdt": symbol_max_loss_usdt.get(symbol),
+        }
+    for symbol in selected:
+        rows_by_symbol.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "instrument_id": _to_deepcoin_swap_instrument(symbol),
+                "selected": True,
+                "max_loss_usdt": symbol_max_loss_usdt.get(symbol),
+            },
+        )
+    return sorted(rows_by_symbol.values(), key=lambda item: item["symbol"])
+
+
 def _float_or_none(value: Any) -> float | None:
     try:
         return float(value)
@@ -1831,6 +1873,31 @@ def create_web_app(
     @app.get("/api/trading-settings")
     def get_trading_settings():
         return load_trading_settings(app.state.session_factory).to_dict()
+
+    @app.get("/api/trading-settings/symbols")
+    def list_trading_setting_symbols():
+        settings = load_trading_settings(app.state.session_factory)
+        saved_symbols = [str(symbol).upper() for symbol in settings.allowed_symbols]
+        try:
+            deepcoin_client = app.state.deepcoin_client_factory()
+            if not hasattr(deepcoin_client, "list_swap_symbols"):
+                raise DeepcoinClientError("Deepcoin client cannot list symbols")
+            exchange_symbols = deepcoin_client.list_swap_symbols()
+        except Exception:
+            exchange_symbols = [
+                {
+                    "symbol": symbol,
+                    "instrument_id": _to_deepcoin_swap_instrument(symbol),
+                }
+                for symbol in saved_symbols
+            ]
+        return {
+            "symbols": _build_trading_symbol_rows(
+                exchange_symbols,
+                selected_symbols=saved_symbols,
+                symbol_max_loss_usdt=settings.symbol_max_loss_usdt,
+            )
+        }
 
     @app.post("/api/trading-settings")
     def update_trading_settings(payload: dict[str, Any]):
