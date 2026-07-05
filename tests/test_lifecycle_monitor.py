@@ -593,7 +593,7 @@ def test_lifecycle_monitor_enters_flexible_entry_range_at_current_price(tmp_path
     assert lifecycle.entered_at == datetime(2026, 6, 24, 7, 26)
 
 
-def test_lifecycle_monitor_requests_review_instead_of_expiring_pending_before_late_price_touch(tmp_path):
+def test_lifecycle_monitor_enters_pending_review_when_price_touches_late(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     signal_at = datetime(2026, 6, 30, 0, 0, tzinfo=UTC)
     with session_factory() as session:
@@ -641,12 +641,10 @@ def test_lifecycle_monitor_requests_review_instead_of_expiring_pending_before_la
     with session_factory() as session:
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
 
-    assert transitions == []
-    assert lifecycle.lifecycle_status == "pending_entry"
-    assert lifecycle.entered_at is None
-    assert lifecycle.entry_price_actual is None
-    assert lifecycle.management_action == "expiry_review_requested"
-    assert "超过 6 小时" in (lifecycle.management_note or "")
+    assert transitions[0]["to"] == "entered"
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.entered_at == datetime(2026, 6, 30, 8, 0)
+    assert lifecycle.entry_price_actual == 60500
     assert len(review_requests) == 1
     assert review_requests[0]["lifecycle_id"] == lifecycle_id
     assert review_requests[0]["symbol"] == "BTC"
@@ -754,3 +752,57 @@ def test_lifecycle_monitor_continued_expiry_review_repeats_after_interval(tmp_pa
     assert review_requests[0]["lifecycle_id"] == lifecycle_id
     assert review_requests[0]["previous_review_at"] == last_review_at.replace(tzinfo=None)
     assert review_requests[0]["expiry_at"] == datetime(2026, 6, 30, 12, 0, tzinfo=UTC)
+
+
+def test_lifecycle_monitor_requested_expiry_review_keeps_scanning_for_entry(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3890,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 30, 0, 0, tzinfo=UTC),
+            entry_range_low=60300,
+            entry_range_high=60800,
+            stop_loss=61300,
+            take_profit="59600",
+            management_action="expiry_review_requested",
+            last_checked_at=datetime(2026, 6, 30, 6, 0, tzinfo=UTC),
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    class FakeLifecycleMonitor(LifecycleMonitor):
+        async def _fetch_candles_full(self, contract, from_, to_):
+            return [
+                PriceCandle(
+                    opened_at=datetime(2026, 6, 30, 8, 0, tzinfo=UTC),
+                    high=60600,
+                    low=60400,
+                )
+            ]
+
+    review_requests = []
+
+    async def fake_notifier(payload):
+        review_requests.append(payload)
+
+    monitor = FakeLifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        config=LifecycleMonitorConfig(max_age_hours=6),
+        now_provider=lambda: datetime(2026, 6, 30, 10, 0, tzinfo=UTC),
+        expiry_review_notifier=fake_notifier,
+    )
+
+    transitions = asyncio.run(monitor.run_once())
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert review_requests == []
+    assert transitions[0]["to"] == "entered"
+    assert lifecycle.lifecycle_status == "entered"

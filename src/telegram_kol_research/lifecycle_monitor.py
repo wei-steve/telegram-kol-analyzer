@@ -587,6 +587,7 @@ class LifecycleMonitor:
                             or_(
                                 StrategyLifecycle.signal_at >= pending_cutoff,
                                 StrategyLifecycle.management_action == "expiry_review_continued",
+                                StrategyLifecycle.management_action == "expiry_review_requested",
                             ),
                         ),
                     ),
@@ -1084,7 +1085,10 @@ class LifecycleMonitor:
     # ── expiry ─────────────────────────────────────────────────────
 
     def _is_expired(self, sig: StrategyLifecycle, now: datetime) -> bool:
-        if getattr(sig, "management_action", None) == "expiry_review_continued":
+        if getattr(sig, "management_action", None) in {
+            "expiry_review_continued",
+            "expiry_review_requested",
+        }:
             return False
         expiry_at = self._expiry_at(sig)
         return not _before(now, expiry_at)
