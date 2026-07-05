@@ -128,6 +128,20 @@ def _elapsed_ms(started_at: float) -> float:
     return round((time.perf_counter() - started_at) * 1000, 1)
 
 
+def _log_background_task_result(task_name: str):
+    def _callback(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            logger.exception("Background task %s exited with error", task_name, exc_info=exc)
+
+    return _callback
+
+
 def _build_trader_dashboard_state(
     *,
     groups: list[dict[str, Any]],
@@ -899,6 +913,9 @@ def create_web_app(
                     session_factory=app.state.session_factory,
                     deepcoin_client_factory=app.state.deepcoin_client_factory,
                 )
+            )
+            app.state.system_operator_bot_command_task.add_done_callback(
+                _log_background_task_result("system_operator_bot_command_task")
             )
         if (
             app.state.live_target_titles

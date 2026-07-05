@@ -95,8 +95,11 @@ async def run_system_operator_bot_command_loop(
     async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
         await _delete_webhook(client, base_url)
         offset = await _latest_update_offset(client, base_url)
+        logger.info("System operator bot command loop started chat_id=%s offset=%s", chat_id, offset)
         while True:
             updates = await _get_updates(client, base_url, offset=offset)
+            if updates:
+                logger.info("System operator bot received %d update(s)", len(updates))
             for update in updates:
                 update_id = int(update.get("update_id") or 0)
                 offset = max(offset, update_id + 1)
@@ -107,6 +110,11 @@ async def run_system_operator_bot_command_loop(
                         if not _message_is_from_alert_chat(message, chat_id):
                             continue
                         callback_data = str(callback.get("data") or "")
+                        logger.info(
+                            "System operator bot processing callback update_id=%s data=%s",
+                            update_id,
+                            callback_data,
+                        )
                         deepcoin_client = (
                             deepcoin_client_factory()
                             if deepcoin_client_factory and callback_data.startswith("expiry_expire_cancel:")
