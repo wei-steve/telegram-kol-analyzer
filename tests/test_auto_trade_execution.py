@@ -680,7 +680,7 @@ def test_auto_process_message_trade_signal_closes_position_from_close_signal(tmp
     assert fake_client.orders[0]["side"] == "sell"
 
 
-def test_auto_process_close_signal_recovers_unique_matching_position_before_close(tmp_path):
+def test_auto_process_close_signal_does_not_steal_live_position_from_other_chat(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         lifecycle = StrategyLifecycle(
@@ -782,29 +782,21 @@ def test_auto_process_close_signal_recovers_unique_matching_position_before_clos
         processed_at=datetime(2026, 7, 2, 13, 8, tzinfo=UTC),
     )
 
-    assert result["status"] == "submitted"
-    assert result["management_action"] == "close_position"
-    assert fake_client.orders == [
-        {
-            "instId": "BTC-USDT-SWAP",
-            "tdMode": "cross",
-            "side": "buy",
-            "posSide": "short",
-            "ordType": "market",
-            "sz": "10",
-            "mrgPosition": "split",
-            "closePosId": "pos-sanjie",
-        }
-    ]
+    assert result["status"] == "skipped"
+    assert result["reason"] == "no_execution_binding"
+    assert fake_client.orders == []
     with session_factory() as session:
         lifecycle = session.query(StrategyLifecycle).filter_by(chat_id=100, message_id=55).one()
-        binding = session.query(ExecutionBinding).filter_by(chat_id=100, message_id=55).one()
+        other_lifecycle = (
+            session.query(StrategyLifecycle).filter_by(chat_id=999, message_id=3888).one()
+        )
         stale_binding = session.query(ExecutionBinding).filter_by(chat_id=999, message_id=3888).one()
 
-    assert lifecycle.execution_binding_id == binding.id
-    assert binding.status == "closed"
-    assert binding.last_exchange_status == "close_position_submitted"
-    assert stale_binding.status == "stale"
+    assert lifecycle.execution_binding_id is None
+    assert stale_binding.status == "active"
+    assert stale_binding.last_exchange_status != "expired_pending_entry_not_attributed"
+    assert other_lifecycle.lifecycle_status == "entered"
+    assert other_lifecycle.execution_binding_id == stale_binding.id
 
 
 def test_auto_process_close_signal_does_not_recover_ambiguous_positions(tmp_path):

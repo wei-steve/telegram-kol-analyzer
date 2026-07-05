@@ -1363,7 +1363,7 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
     )
     if lifecycle is None:
         return True
-    if _is_stale_unentered_lifecycle(lifecycle, updated_at):
+    if row.status != "active" and _is_stale_unentered_lifecycle(lifecycle, updated_at):
         lifecycle.lifecycle_status = "expired"
         lifecycle.exit_reason = "expired"
         lifecycle.exited_at = _pending_entry_expired_at(lifecycle)

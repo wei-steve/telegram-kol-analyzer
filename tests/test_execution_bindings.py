@@ -453,7 +453,7 @@ def test_reconcile_recovers_filled_order_position_id_when_unique(tmp_path):
     assert lifecycle.lifecycle_status == "entered"
 
 
-def test_reconcile_does_not_revive_stale_pending_entry_as_active_position(tmp_path):
+def test_reconcile_keeps_bound_live_position_active_even_when_signal_is_old(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
         session_factory,
@@ -492,18 +492,18 @@ def test_reconcile_does_not_revive_stale_pending_entry_as_active_position(tmp_pa
         recovered_at=datetime(2026, 7, 3, 3, 44),
     )
 
-    assert result.active == 0
-    assert result.stale == 1
+    assert result.active == 1
+    assert result.stale == 0
     with session_factory() as session:
         binding = session.get(ExecutionBinding, binding_id)
         lifecycle = session.query(StrategyLifecycle).one()
 
-    assert binding.status == "stale"
-    assert binding.last_exchange_status == "expired_pending_entry_not_attributed"
-    assert lifecycle.lifecycle_status == "expired"
-    assert lifecycle.exit_reason == "expired"
-    assert lifecycle.entered_at is None
-    assert lifecycle.execution_binding_id is None
+    assert binding.status == "active"
+    assert binding.last_exchange_status == "position_active"
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.exit_reason is None
+    assert lifecycle.exited_at is None
+    assert lifecycle.execution_binding_id == binding_id
 
 
 def test_reconcile_revives_exited_lifecycle_when_bound_position_is_active(tmp_path):
