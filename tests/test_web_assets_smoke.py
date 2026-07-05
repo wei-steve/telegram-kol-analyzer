@@ -165,6 +165,18 @@ def test_app_css_keeps_panels_from_forcing_mobile_horizontal_scroll(tmp_path):
     assert "overflow-wrap: anywhere" in response.text
 
 
+def test_app_css_allows_strategy_summary_prices_to_wrap_in_mid_panel(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.css")
+
+    assert response.status_code == 200
+    assert "grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));" in response.text
+    assert ".strategy-card-summary-grid strong" in response.text
+    assert "overflow-wrap: anywhere" in response.text
+    assert "word-break: break-word" in response.text
+
+
 def test_app_css_allows_trading_settings_tab_to_scroll(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

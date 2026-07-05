@@ -975,7 +975,7 @@ body {
 .strategy-card-summary-grid {
   display: grid;
   grid-column: 3;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
   gap: 6px;
   min-width: 0;
 }
@@ -1000,9 +1000,10 @@ body {
   color: #e5e7eb;
   font-size: 0.76rem;
   font-weight: 700;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .strategy-card-details {
