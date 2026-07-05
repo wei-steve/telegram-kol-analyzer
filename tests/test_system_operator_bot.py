@@ -8,6 +8,7 @@ from telegram_kol_research.system_operator_bot import (
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
 from telegram_kol_research.telegram_bot_commands import (
+    _bot_http_timeout,
     process_system_operator_callback_data,
     process_system_operator_command,
 )
@@ -57,6 +58,13 @@ def test_system_operator_bot_disabled_without_dedicated_destination():
     assert not system_operator_bot_enabled(
         SystemOperatorBotConfig(bot_token="", chat_id="", timeout_seconds=10)
     )
+
+
+def test_bot_http_timeout_allows_long_polling_read_to_finish():
+    timeout = _bot_http_timeout(10)
+
+    assert timeout.read >= 35
+    assert timeout.connect == 10
 
 
 def test_format_pending_entry_expiry_review_message_shows_strategy_code_and_internal_id():

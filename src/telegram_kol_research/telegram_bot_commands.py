@@ -40,12 +40,17 @@ async def run_telegram_bot_command_loop(
 
     base_url = f"https://api.telegram.org/bot{config.bot_token}"
     chat_id = str(config.alert_chat_id)
-    async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
+    async with httpx.AsyncClient(timeout=_bot_http_timeout(config.timeout_seconds)) as client:
         await _delete_webhook(client, base_url)
         await _set_bot_commands(client, base_url)
         offset = await _latest_update_offset(client, base_url)
         while True:
-            updates = await _get_updates(client, base_url, offset=offset)
+            try:
+                updates = await _get_updates(client, base_url, offset=offset)
+            except httpx.TimeoutException:
+                logger.warning("Telegram bot getUpdates timed out; continuing")
+                await asyncio.sleep(poll_interval_seconds)
+                continue
             for update in updates:
                 update_id = int(update.get("update_id") or 0)
                 offset = max(offset, update_id + 1)
@@ -92,12 +97,17 @@ async def run_system_operator_bot_command_loop(
 
     base_url = f"https://api.telegram.org/bot{config.bot_token}"
     chat_id = str(config.chat_id)
-    async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
+    async with httpx.AsyncClient(timeout=_bot_http_timeout(config.timeout_seconds)) as client:
         await _delete_webhook(client, base_url)
         offset = await _latest_update_offset(client, base_url)
         logger.info("System operator bot command loop started chat_id=%s offset=%s", chat_id, offset)
         while True:
-            updates = await _get_updates(client, base_url, offset=offset)
+            try:
+                updates = await _get_updates(client, base_url, offset=offset)
+            except httpx.TimeoutException:
+                logger.warning("System operator bot getUpdates timed out; continuing")
+                await asyncio.sleep(poll_interval_seconds)
+                continue
             if updates:
                 logger.info("System operator bot received %d update(s)", len(updates))
             for update in updates:
@@ -528,6 +538,17 @@ async def _latest_update_offset(client: httpx.AsyncClient, base_url: str) -> int
     updates = response.json().get("result") or []
     update_ids = [int(update.get("update_id") or 0) for update in updates]
     return max(update_ids, default=0) + 1 if update_ids else 0
+
+
+def _bot_http_timeout(config_timeout_seconds: float) -> httpx.Timeout:
+    read_timeout = max(float(config_timeout_seconds), 35.0)
+    return httpx.Timeout(
+        timeout=float(config_timeout_seconds),
+        connect=float(config_timeout_seconds),
+        read=read_timeout,
+        write=float(config_timeout_seconds),
+        pool=float(config_timeout_seconds),
+    )
 
 
 async def _get_updates(client: httpx.AsyncClient, base_url: str, *, offset: int) -> list[dict[str, Any]]:
