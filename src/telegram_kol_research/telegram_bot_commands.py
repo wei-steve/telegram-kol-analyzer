@@ -240,6 +240,12 @@ def _process_expiry_action(
         if lifecycle is None:
             return f"未找到策略 #{lifecycle_id}。"
 
+        if lifecycle.lifecycle_status != "pending_entry":
+            return (
+                f"\u7b56\u7565 #{lifecycle_id} \u5df2\u4e0d\u662f\u5f85\u5165\u573a"
+                f"\uff08\u5f53\u524d: {lifecycle.lifecycle_status}\uff09\uff0c\u672c\u6b21\u64cd\u4f5c\u5df2\u5ffd\u7565\u3002"
+            )
+
         if command == EXPIRY_CONTINUE_COMMAND:
             lifecycle.lifecycle_status = "pending_entry"
             lifecycle.exit_reason = None

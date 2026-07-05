@@ -1221,7 +1221,10 @@ def _is_stale_unentered_lifecycle(lifecycle: Any, updated_at: datetime) -> bool:
         return False
     status = str(lifecycle.lifecycle_status or "")
     exit_reason = str(getattr(lifecycle, "exit_reason", None) or "")
+    management_action = str(getattr(lifecycle, "management_action", None) or "")
     if status == "entered":
+        return False
+    if status == "expired" and management_action == "expiry_expired_keep_order":
         return False
     if status == "exited" and exit_reason not in {"expired", "cancelled", "invalidated"}:
         return False

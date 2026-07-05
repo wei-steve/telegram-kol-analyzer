@@ -262,6 +262,38 @@ def test_process_system_operator_callback_data_dispatches_expiry_action(tmp_path
     assert lifecycle.management_action == "expiry_review_continued"
 
 
+def test_process_expiry_continue_does_not_revert_already_entered_strategy(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3251,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 2, 21, 0, tzinfo=UTC),
+            management_action="expiry_review_requested",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    response = process_system_operator_callback_data(
+        session_factory,
+        f"expiry_continue:{lifecycle_id}",
+        now=datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert "\u5df2\u4e0d\u662f\u5f85\u5165\u573a" in response
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.entered_at is not None
+    assert lifecycle.management_action == "expiry_review_requested"
+
+
 def test_process_expiry_expire_cancel_does_not_expire_while_live_binding_needs_cancel(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
