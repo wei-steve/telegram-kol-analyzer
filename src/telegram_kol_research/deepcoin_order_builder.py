@@ -85,9 +85,12 @@ def build_deepcoin_order_draft(
     market_entry_deviation_pct = _parse_optional_float(
         payload_preview.get("max_market_entry_deviation_pct")
     )
-    take_profit_prices = _parse_take_profit_prices(
-        payload_preview.get("take_profit"),
-        symbol=symbol,
+    take_profit_prices = _order_take_profit_prices(
+        position_side=position_side,
+        prices=_parse_take_profit_prices(
+            payload_preview.get("take_profit"),
+            symbol=symbol,
+        ),
     )
     take_profit_allocations = _normalize_take_profit_allocations(
         payload_preview.get("take_profit_allocations"),
@@ -348,33 +351,25 @@ def _parse_take_profit_prices(value: Any, *, symbol: str | None = None) -> list[
     if value in (None, ""):
         return []
     return extract_normalized_prices(value, symbol=symbol)
-    text = str(value)
-    for separator in ["/", ",", "，", " ", "~"]:
-        text = text.replace(separator, "-")
-    prices: list[float] = []
-    for part in text.split("-"):
-        stripped = part.strip()
-        if not stripped:
-            continue
-        try:
-            price = float(stripped)
-        except ValueError:
-            continue
-        if price > 0:
-            prices.append(price)
-    return prices
+
+
+def _order_take_profit_prices(*, position_side: str, prices: list[float]) -> list[float]:
+    reverse = position_side.lower() == "short"
+    return sorted((float(price) for price in prices if float(price) > 0), reverse=reverse)[:3]
 
 
 def _normalize_take_profit_allocations(value: Any, count: int) -> list[float]:
     if count <= 0:
         return []
+    if count == 1:
+        return [100.0]
     raw_items: list[Any]
     if isinstance(value, str):
         raw_items = value.replace("/", ",").replace("-", ",").split(",")
     elif isinstance(value, list):
         raw_items = value
     else:
-        raw_items = [50, 30, 20] if count == 3 else []
+        raw_items = [40, 30, 30] if count == 3 else []
     allocations: list[float] = []
     for item in raw_items[:count]:
         try:
@@ -383,6 +378,8 @@ def _normalize_take_profit_allocations(value: Any, count: int) -> list[float]:
             continue
         if parsed > 0:
             allocations.append(parsed)
+    if count == 2 and allocations == [40.0, 30.0]:
+        allocations = []
     if len(allocations) < count:
         allocations = [100 / count for _ in range(count)]
     total = sum(allocations)

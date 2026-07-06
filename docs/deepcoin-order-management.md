@@ -1,6 +1,6 @@
 # Deepcoin Order Management Notes
 
-Last checked: 2026-06-30.
+Last checked: 2026-07-05.
 
 Deepcoin API documentation pages are CloudFront-blocked from this environment, so these notes combine the official endpoint names already captured in `docs/context/telegram-deepcoin-auto-trading-context.md`, current project tests, the observed live payload shape from the execution dashboard, and guarded live probes against the server account.
 
@@ -9,7 +9,7 @@ Deepcoin API documentation pages are CloudFront-blocked from this environment, s
 - `POST /deepcoin/trade/order`: regular market/limit order. Market entry can create a position immediately, then protection should be applied with `set-position-sltp`.
 - `POST /deepcoin/trade/trigger-order`: trigger/conditional order. For our current limit-entry flow, the entry trigger order can include `tpTriggerPx`, `slTriggerPx`, `tpOrdPx=-1`, and `slOrdPx=-1`.
 - `POST /deepcoin/trade/cancel-trigger-order`: cancel a pending trigger / conditional order by `instId` and `ordId`.
-- `POST /deepcoin/trade/set-position-sltp`: add TP/SL on an existing position. Live testing showed repeated calls append additional TPSL rows instead of replacing old ones. In split position mode, always include the matched `posId`.
+- `POST /deepcoin/trade/set-position-sltp`: add TP/SL on an existing position. Live testing showed repeated calls append additional TPSL rows instead of replacing old ones. In split position mode, always include the matched `posId`. The official docs also expose `sz` for partial TP/SL; empty `sz` means the full position.
 - `POST /deepcoin/trade/replace-order-sltp`: documented for open-order TP/SL replacement, but server live probes rejected both normal limit and trigger-limit cases. Treat it as unavailable until a working Deepcoin payload is confirmed.
 - `GET /deepcoin/trade/orders-pending`: list pending regular orders. Use this to verify a regular limit order is still open or has disappeared after cancel.
 - `GET /deepcoin/trade/orders-history`: list historical regular orders. Server live probes confirmed this returns filled and cancelled regular orders, including market open/close rows.
@@ -84,7 +84,7 @@ Live probe findings:
 
 Supported queue actions:
 
-- `open_position`: existing entry path. Market entries place the order and then add position TP/SL. Limit entries use Deepcoin trigger orders with embedded TP/SL.
+- `open_position`: existing entry path. Market entries place the order and then add position TP/SL. Limit entries use Deepcoin trigger orders with embedded TP/SL. Multi-stage take-profit now sorts targets by nearest-first (`long`: low to high, `short`: high to low), uses `50/50` for two targets and `40/30/30` for three targets, and caps live submission at the first three targets. Market entries set a full-position stop loss first, then append partial TP rows with `sz`. Limit trigger entries are split into child trigger orders per TP target because there is no `posId` before the entry fills.
 - `set_position_tpsl`: first-time position protection only. This can add TP/SL when no old protection exists.
 - `adjust_position_tpsl`, `adjust_stop_loss`, `adjust_take_profit`: position protection adjustment. These require a matched old TPSL row, cancel all old matched position TPSL orders, preserve the unchanged TP or SL side, then call `set-position-sltp` once.
 - `close_position`, `exit_position`, `temporary_exit`, `temporary_close`: market close using the exact bound `closePosId`.

@@ -1,6 +1,6 @@
 # Project Workflow
 
-- Make code changes and run tests locally first.
+- Make code changes locally. Local checks are useful for syntax/unit coverage that does not require secrets or network identity, but real project verification must run on the server because the Telegram session, Deepcoin API IP allowlist, and production keys only work there.
 - Push reviewed local commits to GitHub on `codex/deepcoin-auto-trading-v1`.
 - Update production by pulling from GitHub on the server, reinstalling the editable package, and restarting `telegram-kol.service`.
 - Prefer the existing helper after pushing:
@@ -9,3 +9,7 @@
 powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1
 ```
 
+# Deepcoin API Docs
+
+- If the browser/web reader gets `403 Forbidden` for Deepcoin docs, retry from the local shell with PowerShell/.NET HTTP requests. The docs page `https://www.deepcoin.com/docs/zh/authentication` was confirmed readable from the local environment with HTTP `200 OK` on 2026-07-05.
+- The authentication page title is `接入指南 | DeepCoin API`. It documents API URL `https://api.deepcoin.com`, private REST headers `DC-ACCESS-KEY`, `DC-ACCESS-SIGN`, `DC-ACCESS-TIMESTAMP`, and `DC-ACCESS-PASSPHRASE`, and the signing string `timestamp + method + requestPath + body` using HMAC SHA256 with Base64 output.

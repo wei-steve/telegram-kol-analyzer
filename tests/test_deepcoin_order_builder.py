@@ -78,7 +78,7 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
             {
                 "index": 1,
                 "price": 69000.0,
-                "allocation_pct": 50.0,
+                "allocation_pct": 40.0,
                 "order_type": "market_on_trigger",
             },
             {
@@ -90,7 +90,7 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
             {
                 "index": 3,
                 "price": 71000.0,
-                "allocation_pct": 20.0,
+                "allocation_pct": 30.0,
                 "order_type": "market_on_trigger",
             },
         ],
@@ -124,6 +124,35 @@ def test_build_deepcoin_order_draft_uses_upper_edge_for_conservative_short_limit
     assert draft["order_legs"][1]["price"] == 68200.0
     assert draft["order_legs"][0]["side"] == "sell"
     assert draft["order_legs"][0]["position_side"] == "short"
+
+
+def test_build_deepcoin_order_draft_sorts_short_take_profit_from_nearest_to_farthest():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            open_side="sell",
+            position_side="short",
+            take_profit="57000 / 59000 / 58000",
+        )
+    )
+
+    assert [leg["price"] for leg in draft["take_profit_legs"]] == [
+        59000.0,
+        58000.0,
+        57000.0,
+    ]
+    assert [leg["allocation_pct"] for leg in draft["take_profit_legs"]] == [
+        40.0,
+        30.0,
+        30.0,
+    ]
+
+
+def test_build_deepcoin_order_draft_uses_equal_allocations_for_two_take_profits():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(take_profit="69000 / 70000"),
+    )
+
+    assert [leg["allocation_pct"] for leg in draft["take_profit_legs"]] == [50.0, 50.0]
 
 
 def test_build_deepcoin_order_draft_eager_long_uses_upper_edge_then_midpoint():
@@ -257,7 +286,7 @@ def test_build_deepcoin_order_draft_blocks_quantity_when_stop_loss_is_missing():
 
     assert draft["blocking_reason_codes"] == ["missing_stop_loss"]
     assert draft["order_legs"][0]["quantity"] is None
-    assert draft["take_profit_legs"][0]["allocation_pct"] == 50.0
+    assert draft["take_profit_legs"][0]["allocation_pct"] == 40.0
     assert draft["notes"] == [
         "offline_constructor_only",
         "default_cross_margin_split_position",

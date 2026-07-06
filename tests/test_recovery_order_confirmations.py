@@ -109,7 +109,9 @@ def test_confirm_recovery_order_dry_run_records_ready_confirmation_when_requeste
     rows = list_recovery_order_confirmations(session_factory)
     assert len(rows) == 1
     assert rows[0]["status"] == "ready_confirmed"
-    assert rows[0]["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 83.0
+    assert [
+        leg["quantity"] for leg in rows[0]["deepcoin_order_draft"]["order_legs"]
+    ] == [71.0, 83.0]
 
 
 def test_confirm_recovery_order_dry_run_does_not_record_when_blocked(tmp_path):

@@ -29,7 +29,7 @@ class TradingSettings:
     allowed_symbols: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
     symbol_max_loss_usdt: dict[str, float] = field(default_factory=dict)
     entry_range_order_style: str = "eager"
-    take_profit_allocations: list[float] = field(default_factory=lambda: [50.0, 30.0, 20.0])
+    take_profit_allocations: list[float] = field(default_factory=lambda: [40.0, 30.0, 30.0])
     move_stop_to_breakeven_after_tp1: bool = True
     allow_vision_auto_trade: bool = True
 

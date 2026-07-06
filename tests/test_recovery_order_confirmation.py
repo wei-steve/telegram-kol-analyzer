@@ -82,7 +82,10 @@ def test_confirm_recovery_order_dry_run_marks_verified_queue_item_ready(tmp_path
     assert result["reason_codes"] == []
     assert result["contract_spec_status"]["code"] == "verified"
     assert result["deepcoin_order_draft"]["order_legs"][0]["quantity_unit"] == "contracts"
-    assert result["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 83.0
+    assert [leg["quantity"] for leg in result["deepcoin_order_draft"]["order_legs"]] == [
+        71.0,
+        83.0,
+    ]
 
 
 def test_confirm_recovery_order_dry_run_blocks_without_contract_spec(tmp_path):

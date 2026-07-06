@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -242,7 +243,8 @@ def _submit_recovery_signal_direct(
     warnings = _protection_warnings(draft)
 
     selected_order_legs = order_legs[:max_order_legs] if max_order_legs else order_legs
-    for index, leg in enumerate(selected_order_legs, start=1):
+    submission_order_legs = _submission_order_legs(draft, selected_order_legs)
+    for index, leg in enumerate(submission_order_legs, start=1):
         if not isinstance(leg, dict):
             raise RecoveryLiveSubmitError("invalid_order_leg")
         order_type = str(leg.get("order_type") or "").lower()
@@ -271,13 +273,24 @@ def _submit_recovery_signal_direct(
                 exclude_pos_ids=pre_submit_position_ids,
             )
             try:
-                protection_payload = build_deepcoin_position_sltp_payload(
+                protection_payloads = build_deepcoin_position_sltp_payloads(
                     draft,
                     pos_id=pos_id,
+                    position_size=float(leg.get("quantity") or 0),
                 )
-                protection_response = deepcoin_client.set_position_sltp(protection_payload)
+                protection_responses = []
+                for payload in protection_payloads:
+                    protection_responses.append(deepcoin_client.set_position_sltp(payload))
+                protection_payload = (
+                    protection_payloads[0] if len(protection_payloads) == 1 else protection_payloads
+                )
+                protection_response = (
+                    protection_responses[0]
+                    if len(protection_responses) == 1
+                    else protection_responses
+                )
             except Exception as exc:  # pragma: no cover - defensive boundary
-                protection_payload = locals().get("protection_payload")
+                protection_payload = locals().get("protection_payloads") or locals().get("protection_payload")
                 protection_response = {"error": str(exc)}
                 warnings.append("position_protection_failed_after_entry_submitted")
         elif order_type == "limit":
@@ -336,8 +349,7 @@ def _submit_recovery_signal_direct(
         )
 
     protection_failed = any(
-        isinstance(order.get("protection_response"), dict)
-        and order["protection_response"].get("error")
+        _protection_response_has_error(order.get("protection_response"))
         for order in submitted_orders
     )
     binding_status = "active" if _join_ids(order["pos_id"] for order in submitted_orders) else "open"
@@ -412,6 +424,111 @@ def _submit_recovery_signal_direct(
         "deepcoin_order_draft": draft,
         "warnings": warnings,
     }
+
+
+def _submission_order_legs(
+    draft: dict[str, Any],
+    order_legs: list[Any],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for leg in order_legs:
+        if not isinstance(leg, dict):
+            result.append(leg)
+            continue
+        if str(leg.get("order_type") or "").lower() != "limit":
+            result.append(leg)
+            continue
+        take_profit_legs = draft.get("take_profit_legs")
+        if not isinstance(take_profit_legs, list) or len(take_profit_legs) <= 1:
+            result.append(leg)
+            continue
+        result.extend(_split_limit_entry_leg_by_take_profit(draft, leg, take_profit_legs))
+    return result
+
+
+def _split_limit_entry_leg_by_take_profit(
+    draft: dict[str, Any],
+    leg: dict[str, Any],
+    take_profit_legs: list[Any],
+) -> list[dict[str, Any]]:
+    quantity = leg.get("quantity")
+    if not isinstance(quantity, int | float) or quantity <= 0:
+        return [leg]
+    allocations = [
+        float(item.get("allocation_pct") or 0)
+        for item in take_profit_legs
+        if isinstance(item, dict) and float(item.get("allocation_pct") or 0) > 0
+    ]
+    if not allocations:
+        return [leg]
+    split_sizes = _split_quantity_by_allocations(
+        quantity=float(quantity),
+        allocations=allocations,
+        quantity_step=_quantity_step_from_draft(draft),
+    )
+    result: list[dict[str, Any]] = []
+    for index, (take_profit_leg, split_size) in enumerate(zip(take_profit_legs, split_sizes), start=1):
+        if not isinstance(take_profit_leg, dict) or split_size <= 0:
+            continue
+        child = dict(leg)
+        child["quantity"] = split_size
+        child["take_profit_leg"] = take_profit_leg
+        if leg.get("client_order_id"):
+            child["client_order_id"] = _take_profit_child_client_order_id(
+                str(leg["client_order_id"]),
+                index,
+            )
+        result.append(child)
+    return result or [leg]
+
+
+def _take_profit_child_client_order_id(parent_client_order_id: str, index: int) -> str:
+    suffix = f"T{index}"
+    return f"{parent_client_order_id[: 20 - len(suffix)]}{suffix}"
+
+
+def _split_quantity_by_allocations(
+    *,
+    quantity: float,
+    allocations: list[float],
+    quantity_step: float,
+) -> list[float]:
+    if quantity <= 0 or not allocations:
+        return []
+    step = quantity_step if quantity_step > 0 else 0.000001
+    sizes: list[float] = []
+    remaining = quantity
+    total = sum(allocations)
+    for allocation in allocations[:-1]:
+        raw_size = quantity * allocation / total
+        size = _round_down_to_step(raw_size, step)
+        sizes.append(size)
+        remaining -= size
+    sizes.append(_round_down_to_step(remaining, step))
+    return [float(f"{size:g}") for size in sizes]
+
+
+def _quantity_step_from_draft(draft: dict[str, Any]) -> float:
+    contract_spec = draft.get("contract_spec")
+    if isinstance(contract_spec, dict):
+        try:
+            return float(contract_spec.get("quantity_step") or 0.000001)
+        except (TypeError, ValueError):
+            pass
+    return 0.000001
+
+
+def _round_down_to_step(value: float, step: float) -> float:
+    rounded = math.floor((value / step) + 1e-12) * step
+    return float(f"{rounded:.12g}")
+
+
+def _protection_response_has_error(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value.get("error"))
+    if isinstance(value, list):
+        return any(_protection_response_has_error(item) for item in value)
+    return False
 
 
 def _record_submitted_order_legs(
@@ -551,15 +668,33 @@ def _record_submitted_order_events(
                 ),
             )
             protection_request = order.get("protection_request")
-            if isinstance(protection_request, dict):
+            protection_response = order.get("protection_response")
+            protection_requests = (
+                protection_request
+                if isinstance(protection_request, list)
+                else [protection_request]
+            )
+            protection_responses = (
+                protection_response
+                if isinstance(protection_response, list)
+                else [protection_response]
+            )
+            for item_index, request_item in enumerate(protection_requests):
+                if not isinstance(request_item, dict):
+                    continue
+                response_item = (
+                    protection_responses[item_index]
+                    if item_index < len(protection_responses)
+                    else protection_response
+                )
                 record_execution_event(
                     session_factory,
                     ExecutionEventRecord(
                         action="set_position_tpsl",
                         reason="entry_protection",
-                        after=_extract_tpsl_snapshot(protection_request),
-                        request=protection_request,
-                        response=order.get("protection_response"),
+                        after=_extract_tpsl_snapshot(request_item),
+                        request=request_item,
+                        response=response_item if isinstance(response_item, dict) else None,
                         related_order_id=base["order_id"],
                         **base,
                     ),
@@ -678,7 +813,8 @@ def build_deepcoin_trigger_order_payload(
     }
     if leg.get("client_order_id"):
         payload["clOrdId"] = str(leg.get("client_order_id"))
-    payload.update(_deepcoin_embedded_sltp_fields(draft))
+    take_profit_leg = leg.get("take_profit_leg") if isinstance(leg.get("take_profit_leg"), dict) else None
+    payload.update(_deepcoin_embedded_sltp_fields(draft, take_profit_leg=take_profit_leg))
     return payload
 
 
@@ -719,8 +855,88 @@ def build_deepcoin_position_sltp_payload(
     return payload
 
 
-def _deepcoin_embedded_sltp_fields(draft: dict[str, Any]) -> dict[str, Any]:
+def build_deepcoin_position_sltp_payloads(
+    draft: dict[str, Any],
+    *,
+    pos_id: str | None,
+    position_size: float,
+) -> list[dict[str, Any]]:
+    """Build one full-position SL payload plus partial TP payloads when needed."""
+
+    base_payload = _deepcoin_position_sltp_base_payload(draft, pos_id=pos_id)
+    payloads: list[dict[str, Any]] = []
+    take_profit_legs = draft.get("take_profit_legs")
+    if not isinstance(take_profit_legs, list) or len(take_profit_legs) <= 1:
+        return [build_deepcoin_position_sltp_payload(draft, pos_id=pos_id)]
+    stop_loss = draft.get("stop_loss")
+    if isinstance(stop_loss, int | float) and stop_loss > 0:
+        payloads.append(
+            {
+                **base_payload,
+                "slTriggerPx": str(stop_loss),
+                "slTriggerPxType": "last",
+                "slOrdPx": "-1",
+            }
+        )
+    allocations = [
+        float(item.get("allocation_pct") or 0)
+        for item in take_profit_legs
+        if isinstance(item, dict) and float(item.get("allocation_pct") or 0) > 0
+    ]
+    sizes = _split_quantity_by_allocations(
+        quantity=float(position_size),
+        allocations=allocations,
+        quantity_step=_quantity_step_from_draft(draft),
+    )
+    for take_profit_leg, size in zip(take_profit_legs, sizes):
+        if not isinstance(take_profit_leg, dict) or size <= 0:
+            continue
+        take_profit_price = take_profit_leg.get("price")
+        if not isinstance(take_profit_price, int | float) or take_profit_price <= 0:
+            raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
+        payloads.append(
+            {
+                **base_payload,
+                "tpTriggerPx": str(float(take_profit_price)),
+                "tpTriggerPxType": "last",
+                "tpOrdPx": "-1",
+                "sz": f"{size:g}",
+            }
+        )
+    if not payloads:
+        raise RecoveryLiveSubmitError("missing_tpsl_for_protection")
+    return payloads
+
+
+def _deepcoin_position_sltp_base_payload(
+    draft: dict[str, Any],
+    *,
+    pos_id: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "instType": "SWAP",
+        "instId": str(draft["instrument_id"]),
+        "posSide": _position_side_from_draft(draft),
+        "mrgPosition": _deepcoin_position_mode(str(draft.get("position_mode") or "split")),
+        "tdMode": _deepcoin_margin_mode(str(draft.get("margin_mode") or "cross")),
+    }
+    if payload["mrgPosition"] == "split":
+        if not pos_id:
+            raise RecoveryLiveSubmitError("missing_pos_id_for_split_position_sltp")
+        payload["posId"] = str(pos_id)
+    return payload
+
+
+def _deepcoin_embedded_sltp_fields(
+    draft: dict[str, Any],
+    take_profit_leg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     protection = build_deepcoin_position_sltp_payload(draft, pos_id="placeholder")
+    if take_profit_leg is not None:
+        take_profit_price = take_profit_leg.get("price")
+        if not isinstance(take_profit_price, int | float) or take_profit_price <= 0:
+            raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
+        protection["tpTriggerPx"] = str(float(take_profit_price))
     fields = {
         "slTriggerPx": float(protection["slTriggerPx"]),
         "slTriggerPxType": protection["slTriggerPxType"],
@@ -753,9 +969,6 @@ def _first_take_profit_price(draft: dict[str, Any]) -> float | None:
 
 
 def _protection_warnings(draft: dict[str, Any]) -> list[str]:
-    take_profit_legs = draft.get("take_profit_legs")
-    if isinstance(take_profit_legs, list) and len(take_profit_legs) > 1:
-        return ["only_first_take_profit_submitted_for_order_sltp"]
     return []
 
 

@@ -94,7 +94,7 @@ def test_recovery_execution_preview_lists_approved_limit_orders_only(tmp_path):
                 "entry_range": "68000-68200",
                 "stop_loss": "67500",
                 "take_profit": None,
-                "take_profit_allocations": [50.0, 30.0, 20.0],
+                "take_profit_allocations": [40.0, 30.0, 30.0],
                 "entry_range_order_style": "eager",
                 "risk_budget_usdt": 100.0,
                 "source": {

@@ -18,7 +18,7 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.allowed_symbols == ["BTC", "ETH"]
     assert settings.entry_range_order_style == "eager"
     assert settings.nearby_entry_market_deviation_pct == 0.15
-    assert settings.take_profit_allocations == [50.0, 30.0, 20.0]
+    assert settings.take_profit_allocations == [40.0, 30.0, 30.0]
     assert settings.allow_vision_auto_trade is True
 
 

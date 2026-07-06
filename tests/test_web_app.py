@@ -1933,14 +1933,21 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
 
     assert response.status_code == 200
     assert response.json()["submitted"] is True
-    assert response.json()["order_count"] == 2
+    assert response.json()["order_count"] == 4
     assert fake_client.payloads == []
     assert [payload["orderType"] for payload in fake_client.trigger_payloads] == [
         "limit",
         "limit",
+        "limit",
+        "limit",
     ]
     assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
-    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0
+    assert [payload["tpTriggerPx"] for payload in fake_client.trigger_payloads] == [
+        69000.0,
+        70000.0,
+        69000.0,
+        70000.0,
+    ]
     assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
 
 
