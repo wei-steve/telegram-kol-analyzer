@@ -372,6 +372,40 @@ body {
   background: #3b82f6;
 }
 
+.exchange-view-switch {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.45);
+  overflow-x: auto;
+}
+
+.exchange-view-button {
+  min-height: 30px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 0.78rem;
+  font-weight: 800;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.exchange-view-button:hover {
+  color: #e5e7eb;
+}
+
+.exchange-view-button.is-active {
+  background: rgba(59, 130, 246, 0.22);
+  color: #f8fafc;
+}
+
 .exchange-tab-panels {
   min-height: 0;
 }
@@ -381,6 +415,14 @@ body {
 }
 
 .exchange-tab-panel.is-active {
+  display: block;
+}
+
+.exchange-view-panel {
+  display: none;
+}
+
+.exchange-view-panel.is-active {
   display: block;
 }
 
@@ -449,6 +491,88 @@ body {
   border-radius: 999px;
   padding: 3px 8px;
   background: rgba(30, 41, 59, 0.65);
+}
+
+.exchange-attribution {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: #cbd5e1;
+  font-size: 0.78rem;
+}
+
+.exchange-attribution span,
+.exchange-attribution code,
+.exchange-attribution small {
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: rgba(30, 41, 59, 0.65);
+}
+
+.exchange-attribution small {
+  color: #94a3b8;
+}
+
+.exchange-attribution-chip {
+  font-weight: 900;
+}
+
+.exchange-attribution--bound .exchange-attribution-chip {
+  color: #bbf7d0;
+  background: rgba(22, 101, 52, 0.36);
+}
+
+.exchange-attribution--candidate .exchange-attribution-chip {
+  color: #fde68a;
+  background: rgba(120, 53, 15, 0.36);
+}
+
+.exchange-attribution--unassigned .exchange-attribution-chip {
+  color: #cbd5e1;
+  background: rgba(71, 85, 105, 0.46);
+}
+
+.exchange-group-list {
+  display: grid;
+  gap: 14px;
+  padding-bottom: 48px;
+}
+
+.exchange-group-section {
+  display: grid;
+  gap: 10px;
+}
+
+.exchange-group-section .exchange-card-list {
+  padding-bottom: 0;
+}
+
+.exchange-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.62);
+}
+
+.exchange-group-header strong {
+  min-width: 0;
+  color: #e5e7eb;
+  font-size: 0.9rem;
+}
+
+.exchange-group-header span {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: rgba(59, 130, 246, 0.16);
+  color: #bfdbfe;
+  font-size: 0.76rem;
+  font-weight: 900;
 }
 
 .exchange-warning-row code {

@@ -1076,6 +1076,8 @@ function bindExchangePositionTabs() {
   document.querySelectorAll('[data-exchange-position-tabs]').forEach((root) => {
     const tabs = root.querySelectorAll('[data-exchange-position-tab]');
     const panels = root.querySelectorAll('[data-exchange-position-panel]');
+    const viewButtons = root.querySelectorAll('[data-exchange-view-mode]');
+    const viewPanels = root.querySelectorAll('[data-exchange-view-panel]');
     tabs.forEach((tab) => {
       tab.addEventListener('click', () => {
         const target = tab.dataset.exchangePositionTab;
@@ -1086,6 +1088,19 @@ function bindExchangePositionTabs() {
         });
         panels.forEach((panel) => {
           panel.classList.toggle('is-active', panel.dataset.exchangePositionPanel === target);
+        });
+      });
+    });
+    viewButtons.forEach((button) => {
+      button.addEventListener('click', () => {
+        const mode = button.dataset.exchangeViewMode || 'list';
+        viewButtons.forEach((item) => {
+          const isActive = item === button;
+          item.classList.toggle('is-active', isActive);
+          item.setAttribute('aria-selected', isActive ? 'true' : 'false');
+        });
+        viewPanels.forEach((panel) => {
+          panel.classList.toggle('is-active', panel.dataset.exchangeViewPanel === mode);
         });
       });
     });

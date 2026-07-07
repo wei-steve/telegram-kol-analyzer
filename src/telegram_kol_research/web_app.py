@@ -532,6 +532,283 @@ def _load_exchange_position_snapshot(
     return snapshot
 
 
+def _annotate_exchange_snapshot_attribution(
+    snapshot: dict[str, Any],
+    *,
+    holding_positions: list[dict[str, Any]],
+    pending_entry_signals: list[dict[str, Any]],
+    exited_positions: list[dict[str, Any]],
+    group_label_by_chat_id: dict[int, str],
+) -> dict[str, Any]:
+    for item in snapshot.get("positions", []):
+        item["attribution"] = _exchange_item_attribution(
+            item,
+            candidates=[*holding_positions, *pending_entry_signals],
+            group_label_by_chat_id=group_label_by_chat_id,
+            default_order_role=None,
+        )
+    for item in snapshot.get("open_orders", []):
+        item["attribution"] = _exchange_item_attribution(
+            item,
+            candidates=[*pending_entry_signals, *holding_positions],
+            group_label_by_chat_id=group_label_by_chat_id,
+            default_order_role=_infer_exchange_order_role(item),
+        )
+    for item in snapshot.get("order_history", []):
+        item["attribution"] = _exchange_item_attribution(
+            item,
+            candidates=[*exited_positions, *holding_positions, *pending_entry_signals],
+            group_label_by_chat_id=group_label_by_chat_id,
+            default_order_role=_infer_exchange_order_role(item),
+        )
+    for item in snapshot.get("position_history", []):
+        item["attribution"] = _exchange_item_attribution(
+            item,
+            candidates=exited_positions,
+            group_label_by_chat_id=group_label_by_chat_id,
+            default_order_role=None,
+        )
+    snapshot["grouped"] = {
+        "positions": _group_exchange_items(snapshot.get("positions", [])),
+        "open_orders": _group_exchange_items(snapshot.get("open_orders", [])),
+        "order_history": _group_exchange_items(snapshot.get("order_history", [])),
+        "position_history": _group_exchange_items(snapshot.get("position_history", [])),
+    }
+    return snapshot
+
+
+def _exchange_item_attribution(
+    item: dict[str, Any],
+    *,
+    candidates: list[dict[str, Any]],
+    group_label_by_chat_id: dict[int, str],
+    default_order_role: str | None,
+) -> dict[str, Any]:
+    bound = _bound_exchange_attribution(
+        item,
+        group_label_by_chat_id=group_label_by_chat_id,
+        default_order_role=default_order_role,
+    )
+    if bound is not None:
+        return bound
+    candidate = _candidate_exchange_attribution(
+        item,
+        candidates=candidates,
+        group_label_by_chat_id=group_label_by_chat_id,
+        default_order_role=default_order_role,
+    )
+    if candidate is not None:
+        return candidate
+    return {
+        "state": "unassigned",
+        "label": "未归属",
+        "chat_id": None,
+        "group_name": "未归属",
+        "strategy_id": None,
+        "strategy_summary": "",
+        "source_excerpt": "",
+        "score": 0,
+        "reasons": [],
+        "order_role": default_order_role,
+    }
+
+
+def _bound_exchange_attribution(
+    item: dict[str, Any],
+    *,
+    group_label_by_chat_id: dict[int, str],
+    default_order_role: str | None,
+) -> dict[str, Any] | None:
+    chat_id = item.get("chat_id")
+    if chat_id in (None, ""):
+        return None
+    try:
+        chat_id_int = int(chat_id)
+    except (TypeError, ValueError):
+        chat_id_int = None
+    group_name = (
+        group_label_by_chat_id.get(chat_id_int)
+        if chat_id_int is not None
+        else None
+    ) or str(item.get("group_label") or item.get("sender_name") or f"群组 {chat_id}")
+    return {
+        "state": "bound",
+        "label": "已绑定",
+        "chat_id": chat_id,
+        "group_name": group_name,
+        "strategy_id": item.get("lifecycle_id") or item.get("message_id"),
+        "strategy_summary": _strategy_summary(item),
+        "source_excerpt": _strategy_excerpt(item),
+        "score": 100,
+        "reasons": ["已有绑定"],
+        "order_role": default_order_role,
+    }
+
+
+def _candidate_exchange_attribution(
+    item: dict[str, Any],
+    *,
+    candidates: list[dict[str, Any]],
+    group_label_by_chat_id: dict[int, str],
+    default_order_role: str | None,
+) -> dict[str, Any] | None:
+    scored: list[tuple[int, dict[str, Any], list[str]]] = []
+    for candidate in candidates:
+        score, reasons = _score_exchange_candidate(item, candidate)
+        if score > 0:
+            scored.append((score, candidate, reasons))
+    if not scored:
+        return None
+    scored.sort(key=lambda entry: entry[0], reverse=True)
+    best_score, best_candidate, reasons = scored[0]
+    is_tied = len(scored) > 1 and scored[1][0] == best_score
+    if best_score < 75 or is_tied:
+        return None
+    chat_id = best_candidate.get("chat_id")
+    try:
+        chat_id_int = int(chat_id) if chat_id not in (None, "") else None
+    except (TypeError, ValueError):
+        chat_id_int = None
+    group_name = (
+        group_label_by_chat_id.get(chat_id_int)
+        if chat_id_int is not None
+        else None
+    ) or str(best_candidate.get("sender_name") or f"群组 {chat_id}")
+    return {
+        "state": "candidate",
+        "label": "可能归属",
+        "chat_id": chat_id,
+        "group_name": group_name,
+        "strategy_id": best_candidate.get("lifecycle_id")
+        or best_candidate.get("message_id"),
+        "strategy_summary": _strategy_summary(best_candidate),
+        "source_excerpt": _strategy_excerpt(best_candidate),
+        "score": best_score,
+        "reasons": reasons,
+        "order_role": default_order_role,
+    }
+
+
+def _score_exchange_candidate(
+    item: dict[str, Any],
+    candidate: dict[str, Any],
+) -> tuple[int, list[str]]:
+    item_symbol = str(item.get("symbol") or _symbol_from_deepcoin_inst_id(item.get("inst_id")) or "").upper()
+    candidate_symbol = str(candidate.get("symbol") or "").upper()
+    item_side = str(item.get("side") or "")
+    candidate_side = str(candidate.get("side") or "")
+    score = 0
+    reasons: list[str] = []
+    if item_symbol and candidate_symbol and item_symbol == candidate_symbol:
+        score += 45
+        reasons.append("币种一致")
+    else:
+        return 0, []
+    if item_side and candidate_side and item_side == candidate_side:
+        score += 25
+        reasons.append("方向一致")
+    else:
+        return 0, []
+    item_price = _exchange_item_price(item)
+    candidate_prices = _strategy_price_values(candidate)
+    if item_price is not None and candidate_prices:
+        closest = min(abs(item_price - price) for price in candidate_prices)
+        denominator = max(abs(item_price), 1.0)
+        if closest / denominator <= 0.002:
+            score += 30
+            reasons.append("价格接近")
+        elif closest / denominator <= 0.01:
+            score += 15
+            reasons.append("价格相近")
+    return score, reasons
+
+
+def _strategy_summary(item: dict[str, Any]) -> str:
+    symbol = str(item.get("symbol") or _symbol_from_deepcoin_inst_id(item.get("inst_id")) or "").upper()
+    side = str(item.get("side") or "")
+    parts = [part for part in [symbol, side] if part]
+    entry = item.get("entry_range_text") or item.get("entry_text")
+    if entry:
+        parts.append(f"entry {entry}")
+    stop_loss = item.get("stop_loss_text") or item.get("stop_loss")
+    if stop_loss:
+        parts.append(f"SL {stop_loss}")
+    take_profit = item.get("take_profit_text") or item.get("take_profit")
+    if take_profit:
+        parts.append(f"TP {take_profit}")
+    return " ".join(str(part) for part in parts)
+
+
+def _strategy_excerpt(item: dict[str, Any]) -> str:
+    text = str(item.get("original_text") or item.get("text") or "")
+    return text[:90]
+
+
+def _exchange_item_price(item: dict[str, Any]) -> float | None:
+    for key in ("entry_price_actual", "price_text", "entry_text"):
+        value = _float_or_none(item.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _strategy_price_values(item: dict[str, Any]) -> list[float]:
+    values: list[float] = []
+    for key in (
+        "entry_price_actual",
+        "entry_range_low",
+        "entry_range_high",
+        "stop_loss",
+        "take_profit",
+        "entry_text",
+        "entry_range_text",
+        "stop_loss_text",
+        "take_profit_text",
+    ):
+        raw_value = item.get(key)
+        if raw_value in (None, ""):
+            continue
+        if isinstance(raw_value, int | float):
+            values.append(float(raw_value))
+            continue
+        values.extend(float(match) for match in re.findall(r"\d+(?:\.\d+)?", str(raw_value)))
+    return values
+
+
+def _group_exchange_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for item in items:
+        attr = item.get("attribution") or {}
+        key = str(attr.get("chat_id") or "unassigned")
+        if key not in groups:
+            group_name = str(attr.get("group_name") or "未归属")
+            groups[key] = {
+                "key": key,
+                "group_name": group_name,
+                "state": attr.get("state") or "unassigned",
+                "items": [],
+            }
+            order.append(key)
+        groups[key]["items"].append(item)
+    return [groups[key] for key in order]
+
+
+def _infer_exchange_order_role(item: dict[str, Any]) -> str | None:
+    source = str(item.get("source") or "").lower()
+    order_type = str(item.get("order_type") or "").lower()
+    price = str(item.get("price_text") or "")
+    if "tpsl" in order_type or "trigger" in source or "触发" in str(item.get("source") or ""):
+        if price:
+            return "触发委托"
+        return "条件委托"
+    if "market" in order_type:
+        return "市价委托"
+    if "limit" in order_type:
+        return "限价委托"
+    return None
+
+
 def _safe_deepcoin_list(client, method_name: str, *, inst_id: str | None = None) -> list[dict[str, Any]]:
     method = getattr(client, method_name, None)
     if method is None:
@@ -1522,14 +1799,22 @@ def create_web_app(
             exited_positions=exited_positions,
         )
         trading_settings = load_trading_settings(app.state.session_factory)
+        group_label_by_chat_id = _group_label_by_chat_id(app.state.group_config)
         exchange_snapshot = _load_exchange_position_snapshot(
             app.state.session_factory,
             deepcoin_client_factory=app.state.deepcoin_client_factory,
-            group_label_by_chat_id=_group_label_by_chat_id(app.state.group_config),
+            group_label_by_chat_id=group_label_by_chat_id,
             pending_entry_signals=pending_entry_signals,
             trading_settings=trading_settings,
         )
         exchange_snapshot["position_history"] = exited_positions
+        exchange_snapshot = _annotate_exchange_snapshot_attribution(
+            exchange_snapshot,
+            holding_positions=holding_positions,
+            pending_entry_signals=pending_entry_signals,
+            exited_positions=exited_positions,
+            group_label_by_chat_id=group_label_by_chat_id,
+        )
         ai_recognition_config = load_ai_recognition_config(
             app.state.ai_recognition_config_path
         )

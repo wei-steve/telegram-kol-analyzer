@@ -247,6 +247,238 @@ def test_exchange_position_tab_uses_deepcoin_account_snapshot(tmp_path):
     assert "order trigger-hist-1" in response.text
 
 
+def test_exchange_position_attribution_shows_bound_group_and_grouped_view(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=56,
+            posted_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+            sender_name="alice",
+            text="BTC long Entry 62400 SL 60800 TP 63600",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            entry_text="62400",
+            stop_loss_text="60800",
+            take_profit_text="63600",
+            parse_source="text_ai",
+            confidence=0.91,
+            review_status="pending",
+        )
+        session.add(candidate)
+        session.flush()
+        binding = ExecutionBinding(
+            kol_id="group:100",
+            chat_id=100,
+            message_id=56,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            order_id="order-56",
+            pos_id="pos-live-1",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                execution_binding_id=binding.id,
+                chat_id=100,
+                message_id=56,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=raw_message.posted_at,
+                entered_at=raw_message.posted_at,
+                entry_range_low=62400,
+                entry_range_high=62400,
+                entry_price_actual=62400,
+                stop_loss=60800,
+                take_profit="63600",
+            )
+        )
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTCUSDT",
+                    "posId": "pos-live-1",
+                    "posSide": "long",
+                    "pos": "0.01",
+                    "avgPx": "62400",
+                }
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+    client = TestClient(
+        create_web_app(
+            database_path=database_path,
+            group_config=GroupConfig(
+                groups=[
+                    TargetGroupConfig(
+                        chat_title="Alpha Group",
+                        chat_id=100,
+                        ai_strategy_enabled=True,
+                        trading_mode="auto_trade",
+                    )
+                ]
+            ),
+            deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        )
+    )
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'data-exchange-view-mode="list"' in response.text
+    assert 'data-exchange-view-mode="grouped"' in response.text
+    assert "已绑定" in response.text
+    assert "Alpha Group" in response.text
+    assert "BTC long" in response.text
+    assert 'data-exchange-group-section' in response.text
+
+
+def test_exchange_current_order_candidate_attribution(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=200,
+            message_id=10,
+            posted_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+            sender_name="bravo",
+            text="BTC long 62400-62500 SL 61800 TP 63600",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            entry_text="62400-62500",
+            stop_loss_text="61800",
+            take_profit_text="63600",
+            parse_source="text_ai",
+            confidence=0.91,
+            review_status="pending",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=200,
+                message_id=10,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="pending_entry",
+                signal_at=raw_message.posted_at,
+                entry_range_low=62400,
+                entry_range_high=62500,
+                stop_loss=61800,
+                take_profit="63600",
+            )
+        )
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def list_open_orders(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTCUSDT",
+                    "ordId": "candidate-order-1",
+                    "side": "long",
+                    "ordType": "limit",
+                    "state": "live",
+                    "px": "62420",
+                    "sz": "10",
+                }
+            ]
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+    client = TestClient(
+        create_web_app(
+            database_path=database_path,
+            group_config=GroupConfig(
+                groups=[
+                    TargetGroupConfig(
+                        chat_title="Bravo Group",
+                        chat_id=200,
+                        ai_strategy_enabled=True,
+                        trading_mode="auto_trade",
+                    )
+                ]
+            ),
+            deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        )
+    )
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "可能归属" in response.text
+    assert "Bravo Group" in response.text
+    assert "BTC long entry 62400-62500" in response.text
+    assert "order candidate-order-1" in response.text
+    assert 'data-exchange-group-section' in response.text
+
+
+def test_exchange_unmatched_order_stays_unassigned(tmp_path):
+    database_path = tmp_path / "research.db"
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def list_open_orders(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "ETHUSDT",
+                    "ordId": "unmatched-order-1",
+                    "side": "short",
+                    "ordType": "limit",
+                    "state": "live",
+                    "px": "2500",
+                    "sz": "1",
+                }
+            ]
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+    client = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        )
+    )
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "未归属" in response.text
+    assert "order unmatched-order-1" in response.text
+    assert 'data-exchange-group-section' in response.text
+
+
 def test_index_page_renders_media_as_compact_preview_links(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
