@@ -463,6 +463,211 @@ def _load_deepcoin_live_position_rows(
         return rows
 
 
+def _load_exchange_position_snapshot(
+    session_factory,
+    *,
+    deepcoin_client_factory,
+    group_label_by_chat_id: dict[int, str],
+    pending_entry_signals: list[dict[str, Any]],
+    trading_settings,
+    order_limit: int = 100,
+) -> dict[str, Any]:
+    """Load the exchange-style dashboard snapshot from Deepcoin read APIs."""
+
+    positions = _load_deepcoin_live_position_rows(
+        session_factory,
+        deepcoin_client_factory=deepcoin_client_factory,
+        group_label_by_chat_id=group_label_by_chat_id,
+    )
+    snapshot: dict[str, Any] = {
+        "positions": positions,
+        "open_orders": [],
+        "order_history": [],
+        "position_history": [],
+        "error": None,
+    }
+    try:
+        client = deepcoin_client_factory()
+    except Exception as exc:
+        logger.exception("Deepcoin exchange snapshot client creation failed")
+        snapshot["error"] = str(exc)
+        return snapshot
+
+    raw_open_orders = _safe_deepcoin_list(client, "list_open_orders")
+    raw_order_history = _safe_deepcoin_list(client, "list_order_history")
+    instruments = _exchange_snapshot_instrument_ids(
+        positions=positions,
+        open_orders=raw_open_orders,
+        order_history=raw_order_history,
+        pending_entry_signals=pending_entry_signals,
+        allowed_symbols=getattr(trading_settings, "allowed_symbols", []),
+    )
+    raw_trigger_orders: list[dict[str, Any]] = []
+    raw_trigger_history: list[dict[str, Any]] = []
+    for inst_id in sorted(instruments):
+        raw_trigger_orders.extend(
+            _safe_deepcoin_list(client, "list_trigger_orders_pending", inst_id=inst_id)
+        )
+        raw_trigger_history.extend(
+            _safe_deepcoin_list(client, "list_trigger_order_history", inst_id=inst_id)
+        )
+
+    snapshot["open_orders"] = _dedupe_exchange_rows(
+        [
+            *(_exchange_order_row(order, source="普通委托") for order in raw_open_orders),
+            *(_exchange_order_row(order, source="触发委托") for order in raw_trigger_orders),
+        ],
+        limit=order_limit,
+    )
+    snapshot["order_history"] = _dedupe_exchange_rows(
+        [
+            *(_exchange_order_row(order, source="历史委托") for order in raw_order_history),
+            *(
+                _exchange_order_row(order, source="触发历史")
+                for order in raw_trigger_history
+            ),
+        ],
+        limit=order_limit,
+    )
+    return snapshot
+
+
+def _safe_deepcoin_list(client, method_name: str, *, inst_id: str | None = None) -> list[dict[str, Any]]:
+    method = getattr(client, method_name, None)
+    if method is None:
+        return []
+    try:
+        rows = method(inst_id=inst_id) if inst_id else method()
+    except TypeError:
+        try:
+            rows = method()
+        except Exception:
+            logger.exception("Deepcoin %s load failed", method_name)
+            return []
+    except Exception:
+        logger.exception("Deepcoin %s load failed", method_name)
+        return []
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def _exchange_snapshot_instrument_ids(
+    *,
+    positions: list[dict[str, Any]],
+    open_orders: list[dict[str, Any]],
+    order_history: list[dict[str, Any]],
+    pending_entry_signals: list[dict[str, Any]],
+    allowed_symbols: list[str],
+) -> set[str]:
+    instruments: set[str] = set()
+    for row in [*positions, *open_orders, *order_history]:
+        inst_id = _exchange_inst_id(row)
+        if inst_id:
+            instruments.add(inst_id)
+    for item in pending_entry_signals:
+        symbol = str(item.get("symbol") or "").upper().strip()
+        if symbol:
+            instruments.add(_symbol_to_deepcoin_inst_id(symbol))
+    for symbol in allowed_symbols or []:
+        symbol_text = str(symbol or "").upper().strip()
+        if symbol_text:
+            instruments.add(_symbol_to_deepcoin_inst_id(symbol_text))
+    return {inst_id for inst_id in instruments if inst_id}
+
+
+def _exchange_order_row(order: dict[str, Any], *, source: str) -> dict[str, Any]:
+    inst_id = _exchange_inst_id(order)
+    return {
+        "source": source,
+        "inst_id": inst_id,
+        "symbol": _symbol_from_deepcoin_inst_id(inst_id),
+        "side": _normalize_deepcoin_position_side(order.get("posSide") or order.get("side")),
+        "order_id": _first_position_string(
+            order,
+            "ordId",
+            "orderId",
+            "order_id",
+            "algoId",
+            "triggerOrderId",
+            "id",
+        ),
+        "client_order_id": _first_position_string(
+            order,
+            "clOrdId",
+            "clientOrderId",
+            "client_order_id",
+        ),
+        "order_type": _first_position_string(
+            order,
+            "ordType",
+            "orderType",
+            "triggerOrderType",
+            "type",
+        ),
+        "status": _first_position_string(order, "state", "status", "orderStatus"),
+        "price_text": _position_text_value(
+            _first_exchange_value(
+                order,
+                "px",
+                "price",
+                "ordPx",
+                "triggerPrice",
+                "slTriggerPrice",
+                "tpTriggerPrice",
+            )
+        ),
+        "size_text": _position_text_value(
+            _first_exchange_value(order, "sz", "size", "qty", "quantity")
+        ),
+        "created_at": _first_position_string(order, "cTime", "createdAt", "createTime"),
+        "updated_at": _first_position_string(order, "uTime", "updatedAt", "updateTime"),
+    }
+
+
+def _dedupe_exchange_rows(rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, str]] = set()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        identity = (
+            str(row.get("source") or ""),
+            str(row.get("order_id") or ""),
+            str(row.get("client_order_id") or ""),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(row)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _exchange_inst_id(row: dict[str, Any]) -> str:
+    inst_id = str(row.get("instId") or row.get("instrument_id") or "").upper().strip()
+    if inst_id:
+        return _symbol_to_deepcoin_inst_id(inst_id)
+    symbol = str(row.get("symbol") or "").upper().strip()
+    return _symbol_to_deepcoin_inst_id(symbol) if symbol else ""
+
+
+def _symbol_to_deepcoin_inst_id(symbol: str) -> str:
+    text = str(symbol or "").upper().strip()
+    if not text:
+        return ""
+    if text.endswith("-USDT-SWAP"):
+        return text
+    if text.endswith("USDT"):
+        return f"{text[:-4]}-USDT-SWAP"
+    return f"{text}-USDT-SWAP"
+
+
+def _first_exchange_value(order: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = order.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def _load_deepcoin_tpsl_orders_by_position_key(
     deepcoin_client,
     positions: list[dict[str, Any]],
@@ -1316,10 +1521,18 @@ def create_web_app(
             pending_entry_signals=pending_entry_signals,
             exited_positions=exited_positions,
         )
+        trading_settings = load_trading_settings(app.state.session_factory)
+        exchange_snapshot = _load_exchange_position_snapshot(
+            app.state.session_factory,
+            deepcoin_client_factory=app.state.deepcoin_client_factory,
+            group_label_by_chat_id=_group_label_by_chat_id(app.state.group_config),
+            pending_entry_signals=pending_entry_signals,
+            trading_settings=trading_settings,
+        )
+        exchange_snapshot["position_history"] = exited_positions
         ai_recognition_config = load_ai_recognition_config(
             app.state.ai_recognition_config_path
         )
-        trading_settings = load_trading_settings(app.state.session_factory)
         return templates.TemplateResponse(
             request,
             "index.html",
@@ -1344,6 +1557,7 @@ def create_web_app(
                 "refresh_mode_label": refresh_mode_label,
                 "trader_dashboard": trader_dashboard,
                 "strategy_kpi": strategy_kpi,
+                "exchange_snapshot": exchange_snapshot,
                 "ai_recognition_config": ai_recognition_config,
                 "ai_prompt_views": build_ai_prompt_views(ai_recognition_config),
                 "recognition_profiles": list_recognition_profiles(),

@@ -150,6 +150,103 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "<summary>" in msgs_resp.text
 
 
+def test_exchange_position_tab_uses_deepcoin_account_snapshot(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=77,
+                message_id=1,
+                posted_at=datetime(2026, 4, 2, tzinfo=UTC),
+                text="hello web",
+            )
+        )
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTCUSDT",
+                    "posId": "pos-live-1",
+                    "posSide": "long",
+                    "pos": "0.01",
+                    "avgPx": "63200",
+                }
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTCUSDT",
+                    "ordId": "limit-1",
+                    "side": "buy",
+                    "ordType": "limit",
+                    "state": "live",
+                    "px": "63100",
+                    "sz": "10",
+                }
+            ]
+
+        def list_order_history(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTCUSDT",
+                    "ordId": "hist-1",
+                    "side": "sell",
+                    "ordType": "market",
+                    "state": "filled",
+                    "px": "63300",
+                    "sz": "10",
+                }
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [
+                {
+                    "instId": inst_id,
+                    "ordId": "trigger-1",
+                    "side": "sell",
+                    "triggerOrderType": "TPSL",
+                    "state": "live",
+                    "triggerPrice": "62000",
+                    "sz": "10",
+                }
+            ]
+
+        def list_trigger_order_history(self, *, inst_id):
+            return [
+                {
+                    "instId": inst_id,
+                    "ordId": "trigger-hist-1",
+                    "side": "sell",
+                    "triggerOrderType": "TPSL",
+                    "state": "cancelled",
+                    "triggerPrice": "62000",
+                    "sz": "10",
+                }
+            ]
+
+    client = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        )
+    )
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "持仓(1)" in response.text
+    assert "当前委托(2)" in response.text
+    assert "历史委托(2)" in response.text
+    assert "pos pos-live-1" in response.text
+    assert "order limit-1" in response.text
+    assert "order trigger-1" in response.text
+    assert "order hist-1" in response.text
+    assert "order trigger-hist-1" in response.text
+
+
 def test_index_page_renders_media_as_compact_preview_links(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
