@@ -536,7 +536,7 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     )
 
     assert result["submitted"] is True
-    assert result["order_count"] == 4
+    assert result["order_count"] == 2
     assert fake_client.payloads == []
     assert fake_client.protection_payloads == []
     assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
@@ -545,9 +545,7 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     assert fake_client.trigger_payloads[0]["triggerPrice"] == "68200.0"
     assert [payload["tpTriggerPx"] for payload in fake_client.trigger_payloads] == [
         69000.0,
-        70000.0,
         69000.0,
-        70000.0,
     ]
     assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
     assert fake_client.position_protection_payloads == []
@@ -558,13 +556,11 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
         legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.leg_index.asc()).all()
         lifecycle = session.query(StrategyLifecycle).one()
     assert binding.status == "open"
-    assert binding.order_id == "trigger-1,trigger-2,trigger-3,trigger-4"
-    assert binding.client_order_id == "TK649760E806ACF61T1,TK649760E806ACF61T2,TK729D11F4739D2A2T1,TK729D11F4739D2A2T2"
+    assert binding.order_id == "trigger-1,trigger-2"
+    assert binding.client_order_id == "TK649760E806ACF61,TK729D11F4739D2A2"
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
     assert lifecycle.execution_binding_id == binding.id
     assert [event.action for event in events] == [
-        "create_trigger_entry",
-        "create_trigger_entry",
         "create_trigger_entry",
         "create_trigger_entry",
     ]
@@ -572,10 +568,8 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     assert events[0].trade_signal_id == result["signal_id"]
     assert events[0].order_id == "trigger-1"
     assert [(leg.leg_index, leg.order_id, leg.client_order_id, leg.status) for leg in legs] == [
-        (1, "trigger-1", "TK649760E806ACF61T1", "open"),
-        (2, "trigger-2", "TK649760E806ACF61T2", "open"),
-        (3, "trigger-3", "TK729D11F4739D2A2T1", "open"),
-        (4, "trigger-4", "TK729D11F4739D2A2T2", "open"),
+        (1, "trigger-1", "TK649760E806ACF61", "open"),
+        (2, "trigger-2", "TK729D11F4739D2A2", "open"),
     ]
     assert {leg.execution_binding_id for leg in legs} == {binding.id}
     assert {leg.strategy_instance_id for leg in legs} == {"deepcoin:100:55:BTC:long"}
@@ -602,7 +596,7 @@ def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):
     )
 
     assert result["signal_id"] == signal.id
-    assert result["order_count"] == 4
+    assert result["order_count"] == 2
     with session_factory() as session:
         assert session.query(ExecutionBinding).count() == 1
         assert session.query(TradeSignal).filter_by(id=signal.id).one().status == "submitted"
@@ -708,9 +702,7 @@ def test_limit_submit_uses_trigger_order_with_embedded_protection(tmp_path):
     assert fake_client.trigger_payloads[0]["orderType"] == "limit"
     assert [payload["tpTriggerPx"] for payload in fake_client.trigger_payloads] == [
         69000.0,
-        70000.0,
         69000.0,
-        70000.0,
     ]
     assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
     assert fake_client.position_protection_payloads == []
@@ -718,7 +710,7 @@ def test_limit_submit_uses_trigger_order_with_embedded_protection(tmp_path):
         binding = session.query(ExecutionBinding).one()
         lifecycle = session.query(StrategyLifecycle).one()
     assert binding.status == "open"
-    assert binding.order_id == "trigger-1,trigger-2,trigger-3,trigger-4"
+    assert binding.order_id == "trigger-1,trigger-2"
     assert binding.last_exchange_status == "submitted"
     assert lifecycle.execution_binding_id == binding.id
 

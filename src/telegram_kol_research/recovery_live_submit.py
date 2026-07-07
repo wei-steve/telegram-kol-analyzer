@@ -435,56 +435,8 @@ def _submission_order_legs(
         if not isinstance(leg, dict):
             result.append(leg)
             continue
-        if str(leg.get("order_type") or "").lower() != "limit":
-            result.append(leg)
-            continue
-        take_profit_legs = draft.get("take_profit_legs")
-        if not isinstance(take_profit_legs, list) or len(take_profit_legs) <= 1:
-            result.append(leg)
-            continue
-        result.extend(_split_limit_entry_leg_by_take_profit(draft, leg, take_profit_legs))
+        result.append(leg)
     return result
-
-
-def _split_limit_entry_leg_by_take_profit(
-    draft: dict[str, Any],
-    leg: dict[str, Any],
-    take_profit_legs: list[Any],
-) -> list[dict[str, Any]]:
-    quantity = leg.get("quantity")
-    if not isinstance(quantity, int | float) or quantity <= 0:
-        return [leg]
-    allocations = [
-        float(item.get("allocation_pct") or 0)
-        for item in take_profit_legs
-        if isinstance(item, dict) and float(item.get("allocation_pct") or 0) > 0
-    ]
-    if not allocations:
-        return [leg]
-    split_sizes = _split_quantity_by_allocations(
-        quantity=float(quantity),
-        allocations=allocations,
-        quantity_step=_quantity_step_from_draft(draft),
-    )
-    result: list[dict[str, Any]] = []
-    for index, (take_profit_leg, split_size) in enumerate(zip(take_profit_legs, split_sizes), start=1):
-        if not isinstance(take_profit_leg, dict) or split_size <= 0:
-            continue
-        child = dict(leg)
-        child["quantity"] = split_size
-        child["take_profit_leg"] = take_profit_leg
-        if leg.get("client_order_id"):
-            child["client_order_id"] = _take_profit_child_client_order_id(
-                str(leg["client_order_id"]),
-                index,
-            )
-        result.append(child)
-    return result or [leg]
-
-
-def _take_profit_child_client_order_id(parent_client_order_id: str, index: int) -> str:
-    suffix = f"T{index}"
-    return f"{parent_client_order_id[: 20 - len(suffix)]}{suffix}"
 
 
 def _split_quantity_by_allocations(

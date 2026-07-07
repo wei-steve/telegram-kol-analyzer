@@ -216,14 +216,12 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
     assert fake_client.orders == []
-    assert len(fake_client.trigger_orders) == 4
+    assert len(fake_client.trigger_orders) == 2
     assert fake_client.trigger_orders[0]["orderType"] == "limit"
     assert fake_client.trigger_orders[0]["triggerPrice"] == "68200.0"
     assert [order["tpTriggerPx"] for order in fake_client.trigger_orders] == [
         69000.0,
-        70000.0,
         69000.0,
-        70000.0,
     ]
     assert fake_client.trigger_orders[0]["slTriggerPx"] == 67500.0
     assert fake_client.protections == []
@@ -266,25 +264,23 @@ def test_auto_process_range_entry_uses_half_market_half_midpoint_limit_when_near
 
     assert result["status"] == "submitted"
     assert len(fake_client.orders) == 1
-    assert len(fake_client.trigger_orders) == 3
+    assert len(fake_client.trigger_orders) == 1
     assert fake_client.orders[0]["ordType"] == "market"
     assert fake_client.orders[0]["sz"] == "2.5"
     assert fake_client.trigger_orders[0]["orderType"] == "limit"
     assert fake_client.trigger_orders[0]["triggerPrice"] == "1575.0"
-    assert [order["sz"] for order in fake_client.trigger_orders] == ["1.3", "0.9", "1.1"]
+    assert [order["sz"] for order in fake_client.trigger_orders] == ["3.3"]
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
     assert binding.symbol == "ETH"
-    assert binding.order_id == "order-1,trigger-1,trigger-2,trigger-3"
+    assert binding.order_id == "order-1,trigger-1"
     assert [event.action for event in events] == [
         "open_market_position",
         "set_position_tpsl",
         "set_position_tpsl",
         "set_position_tpsl",
         "set_position_tpsl",
-        "create_trigger_entry",
-        "create_trigger_entry",
         "create_trigger_entry",
     ]
 
@@ -567,21 +563,13 @@ def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_
     assert fake_client.orders == []
     assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
         "59300.0",
-        "59300.0",
-        "59300.0",
-        "59100.0",
-        "59100.0",
         "59100.0",
     ]
     assert fake_client.protections == []
     assert fake_client.trigger_orders[0]["slTriggerPx"] == 57800.0
     assert [order["tpTriggerPx"] for order in fake_client.trigger_orders] == [
         60000.0,
-        60700.0,
-        62300.0,
         60000.0,
-        60700.0,
-        62300.0,
     ]
 
 
