@@ -1064,6 +1064,10 @@ function bindDashboardTabs() {
       panels.forEach((panel) => {
         panel.classList.toggle('is-active', panel.dataset.dashboardPanel === tab);
       });
+      const menu = button.closest('details');
+      if (menu) {
+        menu.open = false;
+      }
     });
   });
 }
