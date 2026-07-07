@@ -1,0 +1,146 @@
+<section class="panel exchange-positions-panel" data-exchange-position-tabs>
+  <div class="panel-heading">
+    <div>
+      <h2>交易持仓</h2>
+      <p class="ai-helper-text">按 Deepcoin 手机端样式查看本地已同步的仓位、当前委托和历史记录。</p>
+    </div>
+    <button type="button" class="secondary-button" data-dashboard-tab="main">返回主界面</button>
+  </div>
+
+  <div class="exchange-tab-strip" role="tablist" aria-label="交易持仓分页">
+    <button type="button" class="exchange-tab is-active" data-exchange-position-tab="positions" aria-selected="true">
+      持仓{% if strategy_kpi.holding_count is defined %}({{ strategy_kpi.holding_count }}){% endif %}
+    </button>
+    <button type="button" class="exchange-tab" data-exchange-position-tab="open-orders" aria-selected="false">
+      当前委托{% if strategy_kpi.pending_count is defined %}({{ strategy_kpi.pending_count }}){% endif %}
+    </button>
+    <button type="button" class="exchange-tab" data-exchange-position-tab="order-history" aria-selected="false">
+      历史委托
+    </button>
+    <button type="button" class="exchange-tab" data-exchange-position-tab="position-history" aria-selected="false">
+      历史仓位{% if strategy_kpi.exited_count is defined %}({{ strategy_kpi.exited_count }}){% endif %}
+    </button>
+  </div>
+
+  <div class="exchange-tab-panels">
+    <section class="exchange-tab-panel is-active" data-exchange-position-panel="positions">
+      <div class="exchange-card-list">
+        {% set live_positions = holding_positions | list %}
+        {% for item in live_positions %}
+          <article class="exchange-position-card">
+            <div class="exchange-card-head">
+              <div>
+                <strong>{{ item.symbol }}</strong>
+                <span class="side-badge{% if item.side == 'long' %} side-long{% elif item.side == 'short' %} side-short{% endif %}">
+                  {{ '多' if item.side == 'long' else '空' if item.side == 'short' else item.side }}
+                </span>
+              </div>
+              <code>持仓</code>
+            </div>
+            <div class="exchange-account-row">
+              {% if item.sender_name %}<span>{{ item.sender_name }}</span>{% endif %}
+              {% if item.execution_status is defined %}<span>{{ item.execution_status }}</span>{% endif %}
+              {% if item.pos_id is defined and item.pos_id %}<span>pos {{ item.pos_id }}</span>{% endif %}
+            </div>
+            <dl class="exchange-metric-grid">
+              {% if item.entry_text %}<div><dt>开仓均价</dt><dd>{{ item.entry_text }}</dd></div>
+              {% elif item.entry_price_actual %}<div><dt>开仓均价</dt><dd>{{ "%g"|format(item.entry_price_actual) }}</dd></div>{% endif %}
+              {% if item.position_size_text %}<div><dt>数量</dt><dd>{{ item.position_size_text }}</dd></div>{% endif %}
+              {% if item.stop_loss_text %}<div><dt>止损</dt><dd>{{ item.stop_loss_text }}</dd></div>
+              {% elif item.stop_loss %}<div><dt>止损</dt><dd>{{ "%g"|format(item.stop_loss) }}</dd></div>{% endif %}
+              {% if item.take_profit_text %}<div><dt>止盈</dt><dd>{{ item.take_profit_text }}</dd></div>
+              {% elif item.take_profit %}<div><dt>止盈</dt><dd>{{ item.take_profit }}</dd></div>{% endif %}
+              {% if item.last_checked_at_display %}<div><dt>更新时间</dt><dd>{{ item.last_checked_at_display }}</dd></div>{% endif %}
+            </dl>
+          </article>
+        {% else %}
+          <p class="exchange-empty">暂无持仓</p>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="exchange-tab-panel" data-exchange-position-panel="open-orders">
+      <div class="exchange-card-list">
+        {% set pending_orders = pending_entry_signals | list %}
+        {% for item in pending_orders %}
+          <article class="exchange-position-card exchange-position-card--pending">
+            <div class="exchange-card-head">
+              <div>
+                <strong>{{ item.symbol }}</strong>
+                <span class="side-badge{% if item.side == 'long' %} side-long{% elif item.side == 'short' %} side-short{% endif %}">
+                  {{ '多' if item.side == 'long' else '空' if item.side == 'short' else item.side }}
+                </span>
+              </div>
+              <code>当前委托</code>
+            </div>
+            <div class="exchange-account-row">
+              {% if item.execution_status %}<span>{{ item.execution_status }}</span>{% endif %}
+              {% if item.deepcoin_order_draft is defined %}
+                <span>{{ item.deepcoin_order_draft.instrument_id }}</span>
+                <span>{{ item.deepcoin_order_draft.margin_mode }}</span>
+              {% endif %}
+            </div>
+            <dl class="exchange-metric-grid">
+              {% if item.entry_range_text %}<div><dt>委托价格</dt><dd>{{ item.entry_range_text }}</dd></div>
+              {% elif item.entry_text %}<div><dt>委托价格</dt><dd>{{ item.entry_text }}</dd></div>{% endif %}
+              {% if item.position_size_text %}<div><dt>数量</dt><dd>{{ item.position_size_text }}</dd></div>{% endif %}
+              {% if item.stop_loss_text %}<div><dt>止损</dt><dd>{{ item.stop_loss_text }}</dd></div>{% endif %}
+              {% if item.take_profit_text %}<div><dt>止盈</dt><dd>{{ item.take_profit_text }}</dd></div>{% endif %}
+              {% if item.max_loss_usdt is defined %}<div><dt>风险</dt><dd>{{ "%g"|format(item.max_loss_usdt) }} USDT</dd></div>{% endif %}
+            </dl>
+            {% if item.deepcoin_order_draft is defined and item.deepcoin_order_draft.blocking_reason_codes %}
+              <div class="exchange-warning-row">
+                {% for reason_code in item.deepcoin_order_draft.blocking_reason_codes %}
+                  <code>{{ reason_code }}</code>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </article>
+        {% else %}
+          <p class="exchange-empty">暂无当前委托</p>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="exchange-tab-panel" data-exchange-position-panel="order-history">
+      <p class="exchange-empty">历史委托等待接入 Deepcoin 委托历史接口。</p>
+    </section>
+
+    <section class="exchange-tab-panel" data-exchange-position-panel="position-history">
+      <div class="exchange-card-list">
+        {% set history_positions = exited_positions | list %}
+        {% for item in history_positions %}
+          <article class="exchange-position-card exchange-position-card--history">
+            <div class="exchange-card-head">
+              <div>
+                <strong>{{ item.symbol }}</strong>
+                <span class="side-badge{% if item.side == 'long' %} side-long{% elif item.side == 'short' %} side-short{% endif %}">
+                  {{ '多' if item.side == 'long' else '空' if item.side == 'short' else item.side }}
+                </span>
+              </div>
+              <code>
+                {% if item.exit_reason == 'stop_loss' %}止损平仓
+                {% elif item.exit_reason == 'take_profit' %}止盈平仓
+                {% elif item.exit_reason == 'kol_signal' %}KOL 信号平仓
+                {% elif item.exit_reason == 'cancelled' %}已撤单
+                {% elif item.lifecycle_status == 'expired' %}过期
+                {% else %}{{ item.exit_reason or item.lifecycle_status or '历史仓位' }}
+                {% endif %}
+              </code>
+            </div>
+            <dl class="exchange-metric-grid">
+              {% if item.entry_text %}<div><dt>开仓均价</dt><dd>{{ item.entry_text }}</dd></div>
+              {% elif item.entry_price_actual %}<div><dt>开仓均价</dt><dd>{{ "%g"|format(item.entry_price_actual) }}</dd></div>{% endif %}
+              {% if item.exit_price_actual %}<div><dt>平仓均价</dt><dd>{{ "%g"|format(item.exit_price_actual) }}</dd></div>{% endif %}
+              {% if item.position_size_text %}<div><dt>数量</dt><dd>{{ item.position_size_text }}</dd></div>{% endif %}
+              {% if item.entered_at_display %}<div><dt>开仓时间</dt><dd>{{ item.entered_at_display }}</dd></div>{% endif %}
+              {% if item.exited_at_display %}<div><dt>最后平仓时间</dt><dd>{{ item.exited_at_display }}</dd></div>{% endif %}
+            </dl>
+          </article>
+        {% else %}
+          <p class="exchange-empty">暂无历史仓位</p>
+        {% endfor %}
+      </div>
+    </section>
+  </div>
+</section>

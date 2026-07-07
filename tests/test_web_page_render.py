@@ -62,6 +62,25 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "data-ai-recognition-config" in response.text
     assert "data-ai-model-selection" in response.text
     assert "data-trading-settings-form" in response.text
+    assert 'data-dashboard-tab="exchange-positions"' in response.text
+    assert 'data-dashboard-panel="exchange-positions"' in response.text
+    assert "交易持仓" in response.text
+    assert 'data-exchange-position-tabs' in response.text
+    assert 'data-exchange-position-tab="positions"' in response.text
+    assert 'data-exchange-position-tab="open-orders"' in response.text
+    assert 'data-exchange-position-tab="order-history"' in response.text
+    assert 'data-exchange-position-tab="position-history"' in response.text
+    exchange_tabs = re.search(
+        r'<div class="exchange-tab-strip".*?</div>', response.text, re.S
+    )
+    assert exchange_tabs is not None
+    assert exchange_tabs.group(0).index("持仓") < exchange_tabs.group(0).index("当前委托")
+    assert exchange_tabs.group(0).index("当前委托") < exchange_tabs.group(0).index(
+        "历史委托"
+    )
+    assert exchange_tabs.group(0).index("历史委托") < exchange_tabs.group(0).index(
+        "历史仓位"
+    )
     assert 'data-dashboard-tab="recognition-profiles"' in response.text
     assert 'data-dashboard-panel="recognition-profiles"' in response.text
     assert "比特币军长-11分组" in response.text

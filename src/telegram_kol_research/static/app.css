@@ -295,7 +295,8 @@ body {
 .dashboard-tab-panel[data-dashboard-panel="config"].is-active,
 .dashboard-tab-panel[data-dashboard-panel="model-selection"].is-active,
 .dashboard-tab-panel[data-dashboard-panel="recognition-profiles"].is-active,
-.dashboard-tab-panel[data-dashboard-panel="trading-settings"].is-active {
+.dashboard-tab-panel[data-dashboard-panel="trading-settings"].is-active,
+.dashboard-tab-panel[data-dashboard-panel="exchange-positions"].is-active {
   height: 100%;
   min-height: 0;
   overflow-x: hidden;
@@ -315,6 +316,180 @@ body {
   height: auto;
   min-height: 100%;
   overflow: visible;
+}
+
+.exchange-positions-panel {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 12px;
+  min-height: 100%;
+  overflow: visible;
+}
+
+.exchange-tab-strip {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  overflow-x: auto;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  scrollbar-width: thin;
+}
+
+.exchange-tab {
+  position: relative;
+  flex: 0 0 auto;
+  min-height: 38px;
+  padding: 0 0 10px;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 0.9rem;
+  font-weight: 800;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.exchange-tab::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  left: 0;
+  height: 2px;
+  border-radius: 999px;
+  background: transparent;
+}
+
+.exchange-tab:hover {
+  color: #e5e7eb;
+}
+
+.exchange-tab.is-active {
+  color: #f8fafc;
+}
+
+.exchange-tab.is-active::after {
+  background: #3b82f6;
+}
+
+.exchange-tab-panels {
+  min-height: 0;
+}
+
+.exchange-tab-panel {
+  display: none;
+}
+
+.exchange-tab-panel.is-active {
+  display: block;
+}
+
+.exchange-card-list {
+  display: grid;
+  gap: 10px;
+  padding-bottom: 48px;
+}
+
+.exchange-position-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.78);
+}
+
+.exchange-position-card--pending {
+  border-color: rgba(251, 191, 36, 0.22);
+}
+
+.exchange-position-card--history {
+  border-color: rgba(148, 163, 184, 0.12);
+  background: rgba(15, 23, 42, 0.58);
+}
+
+.exchange-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.exchange-card-head > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.exchange-card-head strong {
+  color: #f8fafc;
+  font-size: 1rem;
+}
+
+.exchange-card-head code {
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: rgba(30, 41, 59, 0.9);
+  color: #cbd5e1;
+  font-size: 0.72rem;
+}
+
+.exchange-account-row,
+.exchange-warning-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: #94a3b8;
+  font-size: 0.78rem;
+}
+
+.exchange-account-row span,
+.exchange-warning-row code {
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: rgba(30, 41, 59, 0.65);
+}
+
+.exchange-warning-row code {
+  color: #fde68a;
+  background: rgba(120, 53, 15, 0.35);
+}
+
+.exchange-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.exchange-metric-grid div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.exchange-metric-grid dt {
+  color: #64748b;
+  font-size: 0.72rem;
+}
+
+.exchange-metric-grid dd {
+  margin: 0;
+  color: #e5e7eb;
+  font-size: 0.86rem;
+  font-weight: 750;
+  overflow-wrap: anywhere;
+}
+
+.exchange-empty {
+  margin: 0;
+  padding: 28px 12px;
+  border: 1px dashed rgba(148, 163, 184, 0.22);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.42);
+  color: #94a3b8;
+  text-align: center;
 }
 .ai-recognition-prompt-form {
   display: grid;

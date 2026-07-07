@@ -32,6 +32,7 @@
           <button type="button" class="settings-menu-item" data-dashboard-tab="model-selection">AI模型选择</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="recognition-profiles">识别 Profile</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="trading-settings">交易设置</button>
+          <button type="button" class="settings-menu-item" data-dashboard-tab="exchange-positions">交易持仓</button>
         </nav>
       </details>
     </div>
@@ -347,6 +348,17 @@
         </div>
       </form>
     </section>
+  </section>
+
+  <section class="dashboard-tab-panel" data-dashboard-panel="exchange-positions">
+    {% with
+      strategy_kpi=strategy_kpi,
+      holding_positions=holding_positions,
+      pending_entry_signals=pending_entry_signals,
+      exited_positions=exited_positions
+    %}
+      {% include "_exchange_positions_panel.html" %}
+    {% endwith %}
   </section>
 
   <section class="dashboard-tab-panel is-active" data-dashboard-panel="main">
