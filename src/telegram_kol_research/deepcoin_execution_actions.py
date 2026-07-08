@@ -448,7 +448,7 @@ def cancel_entry_order(
     event_action = "cancel_trigger_entry" if trigger_orders else "cancel_regular_entry"
     cancel_type = "trigger" if trigger_orders else "regular"
     for order in trigger_orders or regular_orders:
-        order_id = _first_string(order, "ordId", "orderId", "order_id", "id")
+        order_id = _order_id_from_payload(order)
         client_order_id = _first_string(order, "clOrdId", "clientOrderId", "client_order_id")
         if not order_id and not client_order_id:
             raise DeepcoinExecutionActionError("missing_cancel_order_id")
@@ -802,7 +802,7 @@ def _select_bound_orders(
     client_order_ids = set(_split_ids(binding.client_order_id))
     matches = []
     for order in orders:
-        order_id = _first_string(order, "ordId", "orderId", "order_id", "id")
+        order_id = _order_id_from_payload(order)
         client_order_id = _first_string(order, "clOrdId", "clientOrderId", "client_order_id")
         if order_id and order_id in order_ids:
             matches.append(order)
@@ -810,6 +810,18 @@ def _select_bound_orders(
         if client_order_id and client_order_id in client_order_ids:
             matches.append(order)
     return matches
+
+
+def _order_id_from_payload(payload: dict[str, Any]) -> str | None:
+    return _first_string(
+        payload,
+        "ordId",
+        "orderId",
+        "order_id",
+        "algoId",
+        "triggerOrderId",
+        "id",
+    )
 
 
 def _resolve_adjusted_tpsl_snapshot(

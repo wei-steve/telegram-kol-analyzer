@@ -547,6 +547,38 @@ def test_process_trade_signal_live_cancels_bound_trigger_entry(tmp_path):
         assert session.get(ExecutionBinding, binding_id).status == "cancelled"
 
 
+def test_process_trade_signal_live_cancels_trigger_entry_identified_by_algo_id(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    binding_id = _binding(session_factory, order_id="trigger-old", pos_id=None, status="open")
+    trade_signal = _signal(
+        session_factory,
+        action="cancel_entry",
+        payload={"binding_id": binding_id},
+    )
+    client = _FakeDeepcoinClient()
+    client.trigger_pending = [
+        {
+            "triggerOrderType": "NORMAL",
+            "algoId": "trigger-old",
+            "instId": "ETH-USDT-SWAP",
+            "side": "buy",
+            "posSide": "long",
+        }
+    ]
+
+    result = process_trade_signal_live(
+        session_factory,
+        signal_id=trade_signal.id,
+        deepcoin_client=client,
+    )
+
+    assert client.cancel_trigger_payloads == [{"instId": "ETH-USDT-SWAP", "ordId": "trigger-old"}]
+    assert result["cancel_type"] == "trigger"
+    with session_factory() as session:
+        assert session.get(ExecutionBinding, binding_id).status == "cancelled"
+
+
 def test_process_trade_signal_live_cancels_all_bound_trigger_entry_legs(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
