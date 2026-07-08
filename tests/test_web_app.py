@@ -835,6 +835,110 @@ def test_bind_live_position_api_attaches_unbound_position_to_lifecycle(tmp_path)
         assert lifecycle.execution_binding_id == binding.id
 
 
+def test_bind_live_position_api_accepts_entry_range_when_actual_entry_drifted(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-btc",
+                    "posSide": "long",
+                    "pos": "1",
+                    "avgPx": "62600",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        now_provider=lambda: datetime(2026, 7, 8, 15, 0),
+    )
+    with app.state.session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=424,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 8, 14, 30),
+            entered_at=datetime(2026, 7, 8, 14, 35),
+            entry_range_low=62200,
+            entry_range_high=63300,
+            entry_price_actual=63270.95,
+            stop_loss=2.0,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/execution/bind-live-position",
+        json={"pos_id": "pos-btc", "lifecycle_id": lifecycle_id},
+    )
+
+    assert response.status_code == 200
+
+
+def test_bind_live_position_api_appends_second_split_position_to_lifecycle(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-btc-1",
+                    "posSide": "long",
+                    "pos": "1",
+                    "avgPx": "62600",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-btc-2",
+                    "posSide": "long",
+                    "pos": "2",
+                    "avgPx": "62600",
+                },
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        now_provider=lambda: datetime(2026, 7, 8, 15, 0),
+    )
+    with app.state.session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=424,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 8, 14, 30),
+            entered_at=datetime(2026, 7, 8, 14, 35),
+            entry_range_low=62200,
+            entry_range_high=63300,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    client = TestClient(app)
+    first_response = client.post(
+        "/api/execution/bind-live-position",
+        json={"pos_id": "pos-btc-1", "lifecycle_id": lifecycle_id},
+    )
+    second_response = client.post(
+        "/api/execution/bind-live-position",
+        json={"pos_id": "pos-btc-2", "lifecycle_id": lifecycle_id},
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    with app.state.session_factory() as session:
+        binding = session.get(ExecutionBinding, first_response.json()["binding_id"])
+
+    assert binding.pos_id == "pos-btc-1,pos-btc-2"
+
+
 def test_bind_live_position_api_normalizes_deepcoin_sell_side(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):

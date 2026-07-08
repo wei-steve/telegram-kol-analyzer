@@ -1114,6 +1114,45 @@ def _has_unique_confident_attribution(candidates: list[dict[str, object]]) -> bo
     return top_score >= 70 and second_score < 70
 
 
+def _load_existing_bound_lifecycle_attribution_candidate(
+    session,
+    *,
+    lifecycle_id: int,
+    pos_id: str,
+    position_symbol: str,
+    position_side: str,
+    entry_price_actual: float | None,
+    stop_loss: float | None,
+    take_profit: float | None,
+) -> dict[str, object] | None:
+    lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+    if lifecycle is None or lifecycle.execution_binding_id is None:
+        return None
+    if lifecycle.symbol != position_symbol or lifecycle.side != position_side:
+        return None
+    binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+    if binding is None or binding.venue != "deepcoin":
+        return None
+    if binding.status not in {"open", "active"}:
+        return None
+    if pos_id in _split_binding_ids(binding.pos_id):
+        return None
+    score, reasons = _score_live_position_attribution(
+        lifecycle,
+        entry_price_actual=entry_price_actual,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
+    if score <= 0:
+        return None
+    return {
+        "lifecycle_id": lifecycle.id,
+        "match_score": score,
+        "match_reasons": reasons,
+        "bindable": score >= 70,
+    }
+
+
 def _score_live_position_attribution(
     lifecycle: StrategyLifecycle,
     *,
@@ -1130,7 +1169,11 @@ def _score_live_position_attribution(
     elif entry_price_actual is not None:
         return 0, []
 
-    if stop_loss is not None and lifecycle.stop_loss is not None:
+    if (
+        stop_loss is not None
+        and lifecycle.stop_loss is not None
+        and _lifecycle_stop_loss_is_plausible(lifecycle)
+    ):
         if _prices_close(stop_loss, lifecycle.stop_loss, tolerance_pct=0.006):
             score += 25
             reasons.append("止损匹配")
@@ -1154,17 +1197,19 @@ def _score_entry_price_match(
 ) -> int:
     if entry_price_actual is None or entry_price_actual <= 0:
         return 0
+    scores: list[int] = []
     if lifecycle.entry_price_actual is not None:
         if _prices_close(entry_price_actual, lifecycle.entry_price_actual, tolerance_pct=0.006):
-            return 65
-        if _prices_close(entry_price_actual, lifecycle.entry_price_actual, tolerance_pct=0.015):
-            return 35
-        return 0
+            scores.append(65)
+        elif _prices_close(entry_price_actual, lifecycle.entry_price_actual, tolerance_pct=0.015):
+            scores.append(35)
+        else:
+            scores.append(0)
 
     low = lifecycle.entry_range_low
     high = lifecycle.entry_range_high
     if low is None and high is None:
-        return 0
+        return max(scores, default=0)
     if low is None:
         low = high
     if high is None:
@@ -1173,11 +1218,33 @@ def _score_entry_price_match(
     lower, upper = sorted((float(low), float(high)))
     padding = max(abs(entry_price_actual) * 0.004, 1.0)
     if lower - padding <= entry_price_actual <= upper + padding:
-        return 65
+        scores.append(65)
+        return max(scores)
     nearest = lower if entry_price_actual < lower else upper
     if _prices_close(entry_price_actual, nearest, tolerance_pct=0.012):
-        return 35
-    return 0
+        scores.append(35)
+    else:
+        scores.append(0)
+    return max(scores)
+
+
+def _lifecycle_stop_loss_is_plausible(lifecycle: StrategyLifecycle) -> bool:
+    stop_loss = _float_or_none(lifecycle.stop_loss)
+    if stop_loss is None or stop_loss <= 0:
+        return False
+    references = [
+        value
+        for value in (
+            _float_or_none(lifecycle.entry_price_actual),
+            _float_or_none(lifecycle.entry_range_low),
+            _float_or_none(lifecycle.entry_range_high),
+        )
+        if value is not None and value > 0
+    ]
+    if not references:
+        return True
+    reference = max(references)
+    return reference * 0.2 <= stop_loss <= reference * 5
 
 
 def _prices_close(actual: float, expected: float, *, tolerance_pct: float) -> bool:
@@ -2312,6 +2379,21 @@ def create_web_app(
                 ),
                 None,
             )
+            if matched_candidate is None:
+                matched_candidate = _load_existing_bound_lifecycle_attribution_candidate(
+                    session,
+                    lifecycle_id=lifecycle_id_int,
+                    pos_id=pos_id,
+                    position_symbol=position_symbol,
+                    position_side=position_side,
+                    entry_price_actual=_float_or_none(active_position.get("avgPx")),
+                    stop_loss=_float_or_none(
+                        _deepcoin_tpsl_price(tpsl_order, "sl") if tpsl_order else None
+                    ),
+                    take_profit=_float_or_none(
+                        _deepcoin_tpsl_price(tpsl_order, "tp") if tpsl_order else None
+                    ),
+                )
             if matched_candidate is None:
                 raise HTTPException(
                     status_code=409,

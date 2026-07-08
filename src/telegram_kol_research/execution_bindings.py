@@ -634,6 +634,28 @@ def bind_deepcoin_position_to_lifecycle(
             raise LookupError("strategy lifecycle not found")
         if lifecycle.lifecycle_status not in {"entered", "pending_entry"}:
             raise ValueError("only active or pending strategies can be bound")
+        if lifecycle.execution_binding_id is not None:
+            binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+            if (
+                binding is not None
+                and binding.venue == "deepcoin"
+                and binding.chat_id == lifecycle.chat_id
+                and binding.message_id == lifecycle.message_id
+                and binding.symbol == lifecycle.symbol
+                and binding.side == lifecycle.side
+                and binding.status in {"open", "active"}
+            ):
+                binding.pos_id = _join_unique_ids([*_split_ids(binding.pos_id), pos_id])
+                binding.status = "active"
+                binding.last_exchange_status = "manual_bound_live_position"
+                binding.updated_at = now
+                if lifecycle.lifecycle_status == "pending_entry":
+                    lifecycle.lifecycle_status = "entered"
+                    lifecycle.entered_at = now
+                lifecycle.updated_at = now
+                binding_id = int(binding.id)
+                session.commit()
+                return binding_id
         record = ExecutionBindingRecord(
             kol_id=f"group:{lifecycle.chat_id}",
             chat_id=lifecycle.chat_id,
