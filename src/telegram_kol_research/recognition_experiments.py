@@ -203,6 +203,8 @@ def run_mimo_direct_for_message(
                 error_message=str(exc),
             )
         session.commit()
+        session.refresh(result)
+        session.expunge(result)
         return result
 
 

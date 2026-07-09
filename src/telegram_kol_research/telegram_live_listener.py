@@ -19,6 +19,10 @@ from telegram_kol_research.raw_ingest import normalize_message_payload, persist_
 from telegram_kol_research.raw_ingest import repair_history_checkpoints
 from telegram_kol_research.recognition_experiments import run_mimo_direct_for_message
 from telegram_kol_research.strategy_alerts import process_strategy_alert_for_record
+from telegram_kol_research.system_operator_bot import (
+    send_ai_recognition_conflict_review,
+    system_operator_bot_enabled,
+)
 from telegram_kol_research.telegram_client import (
     _download_media_if_present,
     _format_sender_name,
@@ -44,6 +48,8 @@ async def persist_live_message_event(
     ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
+    system_operator_bot_config: Any | None = None,
+    system_operator_conflict_sender=send_ai_recognition_conflict_review,
 ) -> dict[str, int]:
     """Normalize and persist one live Telegram event into the existing raw ingest flow.
 
@@ -118,13 +124,25 @@ async def persist_live_message_event(
                 raw_message_id=raw_message.id,
                 ai_recognition_config=live_ai_config,
             )
-            await asyncio.to_thread(
+            mimo_result = await asyncio.to_thread(
                 run_mimo_direct_for_message,
                 session_factory,
                 raw_message_id=raw_message.id,
                 ai_recognition_config=live_ai_config,
                 media_root=media_root,
             )
+            conflict_payload = _build_ai_recognition_conflict_payload(
+                raw_message=raw_message,
+                chat_title=chat_title,
+                deepseek_result=recog_result,
+                mimo_result=mimo_result,
+            )
+            if conflict_payload is not None and system_operator_bot_enabled(system_operator_bot_config):
+                await system_operator_conflict_sender(
+                    config=system_operator_bot_config,
+                    payload=conflict_payload,
+                )
+                return stats
             # ── exit signal → lifecycle monitor ──
             if auto_trade_executor is not None:
                 await asyncio.to_thread(auto_trade_executor, raw_message.id)
@@ -161,6 +179,59 @@ async def persist_live_message_event(
     return stats
 
 
+def _build_ai_recognition_conflict_payload(
+    *,
+    raw_message: RawMessage,
+    chat_title: str | None,
+    deepseek_result: Any | None,
+    mimo_result: Any | None,
+) -> dict[str, Any] | None:
+    deepseek = _classify_deepseek_recognition(deepseek_result)
+    mimo = _classify_mimo_recognition(mimo_result)
+    if deepseek is None or mimo is None:
+        return None
+    if deepseek["kind"] == mimo["kind"]:
+        return None
+    return {
+        "chat_title": chat_title,
+        "chat_id": raw_message.chat_id,
+        "message_id": raw_message.message_id,
+        "posted_at": raw_message.posted_at,
+        "text": raw_message.text,
+        "deepseek": deepseek,
+        "mimo": mimo,
+    }
+
+
+def _classify_deepseek_recognition(result: Any | None) -> dict[str, str] | None:
+    if result is None:
+        return None
+    status = str(getattr(result, "status", "") or "").strip()
+    reason = str(getattr(result, "reason", "") or "").strip()
+    parse_source = str(getattr(result, "parse_source", "") or "").strip()
+    ai_payload = getattr(result, "ai_payload", None) or {}
+    lifecycle_event = ai_payload.get("lifecycle_event") if isinstance(ai_payload, dict) else None
+    if status == "识别失败":
+        return None
+    kind = "non_strategy"
+    if status == "是策略" or parse_source == "lifecycle_ai":
+        kind = "strategy_related"
+    if isinstance(lifecycle_event, dict) and str(lifecycle_event.get("event_type") or "none") != "none":
+        kind = "strategy_related"
+    return {"status": status or "-", "kind": kind, "reason": reason or "-"}
+
+
+def _classify_mimo_recognition(result: Any | None) -> dict[str, str] | None:
+    if result is None or getattr(result, "error_message", None):
+        return None
+    status = str(getattr(result, "status", "") or "").strip()
+    reason = str(getattr(result, "reason", "") or "").strip()
+    if status in {"", "识别失败"}:
+        return None
+    kind = "strategy_related" if status != "非策略" else "non_strategy"
+    return {"status": status, "kind": kind, "reason": reason or "-"}
+
+
 async def run_live_listener(
     *,
     client: Any,
@@ -174,6 +245,7 @@ async def run_live_listener(
     ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
+    system_operator_bot_config: Any | None = None,
 ) -> None:
     """Attach Telethon new-message handlers and keep the client alive."""
 
@@ -201,6 +273,7 @@ async def run_live_listener(
             ai_recognition_config_path=ai_recognition_config_path,
             lifecycle_monitor=lifecycle_monitor,
             auto_trade_executor=auto_trade_executor,
+            system_operator_bot_config=system_operator_bot_config,
         )
 
     add_event_handler = getattr(client, "add_event_handler", None)
@@ -231,6 +304,7 @@ def launch_live_listener_task(
     ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
+    system_operator_bot_config: Any | None = None,
 ) -> asyncio.Task[None]:
     """Schedule the realtime listener in the current event loop."""
 
@@ -248,6 +322,7 @@ def launch_live_listener_task(
             "ai_recognition_config_path": ai_recognition_config_path,
             "lifecycle_monitor": lifecycle_monitor,
             "auto_trade_executor": auto_trade_executor,
+            "system_operator_bot_config": system_operator_bot_config,
         },
     )
     return asyncio.create_task(runner(**kwargs))

@@ -79,6 +79,29 @@ def format_pending_entry_expiry_review_message(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_ai_recognition_conflict_review_message(payload: dict[str, Any]) -> str:
+    deepseek = payload.get("deepseek") if isinstance(payload.get("deepseek"), dict) else {}
+    mimo = payload.get("mimo") if isinstance(payload.get("mimo"), dict) else {}
+    text = str(payload.get("text") or "").strip()
+    if len(text) > 700:
+        text = text[:697] + "..."
+    lines = [
+        "【AI识别分歧复核】",
+        f"群组: {payload.get('chat_title') or payload.get('group_label') or '-'}",
+        f"群ID: {payload.get('chat_id') or '-'}",
+        f"消息: #{payload.get('message_id') or '-'}",
+        f"时间: {_format_local_time(payload.get('posted_at'))}",
+        f"DeepSeek: {_format_value(deepseek.get('status'))} / {_format_value(deepseek.get('kind'))}",
+        f"DeepSeek原因: {_format_value(deepseek.get('reason'))}",
+        f"MiMo: {_format_value(mimo.get('status'))} / {_format_value(mimo.get('kind'))}",
+        f"MiMo原因: {_format_value(mimo.get('reason'))}",
+        "处理: 两个模型判断不一致，已暂停该消息的自动交易和普通策略提醒，请人工复核。",
+        "原文:",
+        text or "-",
+    ]
+    return "\n".join(lines)
+
+
 def build_pending_entry_expiry_review_reply_markup(payload: dict[str, Any]) -> dict[str, Any]:
     lifecycle_id = payload.get("lifecycle_id")
     return {
@@ -133,6 +156,17 @@ async def send_pending_entry_expiry_review(
         config=config,
         text=format_pending_entry_expiry_review_message(payload),
         reply_markup=build_pending_entry_expiry_review_reply_markup(payload),
+    )
+
+
+async def send_ai_recognition_conflict_review(
+    *,
+    config: SystemOperatorBotConfig,
+    payload: dict[str, Any],
+) -> None:
+    await send_system_operator_bot_message(
+        config=config,
+        text=format_ai_recognition_conflict_review_message(payload),
     )
 
 

@@ -80,6 +80,7 @@ from telegram_kol_research.strategy_alerts import (
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
     load_system_operator_bot_config,
+    send_ai_recognition_conflict_review,
     send_pending_entry_expiry_review,
     system_operator_bot_enabled,
 )
@@ -106,7 +107,11 @@ from telegram_kol_research.lifecycle_monitor import (
     LifecycleMonitor,
     LifecycleMonitorConfig,
 )
-from telegram_kol_research.telegram_live_listener import launch_live_listener_task, run_live_listener
+from telegram_kol_research.telegram_live_listener import (
+    _build_ai_recognition_conflict_payload,
+    launch_live_listener_task,
+    run_live_listener,
+)
 from telegram_kol_research.telegram_live_listener import run_periodic_reconcile, run_reconcile_once
 from telegram_kol_research.telegram_bot_commands import (
     run_system_operator_bot_command_loop,
@@ -1525,6 +1530,7 @@ def create_web_app(
                 ai_recognition_config_path=app.state.ai_recognition_config_path,
                 lifecycle_monitor=app.state.lifecycle_monitor,
                 auto_trade_executor=app.state.auto_trade_executor,
+                system_operator_bot_config=app.state.system_operator_bot_config,
             )
             app.state.reconcile_task = asyncio.create_task(
                 _run_reconcile_after_startup_delay(
@@ -1704,6 +1710,7 @@ def create_web_app(
                 ai_recognition_config_path=app.state.ai_recognition_config_path,
                 lifecycle_monitor=app.state.lifecycle_monitor,
                 auto_trade_executor=app.state.auto_trade_executor,
+                system_operator_bot_config=app.state.system_operator_bot_config,
             )
         reconcile_task = app.state.reconcile_task
         if reconcile_task is None or reconcile_task.done():
@@ -2497,13 +2504,38 @@ def create_web_app(
                 raw_message_id=raw_message_id,
                 ai_recognition_config=ai_config,
             )
-            run_mimo_direct_for_message(
+            mimo_result = run_mimo_direct_for_message(
                 app.state.session_factory,
                 raw_message_id=raw_message_id,
                 ai_recognition_config=ai_config,
                 media_root=app.state.media_root,
             )
-            auto_trade_result = app.state.auto_trade_executor(raw_message_id)
+            conflict_payload = None
+            with app.state.session_factory() as session:
+                raw_message = session.get(RawMessage, raw_message_id)
+                if raw_message is None:
+                    raise LookupError(f"Raw message {raw_message_id} not found")
+                conflict_payload = _build_ai_recognition_conflict_payload(
+                    raw_message=raw_message,
+                    chat_title=raw_message.sender_name,
+                    deepseek_result=result,
+                    mimo_result=mimo_result,
+                )
+            if conflict_payload is not None and system_operator_bot_enabled(
+                app.state.system_operator_bot_config
+            ):
+                asyncio.run(
+                    send_ai_recognition_conflict_review(
+                        app.state.system_operator_bot_config,
+                        conflict_payload,
+                    )
+                )
+                auto_trade_result = {
+                    "status": "skipped",
+                    "reason": "ai_recognition_conflict",
+                }
+            else:
+                auto_trade_result = app.state.auto_trade_executor(raw_message_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
@@ -2514,6 +2546,7 @@ def create_web_app(
             "summary": result.summary,
             "reason": result.reason,
             "auto_trade": auto_trade_result,
+            "ai_conflict": conflict_payload is not None,
         }
 
     @app.post("/api/ai-recognition-config")

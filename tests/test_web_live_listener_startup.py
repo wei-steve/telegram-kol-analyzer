@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi.testclient import TestClient
 
+from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.web_app import create_web_app
 
 
@@ -19,8 +20,9 @@ def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
         media_root,
         strategy_alert_config=None,
         strategy_alert_enabled_for_title=None,
+        system_operator_bot_config=None,
     ):
-        calls.append((client, set(target_titles), str(media_root), strategy_alert_config))
+        calls.append((client, set(target_titles), str(media_root), strategy_alert_config, system_operator_bot_config))
 
     async def fake_reconcile_runner(
         *,
@@ -45,12 +47,24 @@ def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
         telegram_client=fake_client,
     )
     app.state.strategy_alert_config = object()
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="system-token",
+        chat_id="system-chat",
+    )
 
     with TestClient(app) as client:
         response = client.get("/")
 
     assert response.status_code == 200
-    assert calls == [(fake_client, {"Demo Group"}, str((tmp_path / "media").resolve()), app.state.strategy_alert_config)]
+    assert calls == [
+        (
+            fake_client,
+            {"Demo Group"},
+            str((tmp_path / "media").resolve()),
+            app.state.strategy_alert_config,
+            app.state.system_operator_bot_config,
+        )
+    ]
     assert reconcile_calls == [
         (fake_client, {"Demo Group"}, str((tmp_path / "media").resolve()), 300)
     ]

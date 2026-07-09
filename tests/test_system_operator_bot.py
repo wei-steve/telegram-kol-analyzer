@@ -1,6 +1,7 @@
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
     build_pending_entry_expiry_review_reply_markup,
+    format_ai_recognition_conflict_review_message,
     format_pending_entry_expiry_review_message,
     load_system_operator_bot_config,
     system_operator_bot_enabled,
@@ -59,6 +60,35 @@ def test_system_operator_bot_disabled_without_dedicated_destination():
     assert not system_operator_bot_enabled(
         SystemOperatorBotConfig(bot_token="", chat_id="", timeout_seconds=10)
     )
+
+
+def test_format_ai_recognition_conflict_review_message_includes_both_model_results():
+    message = format_ai_recognition_conflict_review_message(
+        {
+            "chat_title": "比特币飞扬 11分组",
+            "chat_id": -1002960443256,
+            "message_id": 3885,
+            "posted_at": datetime(2026, 7, 8, 15, 44, 58, tzinfo=UTC),
+            "text": "今日两次BTC策略都没有入场，取消吧",
+            "deepseek": {
+                "status": "非策略",
+                "kind": "non_strategy",
+                "reason": "DeepSeek 未识别为生命周期事件",
+            },
+            "mimo": {
+                "status": "取消入场",
+                "kind": "strategy_related",
+                "reason": "MiMo 认为是取消未入场挂单",
+            },
+        }
+    )
+
+    assert "AI识别分歧复核" in message
+    assert "比特币飞扬 11分组" in message
+    assert "#3885" in message
+    assert "DeepSeek: 非策略 / non_strategy" in message
+    assert "MiMo: 取消入场 / strategy_related" in message
+    assert "今日两次BTC策略都没有入场" in message
 
 
 def test_bot_http_timeout_allows_long_polling_read_to_finish():
