@@ -858,11 +858,26 @@ def _exchange_snapshot_instrument_ids(
 
 def _exchange_order_row(order: dict[str, Any], *, source: str) -> dict[str, Any]:
     inst_id = _exchange_inst_id(order)
+    order_type = _first_position_string(
+        order,
+        "ordType",
+        "orderType",
+        "triggerOrderType",
+        "type",
+    )
+    position_side = _normalize_deepcoin_position_side(order.get("posSide") or order.get("side"))
+    direction_label, direction_side = _exchange_order_direction(
+        order_type=order_type,
+        position_side=position_side,
+        source=source,
+    )
     return {
         "source": source,
         "inst_id": inst_id,
         "symbol": _symbol_from_deepcoin_inst_id(inst_id),
-        "side": _normalize_deepcoin_position_side(order.get("posSide") or order.get("side")),
+        "side": position_side,
+        "order_direction_label": direction_label,
+        "order_direction_side": direction_side,
         "order_id": _first_position_string(
             order,
             "ordId",
@@ -878,13 +893,7 @@ def _exchange_order_row(order: dict[str, Any], *, source: str) -> dict[str, Any]
             "clientOrderId",
             "client_order_id",
         ),
-        "order_type": _first_position_string(
-            order,
-            "ordType",
-            "orderType",
-            "triggerOrderType",
-            "type",
-        ),
+        "order_type": order_type,
         "status": _first_position_string(order, "state", "status", "orderStatus"),
         "price_text": _position_text_value(
             _first_non_zero_exchange_price(
@@ -924,6 +933,28 @@ def _dedupe_exchange_rows(rows: list[dict[str, Any]], *, limit: int) -> list[dic
         if len(result) >= limit:
             break
     return result
+
+
+def _exchange_order_direction(
+    *,
+    order_type: str | None,
+    position_side: str,
+    source: str,
+) -> tuple[str | None, str]:
+    side_action = {
+        "long": ("开多", "平多", "long", "short"),
+        "short": ("开空", "平空", "short", "long"),
+    }.get(position_side)
+    if side_action is None:
+        return None, position_side
+    open_label, close_label, open_side, close_side = side_action
+    normalized_type = str(order_type or "").lower()
+    source_text = str(source or "")
+    if normalized_type == "tpsl":
+        return f"止盈止损/{close_label}", close_side
+    if normalized_type == "conditional" or "触发" in source_text:
+        return f"条件/{open_label}", open_side
+    return open_label, open_side
 
 
 def _exchange_inst_id(row: dict[str, Any]) -> str:

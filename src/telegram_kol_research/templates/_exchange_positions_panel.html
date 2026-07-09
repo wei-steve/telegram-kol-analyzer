@@ -4,6 +4,18 @@
   </span>
 {%- endmacro %}
 
+{% macro order_direction_badge(item) -%}
+  {% set label = item.order_direction_label if item.order_direction_label is defined else none %}
+  {% set badge_side = item.order_direction_side if item.order_direction_side is defined else item.side %}
+  {% if label %}
+    <span class="side-badge{% if badge_side == 'long' %} side-long{% elif badge_side == 'short' %} side-short{% endif %}">
+      {{ label }}
+    </span>
+  {% else %}
+    {{ side_badge(item.side) }}
+  {% endif %}
+{%- endmacro %}
+
 {% macro exchange_attribution(item) -%}
   {% set attr = item.attribution if item.attribution is defined else none %}
   {% if attr %}
@@ -50,7 +62,7 @@
     <div class="exchange-card-head">
       <div>
         <strong>{{ item.inst_id or item.symbol }}</strong>
-        {{ side_badge(item.side) }}
+        {{ order_direction_badge(item) }}
       </div>
       <code>{{ item.source }}</code>
     </div>

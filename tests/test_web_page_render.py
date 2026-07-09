@@ -208,6 +208,7 @@ def test_exchange_position_tab_uses_deepcoin_account_snapshot(tmp_path):
                 {
                     "instId": inst_id,
                     "ordId": "trigger-1",
+                    "posSide": "long",
                     "side": "sell",
                     "triggerOrderType": "TPSL",
                     "state": "live",
@@ -246,6 +247,7 @@ def test_exchange_position_tab_uses_deepcoin_account_snapshot(tmp_path):
     assert "order trigger-1" in response.text
     assert "order hist-1" in response.text
     assert "order trigger-hist-1" in response.text
+    assert "止盈止损/平多" in response.text
 
 
 def test_exchange_position_attribution_shows_bound_group_and_grouped_view(tmp_path):
@@ -461,6 +463,53 @@ def test_exchange_tpsl_order_row_uses_non_zero_trigger_price():
     )
 
     assert row["price_text"] == "64100"
+    assert row["side"] == "long"
+    assert row["order_direction_label"] == "止盈止损/平多"
+    assert row["order_direction_side"] == "short"
+
+
+def test_exchange_order_row_uses_deepcoin_app_direction_labels():
+    short_tpsl = _exchange_order_row(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "ordId": "tpsl-short-1",
+            "posSide": "short",
+            "side": "buy",
+            "triggerOrderType": "TPSL",
+            "tpTriggerPrice": "62600",
+            "slTriggerPrice": "63600",
+        },
+        source="触发委托",
+    )
+    long_conditional = _exchange_order_row(
+        {
+            "instId": "ETH-USDT-SWAP",
+            "ordId": "conditional-long-1",
+            "posSide": "long",
+            "side": "buy",
+            "triggerOrderType": "Conditional",
+            "triggerPx": "1720",
+        },
+        source="触发委托",
+    )
+    short_conditional = _exchange_order_row(
+        {
+            "instId": "ETH-USDT-SWAP",
+            "ordId": "conditional-short-1",
+            "posSide": "short",
+            "side": "sell",
+            "triggerOrderType": "Conditional",
+            "triggerPx": "1767.5",
+        },
+        source="触发委托",
+    )
+
+    assert short_tpsl["order_direction_label"] == "止盈止损/平空"
+    assert short_tpsl["order_direction_side"] == "long"
+    assert long_conditional["order_direction_label"] == "条件/开多"
+    assert long_conditional["order_direction_side"] == "long"
+    assert short_conditional["order_direction_label"] == "条件/开空"
+    assert short_conditional["order_direction_side"] == "short"
 
 
 def test_exchange_unmatched_order_stays_unassigned(tmp_path):
