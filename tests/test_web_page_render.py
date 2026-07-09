@@ -512,6 +512,24 @@ def test_exchange_order_row_uses_deepcoin_app_direction_labels():
     assert short_conditional["order_direction_side"] == "short"
 
 
+def test_exchange_order_row_formats_deepcoin_times_in_china_timezone():
+    row = _exchange_order_row(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "ordId": "conditional-time-1",
+            "posSide": "long",
+            "side": "buy",
+            "triggerOrderType": "Conditional",
+            "cTime": "1783004912000",
+            "uTime": "1783009610",
+        },
+        source="触发委托",
+    )
+
+    assert row["created_at"] == "2026-07-02 23:08:32"
+    assert row["updated_at"] == "2026-07-03 00:26:50"
+
+
 def test_exchange_unmatched_order_stays_unassigned(tmp_path):
     database_path = tmp_path / "research.db"
 

@@ -84,6 +84,7 @@ from telegram_kol_research.system_operator_bot import (
     send_pending_entry_expiry_review,
     system_operator_bot_enabled,
 )
+from telegram_kol_research.time_utils import DEFAULT_LOCAL_TIMEZONE
 from telegram_kol_research.trading_settings import (
     load_trading_settings,
     save_trading_settings,
@@ -912,8 +913,12 @@ def _exchange_order_row(order: dict[str, Any], *, source: str) -> dict[str, Any]
         "size_text": _position_text_value(
             _first_exchange_value(order, "sz", "size", "qty", "quantity")
         ),
-        "created_at": _first_position_string(order, "cTime", "createdAt", "createTime"),
-        "updated_at": _first_position_string(order, "uTime", "updatedAt", "updateTime"),
+        "created_at": _format_deepcoin_timestamp(
+            _first_position_string(order, "cTime", "createdAt", "createTime")
+        ),
+        "updated_at": _format_deepcoin_timestamp(
+            _first_position_string(order, "uTime", "updatedAt", "updateTime")
+        ),
     }
 
 
@@ -955,6 +960,25 @@ def _exchange_order_direction(
     if normalized_type == "conditional" or "触发" in source_text:
         return f"条件/{open_label}", open_side
     return open_label, open_side
+
+
+def _format_deepcoin_timestamp(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    numeric_value = _float_or_none(text)
+    if numeric_value is None:
+        return text
+    timestamp_seconds = (
+        numeric_value / 1000 if abs(numeric_value) >= 10_000_000_000 else numeric_value
+    )
+    try:
+        local_time = datetime.fromtimestamp(timestamp_seconds, tz=UTC).astimezone(
+            DEFAULT_LOCAL_TIMEZONE
+        )
+    except (OSError, OverflowError, ValueError):
+        return text
+    return local_time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _exchange_inst_id(row: dict[str, Any]) -> str:
