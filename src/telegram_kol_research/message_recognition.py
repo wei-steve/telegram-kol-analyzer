@@ -177,6 +177,16 @@ def recognize_message_now(
                 _upsert_recognition(session, ai_event_result, engine=config.text_provider.model)
                 session.commit()
                 return ai_event_result
+            if _apply_lifecycle_transition_signal_if_matched(session, raw_message, text):
+                result = MessageRecognitionResult(
+                    raw_message_id=raw_message.id,
+                    status="非策略",
+                    reason="本地规则识别到明确入场/取消/离场消息，已更新匹配的策略状态。",
+                    parse_source="text",
+                )
+                _upsert_recognition(session, result)
+                session.commit()
+                return result
 
         if text.strip():
             kol_profile_result = _apply_bitcoin_junzhang_profile_if_matched(
@@ -773,6 +783,16 @@ def _apply_ai_lifecycle_event_if_matched(
         return None
 
     event_type = str(decision.get("event_type") or "").strip()
+    if (
+        event_type == "cancel_entry"
+        and _cancel_signal_applies_to_all_matches(raw_message.text or "")
+        and _parse_explicit_cancel_signal(raw_message.text or "") is not None
+    ):
+        _apply_lifecycle_transition_signal_if_matched(
+            session,
+            raw_message,
+            raw_message.text or "",
+        )
     reason = str(decision.get("reason") or "").strip()
     return MessageRecognitionResult(
         raw_message_id=raw_message.id,
@@ -2174,7 +2194,7 @@ def _apply_cancel_signal_if_matched(
     symbol, side = cancel_signal
     query = session.query(StrategyLifecycle).filter(
         StrategyLifecycle.chat_id == raw_message.chat_id,
-        StrategyLifecycle.lifecycle_status.in_(["pending_entry", "expired"]),
+        StrategyLifecycle.lifecycle_status.in_(["pending_entry", "expired", "entered"]),
     )
     if symbol is not None:
         query = query.filter(StrategyLifecycle.symbol == symbol)
@@ -2192,12 +2212,14 @@ def _apply_cancel_signal_if_matched(
         ).all()
         if item.lifecycle_status == "pending_entry"
         or _lifecycle_has_live_execution_binding(session, item)
+        or _lifecycle_entered_after_message(item, raw_message)
     ]
     if not matches:
         return False
 
     latest = matches[0]
-    if symbol is None and len(matches) > 1:
+    cancel_all_matches = _cancel_signal_applies_to_all_matches(text)
+    if symbol is None and len(matches) > 1 and not cancel_all_matches:
         same_latest_time = [
             item for item in matches if item.signal_at == latest.signal_at
         ]
@@ -2205,11 +2227,17 @@ def _apply_cancel_signal_if_matched(
             return False
 
     exited_at = raw_message.posted_at or utc_now()
-    latest.lifecycle_status = "exited"
-    latest.exit_reason = "cancelled"
-    latest.exited_at = exited_at
-    latest.exit_signal_message_id = raw_message.message_id
-    latest.updated_at = utc_now()
+    cancelled_lifecycles = matches if cancel_all_matches else [latest]
+    for lifecycle in cancelled_lifecycles:
+        entered_after_cancel_message = _lifecycle_entered_after_message(lifecycle, raw_message)
+        lifecycle.lifecycle_status = "exited"
+        lifecycle.exit_reason = "cancelled"
+        lifecycle.exited_at = exited_at
+        lifecycle.exit_signal_message_id = raw_message.message_id
+        if entered_after_cancel_message:
+            lifecycle.entered_at = None
+            lifecycle.entry_price_actual = None
+        lifecycle.updated_at = utc_now()
 
     _upsert_close_signal_candidate(
         session,
@@ -2218,6 +2246,18 @@ def _apply_cancel_signal_if_matched(
         parse_source="cancel_heuristic",
     )
     return True
+
+
+def _lifecycle_entered_after_message(
+    lifecycle: StrategyLifecycle,
+    raw_message: RawMessage,
+) -> bool:
+    if lifecycle.lifecycle_status != "entered":
+        return False
+    event_at = raw_message.posted_at
+    if event_at is None:
+        return False
+    return _datetime_after(lifecycle.entered_at, event_at)
 
 
 def _apply_pending_entry_invalidation_if_matched(
@@ -2458,9 +2498,29 @@ def _parse_explicit_cancel_signal(text: str) -> tuple[str | None, str | None] | 
         any(term in normalized for term in ["取消限价", "取消挂单", "撤单", "取消订单", "挂单取消"])
         or any(term in lowered for term in ["cancel limit", "cancel order", "cancel entry"])
     )
+    has_unentered_cancel_term = (
+        "取消" in normalized
+        and any(term in normalized for term in ["没有入场", "没入场", "未入场", "没有进场", "没进场", "未进场"])
+        and any(term in normalized for term in ["策略", "挂单", "单"])
+    )
+    has_english_unentered_cancel_term = (
+        "cancel" in lowered
+        and any(term in lowered for term in ["not entered", "no entry", "unfilled", "not filled"])
+    )
+    if has_unentered_cancel_term or has_english_unentered_cancel_term:
+        return _extract_exit_symbol(normalized), _extract_exit_side(normalized)
     if not has_cancel_term:
         return None
     return _extract_exit_symbol(normalized), _extract_exit_side(normalized)
+
+
+def _cancel_signal_applies_to_all_matches(text: str) -> bool:
+    normalized = (text or "").strip()
+    lowered = normalized.lower()
+    return (
+        any(term in normalized for term in ["全部", "所有", "都", "均", "两次", "两单", "两个"])
+        or any(term in lowered for term in ["all", "both"])
+    )
 
 
 def _parse_explicit_entry_confirmation_signal(

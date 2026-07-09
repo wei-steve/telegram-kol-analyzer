@@ -1451,6 +1451,9 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
         row.last_exchange_status = "expired_pending_entry_not_attributed"
         return False
     lifecycle.execution_binding_id = row.id
+    if _is_terminal_exited_lifecycle(lifecycle):
+        lifecycle.updated_at = updated_at
+        return True
     if row.status == "active" and lifecycle.lifecycle_status != "entered":
         lifecycle.lifecycle_status = "entered"
         lifecycle.exit_reason = None
@@ -1472,6 +1475,13 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
     _refresh_lifecycle_prices_from_binding_payload(lifecycle, row)
     lifecycle.updated_at = updated_at
     return True
+
+
+def _is_terminal_exited_lifecycle(lifecycle: Any) -> bool:
+    if str(getattr(lifecycle, "lifecycle_status", None) or "") != "exited":
+        return False
+    exit_reason = str(getattr(lifecycle, "exit_reason", None) or "")
+    return exit_reason in {"kol_signal", "manual"}
 
 
 def _is_stale_unentered_lifecycle(lifecycle: Any, updated_at: datetime) -> bool:

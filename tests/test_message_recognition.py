@@ -1003,6 +1003,274 @@ def test_ai_lifecycle_event_cancels_pending_order(tmp_path, monkeypatch):
     assert candidate.parse_source == "lifecycle_ai"
 
 
+def test_configured_ai_falls_back_to_local_cancel_for_unentered_btc_orders(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        first_lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=370,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 8, 9, 15, tzinfo=UTC),
+            entry_range_low=62300,
+            entry_range_high=62500,
+            stop_loss=64000,
+            take_profit="60740",
+        )
+        second_lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=371,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 8, 14, 20, tzinfo=UTC),
+            entry_range_low=62500,
+            entry_range_high=62700,
+            stop_loss=62700,
+            take_profit="65620",
+        )
+        later_lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=390,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 9, 11, 45, tzinfo=UTC),
+            entry_range_low=61900,
+            entry_range_high=62100,
+            stop_loss=63688,
+            take_profit="60740",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=376,
+            posted_at=datetime(2026, 7, 8, 23, 44, tzinfo=UTC),
+            text="今日两次BTC策略都没有入场，取消吧",
+        )
+        session.add_all([first_lifecycle, second_lifecycle, later_lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        first_lifecycle_id = first_lifecycle.id
+        second_lifecycle_id = second_lifecycle.id
+        later_lifecycle_id = later_lifecycle.id
+
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "none",
+            "target_lifecycle_id": None,
+            "symbol": "BTC",
+            "side": None,
+            "confidence": 0.4,
+            "reason": "模型未识别为生命周期事件",
+        },
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.parse_source == "text"
+    with session_factory() as session:
+        first_lifecycle = session.get(StrategyLifecycle, first_lifecycle_id)
+        second_lifecycle = session.get(StrategyLifecycle, second_lifecycle_id)
+        later_lifecycle = session.get(StrategyLifecycle, later_lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert first_lifecycle.lifecycle_status == "exited"
+    assert first_lifecycle.exit_reason == "cancelled"
+    assert first_lifecycle.exit_signal_message_id == 376
+    assert second_lifecycle.lifecycle_status == "exited"
+    assert second_lifecycle.exit_reason == "cancelled"
+    assert second_lifecycle.exit_signal_message_id == 376
+    assert later_lifecycle.lifecycle_status == "pending_entry"
+    assert candidate.event_type == "close_signal"
+    assert candidate.parse_source == "cancel_heuristic"
+
+
+def test_unentered_cancel_reverts_lifecycle_entered_after_cancel_message(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3883,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 8, 14, 15, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 8, 17, 31, tzinfo=UTC),
+            entry_range_low=62300,
+            entry_range_high=62500,
+            stop_loss=64000,
+            take_profit="60740",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=3885,
+            posted_at=datetime(2026, 7, 8, 15, 44, tzinfo=UTC),
+            text="今日两次BTC策略都没有入场，取消吧",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.parse_source == "text"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "cancelled"
+    assert lifecycle.exited_at == datetime(2026, 7, 8, 15, 44)
+    assert lifecycle.exit_signal_message_id == 3885
+    assert candidate.event_type == "close_signal"
+    assert candidate.parse_source == "cancel_heuristic"
+
+
+def test_ai_cancel_event_also_runs_local_plural_cancel_fallback(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        pending_lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3878,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 8, 7, 37, tzinfo=UTC),
+            entry_range_low=63000,
+            entry_range_high=63100,
+            stop_loss=65170,
+            take_profit="60740",
+        )
+        later_entered_lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3883,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 8, 14, 15, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 8, 17, 31, tzinfo=UTC),
+            entry_range_low=62300,
+            entry_range_high=62500,
+            stop_loss=64000,
+            take_profit="60740",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=3885,
+            posted_at=datetime(2026, 7, 8, 15, 44, tzinfo=UTC),
+            text="今日两次BTC策略都没有入场，取消吧",
+        )
+        session.add_all([pending_lifecycle, later_entered_lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        pending_lifecycle_id = pending_lifecycle.id
+        later_entered_lifecycle_id = later_entered_lifecycle.id
+
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "cancel_entry",
+            "target_lifecycle_id": pending_lifecycle_id,
+            "symbol": "BTC",
+            "side": "short",
+            "confidence": 0.92,
+            "reason": "模型只锁定了其中一条pending挂单",
+        },
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.parse_source == "lifecycle_ai"
+    with session_factory() as session:
+        pending_lifecycle = session.get(StrategyLifecycle, pending_lifecycle_id)
+        later_entered_lifecycle = session.get(StrategyLifecycle, later_entered_lifecycle_id)
+
+    assert pending_lifecycle.lifecycle_status == "exited"
+    assert pending_lifecycle.exit_reason == "cancelled"
+    assert later_entered_lifecycle.lifecycle_status == "exited"
+    assert later_entered_lifecycle.exit_reason == "cancelled"
+    assert later_entered_lifecycle.entered_at is None
+
+
+def test_local_exit_signal_closes_btc_long_all_out_message(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=381,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 8, 15, 10, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 8, 15, 12, tzinfo=UTC),
+            entry_range_low=62500,
+            entry_range_high=62700,
+            stop_loss=62700,
+            take_profit="65620",
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=386,
+            posted_at=datetime(2026, 7, 9, 8, 12, tzinfo=UTC),
+            text="BTC多单，全部出局吧，加上昨晚止盈的，整体盈利约1000点",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(),
+    )
+
+    assert result.parse_source == "text"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "kol_signal"
+    assert lifecycle.exit_signal_message_id == 386
+    assert candidate.event_type == "close_signal"
+    assert candidate.parse_source == "exit_heuristic"
+
+
 def test_ai_lifecycle_event_confirms_market_entry(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

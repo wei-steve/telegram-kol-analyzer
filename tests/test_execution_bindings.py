@@ -1156,6 +1156,76 @@ def test_reconcile_revives_cancelled_stale_binding_when_positions_fill_later(tmp
     assert lifecycle.exited_at is None
 
 
+def test_reconcile_does_not_reopen_lifecycle_closed_by_kol_exit_signal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    upsert_execution_binding(
+        session_factory,
+        _binding(
+            symbol="BTC",
+            side="long",
+            order_id="order-a",
+            client_order_id="client-a",
+            pos_id="pos-a",
+            status="active",
+        ),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="exited",
+                exit_reason="kol_signal",
+                signal_at=datetime(2026, 7, 7, 4, 38),
+                entered_at=datetime(2026, 7, 7, 14, 36),
+                exited_at=datetime(2026, 7, 7, 22, 49),
+                exit_signal_message_id=3870,
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-a",
+                    "posSide": "long",
+                    "pos": "7",
+                    "avgPx": "62600",
+                    "cTime": "200000",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 7, 9, 12, 30),
+    )
+
+    assert result.active == 1
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+
+    assert binding.status == "active"
+    assert lifecycle.execution_binding_id == binding.id
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "kol_signal"
+    assert lifecycle.exited_at == datetime(2026, 7, 7, 22, 49)
+
+
 def test_reconcile_revives_expired_keep_order_when_position_fills_later(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     upsert_execution_binding(
