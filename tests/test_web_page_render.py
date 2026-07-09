@@ -445,6 +445,91 @@ def test_exchange_current_order_candidate_attribution(tmp_path):
     assert 'data-exchange-group-section' in response.text
 
 
+def test_exchange_current_order_uses_execution_binding_attribution(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=210,
+            message_id=20,
+            posted_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+            sender_name="charlie",
+            text="BTC long 60700 SL 59800 TP 62000",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            entry_text="60700",
+            stop_loss_text="59800",
+            take_profit_text="62000",
+            parse_source="text_ai",
+            confidence=0.91,
+            review_status="pending",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            ExecutionBinding(
+                kol_id="group:210",
+                chat_id=210,
+                message_id=20,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                order_id="bound-open-order-1",
+                status="open",
+            )
+        )
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def list_open_orders(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTCUSDT",
+                    "ordId": "bound-open-order-1",
+                    "side": "buy",
+                    "ordType": "limit",
+                    "state": "live",
+                    "px": "60700",
+                    "sz": "5",
+                }
+            ]
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+    client = TestClient(
+        create_web_app(
+            database_path=database_path,
+            group_config=GroupConfig(
+                groups=[
+                    TargetGroupConfig(
+                        chat_title="Charlie Group",
+                        chat_id=210,
+                        ai_strategy_enabled=True,
+                        trading_mode="auto_trade",
+                    )
+                ]
+            ),
+            deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        )
+    )
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "order bound-open-order-1" in response.text
+    assert "已绑定" in response.text
+    assert "Charlie Group" in response.text
+
+
 def test_exchange_tpsl_order_row_uses_non_zero_trigger_price():
     row = _exchange_order_row(
         {

@@ -535,6 +535,11 @@ def _load_exchange_position_snapshot(
         ],
         limit=order_limit,
     )
+    _attach_exchange_order_bindings(
+        session_factory,
+        [*snapshot["open_orders"], *snapshot["order_history"]],
+        group_label_by_chat_id=group_label_by_chat_id,
+    )
     return snapshot
 
 
@@ -938,6 +943,54 @@ def _dedupe_exchange_rows(rows: list[dict[str, Any]], *, limit: int) -> list[dic
         if len(result) >= limit:
             break
     return result
+
+
+def _attach_exchange_order_bindings(
+    session_factory,
+    rows: list[dict[str, Any]],
+    *,
+    group_label_by_chat_id: dict[int, str],
+) -> None:
+    wanted_ids = {
+        str(value)
+        for row in rows
+        for value in (row.get("order_id"), row.get("client_order_id"))
+        if value not in (None, "")
+    }
+    if not wanted_ids:
+        return
+    with session_factory() as session:
+        bindings = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .order_by(ExecutionBinding.updated_at.desc(), ExecutionBinding.id.desc())
+            .all()
+        )
+    bindings_by_order_id: dict[str, ExecutionBinding] = {}
+    for binding in bindings:
+        binding_ids = [
+            *_split_exchange_binding_ids(binding.order_id),
+            *_split_exchange_binding_ids(binding.client_order_id),
+        ]
+        for binding_id in binding_ids:
+            if binding_id in wanted_ids and binding_id not in bindings_by_order_id:
+                bindings_by_order_id[binding_id] = binding
+    for row in rows:
+        binding = bindings_by_order_id.get(str(row.get("order_id") or ""))
+        if binding is None:
+            binding = bindings_by_order_id.get(str(row.get("client_order_id") or ""))
+        if binding is None:
+            continue
+        row["chat_id"] = binding.chat_id
+        row["message_id"] = binding.message_id
+        row["group_label"] = group_label_by_chat_id.get(binding.chat_id, str(binding.chat_id))
+        row["symbol"] = binding.symbol or row.get("symbol")
+        row["side"] = binding.side or row.get("side")
+        row["execution_status"] = binding.status
+
+
+def _split_exchange_binding_ids(value: str | None) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
 
 def _exchange_order_direction(
