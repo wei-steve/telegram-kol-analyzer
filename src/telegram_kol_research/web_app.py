@@ -887,14 +887,17 @@ def _exchange_order_row(order: dict[str, Any], *, source: str) -> dict[str, Any]
         ),
         "status": _first_position_string(order, "state", "status", "orderStatus"),
         "price_text": _position_text_value(
-            _first_exchange_value(
+            _first_non_zero_exchange_price(
                 order,
                 "px",
                 "price",
                 "ordPx",
+                "triggerPx",
                 "triggerPrice",
                 "slTriggerPrice",
                 "tpTriggerPrice",
+                "closeSLTriggerPrice",
+                "closeTPTriggerPrice",
             )
         ),
         "size_text": _position_text_value(
@@ -948,6 +951,20 @@ def _first_exchange_value(order: dict[str, Any], *keys: str) -> Any:
         if value not in (None, ""):
             return value
     return None
+
+
+def _first_non_zero_exchange_price(order: dict[str, Any], *keys: str) -> Any:
+    fallback = None
+    for key in keys:
+        value = order.get(key)
+        if value in (None, ""):
+            continue
+        if fallback is None:
+            fallback = value
+        numeric_value = _float_or_none(value)
+        if numeric_value is None or numeric_value != 0:
+            return value
+    return fallback
 
 
 def _load_deepcoin_tpsl_orders_by_position_key(

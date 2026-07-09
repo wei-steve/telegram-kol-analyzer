@@ -17,6 +17,7 @@ from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.web_app import create_web_app
+from telegram_kol_research.web_app import _exchange_order_row
 
 
 def test_index_page_shows_group_list_and_messages(tmp_path):
@@ -440,6 +441,26 @@ def test_exchange_current_order_candidate_attribution(tmp_path):
     assert "BTC long entry 62400-62500" in response.text
     assert "order candidate-order-1" in response.text
     assert 'data-exchange-group-section' in response.text
+
+
+def test_exchange_tpsl_order_row_uses_non_zero_trigger_price():
+    row = _exchange_order_row(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "ordId": "tpsl-order-1",
+            "posSide": "long",
+            "side": "sell",
+            "ordPx": "0",
+            "triggerPx": "0",
+            "slTriggerPrice": "0",
+            "tpTriggerPrice": "64100",
+            "triggerOrderType": "TPSL",
+            "sz": "0",
+        },
+        source="触发委托",
+    )
+
+    assert row["price_text"] == "64100"
 
 
 def test_exchange_unmatched_order_stays_unassigned(tmp_path):
