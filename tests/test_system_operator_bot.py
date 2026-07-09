@@ -434,6 +434,39 @@ def test_process_expiry_expire_cancel_executes_deepcoin_cancel_when_client_is_av
     assert lifecycle.management_action == "expiry_cancelled_and_expired"
 
 
+def test_process_expiry_expire_cancel_without_live_binding_keeps_pending_for_manual_review(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=442,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
+            management_action="expiry_review_requested",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    response = process_system_operator_command(
+        session_factory,
+        f"/expiry_expire_cancel {lifecycle_id}",
+        now=datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
+        deepcoin_client=object(),
+    )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert "未找到本地 live 挂单" in response
+    assert "未标记过期" in response
+    assert lifecycle.lifecycle_status == "pending_entry"
+    assert lifecycle.exit_reason is None
+    assert lifecycle.management_action == "expiry_cancel_failed_no_live_order"
+
+
 def test_process_expiry_expire_keep_marks_expired_without_cancelling_binding(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

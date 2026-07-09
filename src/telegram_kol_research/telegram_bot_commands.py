@@ -306,14 +306,12 @@ def _process_expiry_action(
             session.commit()
             return f"策略 #{lifecycle_id} 已请求撤销交易所挂单，撤单完成前不会标记过期。"
 
-        lifecycle.lifecycle_status = "expired"
-        lifecycle.exit_reason = "expired"
-        lifecycle.exited_at = event_at
-        lifecycle.management_action = "expiry_expired_cancel_no_live_order"
-        lifecycle.management_note = "人工确认标记过期并撤单；未发现本地 live 绑定。"
+        lifecycle.management_action = "expiry_cancel_failed_no_live_order"
+        lifecycle.management_note = "人工确认过期并撤单，但未找到本地 live 绑定；未标记过期，请人工确认交易所挂单。"
+        lifecycle.last_checked_at = event_at
         lifecycle.updated_at = event_at
         session.commit()
-        return f"策略 #{lifecycle_id} 未发现本地 live 挂单，已标记过期。"
+        return f"策略 #{lifecycle_id} 未找到本地 live 挂单，未标记过期；请人工确认 Deepcoin 当前委托。"
 
 
 def _parse_operator_lifecycle_identifier(
