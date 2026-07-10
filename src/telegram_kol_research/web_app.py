@@ -17,7 +17,7 @@ from sqlalchemy import func
 try:
     from fastapi import FastAPI, Request
     from fastapi import HTTPException
-    from fastapi.responses import FileResponse, Response, StreamingResponse
+    from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from fastapi.templating import Jinja2Templates
 except (
@@ -29,6 +29,10 @@ except (
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
+from telegram_kol_research.app_logging import (
+    configure_application_logging,
+    read_log_page,
+)
 from telegram_kol_research.ai_recognition_config import (
     AiModelConfig,
     AiProviderConfig,
@@ -126,7 +130,7 @@ from telegram_kol_research.telegram_session_lock import (
 
 REFRESH_TIMEOUT_SECONDS = 180
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
-logger = logging.getLogger("uvicorn.error")
+logger = logging.getLogger(__name__)
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -1581,6 +1585,8 @@ def create_web_app(
     """Create the minimal FastAPI app used by the web command."""
 
     resolved_database_path = Path(database_path)
+    log_directory = resolved_database_path.parent / "logs"
+    configure_application_logging(log_directory)
     resolved_media_root = Path(media_root) if media_root is not None else resolved_database_path.parent / "media"
 
     @asynccontextmanager
@@ -1735,6 +1741,7 @@ def create_web_app(
 
     app = FastAPI(title="Telegram KOL Research Web", lifespan=lifespan)
     app.state.database_path = Path(database_path)
+    app.state.log_directory = log_directory
     app.state.session_factory = create_session_factory(database_path)
     app.state.media_root = resolved_media_root.resolve()
     app.state.live_update_broker = LiveUpdateBroker()
@@ -1912,6 +1919,24 @@ def create_web_app(
         StaticFiles(directory=str(Path(__file__).parent / "static")),
         name="static",
     )
+
+    @app.get("/logs")
+    def logs_page():
+        return HTMLResponse("<!doctype html><title>系统日志</title><h1>系统日志</h1>")
+
+    @app.get("/api/logs")
+    def api_logs(offset: int = 0, limit: int = 100, level: str | None = None):
+        if offset < 0 or not 1 <= limit <= 200:
+            raise HTTPException(status_code=422, detail="invalid log pagination")
+        normalized_level = (level or "").upper() or None
+        if normalized_level not in {None, "INFO", "WARNING", "ERROR"}:
+            raise HTTPException(status_code=422, detail="invalid log level")
+        return read_log_page(
+            app.state.log_directory,
+            offset=offset,
+            limit=limit,
+            level=normalized_level,
+        )
 
     @app.get("/")
     def index(request: Request):

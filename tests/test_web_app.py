@@ -37,6 +37,33 @@ def test_root_page_renders_successfully(tmp_path):
     assert response.status_code == 200
 
 
+def test_logs_page_and_api_return_paginated_application_log_entries(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    log_path = app.state.log_directory / "telegram-kol.log"
+    log_path.write_text(
+        "2026-07-10 10:00:00,000 ERROR telegram_kol_research.web failed <script>alert(1)</script>\n",
+        encoding="utf-8",
+    )
+    client = TestClient(app)
+
+    page = client.get("/logs")
+    response = client.get("/api/logs?offset=0&limit=100&level=ERROR")
+
+    assert page.status_code == 200
+    assert "系统日志" in page.text
+    assert response.status_code == 200
+    assert response.json()["items"][0]["level"] == "ERROR"
+    assert "<script>alert(1)</script>" in response.json()["items"][0]["message"]
+
+
+def test_logs_api_rejects_invalid_pagination(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    assert client.get("/api/logs?offset=-1").status_code == 422
+    assert client.get("/api/logs?limit=201").status_code == 422
+    assert client.get("/api/logs?level=DEBUG").status_code == 422
+
+
 def test_group_automation_api_updates_config_file(tmp_path):
     database_path = tmp_path / "research.db"
     config_path = tmp_path / "groups.yaml"
