@@ -63,3 +63,23 @@ def test_read_log_page_filters_by_level(tmp_path: Path):
         }
     ]
     assert page["has_more"] is False
+
+
+def test_read_log_page_redacts_telegram_bot_token_from_http_error_traceback(
+    tmp_path: Path,
+):
+    token = "123456789:AbCdEfGhIjKlMnOpQrStUvWxYz"
+    (tmp_path / "telegram-kol.log").write_text(
+        "2026-07-10 10:00:00,000 ERROR telegram_kol_research.telegram_bot_commands "
+        "System operator bot failed to process update_id=42\n"
+        "Traceback (most recent call last):\n"
+        "httpx.HTTPStatusError: Client error '401 Unauthorized' for url "
+        f"'https://api.telegram.org/bot{token}/getUpdates'\n",
+        encoding="utf-8",
+    )
+
+    page = read_log_page(tmp_path, offset=0, limit=100, level="ERROR")
+
+    message = page["items"][0]["message"]
+    assert token not in message
+    assert "https://api.telegram.org/bot[REDACTED]/getUpdates" in message

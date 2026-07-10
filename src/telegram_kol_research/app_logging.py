@@ -13,6 +13,9 @@ ENTRY_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) "
     r"(?P<level>[A-Z]+) (?P<logger>[^ ]+) (?P<message>.*)$"
 )
+TELEGRAM_BOT_URL_PATTERN = re.compile(
+    r"(https?://api\.telegram\.org/bot)[^/\s'\"?]+", re.IGNORECASE
+)
 
 
 def configure_application_logging(log_directory: Path) -> Path:
@@ -74,6 +77,8 @@ def read_log_page(
             elif entries:
                 entries[-1]["message"] += f"\n{line}"
 
+    for entry in entries:
+        entry["message"] = TELEGRAM_BOT_URL_PATTERN.sub(r"\1[REDACTED]", entry["message"])
     entries.reverse()
     if level is not None:
         entries = [entry for entry in entries if entry["level"] == level]
