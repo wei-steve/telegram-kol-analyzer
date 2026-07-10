@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_readonly import (
@@ -256,10 +257,20 @@ def reconcile_deepcoin_execution_bindings(
         rows = (
             session.query(ExecutionBinding)
             .filter(ExecutionBinding.venue == "deepcoin")
-            .filter(ExecutionBinding.status.in_(["open", "active", "unknown", "stale"]))
+            .filter(
+                or_(
+                    ExecutionBinding.status.in_(["open", "active", "unknown", "stale"]),
+                    ExecutionBinding.status == "closed",
+                )
+            )
             .order_by(ExecutionBinding.id.asc())
             .all()
         )
+        rows = [
+            row
+            for row in rows
+            if row.status != "closed" or _binding_has_unresolved_entry_leg(session, row)
+        ]
         trigger_orders = _load_pending_trigger_orders(client, rows=rows)
         all_orders = [*orders, *trigger_orders]
         orders_by_order_id = {
@@ -351,10 +362,15 @@ def reconcile_deepcoin_execution_bindings(
                     trade_fills_cache=trade_fills_cache,
                     trigger_history_cache=trigger_history_cache,
                 )
-                if recovered_pos_ids and (_split_ids(row.pos_id) or len(recovered_pos_ids) > 1):
+                if recovered_pos_ids:
+                    existing_pos_ids = _split_ids(row.pos_id)
                     row.pos_id = _join_unique_ids([*_split_ids(row.pos_id), *recovered_pos_ids])
                     row.status = "active"
-                    row.last_exchange_status = "position_active_recovered_additional_pos_id"
+                    row.last_exchange_status = (
+                        "position_active_recovered_from_filled_order"
+                        if not existing_pos_ids and len(recovered_pos_ids) == 1
+                        else "position_active_recovered_additional_pos_id"
+                    )
                     bound_pos_ids.update(recovered_pos_ids)
                     if _attach_binding_to_lifecycle(session, row, now):
                         result.active += 1
@@ -402,6 +418,15 @@ def reconcile_deepcoin_execution_bindings(
                 session,
                 row,
                 active_positions=active_positions,
+                order_leg_position_ids=_recover_order_leg_position_ids(
+                    row,
+                    client=client,
+                    active_positions=active_positions,
+                    bound_pos_ids=bound_pos_ids,
+                    order_history_cache=order_history_cache,
+                    trade_fills_cache=trade_fills_cache,
+                    trigger_history_cache=trigger_history_cache,
+                ),
             )
             result.updated += 1
         session.commit()
@@ -452,6 +477,7 @@ def _refresh_order_legs_from_binding_row(
     row: ExecutionBinding,
     *,
     active_positions: list[dict[str, Any]] | None = None,
+    order_leg_position_ids: dict[str, str] | None = None,
 ) -> None:
     pos_ids = _split_ids(row.pos_id)
     if not pos_ids:
@@ -466,6 +492,16 @@ def _refresh_order_legs_from_binding_row(
         .filter(ExecutionOrderLeg.purpose == "entry")
         .all()
     )
+    recovered_by_order_id = order_leg_position_ids or {}
+    for leg in legs:
+        recovered_pos_id = recovered_by_order_id.get(str(leg.order_id or ""))
+        if recovered_pos_id is None:
+            recovered_pos_id = recovered_by_order_id.get(str(leg.client_order_id or ""))
+        if recovered_pos_id is None:
+            continue
+        leg.pos_id = recovered_pos_id
+        leg.status = "active" if row.status == "active" else leg.status
+        leg.updated_at = row.updated_at
     if len(pos_ids) > 1:
         _refresh_multi_position_order_legs(
             legs,
@@ -473,6 +509,8 @@ def _refresh_order_legs_from_binding_row(
             pos_ids=pos_ids,
             active_positions=active_positions or [],
         )
+        return
+    if len(legs) != 1:
         return
     for leg in legs:
         leg_order_id = str(leg.order_id or "")
@@ -585,6 +623,11 @@ def sync_manual_closed_deepcoin_positions(
                 continue
             result.checked += 1
             if any(pos_id in active_pos_ids for pos_id in pos_ids):
+                continue
+            if _binding_has_unresolved_entry_leg(session, row):
+                row.status = "open"
+                row.last_exchange_status = "entry_legs_pending_after_position_closed"
+                row.updated_at = now
                 continue
 
             row.status = "closed"
@@ -1128,9 +1171,25 @@ def _select_additional_positions_from_order_evidence(
     if not order_ids:
         return []
 
+    recovered_by_order_id = _recover_order_leg_position_ids(
+        row,
+        client=client,
+        active_positions=active_positions,
+        bound_pos_ids=bound_pos_ids,
+        order_history_cache=order_history_cache,
+        trade_fills_cache=trade_fills_cache,
+        trigger_history_cache=trigger_history_cache,
+    )
+    recovered_pos_ids = [
+        pos_id
+        for pos_id in recovered_by_order_id.values()
+        if pos_id not in existing_pos_ids
+    ]
+    if recovered_pos_ids:
+        return recovered_pos_ids
+
     target_symbol = str(row.symbol or "").upper()
     target_side = str(row.side or "").lower()
-    instrument_id = f"{target_symbol}-USDT-SWAP"
     candidates = [
         position
         for position in active_positions
@@ -1142,25 +1201,91 @@ def _select_additional_positions_from_order_evidence(
         )
         == target_side
     ]
-    if not candidates:
-        return []
-
     evidence = _load_order_evidence(
         client,
-        instrument_id=instrument_id,
+        instrument_id=f"{target_symbol}-USDT-SWAP",
+        order_ids=order_ids,
+        order_history_cache=order_history_cache,
+        trade_fills_cache=trade_fills_cache,
+        trigger_history_cache=trigger_history_cache,
+    )
+    return [
+        pos_id
+        for position in candidates
+        if (pos_id := _first_string(position, "posId", "pos_id", "id"))
+        and any(_position_matches_order_evidence(position, item) for item in evidence)
+    ]
+
+
+def _recover_order_leg_position_ids(
+    row: ExecutionBinding,
+    *,
+    client: DeepcoinReadOnlyClient,
+    active_positions: list[dict[str, Any]],
+    bound_pos_ids: set[str],
+    order_history_cache: dict[str, list[dict[str, Any]]],
+    trade_fills_cache: dict[str, list[dict[str, Any]]],
+    trigger_history_cache: dict[str, list[dict[str, Any]]],
+) -> dict[str, str]:
+    order_ids = set(_split_ids(row.order_id)) | set(_split_ids(row.client_order_id))
+    if not order_ids:
+        return {}
+    target_symbol = str(row.symbol or "").upper()
+    target_side = str(row.side or "").lower()
+    owned_pos_ids = set(_split_ids(row.pos_id))
+    candidates = [
+        position
+        for position in active_positions
+        if (
+            (_first_string(position, "posId", "pos_id", "id") not in bound_pos_ids)
+            or (_first_string(position, "posId", "pos_id", "id") in owned_pos_ids)
+        )
+        and _symbol_from_inst_id(position.get("instId")) == target_symbol
+        and _normalize_position_side(
+            str(position.get("posSide") or position.get("side") or "")
+        )
+        == target_side
+    ]
+    if not candidates:
+        return {}
+    evidence = _load_order_evidence(
+        client,
+        instrument_id=f"{target_symbol}-USDT-SWAP",
         order_ids=order_ids,
         order_history_cache=order_history_cache,
         trade_fills_cache=trade_fills_cache,
         trigger_history_cache=trigger_history_cache,
     )
     if not evidence:
-        return []
-
-    recovered: list[str] = []
-    for position in candidates:
-        pos_id = _first_string(position, "posId", "pos_id", "id")
-        if pos_id and any(_position_matches_order_evidence(position, item) for item in evidence):
-            recovered.append(pos_id)
+        return {}
+    recovered: dict[str, str] = {}
+    used_pos_ids: set[str] = set()
+    for item in evidence:
+        evidence_order_id = _first_string(item, "ordId", "orderId", "order_id", "id")
+        evidence_client_order_id = _first_string(
+            item, "clOrdId", "clientOrderId", "client_order_id"
+        )
+        evidence_key = evidence_order_id or evidence_client_order_id
+        if not evidence_key:
+            continue
+        scored_matches = [
+            (_position_order_evidence_score(position, item), position)
+            for position in candidates
+            if (pos_id := _first_string(position, "posId", "pos_id", "id"))
+            and pos_id not in used_pos_ids
+        ]
+        scored_matches = [item for item in scored_matches if item[0] >= 2]
+        if not scored_matches:
+            continue
+        best_score = max(score for score, _ in scored_matches)
+        matches = [position for score, position in scored_matches if score == best_score]
+        if len(matches) != 1:
+            continue
+        pos_id = _first_string(matches[0], "posId", "pos_id", "id")
+        if pos_id is None:
+            continue
+        recovered[evidence_key] = pos_id
+        used_pos_ids.add(pos_id)
     return recovered
 
 
@@ -1283,6 +1408,48 @@ def _position_matches_order_evidence(position: dict[str, Any], evidence: dict[st
             matched_fields += 1
 
     return matched_fields >= 2
+
+
+def _position_order_evidence_score(position: dict[str, Any], evidence: dict[str, Any]) -> int:
+    score = 0
+    evidence_size = _to_float(
+        evidence.get("fillSz")
+        or evidence.get("accFillSz")
+        or evidence.get("sz")
+        or evidence.get("size")
+    )
+    if evidence_size is not None:
+        position_size = _to_float(position.get("pos") or position.get("size"))
+        if position_size is None or not _close_number(position_size, evidence_size, rel_tol=0.001):
+            return -1
+        score += 2
+
+    evidence_time = _to_int(
+        evidence.get("fillTime")
+        or evidence.get("uTime")
+        or evidence.get("ts")
+        or evidence.get("cTime")
+        or evidence.get("triggerTime")
+    )
+    if evidence_time is not None:
+        position_time = _to_int(position.get("uTime") or position.get("cTime"))
+        if position_time is not None and abs(position_time - evidence_time) <= 120_000:
+            score += 1
+
+    evidence_price = _to_float(
+        evidence.get("fillPx")
+        or evidence.get("avgPx")
+        or evidence.get("avgPrice")
+        or evidence.get("px")
+        or evidence.get("price")
+    )
+    if evidence_price is not None:
+        position_price = _to_float(
+            position.get("avgPx") or position.get("avgPrice") or position.get("openAvgPx")
+        )
+        if position_price is not None and _close_number(position_price, evidence_price, rel_tol=0.001):
+            score += 1
+    return score
 
 
 def _select_position_from_submitted_order_payload(
@@ -1451,7 +1618,9 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
         row.last_exchange_status = "expired_pending_entry_not_attributed"
         return False
     lifecycle.execution_binding_id = row.id
-    if _is_terminal_exited_lifecycle(lifecycle):
+    if _is_terminal_exited_lifecycle(lifecycle) and not (
+        row.status == "active" and lifecycle.exit_reason == "manual"
+    ):
         lifecycle.updated_at = updated_at
         return True
     if row.status == "active" and lifecycle.lifecycle_status != "entered":
@@ -1475,6 +1644,19 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
     _refresh_lifecycle_prices_from_binding_payload(lifecycle, row)
     lifecycle.updated_at = updated_at
     return True
+
+
+def _binding_has_unresolved_entry_leg(session, row: ExecutionBinding) -> bool:
+    legs = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.execution_binding_id == row.id)
+        .filter(ExecutionOrderLeg.purpose == "entry")
+        .all()
+    )
+    if legs:
+        leg_pos_ids = {str(leg.pos_id) for leg in legs if leg.pos_id}
+        return not leg_pos_ids or len(leg_pos_ids) < len(legs)
+    return len(_split_ids(row.order_id)) > len(_split_ids(row.pos_id))
 
 
 def _is_terminal_exited_lifecycle(lifecycle: Any) -> bool:

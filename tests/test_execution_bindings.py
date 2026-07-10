@@ -981,6 +981,226 @@ def test_reconcile_appends_filled_second_leg_position_id(tmp_path):
     assert binding.last_exchange_status == "position_active_recovered_additional_pos_id"
 
 
+def test_reconcile_recovers_each_trigger_leg_despite_fill_slippage(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            symbol="ETH",
+            side="short",
+            order_id="trigger-37,trigger-42",
+            client_order_id="client-37,client-42",
+            pos_id="pos-42",
+            status="active",
+            payload={
+                "submitted_orders": [
+                    {
+                        "leg_index": 1,
+                        "execution_type": "trigger_limit",
+                        "order_id": "trigger-37",
+                        "client_order_id": "client-37",
+                        "request": {
+                            "instId": "ETH-USDT-SWAP",
+                            "posSide": "short",
+                            "triggerPx": "1765",
+                            "sz": "3.7",
+                        },
+                    },
+                    {
+                        "leg_index": 2,
+                        "execution_type": "trigger_limit",
+                        "order_id": "trigger-42",
+                        "client_order_id": "client-42",
+                        "request": {
+                            "instId": "ETH-USDT-SWAP",
+                            "posSide": "short",
+                            "triggerPx": "1767.5",
+                            "sz": "4.2",
+                        },
+                    },
+                ]
+            },
+        ),
+    )
+    repair_execution_order_legs_from_binding_payloads(session_factory)
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-37",
+                    "posSide": "short",
+                    "pos": "3.7",
+                    "avgPx": "1767.18",
+                    "uTime": "1783648112000",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-42",
+                    "posSide": "short",
+                    "pos": "4.2",
+                    "avgPx": "1769.13",
+                    "uTime": "1783648113000",
+                },
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            assert inst_id == "ETH-USDT-SWAP"
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "trigger-37",
+                    "posSide": "short",
+                    "side": "sell",
+                    "sz": "3.7",
+                    "px": "1765",
+                    "triggerTime": "1783648112000",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "trigger-42",
+                    "posSide": "short",
+                    "side": "sell",
+                    "sz": "4.2",
+                    "px": "1767.5",
+                    "triggerTime": "1783648113000",
+                },
+            ]
+
+    reconcile_deepcoin_execution_bindings(session_factory, client=FakeClient())
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+
+    legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
+    assert binding.pos_id == "pos-42,pos-37"
+    assert [(leg.order_id, leg.pos_id) for leg in legs] == [
+        ("trigger-37", "pos-37"),
+        ("trigger-42", "pos-42"),
+    ]
+
+
+def test_reconcile_revives_closed_binding_when_pending_trigger_leg_fills(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            symbol="ETH",
+            side="short",
+            order_id="filled-trigger,pending-trigger",
+            client_order_id="filled-client,pending-client",
+            pos_id="old-pos",
+            status="closed",
+            payload={
+                "submitted_orders": [
+                    {
+                        "leg_index": 1,
+                        "execution_type": "trigger_limit",
+                        "order_id": "filled-trigger",
+                        "client_order_id": "filled-client",
+                        "request": {
+                            "instId": "ETH-USDT-SWAP",
+                            "posSide": "short",
+                            "triggerPx": "1760",
+                            "sz": "2.5",
+                        },
+                    },
+                    {
+                        "leg_index": 2,
+                        "execution_type": "trigger_limit",
+                        "order_id": "pending-trigger",
+                        "client_order_id": "pending-client",
+                        "request": {
+                            "instId": "ETH-USDT-SWAP",
+                            "posSide": "short",
+                            "triggerPx": "1766",
+                            "sz": "3.9",
+                        },
+                    },
+                ]
+            },
+        ),
+    )
+    repair_execution_order_legs_from_binding_payloads(session_factory)
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="ETH",
+                side="short",
+                lifecycle_status="exited",
+                exit_reason="manual",
+                signal_at=datetime(2026, 7, 8, 3, 44),
+                exited_at=datetime(2026, 7, 8, 7, 6),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "new-pos",
+                    "posSide": "short",
+                    "pos": "3.9",
+                    "avgPx": "1767.03",
+                    "uTime": "1783648112000",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            assert inst_id == "ETH-USDT-SWAP"
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "pending-trigger",
+                    "posSide": "short",
+                    "side": "sell",
+                    "sz": "3.9",
+                    "px": "1766",
+                    "triggerTime": "1783648112000",
+                }
+            ]
+
+    reconcile_deepcoin_execution_bindings(session_factory, client=FakeClient())
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = session.query(StrategyLifecycle).one()
+
+    legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
+    assert binding.status == "active"
+    assert binding.pos_id == "old-pos,new-pos"
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.exit_reason is None
+    assert [(leg.order_id, leg.pos_id) for leg in legs] == [
+        ("filled-trigger", None),
+        ("pending-trigger", "new-pos"),
+    ]
+
+
 def test_reconcile_recovers_second_leg_when_first_leg_is_no_longer_active(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     upsert_execution_binding(
@@ -1592,3 +1812,65 @@ def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, bi
     assert binding.last_exchange_status == "manual_closed_or_not_found_on_exchange"
     assert lifecycle.lifecycle_status == "exited"
     assert lifecycle.exit_reason == "manual"
+
+
+def test_sync_manual_closed_positions_keeps_binding_open_for_unfilled_entry_leg(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            order_id="filled-trigger,pending-trigger",
+            client_order_id="filled-client,pending-client",
+            pos_id="closed-pos",
+            status="active",
+            payload={
+                "submitted_orders": [
+                    {
+                        "leg_index": 1,
+                        "order_id": "filled-trigger",
+                        "client_order_id": "filled-client",
+                    },
+                    {
+                        "leg_index": 2,
+                        "order_id": "pending-trigger",
+                        "client_order_id": "pending-client",
+                    },
+                ]
+            },
+        ),
+    )
+    repair_execution_order_legs_from_binding_payloads(session_factory)
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+                entered_at=datetime(2026, 6, 30, 9, 1),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return []
+
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=FakeClient(),
+        synced_at=datetime(2026, 6, 30, 10, 0),
+    )
+
+    assert result.checked == 1
+    assert result.manually_closed == 0
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = session.query(StrategyLifecycle).one()
+
+    assert binding.status == "open"
+    assert binding.last_exchange_status == "entry_legs_pending_after_position_closed"
+    assert lifecycle.lifecycle_status == "entered"
