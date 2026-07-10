@@ -1921,8 +1921,12 @@ def create_web_app(
     )
 
     @app.get("/logs")
-    def logs_page():
-        return HTMLResponse("<!doctype html><title>系统日志</title><h1>系统日志</h1>")
+    def logs_page(request: Request):
+        return templates.TemplateResponse(
+            request,
+            "logs.html",
+            {"asset_version": app.state.asset_version},
+        )
 
     @app.get("/api/logs")
     def api_logs(offset: int = 0, limit: int = 100, level: str | None = None):

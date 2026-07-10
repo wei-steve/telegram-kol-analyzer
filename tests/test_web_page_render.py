@@ -20,6 +20,18 @@ from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.web_app import _exchange_order_row
 
 
+def test_logs_page_has_safe_paginated_viewer_controls(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/logs")
+
+    assert response.status_code == 200
+    assert "data-log-viewer" in response.text
+    assert "data-log-level-filter" in response.text
+    assert "data-log-refresh" in response.text
+    assert "data-log-list" in response.text
+
+
 def test_index_page_shows_group_list_and_messages(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

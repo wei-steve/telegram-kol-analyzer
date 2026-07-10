@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}系统日志{% endblock %}
+
+{% block body %}
+<main class="log-viewer" data-log-viewer>
+  <header class="trader-desk-header">
+    <div class="header-left">
+      <h1>系统日志</h1>
+      <a class="header-link" href="/">交易执行台</a>
+    </div>
+  </header>
+  <div class="log-viewer-toolbar">
+    <label>
+      日志级别
+      <select data-log-level-filter>
+        <option value="">全部</option>
+        <option value="INFO">INFO</option>
+        <option value="WARNING">WARNING</option>
+        <option value="ERROR">ERROR</option>
+      </select>
+    </label>
+    <button type="button" class="secondary-button" data-log-refresh>刷新</button>
+    <span data-log-status aria-live="polite"></span>
+  </div>
+  <section class="log-viewer-list" data-log-list aria-label="系统日志"></section>
+</main>
+{% endblock %}

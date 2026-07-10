@@ -2255,6 +2255,99 @@ function bindDeepcoinPositionSync() {
   });
 }
 
+function initLogViewer() {
+  const viewer = document.querySelector('[data-log-viewer]');
+  if (!viewer) {
+    return;
+  }
+
+  const levelFilter = viewer.querySelector('[data-log-level-filter]');
+  const refreshButton = viewer.querySelector('[data-log-refresh]');
+  const status = viewer.querySelector('[data-log-status]');
+  const container = viewer.querySelector('[data-log-list]');
+  const pageSize = 100;
+  let offset = 0;
+  let hasMore = true;
+  let loading = false;
+  let requestVersion = 0;
+  let reloadPending = false;
+
+  const setStatus = (message, isError = false) => {
+    status.textContent = message;
+    status.classList.toggle('is-error', isError);
+  };
+  const appendLogEntry = (entry) => {
+    const article = document.createElement('article');
+    article.className = `log-entry log-entry--${entry.level.toLowerCase()}`;
+    const meta = document.createElement('div');
+    meta.className = 'log-entry-meta';
+    meta.textContent = `${entry.timestamp} ${entry.level} ${entry.logger}`;
+    const message = document.createElement('pre');
+    message.className = 'log-entry-message';
+    message.textContent = entry.message;
+    article.append(meta, message);
+    container.append(article);
+  };
+  const loadEntries = async () => {
+    if (loading || !hasMore) {
+      return;
+    }
+    loading = true;
+    const activeRequestVersion = requestVersion;
+    setStatus('正在加载…');
+    const params = new URLSearchParams({ offset: String(offset), limit: String(pageSize) });
+    if (levelFilter.value) {
+      params.set('level', levelFilter.value);
+    }
+    try {
+      const response = await fetch(`/api/logs?${params}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.detail || '加载日志失败');
+      }
+      if (activeRequestVersion !== requestVersion) {
+        return;
+      }
+      const entries = payload.items || [];
+      entries.forEach(appendLogEntry);
+      offset = payload.next_offset;
+      hasMore = payload.has_more;
+      if (!entries.length && offset === 0) {
+        container.textContent = '暂无匹配的日志。';
+      }
+      setStatus(hasMore ? '继续向下滚动以加载更多。' : '已加载全部日志。');
+    } catch (error) {
+      setStatus(error.message || '加载日志失败', true);
+    } finally {
+      loading = false;
+      if (reloadPending) {
+        reloadPending = false;
+        loadEntries();
+      }
+    }
+  };
+  const resetAndLoad = () => {
+    requestVersion += 1;
+    offset = 0;
+    hasMore = true;
+    container.replaceChildren();
+    if (loading) {
+      reloadPending = true;
+      return Promise.resolve();
+    }
+    return loadEntries();
+  };
+
+  levelFilter.addEventListener('change', resetAndLoad);
+  refreshButton.addEventListener('click', resetAndLoad);
+  container.addEventListener('scroll', () => {
+    if (container.scrollTop + container.clientHeight >= container.scrollHeight - 80) {
+      loadEntries();
+    }
+  }, { passive: true });
+  resetAndLoad();
+}
+
 function bindLivePositionAttributionButtons() {
   document.querySelectorAll('[data-bind-live-position]').forEach((button) => {
     button.addEventListener('click', async () => {
@@ -2317,6 +2410,7 @@ window.addEventListener('DOMContentLoaded', () => {
   bindClearAiHistory();
   bindManualCloseButtons();
   bindDeepcoinPositionSync();
+  initLogViewer();
   bindLivePositionAttributionButtons();
   renderConversationHistory();
   setAiStatus('');
