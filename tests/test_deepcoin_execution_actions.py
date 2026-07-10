@@ -187,6 +187,29 @@ def test_adjust_position_tpsl_refuses_to_append_when_existing_tpsl_is_missing(tm
     assert client.protection_payloads == []
 
 
+def test_adjust_position_tpsl_refuses_unattributed_pending_tpsl_orders(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    trade_signal = _signal(
+        session_factory,
+        action="adjust_stop_loss",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+    )
+    client = _FakeDeepcoinClient()
+    for order in client.trigger_pending:
+        order.pop("posId")
+
+    with pytest.raises(DeepcoinExecutionActionError, match="ambiguous_pending_position_tpsl"):
+        adjust_position_tpsl(
+            session_factory,
+            trade_signal=trade_signal,
+            deepcoin_client=client,
+        )
+
+    assert client.cancel_trigger_payloads == []
+    assert client.protection_payloads == []
+
+
 def test_process_trade_signal_live_closes_bound_position_with_close_pos_id(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})

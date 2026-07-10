@@ -103,6 +103,8 @@ def adjust_position_tpsl(
         inst_id=inst_id,
     )
     pending = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
+    if _has_unattributed_pending_tpsl_for_position(position=position, pending_trigger_orders=pending):
+        raise DeepcoinExecutionActionError("ambiguous_pending_position_tpsl")
     old_tpsl_rows = select_position_tpsl_orders(position=position, pending_trigger_orders=pending)
     old_order_ids = pending_tpsl_order_ids_for_position(
         position=position,
@@ -569,6 +571,25 @@ def _select_bound_position(
     if len(matches) == 1:
         return matches[0]
     raise DeepcoinExecutionActionError("ambiguous_bound_position")
+
+
+def _has_unattributed_pending_tpsl_for_position(
+    *,
+    position: dict[str, Any],
+    pending_trigger_orders: list[dict[str, Any]],
+) -> bool:
+    inst_id = str(position.get("instId") or "").upper()
+    side = _normalize_side(str(position.get("posSide") or position.get("side") or ""))
+    for order in pending_trigger_orders:
+        if str(order.get("triggerOrderType") or "").upper() != "TPSL":
+            continue
+        if str(order.get("instId") or "").upper() != inst_id:
+            continue
+        if _normalize_side(str(order.get("posSide") or order.get("side") or "")) != side:
+            continue
+        if not _first_string(order, "posId", "pos_id", "positionId"):
+            return True
+    return False
 
 
 def _select_bound_positions(
