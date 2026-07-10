@@ -30,3 +30,4 @@ data/media/
 exports/
 reports/*.json
 *.log
+.worktrees/
