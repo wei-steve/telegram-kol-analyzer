@@ -2606,6 +2606,87 @@ pre { white-space: pre-wrap; }
   .execution-layout { height: auto; overflow: visible; }
 }
 
+@media (max-width: 760px) {
+  .trader-layout {
+    height: 100dvh;
+    min-height: 100dvh;
+    padding: 8px 10px calc(68px + env(safe-area-inset-bottom));
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
+  .trader-shell {
+    display: block;
+    height: auto;
+    overflow: visible;
+  }
+
+  .trader-shell > [data-mobile-work-region] {
+    display: none;
+    height: auto;
+    max-height: none;
+  }
+
+  [data-trader-dashboard]:not(.mobile-view-strategies):not(.mobile-view-messages) [data-mobile-work-region="overview"],
+  [data-trader-dashboard].mobile-view-overview [data-mobile-work-region="overview"] {
+    display: block;
+  }
+
+  [data-trader-dashboard]:not(.mobile-view-strategies):not(.mobile-view-messages) [data-mobile-work-region="strategies"],
+  [data-trader-dashboard].mobile-view-overview [data-mobile-work-region="strategies"],
+  [data-trader-dashboard].mobile-view-strategies [data-mobile-work-region="strategies"] {
+    display: grid;
+    margin-top: 10px;
+  }
+
+  [data-trader-dashboard].mobile-view-messages [data-mobile-work-region="messages"] {
+    display: block;
+  }
+
+  .dashboard-tab-panel[data-dashboard-panel="trading-settings"].is-active,
+  .dashboard-tab-panel[data-dashboard-panel="exchange-positions"].is-active {
+    height: 100%;
+    min-height: 100%;
+  }
+
+  [data-mobile-work-nav],
+  .mobile-work-nav {
+    position: fixed;
+    z-index: 20;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+    border-top: 1px solid rgba(148, 163, 184, 0.24);
+    background: #0f172a;
+  }
+
+  .mobile-work-nav button {
+    min-width: 0;
+    min-height: 44px;
+    padding: 6px 4px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: #94a3b8;
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 700;
+  }
+
+  .mobile-work-nav button.is-active,
+  .mobile-work-nav button[aria-current="page"] {
+    background: rgba(37, 99, 235, 0.28);
+    color: #dbeafe;
+  }
+
+  .mobile-work-nav button:active {
+    background: rgba(59, 130, 246, 0.42);
+  }
+}
+
 @media (max-width: 600px) {
   .trader-kpi-strip { flex-wrap: wrap; justify-content: center; }
   .header-center { display: none; }

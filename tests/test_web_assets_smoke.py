@@ -189,6 +189,18 @@ def test_app_css_allows_trading_settings_tab_to_scroll(tmp_path):
     assert "overflow-y: auto" in response.text
 
 
+def test_app_css_includes_mobile_work_mode_navigation(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.css")
+
+    assert response.status_code == 200
+    assert "[data-mobile-work-nav]" in response.text
+    assert "@media (max-width: 760px)" in response.text
+    assert ".mobile-work-nav" in response.text
+    assert "env(safe-area-inset-bottom" in response.text
+
+
 def test_app_js_binds_recovery_order_confirmation_dry_run(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
