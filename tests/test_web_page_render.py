@@ -67,6 +67,13 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
 
     assert response.status_code == 200
     assert "data-trader-dashboard" in response.text
+    assert "data-mobile-work-nav" in response.text
+    assert 'data-mobile-work-view="overview"' in response.text
+    assert 'data-mobile-work-view="strategies"' in response.text
+    assert 'data-mobile-work-view="messages"' in response.text
+    assert 'data-mobile-work-view="positions"' in response.text
+    assert 'data-mobile-work-view="more"' in response.text
+    assert 'data-mobile-work-region="overview"' in response.text
     assert "data-dashboard-tab" in response.text
     assert "data-ai-recognition-prompt" in response.text
     assert "data-ai-recognition-config" in response.text

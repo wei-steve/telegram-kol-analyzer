@@ -365,7 +365,7 @@
 
   <section class="dashboard-tab-panel is-active" data-dashboard-panel="main">
     <div class="trader-shell">
-      <aside class="panel trader-groups-panel" data-layout-scroll-panel>
+      <aside class="panel trader-groups-panel" data-layout-scroll-panel data-mobile-work-region="overview">
         <div class="panel-heading">
           <h2>群组 / KOL</h2>
           <span>{{ groups|length }} 群组</span>
@@ -375,7 +375,7 @@
         {% endwith %}
       </aside>
 
-      <section class="trader-strategy-panel" data-strategy-panel>
+      <section class="trader-strategy-panel" data-strategy-panel data-mobile-work-region="strategies">
         {% with
           filter='holding',
           selected_chat_id=selected_chat_id,
@@ -388,7 +388,7 @@
         {% endwith %}
       </section>
 
-      <section class="trader-detail-panel" data-detail-panel>
+      <section class="trader-detail-panel" data-detail-panel data-mobile-work-region="messages">
         {% with
           selected_group=selected_group,
           selected_chat_id=selected_chat_id,
@@ -403,5 +403,12 @@
       </section>
     </div>
   </section>
+  <nav class="mobile-work-nav" data-mobile-work-nav aria-label="移动工作区导航">
+    <button type="button" class="is-active" data-mobile-work-view="overview" aria-current="page">概览</button>
+    <button type="button" data-mobile-work-view="strategies">策略</button>
+    <button type="button" data-mobile-work-view="messages">消息</button>
+    <button type="button" data-mobile-work-view="positions">持仓</button>
+    <button type="button" data-mobile-work-view="more">更多</button>
+  </nav>
 </main>
 {% endblock %}
