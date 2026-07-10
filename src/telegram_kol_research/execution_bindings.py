@@ -414,19 +414,25 @@ def reconcile_deepcoin_execution_bindings(
                         result.stale += 1
             row.recovered_at = now
             row.updated_at = now
+            order_leg_position_ids = _recover_order_leg_position_ids(
+                row,
+                client=client,
+                active_positions=active_positions,
+                bound_pos_ids=bound_pos_ids,
+                order_history_cache=order_history_cache,
+                trade_fills_cache=trade_fills_cache,
+                trigger_history_cache=trigger_history_cache,
+            )
+            _remove_reassigned_position_ids(
+                session,
+                owner=row,
+                pos_ids=set(order_leg_position_ids.values()),
+            )
             _refresh_order_legs_from_binding_row(
                 session,
                 row,
                 active_positions=active_positions,
-                order_leg_position_ids=_recover_order_leg_position_ids(
-                    row,
-                    client=client,
-                    active_positions=active_positions,
-                    bound_pos_ids=bound_pos_ids,
-                    order_history_cache=order_history_cache,
-                    trade_fills_cache=trade_fills_cache,
-                    trigger_history_cache=trigger_history_cache,
-                ),
+                order_leg_position_ids=order_leg_position_ids,
             )
             result.updated += 1
         session.commit()
@@ -1236,11 +1242,7 @@ def _recover_order_leg_position_ids(
     candidates = [
         position
         for position in active_positions
-        if (
-            (_first_string(position, "posId", "pos_id", "id") not in bound_pos_ids)
-            or (_first_string(position, "posId", "pos_id", "id") in owned_pos_ids)
-        )
-        and _symbol_from_inst_id(position.get("instId")) == target_symbol
+        if _symbol_from_inst_id(position.get("instId")) == target_symbol
         and _normalize_position_side(
             str(position.get("posSide") or position.get("side") or "")
         )
@@ -1274,7 +1276,7 @@ def _recover_order_leg_position_ids(
             if (pos_id := _first_string(position, "posId", "pos_id", "id"))
             and pos_id not in used_pos_ids
         ]
-        scored_matches = [item for item in scored_matches if item[0] >= 2]
+        scored_matches = [item for item in scored_matches if item[0] >= 3]
         if not scored_matches:
             continue
         best_score = max(score for score, _ in scored_matches)
@@ -1287,6 +1289,41 @@ def _recover_order_leg_position_ids(
         recovered[evidence_key] = pos_id
         used_pos_ids.add(pos_id)
     return recovered
+
+
+def _remove_reassigned_position_ids(
+    session,
+    *,
+    owner: ExecutionBinding,
+    pos_ids: set[str],
+) -> None:
+    if not pos_ids:
+        return
+    bindings = (
+        session.query(ExecutionBinding)
+        .filter(ExecutionBinding.venue == owner.venue)
+        .filter(ExecutionBinding.id != owner.id)
+        .all()
+    )
+    for binding in bindings:
+        current_pos_ids = _split_ids(binding.pos_id)
+        remaining_pos_ids = [pos_id for pos_id in current_pos_ids if pos_id not in pos_ids]
+        if len(remaining_pos_ids) == len(current_pos_ids):
+            continue
+        binding.pos_id = _join_unique_ids(remaining_pos_ids) or None
+        binding.last_exchange_status = "position_reassigned_by_stronger_order_evidence"
+        binding.updated_at = owner.updated_at
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == binding.id)
+            .all()
+        )
+        for leg in legs:
+            if str(leg.pos_id or "") not in pos_ids:
+                continue
+            leg.pos_id = None
+            leg.status = "open"
+            leg.updated_at = owner.updated_at
 
 
 def _load_order_evidence(

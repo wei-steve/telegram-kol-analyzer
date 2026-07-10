@@ -1090,6 +1090,113 @@ def test_reconcile_recovers_each_trigger_leg_despite_fill_slippage(tmp_path):
     ]
 
 
+def test_reconcile_reassigns_position_from_weak_old_trigger_match(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    wrong_binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            chat_id=99,
+            message_id=1,
+            symbol="ETH",
+            side="short",
+            order_id="old-trigger",
+            client_order_id="old-client",
+            pos_id="pos-37",
+            status="active",
+            payload={
+                "submitted_orders": [
+                    {
+                        "leg_index": 1,
+                        "order_id": "old-trigger",
+                        "client_order_id": "old-client",
+                    }
+                ]
+            },
+        ),
+    )
+    correct_binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            chat_id=100,
+            message_id=2,
+            symbol="ETH",
+            side="short",
+            order_id="current-trigger",
+            client_order_id="current-client",
+            pos_id=None,
+            status="open",
+            payload={
+                "submitted_orders": [
+                    {
+                        "leg_index": 1,
+                        "order_id": "current-trigger",
+                        "client_order_id": "current-client",
+                    }
+                ]
+            },
+        ),
+    )
+    repair_execution_order_legs_from_binding_payloads(session_factory)
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-37",
+                    "posSide": "short",
+                    "pos": "3.7",
+                    "avgPx": "1767.18",
+                    "uTime": "1783648112000",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            assert inst_id == "ETH-USDT-SWAP"
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "old-trigger",
+                    "posSide": "short",
+                    "side": "sell",
+                    "sz": "3.7",
+                    "px": "1790",
+                    "triggerTime": "1783354072000",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "current-trigger",
+                    "posSide": "short",
+                    "side": "sell",
+                    "sz": "3.7",
+                    "px": "1765",
+                    "triggerTime": "1783648112000",
+                },
+            ]
+
+    reconcile_deepcoin_execution_bindings(session_factory, client=FakeClient())
+
+    with session_factory() as session:
+        wrong_binding = session.get(ExecutionBinding, wrong_binding_id)
+        correct_binding = session.get(ExecutionBinding, correct_binding_id)
+
+    assert wrong_binding.pos_id is None
+    assert correct_binding.pos_id == "pos-37"
+    wrong_legs = list_execution_order_legs(session_factory, execution_binding_id=wrong_binding_id)
+    correct_legs = list_execution_order_legs(session_factory, execution_binding_id=correct_binding_id)
+    assert wrong_legs[0].pos_id is None
+    assert correct_legs[0].pos_id == "pos-37"
+
+
 def test_reconcile_revives_closed_binding_when_pending_trigger_leg_fills(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
