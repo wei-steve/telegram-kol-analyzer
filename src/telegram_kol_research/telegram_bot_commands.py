@@ -29,6 +29,12 @@ EXPIRY_EXPIRE_KEEP_COMMAND = "expiry_expire_keep"
 logger = logging.getLogger(__name__)
 
 
+def _log_system_operator_callback_processed(*, update_id: int, callback_data: str) -> None:
+    """Log callback handling without retaining untrusted callback payload data."""
+    del callback_data
+    logger.info("System operator bot processing callback update_id=%s", update_id)
+
+
 async def run_telegram_bot_command_loop(
     *,
     config: StrategyAlertConfig,
@@ -120,10 +126,9 @@ async def run_system_operator_bot_command_loop(
                         if not _message_is_from_alert_chat(message, chat_id):
                             continue
                         callback_data = str(callback.get("data") or "")
-                        logger.info(
-                            "System operator bot processing callback update_id=%s data=%s",
-                            update_id,
-                            callback_data,
+                        _log_system_operator_callback_processed(
+                            update_id=update_id,
+                            callback_data=callback_data,
                         )
                         deepcoin_client = (
                             deepcoin_client_factory()

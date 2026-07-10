@@ -26,6 +26,9 @@ from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.message_recognition import MessageRecognitionResult
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
+from telegram_kol_research.telegram_bot_commands import (
+    _log_system_operator_callback_processed,
+)
 
 
 def test_root_page_renders_successfully(tmp_path):
@@ -62,6 +65,19 @@ def test_logs_api_rejects_invalid_pagination(tmp_path):
     assert client.get("/api/logs?offset=-1").status_code == 422
     assert client.get("/api/logs?limit=201").status_code == 422
     assert client.get("/api/logs?level=DEBUG").status_code == 422
+
+
+def test_logs_api_does_not_expose_system_operator_callback_data(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    callback_data = "expiry_expire_cancel:confidential-operator-payload"
+
+    _log_system_operator_callback_processed(update_id=42, callback_data=callback_data)
+
+    response = TestClient(app).get("/api/logs")
+
+    messages = [item["message"] for item in response.json()["items"]]
+    assert callback_data not in "\n".join(messages)
+    assert "System operator bot processing callback update_id=42" in messages
 
 
 def test_group_automation_api_updates_config_file(tmp_path):
