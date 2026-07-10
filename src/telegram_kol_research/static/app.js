@@ -1072,6 +1072,48 @@ function bindDashboardTabs() {
   });
 }
 
+function bindMobileWorkNavigation() {
+  const dashboard = document.querySelector('[data-trader-dashboard]');
+  const buttons = document.querySelectorAll('[data-mobile-work-view]');
+  if (!dashboard || !buttons.length) {
+    return;
+  }
+
+  const views = ['overview', 'strategies', 'messages', 'positions', 'more'];
+  const setMobileWorkView = (view) => {
+    dashboard.classList.remove(...views.map((item) => `mobile-view-${item}`));
+    dashboard.classList.add(`mobile-view-${view}`);
+    buttons.forEach((button) => {
+      const isActive = button.dataset.mobileWorkView === view;
+      button.classList.toggle('is-active', isActive);
+      if (isActive) {
+        button.setAttribute('aria-current', 'page');
+      } else {
+        button.removeAttribute('aria-current');
+      }
+    });
+  };
+
+  buttons.forEach((button) => {
+    button.addEventListener('click', () => {
+      const view = button.dataset.mobileWorkView || 'overview';
+      setMobileWorkView(view);
+      if (view === 'positions') {
+        document.querySelector('[data-dashboard-tab="exchange-positions"]')?.click();
+      } else if (view === 'more') {
+        const settingsMenu = document.querySelector('.settings-dropdown');
+        if (settingsMenu) {
+          settingsMenu.open = true;
+        }
+      } else {
+        document.querySelector('[data-dashboard-tab="main"]')?.click();
+      }
+    });
+  });
+
+  setMobileWorkView('overview');
+}
+
 function bindExchangePositionTabs() {
   document.querySelectorAll('[data-exchange-position-tabs]').forEach((root) => {
     const tabs = root.querySelectorAll('[data-exchange-position-tab]');
@@ -2401,6 +2443,7 @@ window.addEventListener('DOMContentLoaded', () => {
   bindGroupAutomationToggles();
   bindDetailPanelControls();
   bindDashboardTabs();
+  bindMobileWorkNavigation();
   bindExchangePositionTabs();
   bindTradingSettingsForm();
   bindStrategyFilterBadges();

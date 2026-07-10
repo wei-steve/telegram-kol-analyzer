@@ -211,6 +211,19 @@ def test_app_css_includes_mobile_work_mode_navigation(tmp_path):
     assert "env(safe-area-inset-bottom" in css[mobile_start:]
 
 
+def test_app_js_binds_mobile_work_navigation_to_existing_dashboard_views(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "function bindMobileWorkNavigation" in response.text
+    assert "[data-mobile-work-view]" in response.text
+    assert "setMobileWorkView('overview')" in response.text
+    assert '[data-dashboard-tab="exchange-positions"]' in response.text
+    assert "bindMobileWorkNavigation();" in response.text
+
+
 def test_app_js_binds_recovery_order_confirmation_dry_run(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
