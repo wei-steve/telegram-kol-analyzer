@@ -14,7 +14,6 @@ from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_dr
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
-from telegram_kol_research.deepcoin_execution_actions import recover_missing_position_protections
 from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.models import ExecutionBinding, MediaAsset, RawMessage, SignalCandidate, Source, StrategyLifecycle
@@ -379,16 +378,6 @@ def _auto_process_management_signal(
             client=deepcoin_client,
             recovered_at=processed_at,
         )
-    if hasattr(deepcoin_client, "set_position_sltp") and hasattr(
-        deepcoin_client,
-        "list_trigger_orders_pending",
-    ):
-        recover_missing_position_protections(
-            session_factory,
-            deepcoin_client=deepcoin_client,
-            recovered_at=processed_at,
-        )
-
     binding = _load_active_execution_binding(
         session_factory,
         chat_id=raw_message.chat_id,

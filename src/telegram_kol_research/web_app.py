@@ -40,7 +40,6 @@ from telegram_kol_research.ai_recognition_config import (
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
-from telegram_kol_research.deepcoin_execution_actions import recover_missing_position_protections
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
@@ -2414,16 +2413,6 @@ def create_web_app(
                 client=client,
                 synced_at=app.state.now_provider(),
             )
-            protection_result = (
-                recover_missing_position_protections(
-                    app.state.session_factory,
-                    deepcoin_client=client,
-                    recovered_at=app.state.now_provider(),
-                )
-                if hasattr(client, "set_position_sltp")
-                and hasattr(client, "list_trigger_orders_pending")
-                else None
-            )
         except DeepcoinClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:
@@ -2436,12 +2425,6 @@ def create_web_app(
             "reconciled_active": reconcile_result.active if reconcile_result else 0,
             "reconciled_open": reconcile_result.open if reconcile_result else 0,
             "reconciled_stale": reconcile_result.stale if reconcile_result else 0,
-            "protection_checked": protection_result.checked if protection_result else 0,
-            "protection_recovered": protection_result.protected if protection_result else 0,
-            "protection_skipped_existing": protection_result.skipped_existing if protection_result else 0,
-            "protection_skipped_missing_prices": (
-                protection_result.skipped_missing_prices if protection_result else 0
-            ),
         }
 
     @app.post("/api/execution/bind-live-position")
@@ -3228,15 +3211,6 @@ async def run_deepcoin_execution_reconcile_loop(
                 client=client,
                 synced_at=synced_at,
             )
-            if hasattr(client, "set_position_sltp") and hasattr(
-                client,
-                "list_trigger_orders_pending",
-            ):
-                recover_missing_position_protections(
-                    session_factory,
-                    deepcoin_client=client,
-                    recovered_at=synced_at,
-                )
         except DeepcoinClientError as exc:
             logger.warning("Deepcoin execution reconcile skipped: %s", exc)
         except Exception:

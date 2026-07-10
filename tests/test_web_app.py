@@ -604,7 +604,7 @@ def test_execution_sync_api_marks_missing_deepcoin_position_closed(tmp_path):
         assert lifecycle.exit_reason == "manual"
 
 
-def test_execution_sync_api_recovers_second_leg_before_manual_close_check(tmp_path):
+def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):
     class FakeDeepcoinClient:
         def __init__(self):
             self.protection_payloads = []
@@ -687,10 +687,8 @@ def test_execution_sync_api_recovers_second_leg_before_manual_close_check(tmp_pa
     assert response.status_code == 200
     assert response.json()["reconciled_active"] == 1
     assert response.json()["manually_closed"] == 0
-    assert response.json()["protection_recovered"] == 1
-    assert fake_client.protection_payloads[0]["posId"] == "pos-limit"
-    assert fake_client.protection_payloads[0]["slTriggerPx"] == "1640.0"
-    assert fake_client.protection_payloads[0]["tpTriggerPx"] == "1608.0"
+    assert "protection_recovered" not in response.json()
+    assert fake_client.protection_payloads == []
     with app.state.session_factory() as session:
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         binding = session.get(ExecutionBinding, binding_id)

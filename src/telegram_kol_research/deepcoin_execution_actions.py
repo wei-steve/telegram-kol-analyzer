@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -41,15 +40,6 @@ class _LoadedBinding:
     margin_mode: str
     position_mode: str
     status: str
-
-
-@dataclass(slots=True)
-class MissingProtectionRecoveryResult:
-    checked: int = 0
-    protected: int = 0
-    skipped_existing: int = 0
-    skipped_missing_prices: int = 0
-    skipped_unbound: int = 0
 
 
 def execute_deepcoin_management_signal(
@@ -92,111 +82,6 @@ def execute_deepcoin_management_signal(
             executed_at=executed_at,
         )
     raise DeepcoinExecutionActionError(f"unsupported_trade_signal_action:{trade_signal.action}")
-
-
-def recover_missing_position_protections(
-    session_factory: sessionmaker,
-    *,
-    deepcoin_client: DeepcoinTradingClientProtocol,
-    recovered_at: datetime | None = None,
-) -> MissingProtectionRecoveryResult:
-    """Set position TP/SL for active bindings that are missing exchange protection."""
-
-    now = recovered_at or datetime.now(UTC)
-    result = MissingProtectionRecoveryResult()
-    with session_factory() as session:
-        rows = (
-            session.query(ExecutionBinding)
-            .filter(ExecutionBinding.venue == "deepcoin")
-            .filter(ExecutionBinding.status == "active")
-            .filter(ExecutionBinding.pos_id.isnot(None))
-            .order_by(ExecutionBinding.id.asc())
-            .all()
-        )
-        snapshots = [
-            (
-                _LoadedBinding(
-                    id=int(row.id),
-                    strategy_instance_id=row.strategy_instance_id,
-                    kol_id=row.kol_id,
-                    chat_id=int(row.chat_id),
-                    message_id=int(row.message_id),
-                    symbol=row.symbol,
-                    side=row.side,
-                    venue=row.venue,
-                    order_id=row.order_id,
-                    client_order_id=row.client_order_id,
-                    pos_id=row.pos_id,
-                    margin_mode=row.margin_mode,
-                    position_mode=row.position_mode,
-                    status=row.status,
-                ),
-                _target_tpsl_from_binding_row(row, session),
-            )
-            for row in rows
-        ]
-
-    for binding, target in snapshots:
-        if not binding.pos_id:
-            result.skipped_unbound += 1
-            continue
-        after = {key: value for key, value in target.items() if value not in (None, "", 0, "0")}
-        if not after:
-            result.skipped_missing_prices += 1
-            continue
-        inst_id = _to_deepcoin_swap_instrument(binding.symbol)
-        positions = _select_bound_positions(
-            deepcoin_client.list_positions(inst_id=inst_id),
-            binding=binding,
-            inst_id=inst_id,
-        )
-        pending = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
-        for position in positions:
-            result.checked += 1
-            old_tpsl_rows = select_position_tpsl_orders(position=position, pending_trigger_orders=pending)
-            if pending_tpsl_order_ids_for_position(position=position, pending_trigger_orders=pending):
-                result.skipped_existing += 1
-                continue
-
-            set_payload = _build_position_tpsl_payload(
-                binding=binding,
-                position=position,
-                inst_id=inst_id,
-                after=after,
-            )
-            set_response = deepcoin_client.set_position_sltp(set_payload)
-            record_execution_event(
-                session_factory,
-                ExecutionEventRecord(
-                    execution_binding_id=binding.id,
-                    trade_signal_id=None,
-                    strategy_instance_id=binding.strategy_instance_id,
-                    kol_id=binding.kol_id,
-                    chat_id=binding.chat_id,
-                    message_id=binding.message_id,
-                    source_message_id=binding.message_id,
-                    symbol=binding.symbol,
-                    side=binding.side,
-                    action="set_position_tpsl",
-                    order_id=_extract_order_id(set_response),
-                    pos_id=_first_string(position, "posId", "pos_id", "id"),
-                    reason="recover_missing_position_protection",
-                    before=_tpsl_snapshot(old_tpsl_rows) or None,
-                    after=after,
-                    request=set_payload,
-                    response=set_response,
-                    created_at=now,
-                ),
-            )
-            _update_binding_status(
-                session_factory,
-                binding.id,
-                status="active",
-                last_exchange_status="position_tpsl_adjusted",
-                updated_at=now,
-            )
-            result.protected += 1
-    return result
 
 
 def adjust_position_tpsl(
@@ -672,74 +557,6 @@ def _load_binding_for_signal(
             status=row.status,
         )
     return loaded
-
-
-def _target_tpsl_from_binding_row(row: ExecutionBinding, session) -> dict[str, Any]:
-    target: dict[str, Any] = {}
-    try:
-        payload = json.loads(row.payload_json or "{}")
-    except json.JSONDecodeError:
-        payload = {}
-    draft = payload.get("draft") if isinstance(payload.get("draft"), dict) else {}
-    stop_loss = _first_payload_value(draft, "stop_loss", "stop_loss_price", "sl", "slTriggerPx")
-    take_profit = _first_take_profit_from_draft(draft)
-    if stop_loss is not None:
-        target["stop_loss"] = stop_loss
-    if take_profit is not None:
-        target["take_profit"] = take_profit
-
-    lifecycle = (
-        session.query(StrategyLifecycle)
-        .filter(StrategyLifecycle.execution_binding_id == row.id)
-        .order_by(StrategyLifecycle.id.desc())
-        .first()
-    )
-    if lifecycle is None:
-        lifecycle = (
-            session.query(StrategyLifecycle)
-            .filter(StrategyLifecycle.chat_id == row.chat_id)
-            .filter(StrategyLifecycle.message_id == row.message_id)
-            .filter(StrategyLifecycle.symbol == row.symbol)
-            .filter(StrategyLifecycle.side == row.side)
-            .order_by(StrategyLifecycle.id.desc())
-            .first()
-        )
-    if lifecycle is not None:
-        if target.get("stop_loss") is None and lifecycle.stop_loss is not None:
-            target["stop_loss"] = lifecycle.stop_loss
-        if target.get("take_profit") is None:
-            lifecycle_tp = _first_number_from_text(lifecycle.take_profit)
-            if lifecycle_tp is not None:
-                target["take_profit"] = lifecycle_tp
-    return target
-
-
-def _first_take_profit_from_draft(draft: dict[str, Any]) -> Any:
-    take_profit = _first_payload_value(draft, "take_profit", "take_profit_price", "tp", "tpTriggerPx")
-    if take_profit is not None:
-        return take_profit
-    legs = draft.get("take_profit_legs")
-    if isinstance(legs, list):
-        for leg in legs:
-            if not isinstance(leg, dict):
-                continue
-            price = _first_payload_value(leg, "price", "take_profit", "tp", "tpTriggerPx")
-            if price is not None:
-                return price
-    return None
-
-
-def _first_number_from_text(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    for chunk in str(value).replace(",", "/").split("/"):
-        try:
-            number = float(chunk.strip())
-        except ValueError:
-            continue
-        if number > 0:
-            return number
-    return None
 
 
 def _select_bound_position(
