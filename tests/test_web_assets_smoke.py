@@ -195,10 +195,20 @@ def test_app_css_includes_mobile_work_mode_navigation(tmp_path):
     response = client.get("/static/app.css")
 
     assert response.status_code == 200
-    assert "[data-mobile-work-nav]" in response.text
-    assert "@media (max-width: 760px)" in response.text
-    assert ".mobile-work-nav" in response.text
-    assert "env(safe-area-inset-bottom" in response.text
+    css = response.text
+    nav_selector = "[data-mobile-work-nav]"
+    mobile_media = "@media (max-width: 760px)"
+
+    mobile_start = css.rindex(mobile_media)
+    default_nav_start = css.index(nav_selector)
+    default_nav_end = css.index("}", default_nav_start)
+    assert default_nav_start < mobile_start
+    assert "display: none" in css[default_nav_start:default_nav_end]
+
+    mobile_nav_start = css.index(nav_selector, mobile_start)
+    mobile_nav_end = css.index("}", mobile_nav_start)
+    assert "display: grid" in css[mobile_nav_start:mobile_nav_end]
+    assert "env(safe-area-inset-bottom" in css[mobile_start:]
 
 
 def test_app_js_binds_recovery_order_confirmation_dry_run(tmp_path):

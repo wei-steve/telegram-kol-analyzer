@@ -2594,6 +2594,11 @@ pre { white-space: pre-wrap; }
 }
 
 /* ── Responsive ── */
+[data-mobile-work-nav],
+.mobile-work-nav {
+  display: none;
+}
+
 @media (max-width: 900px) {
   .trader-shell {
     grid-template-columns: 1fr;
