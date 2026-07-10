@@ -16,6 +16,7 @@ src/*.egg-info/
 
 config/groups.yaml
 config/*.env
+config/development.env
 config/ai_recognition.yaml
 
 data/
