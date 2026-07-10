@@ -43,16 +43,28 @@ Nginx proxies public port `80` to the local app on `127.0.0.1:8000`.
 
 ## Update Flow
 
-After making local changes:
+After making local changes, commit and push first. Then choose the helper for
+your workstation:
 
 ```powershell
 git add .
 git commit -m "describe the change"
 git push origin codex/deepcoin-auto-trading-v1
+```
+
+macOS / Linux:
+
+```bash
+./scripts/server_git_update.sh
+```
+
+Windows:
+
+```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1
 ```
 
-The update script tells the server to:
+Both helpers tell the server to:
 
 1. Fetch and pull the latest GitHub code.
 2. Reinstall the package in editable mode with the server virtualenv.
