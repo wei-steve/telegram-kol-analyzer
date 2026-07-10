@@ -2222,6 +2222,37 @@ function startPollingUpdates() {
   }, 5000);
 }
 
+function requestLiveActionConfirmation(button) {
+  const actionLabel = button.dataset.liveActionLabel || '执行此操作';
+  const symbol = button.dataset.liveActionSymbol;
+  const side = button.dataset.liveActionSide;
+  const groupLabel = button.dataset.liveActionGroupLabel;
+  const context = [
+    actionLabel,
+    symbol,
+    side === 'long' ? '多' : side === 'short' ? '空' : side,
+    groupLabel,
+  ].filter(Boolean).join(' · ');
+  const dialog = document.querySelector('[data-live-action-confirm]');
+
+  if (!dialog || typeof dialog.showModal !== 'function') {
+    return Promise.resolve(window.confirm(`确认${context}？这只会更新项目状态，不会向 DeepCoin 下单。`));
+  }
+
+  const contextElement = dialog.querySelector('[data-live-action-confirm-context]');
+  if (contextElement) {
+    contextElement.textContent = `即将${context}。`;
+  }
+  return new Promise((resolve) => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'confirm'), { once: true });
+    try {
+      dialog.showModal();
+    } catch {
+      resolve(window.confirm(`确认${context}？这只会更新项目状态，不会向 DeepCoin 下单。`));
+    }
+  });
+}
+
 function bindManualCloseButtons() {
   document.querySelectorAll('[data-manual-close-lifecycle]').forEach((button) => {
     button.addEventListener('click', async () => {
@@ -2231,7 +2262,7 @@ function bindManualCloseButtons() {
       if (!lifecycleId) {
         return;
       }
-      const confirmed = window.confirm('确认已经在交易所手动平仓？这只会更新项目状态，不会向 DeepCoin 下单。');
+      const confirmed = await requestLiveActionConfirmation(button);
       if (!confirmed) {
         return;
       }
@@ -2400,7 +2431,7 @@ function bindLivePositionAttributionButtons() {
       if (!posId || !lifecycleId) {
         return;
       }
-      const confirmed = window.confirm('确认把这个 DeepCoin 实盘仓位绑定到选中的 KOL 策略？这不会向交易所下单。');
+      const confirmed = await requestLiveActionConfirmation(button);
       if (!confirmed) {
         return;
       }

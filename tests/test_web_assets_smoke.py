@@ -257,3 +257,15 @@ def test_app_js_binds_recovery_live_submit(tmp_path):
     assert "data-live-recovery-submit" in response.text
     assert "/api/recovery-live-submit" in response.text
     assert "实盘提交" in response.text
+
+
+def test_live_action_confirmation_uses_shared_dialog_hooks(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "requestLiveActionConfirmation" in response.text
+    assert "data-live-action-confirm" in response.text
+    assert "data-manual-close-lifecycle" in response.text
+    assert "data-bind-live-position" in response.text

@@ -111,6 +111,10 @@
                   data-bind-live-position
                   data-pos-id="{{ item.pos_id }}"
                   data-lifecycle-id="{{ candidate.lifecycle_id }}"
+                  data-live-action-label="绑定实盘仓位"
+                  {% if item.symbol %}data-live-action-symbol="{{ item.symbol }}"{% endif %}
+                  {% if item.side %}data-live-action-side="{{ item.side }}"{% endif %}
+                  {% if candidate.group_label %}data-live-action-group-label="{{ candidate.group_label }}"{% endif %}
                   {% if not candidate.bindable %}disabled title="归属不唯一或置信度不足，禁止一键绑定"{% endif %}
                 >{% if candidate.bindable %}绑定{% else %}需核对{% endif %}</button>
               </div>
@@ -126,6 +130,10 @@
               class="danger-button"
               data-manual-close-lifecycle
               data-lifecycle-id="{{ item.lifecycle_id }}"
+              data-live-action-label="标记已手动平仓"
+              {% if item.symbol %}data-live-action-symbol="{{ item.symbol }}"{% endif %}
+              {% if item.side %}data-live-action-side="{{ item.side }}"{% endif %}
+              {% if item.group_label %}data-live-action-group-label="{{ item.group_label }}"{% endif %}
             >标记已手动平仓</button>
             <span class="execution-action-status" data-manual-close-status aria-live="polite"></span>
           </div>
@@ -137,5 +145,17 @@
       </div>
     {% endfor %}
   </section>
+
+  <dialog class="live-action-confirm-dialog" data-live-action-confirm aria-labelledby="live-action-confirm-title" aria-describedby="live-action-confirm-context">
+    <form method="dialog">
+      <h2 id="live-action-confirm-title">确认实盘状态操作</h2>
+      <p id="live-action-confirm-context" data-live-action-confirm-context></p>
+      <p class="live-action-confirm-note">此操作只更新项目中的仓位归属或状态，不会向 DeepCoin 下单。</p>
+      <div class="live-action-confirm-actions">
+        <button type="submit" class="secondary-button" value="cancel" data-live-action-confirm-cancel>取消</button>
+        <button type="submit" class="danger-button" value="confirm" data-live-action-confirm-submit>确认操作</button>
+      </div>
+    </form>
+  </dialog>
 </main>
 {% endblock %}

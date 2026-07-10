@@ -2593,6 +2593,50 @@ pre { white-space: pre-wrap; }
   color: #94a3b8;
 }
 
+.live-action-confirm-dialog {
+  width: min(calc(100vw - 32px), 420px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid rgba(148, 163, 184, 0.30);
+  border-radius: 12px;
+  background: #0f172a;
+  color: #e2e8f0;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.48);
+}
+.live-action-confirm-dialog::backdrop {
+  background: rgba(2, 6, 23, 0.72);
+}
+.live-action-confirm-dialog form {
+  display: grid;
+  gap: 14px;
+  padding: 20px;
+}
+.live-action-confirm-dialog h2,
+.live-action-confirm-dialog p {
+  margin: 0;
+}
+.live-action-confirm-dialog h2 {
+  font-size: 1.05rem;
+}
+.live-action-confirm-dialog [data-live-action-confirm-context] {
+  color: #dbeafe;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.live-action-confirm-note {
+  color: #94a3b8;
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+.live-action-confirm-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.live-action-confirm-actions button {
+  min-height: 44px;
+}
+
 /* ── Responsive ── */
 [data-mobile-work-nav],
 .mobile-work-nav {
