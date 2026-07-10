@@ -31,3 +31,4 @@ exports/
 reports/*.json
 *.log
 .worktrees/
+data/logs/
