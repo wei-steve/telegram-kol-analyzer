@@ -2246,6 +2246,7 @@ function requestLiveActionConfirmation(button) {
   return new Promise((resolve) => {
     dialog.addEventListener('close', () => resolve(dialog.returnValue === 'confirm'), { once: true });
     try {
+      dialog.returnValue = '';
       dialog.showModal();
     } catch {
       resolve(window.confirm(`确认${context}？这只会更新项目状态，不会向 DeepCoin 下单。`));

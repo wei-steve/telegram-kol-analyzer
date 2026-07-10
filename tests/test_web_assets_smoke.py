@@ -269,3 +269,13 @@ def test_live_action_confirmation_uses_shared_dialog_hooks(tmp_path):
     assert "data-live-action-confirm" in response.text
     assert "data-manual-close-lifecycle" in response.text
     assert "data-bind-live-position" in response.text
+
+
+def test_live_action_confirmation_clears_stale_return_value_before_opening(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "dialog.returnValue = '';" in response.text
+    assert response.text.index("dialog.returnValue = '';") < response.text.index("dialog.showModal();")
