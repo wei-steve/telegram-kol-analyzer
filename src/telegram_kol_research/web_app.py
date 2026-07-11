@@ -99,6 +99,7 @@ from telegram_kol_research.web_queries import (
     load_database_freshness,
     load_group_messages,
     load_group_rows,
+    load_home_event_rows,
     list_execution_strategy_overview,
     load_lifecycle_counts,
     load_lifecycle_counts_by_chat_id,
@@ -2044,6 +2045,64 @@ def create_web_app(
             exited_positions=exited_positions,
             group_label_by_chat_id=group_label_by_chat_id,
         )
+        home_events = load_home_event_rows(app.state.session_factory, limit=50)
+        exchange_positions = exchange_snapshot.get("positions") or []
+        missing_stop_positions = [
+            row for row in holding_positions
+            if not (row.get("stop_loss") or row.get("stop_loss_text"))
+        ]
+        unassigned_positions = [
+            row for row in exchange_positions
+            if (row.get("attribution") or {}).get("state") in {"unassigned", "candidate"}
+        ]
+        risk_rows = []
+        for row in missing_stop_positions:
+            risk_rows.append({
+                "id": f"risk:missing-stop:{row.get('id') or row.get('message_id')}",
+                "kind": "risk",
+                "occurred_at": row.get("latest_event_at") or row.get("signal_at") or app.state.now_provider(),
+                "source_label": row.get("sender_name") or str(row.get("chat_id") or "策略"),
+                "title": "持仓缺少止损",
+                "summary": f"{row.get('symbol') or '-'} {row.get('side') or ''}",
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "status": "risk",
+                "destination": {"view": "positions", "pos_id": row.get("pos_id")},
+            })
+        for row in unassigned_positions:
+            risk_rows.append({
+                "id": f"risk:unassigned:{row.get('pos_id') or row.get('symbol')}",
+                "kind": "risk",
+                "occurred_at": app.state.now_provider(),
+                "source_label": "Deepcoin",
+                "title": "交易所仓位归属异常",
+                "summary": f"{row.get('symbol') or '-'} {row.get('side') or ''}",
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "status": "risk",
+                "destination": {"view": "positions", "pos_id": row.get("pos_id")},
+            })
+        home_events = sorted(
+            [*risk_rows, *home_events],
+            key=lambda row: (
+                row["occurred_at"].astimezone(UTC).replace(tzinfo=None)
+                if row["occurred_at"].tzinfo is not None
+                else row["occurred_at"]
+            ),
+            reverse=True,
+        )[:50]
+        home_summary = {
+            "position_count": len(exchange_positions),
+            "unrealized_pnl": sum(
+                float(row.get("unrealized_pnl") or row.get("upl") or 0)
+                for row in exchange_positions
+            ),
+            "risk_count": len(missing_stop_positions) + len(unassigned_positions),
+            "pending_count": strategy_kpi["pending_count"],
+            "telegram_state": monitor_status["state"],
+            "database_state": "stale" if freshness["stale_hours"] is not None and freshness["stale_hours"] > 1 else "current",
+            "exchange_state": "error" if exchange_snapshot.get("error") else "current",
+        }
         ai_recognition_config = load_ai_recognition_config(
             app.state.ai_recognition_config_path
         )
@@ -2072,6 +2131,8 @@ def create_web_app(
                 "trader_dashboard": trader_dashboard,
                 "strategy_kpi": strategy_kpi,
                 "exchange_snapshot": exchange_snapshot,
+                "home_events": home_events,
+                "home_summary": home_summary,
                 "ai_recognition_config": ai_recognition_config,
                 "ai_prompt_views": build_ai_prompt_views(ai_recognition_config),
                 "recognition_profiles": list_recognition_profiles(),

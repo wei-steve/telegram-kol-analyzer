@@ -15,6 +15,14 @@
       </div>
     </div>
 
+    <nav class="message-workflow-filters" aria-label="消息筛选">
+      <button type="button" class="is-active" data-message-workflow-filter="all">全部</button>
+      <button type="button" data-message-workflow-filter="recognized">已识别策略</button>
+      <button type="button" data-message-workflow-filter="unrecognized">未识别</button>
+      <button type="button" data-message-workflow-filter="media">图片消息</button>
+      <button type="button" data-message-workflow-filter="abnormal">异常</button>
+    </nav>
+
     <div class="detail-lower">
       {% include "_messages.html" %}
     </div>

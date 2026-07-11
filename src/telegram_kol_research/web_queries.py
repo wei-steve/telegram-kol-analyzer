@@ -11,11 +11,13 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionEvent,
     MediaAsset,
     MessageRecognition,
     RawMessage,
     RecognitionExperiment,
     SignalCandidate,
+    StrategyLifecycle,
     utc_now,
 )
 from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
@@ -30,6 +32,103 @@ STRATEGY_TIME_DISPLAY_FIELDS = (
     "latest_event_at",
 )
 MAX_MEDIA_ASSETS_PER_MESSAGE = 3
+
+
+def load_home_event_rows(
+    session_factory: sessionmaker,
+    *,
+    limit: int = 50,
+    kinds: set[str] | None = None,
+) -> list[dict[str, object]]:
+    """Return a small, normalized feed without duplicating source state."""
+
+    selected = kinds or {"message", "strategy", "execution"}
+    rows: list[dict[str, object]] = []
+    with session_factory() as session:
+        if "message" in selected:
+            messages = (
+                session.query(RawMessage)
+                .order_by(RawMessage.posted_at.desc(), RawMessage.message_id.desc())
+                .limit(limit)
+                .all()
+            )
+            rows.extend(
+                {
+                    "id": f"message:{message.chat_id}:{message.message_id}",
+                    "kind": "message",
+                    "occurred_at": message.posted_at or message.created_at,
+                    "source_label": message.sender_name or str(message.chat_id),
+                    "title": "收到新消息",
+                    "summary": (message.text or "图片或媒体消息").strip()[:160],
+                    "symbol": None,
+                    "side": None,
+                    "status": "received",
+                    "destination": {
+                        "view": "messages",
+                        "chat_id": message.chat_id,
+                        "message_id": message.message_id,
+                    },
+                }
+                for message in messages
+            )
+        if "strategy" in selected:
+            strategies = (
+                session.query(StrategyLifecycle)
+                .order_by(StrategyLifecycle.updated_at.desc(), StrategyLifecycle.id.desc())
+                .limit(limit)
+                .all()
+            )
+            rows.extend(
+                {
+                    "id": f"strategy:{strategy.id}",
+                    "kind": "strategy",
+                    "occurred_at": (
+                        strategy.exited_at
+                        or strategy.entered_at
+                        or strategy.signal_at
+                    ),
+                    "source_label": str(strategy.chat_id),
+                    "title": "策略状态更新",
+                    "summary": f"{strategy.symbol} {strategy.side} · {strategy.lifecycle_status}",
+                    "symbol": strategy.symbol,
+                    "side": strategy.side,
+                    "status": strategy.lifecycle_status,
+                    "destination": {
+                        "view": "strategies",
+                        "chat_id": strategy.chat_id,
+                        "message_id": strategy.message_id,
+                    },
+                }
+                for strategy in strategies
+            )
+        if "execution" in selected:
+            executions = (
+                session.query(ExecutionEvent)
+                .order_by(ExecutionEvent.created_at.desc(), ExecutionEvent.id.desc())
+                .limit(limit)
+                .all()
+            )
+            rows.extend(
+                {
+                    "id": f"execution:{event.id}",
+                    "kind": "execution",
+                    "occurred_at": event.created_at,
+                    "source_label": event.kol_id or event.venue,
+                    "title": "交易执行更新",
+                    "summary": event.reason or event.action.replace("_", " "),
+                    "symbol": event.symbol,
+                    "side": event.side,
+                    "status": event.status,
+                    "destination": {
+                        "view": "positions",
+                        "pos_id": event.pos_id,
+                        "order_id": event.order_id,
+                    },
+                }
+                for event in executions
+            )
+    rows.sort(key=lambda row: row["occurred_at"], reverse=True)
+    return rows[: max(0, limit)]
 
 
 def _format_strategy_time(value: object) -> str | None:

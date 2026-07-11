@@ -219,6 +219,23 @@ def test_app_css_includes_mobile_work_mode_navigation(tmp_path):
     assert "overflow-y: auto" not in mobile_layout
 
 
+def test_app_css_includes_mobile_first_workbench_visual_contract(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.css")
+
+    assert response.status_code == 200
+    css = response.text
+    assert "--color-profit" in css
+    assert ".desktop-workbench-nav" in css
+    assert ".home-risk-summary" in css
+    assert ".home-event-card" in css
+    assert ".home-priority-risk" in css
+    assert ".workbench-detail-drawer" in css
+    assert "min-height: 44px" in css
+    assert "env(safe-area-inset-bottom" in css
+
+
 def test_app_js_binds_mobile_work_navigation_to_existing_dashboard_views(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
@@ -230,6 +247,33 @@ def test_app_js_binds_mobile_work_navigation_to_existing_dashboard_views(tmp_pat
     assert "setMobileWorkView('overview')" in response.text
     assert '[data-dashboard-tab="exchange-positions"]' in response.text
     assert "bindMobileWorkNavigation();" in response.text
+
+
+def test_app_js_binds_workbench_navigation_and_home_event_filters(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "function bindWorkbenchNavigation" in response.text
+    assert "[data-workbench-view]" in response.text
+    assert "[data-workbench-panel]" in response.text
+    assert "function bindHomeEventFilters" in response.text
+    assert "[data-home-event-filter]" in response.text
+    assert "[data-new-home-events]" in response.text
+
+
+def test_app_assets_expose_persistent_mutation_states(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    js = client.get("/static/app.js").text
+    css = client.get("/static/app.css").text
+
+    assert "aria-busy" in js
+    assert ".is-loading" in css
+    assert ".is-empty" in css
+    assert ".is-stale" in css
+    assert ".is-error" in css
 
 
 def test_app_js_binds_recovery_order_confirmation_dry_run(tmp_path):

@@ -103,6 +103,8 @@
         class="message-card{% if not message_default_expanded %} is-message-collapsed{% endif %}"
         id="message-{{ message.raw_message_id }}"
         data-message-card
+        data-message-kind="{% if strategy_related %}recognized{% else %}unrecognized{% endif %}"
+        data-message-has-media="{{ 'true' if message.media_assets else 'false' }}"
         data-message-default-expanded="{{ 'true' if message_default_expanded else 'false' }}"
       >
         <header class="message-card-header">

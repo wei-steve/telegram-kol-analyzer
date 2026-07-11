@@ -56,7 +56,9 @@
       {% if item.last_checked_at_display %}<div><dt>更新时间</dt><dd>{{ item.last_checked_at_display }}</dd></div>{% endif %}
     </dl>
     {% if attr and attr.state == 'bound' and item.pos_id %}
-      <div class="exchange-position-actions">
+      <details class="exchange-position-danger-zone" data-position-danger-zone>
+        <summary>仓位操作</summary>
+        <div class="exchange-position-actions">
         <button
           type="button"
           class="danger-button"
@@ -70,7 +72,8 @@
           data-live-action-confirmation-note="这会向 DeepCoin 提交该指定仓位的市价全平订单。"
         >市价平仓</button>
         <span class="exchange-position-action-status" data-close-bound-position-status aria-live="polite"></span>
-      </div>
+        </div>
+      </details>
     {% endif %}
   </article>
 {%- endmacro %}

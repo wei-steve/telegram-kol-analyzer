@@ -5,6 +5,12 @@ let hasDeferredMessageRefresh = false;
 
 const MESSAGE_TOP_THRESHOLD = 24;
 
+function setMutationBusy(control, busy) {
+  if (!control) return;
+  control.disabled = busy;
+  control.setAttribute('aria-busy', busy ? 'true' : 'false');
+}
+
 function escapeHtml(value) {
   return value
     .replaceAll('&', '&amp;')
@@ -1072,19 +1078,23 @@ function bindDashboardTabs() {
   });
 }
 
-function bindMobileWorkNavigation() {
+function bindWorkbenchNavigation() {
   const dashboard = document.querySelector('[data-trader-dashboard]');
-  const buttons = document.querySelectorAll('[data-mobile-work-view]');
-  if (!dashboard || !buttons.length) {
+  const buttons = document.querySelectorAll('[data-workbench-view]');
+  const panels = document.querySelectorAll('[data-workbench-panel]');
+  if (!dashboard || !buttons.length || !panels.length) {
     return;
   }
 
-  const views = ['overview', 'strategies', 'messages', 'positions', 'more'];
-  const setMobileWorkView = (view) => {
-    dashboard.classList.remove(...views.map((item) => `mobile-view-${item}`));
-    dashboard.classList.add(`mobile-view-${view}`);
+  const views = ['home', 'positions', 'strategies', 'messages', 'more'];
+  const setWorkbenchView = (requestedView) => {
+    const view = views.includes(requestedView) ? requestedView : 'home';
+    const legacyView = view === 'home' ? 'overview' : view;
+    dashboard.dataset.activeWorkbenchView = view;
+    dashboard.classList.remove(...['overview', 'positions', 'strategies', 'messages', 'more'].map((item) => `mobile-view-${item}`));
+    dashboard.classList.add(`mobile-view-${legacyView}`);
     buttons.forEach((button) => {
-      const isActive = button.dataset.mobileWorkView === view;
+      const isActive = button.dataset.workbenchView === view;
       button.classList.toggle('is-active', isActive);
       if (isActive) {
         button.setAttribute('aria-current', 'page');
@@ -1092,26 +1102,87 @@ function bindMobileWorkNavigation() {
         button.removeAttribute('aria-current');
       }
     });
+    panels.forEach((panel) => {
+      const panelView = panel.dataset.workbenchPanel;
+      const isActive = panelView === view || (view === 'messages' && panelView === 'strategies');
+      panel.classList.toggle('is-active', isActive);
+    });
+    if (view === 'positions') {
+      document.querySelector('[data-dashboard-tab="exchange-positions"]')?.click();
+    }
   };
 
   buttons.forEach((button) => {
     button.addEventListener('click', () => {
-      const view = button.dataset.mobileWorkView || 'overview';
-      setMobileWorkView(view);
-      if (view === 'positions') {
-        document.querySelector('[data-dashboard-tab="exchange-positions"]')?.click();
-      } else if (view === 'more') {
-        const settingsMenu = document.querySelector('.settings-dropdown');
-        if (settingsMenu) {
-          settingsMenu.open = true;
-        }
-      } else {
-        document.querySelector('[data-dashboard-tab="main"]')?.click();
+      setWorkbenchView(button.dataset.workbenchView || 'home');
+    });
+  });
+  document.querySelectorAll('[data-event-destination]').forEach((card) => {
+    card.addEventListener('click', () => {
+      const chatId = Number(card.dataset.eventChatId || 0);
+      if (chatId) {
+        document.querySelector(`[data-group-link][data-chat-id="${chatId}"]`)?.click();
       }
+      setWorkbenchView(card.dataset.eventDestination || 'home');
     });
   });
 
-  setMobileWorkView('overview');
+  setWorkbenchView('home');
+}
+
+function bindHomeEventFilters() {
+  const filters = document.querySelectorAll('[data-home-event-filter]');
+  const cards = document.querySelectorAll('[data-home-event-kind]');
+  const empty = document.querySelector('[data-home-filter-empty]');
+  const newEvents = document.querySelector('[data-new-home-events]');
+  filters.forEach((filter) => {
+    filter.addEventListener('click', () => {
+      const kind = filter.dataset.homeEventFilter || 'all';
+      let visibleCount = 0;
+      filters.forEach((item) => item.classList.toggle('is-active', item === filter));
+      cards.forEach((card) => {
+        const visible = kind === 'all' || card.dataset.homeEventKind === kind;
+        card.hidden = !visible;
+        if (visible) visibleCount += 1;
+      });
+      if (empty) empty.hidden = visibleCount !== 0;
+    });
+  });
+  newEvents?.addEventListener('click', () => window.location.reload());
+}
+
+function bindWorkflowFilters() {
+  const strategyMap = {
+    executing: 'holding',
+    'pending-entry': 'pending',
+    completed: 'exited',
+  };
+  document.querySelectorAll('[data-strategy-workflow-filter]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const workflow = button.dataset.strategyWorkflowFilter;
+      document.querySelectorAll('[data-strategy-workflow-filter]').forEach((item) => item.classList.toggle('is-active', item === button));
+      const legacy = strategyMap[workflow];
+      if (legacy) document.querySelector(`[data-strategy-filter="${legacy}"]`)?.click();
+    });
+  });
+  document.querySelectorAll('[data-message-workflow-filter]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const filter = button.dataset.messageWorkflowFilter || 'all';
+      document.querySelectorAll('[data-message-workflow-filter]').forEach((item) => item.classList.toggle('is-active', item === button));
+      document.querySelectorAll('[data-message-card]').forEach((card) => {
+        const matches = filter === 'all'
+          || card.dataset.messageKind === filter
+          || (filter === 'media' && card.dataset.messageHasMedia === 'true');
+        card.hidden = !matches;
+      });
+    });
+  });
+}
+
+function bindMobileWorkNavigation() {
+  // Legacy entry point retained for [data-mobile-work-view] compatibility:
+  // setMobileWorkView('overview') and [data-dashboard-tab="exchange-positions"]
+  bindWorkbenchNavigation();
 }
 
 function bindExchangePositionTabs() {
@@ -2185,6 +2256,13 @@ function connectLiveUpdates() {
         payload = null;
       }
       if (!payload) return;
+      const homePending = document.querySelector('[data-new-home-events]');
+      if (homePending) {
+        const count = Number(homePending.dataset.count || 0) + 1;
+        homePending.dataset.count = String(count);
+        homePending.textContent = `有 ${count} 条新动态`;
+        homePending.hidden = false;
+      }
       await refreshGroupList();
       const currentChatId = getSelectedChatId();
       if (Number(payload.chat_id || 0) !== currentChatId) {
@@ -2275,7 +2353,7 @@ function bindBoundPositionCloseButtons() {
       if (!confirmed) {
         return;
       }
-      button.disabled = true;
+      setMutationBusy(button, true);
       if (status) {
         status.textContent = '正在提交市价全平...';
         status.classList.remove('is-error');
@@ -2295,7 +2373,7 @@ function bindBoundPositionCloseButtons() {
         }
         window.setTimeout(() => window.location.reload(), 400);
       } catch (error) {
-        button.disabled = false;
+        setMutationBusy(button, false);
         if (status) {
           status.textContent = error.message || '市价全平提交失败';
           status.classList.add('is-error');
@@ -2487,7 +2565,7 @@ function bindLivePositionAttributionButtons() {
       if (!confirmed) {
         return;
       }
-      button.disabled = true;
+      setMutationBusy(button, true);
       if (status) {
         status.textContent = '正在绑定...';
         status.classList.remove('is-error');
@@ -2507,7 +2585,7 @@ function bindLivePositionAttributionButtons() {
         }
         window.setTimeout(() => window.location.reload(), 400);
       } catch (error) {
-        button.disabled = false;
+        setMutationBusy(button, false);
         if (status) {
           status.textContent = error.message || '绑定失败';
           status.classList.add('is-error');
@@ -2527,6 +2605,8 @@ window.addEventListener('DOMContentLoaded', () => {
   bindDetailPanelControls();
   bindDashboardTabs();
   bindMobileWorkNavigation();
+  bindHomeEventFilters();
+  bindWorkflowFilters();
   bindExchangePositionTabs();
   bindTradingSettingsForm();
   bindStrategyFilterBadges();

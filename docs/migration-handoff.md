@@ -28,3 +28,18 @@ Use GitHub as the code-transfer channel. After a reviewed commit is pushed to `c
 - Use `scripts/preflight_mac_migration.ps1` before moving to a new workstation.
 - Store only non-secret decisions and operational notes in repository documentation.
 - If a credential is discovered in Git history, revoke or rotate it; deleting a working-tree file is insufficient.
+
+## Mobile-first web workbench
+
+The main web console now follows one shared mobile-first information architecture rather than adapting the old three-column desktop shell independently. Its five primary destinations are `首页`, `持仓`, `策略`, `消息`, and `更多`.
+
+The home destination leads with account risk and service health, then combines recent Telegram messages, strategy lifecycle changes, and Deepcoin execution records into a normalized read-only event feed. Source tables remain authoritative; the feed does not copy trading state.
+
+Mobile is the primary layout. Desktop enhances the same hierarchy with a left navigation rail and wider content area. Do not create a separate `/mobile` application or duplicate backend actions.
+
+Low-risk actions such as refresh, filtering, navigation, and opening details can happen directly. Position close, live-position binding, and trading-setting changes remain detail-only actions with explicit confirmation, pending-state feedback, and duplicate-submit protection.
+
+Design and implementation references:
+
+- `docs/plans/2026-07-12-mobile-first-web-workbench-design.md`
+- `docs/plans/2026-07-12-mobile-first-web-workbench.md`

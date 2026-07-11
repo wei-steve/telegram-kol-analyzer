@@ -32,6 +32,19 @@ def test_logs_page_has_safe_paginated_viewer_controls(tmp_path):
     assert "data-log-list" in response.text
 
 
+def test_index_page_renders_explicit_operational_states(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'data-service-health="telegram"' in response.text
+    assert 'data-service-health="database"' in response.text
+    assert 'data-service-health="deepcoin"' in response.text
+    assert "data-home-event-empty" in response.text
+    assert "data-last-success-at" in response.text
+
+
 def test_index_page_shows_group_list_and_messages(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
@@ -67,6 +80,12 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
 
     assert response.status_code == 200
     assert "data-trader-dashboard" in response.text
+    assert 'data-workbench-view="home"' in response.text
+    assert 'data-workbench-view="positions"' in response.text
+    assert "data-home-risk-summary" in response.text
+    assert "data-home-event-feed" in response.text
+    assert 'data-home-event-filter="risk"' in response.text
+    assert "data-desktop-workbench-nav" in response.text
     assert "data-mobile-work-nav" in response.text
     assert 'data-mobile-work-view="overview"' in response.text
     assert 'data-mobile-work-view="strategies"' in response.text
@@ -123,6 +142,11 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert 'data-strategy-filter="holding"' in response.text
     assert 'data-strategy-filter="pending"' in response.text
     assert 'data-strategy-filter="exited"' in response.text
+    assert 'data-strategy-workflow-filter="executing"' in response.text
+    assert 'data-strategy-workflow-filter="confirmation"' in response.text
+    assert 'data-strategy-workflow-filter="abnormal"' in response.text
+    assert 'data-message-workflow-filter="recognized"' in response.text
+    assert "data-position-danger-zone" in response.text
     assert "data-group-link" in response.text
     assert "data-trader-dashboard" in response.text
     assert "data-detail-panel" in response.text

@@ -213,6 +213,20 @@ Confirmed runtime mode:
 - Periodic reconcile/backfill every 5 minutes to reduce missed messages.
 - Web workbench for status, review, config, and logs.
 
+## Current Web Workbench Direction
+
+The confirmed workbench structure is mobile-first and uses the same Flask/Jinja application on phone and desktop:
+
+- `首页`: four high-priority risk/operations metrics, independent Telegram/database/Deepcoin health, and a unified event feed.
+- `持仓`: open positions, orders, attribution, risk warnings, and history.
+- `策略`: executing, confirmation, pending-entry, completed, and abnormal workflows.
+- `消息`: latest-activity KOL/group navigation and chronological messages with recognition details.
+- `更多`: trading settings, AI configuration, prompts, profiles, and logs.
+
+The event feed normalizes existing source records for display and links back to their detail views. It must not become a second source of truth.
+
+Mobile home pages do not expose dangerous trading mutations. Closing or binding a live position and changing trading configuration require entering the corresponding detail view, reviewing concrete instrument/side/quantity/source context, and confirming the action. Backend validation and idempotency remain authoritative.
+
 ## Deepcoin Requirements
 
 Trading venue: `www.deepcoin.com`.
@@ -458,4 +472,3 @@ Design document should cover:
   - Deepcoin API mock tests.
   - browser selector smoke tests.
   - fail-closed tests.
-

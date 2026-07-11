@@ -52,6 +52,12 @@
     </div>
   {% endif %}
 
+  {% include "_workbench_nav.html" %}
+
+  <section class="workbench-panel is-active" data-workbench-panel="home">
+    {% include "_home_dashboard.html" %}
+  </section>
+
   <section class="dashboard-tab-panel" data-dashboard-panel="prompt">
     <section class="panel ai-recognition-panel" data-ai-recognition-prompt>
       <div class="panel-heading">
@@ -351,7 +357,7 @@
     </section>
   </section>
 
-  <section class="dashboard-tab-panel" data-dashboard-panel="exchange-positions">
+  <section class="dashboard-tab-panel workbench-panel" data-dashboard-panel="exchange-positions" data-workbench-panel="positions">
     {% with
       strategy_kpi=strategy_kpi,
       exchange_snapshot=exchange_snapshot,
@@ -363,7 +369,7 @@
     {% endwith %}
   </section>
 
-  <section class="dashboard-tab-panel is-active" data-dashboard-panel="main">
+  <section class="dashboard-tab-panel workbench-panel" data-dashboard-panel="main" data-workbench-panel="strategies">
     <div class="trader-shell">
       <aside class="panel trader-groups-panel" data-layout-scroll-panel data-mobile-work-region="overview">
         <div class="panel-heading">
@@ -403,12 +409,16 @@
       </section>
     </div>
   </section>
-  <nav class="mobile-work-nav" data-mobile-work-nav aria-label="移动工作区导航">
-    <button type="button" class="is-active" data-mobile-work-view="overview" aria-current="page">概览</button>
-    <button type="button" data-mobile-work-view="strategies">策略</button>
-    <button type="button" data-mobile-work-view="messages">消息</button>
-    <button type="button" data-mobile-work-view="positions">持仓</button>
-    <button type="button" data-mobile-work-view="more">更多</button>
-  </nav>
+  <section class="workbench-panel more-workbench-panel" data-workbench-panel="more">
+    <h2>更多工具</h2>
+    <div class="more-workbench-grid">
+      <button type="button" data-dashboard-tab="trading-settings">交易设置</button>
+      <button type="button" data-dashboard-tab="prompt">AI 识别提示词</button>
+      <button type="button" data-dashboard-tab="config">AI 配置</button>
+      <button type="button" data-dashboard-tab="recognition-profiles">识别 Profile</button>
+      <a href="/execution">执行中策略</a>
+      <a href="/logs">系统日志</a>
+    </div>
+  </section>
 </main>
 {% endblock %}

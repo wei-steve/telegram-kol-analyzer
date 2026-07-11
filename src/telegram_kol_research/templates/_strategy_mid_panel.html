@@ -18,6 +18,13 @@
   </summary>
 {%- endmacro %}
 <div class="strategy-panel-content">
+  <nav class="strategy-workflow-filters" aria-label="策略工作流筛选">
+    <button type="button" class="is-active" data-strategy-workflow-filter="executing">执行中</button>
+    <button type="button" data-strategy-workflow-filter="confirmation">待确认</button>
+    <button type="button" data-strategy-workflow-filter="pending-entry">待入场</button>
+    <button type="button" data-strategy-workflow-filter="completed">已结束</button>
+    <button type="button" data-strategy-workflow-filter="abnormal">异常</button>
+  </nav>
   <div class="strategy-panel-toolbar">
     <div class="trader-kpi-strip" aria-label="交易执行概览">
       <span class="kpi-badge kpi-holding{% if filter == 'holding' %} is-active-filter{% endif %}" data-strategy-filter="holding" title="点击查看持仓中策略">

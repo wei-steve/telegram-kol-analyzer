@@ -1,0 +1,46 @@
+<section class="home-dashboard" data-home-dashboard>
+  <div class="home-risk-summary" data-home-risk-summary>
+    <article><small>总浮盈亏</small><strong class="{% if home_summary.unrealized_pnl < 0 %}is-loss{% else %}is-profit{% endif %}">{{ "%+.2f"|format(home_summary.unrealized_pnl) }} USDT</strong></article>
+    <article><small>当前持仓</small><strong>{{ home_summary.position_count }}</strong></article>
+    <article><small>风险异常</small><strong class="{% if home_summary.risk_count %}is-risk{% endif %}">{{ home_summary.risk_count }}</strong></article>
+    <article><small>待处理策略</small><strong>{{ home_summary.pending_count }}</strong></article>
+  </div>
+
+  <div class="home-service-health{% if home_summary.database_state == 'stale' %} is-stale{% endif %}" aria-label="服务状态" data-last-success-at="{{ database_latest_message_at or '' }}">
+    <span data-service-health="telegram">Telegram · {{ home_summary.telegram_state }}</span>
+    <span data-service-health="database">数据库 · {{ home_summary.database_state }}</span>
+    <span data-service-health="deepcoin">Deepcoin · {{ home_summary.exchange_state }}</span>
+  </div>
+
+  {% if home_summary.risk_count %}
+    <button type="button" class="home-priority-risk" data-workbench-view="positions">
+      <span>⚠ {{ home_summary.risk_count }} 个持仓风险需要检查</span><strong>查看详情 →</strong>
+    </button>
+  {% endif %}
+
+  <div class="home-event-toolbar">
+    <div class="home-event-filters" aria-label="事件筛选">
+      <button type="button" class="is-active" data-home-event-filter="all">全部</button>
+      <button type="button" data-home-event-filter="message">消息</button>
+      <button type="button" data-home-event-filter="strategy">策略</button>
+      <button type="button" data-home-event-filter="execution">成交</button>
+      <button type="button" data-home-event-filter="risk">异常</button>
+    </div>
+    <button type="button" class="new-home-events" data-new-home-events hidden>有新动态</button>
+  </div>
+
+  <div class="home-event-feed" data-home-event-feed>
+    {% for event in home_events %}
+      <button type="button" class="home-event-card home-event-card--{{ event.kind }}" data-home-event-kind="{{ event.kind }}" data-event-destination="{{ event.destination.view }}" data-event-chat-id="{{ event.destination.chat_id or '' }}" data-event-message-id="{{ event.destination.message_id or '' }}" data-event-pos-id="{{ event.destination.pos_id or '' }}">
+        <time>{{ event.occurred_at }}</time>
+        <span class="home-event-source">{{ event.source_label }}{% if event.symbol %} · {{ event.symbol }}{% endif %}</span>
+        <strong>{{ event.title }}</strong>
+        <span>{{ event.summary }}</span>
+        <small>{{ event.status }} ›</small>
+      </button>
+    {% else %}
+      <p class="home-event-empty" data-home-event-empty>暂时没有重要动态</p>
+    {% endfor %}
+    <p class="home-event-empty" data-home-filter-empty hidden>当前筛选没有动态</p>
+  </div>
+</section>
