@@ -751,7 +751,7 @@ LIFECYCLE_EVENT_PROMPT = """
 - entry_confirm：当前消息是在通知之前 pending_entry 策略现在/现价/市价/直接入场，或明确说已经进场。
 - cancel_entry：当前消息是在取消之前 pending_entry 限价挂单或等待入场策略，例如取消限价、撤单、取消挂单、等后续信号。
 - exit_position：当前消息是在关闭已 entered 策略，例如平仓、全平、离场、临时离场、止盈了、止损了、先出来、保本出局、成本附近保本出局、保本走、成本走、breakeven exit。
-- position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、分批止盈30%、按比例止盈、减仓一半、减仓30%、持仓收益达到100%后分批止盈、带保护、保护止损、上移止损、推保护、继续持有。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
+- position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、分批止盈30%、按比例止盈、减仓一半、减仓30%、持仓收益达到100%后分批止盈、带保护、保护止损、上移止损、推保护、继续持有。“回成本了，注意保护成本，平加仓”表示减仓一半并将止损移至成本价，management_action 应输出 partial_take_profit, move_stop_to_protect。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
 - none：普通聊天、行情观点、广告、复盘、联系方式、无法确定目标策略、或只是识别新策略但不改变已有策略。
 - 必须优先依据当前消息，不要把上下文里的旧消息当成当前动作。
 - 如果能明确对应活跃策略，请输出 target_lifecycle_id。
@@ -1098,9 +1098,13 @@ def _management_action_for_exit_downgrade(
     decision: dict[str, Any],
 ) -> str:
     combined = _combined_lifecycle_text(text, decision)
-    if _has_protective_stop_terms(combined):
+    has_partial_close = _has_partial_take_profit_terms(combined)
+    has_protective_stop = _has_protective_stop_terms(combined)
+    if has_partial_close and has_protective_stop:
+        return "partial_take_profit, move_stop_to_protect"
+    if has_protective_stop:
         return "move_stop_to_protect"
-    if _has_partial_take_profit_terms(combined):
+    if has_partial_close:
         return "partial_take_profit"
     return "position_update"
 
@@ -1151,6 +1155,7 @@ def _has_partial_take_profit_terms(text: str) -> bool:
         "分批止盈",
         "提前止盈",
         "减仓",
+        "平加仓",
         "partial_take_profit",
     ]
     return any(term in text for term in partial_terms)
@@ -1163,6 +1168,8 @@ def _has_protective_stop_terms(text: str) -> bool:
         "止损到成本",
         "止损移到成本",
         "止损移动到成本",
+        "回成本",
+        "保护成本",
         "成本价",
         "成本保护",
         "保本保护",

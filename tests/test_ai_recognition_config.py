@@ -23,6 +23,8 @@ def test_load_ai_recognition_config_uses_defaults_when_file_is_missing(tmp_path)
     assert "58900-59300" in config.recognition_prompt
     assert "5.78" in config.lifecycle_event_prompt
     assert "57800" in config.lifecycle_event_prompt
+    assert "平加仓" in config.lifecycle_event_prompt
+    assert "保护成本" in config.lifecycle_event_prompt
     assert "6万/6.07/6.23" in config.mimo_direct_prompt
 
 

@@ -10,6 +10,7 @@ from telegram_kol_research.message_recognition import (
     _chat_completions_url,
     _ensure_lifecycle_record,
     _load_lifecycle_event_context,
+    _management_action_for_exit_downgrade,
     _result_from_ai_payload,
     _upsert_ai_signal_candidate,
     recognize_message_now,
@@ -61,6 +62,15 @@ def test_chat_completions_url_does_not_duplicate_v1_path():
         _chat_completions_url("https://api.xiaomimimo.com/v1")
         == "https://api.xiaomimimo.com/v1/chat/completions"
     )
+
+
+def test_exit_downgrade_treats_andy_add_on_breakeven_message_as_combined_management():
+    action = _management_action_for_exit_downgrade(
+        "回成本了，时间太久，注意保护成本，如果有在上面补仓的一定要现在平加仓，甚至还有微弱利润",
+        {"management_action": ""},
+    )
+
+    assert action == "partial_take_profit, move_stop_to_protect"
     assert (
         _chat_completions_url("https://api.deepseek.com")
         == "https://api.deepseek.com/v1/chat/completions"
