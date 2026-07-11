@@ -22,6 +22,7 @@ from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.message_recognition import MessageRecognitionResult
@@ -599,6 +600,156 @@ def test_manual_close_api_marks_lifecycle_and_binding_closed(tmp_path):
         assert lifecycle.exit_price_actual == 59500
         assert binding.status == "closed"
         assert binding.last_exchange_status.startswith("manual_closed_by_user")
+
+
+def test_bound_position_close_api_rejects_unbound_or_ambiguous_position_before_order_submission(tmp_path):
+    class FakeDeepcoinClient:
+        def __init__(self):
+            self.order_payloads = []
+
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def place_order(self, payload):
+            self.order_payloads.append(payload)
+            return {"code": "0", "data": {"ordId": "should-not-exist"}}
+
+    fake_client = FakeDeepcoinClient()
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: fake_client,
+    )
+    with app.state.session_factory() as session:
+        session.add_all(
+            [
+                ExecutionBinding(
+                    kol_id="group:88",
+                    chat_id=88,
+                    message_id=10,
+                    symbol="BTC",
+                    side="short",
+                    status="active",
+                    pos_id="pos-ambiguous",
+                ),
+                ExecutionBinding(
+                    kol_id="group:89",
+                    chat_id=89,
+                    message_id=11,
+                    symbol="BTC",
+                    side="short",
+                    status="active",
+                    pos_id="pos-ambiguous",
+                ),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(app)
+
+    unbound = client.post("/api/execution/close-bound-position", json={"pos_id": "pos-unbound"})
+    ambiguous = client.post("/api/execution/close-bound-position", json={"pos_id": "pos-ambiguous"})
+    extra_field = client.post(
+        "/api/execution/close-bound-position",
+        json={"pos_id": "pos-unbound", "size": "999999"},
+    )
+
+    assert unbound.status_code == 409
+    assert ambiguous.status_code == 409
+    assert extra_field.status_code == 400
+    assert fake_client.order_payloads == []
+
+
+def test_bound_position_close_api_submits_exact_live_position_and_keeps_lifecycle_open(tmp_path):
+    class FakeDeepcoinClient:
+        def __init__(self):
+            self.position_calls = []
+            self.order_payloads = []
+
+        def list_positions(self, *, inst_id=None):
+            self.position_calls.append(inst_id)
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-target",
+                    "posSide": "short",
+                    "pos": "11",
+                    "avgPx": "64350",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-other",
+                    "posSide": "short",
+                    "pos": "7",
+                },
+            ]
+
+        def place_order(self, payload):
+            self.order_payloads.append(payload)
+            return {"code": "0", "data": {"ordId": "close-target"}}
+
+    fake_client = FakeDeepcoinClient()
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: fake_client,
+        now_provider=lambda: datetime(2026, 7, 11, 11, 0),
+    )
+    with app.state.session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 11, 10, 0),
+            entered_at=datetime(2026, 7, 11, 10, 1),
+        )
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="short",
+            status="active",
+            pos_id="pos-target",
+            margin_mode="cross",
+            position_mode="split",
+        )
+        session.add_all([lifecycle, binding])
+        session.commit()
+        lifecycle_id = lifecycle.id
+        binding_id = binding.id
+
+    response = TestClient(app).post(
+        "/api/execution/close-bound-position",
+        json={"pos_id": "pos-target"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted"] is True
+    assert response.json()["pos_id"] == "pos-target"
+    assert fake_client.position_calls == ["BTC-USDT-SWAP"]
+    assert fake_client.order_payloads == [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "tdMode": "cross",
+            "side": "buy",
+            "posSide": "short",
+            "ordType": "market",
+            "sz": "11",
+            "mrgPosition": "split",
+            "closePosId": "pos-target",
+        }
+    ]
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, binding_id)
+        event = session.query(ExecutionEvent).one()
+
+        assert lifecycle.lifecycle_status == "entered"
+        assert binding.status == "active"
+        assert event.action == "close_bound_position_market"
+        assert event.pos_id == "pos-target"
+        assert event.request_json is not None and '"closePosId": "pos-target"' in event.request_json
 
 
 def test_execution_sync_api_marks_missing_deepcoin_position_closed(tmp_path):

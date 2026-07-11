@@ -44,6 +44,8 @@ from telegram_kol_research.ai_recognition_config import (
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
+from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
@@ -2455,6 +2457,30 @@ def create_web_app(
             "reconciled_open": reconcile_result.open if reconcile_result else 0,
             "reconciled_stale": reconcile_result.stale if reconcile_result else 0,
         }
+
+    @app.post("/api/execution/close-bound-position")
+    async def close_bound_position(payload: dict[str, Any] | None = None):
+        data = payload or {}
+        if set(data) != {"pos_id"}:
+            raise HTTPException(status_code=400, detail="only pos_id is accepted")
+        pos_id = str(data.get("pos_id") or "").strip()
+        if not pos_id:
+            raise HTTPException(status_code=400, detail="pos_id is required")
+        try:
+            result = close_bound_position_market(
+                app.state.session_factory,
+                pos_id=pos_id,
+                deepcoin_client=app.state.deepcoin_client_factory(),
+                executed_at=app.state.now_provider(),
+            )
+        except DeepcoinExecutionActionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except DeepcoinClientError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("bound Deepcoin position close failed")
+            raise HTTPException(status_code=500, detail="bound position close failed") from exc
+        return result
 
     @app.post("/api/execution/bind-live-position")
     async def bind_live_position(payload: dict[str, Any]):

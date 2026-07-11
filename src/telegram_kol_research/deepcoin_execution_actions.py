@@ -378,6 +378,89 @@ def close_position_market(
     }
 
 
+def close_bound_position_market(
+    session_factory: sessionmaker,
+    *,
+    pos_id: str,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    executed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Submit one market close for one exact, actively bound live position.
+
+    This intentionally does not mark the binding or strategy lifecycle closed: a
+    submitted market order is not proof that the exchange position has closed.
+    Reconciliation owns that state transition.
+    """
+
+    normalized_pos_id = str(pos_id or "").strip()
+    if not normalized_pos_id:
+        raise DeepcoinExecutionActionError("missing_pos_id")
+    binding = _load_exact_active_binding_for_position(session_factory, normalized_pos_id)
+    inst_id = _to_deepcoin_swap_instrument(binding.symbol)
+    positions = _select_bound_positions(
+        deepcoin_client.list_positions(inst_id=inst_id),
+        binding=binding,
+        inst_id=inst_id,
+        requested_pos_ids={normalized_pos_id},
+    )
+    if len(positions) != 1:
+        raise DeepcoinExecutionActionError("ambiguous_exact_bound_live_position")
+    position = positions[0]
+    live_pos_id = _first_string(position, "posId", "pos_id", "id")
+    if live_pos_id != normalized_pos_id:
+        raise DeepcoinExecutionActionError("exact_bound_live_position_not_found")
+    close_size = _position_size(position)
+    if close_size <= 0:
+        raise DeepcoinExecutionActionError("non_positive_close_size")
+
+    payload = {
+        "instId": inst_id,
+        "tdMode": _deepcoin_margin_mode(binding.margin_mode),
+        "side": "sell" if binding.side.lower() == "long" else "buy",
+        "posSide": binding.side.lower(),
+        "ordType": "market",
+        "sz": f"{close_size:g}",
+        "mrgPosition": _deepcoin_position_mode(binding.position_mode),
+        "closePosId": normalized_pos_id,
+    }
+    response = deepcoin_client.place_order(payload)
+    now = executed_at or datetime.now(UTC)
+    order_id = _extract_order_id(response)
+    event_id = record_execution_event(
+        session_factory,
+        ExecutionEventRecord(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            kol_id=binding.kol_id,
+            chat_id=binding.chat_id,
+            message_id=binding.message_id,
+            source_message_id=binding.message_id,
+            symbol=binding.symbol,
+            side=binding.side,
+            action="close_bound_position_market",
+            order_id=order_id,
+            pos_id=normalized_pos_id,
+            reason="manual_bound_position_close",
+            before={"position_size": close_size},
+            after={"close_size": close_size, "full_close_requested": True},
+            request=payload,
+            response=response,
+            created_at=now,
+        ),
+    )
+    return {
+        "submitted": True,
+        "venue": "deepcoin",
+        "action": "close_bound_position_market",
+        "binding_id": binding.id,
+        "pos_id": normalized_pos_id,
+        "order_id": order_id,
+        "close_size": close_size,
+        "event_id": event_id,
+        "executed_at": now.isoformat(),
+    }
+
+
 def cancel_entry_order(
     session_factory: sessionmaker,
     *,
@@ -631,6 +714,41 @@ def _load_binding_for_signal(
             status=row.status,
         )
     return loaded
+
+
+def _load_exact_active_binding_for_position(
+    session_factory: sessionmaker,
+    pos_id: str,
+) -> _LoadedBinding:
+    """Return the sole active Deepcoin binding containing this exact position ID."""
+
+    with session_factory() as session:
+        rows = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .filter(ExecutionBinding.status.in_(["open", "active"]))
+            .all()
+        )
+        matches = [row for row in rows if pos_id in _split_ids(row.pos_id)]
+        if len(matches) != 1:
+            raise DeepcoinExecutionActionError("position_not_bound_to_exactly_one_active_binding")
+        row = matches[0]
+        return _LoadedBinding(
+            id=int(row.id),
+            strategy_instance_id=row.strategy_instance_id,
+            kol_id=row.kol_id,
+            chat_id=int(row.chat_id),
+            message_id=int(row.message_id),
+            symbol=row.symbol,
+            side=row.side,
+            venue=row.venue,
+            order_id=row.order_id,
+            client_order_id=row.client_order_id,
+            pos_id=row.pos_id,
+            margin_mode=row.margin_mode,
+            position_mode=row.position_mode,
+            status=row.status,
+        )
 
 
 def _select_bound_position(
