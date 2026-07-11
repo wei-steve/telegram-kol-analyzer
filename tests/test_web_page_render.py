@@ -45,6 +45,33 @@ def test_index_page_renders_explicit_operational_states(tmp_path):
     assert "data-last-success-at" in response.text
 
 
+def test_message_view_renders_group_selector_for_switching_groups(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(chat_id=77, message_id=1, posted_at=datetime(2026, 7, 12, tzinfo=UTC), sender_name="Andy", text="one"),
+                RawMessage(chat_id=88, message_id=1, posted_at=datetime(2026, 7, 12, 1, tzinfo=UTC), sender_name="币姐", text="two"),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "data-message-group-select" in response.text
+    assert 'value="77"' in response.text
+    assert 'value="88"' in response.text
+
+    detail_response = client.get("/groups/77/detail")
+    assert detail_response.status_code == 200
+    assert "data-message-group-select" in detail_response.text
+    assert 'value="77"' in detail_response.text
+    assert 'value="88"' in detail_response.text
+
+
 def test_index_page_shows_group_list_and_messages(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

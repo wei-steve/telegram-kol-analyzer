@@ -523,6 +523,15 @@ function bindStrategyFilterBadges() {
 }
 
 function bindDetailPanelControls() {
+  document.querySelectorAll('[data-message-group-select]').forEach((select) => {
+    if (select.dataset.groupSelectBound === 'true') return;
+    select.dataset.groupSelectBound = 'true';
+    select.addEventListener('change', () => {
+      const chatId = Number(select.value || 0);
+      if (!chatId) return;
+      document.querySelector(`[data-group-link][data-chat-id="${chatId}"]`)?.click();
+    });
+  });
   // Horizontal tab switching with lazy loading
   document.querySelectorAll('[data-detail-tab]').forEach((tab) => {
     tab.addEventListener('click', async () => {

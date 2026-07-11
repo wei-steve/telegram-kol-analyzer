@@ -261,6 +261,7 @@ def test_app_js_binds_workbench_navigation_and_home_event_filters(tmp_path):
     assert "function bindHomeEventFilters" in response.text
     assert "[data-home-event-filter]" in response.text
     assert "[data-new-home-events]" in response.text
+    assert "[data-message-group-select]" in response.text
 
 
 def test_app_assets_expose_persistent_mutation_states(tmp_path):
