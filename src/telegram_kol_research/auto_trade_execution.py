@@ -690,6 +690,33 @@ def _load_active_execution_binding(
         return rows[0]
 
 
+def _load_active_execution_bindings(
+    session_factory: sessionmaker,
+    *,
+    chat_id: int,
+    kol_id: str,
+    symbol: str,
+    side: str,
+) -> list[ExecutionBinding]:
+    """Return every exact active binding for a multi-position KOL management action."""
+
+    with session_factory() as session:
+        rows = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .filter(ExecutionBinding.chat_id == chat_id)
+            .filter(ExecutionBinding.kol_id == kol_id)
+            .filter(ExecutionBinding.symbol == symbol.upper())
+            .filter(ExecutionBinding.side == side.lower())
+            .filter(ExecutionBinding.status.in_(["open", "active"]))
+            .order_by(ExecutionBinding.id.asc())
+            .all()
+        )
+        for row in rows:
+            session.expunge(row)
+        return rows
+
+
 def _recover_exit_signal_execution_binding(
     session_factory: sessionmaker,
     *,
@@ -1041,14 +1068,14 @@ def _extract_partial_close_fraction(text: str | None) -> float | None:
         return None
     if not any(
         token in normalized
-        for token in ("止盈", "减仓", "平仓", "利润", "仓位", "走", "出")
+        for token in ("止盈", "减仓", "平仓", "平加仓", "利润", "仓位", "走", "出")
     ):
         return None
     percent_match = re.search(r"(\d+(?:\.\d+)?)\s*%", normalized)
     if percent_match:
         value = float(percent_match.group(1)) / 100
         return value if 0 < value < 1 else None
-    if "一半" in normalized or "半仓" in normalized:
+    if "一半" in normalized or "半仓" in normalized or "平加仓" in normalized:
         return 0.5
     chinese_digits = {
         "三成": 0.3,

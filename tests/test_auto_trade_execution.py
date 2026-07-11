@@ -1,6 +1,8 @@
 ﻿from datetime import UTC, datetime
 
 from telegram_kol_research.auto_trade_execution import _load_active_execution_binding
+from telegram_kol_research.auto_trade_execution import _load_active_execution_bindings
+from telegram_kol_research.auto_trade_execution import _extract_partial_close_fraction
 from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord, upsert_execution_binding
 from telegram_kol_research.db import create_session_factory
@@ -124,6 +126,57 @@ def test_load_active_execution_binding_uses_kol_id_to_disambiguate(tmp_path):
     assert selected is not None
     assert selected.id == second_id
     assert selected.id != first_id
+
+
+def test_load_active_execution_bindings_returns_every_exact_kol_match_for_andy_management(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="group:100#andy",
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="short",
+            pos_id="pos-andy-1",
+            status="active",
+        ),
+    )
+    second_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="group:100#andy",
+            chat_id=100,
+            message_id=56,
+            symbol="BTC",
+            side="short",
+            pos_id="pos-andy-2",
+            status="active",
+        ),
+    )
+    upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="group:100#other-kol",
+            chat_id=100,
+            message_id=57,
+            symbol="BTC",
+            side="short",
+            pos_id="pos-other",
+            status="active",
+        ),
+    )
+
+    matches = _load_active_execution_bindings(
+        session_factory,
+        chat_id=100,
+        kol_id="group:100#andy",
+        symbol="BTC",
+        side="short",
+    )
+
+    assert [binding.id for binding in matches] == [first_id, second_id]
+    assert _extract_partial_close_fraction("回成本了，注意保护成本，平加仓") == 0.5
 
 
 def _persist_candidate(
