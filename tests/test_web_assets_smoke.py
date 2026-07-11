@@ -210,6 +210,14 @@ def test_app_css_includes_mobile_work_mode_navigation(tmp_path):
     assert "display: grid" in css[mobile_nav_start:mobile_nav_end]
     assert "env(safe-area-inset-bottom" in css[mobile_start:]
 
+    mobile_layout_start = css.index(".trader-layout", mobile_start)
+    mobile_layout_end = css.index("}", mobile_layout_start)
+    mobile_layout = css[mobile_layout_start:mobile_layout_end]
+    assert "padding: 8px 10px calc(68px + env(safe-area-inset-bottom))" in mobile_layout
+    assert "height: 100dvh" not in mobile_layout
+    assert "min-height: 100dvh" not in mobile_layout
+    assert "overflow-y: auto" not in mobile_layout
+
 
 def test_app_js_binds_mobile_work_navigation_to_existing_dashboard_views(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))

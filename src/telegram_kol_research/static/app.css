@@ -2657,11 +2657,8 @@ pre { white-space: pre-wrap; }
 
 @media (max-width: 760px) {
   .trader-layout {
-    height: 100dvh;
-    min-height: 100dvh;
     padding: 8px 10px calc(68px + env(safe-area-inset-bottom));
     overflow-x: hidden;
-    overflow-y: auto;
   }
 
   .trader-shell {
