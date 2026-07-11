@@ -170,7 +170,7 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "<summary>" in msgs_resp.text
 
 
-def test_exchange_position_tab_uses_deepcoin_account_snapshot(tmp_path):
+def test_bound_position_close_is_not_rendered_for_unbound_exchange_position(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
     with session_factory() as session:
@@ -267,9 +267,10 @@ def test_exchange_position_tab_uses_deepcoin_account_snapshot(tmp_path):
     assert "order hist-1" in response.text
     assert "order trigger-hist-1" in response.text
     assert "止盈止损/平多" in response.text
+    assert "data-close-bound-position" not in response.text
 
 
-def test_exchange_position_attribution_shows_bound_group_and_grouped_view(tmp_path):
+def test_bound_position_close_renders_exact_context_for_bound_exchange_position(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
     with session_factory() as session:
@@ -372,6 +373,17 @@ def test_exchange_position_attribution_shows_bound_group_and_grouped_view(tmp_pa
     assert "Alpha Group" in response.text
     assert "BTC long" in response.text
     assert 'data-exchange-group-section' in response.text
+    close_buttons = re.findall(
+        r'<button[^>]+data-close-bound-position[^>]*>', response.text,
+    )
+    assert close_buttons
+    for button in close_buttons:
+        assert 'data-pos-id="pos-live-1"' in button
+        assert 'data-live-action-symbol="BTC"' in button
+        assert 'data-live-action-side="long"' in button
+        assert 'data-live-action-size="0.01 contracts BTCUSDT"' in button
+        assert 'data-live-action-label="市价全平"' in button
+    assert 'data-close-bound-position-status aria-live="polite"' in response.text
 
 
 def test_exchange_current_order_candidate_attribution(tmp_path):

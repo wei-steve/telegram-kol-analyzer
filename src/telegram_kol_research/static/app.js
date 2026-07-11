@@ -2226,22 +2226,30 @@ function requestLiveActionConfirmation(button) {
   const actionLabel = button.dataset.liveActionLabel || '执行此操作';
   const symbol = button.dataset.liveActionSymbol;
   const side = button.dataset.liveActionSide;
+  const size = button.dataset.liveActionSize;
   const groupLabel = button.dataset.liveActionGroupLabel;
+  const confirmationNote = button.dataset.liveActionConfirmationNote
+    || '这只会更新项目状态，不会向 DeepCoin 下单。';
   const context = [
     actionLabel,
     symbol,
     side === 'long' ? '多' : side === 'short' ? '空' : side,
+    size ? `数量 ${size}` : '',
     groupLabel,
   ].filter(Boolean).join(' · ');
   const dialog = document.querySelector('[data-live-action-confirm]');
 
   if (!dialog || typeof dialog.showModal !== 'function') {
-    return Promise.resolve(window.confirm(`确认${context}？这只会更新项目状态，不会向 DeepCoin 下单。`));
+    return Promise.resolve(window.confirm(`确认${context}？${confirmationNote}`));
   }
 
   const contextElement = dialog.querySelector('[data-live-action-confirm-context]');
   if (contextElement) {
     contextElement.textContent = `即将${context}。`;
+  }
+  const noteElement = dialog.querySelector('.live-action-confirm-note');
+  if (noteElement) {
+    noteElement.textContent = confirmationNote;
   }
   return new Promise((resolve) => {
     dialog.addEventListener('close', () => resolve(dialog.returnValue === 'confirm'), { once: true });
@@ -2249,8 +2257,51 @@ function requestLiveActionConfirmation(button) {
       dialog.returnValue = '';
       dialog.showModal();
     } catch {
-      resolve(window.confirm(`确认${context}？这只会更新项目状态，不会向 DeepCoin 下单。`));
+      resolve(window.confirm(`确认${context}？${confirmationNote}`));
     }
+  });
+}
+
+function bindBoundPositionCloseButtons() {
+  document.querySelectorAll('[data-close-bound-position]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const posId = button.dataset.posId;
+      const card = button.closest('.exchange-position-card');
+      const status = card ? card.querySelector('[data-close-bound-position-status]') : null;
+      if (!posId) {
+        return;
+      }
+      const confirmed = await requestLiveActionConfirmation(button);
+      if (!confirmed) {
+        return;
+      }
+      button.disabled = true;
+      if (status) {
+        status.textContent = '正在提交市价全平...';
+        status.classList.remove('is-error');
+      }
+      try {
+        const response = await fetch('/api/execution/close-bound-position', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pos_id: posId }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(payload.detail || 'bound position close failed');
+        }
+        if (status) {
+          status.textContent = '市价全平已提交，正在刷新...';
+        }
+        window.setTimeout(() => window.location.reload(), 400);
+      } catch (error) {
+        button.disabled = false;
+        if (status) {
+          status.textContent = error.message || '市价全平提交失败';
+          status.classList.add('is-error');
+        }
+      }
+    });
   });
 }
 
@@ -2483,6 +2534,7 @@ window.addEventListener('DOMContentLoaded', () => {
   bindAiModelSelectionForm();
   bindGroupPromptEditor();
   bindClearAiHistory();
+  bindBoundPositionCloseButtons();
   bindManualCloseButtons();
   bindDeepcoinPositionSync();
   initLogViewer();

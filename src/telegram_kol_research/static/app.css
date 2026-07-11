@@ -450,6 +450,22 @@ body {
   background: rgba(15, 23, 42, 0.58);
 }
 
+.exchange-position-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.exchange-position-action-status {
+  color: #93c5fd;
+  font-size: 0.82rem;
+}
+
+.exchange-position-action-status.is-error {
+  color: #fecaca;
+}
+
 .exchange-card-head {
   display: flex;
   align-items: center;

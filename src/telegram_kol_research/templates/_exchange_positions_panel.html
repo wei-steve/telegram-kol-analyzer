@@ -30,6 +30,7 @@
 {%- endmacro %}
 
 {% macro position_card(item) -%}
+  {% set attr = item.attribution if item.attribution is defined else none %}
   <article class="exchange-position-card">
     <div class="exchange-card-head">
       <div>
@@ -54,6 +55,23 @@
       {% elif item.take_profit %}<div><dt>止盈</dt><dd>{{ item.take_profit }}</dd></div>{% endif %}
       {% if item.last_checked_at_display %}<div><dt>更新时间</dt><dd>{{ item.last_checked_at_display }}</dd></div>{% endif %}
     </dl>
+    {% if attr and attr.state == 'bound' and item.pos_id %}
+      <div class="exchange-position-actions">
+        <button
+          type="button"
+          class="danger-button"
+          data-close-bound-position
+          data-pos-id="{{ item.pos_id }}"
+          data-live-action-label="市价全平"
+          data-live-action-symbol="{{ item.symbol }}"
+          data-live-action-side="{{ item.side }}"
+          data-live-action-size="{{ item.position_size_text }}"
+          data-live-action-group-label="{{ attr.group_name }}"
+          data-live-action-confirmation-note="这会向 DeepCoin 提交该指定仓位的市价全平订单。"
+        >市价平仓</button>
+        <span class="exchange-position-action-status" data-close-bound-position-status aria-live="polite"></span>
+      </div>
+    {% endif %}
   </article>
 {%- endmacro %}
 

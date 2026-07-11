@@ -279,6 +279,21 @@ def test_live_action_confirmation_uses_shared_dialog_hooks(tmp_path):
     assert "data-bind-live-position" in response.text
 
 
+def test_bound_position_close_app_js_binds_confirmed_exact_market_close(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "function bindBoundPositionCloseButtons" in response.text
+    assert "[data-close-bound-position]" in response.text
+    assert "/api/execution/close-bound-position" in response.text
+    assert "body: JSON.stringify({ pos_id: posId })" in response.text
+    assert "正在提交市价全平..." in response.text
+    assert "市价全平已提交，正在刷新..." in response.text
+    assert "bindBoundPositionCloseButtons();" in response.text
+
+
 def test_live_action_confirmation_clears_stale_return_value_before_opening(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
