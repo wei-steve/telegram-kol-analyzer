@@ -743,7 +743,11 @@ def test_bound_position_close_api_submits_exact_live_position_and_keeps_lifecycl
     with app.state.session_factory() as session:
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         binding = session.get(ExecutionBinding, binding_id)
-        event = session.query(ExecutionEvent).one()
+        event = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "close_bound_position_market")
+            .one()
+        )
 
         assert lifecycle.lifecycle_status == "entered"
         assert binding.status == "active"

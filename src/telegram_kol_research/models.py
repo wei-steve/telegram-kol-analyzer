@@ -322,6 +322,26 @@ class ExecutionEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class BoundPositionCloseReservation(Base):
+    """One-way idempotency record for a manually submitted exact-position close."""
+
+    __tablename__ = "bound_position_close_reservations"
+    __table_args__ = (
+        Index("ix_bound_position_close_reservations_binding", "execution_binding_id"),
+        Index("ix_bound_position_close_reservations_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(64), nullable=False, default="reserved")
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class TradeSignal(Base):
     __tablename__ = "trade_signals"
     __table_args__ = (

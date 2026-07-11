@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
@@ -16,7 +17,12 @@ from telegram_kol_research.deepcoin_order_matching import (
 )
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
-from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg, StrategyLifecycle
+from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    StrategyLifecycle,
+)
 from telegram_kol_research.trade_signals import TradeSignalRecord
 
 
@@ -395,36 +401,76 @@ def close_bound_position_market(
     normalized_pos_id = str(pos_id or "").strip()
     if not normalized_pos_id:
         raise DeepcoinExecutionActionError("missing_pos_id")
-    binding = _load_exact_active_binding_for_position(session_factory, normalized_pos_id)
-    inst_id = _to_deepcoin_swap_instrument(binding.symbol)
-    positions = _select_bound_positions(
-        deepcoin_client.list_positions(inst_id=inst_id),
-        binding=binding,
-        inst_id=inst_id,
-        requested_pos_ids={normalized_pos_id},
-    )
-    if len(positions) != 1:
-        raise DeepcoinExecutionActionError("ambiguous_exact_bound_live_position")
-    position = positions[0]
-    live_pos_id = _first_string(position, "posId", "pos_id", "id")
-    if live_pos_id != normalized_pos_id:
-        raise DeepcoinExecutionActionError("exact_bound_live_position_not_found")
-    close_size = _position_size(position)
-    if close_size <= 0:
-        raise DeepcoinExecutionActionError("non_positive_close_size")
-
-    payload = {
-        "instId": inst_id,
-        "tdMode": _deepcoin_margin_mode(binding.margin_mode),
-        "side": "sell" if binding.side.lower() == "long" else "buy",
-        "posSide": binding.side.lower(),
-        "ordType": "market",
-        "sz": f"{close_size:g}",
-        "mrgPosition": _deepcoin_position_mode(binding.position_mode),
-        "closePosId": normalized_pos_id,
-    }
-    response = deepcoin_client.place_order(payload)
     now = executed_at or datetime.now(UTC)
+    binding = _load_exact_active_binding_for_position(session_factory, normalized_pos_id)
+    _reserve_bound_position_close(session_factory, binding=binding, pos_id=normalized_pos_id, now=now)
+    _record_bound_position_close_reservation_event(
+        session_factory,
+        binding=binding,
+        pos_id=normalized_pos_id,
+        status="reserved",
+        now=now,
+    )
+    try:
+        inst_id = _to_deepcoin_swap_instrument(binding.symbol)
+        positions = _select_bound_positions(
+            deepcoin_client.list_positions(inst_id=inst_id),
+            binding=binding,
+            inst_id=inst_id,
+            requested_pos_ids={normalized_pos_id},
+        )
+        if len(positions) != 1:
+            raise DeepcoinExecutionActionError("ambiguous_exact_bound_live_position")
+        position = positions[0]
+        live_pos_id = _first_string(position, "posId", "pos_id", "id")
+        if live_pos_id != normalized_pos_id:
+            raise DeepcoinExecutionActionError("exact_bound_live_position_not_found")
+        close_size = _position_size(position)
+        if close_size <= 0:
+            raise DeepcoinExecutionActionError("non_positive_close_size")
+
+        payload = {
+            "instId": inst_id,
+            "tdMode": _deepcoin_margin_mode(binding.margin_mode),
+            "side": "sell" if binding.side.lower() == "long" else "buy",
+            "posSide": binding.side.lower(),
+            "ordType": "market",
+            "sz": f"{close_size:g}",
+            "mrgPosition": _deepcoin_position_mode(binding.position_mode),
+            "closePosId": normalized_pos_id,
+        }
+        response = deepcoin_client.place_order(payload)
+    except Exception as exc:
+        _mark_bound_position_close_reservation(
+            session_factory,
+            pos_id=normalized_pos_id,
+            status="unknown_exchange_outcome",
+            error=str(exc),
+            now=now,
+        )
+        _record_bound_position_close_reservation_event(
+            session_factory,
+            binding=binding,
+            pos_id=normalized_pos_id,
+            status="unknown_exchange_outcome",
+            error=str(exc),
+            now=now,
+        )
+        raise
+
+    _mark_bound_position_close_reservation(
+        session_factory,
+        pos_id=normalized_pos_id,
+        status="submitted",
+        now=now,
+    )
+    _record_bound_position_close_reservation_event(
+        session_factory,
+        binding=binding,
+        pos_id=normalized_pos_id,
+        status="submitted",
+        now=now,
+    )
     order_id = _extract_order_id(response)
     event_id = record_execution_event(
         session_factory,
@@ -459,6 +505,82 @@ def close_bound_position_market(
         "event_id": event_id,
         "executed_at": now.isoformat(),
     }
+
+
+def _reserve_bound_position_close(
+    session_factory: sessionmaker,
+    *,
+    binding: _LoadedBinding,
+    pos_id: str,
+    now: datetime,
+) -> None:
+    """Durably claim an exact position before any exchange request is made."""
+
+    with session_factory() as session:
+        session.add(
+            BoundPositionCloseReservation(
+                pos_id=pos_id,
+                execution_binding_id=binding.id,
+                status="reserved",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise DeepcoinExecutionActionError("bound_position_close_already_reserved") from exc
+
+
+def _mark_bound_position_close_reservation(
+    session_factory: sessionmaker,
+    *,
+    pos_id: str,
+    status: str,
+    now: datetime,
+    error: str | None = None,
+) -> None:
+    with session_factory() as session:
+        reservation = (
+            session.query(BoundPositionCloseReservation)
+            .filter(BoundPositionCloseReservation.pos_id == pos_id)
+            .one()
+        )
+        reservation.status = status
+        reservation.last_error = error
+        reservation.updated_at = now
+        session.commit()
+
+
+def _record_bound_position_close_reservation_event(
+    session_factory: sessionmaker,
+    *,
+    binding: _LoadedBinding,
+    pos_id: str,
+    status: str,
+    now: datetime,
+    error: str | None = None,
+) -> None:
+    record_execution_event(
+        session_factory,
+        ExecutionEventRecord(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            kol_id=binding.kol_id,
+            chat_id=binding.chat_id,
+            message_id=binding.message_id,
+            source_message_id=binding.message_id,
+            symbol=binding.symbol,
+            side=binding.side,
+            action="close_bound_position_reservation",
+            status=status,
+            pos_id=pos_id,
+            reason="manual_bound_position_close",
+            after={"error": error} if error else None,
+            created_at=now,
+        ),
+    )
 
 
 def cancel_entry_order(

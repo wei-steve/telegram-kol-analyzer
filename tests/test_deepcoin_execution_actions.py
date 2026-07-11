@@ -1,10 +1,12 @@
 from datetime import UTC, datetime
+from threading import Event, Thread
 
 import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
 from telegram_kol_research.deepcoin_execution_actions import adjust_position_tpsl
+from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
 from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
@@ -442,6 +444,93 @@ def test_process_trade_signal_live_closes_only_requested_bound_position_id(tmp_p
     assert [(leg.leg_index, leg.pos_id, leg.status) for leg in legs] == [
         (1, "pos-1", "active"),
         (2, "pos-2", "partial_closed"),
+    ]
+
+
+def test_bound_position_market_close_reserves_exact_position_before_concurrent_submission(tmp_path):
+    class BlockingClient(_FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.listing_started = Event()
+            self.release_listing = Event()
+
+        def list_positions(self, *, inst_id=None):
+            self.listing_started.set()
+            assert self.release_listing.wait(timeout=5)
+            return super().list_positions(inst_id=inst_id)
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _binding(session_factory, pos_id="pos-1", status="active")
+    client = BlockingClient()
+    first_attempt_errors = []
+
+    def first_attempt():
+        try:
+            close_bound_position_market(
+                session_factory,
+                pos_id="pos-1",
+                deepcoin_client=client,
+                executed_at=datetime(2026, 7, 11, 12, 0, tzinfo=UTC),
+            )
+        except Exception as exc:  # pragma: no cover - assertion below documents failures
+            first_attempt_errors.append(exc)
+
+    thread = Thread(target=first_attempt)
+    thread.start()
+    assert client.listing_started.wait(timeout=5)
+
+    with pytest.raises(DeepcoinExecutionActionError, match="close_already_reserved"):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+            executed_at=datetime(2026, 7, 11, 12, 1, tzinfo=UTC),
+        )
+
+    client.release_listing.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert first_attempt_errors == []
+    assert [payload["closePosId"] for payload in client.order_payloads] == ["pos-1"]
+    events = list_execution_events(session_factory, pos_id="pos-1")
+    assert [(event.action, event.status) for event in events] == [
+        ("close_bound_position_market", "submitted"),
+        ("close_bound_position_reservation", "submitted"),
+        ("close_bound_position_reservation", "reserved"),
+    ]
+
+
+def test_bound_position_market_close_keeps_reservation_after_exchange_error(tmp_path):
+    class FailingClient(_FakeDeepcoinClient):
+        def place_order(self, order_payload):
+            self.order_payloads.append(order_payload)
+            raise RuntimeError("connection lost after request may have reached exchange")
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _binding(session_factory, pos_id="pos-1", status="active")
+    client = FailingClient()
+
+    with pytest.raises(RuntimeError, match="connection lost"):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+            executed_at=datetime(2026, 7, 11, 12, 0, tzinfo=UTC),
+        )
+
+    with pytest.raises(DeepcoinExecutionActionError, match="close_already_reserved"):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+            executed_at=datetime(2026, 7, 11, 12, 1, tzinfo=UTC),
+        )
+
+    assert len(client.order_payloads) == 1
+    events = list_execution_events(session_factory, pos_id="pos-1")
+    assert [(event.action, event.status) for event in events] == [
+        ("close_bound_position_reservation", "unknown_exchange_outcome"),
+        ("close_bound_position_reservation", "reserved"),
     ]
 
 

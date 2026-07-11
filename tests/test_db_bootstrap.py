@@ -189,6 +189,26 @@ def test_database_bootstrap_creates_execution_events_table(tmp_path):
     assert "ix_execution_events_order" in indexes
 
 
+def test_database_bootstrap_creates_unique_bound_position_close_reservations(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(bound_position_close_reservations)").fetchall()
+    }
+    unique_indexes = [
+        row[1]
+        for row in conn.execute("PRAGMA index_list(bound_position_close_reservations)").fetchall()
+        if row[2]
+    ]
+    conn.close()
+
+    assert {"pos_id", "execution_binding_id", "status", "last_error"}.issubset(columns)
+    assert unique_indexes
+
+
 def test_database_bootstrap_creates_execution_order_legs_table(tmp_path):
     database_path = tmp_path / "research.db"
     create_session_factory(database_path)
