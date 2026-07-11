@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -59,6 +59,13 @@ def execute_deepcoin_management_signal(
             deepcoin_client=deepcoin_client,
             executed_at=executed_at,
         )
+    if action == "partial_close_and_move_stop_to_entry":
+        return partial_close_and_move_stop_to_entry(
+            session_factory,
+            trade_signal=trade_signal,
+            deepcoin_client=deepcoin_client,
+            executed_at=executed_at,
+        )
     if action in {"set_position_tpsl", "adjust_position_tpsl", "adjust_stop_loss", "adjust_take_profit"}:
         return adjust_position_tpsl(
             session_factory,
@@ -82,6 +89,71 @@ def execute_deepcoin_management_signal(
             executed_at=executed_at,
         )
     raise DeepcoinExecutionActionError(f"unsupported_trade_signal_action:{trade_signal.action}")
+
+
+def partial_close_and_move_stop_to_entry(
+    session_factory: sessionmaker,
+    *,
+    trade_signal: TradeSignalRecord,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    executed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Reduce each exact target, then set that position's stop to its own entry."""
+
+    targets = trade_signal.payload.get("targets") if isinstance(trade_signal.payload, dict) else None
+    if not isinstance(targets, list) or not targets:
+        raise DeepcoinExecutionActionError("missing_breakeven_management_targets")
+
+    prepared: list[tuple[_LoadedBinding, float, float]] = []
+    for target in targets:
+        if not isinstance(target, dict):
+            raise DeepcoinExecutionActionError("invalid_breakeven_management_target")
+        binding_id = target.get("binding_id")
+        fraction = _positive_fraction(target.get("fraction"))
+        if binding_id in (None, "") or fraction is None:
+            raise DeepcoinExecutionActionError("invalid_breakeven_management_target")
+        binding = _load_binding_for_signal(session_factory, replace(trade_signal, payload={"binding_id": binding_id}))
+        if (
+            binding.kol_id != trade_signal.kol_id
+            or binding.chat_id != trade_signal.chat_id
+            or binding.symbol != trade_signal.symbol.upper()
+            or binding.side != trade_signal.side.lower()
+            or not binding.pos_id
+        ):
+            raise DeepcoinExecutionActionError("breakeven_management_target_not_exactly_bound")
+        inst_id = _to_deepcoin_swap_instrument(binding.symbol)
+        position = _select_bound_position(deepcoin_client.list_positions(inst_id=inst_id), binding=binding, inst_id=inst_id)
+        average_entry = _position_average_entry(position)
+        if average_entry is None:
+            raise DeepcoinExecutionActionError("missing_position_average_entry")
+        prepared.append((binding, fraction, average_entry))
+
+    results: list[dict[str, Any]] = []
+    for binding, fraction, average_entry in prepared:
+        close_signal = replace(
+            trade_signal,
+            action="close_position",
+            strategy_instance_id=binding.strategy_instance_id,
+            payload={"binding_id": binding.id, "fraction": fraction},
+        )
+        try:
+            close_result = close_position_market(session_factory, trade_signal=close_signal, deepcoin_client=deepcoin_client, executed_at=executed_at)
+        except Exception as exc:
+            results.append({"binding_id": binding.id, "status": "failed", "stage": "partial_close", "error": str(exc)})
+            continue
+        protection_signal = replace(
+            trade_signal,
+            action="adjust_stop_loss",
+            strategy_instance_id=binding.strategy_instance_id,
+            payload={"binding_id": binding.id, "stop_loss": average_entry},
+        )
+        try:
+            protection_result = adjust_position_tpsl(session_factory, trade_signal=protection_signal, deepcoin_client=deepcoin_client, executed_at=executed_at)
+        except Exception as exc:
+            results.append({"binding_id": binding.id, "status": "failed", "stage": "move_stop", "close": close_result, "error": str(exc)})
+            continue
+        results.append({"binding_id": binding.id, "status": "submitted", "close": close_result, "protection": protection_result})
+    return {"submitted": any(item["status"] == "submitted" for item in results), "action": trade_signal.action, "targets": results}
 
 
 def adjust_position_tpsl(
@@ -803,6 +875,25 @@ def _position_size(position: dict[str, Any]) -> float:
         return abs(float(position.get("pos") or position.get("size") or 0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _position_average_entry(position: dict[str, Any]) -> float | None:
+    for key in ("avgPx", "avgPrice", "openAvgPx", "entryPrice"):
+        try:
+            value = float(position.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _positive_fraction(value: Any) -> float | None:
+    try:
+        fraction = float(value)
+    except (TypeError, ValueError):
+        return None
+    return fraction if 0 < fraction < 1 else None
 
 
 def _first_payload_value(payload: dict[str, Any], *keys: str) -> Any:

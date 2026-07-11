@@ -88,6 +88,7 @@ Supported queue actions:
 - `set_position_tpsl`: first-time position protection only. This can add TP/SL when no old protection exists.
 - `adjust_position_tpsl`, `adjust_stop_loss`, `adjust_take_profit`: position protection adjustment. These require a matched old TPSL row, cancel all old matched position TPSL orders, preserve the unchanged TP or SL side, then call `set-position-sltp` once.
 - `close_position`, `exit_position`, `temporary_exit`, `temporary_close`: market close using the exact bound `closePosId`.
+- `partial_close_and_move_stop_to_entry`: for an exact same-chat, same-KOL, same-symbol, same-side set of split positions, market-close the requested fraction of every bound position and then move each successful target's stop loss to its own live `avgPx`, preserving its existing take profit. Every target must have an exact binding, `posId`, and positive average entry price. A failed partial close never changes that target's stop; other exact targets report their own outcome independently.
 - `cancel_entry`, `cancel_limit_entry`, `cancel_trigger_entry`: cancel a bound unfilled regular or trigger entry order after verifying it is still pending.
 - `adjust_trigger_entry_tpsl`, `recreate_trigger_entry`: unfilled trigger-limit TP/SL adjustment by canceling the old trigger order and recreating it with the same entry fields plus the new TP/SL.
 

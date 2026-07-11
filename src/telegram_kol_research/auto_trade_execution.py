@@ -378,61 +378,85 @@ def _auto_process_management_signal(
             client=deepcoin_client,
             recovered_at=processed_at,
         )
-    binding = _load_active_execution_binding(
-        session_factory,
-        chat_id=raw_message.chat_id,
-        kol_id=str(runtime_config["kol_id"]),
-        symbol=symbol,
-        side=side,
-    )
-    if binding is None and candidate.event_type == "close_signal":
-        binding = _recover_exit_signal_execution_binding(
+    partial_close_fraction = _extract_partial_close_fraction(raw_message.text)
+    if (
+        candidate.event_type == "position_update"
+        and partial_close_fraction is not None
+        and _requests_breakeven_protection(raw_message.text)
+    ):
+        bindings = _load_active_execution_bindings(
             session_factory,
-            raw_message=raw_message,
-            candidate=candidate,
-            runtime_kol_id=str(runtime_config["kol_id"]),
-            deepcoin_client=deepcoin_client,
-            recovered_at=processed_at,
+            chat_id=raw_message.chat_id,
+            kol_id=str(runtime_config["kol_id"]),
+            symbol=symbol,
+            side=side,
         )
-    if binding is None:
-        return {"status": "skipped", "reason": "no_execution_binding"}
-
-    action_payload: dict[str, Any] = {"binding_id": binding.id}
-    if candidate.event_type == "close_signal":
-        action = "close_position" if binding.pos_id else "cancel_entry"
+        if not bindings:
+            return {"status": "skipped", "reason": "no_execution_binding"}
+        action = "partial_close_and_move_stop_to_entry"
+        action_payload: dict[str, Any] = {
+            "targets": [
+                {"binding_id": binding.id, "fraction": partial_close_fraction}
+                for binding in bindings
+            ]
+        }
+        strategy_instance_id = None
     else:
-        partial_close_fraction = _extract_partial_close_fraction(raw_message.text)
-        if partial_close_fraction is not None:
-            action = "close_position"
-            action_payload["fraction"] = partial_close_fraction
-            action_payload["partial_close_reason"] = "partial_take_profit"
+        binding = _load_active_execution_binding(
+            session_factory,
+            chat_id=raw_message.chat_id,
+            kol_id=str(runtime_config["kol_id"]),
+            symbol=symbol,
+            side=side,
+        )
+        if binding is None and candidate.event_type == "close_signal":
+            binding = _recover_exit_signal_execution_binding(
+                session_factory,
+                raw_message=raw_message,
+                candidate=candidate,
+                runtime_kol_id=str(runtime_config["kol_id"]),
+                deepcoin_client=deepcoin_client,
+                recovered_at=processed_at,
+            )
+        if binding is None:
+            return {"status": "skipped", "reason": "no_execution_binding"}
+
+        action_payload = {"binding_id": binding.id}
+        strategy_instance_id = binding.strategy_instance_id
+        if candidate.event_type == "close_signal":
+            action = "close_position" if binding.pos_id else "cancel_entry"
         else:
-            reference_price = _safe_ticker_price(
-                deepcoin_client,
-                inst_id=_to_deepcoin_swap_instrument(symbol),
-            )
-            stop_loss = _first_price(
-                candidate.stop_loss_text,
-                symbol=symbol,
-                reference_price=reference_price,
-            )
-            take_profit = _first_price(
-                candidate.take_profit_text,
-                symbol=symbol,
-                reference_price=reference_price,
-            )
-            if stop_loss is not None:
-                action_payload["stop_loss"] = stop_loss
-            if take_profit is not None:
-                action_payload["take_profit"] = take_profit
-            if stop_loss is not None and take_profit is not None:
-                action = "adjust_position_tpsl"
-            elif stop_loss is not None:
-                action = "adjust_stop_loss"
-            elif take_profit is not None:
-                action = "adjust_take_profit"
+            if partial_close_fraction is not None:
+                action = "close_position"
+                action_payload["fraction"] = partial_close_fraction
+                action_payload["partial_close_reason"] = "partial_take_profit"
             else:
-                return {"status": "skipped", "reason": "no_tpsl_update"}
+                reference_price = _safe_ticker_price(
+                    deepcoin_client,
+                    inst_id=_to_deepcoin_swap_instrument(symbol),
+                )
+                stop_loss = _first_price(
+                    candidate.stop_loss_text,
+                    symbol=symbol,
+                    reference_price=reference_price,
+                )
+                take_profit = _first_price(
+                    candidate.take_profit_text,
+                    symbol=symbol,
+                    reference_price=reference_price,
+                )
+                if stop_loss is not None:
+                    action_payload["stop_loss"] = stop_loss
+                if take_profit is not None:
+                    action_payload["take_profit"] = take_profit
+                if stop_loss is not None and take_profit is not None:
+                    action = "adjust_position_tpsl"
+                elif stop_loss is not None:
+                    action = "adjust_stop_loss"
+                elif take_profit is not None:
+                    action = "adjust_take_profit"
+                else:
+                    return {"status": "skipped", "reason": "no_tpsl_update"}
 
     trade_signal = enqueue_trade_signal(
         session_factory,
@@ -453,7 +477,7 @@ def _auto_process_management_signal(
             },
             **action_payload,
         },
-        strategy_instance_id=binding.strategy_instance_id,
+        strategy_instance_id=strategy_instance_id,
         enqueued_at=processed_at,
     )
     submit_result = process_trade_signal_live(
@@ -1089,3 +1113,8 @@ def _extract_partial_close_fraction(text: str | None) -> float | None:
         if token in normalized:
             return value
     return None
+
+
+def _requests_breakeven_protection(text: str | None) -> bool:
+    normalized = str(text or "")
+    return any(token in normalized for token in ("回成本", "保护成本", "成本保护", "止损至成本", "止损到成本"))

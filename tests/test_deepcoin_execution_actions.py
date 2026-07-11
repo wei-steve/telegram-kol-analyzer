@@ -5,6 +5,7 @@ import pytest
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
 from telegram_kol_research.deepcoin_execution_actions import adjust_position_tpsl
+from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
 from telegram_kol_research.execution_bindings import list_execution_order_legs
@@ -104,16 +105,16 @@ def _binding(session_factory, **overrides):
     return upsert_execution_binding(session_factory, ExecutionBindingRecord(**values))
 
 
-def _signal(session_factory, *, action, payload=None, message_id=88):
+def _signal(session_factory, *, action, payload=None, message_id=88, kol_id="alice", symbol="ETH", side="long"):
     return enqueue_trade_signal(
         session_factory,
         venue="deepcoin",
         source_type="kol_management",
-        kol_id="alice",
+        kol_id=kol_id,
         chat_id=100,
         message_id=message_id,
-        symbol="ETH",
-        side="long",
+        symbol=symbol,
+        side=side,
         action=action,
         payload=payload or {},
         strategy_instance_id="deepcoin:100:55:ETH:long",
@@ -292,6 +293,65 @@ def test_process_trade_signal_live_closes_all_bound_position_ids(tmp_path):
     with session_factory() as session:
         binding = session.get(ExecutionBinding, binding_id)
         assert binding.status == "closed"
+
+
+def test_composite_breakeven_management_reduces_each_target_then_uses_its_own_average_entry(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_binding_id = _binding(
+        session_factory,
+        kol_id="andy",
+        symbol="BTC",
+        side="short",
+        pos_id="pos-1",
+        strategy_instance_id="deepcoin:100:55:BTC:short",
+    )
+    second_binding_id = _binding(
+        session_factory,
+        kol_id="andy",
+        message_id=56,
+        symbol="BTC",
+        side="short",
+        pos_id="pos-2",
+        strategy_instance_id="deepcoin:100:56:BTC:short",
+    )
+    signal = _signal(
+        session_factory,
+        action="partial_close_and_move_stop_to_entry",
+        payload={
+            "targets": [
+                {"binding_id": first_binding_id, "fraction": 0.5},
+                {"binding_id": second_binding_id, "fraction": 0.5},
+            ]
+        },
+        kol_id="andy",
+        symbol="BTC",
+        side="short",
+    )
+    client = _FakeDeepcoinClient()
+    client.positions = [
+        {"posId": "pos-1", "instId": "BTC-USDT-SWAP", "posSide": "short", "pos": "2", "avgPx": "64000", "cTime": "1000"},
+        {"posId": "pos-2", "instId": "BTC-USDT-SWAP", "posSide": "short", "pos": "4", "avgPx": "64500", "cTime": "1001"},
+    ]
+    client.trigger_pending = [
+        {"triggerOrderType": "TPSL", "ordId": "tp-1", "instId": "BTC-USDT-SWAP", "posSide": "short", "posId": "pos-1", "tpTriggerPx": "63200", "sz": "2", "cTime": "1000"},
+        {"triggerOrderType": "TPSL", "ordId": "sl-1", "instId": "BTC-USDT-SWAP", "posSide": "short", "posId": "pos-1", "slTriggerPx": "65200", "sz": "2", "cTime": "1000"},
+        {"triggerOrderType": "TPSL", "ordId": "tp-2", "instId": "BTC-USDT-SWAP", "posSide": "short", "posId": "pos-2", "tpTriggerPx": "62500", "sz": "4", "cTime": "1001"},
+        {"triggerOrderType": "TPSL", "ordId": "sl-2", "instId": "BTC-USDT-SWAP", "posSide": "short", "posId": "pos-2", "slTriggerPx": "65400", "sz": "4", "cTime": "1001"},
+    ]
+
+    result = execute_deepcoin_management_signal(
+        session_factory,
+        trade_signal=signal,
+        deepcoin_client=client,
+        executed_at=datetime(2026, 7, 11, 10, 0, tzinfo=UTC),
+    )
+
+    assert [order["closePosId"] for order in client.order_payloads] == ["pos-1", "pos-2"]
+    assert [order["sz"] for order in client.order_payloads] == ["1", "2"]
+    assert [target["status"] for target in result["targets"]] == ["submitted", "submitted"], result["targets"]
+    assert [payload["slTriggerPx"] for payload in client.protection_payloads] == ["64000.0", "64500.0"]
+    assert [payload["tpTriggerPx"] for payload in client.protection_payloads] == ["63200.0", "62500.0"]
+    assert [target["status"] for target in result["targets"]] == ["submitted", "submitted"]
 
 
 def test_process_trade_signal_live_closes_only_requested_bound_position_id(tmp_path):

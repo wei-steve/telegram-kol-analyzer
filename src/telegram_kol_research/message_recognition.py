@@ -1098,13 +1098,12 @@ def _management_action_for_exit_downgrade(
     decision: dict[str, Any],
 ) -> str:
     combined = _combined_lifecycle_text(text, decision)
-    has_partial_close = _has_partial_take_profit_terms(combined)
     has_protective_stop = _has_protective_stop_terms(combined)
-    if has_partial_close and has_protective_stop:
+    if "平加仓" in combined and has_protective_stop:
         return "partial_take_profit, move_stop_to_protect"
     if has_protective_stop:
         return "move_stop_to_protect"
-    if has_partial_close:
+    if _has_partial_take_profit_terms(combined):
         return "partial_take_profit"
     return "position_update"
 
