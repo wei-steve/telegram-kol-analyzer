@@ -249,6 +249,16 @@ def test_group_context_responsive_contract(tmp_path):
     assert "@media (prefers-reduced-motion: reduce)" in css
 
 
+def test_group_switch_prioritizes_active_destination_without_waiting_for_both_panels(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+
+    assert "activeWorkbenchView" in js
+    assert "loadVisibleGroupDestination" in js
+    assert "loadBackgroundGroupDestination" in js
+    assert "Promise.all([" not in js
+
+
 def test_app_js_binds_mobile_work_navigation_to_existing_dashboard_views(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

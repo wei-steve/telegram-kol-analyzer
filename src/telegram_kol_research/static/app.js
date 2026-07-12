@@ -1085,27 +1085,20 @@ function bindGroupLinks() {
       const strategyPanel = document.querySelector('[data-strategy-panel]');
       const filterInput = document.querySelector('[data-strategy-filter-input]');
       const filter = filterInput ? filterInput.value : 'holding';
+      const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView === 'messages'
+        ? 'messages'
+        : 'strategies';
       setAiStatus('');
       document.dispatchEvent(new CustomEvent('group-context-pending', { detail: { chatId } }));
       try {
-        const [nextContent, nextStrategyContent] = await Promise.all([
-          fetchDetailPanel(chatId),
-          strategyPanel ? fetchStrategyMidPanel(chatId, filter) : Promise.resolve(null),
-        ]);
-        if (requestId !== groupSwitchRequestId || !detailPanel || !nextContent) return;
-        detailPanel.innerHTML = '';
-        detailPanel.appendChild(nextContent);
-        if (strategyPanel && nextStrategyContent) {
-          strategyPanel.innerHTML = '';
-          strategyPanel.appendChild(nextStrategyContent);
-        }
-        bindDetailPanelControls();
-        bindStrategyFilterBadges();
+        await loadVisibleGroupDestination({ activeView, chatId, filter, detailPanel, strategyPanel, requestId });
+        if (requestId !== groupSwitchRequestId) return;
         syncSelectedGroupState(chatId, { focus: true });
         applyGroupPromptToEditor(String(chatId));
         renderConversationHistory();
-        refreshGroupList().catch(() => {});
         document.dispatchEvent(new CustomEvent('group-context-success', { detail: { chatId } }));
+        loadBackgroundGroupDestination({ activeView, chatId, filter, detailPanel, strategyPanel, requestId });
+        refreshGroupList().catch(() => {});
       } catch (error) {
         if (requestId === groupSwitchRequestId) {
           setAiStatus('群组切换失败，请重试。', true);
@@ -1114,6 +1107,45 @@ function bindGroupLinks() {
       }
     });
   });
+}
+
+async function loadVisibleGroupDestination({ activeView, chatId, filter, detailPanel, strategyPanel, requestId }) {
+  if (activeView === 'messages') {
+    const nextContent = await fetchDetailPanel(chatId);
+    if (requestId !== groupSwitchRequestId) return;
+    if (!detailPanel) throw new Error('missing detail panel');
+    detailPanel.innerHTML = '';
+    detailPanel.appendChild(nextContent);
+    bindDetailPanelControls();
+    return;
+  }
+  const nextStrategyContent = await fetchStrategyMidPanel(chatId, filter);
+  if (requestId !== groupSwitchRequestId) return;
+  if (!strategyPanel) throw new Error('missing strategy panel');
+  strategyPanel.innerHTML = '';
+  strategyPanel.appendChild(nextStrategyContent);
+  bindStrategyFilterBadges();
+  bindDetailPanelControls();
+}
+
+async function loadBackgroundGroupDestination({ activeView, chatId, filter, detailPanel, strategyPanel, requestId }) {
+  try {
+    if (activeView === 'messages') {
+      const nextStrategyContent = await fetchStrategyMidPanel(chatId, filter);
+      if (requestId !== groupSwitchRequestId || getSelectedChatId() !== chatId || !strategyPanel) return;
+      strategyPanel.innerHTML = '';
+      strategyPanel.appendChild(nextStrategyContent);
+      bindStrategyFilterBadges();
+      return;
+    }
+    const nextContent = await fetchDetailPanel(chatId);
+    if (requestId !== groupSwitchRequestId || getSelectedChatId() !== chatId || !detailPanel) return;
+    detailPanel.innerHTML = '';
+    detailPanel.appendChild(nextContent);
+    bindDetailPanelControls();
+  } catch {
+    // The visible destination is already usable; retry the background destination when opened.
+  }
 }
 
 function bindGroupAutomationToggles() {
