@@ -223,6 +223,14 @@ The confirmed workbench structure is mobile-first and uses the same Flask/Jinja 
 - `消息`: latest-activity KOL/group navigation and chronological messages with recognition details.
 - `更多`: trading settings, AI configuration, prompts, profiles, and logs.
 
+Group context rules:
+
+- `策略` and `消息` use the same selected Telegram group.
+- The shared selection is persisted in the browser and restored only when that group still exists.
+- Mobile selects through a searchable bottom sheet; desktop uses the same group data in an overlay.
+- `首页` continues to aggregate all groups so other KOL events are not hidden.
+- Existing sidebar group rows are auxiliary controls and must delegate to the same selected-group state.
+
 The event feed normalizes existing source records for display and links back to their detail views. It must not become a second source of truth.
 
 Mobile home pages do not expose dangerous trading mutations. Closing or binding a live position and changing trading configuration require entering the corresponding detail view, reviewing concrete instrument/side/quantity/source context, and confirming the action. Backend validation and idempotency remain authoritative.

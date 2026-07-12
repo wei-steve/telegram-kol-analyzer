@@ -435,6 +435,71 @@ function syncSelectedGroupState(chatId, options = {}) {
   }
 }
 
+function bindGroupPickerOptions(root, close) {
+  root.querySelectorAll('[data-group-picker-option]').forEach((option) => {
+    if (option.dataset.pickerBound === 'true') return;
+    option.dataset.pickerBound = 'true';
+    option.addEventListener('click', () => {
+      const chatId = Number(option.dataset.chatId || 0);
+      const status = root.querySelector('[data-group-context-status]');
+      if (status) status.textContent = '正在切换…';
+      const onSuccess = (event) => {
+        if (Number(event.detail?.chatId) !== chatId) return;
+        cleanup();
+        if (status) status.textContent = '群组已切换';
+        close();
+      };
+      const onError = (event) => {
+        if (Number(event.detail?.chatId) !== chatId) return;
+        cleanup();
+        if (status) status.textContent = '切换失败，点击重试';
+      };
+      const cleanup = () => {
+        document.removeEventListener('group-context-success', onSuccess);
+        document.removeEventListener('group-context-error', onError);
+      };
+      document.addEventListener('group-context-success', onSuccess);
+      document.addEventListener('group-context-error', onError);
+      document.querySelector(`[data-group-link][data-chat-id="${chatId}"]`)?.click();
+    });
+  });
+}
+
+function refreshGroupPickerOptions() {
+  const root = document.querySelector('[data-group-context]');
+  const results = root?.querySelector('[data-group-picker-results]');
+  if (!root || !results) return;
+  const selectedChatId = getSelectedChatId();
+  results.innerHTML = '';
+  document.querySelectorAll('.kol-strategy-row [data-group-link]').forEach((groupLink) => {
+    const option = document.createElement('button');
+    const chatId = Number(groupLink.dataset.chatId || 0);
+    const title = groupLink.querySelector('.kol-name-row strong')?.textContent?.trim() || String(chatId);
+    const status = groupLink.querySelector('.kol-status-row')?.textContent?.replace(/\s+/g, ' ').trim() || '';
+    option.type = 'button';
+    option.className = `group-picker-option${chatId === selectedChatId ? ' is-selected' : ''}`;
+    option.dataset.groupPickerOption = '';
+    option.dataset.chatId = String(chatId);
+    option.dataset.searchText = title.toLowerCase();
+    option.setAttribute('aria-current', chatId === selectedChatId ? 'true' : 'false');
+    const text = document.createElement('span');
+    const strong = document.createElement('strong');
+    const small = document.createElement('small');
+    strong.textContent = title;
+    small.textContent = status;
+    text.append(strong, small);
+    const check = document.createElement('span');
+    check.className = 'group-picker-check';
+    check.textContent = chatId === selectedChatId ? '✓' : '';
+    option.append(text, check);
+    results.appendChild(option);
+  });
+  bindGroupPickerOptions(root, () => {
+    const picker = root.querySelector('[data-group-picker]');
+    if (picker) picker.hidden = true;
+  });
+}
+
 function bindGroupContext() {
   const root = document.querySelector('[data-group-context]');
   const picker = root?.querySelector('[data-group-picker]');
@@ -444,13 +509,7 @@ function bindGroupContext() {
   const close = () => { picker.hidden = true; trigger.focus({ preventScroll: true }); };
   trigger.addEventListener('click', () => { picker.hidden = false; search?.focus(); });
   root.querySelectorAll('[data-group-picker-close]').forEach((button) => button.addEventListener('click', close));
-  root.querySelectorAll('[data-group-picker-option]').forEach((option) => {
-    option.addEventListener('click', () => {
-      const chatId = Number(option.dataset.chatId || 0);
-      document.querySelector(`[data-group-link][data-chat-id="${chatId}"]`)?.click();
-      close();
-    });
-  });
+  bindGroupPickerOptions(root, close);
   search?.addEventListener('input', () => {
     const query = search.value.trim().toLowerCase();
     let visible = 0;
@@ -490,6 +549,7 @@ async function refreshGroupList() {
   }
 
   bindGroupLinks();
+  refreshGroupPickerOptions();
   syncSelectedGroupState(selectedChatId);
 }
 
@@ -518,6 +578,7 @@ async function fetchMessagePanel(chatId, options = {}) {
 async function fetchDetailPanel(chatId) {
   const url = `/groups/${chatId}/detail?_t=${Date.now()}`;
   const response = await fetch(url, { cache: 'no-store' });
+  if (!response.ok) throw new Error(`detail request failed: ${response.status}`);
   const html = await response.text();
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
@@ -527,6 +588,7 @@ async function fetchDetailPanel(chatId) {
 async function fetchStrategyMidPanel(chatId, filter) {
   const url = `/groups/${chatId}/strategy-mid-panel?filter=${filter}&_t=${Date.now()}`;
   const response = await fetch(url, { cache: 'no-store' });
+  if (!response.ok) throw new Error(`strategy request failed: ${response.status}`);
   const html = await response.text();
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
@@ -1007,48 +1069,36 @@ function bindGroupLinks() {
       const chatId = Number(element.dataset.chatId);
       const requestId = ++groupSwitchRequestId;
       hasDeferredMessageRefresh = false;
-      syncSelectedGroupState(chatId, { focus: true });
-      refreshGroupList().catch(() => {
-        // Keep switching groups responsive even if the sidebar refresh fails.
-      });
       const detailPanel = document.querySelector('[data-detail-panel]');
       const strategyPanel = document.querySelector('[data-strategy-panel]');
       const filterInput = document.querySelector('[data-strategy-filter-input]');
       const filter = filterInput ? filterInput.value : 'holding';
       setAiStatus('');
-      applyGroupPromptToEditor(String(chatId));
-      renderConversationHistory();
-
-      fetchDetailPanel(chatId)
-        .then((nextContent) => {
-          if (requestId !== groupSwitchRequestId || !detailPanel || !nextContent) {
-            return;
-          }
-          detailPanel.innerHTML = '';
-          detailPanel.appendChild(nextContent);
-          bindDetailPanelControls();
-          syncSelectedGroupState(chatId);
-        })
-        .catch(() => {
-          if (requestId === groupSwitchRequestId) {
-            setAiStatus('消息列表加载失败，请重试。', true);
-          }
-        });
-
-      if (strategyPanel) {
-        fetchStrategyMidPanel(chatId, filter)
-          .then((nextStrategyContent) => {
-            if (requestId !== groupSwitchRequestId || !nextStrategyContent) {
-              return;
-            }
-            strategyPanel.innerHTML = '';
-            strategyPanel.appendChild(nextStrategyContent);
-            bindStrategyFilterBadges();
-            bindDetailPanelControls();
-          })
-          .catch(() => {
-            // Keep the current strategy panel visible if the slower side panel fails.
-          });
+      document.dispatchEvent(new CustomEvent('group-context-pending', { detail: { chatId } }));
+      try {
+        const [nextContent, nextStrategyContent] = await Promise.all([
+          fetchDetailPanel(chatId),
+          strategyPanel ? fetchStrategyMidPanel(chatId, filter) : Promise.resolve(null),
+        ]);
+        if (requestId !== groupSwitchRequestId || !detailPanel || !nextContent) return;
+        detailPanel.innerHTML = '';
+        detailPanel.appendChild(nextContent);
+        if (strategyPanel && nextStrategyContent) {
+          strategyPanel.innerHTML = '';
+          strategyPanel.appendChild(nextStrategyContent);
+        }
+        bindDetailPanelControls();
+        bindStrategyFilterBadges();
+        syncSelectedGroupState(chatId, { focus: true });
+        applyGroupPromptToEditor(String(chatId));
+        renderConversationHistory();
+        refreshGroupList().catch(() => {});
+        document.dispatchEvent(new CustomEvent('group-context-success', { detail: { chatId } }));
+      } catch (error) {
+        if (requestId === groupSwitchRequestId) {
+          setAiStatus('群组切换失败，请重试。', true);
+          document.dispatchEvent(new CustomEvent('group-context-error', { detail: { chatId } }));
+        }
       }
     });
   });

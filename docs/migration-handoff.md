@@ -39,7 +39,11 @@ Mobile is the primary layout. Desktop enhances the same hierarchy with a left na
 
 Low-risk actions such as refresh, filtering, navigation, and opening details can happen directly. Position close, live-position binding, and trading-setting changes remain detail-only actions with explicit confirmation, pending-state feedback, and duplicate-submit protection.
 
+`策略` and `消息` share one persisted current-group context. Their canonical selector is the sticky context bar above the shared workbench. Mobile opens a searchable bottom sheet; desktop opens the same picker as a compact overlay. `首页`, `持仓`, and `更多` remain global and must not be implicitly filtered by this selected group.
+
 Design and implementation references:
 
 - `docs/plans/2026-07-12-mobile-first-web-workbench-design.md`
 - `docs/plans/2026-07-12-mobile-first-web-workbench.md`
+- `docs/plans/2026-07-12-shared-group-context-design.md`
+- `docs/plans/2026-07-12-shared-group-context.md`
