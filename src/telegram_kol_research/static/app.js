@@ -550,6 +550,14 @@ async function refreshGroupList() {
 
   bindGroupLinks();
   refreshGroupPickerOptions();
+  const selectedStillExists = document.querySelector(`[data-group-link][data-chat-id="${selectedChatId}"]`);
+  if (!selectedStillExists) {
+    const fallback = document.querySelector('[data-group-link]');
+    if (fallback) {
+      fallback.click();
+      return;
+    }
+  }
   syncSelectedGroupState(selectedChatId);
 }
 
@@ -582,7 +590,9 @@ async function fetchDetailPanel(chatId) {
   const html = await response.text();
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
-  return doc.querySelector('.strategy-detail-shell');
+  const fragment = doc.querySelector('.strategy-detail-shell');
+  if (!fragment) throw new Error('detail response missing strategy-detail-shell');
+  return fragment;
 }
 
 async function fetchStrategyMidPanel(chatId, filter) {
@@ -592,7 +602,9 @@ async function fetchStrategyMidPanel(chatId, filter) {
   const html = await response.text();
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
-  return doc.querySelector('.strategy-panel-content');
+  const fragment = doc.querySelector('.strategy-panel-content');
+  if (!fragment) throw new Error('strategy response missing strategy-panel-content');
+  return fragment;
 }
 
 async function refreshStrategyMidPanel() {
