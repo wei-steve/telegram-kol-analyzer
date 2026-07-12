@@ -236,6 +236,19 @@ def test_app_css_includes_mobile_first_workbench_visual_contract(tmp_path):
     assert "env(safe-area-inset-bottom" in css
 
 
+def test_group_context_responsive_contract(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    css = client.get("/static/app.css").text
+
+    assert ".group-context" in css
+    assert "position: sticky" in css
+    assert ".group-picker-surface" in css
+    assert "min-height: 48px" in css
+    assert "env(safe-area-inset-bottom)" in css
+    assert "@media (max-width: 760px)" in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+
+
 def test_app_js_binds_mobile_work_navigation_to_existing_dashboard_views(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
@@ -261,7 +274,9 @@ def test_app_js_binds_workbench_navigation_and_home_event_filters(tmp_path):
     assert "function bindHomeEventFilters" in response.text
     assert "[data-home-event-filter]" in response.text
     assert "[data-new-home-events]" in response.text
-    assert "[data-message-group-select]" in response.text
+    assert "function bindGroupContext" in response.text
+    assert "telegram-workbench:selected-group" in response.text
+    assert "[data-group-picker-search]" in response.text
 
 
 def test_app_assets_expose_persistent_mutation_states(tmp_path):

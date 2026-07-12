@@ -1,0 +1,22 @@
+<section class="group-context" data-group-context>
+  <button type="button" class="group-context-trigger" data-group-context-trigger aria-haspopup="dialog">
+    <span><small>当前群组</small><strong data-group-context-label>{{ selected_group.title if selected_group else '暂无群组' }}</strong></span>
+    <span>切换 ›</span>
+  </button>
+  <div class="group-picker" data-group-picker role="dialog" aria-modal="true" aria-labelledby="group-picker-title" hidden>
+    <div class="group-picker-backdrop" data-group-picker-close></div>
+    <section class="group-picker-surface">
+      <header><h2 id="group-picker-title">选择群组</h2><button type="button" data-group-picker-close>关闭</button></header>
+      <label class="group-picker-search"><span class="sr-only">搜索群组或 KOL</span><input type="search" placeholder="搜索群组 / KOL" data-group-picker-search /></label>
+      <div class="group-picker-results" data-group-picker-results>
+        {% for group in trader_dashboard.group_rows %}
+          <button type="button" class="group-picker-option{% if group.chat_id == selected_chat_id %} is-selected{% endif %}" value="{{ group.chat_id }}" data-group-picker-option data-chat-id="{{ group.chat_id }}" data-search-text="{{ (group.title ~ ' ' ~ (group.raw_title or ''))|lower }}" aria-current="{{ 'true' if group.chat_id == selected_chat_id else 'false' }}">
+            <span><strong>{{ group.title }}</strong><small>{{ group.holding_count }} 个持仓 · {{ group.pending_count }} 个待入场</small></span><span class="group-picker-check">{% if group.chat_id == selected_chat_id %}✓{% endif %}</span>
+          </button>
+        {% else %}<p class="group-picker-empty">暂无已配置或已同步的群组</p>{% endfor %}
+      </div>
+      <p class="group-picker-empty" data-group-picker-empty hidden>没有匹配的群组</p>
+      <p class="group-context-status" data-group-context-status aria-live="polite"></p>
+    </section>
+  </div>
+</section>

@@ -45,7 +45,7 @@ def test_index_page_renders_explicit_operational_states(tmp_path):
     assert "data-last-success-at" in response.text
 
 
-def test_message_view_renders_group_selector_for_switching_groups(tmp_path):
+def test_shared_group_context_renders_all_groups(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
     with session_factory() as session:
@@ -61,15 +61,14 @@ def test_message_view_renders_group_selector_for_switching_groups(tmp_path):
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "data-message-group-select" in response.text
+    assert "data-group-context" in response.text
+    assert "data-group-context-trigger" in response.text
+    assert "data-group-picker" in response.text
+    assert "data-group-picker-search" in response.text
+    assert response.text.count("data-group-picker-option") == 2
     assert 'value="77"' in response.text
     assert 'value="88"' in response.text
-
-    detail_response = client.get("/groups/77/detail")
-    assert detail_response.status_code == 200
-    assert "data-message-group-select" in detail_response.text
-    assert 'value="77"' in detail_response.text
-    assert 'value="88"' in detail_response.text
+    assert "data-message-group-select" not in response.text
 
 
 def test_index_page_shows_group_list_and_messages(tmp_path):

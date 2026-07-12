@@ -8,14 +8,6 @@
           最新消息 {{ selected_group.last_posted_at.strftime('%m-%d %H:%M') if selected_group.last_posted_at else '-' }}
           · 共 {{ selected_group.message_count if selected_group.message_count else 0 }} 条
         </span>
-        <label class="message-group-selector">
-          <span>选择群组</span>
-          <select data-message-group-select aria-label="选择消息群组">
-            {% for group in groups %}
-              <option value="{{ group.chat_id }}" {% if group.chat_id == selected_chat_id %}selected{% endif %}>{{ group.title }}</option>
-            {% endfor %}
-          </select>
-        </label>
       </div>
       <div class="detail-header-actions">
         <button type="button" class="secondary-button" data-run-recovery-scan title="刷新策略扫描">刷新策略</button>

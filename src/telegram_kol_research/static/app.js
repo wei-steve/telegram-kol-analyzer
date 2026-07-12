@@ -418,8 +418,54 @@ function syncSelectedGroupState(chatId, options = {}) {
       selectedButton = button;
     }
   });
+  const pickerOption = document.querySelector(`[data-group-picker-option][data-chat-id="${selectedChatId}"]`);
+  document.querySelectorAll('[data-group-picker-option]').forEach((option) => {
+    const selected = option === pickerOption;
+    option.classList.toggle('is-selected', selected);
+    option.setAttribute('aria-current', selected ? 'true' : 'false');
+    const check = option.querySelector('.group-picker-check');
+    if (check) check.textContent = selected ? '✓' : '';
+  });
+  const label = document.querySelector('[data-group-context-label]');
+  const selectedName = pickerOption?.querySelector('strong')?.textContent?.trim();
+  if (label && selectedName) label.textContent = selectedName;
+  try { window.localStorage.setItem('telegram-workbench:selected-group', String(selectedChatId)); } catch {}
   if (options.focus && selectedButton) {
     selectedButton.focus({ preventScroll: true });
+  }
+}
+
+function bindGroupContext() {
+  const root = document.querySelector('[data-group-context]');
+  const picker = root?.querySelector('[data-group-picker]');
+  const trigger = root?.querySelector('[data-group-context-trigger]');
+  const search = root?.querySelector('[data-group-picker-search]');
+  if (!root || !picker || !trigger) return;
+  const close = () => { picker.hidden = true; trigger.focus({ preventScroll: true }); };
+  trigger.addEventListener('click', () => { picker.hidden = false; search?.focus(); });
+  root.querySelectorAll('[data-group-picker-close]').forEach((button) => button.addEventListener('click', close));
+  root.querySelectorAll('[data-group-picker-option]').forEach((option) => {
+    option.addEventListener('click', () => {
+      const chatId = Number(option.dataset.chatId || 0);
+      document.querySelector(`[data-group-link][data-chat-id="${chatId}"]`)?.click();
+      close();
+    });
+  });
+  search?.addEventListener('input', () => {
+    const query = search.value.trim().toLowerCase();
+    let visible = 0;
+    root.querySelectorAll('[data-group-picker-option]').forEach((option) => {
+      const matches = !query || (option.dataset.searchText || '').includes(query);
+      option.hidden = !matches;
+      if (matches) visible += 1;
+    });
+    const empty = root.querySelector('[data-group-picker-empty]');
+    if (empty) empty.hidden = visible !== 0;
+  });
+  let persisted = 0;
+  try { persisted = Number(window.localStorage.getItem('telegram-workbench:selected-group') || 0); } catch {}
+  if (persisted && root.querySelector(`[data-group-picker-option][data-chat-id="${persisted}"]`)) {
+    document.querySelector(`[data-group-link][data-chat-id="${persisted}"]`)?.click();
   }
 }
 
@@ -523,15 +569,6 @@ function bindStrategyFilterBadges() {
 }
 
 function bindDetailPanelControls() {
-  document.querySelectorAll('[data-message-group-select]').forEach((select) => {
-    if (select.dataset.groupSelectBound === 'true') return;
-    select.dataset.groupSelectBound = 'true';
-    select.addEventListener('change', () => {
-      const chatId = Number(select.value || 0);
-      if (!chatId) return;
-      document.querySelector(`[data-group-link][data-chat-id="${chatId}"]`)?.click();
-    });
-  });
   // Horizontal tab switching with lazy loading
   document.querySelectorAll('[data-detail-tab]').forEach((tab) => {
     tab.addEventListener('click', async () => {
@@ -2615,6 +2652,7 @@ window.addEventListener('DOMContentLoaded', () => {
   bindDashboardTabs();
   bindMobileWorkNavigation();
   bindHomeEventFilters();
+  bindGroupContext();
   bindWorkflowFilters();
   bindExchangePositionTabs();
   bindTradingSettingsForm();

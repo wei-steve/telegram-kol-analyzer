@@ -2254,18 +2254,12 @@ def create_web_app(
         )
         freshness_ms = _elapsed_ms(step_started_at)
         step_started_at = time.perf_counter()
-        groups = load_group_rows(
-            app.state.session_factory,
-            group_labels_by_title=app.state.group_labels_by_title,
-            configured_groups=app.state.group_config.groups,
-        )
         response = templates.TemplateResponse(
             request,
             "_strategy_detail.html",
             {
                 "selected_group": selected_group,
                 "selected_chat_id": chat_id,
-                "groups": groups,
                 "messages": messages,
                 "monitor_status": monitor_status,
                 "live_listener_enabled": monitor_status["state"] == "monitoring",
