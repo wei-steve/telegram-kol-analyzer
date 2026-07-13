@@ -2,6 +2,14 @@ let latestFreshnessSnapshot = null;
 let currentSelectedChatId = null;
 let groupSwitchRequestId = 0;
 let hasDeferredMessageRefresh = false;
+let recoveryRefreshPromise = null;
+
+const workbenchLoadState = {
+  home: { key: null, promise: null },
+  positions: { key: null, promise: null },
+  strategies: { key: null, promise: null },
+  messages: { key: null, promise: null },
+};
 
 const MESSAGE_TOP_THRESHOLD = 24;
 
@@ -523,9 +531,14 @@ function bindGroupContext() {
   });
   let persisted = 0;
   try { persisted = Number(window.localStorage.getItem('telegram-workbench:selected-group') || 0); } catch {}
+  let initialSelectedChatId = Number(
+    root.querySelector('[data-group-picker-option][aria-current="true"]')?.dataset.chatId || 0,
+  );
   if (persisted && root.querySelector(`[data-group-picker-option][data-chat-id="${persisted}"]`)) {
-    document.querySelector(`[data-group-link][data-chat-id="${persisted}"]`)?.click();
+    syncSelectedGroupState(persisted);
+    initialSelectedChatId = persisted;
   }
+  if (initialSelectedChatId) syncSelectedGroupState(initialSelectedChatId);
 }
 
 async function refreshGroupList() {
@@ -623,7 +636,7 @@ async function refreshStrategyMidPanel() {
   strategyPanel.innerHTML = '';
   strategyPanel.appendChild(nextContent);
   bindStrategyFilterBadges();
-  bindDetailPanelControls();
+  bindWorkflowFilters();
 }
 
 function bindStrategyFilterBadges() {
@@ -1093,11 +1106,11 @@ function bindGroupLinks() {
       try {
         await loadVisibleGroupDestination({ activeView, chatId, filter, detailPanel, strategyPanel, requestId });
         if (requestId !== groupSwitchRequestId) return;
+        markWorkbenchLoaded(activeView, chatId);
         syncSelectedGroupState(chatId, { focus: true });
         applyGroupPromptToEditor(String(chatId));
         renderConversationHistory();
         document.dispatchEvent(new CustomEvent('group-context-success', { detail: { chatId } }));
-        loadBackgroundGroupDestination({ activeView, chatId, filter, detailPanel, strategyPanel, requestId });
         refreshGroupList().catch(() => {});
       } catch (error) {
         if (requestId === groupSwitchRequestId) {
@@ -1117,6 +1130,7 @@ async function loadVisibleGroupDestination({ activeView, chatId, filter, detailP
     detailPanel.innerHTML = '';
     detailPanel.appendChild(nextContent);
     bindDetailPanelControls();
+    bindWorkflowFilters();
     return;
   }
   const nextStrategyContent = await fetchStrategyMidPanel(chatId, filter);
@@ -1125,27 +1139,7 @@ async function loadVisibleGroupDestination({ activeView, chatId, filter, detailP
   strategyPanel.innerHTML = '';
   strategyPanel.appendChild(nextStrategyContent);
   bindStrategyFilterBadges();
-  bindDetailPanelControls();
-}
-
-async function loadBackgroundGroupDestination({ activeView, chatId, filter, detailPanel, strategyPanel, requestId }) {
-  try {
-    if (activeView === 'messages') {
-      const nextStrategyContent = await fetchStrategyMidPanel(chatId, filter);
-      if (requestId !== groupSwitchRequestId || getSelectedChatId() !== chatId || !strategyPanel) return;
-      strategyPanel.innerHTML = '';
-      strategyPanel.appendChild(nextStrategyContent);
-      bindStrategyFilterBadges();
-      return;
-    }
-    const nextContent = await fetchDetailPanel(chatId);
-    if (requestId !== groupSwitchRequestId || getSelectedChatId() !== chatId || !detailPanel) return;
-    detailPanel.innerHTML = '';
-    detailPanel.appendChild(nextContent);
-    bindDetailPanelControls();
-  } catch {
-    // The visible destination is already usable; retry the background destination when opened.
-  }
+  bindWorkflowFilters();
 }
 
 function bindGroupAutomationToggles() {
@@ -1200,10 +1194,116 @@ function bindGroupPromptEditor() {
   promptInput.addEventListener('change', persist);
 }
 
+function workbenchLoadKey(view) {
+  if (view === 'strategies' || view === 'messages') {
+    return String(getSelectedChatId() || 0);
+  }
+  return 'global';
+}
+
+function markWorkbenchLoaded(view, key = workbenchLoadKey(view)) {
+  if (workbenchLoadState[view]) {
+    workbenchLoadState[view].key = String(key);
+  }
+}
+
+function showWorkbenchLoadError(view, error) {
+  const container = document.querySelector(`[data-lazy-workbench="${view}"]`);
+  if (!container) return;
+  container.innerHTML = '';
+  container.setAttribute('aria-busy', 'false');
+  const message = document.createElement('p');
+  message.className = 'workbench-load-error';
+  message.textContent = `加载失败：${error?.message || '请检查服务状态'}`;
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'secondary-button';
+  retry.textContent = '重新加载';
+  retry.addEventListener('click', () => ensureWorkbenchViewLoaded(view, { force: true }));
+  container.append(message, retry);
+}
+
+async function fetchWorkbenchPartial(url, selector) {
+  const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}_t=${Date.now()}`, { cache: 'no-store' });
+  if (!response.ok) throw new Error(`请求失败 (${response.status})`);
+  const html = await response.text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const fragment = doc.querySelector(selector);
+  if (!fragment) throw new Error('返回内容不完整');
+  return fragment;
+}
+
+async function loadHomeDashboard() {
+  const container = document.querySelector('[data-lazy-workbench="home"]');
+  if (!container) return;
+  const fragment = await fetchWorkbenchPartial('/home-dashboard', '[data-home-dashboard]');
+  container.innerHTML = '';
+  container.appendChild(fragment);
+  bindHomeEventFilters();
+  bindHomeEventNavigation();
+}
+
+async function loadPositionsPanel() {
+  const container = document.querySelector('[data-lazy-workbench="positions"]');
+  if (!container) return;
+  const fragment = await fetchWorkbenchPartial('/positions-panel', '[data-exchange-position-tabs]');
+  container.innerHTML = '';
+  container.appendChild(fragment);
+  bindDashboardTabs();
+  bindExchangePositionTabs();
+  bindBoundPositionCloseButtons();
+  bindDeepcoinPositionSync();
+  bindLivePositionAttributionButtons();
+}
+
+async function loadSelectedGroupDestination(view) {
+  const chatId = getSelectedChatId();
+  if (!chatId) return;
+  const requestId = ++groupSwitchRequestId;
+  const filterInput = document.querySelector('[data-strategy-filter-input]');
+  const filter = filterInput ? filterInput.value : 'holding';
+  await loadVisibleGroupDestination({
+    activeView: view,
+    chatId,
+    filter,
+    detailPanel: document.querySelector('[data-detail-panel]'),
+    strategyPanel: document.querySelector('[data-strategy-panel]'),
+    requestId,
+  });
+}
+
+async function ensureWorkbenchViewLoaded(view, options = {}) {
+  const state = workbenchLoadState[view];
+  if (!state) return;
+  const key = workbenchLoadKey(view);
+  if (!options.force && state.key === key) return;
+  if (state.promise) return state.promise;
+  const container = document.querySelector(`[data-lazy-workbench="${view}"]`);
+  if (container) container.setAttribute('aria-busy', 'true');
+  state.promise = (async () => {
+    if (view === 'home') {
+      await loadHomeDashboard();
+    } else if (view === 'positions') {
+      await loadPositionsPanel();
+    } else {
+      await loadSelectedGroupDestination(view);
+    }
+    state.key = key;
+    if (container) container.setAttribute('aria-busy', 'false');
+  })().catch((error) => {
+    showWorkbenchLoadError(view, error);
+  }).finally(() => {
+    state.promise = null;
+  });
+  return state.promise;
+}
+
 function bindDashboardTabs() {
   const buttons = document.querySelectorAll('[data-dashboard-tab]');
   const panels = document.querySelectorAll('[data-dashboard-panel]');
   buttons.forEach((button) => {
+    if (button.dataset.dashboardTabBound === 'true') return;
+    button.dataset.dashboardTabBound = 'true';
     button.addEventListener('click', () => {
       const tab = button.dataset.dashboardTab || 'main';
       buttons.forEach((item) => item.classList.toggle('is-active', item === button));
@@ -1250,6 +1350,7 @@ function bindWorkbenchNavigation() {
     if (view === 'positions') {
       document.querySelector('[data-dashboard-tab="exchange-positions"]')?.click();
     }
+    ensureWorkbenchViewLoaded(view);
   };
 
   buttons.forEach((button) => {
@@ -1257,17 +1358,30 @@ function bindWorkbenchNavigation() {
       setWorkbenchView(button.dataset.workbenchView || 'home');
     });
   });
+  setWorkbenchView('home');
+}
+
+function bindHomeEventNavigation() {
+  document.querySelectorAll('[data-home-dashboard] [data-workbench-view]').forEach((button) => {
+    if (button.dataset.homeWorkbenchNavigationBound === 'true') return;
+    button.dataset.homeWorkbenchNavigationBound = 'true';
+    button.addEventListener('click', () => {
+      const destination = button.dataset.workbenchView || 'home';
+      document.querySelector(`nav [data-workbench-view="${destination}"]`)?.click();
+    });
+  });
   document.querySelectorAll('[data-event-destination]').forEach((card) => {
+    if (card.dataset.eventNavigationBound === 'true') return;
+    card.dataset.eventNavigationBound = 'true';
     card.addEventListener('click', () => {
+      const destination = card.dataset.eventDestination || 'home';
+      document.querySelector(`[data-workbench-view="${destination}"]`)?.click();
       const chatId = Number(card.dataset.eventChatId || 0);
       if (chatId) {
         document.querySelector(`[data-group-link][data-chat-id="${chatId}"]`)?.click();
       }
-      setWorkbenchView(card.dataset.eventDestination || 'home');
     });
   });
-
-  setWorkbenchView('home');
 }
 
 function bindHomeEventFilters() {
@@ -1298,6 +1412,8 @@ function bindWorkflowFilters() {
     completed: 'exited',
   };
   document.querySelectorAll('[data-strategy-workflow-filter]').forEach((button) => {
+    if (button.dataset.workflowFilterBound === 'true') return;
+    button.dataset.workflowFilterBound = 'true';
     button.addEventListener('click', () => {
       const workflow = button.dataset.strategyWorkflowFilter;
       document.querySelectorAll('[data-strategy-workflow-filter]').forEach((item) => item.classList.toggle('is-active', item === button));
@@ -1306,6 +1422,8 @@ function bindWorkflowFilters() {
     });
   });
   document.querySelectorAll('[data-message-workflow-filter]').forEach((button) => {
+    if (button.dataset.workflowFilterBound === 'true') return;
+    button.dataset.workflowFilterBound = 'true';
     button.addEventListener('click', () => {
       const filter = button.dataset.messageWorkflowFilter || 'all';
       document.querySelectorAll('[data-message-workflow-filter]').forEach((item) => item.classList.toggle('is-active', item === button));
@@ -2291,6 +2409,7 @@ async function refreshCurrentGroupPanel(options = {}) {
   detailPanel.innerHTML = '';
   detailPanel.appendChild(nextContent);
   bindDetailPanelControls();
+  bindWorkflowFilters();
 
   const nextMessagePanel = getMessagePanel();
   if (options.scrollToTopAfterRefresh) {
@@ -2345,7 +2464,7 @@ function hasNewerSelectedMessage(snapshot, previousSnapshot) {
   return currentMessageId > previousMessageId || currentRawMessageId > previousRawMessageId;
 }
 
-async function refreshFromDatabaseChanges(options = {}) {
+async function refreshFromDatabaseChanges() {
   let snapshot = null;
   try {
     snapshot = await fetchFreshnessSnapshot();
@@ -2360,10 +2479,6 @@ async function refreshFromDatabaseChanges(options = {}) {
 
   if (!latestFreshnessSnapshot) {
     latestFreshnessSnapshot = snapshot;
-    if (options.force) {
-      await refreshCurrentGroupPanel({ force: true, showStatus: false });
-      await refreshGroupList();
-    }
     return;
   }
 
@@ -2374,14 +2489,22 @@ async function refreshFromDatabaseChanges(options = {}) {
   const selectedHasNewerMessage = hasNewerSelectedMessage(snapshot, latestFreshnessSnapshot);
   latestFreshnessSnapshot = snapshot;
 
-  if (globalChanged || options.force) {
+  if (globalChanged) {
     await refreshGroupList();
   }
-  if (selectedChanged || options.force) {
-    await refreshCurrentGroupPanel({
-      force: true,
-      deferIfMessageListAwayFromTop: selectedHasNewerMessage,
-    });
+  if (selectedChanged) {
+    const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView;
+    if (activeView === 'messages') {
+      await refreshCurrentGroupPanel({
+        force: true,
+        deferIfMessageListAwayFromTop: selectedHasNewerMessage,
+      });
+      markWorkbenchLoaded('messages');
+      markWorkbenchLoaded('strategies');
+    } else if (activeView === 'strategies') {
+      await refreshStrategyMidPanel();
+      markWorkbenchLoaded('strategies');
+    }
   }
 }
 
@@ -2408,7 +2531,15 @@ function connectLiveUpdates() {
       if (Number(payload.chat_id || 0) !== currentChatId) {
         return;
       }
-      await refreshCurrentGroupPanel({ deferIfMessageListAwayFromTop: true });
+      const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView;
+      if (activeView === 'messages') {
+        await refreshCurrentGroupPanel({ deferIfMessageListAwayFromTop: true });
+        markWorkbenchLoaded('messages');
+        markWorkbenchLoaded('strategies');
+      } else if (activeView === 'strategies') {
+        await refreshStrategyMidPanel();
+        markWorkbenchLoaded('strategies');
+      }
     });
     let sseWasDisconnected = false;
     source.onerror = () => {
@@ -2438,6 +2569,21 @@ function startPollingUpdates() {
     await refreshMonitorStatus();
     await refreshFromDatabaseChanges();
   }, 5000);
+}
+
+function scheduleRecoveryRefresh() {
+  if (recoveryRefreshPromise) return recoveryRefreshPromise;
+  recoveryRefreshPromise = (async () => {
+    await refreshMonitorStatus();
+    await refreshFromDatabaseChanges();
+    const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView;
+    if (activeView === 'home' || activeView === 'positions') {
+      await ensureWorkbenchViewLoaded(activeView, { force: true });
+    }
+  })().finally(() => {
+    recoveryRefreshPromise = null;
+  });
+  return recoveryRefreshPromise;
 }
 
 function requestLiveActionConfirmation(button) {
@@ -2765,18 +2911,16 @@ window.addEventListener('DOMContentLoaded', () => {
   resetInitialMessagePanelScroll();
   connectLiveUpdates();
   refreshMonitorStatus();
-  refreshFromDatabaseChanges({ force: true });
+  refreshFromDatabaseChanges();
   startPollingUpdates();
 
   // ── Refresh immediately when the tab gains focus (catch up) ──────
   window.addEventListener('focus', () => {
-    refreshMonitorStatus();
-    refreshFromDatabaseChanges({ force: true });
+    scheduleRecoveryRefresh();
   });
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
-      refreshMonitorStatus();
-      refreshFromDatabaseChanges({ force: true });
+      scheduleRecoveryRefresh();
     }
   });
 });

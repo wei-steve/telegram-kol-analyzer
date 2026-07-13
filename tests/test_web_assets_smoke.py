@@ -255,8 +255,39 @@ def test_group_switch_prioritizes_active_destination_without_waiting_for_both_pa
 
     assert "activeWorkbenchView" in js
     assert "loadVisibleGroupDestination" in js
-    assert "loadBackgroundGroupDestination" in js
+    assert "loadBackgroundGroupDestination" not in js
     assert "Promise.all([" not in js
+
+
+def test_app_js_lazy_loads_workbench_destinations_without_forced_startup_refresh(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+
+    assert "workbenchLoadState" in js
+    assert "ensureWorkbenchViewLoaded" in js
+    assert "loadHomeDashboard" in js
+    assert "loadPositionsPanel" in js
+    assert "bindHomeEventNavigation" in js
+    assert "bindHomeEventNavigation();" in js
+    assert "[data-home-dashboard] [data-workbench-view]" in js
+    assert js.count("bindWorkflowFilters();") >= 5
+    assert "workflowFilterBound" in js
+    assert "refreshFromDatabaseChanges({ force: true });" not in js
+    assert "scheduleRecoveryRefresh" in js
+
+
+def test_app_js_restores_persisted_group_as_state_without_clicking_it(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+
+    persisted_block_start = js.index("if (persisted && root.querySelector")
+    persisted_block_end = js.index("\n  }", persisted_block_start)
+    persisted_block = js[persisted_block_start:persisted_block_end]
+
+    assert "syncSelectedGroupState(persisted" in persisted_block
+    assert ".click()" not in persisted_block
+    assert "initialSelectedChatId" in js
+    assert "syncSelectedGroupState(initialSelectedChatId);" in js
 
 
 def test_app_js_binds_mobile_work_navigation_to_existing_dashboard_views(tmp_path):

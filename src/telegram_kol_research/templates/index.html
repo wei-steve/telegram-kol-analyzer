@@ -55,7 +55,9 @@
   {% include "_workbench_nav.html" %}
 
   <section class="workbench-panel is-active" data-workbench-panel="home">
-    {% include "_home_dashboard.html" %}
+    <div data-lazy-workbench="home" aria-busy="true">
+      {% with loading_text='正在加载首页实时数据…' %}{% include "_workbench_loading.html" %}{% endwith %}
+    </div>
   </section>
 
   <section class="dashboard-tab-panel" data-dashboard-panel="prompt">
@@ -358,15 +360,9 @@
   </section>
 
   <section class="dashboard-tab-panel workbench-panel" data-dashboard-panel="exchange-positions" data-workbench-panel="positions">
-    {% with
-      strategy_kpi=strategy_kpi,
-      exchange_snapshot=exchange_snapshot,
-      holding_positions=holding_positions,
-      pending_entry_signals=pending_entry_signals,
-      exited_positions=exited_positions
-    %}
-      {% include "_exchange_positions_panel.html" %}
-    {% endwith %}
+    <div data-lazy-workbench="positions" aria-busy="false">
+      {% with loading_text='打开持仓后加载 Deepcoin 实时数据' %}{% include "_workbench_loading.html" %}{% endwith %}
+    </div>
   </section>
 
   <section class="dashboard-tab-panel workbench-panel" data-dashboard-panel="main" data-workbench-panel="strategies">
@@ -382,31 +378,12 @@
         {% endwith %}
       </aside>
 
-      <section class="trader-strategy-panel" data-strategy-panel data-mobile-work-region="strategies">
-        {% with
-          filter='holding',
-          selected_chat_id=selected_chat_id,
-          strategy_kpi=strategy_kpi,
-          holding_positions=holding_positions,
-          pending_entry_signals=pending_entry_signals,
-          exited_positions=exited_positions
-        %}
-          {% include "_strategy_mid_panel.html" %}
-        {% endwith %}
+      <section class="trader-strategy-panel" data-strategy-panel data-mobile-work-region="strategies" data-lazy-workbench="strategies" aria-busy="false">
+        {% with loading_text='打开策略后加载当前群组数据' %}{% include "_workbench_loading.html" %}{% endwith %}
       </section>
 
-      <section class="trader-detail-panel" data-detail-panel data-mobile-work-region="messages">
-        {% with
-          selected_group=selected_group,
-          selected_chat_id=selected_chat_id,
-          messages=messages,
-          monitor_status=monitor_status,
-          live_listener_enabled=live_listener_enabled,
-          database_latest_message_at=database_latest_message_at,
-          database_stale_hours=database_stale_hours
-        %}
-          {% include "_strategy_detail.html" %}
-        {% endwith %}
+      <section class="trader-detail-panel" data-detail-panel data-mobile-work-region="messages" data-lazy-workbench="messages" aria-busy="false">
+        {% with loading_text='打开消息后加载当前群组记录' %}{% include "_workbench_loading.html" %}{% endwith %}
       </section>
     </div>
   </section>

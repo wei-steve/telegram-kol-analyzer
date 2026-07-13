@@ -1,5 +1,6 @@
 ﻿import re
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -35,7 +36,7 @@ def test_logs_page_has_safe_paginated_viewer_controls(tmp_path):
 def test_index_page_renders_explicit_operational_states(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
-    response = client.get("/")
+    response = client.get("/home-dashboard")
 
     assert response.status_code == 200
     assert 'data-service-health="telegram"' in response.text
@@ -43,6 +44,95 @@ def test_index_page_renders_explicit_operational_states(tmp_path):
     assert 'data-service-health="deepcoin"' in response.text
     assert "data-home-event-empty" in response.text
     assert "data-last-success-at" in response.text
+
+
+def test_index_page_is_a_lightweight_shell_without_deepcoin_or_message_timeline(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=77,
+                message_id=1,
+                posted_at=datetime(2026, 7, 13, tzinfo=UTC),
+                text="must be deferred until messages view opens",
+            )
+        )
+        session.commit()
+
+    deepcoin_factory_calls = []
+
+    def tracking_deepcoin_factory():
+        deepcoin_factory_calls.append(True)
+        raise AssertionError("root page must not construct a Deepcoin client")
+
+    client = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=tracking_deepcoin_factory,
+        )
+    )
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert deepcoin_factory_calls == []
+    assert 'data-lazy-workbench="home"' in response.text
+    assert 'data-lazy-workbench="positions"' in response.text
+    assert 'data-lazy-workbench="strategies"' in response.text
+    assert 'data-lazy-workbench="messages"' in response.text
+    assert "must be deferred until messages view opens" not in response.text
+    assert "data-message-card" not in response.text
+    assert "data-exchange-position-tabs" not in response.text
+
+
+def test_deferred_home_and_positions_partials_render_independently(tmp_path):
+    class EmptyDeepcoinClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self):
+            return []
+
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=EmptyDeepcoinClient,
+        )
+    )
+
+    home = client.get("/home-dashboard")
+    positions = client.get("/positions-panel")
+
+    assert home.status_code == 200
+    assert "data-home-dashboard" in home.text
+    assert "data-home-risk-summary" in home.text
+    assert positions.status_code == 200
+    assert "data-exchange-position-tabs" in positions.text
+    assert 'data-exchange-position-tab="positions"' in positions.text
+
+
+def test_deferred_home_marks_deepcoin_error_without_blocking_the_shell(tmp_path):
+    class BrokenDeepcoinClient:
+        def list_positions(self):
+            raise RuntimeError("exchange unavailable")
+
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=BrokenDeepcoinClient,
+        )
+    )
+
+    root = client.get("/")
+    home = client.get("/home-dashboard")
+
+    assert root.status_code == 200
+    assert home.status_code == 200
+    assert "Deepcoin · error" in home.text
 
 
 def test_shared_group_context_renders_all_groups(tmp_path):
@@ -102,7 +192,19 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
             now_provider=lambda: datetime(2026, 4, 21, tzinfo=UTC),
         )
     )
-    response = client.get("/")
+    root_response = client.get("/")
+    response = SimpleNamespace(
+        status_code=root_response.status_code,
+        text="\n".join(
+            [
+                root_response.text,
+                client.get("/home-dashboard").text,
+                client.get("/positions-panel").text,
+                client.get("/groups/77/strategy-mid-panel?filter=holding").text,
+                client.get("/groups/77/detail").text,
+            ]
+        ),
+    )
 
     assert response.status_code == 200
     assert "data-trader-dashboard" in response.text
@@ -305,7 +407,7 @@ def test_bound_position_close_is_not_rendered_for_unbound_exchange_position(tmp_
             deepcoin_client_factory=lambda: FakeDeepcoinClient(),
         )
     )
-    response = client.get("/")
+    response = client.get("/positions-panel")
 
     assert response.status_code == 200
     assert "持仓(1)" in response.text
@@ -414,7 +516,7 @@ def test_bound_position_close_renders_exact_context_for_bound_exchange_position(
             deepcoin_client_factory=lambda: FakeDeepcoinClient(),
         )
     )
-    response = client.get("/")
+    response = client.get("/positions-panel")
 
     assert response.status_code == 200
     assert 'data-exchange-view-mode="list"' in response.text
@@ -516,7 +618,7 @@ def test_exchange_current_order_candidate_attribution(tmp_path):
             deepcoin_client_factory=lambda: FakeDeepcoinClient(),
         )
     )
-    response = client.get("/")
+    response = client.get("/positions-panel")
 
     assert response.status_code == 200
     assert "可能归属" in response.text
@@ -603,7 +705,7 @@ def test_exchange_current_order_uses_execution_binding_attribution(tmp_path):
             deepcoin_client_factory=lambda: FakeDeepcoinClient(),
         )
     )
-    response = client.get("/")
+    response = client.get("/positions-panel")
 
     assert response.status_code == 200
     assert "order bound-open-order-1" in response.text
@@ -725,7 +827,7 @@ def test_exchange_unmatched_order_stays_unassigned(tmp_path):
             deepcoin_client_factory=lambda: FakeDeepcoinClient(),
         )
     )
-    response = client.get("/")
+    response = client.get("/positions-panel")
 
     assert response.status_code == 200
     assert "未归属" in response.text
@@ -878,8 +980,10 @@ def test_index_page_shows_recovery_decisions_for_manual_review(tmp_path):
 
     assert response.status_code == 200
     assert "data-trader-dashboard" in response.text
-    assert 'data-strategy-filter="holding"' in response.text
-    assert 'data-strategy-filter="pending"' in response.text
+    strategy_response = client.get("/groups/100/strategy-mid-panel?filter=holding")
+    assert strategy_response.status_code == 200
+    assert 'data-strategy-filter="holding"' in strategy_response.text
+    assert 'data-strategy-filter="pending"' in strategy_response.text
 
     # Recovery detail renders in the detail panel per-group
     detail_response = client.get("/groups/100/detail")
@@ -932,7 +1036,9 @@ def test_index_page_shows_recovery_execution_preview_queue(tmp_path):
     response = client.get("/")
 
     assert response.status_code == 200
-    assert 'data-strategy-filter="pending"' in response.text
+    strategy_response = client.get("/groups/100/strategy-mid-panel?filter=pending")
+    assert strategy_response.status_code == 200
+    assert 'data-strategy-filter="pending"' in strategy_response.text
 
     # Execution preview renders in the pending tab (lazy-loaded)
     queue_response = client.get("/api/recovery-execution-queue")

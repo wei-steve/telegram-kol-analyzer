@@ -336,12 +336,15 @@ def _load_deepcoin_live_position_rows(
     *,
     deepcoin_client_factory,
     group_label_by_chat_id: dict[int, str],
+    error_state: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     try:
         deepcoin_client = deepcoin_client_factory()
         positions = deepcoin_client.list_positions()
-    except Exception:
+    except Exception as exc:
         logger.exception("Deepcoin live position load failed")
+        if error_state is not None:
+            error_state["error"] = str(exc)
         return []
 
     active_positions = [
@@ -1945,38 +1948,7 @@ def create_web_app(
             level=normalized_level,
         )
 
-    @app.get("/")
-    def index(request: Request):
-        groups = load_group_rows(
-            app.state.session_factory,
-            group_labels_by_title=app.state.group_labels_by_title,
-            configured_groups=app.state.group_config.groups,
-        )
-        selected_chat_id = groups[0]["chat_id"] if groups else None
-        selected_group = next(
-            (group for group in groups if group["chat_id"] == selected_chat_id),
-            None,
-        )
-        messages = (
-            load_group_messages(
-                app.state.session_factory, chat_id=int(selected_chat_id), limit=50
-            )
-            if selected_chat_id is not None
-            else []
-        )
-        freshness = load_database_freshness(
-            app.state.session_factory,
-            now=app.state.now_provider(),
-        )
-        recovery_decisions = list_recovery_decisions(
-            app.state.session_factory,
-            limit=20,
-        )
-        active_positions = list_active_positions(
-            app.state.session_factory,
-            chat_id=None,
-            limit=200,
-        )
+    def build_home_dashboard_context() -> dict[str, Any]:
         symbol_whitelist_by_chat_id = _symbol_whitelist_by_chat_id(app.state.group_config)
         pending_entry_signals = list_pending_strategies(
             app.state.session_factory,
@@ -1984,68 +1956,32 @@ def create_web_app(
             limit=200,
             symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
         )
-        # ── lifecycle data ──
-        lifecycle_counts_by_chat_id = load_lifecycle_counts_by_chat_id(
-            app.state.session_factory,
-            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
-        )
-        lifecycle_counts = load_lifecycle_counts(
-            app.state.session_factory,
-            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
-        )
         holding_positions = list_holding_strategies(
             app.state.session_factory,
             chat_id=None,
             limit=200,
         )
-        exited_positions = list_exited_strategies(
-            app.state.session_factory,
-            chat_id=selected_chat_id,
-            limit=50,
-        )
-        monitor_status = build_monitor_status()
-        live_listener_enabled = monitor_status["state"] == "monitoring"
-        refresh_mode_label = (
-            "实时监听 + SSE"
-            if live_listener_enabled
-            else "仅本地快照"
-        )
-        trader_dashboard = _build_trader_dashboard_state(
-            groups=groups,
-            group_config=app.state.group_config,
-            active_positions=active_positions,
-            pending_entry_signals=pending_entry_signals,
-            holding_positions=holding_positions,
-            exited_positions=exited_positions,
-            lifecycle_counts=lifecycle_counts,
-            lifecycle_counts_by_chat_id=lifecycle_counts_by_chat_id,
-            live_listener_enabled=live_listener_enabled,
-            refresh_mode_label=refresh_mode_label,
-        )
-        strategy_kpi = _build_strategy_kpi_counts(
-            selected_chat_id=selected_chat_id,
-            holding_positions=holding_positions,
-            pending_entry_signals=pending_entry_signals,
-            exited_positions=exited_positions,
-        )
-        trading_settings = load_trading_settings(app.state.session_factory)
         group_label_by_chat_id = _group_label_by_chat_id(app.state.group_config)
-        exchange_snapshot = _load_exchange_position_snapshot(
+        exchange_error: dict[str, str] = {}
+        exchange_positions = _load_deepcoin_live_position_rows(
             app.state.session_factory,
             deepcoin_client_factory=app.state.deepcoin_client_factory,
             group_label_by_chat_id=group_label_by_chat_id,
-            pending_entry_signals=pending_entry_signals,
-            trading_settings=trading_settings,
+            error_state=exchange_error,
         )
-        exchange_snapshot["position_history"] = exited_positions
         exchange_snapshot = _annotate_exchange_snapshot_attribution(
-            exchange_snapshot,
+            {
+                "positions": exchange_positions,
+                "open_orders": [],
+                "order_history": [],
+                "position_history": [],
+                "error": None,
+            },
             holding_positions=holding_positions,
             pending_entry_signals=pending_entry_signals,
-            exited_positions=exited_positions,
+            exited_positions=[],
             group_label_by_chat_id=group_label_by_chat_id,
         )
-        home_events = load_home_event_rows(app.state.session_factory, limit=50)
         exchange_positions = exchange_snapshot.get("positions") or []
         missing_stop_positions = [
             row for row in holding_positions
@@ -2055,7 +1991,7 @@ def create_web_app(
             row for row in exchange_positions
             if (row.get("attribution") or {}).get("state") in {"unassigned", "candidate"}
         ]
-        risk_rows = []
+        risk_rows: list[dict[str, Any]] = []
         for row in missing_stop_positions:
             risk_rows.append({
                 "id": f"risk:missing-stop:{row.get('id') or row.get('message_id')}",
@@ -2083,7 +2019,7 @@ def create_web_app(
                 "destination": {"view": "positions", "pos_id": row.get("pos_id")},
             })
         home_events = sorted(
-            [*risk_rows, *home_events],
+            [*risk_rows, *load_home_event_rows(app.state.session_factory, limit=50)],
             key=lambda row: (
                 row["occurred_at"].astimezone(UTC).replace(tzinfo=None)
                 if row["occurred_at"].tzinfo is not None
@@ -2091,18 +2027,140 @@ def create_web_app(
             ),
             reverse=True,
         )[:50]
-        home_summary = {
-            "position_count": len(exchange_positions),
-            "unrealized_pnl": sum(
-                float(row.get("unrealized_pnl") or row.get("upl") or 0)
-                for row in exchange_positions
-            ),
-            "risk_count": len(missing_stop_positions) + len(unassigned_positions),
-            "pending_count": strategy_kpi["pending_count"],
-            "telegram_state": monitor_status["state"],
-            "database_state": "stale" if freshness["stale_hours"] is not None and freshness["stale_hours"] > 1 else "current",
-            "exchange_state": "error" if exchange_snapshot.get("error") else "current",
+        monitor_status = build_monitor_status()
+        freshness = load_database_freshness(
+            app.state.session_factory,
+            now=app.state.now_provider(),
+        )
+        return {
+            "home_events": home_events,
+            "home_summary": {
+                "position_count": len(exchange_positions),
+                "unrealized_pnl": sum(
+                    float(row.get("unrealized_pnl") or row.get("upl") or 0)
+                    for row in exchange_positions
+                ),
+                "risk_count": len(missing_stop_positions) + len(unassigned_positions),
+                "pending_count": len(pending_entry_signals),
+                "telegram_state": monitor_status["state"],
+                "database_state": (
+                    "stale"
+                    if freshness["stale_hours"] is not None and freshness["stale_hours"] > 1
+                    else "current"
+                ),
+                "exchange_state": "error" if exchange_error else "current",
+            },
+            "database_latest_message_at": freshness["latest_message_at"],
         }
+
+    def build_positions_panel_context() -> dict[str, Any]:
+        symbol_whitelist_by_chat_id = _symbol_whitelist_by_chat_id(app.state.group_config)
+        pending_entry_signals = list_pending_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=200,
+            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
+        )
+        holding_positions = list_holding_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=200,
+        )
+        exited_positions = list_exited_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=50,
+        )
+        group_label_by_chat_id = _group_label_by_chat_id(app.state.group_config)
+        exchange_snapshot = _load_exchange_position_snapshot(
+            app.state.session_factory,
+            deepcoin_client_factory=app.state.deepcoin_client_factory,
+            group_label_by_chat_id=group_label_by_chat_id,
+            pending_entry_signals=pending_entry_signals,
+            trading_settings=load_trading_settings(app.state.session_factory),
+        )
+        exchange_snapshot["position_history"] = exited_positions
+        exchange_snapshot = _annotate_exchange_snapshot_attribution(
+            exchange_snapshot,
+            holding_positions=holding_positions,
+            pending_entry_signals=pending_entry_signals,
+            exited_positions=exited_positions,
+            group_label_by_chat_id=group_label_by_chat_id,
+        )
+        return {
+            "exchange_snapshot": exchange_snapshot,
+            "holding_positions": holding_positions,
+            "pending_entry_signals": pending_entry_signals,
+            "exited_positions": exited_positions,
+        }
+
+    @app.get("/home-dashboard")
+    def home_dashboard_partial(request: Request):
+        return templates.TemplateResponse(
+            request,
+            "_home_dashboard.html",
+            build_home_dashboard_context(),
+        )
+
+    @app.get("/positions-panel")
+    def positions_panel_partial(request: Request):
+        return templates.TemplateResponse(
+            request,
+            "_exchange_positions_panel.html",
+            build_positions_panel_context(),
+        )
+
+    @app.get("/")
+    def index(request: Request):
+        groups = load_group_rows(
+            app.state.session_factory,
+            group_labels_by_title=app.state.group_labels_by_title,
+            configured_groups=app.state.group_config.groups,
+        )
+        selected_chat_id = groups[0]["chat_id"] if groups else None
+        selected_group = next(
+            (group for group in groups if group["chat_id"] == selected_chat_id),
+            None,
+        )
+        freshness = load_database_freshness(
+            app.state.session_factory,
+            now=app.state.now_provider(),
+        )
+        symbol_whitelist_by_chat_id = _symbol_whitelist_by_chat_id(app.state.group_config)
+        pending_entry_signals = list_pending_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=200,
+            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
+        )
+        # ── lifecycle data ──
+        lifecycle_counts_by_chat_id = load_lifecycle_counts_by_chat_id(
+            app.state.session_factory,
+            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
+        )
+        holding_positions = list_holding_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=200,
+        )
+        monitor_status = build_monitor_status()
+        live_listener_enabled = monitor_status["state"] == "monitoring"
+        refresh_mode_label = (
+            "实时监听 + SSE"
+            if live_listener_enabled
+            else "仅本地快照"
+        )
+        trader_dashboard = _build_trader_dashboard_state(
+            groups=groups,
+            group_config=app.state.group_config,
+            active_positions=[],
+            pending_entry_signals=pending_entry_signals,
+            holding_positions=holding_positions,
+            lifecycle_counts_by_chat_id=lifecycle_counts_by_chat_id,
+            live_listener_enabled=live_listener_enabled,
+            refresh_mode_label=refresh_mode_label,
+        )
+        trading_settings = load_trading_settings(app.state.session_factory)
         ai_recognition_config = load_ai_recognition_config(
             app.state.ai_recognition_config_path
         )
@@ -2111,7 +2169,6 @@ def create_web_app(
             "index.html",
             {
                 "groups": groups,
-                "messages": messages,
                 "selected_chat_id": selected_chat_id,
                 "selected_group": selected_group,
                 "live_listener_enabled": live_listener_enabled,
@@ -2123,16 +2180,8 @@ def create_web_app(
                 "database_latest_message_at": freshness["latest_message_at"],
                 "database_stale_hours": freshness["stale_hours"],
                 "asset_version": app.state.asset_version,
-                "active_positions": active_positions,
-                "pending_entry_signals": pending_entry_signals,
-                "holding_positions": holding_positions,
-                "exited_positions": exited_positions,
                 "refresh_mode_label": refresh_mode_label,
                 "trader_dashboard": trader_dashboard,
-                "strategy_kpi": strategy_kpi,
-                "exchange_snapshot": exchange_snapshot,
-                "home_events": home_events,
-                "home_summary": home_summary,
                 "ai_recognition_config": ai_recognition_config,
                 "ai_prompt_views": build_ai_prompt_views(ai_recognition_config),
                 "recognition_profiles": list_recognition_profiles(),

@@ -41,9 +41,13 @@ Low-risk actions such as refresh, filtering, navigation, and opening details can
 
 `策略` and `消息` share one persisted current-group context. Their canonical selector is the sticky context bar above the shared workbench. Mobile opens a searchable bottom sheet; desktop opens the same picker as a compact overlay. `首页`, `持仓`, and `更多` remain global and must not be implicitly filtered by this selected group.
 
+The workbench shell uses destination-level lazy loading. `GET /` must not call Deepcoin or embed the selected group's message timeline, strategy cards, or exchange-position panel. The home dashboard loads asynchronously after first paint; `持仓`, `策略`, and `消息` load when first opened. Restoring a persisted group changes selection state only and must not simulate a group click while the user is still on `首页`. Focus/visibility recovery requests are coalesced to avoid duplicate refresh bursts.
+
 Design and implementation references:
 
 - `docs/plans/2026-07-12-mobile-first-web-workbench-design.md`
 - `docs/plans/2026-07-12-mobile-first-web-workbench.md`
 - `docs/plans/2026-07-12-shared-group-context-design.md`
 - `docs/plans/2026-07-12-shared-group-context.md`
+- `docs/plans/2026-07-13-lazy-workbench-loading-design.md`
+- `docs/plans/2026-07-13-lazy-workbench-loading.md`
