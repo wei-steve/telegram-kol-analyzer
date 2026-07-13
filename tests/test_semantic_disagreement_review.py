@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime
 from decimal import Decimal
+import json
 
 import pytest
 
@@ -9,8 +11,17 @@ from telegram_kol_research.semantic_disagreement_review import (
     decide_semantic_severity,
     normalize_mimo_action,
     normalize_price,
+    run_deepseek_semantic_review,
     validate_review_payload,
 )
+from telegram_kol_research.ai_recognition_config import AiProviderConfig, AiRecognitionConfig
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.models import AiPromptInvocation, RawMessage, RecognitionDecision, StrategyLifecycle
+from telegram_kol_research.prompt_defaults import (
+    SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
+    seed_default_prompt_registry,
+)
+from telegram_kol_research.prompt_registry import resolve_active_prompt
 
 
 def mimo_payload(
@@ -97,6 +108,171 @@ def decide(mimo: dict[str, object], review: dict[str, object], **kwargs):
         ),
         **kwargs,
     )
+
+
+def test_review_request_is_grounded_safe_strict_and_audited(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    config = AiRecognitionConfig(
+        text_provider=AiProviderConfig(
+            base_url="https://api.deepseek.example/v1",
+            api_key="SUPER-SECRET-KEY",
+            model="deepseek-review",
+            timeout_seconds=7,
+        )
+    )
+    seed_default_prompt_registry(session_factory, config)
+    active_prompt = resolve_active_prompt(
+        session_factory, SEMANTIC_DISAGREEMENT_REVIEW_PROMPT
+    )
+    authoritative = mimo_payload(
+        event_type="exit_position",
+        target_lifecycle_id=41,
+        symbol="BTC",
+        side="short",
+    )
+    authoritative["input_reading"] = {
+        "observed_text": "62800附近全部出局",
+        "image_quality": "none",
+    }
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=991,
+            message_id=778,
+            sender_id=51,
+            sender_name="峰哥",
+            text="现价62800附近全部出局，空仓等待。",
+        )
+        session.add(raw)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=991,
+            message_id=700,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 13, 10, 0),
+            entry_range_low=63100,
+            entry_range_high=63300,
+            stop_loss=64000,
+            take_profit="62000/61000",
+            management_action="exit_requested",
+            management_note="safe note",
+        )
+        session.add(lifecycle)
+        session.flush()
+        lifecycle_id = lifecycle.id
+        authoritative["lifecycle_event"]["target_lifecycle_id"] = lifecycle_id
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json=json.dumps(authoritative, ensure_ascii=False),
+                agreement_status="pending",
+                differences_json="[]",
+                prompt_versions_json=json.dumps({"mimo": {"trading.analysis.shared": 5}}),
+                comparison_status="running",
+                automation_status="submitted",
+                automation_reason="close_position pos_id redacted",
+            )
+        )
+        session.commit()
+        raw_message_id = raw.id
+
+    captured = {}
+
+    def requester(**kwargs):
+        captured.update(kwargs)
+        return {
+            "choices": [
+                {"message": {"content": json.dumps(review_payload(
+                    action_type="exit_full",
+                    target_lifecycle_id=lifecycle_id,
+                    symbol="BTC",
+                    side="short",
+                    evidence=["全部出局"],
+                ), ensure_ascii=False)}}
+            ]
+        }
+
+    result = run_deepseek_semantic_review(
+        session_factory,
+        raw_message_id=raw_message_id,
+        config=config,
+        requester=requester,
+    )
+
+    assert captured["url"] == "https://api.deepseek.example/v1/chat/completions"
+    assert captured["timeout"] == 7
+    request_json = json.dumps(captured["json"], ensure_ascii=False, sort_keys=True)
+    request_context = json.loads(captured["json"]["messages"][1]["content"])
+    assert "现价62800附近全部出局，空仓等待。" in request_json
+    assert request_context["source"]["chat_id"] == 991
+    assert request_context["source"]["message_id"] == 778
+    assert request_context["source"]["sender_name"] == "峰哥"
+    assert request_context["active_strategies"][0]["lifecycle_status"] == "entered"
+    assert request_context["mimo"]["authoritative_payload"] == authoritative
+    assert request_context["mimo"]["input_reading"] == authoritative["input_reading"]
+    assert request_context["automation"]["automation_status"] == "submitted"
+    assert str(active_prompt.version_id) in request_json
+    assert "SUPER-SECRET-KEY" not in request_json
+    assert "Authorization" not in request_json
+    assert result.prompt_versions == {
+        SEMANTIC_DISAGREEMENT_REVIEW_PROMPT: active_prompt.version_id
+    }
+    assert result.decision.severity == "none"
+
+    with session_factory() as session:
+        audit = session.query(AiPromptInvocation).one()
+        assert audit.feature == "semantic_disagreement_review"
+        assert audit.raw_message_id == raw_message_id
+        assert audit.status == "completed"
+        assert json.loads(audit.prompt_versions_json) == result.prompt_versions
+
+
+def test_review_rejects_non_strict_json_and_audits_failure(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    config = AiRecognitionConfig(
+        text_provider=AiProviderConfig(
+            base_url="https://api.deepseek.example",
+            model="deepseek-review",
+        )
+    )
+    seed_default_prompt_registry(session_factory, config)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=2, text="BTC short")
+        session.add(raw)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw.id,
+                input_kind="text",
+                authoritative_model="mimo",
+                authoritative_status="非策略",
+                authoritative_payload_json=json.dumps(mimo_payload()),
+                agreement_status="pending",
+                differences_json="[]",
+                comparison_status="running",
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+
+    with pytest.raises(ValueError, match="closed contract"):
+        run_deepseek_semantic_review(
+            session_factory,
+            raw_message_id=raw_id,
+            config=config,
+            requester=lambda **_: {
+                "choices": [{"message": {"content": '{"unexpected": true}'}}]
+            },
+        )
+
+    with session_factory() as session:
+        audit = session.query(AiPromptInvocation).one()
+        assert audit.status == "failed"
+        assert "closed contract" in audit.error_message
 
 
 def test_equivalent_numeric_formats_are_none():

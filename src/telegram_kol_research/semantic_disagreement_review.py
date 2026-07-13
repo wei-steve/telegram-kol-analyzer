@@ -7,10 +7,53 @@ work.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+import hashlib
+import inspect
+import json
+import logging
+from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Callable
+
+import httpx
+from sqlalchemy.orm import sessionmaker
+
+from telegram_kol_research.ai_recognition_config import (
+    AiRecognitionConfig,
+    load_ai_recognition_config,
+)
+from telegram_kol_research.models import (
+    RawMessage,
+    RecognitionDecision,
+    StrategyLifecycle,
+    utc_now,
+)
+from telegram_kol_research.prompt_defaults import (
+    SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
+    seed_default_prompt_registry,
+)
+from telegram_kol_research.prompt_registry import (
+    PromptInvocationRecord,
+    record_prompt_invocation,
+    resolve_active_prompt,
+)
+from telegram_kol_research.recognition_decisions import (
+    claim_critical_notification,
+    claim_next_semantic_review,
+    complete_semantic_review,
+    fail_semantic_review,
+)
+from telegram_kol_research.recognition_experiments import (
+    _extract_chat_content,
+    _parse_json_object,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 ACTION_TYPES = frozenset(
@@ -97,6 +140,335 @@ class SemanticReviewDecision:
     conflict_types: tuple[str, ...]
     differences: tuple[str, ...]
     reason: str
+
+
+@dataclass(frozen=True)
+class SemanticReviewRun:
+    raw_message_id: int
+    model: str
+    review_payload: dict[str, Any]
+    auxiliary_payload: dict[str, Any]
+    decision: SemanticReviewDecision
+    prompt_versions: dict[str, int]
+
+
+def _chat_completions_url(base_url: str) -> str:
+    normalized = base_url.strip().rstrip("/")
+    if normalized.endswith("/v1"):
+        return f"{normalized}/chat/completions"
+    return f"{normalized}/v1/chat/completions"
+
+
+def _request_openai_compatible(
+    *,
+    url: str,
+    json: dict[str, Any],
+    headers: dict[str, str],
+    timeout: float,
+) -> dict[str, Any]:
+    with httpx.Client(timeout=timeout) as client:
+        response = client.post(url, json=json, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+
+def _safe_active_strategy_context(session, *, chat_id: int) -> list[dict[str, Any]]:
+    rows = (
+        session.query(StrategyLifecycle)
+        .filter(
+            StrategyLifecycle.chat_id == chat_id,
+            StrategyLifecycle.lifecycle_status.in_(("pending_entry", "entered")),
+        )
+        .order_by(StrategyLifecycle.id.asc())
+        .all()
+    )
+    return [
+        {
+            "lifecycle_id": row.id,
+            "source_message_id": row.message_id,
+            "symbol": row.symbol,
+            "side": row.side,
+            "lifecycle_status": row.lifecycle_status,
+            "entry_range_low": row.entry_range_low,
+            "entry_range_high": row.entry_range_high,
+            "stop_loss": row.stop_loss,
+            "take_profit": row.take_profit,
+            "entry_price_actual": row.entry_price_actual,
+            "management_action": row.management_action,
+        }
+        for row in rows
+    ]
+
+
+def run_deepseek_semantic_review(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    config: AiRecognitionConfig,
+    requester: Callable[..., dict[str, Any]] | None = None,
+) -> SemanticReviewRun:
+    """Independently review a persisted MiMo decision without mutating automation."""
+
+    seed_default_prompt_registry(session_factory, config)
+    prompt = resolve_active_prompt(
+        session_factory, SEMANTIC_DISAGREEMENT_REVIEW_PROMPT
+    )
+    provider = config.text_provider
+    if not provider.is_configured:
+        raise RuntimeError("DeepSeek semantic-review provider is not configured")
+
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, raw_message_id)
+        decision_row = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == raw_message_id)
+            .one_or_none()
+        )
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        if decision_row is None:
+            raise LookupError("recognition decision not found")
+        authoritative_payload = json.loads(decision_row.authoritative_payload_json)
+        context = {
+            "source": {
+                "raw_message_id": raw_message.id,
+                "chat_id": raw_message.chat_id,
+                "message_id": raw_message.message_id,
+                "sender_id": raw_message.sender_id,
+                "sender_name": raw_message.sender_name,
+                "posted_at": str(raw_message.posted_at) if raw_message.posted_at else None,
+                "text": raw_message.text or "",
+            },
+            "active_strategies": _safe_active_strategy_context(
+                session, chat_id=raw_message.chat_id
+            ),
+            "mimo": {
+                "model": decision_row.authoritative_model,
+                "status": decision_row.authoritative_status,
+                "authoritative_payload": authoritative_payload,
+                "input_reading": authoritative_payload.get("input_reading"),
+            },
+            "automation": {
+                "automation_status": decision_row.automation_status,
+                "automation_reason": decision_row.automation_reason,
+            },
+            "semantic_review_prompt": {
+                "key": prompt.prompt_key,
+                "version_id": prompt.version_id,
+                "version_number": prompt.version_number,
+            },
+        }
+        chat_id = raw_message.chat_id
+        current_message_text = raw_message.text or ""
+        input_kind = decision_row.input_kind
+
+    request_payload = {
+        "model": provider.model,
+        "messages": [
+            {"role": "system", "content": prompt.content},
+            {
+                "role": "user",
+                "content": json.dumps(context, ensure_ascii=False, sort_keys=True),
+            },
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Content-Type": "application/json"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    invoke = requester or _request_openai_compatible
+    prompt_versions = {prompt.prompt_key: prompt.version_id}
+    error_message: str | None = None
+    try:
+        response = invoke(
+            url=_chat_completions_url(provider.base_url),
+            json=request_payload,
+            headers=headers,
+            timeout=provider.timeout_seconds,
+        )
+        review_payload = _parse_json_object(_extract_chat_content(response))
+        validate_review_payload(review_payload)
+        automation = {
+            "status": context["automation"]["automation_status"],
+            "reason": context["automation"]["automation_reason"],
+        }
+        semantic_decision = decide_semantic_severity(
+            mimo_payload=authoritative_payload,
+            review_payload=review_payload,
+            automation=automation,
+            input_kind=input_kind,
+            current_message_text=current_message_text,
+        )
+        return SemanticReviewRun(
+            raw_message_id=raw_message_id,
+            model=provider.model,
+            review_payload=review_payload,
+            auxiliary_payload=review_payload,
+            decision=semantic_decision,
+            prompt_versions=prompt_versions,
+        )
+    except Exception as exc:
+        error_message = str(exc)
+        raise
+    finally:
+        record_prompt_invocation(
+            session_factory,
+            PromptInvocationRecord(
+                feature="semantic_disagreement_review",
+                correlation_key=f"semantic-review:{raw_message_id}",
+                raw_message_id=raw_message_id,
+                chat_id=chat_id,
+                model=provider.model,
+                prompt_versions=prompt_versions,
+                status="failed" if error_message else "completed",
+                error_message=error_message,
+            ),
+        )
+
+
+def _load_review_attempts(session_factory: sessionmaker, raw_message_id: int) -> int:
+    with session_factory() as session:
+        value = session.query(RecognitionDecision.comparison_attempts).filter_by(
+            raw_message_id=raw_message_id
+        ).scalar()
+        if value is None:
+            raise LookupError("recognition decision not found")
+        return int(value)
+
+
+async def _notify(notifier: Callable[..., Any], **kwargs: Any) -> None:
+    if inspect.iscoroutinefunction(notifier):
+        await notifier(**kwargs)
+        return
+    result = await asyncio.to_thread(notifier, **kwargs)
+    if inspect.isawaitable(result):
+        await result
+
+
+async def run_semantic_review_once(
+    session_factory: sessionmaker,
+    *,
+    config: AiRecognitionConfig,
+    notifier: Callable[..., Any] | None,
+    now: datetime,
+    reviewer: Callable[..., SemanticReviewRun] = run_deepseek_semantic_review,
+    max_attempts: int = 3,
+    retry_delay_seconds: float = 1.0,
+    stale_after: timedelta = timedelta(minutes=5),
+) -> bool:
+    """Claim and process at most one semantic review row."""
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least one")
+    claim = await asyncio.to_thread(
+        claim_next_semantic_review,
+        session_factory,
+        now=now,
+        stale_before=now - stale_after,
+    )
+    if claim is None:
+        return False
+
+    try:
+        run = await asyncio.to_thread(
+            reviewer,
+            session_factory,
+            raw_message_id=claim.raw_message_id,
+            config=config,
+        )
+        completed = await asyncio.to_thread(
+            complete_semantic_review,
+            session_factory,
+            raw_message_id=claim.raw_message_id,
+            claim_token=claim.token,
+            model=run.model,
+            auxiliary_payload=run.auxiliary_payload,
+            comparison_payload=run.review_payload,
+            agreement_status=run.decision.agreement_status,
+            severity=run.decision.severity,
+            differences=list(run.decision.differences),
+            prompt_versions=run.prompt_versions,
+            compared_at=now,
+        )
+        if not completed or run.decision.severity != "critical" or notifier is None:
+            return True
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                run.review_payload, ensure_ascii=False, sort_keys=True
+            ).encode("utf-8")
+        ).hexdigest()
+        claimed_notification = await asyncio.to_thread(
+            claim_critical_notification,
+            session_factory,
+            raw_message_id=claim.raw_message_id,
+            fingerprint=fingerprint,
+        )
+        if claimed_notification:
+            try:
+                await _notify(
+                    notifier,
+                    raw_message_id=claim.raw_message_id,
+                    review=run,
+                )
+            except Exception:
+                logger.exception(
+                    "Critical semantic-review notifier failed for raw_message_id=%s",
+                    claim.raw_message_id,
+                )
+        return True
+    except Exception as exc:
+        attempts = await asyncio.to_thread(
+            _load_review_attempts, session_factory, claim.raw_message_id
+        )
+        next_attempt_number = attempts + 1
+        next_attempt_at = None
+        if next_attempt_number < max_attempts:
+            next_attempt_at = now + timedelta(
+                seconds=retry_delay_seconds * next_attempt_number
+            )
+        await asyncio.to_thread(
+            fail_semantic_review,
+            session_factory,
+            raw_message_id=claim.raw_message_id,
+            claim_token=claim.token,
+            error=str(exc),
+            next_attempt_at=next_attempt_at,
+        )
+        logger.exception(
+            "Semantic disagreement review failed for raw_message_id=%s",
+            claim.raw_message_id,
+        )
+        return True
+
+
+async def run_semantic_review_loop(
+    *,
+    session_factory: sessionmaker,
+    config_path: Path,
+    notifier: Callable[..., Any] | None,
+    poll_interval_seconds: float = 1.0,
+    max_attempts: int = 3,
+) -> None:
+    """Continuously process review rows while isolating per-item failures."""
+
+    while True:
+        try:
+            config = await asyncio.to_thread(load_ai_recognition_config, config_path)
+            processed = await run_semantic_review_once(
+                session_factory,
+                config=config,
+                notifier=notifier,
+                now=utc_now(),
+                max_attempts=max_attempts,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            processed = False
+            logger.exception("Semantic disagreement review loop iteration failed")
+        if not processed:
+            await asyncio.sleep(poll_interval_seconds)
 
 
 def normalize_price(value: Any) -> Decimal | tuple[Decimal, ...] | str | None:
