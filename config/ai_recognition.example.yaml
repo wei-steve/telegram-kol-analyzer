@@ -36,6 +36,9 @@ image_provider:
   api_key: "your_zhipu_api_key"
   model: "glm-ocr"
   timeout_seconds: 60
+# Deprecated prompt compatibility inputs. On first startup, these values seed
+# the Web-managed prompt registry. After registry seeding, edit and publish
+# prompts from the AI prompt center; runtime provider credentials remain here.
 recognition_prompt: |
   你是 Telegram 加密货币 KOL 消息的交易策略识别器。
   判断单条消息是否包含可执行的新开仓策略。

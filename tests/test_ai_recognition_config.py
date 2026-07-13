@@ -9,6 +9,68 @@ from telegram_kol_research.ai_recognition_config import (
     load_ai_recognition_config,
     save_ai_recognition_config,
 )
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.prompt_defaults import (
+    DEFAULT_MIMO_VISION_PROMPT,
+    DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
+    MIMO_VISION_PROMPT,
+    SHARED_TRADING_PROMPT,
+    build_prompt_seeds_from_legacy,
+    seed_default_prompt_registry,
+)
+from telegram_kol_research.prompt_registry import get_prompt_detail
+
+
+def test_default_trading_templates_have_strict_boundaries():
+    assert '"recognition_result"' in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+    assert '"lifecycle_event"' in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+    assert "58900-59300" in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+    assert "平加仓" in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+    assert "图片模糊" not in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+    assert "DeepSeek" not in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+    assert "MiMo" not in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+
+    assert "图片模糊" in DEFAULT_MIMO_VISION_PROMPT
+    assert "交易所截图" in DEFAULT_MIMO_VISION_PROMPT
+    assert '"recognition_result"' not in DEFAULT_MIMO_VISION_PROMPT
+    assert '"lifecycle_event"' not in DEFAULT_MIMO_VISION_PROMPT
+
+
+def test_build_prompt_seeds_from_legacy_preserves_custom_text_experience():
+    seeds = build_prompt_seeds_from_legacy(
+        AiRecognitionConfig(
+            recognition_prompt="CUSTOM ENTRY EXPERIENCE",
+            lifecycle_event_prompt="CUSTOM EXIT EXPERIENCE",
+            mimo_direct_prompt="CUSTOM IMAGE EXPERIENCE: read screenshots carefully.",
+        )
+    )
+    by_key = {seed.prompt_key: seed for seed in seeds}
+
+    assert "CUSTOM ENTRY EXPERIENCE" in by_key[SHARED_TRADING_PROMPT].content
+    assert "CUSTOM EXIT EXPERIENCE" in by_key[SHARED_TRADING_PROMPT].content
+    assert "CUSTOM IMAGE EXPERIENCE" in by_key[MIMO_VISION_PROMPT].content
+    assert '"recognition_result"' not in by_key[MIMO_VISION_PROMPT].content
+
+
+def test_seed_default_prompt_registry_never_overwrites_active_database_version(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    first_config = AiRecognitionConfig(
+        recognition_prompt="FIRST ENTRY",
+        lifecycle_event_prompt="FIRST EXIT",
+        mimo_direct_prompt="FIRST IMAGE",
+    )
+    second_config = AiRecognitionConfig(
+        recognition_prompt="SECOND ENTRY",
+        lifecycle_event_prompt="SECOND EXIT",
+        mimo_direct_prompt="SECOND IMAGE",
+    )
+
+    seed_default_prompt_registry(factory, first_config)
+    seed_default_prompt_registry(factory, second_config)
+
+    shared = get_prompt_detail(factory, SHARED_TRADING_PROMPT)
+    assert "FIRST ENTRY" in shared.active_version.content
+    assert "SECOND ENTRY" not in shared.active_version.content
 
 
 def test_authoritative_mimo_prompt_inherits_all_text_experience_and_image_rules():
