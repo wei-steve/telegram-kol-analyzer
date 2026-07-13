@@ -2557,11 +2557,60 @@ body {
 .message-strategy-content span { color: #86efac; font-size: 0.72rem; font-weight: 700; }
 .message-strategy-content strong { color: #f8fafc; font-weight: 700; }
 
+.semantic-review {
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 7px 9px;
+  background: rgba(15, 23, 42, 0.5);
+  color: #cbd5e1;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.semantic-review summary {
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.semantic-review-agreed { border-left-color: #22c55e; color: #dcfce7; }
+.semantic-review-normal { border-left-color: #f59e0b; color: #fde68a; }
+.semantic-review-pending { border-left-color: #38bdf8; color: #bae6fd; }
+.semantic-review-failed { border-left-color: #ef4444; color: #fecaca; }
+
+.semantic-review-critical {
+  border-color: rgba(248, 113, 113, 0.7);
+  border-left-color: #ef4444;
+  background: rgba(127, 29, 29, 0.36);
+  color: #fee2e2;
+  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.16);
+}
+
+.semantic-review-details {
+  display: grid;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.semantic-review-details p,
+.semantic-review-details ul { margin: 0; }
+.semantic-review-details ul { padding-left: 18px; }
+.semantic-review-details small { color: inherit; opacity: 0.78; }
+
 .recognition-comparison {
   display: grid;
   gap: 6px;
   margin-top: 8px;
 }
+
+.recognition-comparison-label {
+  display: grid;
+  gap: 2px;
+  color: #94a3b8;
+  font-size: 0.72rem;
+}
+
+.recognition-comparison-label strong { color: #cbd5e1; }
 
 .recognition-comparison-row {
   display: grid;

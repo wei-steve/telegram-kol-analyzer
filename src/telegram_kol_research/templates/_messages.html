@@ -82,6 +82,7 @@
     {% for message in messages %}
       {% set detection = message.strategy_detection %}
       {% set comparison = message.recognition_comparison %}
+      {% set semantic_review = message.semantic_review %}
       {% set ai_panel_class = detection.status_class if detection else 'is-pending' %}
       {% set strategy_related = ai_panel_class == 'is-strategy' %}
       {% if comparison %}
@@ -98,7 +99,7 @@
         {% endfor %}
         {% set strategy_related = strategy_ns.value %}
       {% endif %}
-      {% set message_default_expanded = strategy_related or ai_panel_class != 'is-not-strategy' %}
+      {% set message_default_expanded = strategy_related or ai_panel_class != 'is-not-strategy' or (semantic_review and semantic_review.severity == 'critical') %}
       <article
         class="message-card{% if not message_default_expanded %} is-message-collapsed{% endif %}"
         id="message-{{ message.raw_message_id }}"
@@ -209,8 +210,38 @@
                   </div>
                 {% endif %}
               </div>
+              {% if semantic_review %}
+                {% if semantic_review.severity in ['normal', 'critical'] %}
+                  <details class="semantic-review semantic-review-{{ semantic_review.severity }}"
+                    {% if semantic_review.severity == 'critical' %}open role="alert" aria-label="AI复核：严重分歧"{% endif %}
+                  >
+                    <summary>AI复核：{{ semantic_review.label }}</summary>
+                    <div class="semantic-review-details">
+                      {% if semantic_review.reason %}<p>{{ semantic_review.reason }}</p>{% endif %}
+                      {% if semantic_review.conflict_types %}
+                        <ul aria-label="分歧类型">
+                          {% for conflict_type in semantic_review.conflict_types %}
+                            <li>{{ conflict_type }}</li>
+                          {% endfor %}
+                        </ul>
+                      {% endif %}
+                      {% if semantic_review.model %}<small>复核模型：{{ semantic_review.model }}</small>{% endif %}
+                    </div>
+                  </details>
+                {% else %}
+                  <div
+                    class="semantic-review semantic-review-{{ semantic_review.severity }}"
+                    role="status"
+                    aria-label="AI复核：{{ semantic_review.label }}"
+                  >AI复核：{{ semantic_review.label }}</div>
+                {% endif %}
+              {% endif %}
               {% if comparison %}
                 <div class="recognition-comparison">
+                  <div class="recognition-comparison-label">
+                    <strong>历史实验（非权威）</strong>
+                    <small>仅供调试参考，不代表当前 AI 复核结论。</small>
+                  </div>
                   {% for item in [
                     ('DeepSeek text', comparison.deepseek_text),
                     ('GLM-OCR image', comparison.glm_ocr_image),

@@ -1756,6 +1756,83 @@ def test_message_recognition_api_reports_pending_without_scheduling_review(
     assert auto_trade_calls == [raw_message_id]
 
 
+@pytest.mark.parametrize("semantic_review_status", ["execution_pending", "execution_running"])
+def test_message_recognition_api_preserves_execution_review_state(
+    tmp_path, semantic_review_status
+):
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
+    )
+    with app.state.session_factory() as session:
+        raw_message = RawMessage(chat_id=88, message_id=4, text="BTC long")
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    result = MessageRecognitionResult(
+        raw_message_id=raw_message_id,
+        status="是策略",
+        summary="BTC long",
+        reason=None,
+        parse_source="mimo",
+    )
+    app.state.authoritative_processor = lambda _message_id: SimpleNamespace(
+        recognition=result,
+        assessment=SimpleNamespace(
+            agreement_status="agreed",
+            semantic_review_status=semantic_review_status,
+            differences=["must-not-be-returned-before-review"],
+            mimo=SimpleNamespace(model="mimo-v2.5"),
+        ),
+        automation={"status": "pending"},
+    )
+
+    response = TestClient(app).post(f"/api/messages/{raw_message_id}/recognize")
+
+    assert response.status_code == 200
+    assert response.json()["semantic_review_status"] == semantic_review_status
+    assert response.json()["agreement_status"] == "pending"
+    assert response.json()["ai_conflict"] is False
+    assert response.json()["differences"] == []
+
+
+def test_message_recognition_api_defaults_review_to_pending_not_immediate_agreement(tmp_path):
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
+    )
+    with app.state.session_factory() as session:
+        raw_message = RawMessage(chat_id=88, message_id=5, text="BTC long")
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    result = MessageRecognitionResult(
+        raw_message_id=raw_message_id,
+        status="是策略",
+        summary="BTC long",
+        reason=None,
+        parse_source="mimo",
+    )
+    app.state.authoritative_processor = lambda _message_id: SimpleNamespace(
+        recognition=result,
+        assessment=SimpleNamespace(
+            agreement_status="agreed",
+            differences=[],
+            mimo=SimpleNamespace(model="mimo-v2.5"),
+        ),
+        automation={"status": "pending"},
+    )
+
+    response = TestClient(app).post(f"/api/messages/{raw_message_id}/recognize")
+
+    assert response.status_code == 200
+    assert response.json()["semantic_review_status"] == "pending"
+    assert response.json()["agreement_status"] == "pending"
+    assert response.json()["ai_conflict"] is False
+
+
 def test_strategy_mid_panel_loads_only_visible_strategy_list(tmp_path, monkeypatch):
     calls: list[str] = []
 

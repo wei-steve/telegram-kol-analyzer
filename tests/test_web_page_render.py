@@ -1,4 +1,5 @@
-﻿import re
+﻿import json
+import re
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import MediaAsset
 from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import RecognitionDecision
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.group_config import GroupConfig
@@ -957,6 +959,78 @@ def test_index_page_renders_message_cards_with_hierarchy_and_media_labels(tmp_pa
     assert "/local-media/77/2.jpg" in response.text
     assert 'class="media-token"' in response.text
     assert "/local-media/77/2.mp4" not in response.text
+
+
+def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    states = [
+        ("completed", None, "一致", "equivalent", []),
+        (
+            "completed",
+            "normal",
+            "普通差异",
+            "止盈细节不同",
+            ["non_material_price_detail"],
+        ),
+        ("completed", "critical", "严重分歧", "方向冲突", ["action_family"]),
+        ("execution_pending", None, "等待中", None, []),
+        ("execution_running", None, "等待中", None, []),
+        ("failed", None, "失败", None, []),
+    ]
+    with session_factory() as session:
+        for index, (status, severity, _label, reason, conflict_types) in enumerate(states, 1):
+            raw_message = RawMessage(chat_id=77, message_id=index, text=f"message {index}")
+            session.add(raw_message)
+            session.flush()
+            session.add(
+                RecognitionDecision(
+                    raw_message_id=raw_message.id,
+                    input_kind="text",
+                    authoritative_model="mimo-v2.5",
+                    authoritative_status="是策略",
+                    authoritative_payload_json="{}",
+                    agreement_status="agreed" if severity is None else "disagreed",
+                    differences_json="[]",
+                    comparison_status=status,
+                    disagreement_severity=severity,
+                    comparison_model="deepseek-v4-flash",
+                    comparison_payload_json=json.dumps(
+                        {
+                            "reason": reason,
+                            "conflict_types": conflict_types,
+                            "raw_provider_response": "never-render-provider-secret",
+                            "notification_claim_token": "never-render-frozen-token",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    comparison_error="provider timeout" if status == "failed" else None,
+                )
+            )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/detail/tab/messages"
+    )
+
+    assert response.status_code == 200
+    for _status, _severity, label, _reason, _conflicts in states:
+        assert f"AI复核：{label}" in response.text
+    assert 'class="semantic-review semantic-review-critical"' in response.text
+    assert 'role="alert"' in response.text
+    normal_review = re.search(
+        r'<details class="semantic-review semantic-review-normal"(.*?)</details>',
+        response.text,
+        re.S,
+    )
+    assert normal_review is not None
+    assert " open" not in normal_review.group(1).split(">", 1)[0]
+    assert "止盈细节不同" in normal_review.group(1)
+    assert "non_material_price_detail" in normal_review.group(1)
+    assert "历史实验（非权威）" in response.text
+    assert "never-render-provider-secret" not in response.text
+    assert "never-render-frozen-token" not in response.text
+    assert "provider timeout" not in response.text
 
 
 def test_index_page_versions_static_assets_to_avoid_stale_browser_cache(tmp_path):

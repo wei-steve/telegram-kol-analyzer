@@ -2922,28 +2922,28 @@ def create_web_app(
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         result = processing_result.recognition
+        semantic_review_status = getattr(
+            processing_result.assessment,
+            "semantic_review_status",
+            None,
+        )
+        if semantic_review_status not in {
+            "pending",
+            "execution_pending",
+            "execution_running",
+        }:
+            semantic_review_status = "pending"
         return {
             "raw_message_id": result.raw_message_id,
             "status": result.status,
             "summary": result.summary,
             "reason": result.reason,
             "auto_trade": processing_result.automation,
-            "ai_conflict": processing_result.assessment.agreement_status == "disagreed",
+            "ai_conflict": False,
             "authoritative_model": processing_result.assessment.mimo.model,
-            "agreement_status": processing_result.assessment.agreement_status,
-            "semantic_review_status": (
-                getattr(
-                    processing_result.assessment,
-                    "semantic_review_status",
-                    None,
-                )
-                or (
-                    "pending"
-                    if processing_result.assessment.agreement_status == "pending"
-                    else "not_applicable"
-                )
-            ),
-            "differences": processing_result.assessment.differences,
+            "agreement_status": "pending",
+            "semantic_review_status": semantic_review_status,
+            "differences": [],
             "notification_scheduled": (
                 conflict_payload is not None
                 and system_operator_bot_enabled(app.state.system_operator_bot_config)

@@ -1,8 +1,11 @@
+import json
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import event
+
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import MediaAsset, RawMessage
+from telegram_kol_research.models import MediaAsset, RawMessage, RecognitionDecision
 from telegram_kol_research.web_queries import load_group_messages, load_messages_in_time_window
 
 
@@ -180,3 +183,97 @@ def test_load_messages_in_time_window_normalizes_aware_local_bounds_to_utc(tmp_p
     )
 
     assert [row["message_id"] for row in rows] == [2]
+
+
+def test_load_group_messages_serializes_semantic_review_decisions_in_one_bulk_query(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        messages = [
+            RawMessage(chat_id=9, message_id=index, text=f"message {index}")
+            for index in range(1, 4)
+        ]
+        session.add_all(messages)
+        session.flush()
+        session.add_all(
+            [
+                RecognitionDecision(
+                    raw_message_id=message.id,
+                    input_kind="text",
+                    authoritative_model="mimo-v2.5",
+                    authoritative_status="是策略",
+                    authoritative_payload_json="{}",
+                    agreement_status="disagreed",
+                    differences_json='["take_profit"]',
+                    comparison_status="completed",
+                    disagreement_severity="normal",
+                    comparison_model="deepseek-v4-flash",
+                    comparison_payload_json=json.dumps(
+                        {
+                            "reason": "止盈细节不同",
+                            "conflict_types": ["non_material_price_detail"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                for message in messages
+            ]
+        )
+        session.commit()
+
+    decision_queries: list[str] = []
+    engine = session_factory.kw["bind"]
+
+    def track_decision_queries(_conn, _cursor, statement, _parameters, _context, _many):
+        if "recognition_decisions" in statement.lower():
+            decision_queries.append(statement)
+
+    event.listen(engine, "before_cursor_execute", track_decision_queries)
+    try:
+        rows = load_group_messages(session_factory, chat_id=9, limit=10)
+    finally:
+        event.remove(engine, "before_cursor_execute", track_decision_queries)
+
+    assert len(decision_queries) == 1
+    assert rows[0]["semantic_review"] == {
+        "status": "completed",
+        "severity": "normal",
+        "label": "普通差异",
+        "reason": "止盈细节不同",
+        "conflict_types": ["non_material_price_detail"],
+        "model": "deepseek-v4-flash",
+    }
+
+
+def test_load_group_messages_defensively_serializes_malformed_semantic_review_json(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(chat_id=9, message_id=1, text="BTC long")
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="是策略",
+                authoritative_payload_json="{}",
+                agreement_status="disagreed",
+                differences_json="[]",
+                comparison_status="completed",
+                disagreement_severity="critical",
+                comparison_model="deepseek-v4-flash",
+                comparison_payload_json="not-json",
+            )
+        )
+        session.commit()
+
+    row = load_group_messages(session_factory, chat_id=9, limit=10)[0]
+
+    assert row["semantic_review"] == {
+        "status": "completed",
+        "severity": "critical",
+        "label": "严重分歧",
+        "reason": None,
+        "conflict_types": [],
+        "model": "deepseek-v4-flash",
+    }

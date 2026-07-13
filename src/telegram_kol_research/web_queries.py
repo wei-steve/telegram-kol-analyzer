@@ -15,6 +15,7 @@ from telegram_kol_research.models import (
     MediaAsset,
     MessageRecognition,
     RawMessage,
+    RecognitionDecision,
     RecognitionExperiment,
     SignalCandidate,
     StrategyLifecycle,
@@ -393,6 +394,15 @@ def _serialize_raw_messages(
     )
     rec_by_msg_id: dict[int, MessageRecognition] = {r.raw_message_id: r for r in all_recs}
 
+    all_decisions = (
+        session.query(RecognitionDecision)
+        .filter(RecognitionDecision.raw_message_id.in_(raw_message_ids))
+        .all()
+    )
+    decisions_by_msg_id: dict[int, RecognitionDecision] = {
+        decision.raw_message_id: decision for decision in all_decisions
+    }
+
     all_experiments = (
         session.query(RecognitionExperiment)
         .filter(RecognitionExperiment.raw_message_id.in_(raw_message_ids))
@@ -435,6 +445,9 @@ def _serialize_raw_messages(
                     candidate=cand_by_msg_id.get(raw_message.id),
                     media_assets=media_assets,
                 ),
+                "semantic_review": _serialize_semantic_review(
+                    decisions_by_msg_id.get(raw_message.id)
+                ),
                 "recognition_comparison": _build_recognition_comparison(
                     recognition=rec_by_msg_id.get(raw_message.id),
                     media_assets=media_assets,
@@ -458,6 +471,59 @@ def _serialize_media_assets(media_assets: list[MediaAsset]) -> list[dict[str, ob
         }
         for media_asset in media_assets
     ]
+
+
+def _serialize_semantic_review(
+    decision: RecognitionDecision | None,
+) -> dict[str, object | None] | None:
+    if decision is None:
+        return None
+
+    payload: dict[str, object] = {}
+    if decision.comparison_payload_json:
+        try:
+            loaded = json.loads(decision.comparison_payload_json)
+        except (json.JSONDecodeError, TypeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            payload = loaded
+
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        reason = None
+    else:
+        reason = reason.strip()
+
+    conflict_types = payload.get("conflict_types")
+    if not isinstance(conflict_types, list):
+        conflict_types = []
+    conflict_types = [item for item in conflict_types if isinstance(item, str)]
+
+    status = decision.comparison_status or "pending"
+    if status == "failed" or decision.agreement_status == "authoritative_failed":
+        severity = "failed"
+        label = "失败"
+    elif status == "completed" and decision.disagreement_severity == "critical":
+        severity = "critical"
+        label = "严重分歧"
+    elif status == "completed" and decision.disagreement_severity == "normal":
+        severity = "normal"
+        label = "普通差异"
+    elif status == "completed":
+        severity = "agreed"
+        label = "一致"
+    else:
+        severity = "pending"
+        label = "等待中"
+
+    return {
+        "status": status,
+        "severity": severity,
+        "label": label,
+        "reason": reason,
+        "conflict_types": conflict_types,
+        "model": decision.comparison_model,
+    }
 
 
 def _build_recognition_comparison(
