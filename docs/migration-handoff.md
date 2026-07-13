@@ -65,6 +65,30 @@ Design and implementation plan:
 - `docs/superpowers/specs/2026-07-13-mimo-authoritative-recognition-design.md`
 - `docs/superpowers/plans/2026-07-13-mimo-authoritative-recognition.md`
 
+## Background semantic disagreement review
+
+MiMo remains the only execution authority. A successful authoritative generation moves through `execution_pending -> execution_running`; only the exact owner token may perform lifecycle/automatic-execution work and persist its real automation outcome. Finalization then exposes a reviewable row as `pending`. The Web service claims that work as `running` and invokes DeepSeek in the background, after the MiMo path has returned. DeepSeek can classify audit severity and notification eligibility only; timeout, invalid output, or any other DeepSeek failure cannot authorize, block, modify, retry, compensate, or roll back a trade.
+
+Operator interpretation of `recognition_decisions.comparison_status` is:
+
+- `execution_pending`: a MiMo generation is persisted but has not claimed execution ownership;
+- `execution_running`: the exact MiMo generation owns execution and must be recovered cautiously if it is stranded; do not manually queue semantic review or replay a trade from this state;
+- `pending`: authoritative automation has finished and semantic review is waiting or delayed until `comparison_next_attempt_at`;
+- `running`: one worker owns semantic review; a claim older than five minutes is recoverable after restart;
+- `completed`: semantic review is terminal; inspect `disagreement_severity` and notification state;
+- `failed`: three review attempts were exhausted; the persisted MiMo/automation outcome remains authoritative and unchanged.
+
+Completed results use `none`, `normal`, or `critical`. Only `critical` schedules a system-operator notification. `none` and `normal` remain database-audited and Web-visible; normal details are collapsed by default. Pre-migration completed rows have no semantic severity and the Web labels them `待重新复核` (`unclassified`) instead of falsely reporting agreement.
+
+Review retries are bounded to three attempts with increasing delay. Stale `running` work is reclaimed through a new claim token, so an old worker cannot complete over a newer owner. Critical notification delivery separately freezes an immutable payload and fingerprint and commits `scheduled` before the network call. `scheduled`, `sent`, and `failed` are never automatically claimed again, providing at-most-once sending across retries and restarts; a crash after `scheduled` can therefore require manual delivery investigation rather than an automatic resend.
+
+Design and implementation references:
+
+- `docs/plans/2026-07-13-semantic-ai-disagreement-review-design.md`
+- `docs/plans/2026-07-13-semantic-ai-disagreement-review.md`
+
+Production deployment and controlled server verification for this change remain pending. Use the read-only audit in `docs/runbook.md`; never place a real order merely to test semantic-review notification.
+
 ## Web-managed AI prompts
 
 All AI business prompts now belong to the versioned database registry. The shared trading template A covers new-strategy judgment and the full strategy lifecycle; MiMo alone adds image template B. Runtime context C remains dynamically generated. Therefore DeepSeek uses `A + C`, while authoritative MiMo uses `A + B + C`.

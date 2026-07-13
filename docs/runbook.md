@@ -169,3 +169,61 @@ Run the current automated test suite:
 ```bash
 python3 -m pytest tests -v
 ```
+
+## 10. Audit Semantic Disagreement Review
+
+The Web service runs DeepSeek semantic review in the background after MiMo has persisted the real automation outcome. `execution_pending` and `execution_running` belong to MiMo execution ownership; `pending`, `running`, `completed`, and `failed` belong to later semantic review. Do not change a row, replay recognition, or place an order merely to clear an audit state.
+
+Only `critical` review results are eligible for a system-operator bot message. `normal` and `none` remain Web-visible/database-only. A completed historical row with no severity appears as `待重新复核` (`unclassified`); it is not evidence that the models agreed. DeepSeek errors retry at most three times, then remain `failed` without changing the MiMo decision or automation result. A `running` claim older than five minutes can be recovered by the worker. Notification `scheduled`, `sent`, and `failed` are at-most-once terminal claims and must not be reset for an automatic resend.
+
+Run the following on the production server only, from `/opt/telegram-kol-analyzer`. `sqlite3 -readonly` prevents accidental writes, and these grouped queries return counts/timestamps only: they do not select Telegram message text, model payloads, exception text, or credentials.
+
+```bash
+sqlite3 -readonly data/research.db <<'SQL'
+.headers on
+.mode column
+
+SELECT comparison_status, COUNT(*) AS row_count
+FROM recognition_decisions
+GROUP BY comparison_status
+ORDER BY comparison_status;
+
+SELECT COALESCE(disagreement_severity, 'unclassified') AS severity,
+       COUNT(*) AS row_count
+FROM recognition_decisions
+WHERE comparison_status = 'completed'
+GROUP BY COALESCE(disagreement_severity, 'unclassified')
+ORDER BY severity;
+
+SELECT COUNT(*) AS pending_count,
+       MIN(updated_at) AS oldest_pending_updated_at,
+       ROUND((julianday('now') - julianday(MIN(updated_at))) * 1440, 1)
+         AS oldest_pending_age_minutes,
+       SUM(CASE
+             WHEN comparison_next_attempt_at IS NOT NULL
+              AND comparison_next_attempt_at > CURRENT_TIMESTAMP
+             THEN 1 ELSE 0
+           END) AS retry_delayed_count
+FROM recognition_decisions
+WHERE comparison_status = 'pending';
+
+SELECT comparison_attempts,
+       COUNT(*) AS failed_count,
+       SUM(CASE WHEN comparison_error IS NOT NULL THEN 1 ELSE 0 END)
+         AS rows_with_error
+FROM recognition_decisions
+WHERE comparison_status = 'failed'
+GROUP BY comparison_attempts
+ORDER BY comparison_attempts;
+
+SELECT COALESCE(notification_status, 'not_scheduled') AS notification_status,
+       COUNT(*) AS critical_count
+FROM recognition_decisions
+WHERE comparison_status = 'completed'
+  AND disagreement_severity = 'critical'
+GROUP BY COALESCE(notification_status, 'not_scheduled')
+ORDER BY notification_status;
+SQL
+```
+
+Interpret a growing pending age, repeated `failed` rows, or critical `scheduled`/`failed` delivery as an operational investigation signal. Keep investigation read-only until service logs, provider health, and the exact ownership/notification state are understood. Production rollout and controlled latency/notification verification must follow `docs/server-deployment.md` and the semantic-review plan; do not use live trading as a test fixture.
