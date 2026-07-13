@@ -111,24 +111,30 @@ def test_worker_completes_pending_review(tmp_path):
 
 def test_worker_retries_timeout_without_touching_automation(tmp_path):
     factory, _, _ = _setup(tmp_path)
+    failure_clock = [NOW]
+
+    def fail_after_elapsed(*args, **kwargs):
+        failure_clock[0] += timedelta(seconds=100)
+        raise TimeoutError("slow")
 
     async def run_at(when):
         return await run_semantic_review_once(
             factory,
             config=AiRecognitionConfig(),
             notifier=None,
-            reviewer=lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("slow")),
+            reviewer=fail_after_elapsed,
             now=when,
+            now_provider=lambda: failure_clock[0],
             retry_delay_seconds=10,
         )
 
     assert asyncio.run(run_at(NOW)) is True
-    assert asyncio.run(run_at(NOW + timedelta(seconds=10))) is True
+    assert asyncio.run(run_at(NOW + timedelta(seconds=110))) is True
     with factory() as session:
         row = session.query(RecognitionDecision).one()
         assert row.comparison_status == "pending"
         assert row.comparison_attempts == 2
-        assert row.comparison_next_attempt_at == NOW + timedelta(seconds=30)
+        assert row.comparison_next_attempt_at == NOW + timedelta(seconds=220)
         assert row.automation_status == "submitted"
         assert row.automation_reason == "preserve me"
 
@@ -143,6 +149,7 @@ def test_worker_marks_invalid_json_failed_after_three_attempts(tmp_path):
             notifier=None,
             reviewer=lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("invalid JSON")),
             now=when,
+            now_provider=lambda when=when: when,
             retry_delay_seconds=1,
             max_attempts=3,
         )) is True

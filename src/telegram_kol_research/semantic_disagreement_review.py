@@ -1,8 +1,8 @@
-"""Pure normalization and severity rules for semantic AI review results.
+"""Semantic disagreement review integration and deterministic severity rules.
 
-MiMo remains authoritative.  This module only classifies the materiality of an
-independent DeepSeek review; it performs no persistence, network, or execution
-work.
+MiMo remains authoritative. This module builds and audits the independent
+DeepSeek review request, processes retryable database work, and classifies
+materiality without mutating or authorizing trading automation.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import re
 from typing import Any, Callable
 
 import httpx
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.ai_recognition_config import (
@@ -49,7 +50,6 @@ from telegram_kol_research.recognition_decisions import (
 )
 from telegram_kol_research.recognition_experiments import (
     _extract_chat_content,
-    _parse_json_object,
 )
 
 
@@ -172,14 +172,30 @@ def _request_openai_compatible(
         return response.json()
 
 
-def _safe_active_strategy_context(session, *, chat_id: int) -> list[dict[str, Any]]:
+def _safe_active_strategy_context(
+    session,
+    *,
+    chat_id: int,
+    as_of: datetime,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
     rows = (
         session.query(StrategyLifecycle)
         .filter(
             StrategyLifecycle.chat_id == chat_id,
-            StrategyLifecycle.lifecycle_status.in_(("pending_entry", "entered")),
+            StrategyLifecycle.signal_at <= as_of,
+            or_(
+                and_(
+                    StrategyLifecycle.exited_at.is_(None),
+                    StrategyLifecycle.lifecycle_status.in_(
+                        ("pending_entry", "entered", "expired")
+                    ),
+                ),
+                StrategyLifecycle.exited_at > as_of,
+            ),
         )
-        .order_by(StrategyLifecycle.id.asc())
+        .order_by(StrategyLifecycle.signal_at.desc(), StrategyLifecycle.id.desc())
+        .limit(max(limit, 1))
         .all()
     )
     return [
@@ -188,7 +204,7 @@ def _safe_active_strategy_context(session, *, chat_id: int) -> list[dict[str, An
             "source_message_id": row.message_id,
             "symbol": row.symbol,
             "side": row.side,
-            "lifecycle_status": row.lifecycle_status,
+            "lifecycle_status": _historical_lifecycle_status(row, as_of=as_of),
             "entry_range_low": row.entry_range_low,
             "entry_range_high": row.entry_range_high,
             "stop_loss": row.stop_loss,
@@ -198,6 +214,30 @@ def _safe_active_strategy_context(session, *, chat_id: int) -> list[dict[str, An
         }
         for row in rows
     ]
+
+
+def _historical_lifecycle_status(
+    lifecycle: StrategyLifecycle,
+    *,
+    as_of: datetime,
+) -> str:
+    if lifecycle.entered_at is not None and lifecycle.entered_at <= as_of:
+        return "entered"
+    if lifecycle.lifecycle_status == "entered" and lifecycle.exited_at is None:
+        return "entered"
+    return "pending_entry"
+
+
+def _parse_strict_json_object(content: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(content.strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "semantic review response must be a strict JSON object"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("semantic review response must be a strict JSON object")
+    return payload
 
 
 def run_deepseek_semantic_review(
@@ -229,6 +269,7 @@ def run_deepseek_semantic_review(
         if decision_row is None:
             raise LookupError("recognition decision not found")
         authoritative_payload = json.loads(decision_row.authoritative_payload_json)
+        message_time = raw_message.posted_at or raw_message.created_at
         context = {
             "source": {
                 "raw_message_id": raw_message.id,
@@ -240,7 +281,9 @@ def run_deepseek_semantic_review(
                 "text": raw_message.text or "",
             },
             "active_strategies": _safe_active_strategy_context(
-                session, chat_id=raw_message.chat_id
+                session,
+                chat_id=raw_message.chat_id,
+                as_of=message_time,
             ),
             "mimo": {
                 "model": decision_row.authoritative_model,
@@ -287,7 +330,7 @@ def run_deepseek_semantic_review(
             headers=headers,
             timeout=provider.timeout_seconds,
         )
-        review_payload = _parse_json_object(_extract_chat_content(response))
+        review_payload = _parse_strict_json_object(_extract_chat_content(response))
         validate_review_payload(review_payload)
         automation = {
             "status": context["automation"]["automation_status"],
@@ -356,6 +399,7 @@ async def run_semantic_review_once(
     max_attempts: int = 3,
     retry_delay_seconds: float = 1.0,
     stale_after: timedelta = timedelta(minutes=5),
+    now_provider: Callable[[], datetime] = utc_now,
 ) -> bool:
     """Claim and process at most one semantic review row."""
 
@@ -418,13 +462,14 @@ async def run_semantic_review_once(
                 )
         return True
     except Exception as exc:
+        failure_at = now_provider()
         attempts = await asyncio.to_thread(
             _load_review_attempts, session_factory, claim.raw_message_id
         )
         next_attempt_number = attempts + 1
         next_attempt_at = None
         if next_attempt_number < max_attempts:
-            next_attempt_at = now + timedelta(
+            next_attempt_at = failure_at + timedelta(
                 seconds=retry_delay_seconds * next_attempt_number
             )
         await asyncio.to_thread(

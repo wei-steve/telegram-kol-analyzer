@@ -140,6 +140,7 @@ def test_review_request_is_grounded_safe_strict_and_audited(tmp_path):
             message_id=778,
             sender_id=51,
             sender_name="峰哥",
+            posted_at=datetime(2026, 7, 13, 12, 0),
             text="现价62800附近全部出局，空仓等待。",
         )
         session.add(raw)
@@ -161,6 +162,56 @@ def test_review_request_is_grounded_safe_strict_and_audited(tmp_path):
         session.add(lifecycle)
         session.flush()
         lifecycle_id = lifecycle.id
+        later_exited = StrategyLifecycle(
+            chat_id=991,
+            message_id=701,
+            symbol="ETH",
+            side="long",
+            lifecycle_status="exited",
+            signal_at=datetime(2026, 7, 13, 11, 0),
+            exited_at=datetime(2026, 7, 13, 13, 0),
+        )
+        future = StrategyLifecycle(
+            chat_id=991,
+            message_id=702,
+            symbol="SOL",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 13, 13, 0),
+        )
+        already_exited = StrategyLifecycle(
+            chat_id=991,
+            message_id=703,
+            symbol="DOGE",
+            side="long",
+            lifecycle_status="exited",
+            signal_at=datetime(2026, 7, 13, 9, 0),
+            exited_at=datetime(2026, 7, 13, 11, 0),
+        )
+        already_cancelled = StrategyLifecycle(
+            chat_id=991,
+            message_id=704,
+            symbol="BNB",
+            side="short",
+            lifecycle_status="cancelled",
+            signal_at=datetime(2026, 7, 13, 9, 30),
+            exited_at=datetime(2026, 7, 13, 11, 30),
+        )
+        session.add_all([later_exited, future, already_exited, already_cancelled])
+        for index in range(25):
+            session.add(
+                StrategyLifecycle(
+                    chat_id=991,
+                    message_id=800 + index,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="entered",
+                    signal_at=datetime(2026, 7, 13, 10, index + 1),
+                )
+            )
+        session.flush()
+        later_exited_id = later_exited.id
+        excluded_ids = {future.id, already_exited.id, already_cancelled.id}
         authoritative["lifecycle_event"]["target_lifecycle_id"] = lifecycle_id
         session.add(
             RecognitionDecision(
@@ -211,7 +262,12 @@ def test_review_request_is_grounded_safe_strict_and_audited(tmp_path):
     assert request_context["source"]["chat_id"] == 991
     assert request_context["source"]["message_id"] == 778
     assert request_context["source"]["sender_name"] == "峰哥"
-    assert request_context["active_strategies"][0]["lifecycle_status"] == "entered"
+    context_ids = {
+        item["lifecycle_id"] for item in request_context["active_strategies"]
+    }
+    assert len(request_context["active_strategies"]) == 20
+    assert later_exited_id in context_ids
+    assert context_ids.isdisjoint(excluded_ids)
     assert request_context["mimo"]["authoritative_payload"] == authoritative
     assert request_context["mimo"]["input_reading"] == authoritative["input_reading"]
     assert request_context["automation"]["automation_status"] == "submitted"
@@ -273,6 +329,51 @@ def test_review_rejects_non_strict_json_and_audits_failure(tmp_path):
         audit = session.query(AiPromptInvocation).one()
         assert audit.status == "failed"
         assert "closed contract" in audit.error_message
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "```json\n" + json.dumps(review_payload()) + "\n```",
+        "analysis first\n" + json.dumps(review_payload()),
+        json.dumps(review_payload()) + "\ntrailing prose",
+    ],
+)
+def test_review_rejects_fenced_or_prose_wrapped_json(tmp_path, content):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    config = AiRecognitionConfig(
+        text_provider=AiProviderConfig(
+            base_url="https://api.deepseek.example",
+            model="deepseek-review",
+        )
+    )
+    seed_default_prompt_registry(session_factory, config)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=2, text="BTC short")
+        session.add(raw)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw.id,
+                input_kind="text",
+                authoritative_model="mimo",
+                authoritative_status="非策略",
+                authoritative_payload_json=json.dumps(mimo_payload()),
+                agreement_status="pending",
+                differences_json="[]",
+                comparison_status="running",
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+
+    with pytest.raises(ValueError, match="strict JSON"):
+        run_deepseek_semantic_review(
+            session_factory,
+            raw_message_id=raw_id,
+            config=config,
+            requester=lambda **_: {"choices": [{"message": {"content": content}}]},
+        )
 
 
 def test_equivalent_numeric_formats_are_none():
