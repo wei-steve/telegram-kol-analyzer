@@ -159,6 +159,111 @@ class RecognitionDecision(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class AiPromptDefinition(Base):
+    __tablename__ = "ai_prompt_definitions"
+    __table_args__ = (
+        UniqueConstraint(
+            "prompt_key",
+            "scope_key",
+            name="uq_ai_prompt_definition_scope",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prompt_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope_key: Mapped[str] = mapped_column(String(128), nullable=False, default="global")
+    scope_chat_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    consumers_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    required_variables_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    validation_profile: Mapped[str] = mapped_column(String(64), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    active_version_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class AiPromptVersion(Base):
+    __tablename__ = "ai_prompt_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "prompt_definition_id",
+            "version_number",
+            name="uq_ai_prompt_version_number",
+        ),
+        Index(
+            "ix_ai_prompt_versions_definition_status",
+            "prompt_definition_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prompt_definition_id: Mapped[int] = mapped_column(
+        ForeignKey("ai_prompt_definitions.id"),
+        nullable=False,
+        index=True,
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    change_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    source_version_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class AiPromptTestRun(Base):
+    __tablename__ = "ai_prompt_test_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prompt_definition_id: Mapped[int] = mapped_column(
+        ForeignKey("ai_prompt_definitions.id"),
+        nullable=False,
+        index=True,
+    )
+    draft_version_id: Mapped[int] = mapped_column(
+        ForeignKey("ai_prompt_versions.id"),
+        nullable=False,
+        index=True,
+    )
+    raw_message_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("raw_messages.id"),
+        nullable=True,
+        index=True,
+    )
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    active_result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    draft_result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    differences_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class AiPromptInvocation(Base):
+    __tablename__ = "ai_prompt_invocations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    feature: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    correlation_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    raw_message_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("raw_messages.id"),
+        nullable=True,
+        index=True,
+    )
+    chat_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_versions_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class TradeIdea(Base):
     __tablename__ = "trade_ideas"
 

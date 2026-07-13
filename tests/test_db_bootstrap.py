@@ -17,6 +17,27 @@ def test_database_bootstrap_creates_tables(tmp_path):
     assert engine is not None
 
 
+def test_database_bootstrap_creates_prompt_registry_tables(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    names = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    conn.close()
+
+    assert {
+        "ai_prompt_definitions",
+        "ai_prompt_versions",
+        "ai_prompt_test_runs",
+        "ai_prompt_invocations",
+    } <= names
+
+
 def test_database_bootstrap_creates_recognition_decisions_table(tmp_path):
     database_path = tmp_path / "research.db"
     create_session_factory(database_path)
