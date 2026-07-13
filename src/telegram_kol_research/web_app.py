@@ -52,7 +52,7 @@ from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.message_recognition import recognize_message_now
-from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import AiPromptTestRun, ExecutionBinding
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.prompt_composition import (
@@ -79,6 +79,7 @@ from telegram_kol_research.prompt_registry import (
     rollback_prompt,
     save_prompt_draft,
 )
+from telegram_kol_research.prompt_testing import run_prompt_draft_test
 from telegram_kol_research.recognition_profiles import list_recognition_profiles
 from telegram_kol_research.llm_chat import (
     build_proxy_chat_payload,
@@ -1805,6 +1806,7 @@ def create_web_app(
         else None
     )
     app.state.chat_requester = request_grounded_chat_answer
+    app.state.prompt_test_runner = run_prompt_draft_test
     app.state.live_target_titles = live_target_titles or set()
     app.state.live_listener_runner = live_listener_runner or run_live_listener
     app.state.live_listener_task = None
@@ -2989,12 +2991,28 @@ def create_web_app(
         chat_id: int | None = None,
     ):
         try:
+            current = get_prompt_detail(
+                app.state.session_factory,
+                prompt_key,
+                chat_id=chat_id,
+            )
+            expected_draft_id = int(payload.get("expected_draft_version_id"))
+            if current.category == "trading":
+                with app.state.session_factory() as session:
+                    completed_tests = (
+                        session.query(AiPromptTestRun)
+                        .filter(AiPromptTestRun.draft_version_id == expected_draft_id)
+                        .filter(AiPromptTestRun.status == "completed")
+                        .count()
+                    )
+                if completed_tests == 0:
+                    raise PromptRegistryConflict(
+                        "trading prompt draft requires a completed historical test"
+                    )
             detail = publish_prompt_draft(
                 app.state.session_factory,
                 prompt_key,
-                expected_draft_version_id=int(
-                    payload.get("expected_draft_version_id")
-                ),
+                expected_draft_version_id=expected_draft_id,
                 chat_id=chat_id,
             )
         except PromptRegistryNotFound as exc:
@@ -3002,6 +3020,56 @@ def create_web_app(
         except (PromptRegistryConflict, TypeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _prompt_detail_response(detail)
+
+    @app.post("/api/ai-prompts/{prompt_key}/test")
+    def test_ai_prompt_draft(
+        prompt_key: str,
+        payload: dict[str, Any],
+    ):
+        try:
+            draft_version_id = int(payload.get("draft_version_id"))
+            raw_message_ids = [
+                int(value) for value in (payload.get("raw_message_ids") or [])
+            ]
+            model_kinds = [
+                str(value) for value in (payload.get("model_kinds") or ["mimo"])
+            ]
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not raw_message_ids:
+            raise HTTPException(status_code=422, detail="raw_message_ids is required")
+        if len(raw_message_ids) > 20:
+            raise HTTPException(status_code=422, detail="at most 20 messages per test")
+
+        config = load_ai_recognition_config(app.state.ai_recognition_config_path)
+        items: list[dict[str, Any]] = []
+        for raw_message_id in raw_message_ids:
+            for model_kind in model_kinds:
+                try:
+                    result = app.state.prompt_test_runner(
+                        app.state.session_factory,
+                        prompt_key=prompt_key,
+                        draft_version_id=draft_version_id,
+                        raw_message_id=raw_message_id,
+                        model_kind=model_kind,
+                        ai_recognition_config=config,
+                        media_root=app.state.media_root,
+                    )
+                except (LookupError, ValueError) as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                items.append(
+                    {
+                        "test_run_id": result.test_run_id,
+                        "raw_message_id": raw_message_id,
+                        "model_kind": model_kind,
+                        "active_payload": result.active_payload,
+                        "draft_payload": result.draft_payload,
+                        "differences": result.differences,
+                        "duration_ms": result.duration_ms,
+                        "error_message": result.error_message,
+                    }
+                )
+        return {"items": items}
 
     @app.post("/api/ai-prompts/{prompt_key}/rollback")
     def rollback_ai_prompt(
