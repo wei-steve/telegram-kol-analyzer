@@ -11,7 +11,6 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
-import hashlib
 import inspect
 import json
 import logging
@@ -393,32 +392,76 @@ async def _notify(notifier: Callable[..., Any], **kwargs: Any) -> None:
         await result
 
 
-def _critical_notification_fingerprint(
-    session_factory: sessionmaker,
-    *,
-    raw_message_id: int,
-) -> str:
-    """Hash only the final persisted semantic-review audit fields."""
+def build_semantic_notification_payload(
+    claimed_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Map an immutable claimed audit snapshot to the Telegram payload."""
 
-    with session_factory() as session:
-        row = (
-            session.query(RecognitionDecision)
-            .filter(RecognitionDecision.raw_message_id == raw_message_id)
-            .one()
-        )
-        canonical_payload = {
-            "raw_message_id": raw_message_id,
-            "authoritative_payload": json.loads(row.authoritative_payload_json),
-            "comparison_payload": json.loads(row.comparison_payload_json or "{}"),
-            "severity": row.disagreement_severity,
-        }
-    canonical_json = json.dumps(
-        canonical_payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    source = claimed_payload.get("source")
+    source = source if isinstance(source, dict) else {}
+    authoritative = claimed_payload.get("authoritative")
+    authoritative = authoritative if isinstance(authoritative, dict) else {}
+    authoritative_payload = authoritative.get("payload")
+    authoritative_payload = (
+        authoritative_payload if isinstance(authoritative_payload, dict) else {}
     )
-    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+    comparison = claimed_payload.get("comparison")
+    comparison = comparison if isinstance(comparison, dict) else {}
+    comparison_payload = comparison.get("payload")
+    comparison_payload = (
+        comparison_payload if isinstance(comparison_payload, dict) else {}
+    )
+    action = comparison_payload.get("independent_action")
+    action = action if isinstance(action, dict) else {}
+    evidence = comparison_payload.get("evidence")
+    evidence = evidence if isinstance(evidence, list) else []
+    conflict_types = comparison_payload.get("conflict_types")
+    conflict_types = conflict_types if isinstance(conflict_types, list) else []
+    posted_at = source.get("posted_at")
+    if isinstance(posted_at, str) and posted_at:
+        try:
+            posted_at = datetime.fromisoformat(posted_at)
+        except ValueError:
+            posted_at = None
+    automation = claimed_payload.get("automation")
+    automation = automation if isinstance(automation, dict) else {}
+    return {
+        "chat_id": source.get("chat_id"),
+        "message_id": source.get("message_id"),
+        "sender_name": source.get("sender_name"),
+        "posted_at": posted_at,
+        "text": source.get("text") or "",
+        "agreement_status": "disagreed",
+        "conflict_types": list(conflict_types),
+        "deepseek": {
+            "status": action.get("action_type") or "none",
+            "kind": "semantic_review",
+            "reason": comparison_payload.get("reason") or "-",
+            "evidence": list(evidence),
+            "conflict_types": list(conflict_types),
+        },
+        "mimo": {
+            "status": normalize_mimo_action(authoritative_payload)["action_type"],
+            "kind": "authoritative",
+            "reason": authoritative_payload.get("reason") or "-",
+        },
+        "automation": {
+            "status": automation.get("status"),
+            "reason": automation.get("reason"),
+        },
+    }
+
+
+def sanitize_notifier_exception(exc: BaseException) -> str:
+    """Return a bounded, non-secret notifier failure summary."""
+
+    summary = re.sub(r"[^A-Za-z0-9_.]", "", type(exc).__name__)[:100]
+    summary = summary or "Exception"
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int) and 100 <= status_code <= 599:
+        summary += f" status={status_code}"
+    return summary
 
 
 def _update_critical_notification_delivery(
@@ -483,6 +526,10 @@ async def run_semantic_review_once(
             raw_message_id=claim.raw_message_id,
             config=config,
         )
+        final_comparison_payload = dict(run.review_payload)
+        final_comparison_payload["conflict_types"] = list(
+            run.decision.conflict_types
+        )
         completed = await asyncio.to_thread(
             complete_semantic_review,
             session_factory,
@@ -490,7 +537,7 @@ async def run_semantic_review_once(
             claim_token=claim.token,
             model=run.model,
             auxiliary_payload=run.auxiliary_payload,
-            comparison_payload=run.review_payload,
+            comparison_payload=final_comparison_payload,
             agreement_status=run.decision.agreement_status,
             severity=run.decision.severity,
             differences=list(run.decision.differences),
@@ -499,43 +546,50 @@ async def run_semantic_review_once(
         )
         if not completed or run.decision.severity != "critical" or notifier is None:
             return True
-        fingerprint = await asyncio.to_thread(
-            _critical_notification_fingerprint,
-            session_factory,
-            raw_message_id=claim.raw_message_id,
-        )
         claimed_notification = await asyncio.to_thread(
             claim_critical_notification,
             session_factory,
             raw_message_id=claim.raw_message_id,
-            fingerprint=fingerprint,
         )
-        if claimed_notification:
+        if claimed_notification is not None:
+            notification_payload = build_semantic_notification_payload(
+                claimed_notification.payload
+            )
             try:
                 await _notify(
                     notifier,
                     raw_message_id=claim.raw_message_id,
-                    review=run,
+                    payload=notification_payload,
                 )
             except Exception as exc:
-                await asyncio.to_thread(
-                    _update_critical_notification_delivery,
-                    session_factory,
-                    raw_message_id=claim.raw_message_id,
-                    fingerprint=fingerprint,
-                    status="failed",
-                    error=str(exc),
-                )
-                logger.exception(
-                    "Critical semantic-review notifier failed for raw_message_id=%s",
+                safe_error = sanitize_notifier_exception(exc)
+                try:
+                    await asyncio.to_thread(
+                        _update_critical_notification_delivery,
+                        session_factory,
+                        raw_message_id=claim.raw_message_id,
+                        fingerprint=claimed_notification.fingerprint,
+                        status="failed",
+                        error=safe_error,
+                    )
+                except Exception as status_exc:
+                    logger.error(
+                        "Critical semantic-review notification status write failed "
+                        "for raw_message_id=%s: %s",
+                        claim.raw_message_id,
+                        sanitize_notifier_exception(status_exc),
+                    )
+                logger.error(
+                    "Critical semantic-review notifier failed for raw_message_id=%s: %s",
                     claim.raw_message_id,
+                    safe_error,
                 )
             else:
                 await asyncio.to_thread(
                     _update_critical_notification_delivery,
                     session_factory,
                     raw_message_id=claim.raw_message_id,
-                    fingerprint=fingerprint,
+                    fingerprint=claimed_notification.fingerprint,
                     status="sent",
                 )
         return True

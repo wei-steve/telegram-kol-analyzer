@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -11,7 +12,7 @@ from uuid import uuid4
 from sqlalchemy import and_, case, or_, update
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.models import RecognitionDecision, utc_now
+from telegram_kol_research.models import RawMessage, RecognitionDecision, utc_now
 
 
 @dataclass(frozen=True)
@@ -35,8 +36,25 @@ class SemanticReviewClaim:
     token: str
 
 
+@dataclass(frozen=True)
+class CriticalNotificationClaim:
+    raw_message_id: int
+    fingerprint: str
+    payload_json: str
+    payload: dict[str, Any]
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def save_terminal_authoritative_decision(
@@ -472,11 +490,61 @@ def claim_critical_notification(
     session_factory: sessionmaker,
     *,
     raw_message_id: int,
-    fingerprint: str,
-) -> bool:
-    """Reserve the single critical-review notification allowed for a message."""
+) -> CriticalNotificationClaim | None:
+    """Atomically freeze and reserve one critical notification snapshot."""
 
     with session_factory() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == raw_message_id)
+            .one_or_none()
+        )
+        if (
+            row is None
+            or row.comparison_status != "completed"
+            or row.disagreement_severity != "critical"
+            or row.notification_fingerprint is not None
+            or row.notification_status is not None
+        ):
+            session.rollback()
+            return None
+        raw_message = session.get(RawMessage, raw_message_id)
+        if raw_message is None:
+            session.rollback()
+            return None
+        payload = {
+            "raw_message_id": raw_message_id,
+            "source": {
+                "chat_id": raw_message.chat_id,
+                "message_id": raw_message.message_id,
+                "sender_id": raw_message.sender_id,
+                "sender_name": raw_message.sender_name,
+                "posted_at": (
+                    raw_message.posted_at.isoformat()
+                    if raw_message.posted_at is not None
+                    else None
+                ),
+                "text": raw_message.text or "",
+            },
+            "authoritative": {
+                "model": row.authoritative_model,
+                "status": row.authoritative_status,
+                "payload": json.loads(row.authoritative_payload_json),
+            },
+            "comparison": {
+                "model": row.comparison_model,
+                "payload": json.loads(row.comparison_payload_json or "{}"),
+            },
+            "severity": row.disagreement_severity,
+            "automation": {
+                "status": row.automation_status,
+                "reason": row.automation_reason,
+            },
+        }
+        payload_json = _canonical_json(payload)
+        fingerprint = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        observed_updated_at = row.updated_at
         result = session.execute(
             update(RecognitionDecision)
             .where(
@@ -485,16 +553,26 @@ def claim_critical_notification(
                 RecognitionDecision.disagreement_severity == "critical",
                 RecognitionDecision.notification_fingerprint.is_(None),
                 RecognitionDecision.notification_status.is_(None),
+                RecognitionDecision.updated_at == observed_updated_at,
             )
             .values(
                 notification_fingerprint=fingerprint,
+                notification_payload_json=payload_json,
                 notification_status="scheduled",
                 notification_error=None,
                 updated_at=utc_now(),
             )
         )
+        if result.rowcount != 1:
+            session.rollback()
+            return None
         session.commit()
-        return result.rowcount == 1
+        return CriticalNotificationClaim(
+            raw_message_id=raw_message_id,
+            fingerprint=fingerprint,
+            payload_json=payload_json,
+            payload=payload,
+        )
 
 
 def update_recognition_execution_outcome(

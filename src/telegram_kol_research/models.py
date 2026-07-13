@@ -171,6 +171,7 @@ class RecognitionDecision(Base):
     comparison_claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     compared_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     notification_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    notification_payload_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 

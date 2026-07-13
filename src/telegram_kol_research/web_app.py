@@ -109,10 +109,7 @@ from telegram_kol_research.recovery_live_submit import submit_recovery_order_liv
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_runner import run_recovery_dry_run
-from telegram_kol_research.semantic_disagreement_review import (
-    normalize_mimo_action,
-    run_semantic_review_loop,
-)
+from telegram_kol_research.semantic_disagreement_review import run_semantic_review_loop
 from telegram_kol_research.strategy_alerts import (
     StrategyAlertConfig,
     load_strategy_alert_config,
@@ -198,75 +195,7 @@ def _build_semantic_review_notifier(app: FastAPI):
     if not isinstance(config, SystemOperatorBotConfig):
         return None
 
-    async def notify(*, raw_message_id: int, review: Any) -> None:
-        with app.state.session_factory() as session:
-            raw_message = session.get(RawMessage, raw_message_id)
-            decision = (
-                session.query(RecognitionDecision)
-                .filter(RecognitionDecision.raw_message_id == raw_message_id)
-                .one_or_none()
-            )
-            if raw_message is None:
-                logger.warning(
-                    "Semantic review notification skipped; raw message %s was not found",
-                    raw_message_id,
-                )
-                return
-            raw_payload = (
-                decision.authoritative_payload_json if decision is not None else "{}"
-            )
-            try:
-                authoritative_payload = json.loads(raw_payload or "{}")
-            except (TypeError, ValueError):
-                authoritative_payload = {}
-            persisted_review_payload: dict[str, Any] | None = None
-            if decision is not None and decision.comparison_payload_json:
-                try:
-                    candidate = json.loads(decision.comparison_payload_json)
-                except (TypeError, ValueError):
-                    candidate = None
-                if isinstance(candidate, dict):
-                    persisted_review_payload = candidate
-            review_payload = (
-                persisted_review_payload
-                if persisted_review_payload is not None
-                else (
-                    review.review_payload
-                    if isinstance(review.review_payload, dict)
-                    else review.auxiliary_payload
-                )
-            )
-            independent_action = review_payload.get("independent_action")
-            if not isinstance(independent_action, dict):
-                independent_action = {}
-            evidence = review_payload.get("evidence")
-            if not isinstance(evidence, list):
-                evidence = []
-            payload = {
-                "chat_id": raw_message.chat_id,
-                "message_id": raw_message.message_id,
-                "sender_name": raw_message.sender_name,
-                "posted_at": raw_message.posted_at,
-                "text": raw_message.text,
-                "agreement_status": review.decision.agreement_status,
-                "conflict_types": list(review.decision.conflict_types),
-                "deepseek": {
-                    "status": independent_action.get("action_type") or "none",
-                    "kind": "semantic_review",
-                    "reason": review_payload.get("reason") or "-",
-                    "evidence": evidence,
-                    "conflict_types": list(review.decision.conflict_types),
-                },
-                "mimo": {
-                    "status": normalize_mimo_action(authoritative_payload)["action_type"],
-                    "kind": "authoritative",
-                    "reason": authoritative_payload.get("reason") or "-",
-                },
-                "automation": {
-                    "status": decision.automation_status if decision is not None else "-",
-                    "reason": decision.automation_reason if decision is not None else None,
-                },
-            }
+    async def notify(*, raw_message_id: int, payload: dict[str, Any]) -> None:
         await send_semantic_disagreement_notification(config=config, payload=payload)
 
     return notify

@@ -1,8 +1,10 @@
 import asyncio
 import hashlib
 import json
+import logging
 from datetime import datetime, timedelta
 
+import httpx
 import pytest
 
 from telegram_kol_research.ai_recognition_config import AiProviderConfig, AiRecognitionConfig
@@ -272,6 +274,11 @@ def test_worker_persists_sent_status_and_canonical_fingerprint(tmp_path):
         with factory() as session:
             row = session.query(RecognitionDecision).one()
             observed.append((row.notification_status, row.automation_status))
+        assert kwargs["payload"]["text"] == "全部出局"
+        assert kwargs["payload"]["conflict_types"] == [
+            "actionability",
+            "urgent_exit_missed",
+        ]
 
     asyncio.run(run_semantic_review_once(
         factory,
@@ -281,25 +288,19 @@ def test_worker_persists_sent_status_and_canonical_fingerprint(tmp_path):
         now=NOW,
     ))
 
-    canonical = json.dumps(
-        {
-            "authoritative_payload": mimo,
-            "comparison_payload": payload,
-            "raw_message_id": raw_id,
-            "severity": "critical",
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
     with factory() as session:
         row = session.query(RecognitionDecision).one()
         assert observed == [("scheduled", "submitted")]
         assert row.notification_status == "sent"
         assert row.notification_error is None
         assert row.notification_fingerprint == hashlib.sha256(
-            canonical.encode("utf-8")
+            row.notification_payload_json.encode("utf-8")
         ).hexdigest()
+        persisted_payload = json.loads(row.notification_payload_json)
+        assert persisted_payload["comparison"]["payload"]["conflict_types"] == [
+            "actionability",
+            "urgent_exit_missed",
+        ]
         assert row.automation_status == "submitted"
         assert row.automation_reason == "preserve me"
 
@@ -350,7 +351,7 @@ def test_worker_failed_notification_is_final_and_does_not_change_automation(tmp_
     with factory() as session:
         row = session.query(RecognitionDecision).one()
         assert row.notification_status == "failed"
-        assert row.notification_error == "telegram timeout"
+        assert row.notification_error == "TimeoutError"
         assert row.automation_status == "submitted"
         assert row.automation_reason == "preserve me"
 
@@ -395,6 +396,153 @@ def test_notification_delivery_status_update_never_overwrites_newer_automation(t
         assert row.notification_status == "sent"
         assert row.automation_status == "reconciled"
         assert row.automation_reason == "position_absent"
+
+
+def test_worker_sends_generation_a_claimed_payload_after_generation_b_mutates_db(tmp_path):
+    factory, raw_id, mimo = _setup(tmp_path, text="generation A source")
+    review_payload = _review_payload(action_type="exit_full", critical=True)
+    sent = []
+
+    def notifier(**kwargs):
+        with factory() as session:
+            raw = session.get(RawMessage, raw_id)
+            row = session.query(RecognitionDecision).one()
+            raw.text = "generation B source"
+            row.authoritative_payload_json = json.dumps(
+                {"reason": "authority B"}, ensure_ascii=False, sort_keys=True
+            )
+            row.comparison_payload_json = json.dumps(
+                {
+                    "independent_action": {"action_type": "none"},
+                    "conflict_types": ["symbol"],
+                    "evidence": ["evidence B"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            row.automation_status = "skipped"
+            row.automation_reason = "generation B"
+            session.commit()
+        sent.append(kwargs["payload"])
+
+    asyncio.run(run_semantic_review_once(
+        factory,
+        config=AiRecognitionConfig(),
+        notifier=notifier,
+        reviewer=lambda *args, **kwargs: _run(raw_id, mimo, review_payload),
+        now=NOW,
+    ))
+
+    assert sent[0]["text"] == "generation A source"
+    assert sent[0]["deepseek"]["status"] == "exit_full"
+    assert sent[0]["deepseek"]["evidence"] == ["全部出局"]
+    assert sent[0]["conflict_types"] == [
+        "actionability",
+        "urgent_exit_missed",
+    ]
+    assert sent[0]["automation"] == {
+        "status": "submitted",
+        "reason": "preserve me",
+    }
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        stored = json.loads(row.notification_payload_json)
+        assert stored["source"]["text"] == "generation A source"
+        assert stored["comparison"]["payload"]["evidence"] == ["全部出局"]
+        assert row.notification_fingerprint == hashlib.sha256(
+            row.notification_payload_json.encode("utf-8")
+        ).hexdigest()
+
+
+def test_notifier_http_error_persists_and_logs_only_safe_summary(
+    tmp_path, caplog, monkeypatch
+):
+    factory, raw_id, mimo = _setup(tmp_path, text="全部出局")
+    payload = _review_payload(action_type="exit_full", critical=True)
+    secret = "botSECRET_TOKEN"
+
+    def fail_notification(**kwargs):
+        request = httpx.Request(
+            "POST", f"https://api.telegram.org/{secret}/sendMessage?chat_id=987"
+        )
+        response = httpx.Response(
+            502,
+            request=request,
+            text=f"upstream body leaked {secret}",
+            headers={"X-Secret": secret},
+        )
+        raise httpx.HTTPStatusError(
+            f"request failed at {request.url} body={response.text}",
+            request=request,
+            response=response,
+        )
+
+    monkeypatch.setattr(review_module.logger, "propagate", True)
+    caplog.set_level(logging.ERROR, logger=review_module.__name__)
+    review_module.logger.addHandler(caplog.handler)
+    try:
+        asyncio.run(run_semantic_review_once(
+            factory,
+            config=AiRecognitionConfig(),
+            notifier=fail_notification,
+            reviewer=lambda *args, **kwargs: _run(raw_id, mimo, payload),
+            now=NOW,
+        ))
+    finally:
+        review_module.logger.removeHandler(caplog.handler)
+
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.notification_status == "failed"
+        assert row.notification_error == "HTTPStatusError status=502"
+        assert secret not in (row.notification_error or "")
+    assert secret not in caplog.text
+    assert "chat_id=987" not in caplog.text
+    assert "upstream body" not in caplog.text
+    assert "HTTPStatusError status=502" in caplog.text
+
+
+def test_notifier_secret_is_not_logged_if_failed_status_write_also_fails(
+    tmp_path, caplog, monkeypatch
+):
+    factory, raw_id, mimo = _setup(tmp_path, text="全部出局")
+    payload = _review_payload(action_type="exit_full", critical=True)
+    secret = "botSECRET_TOKEN"
+
+    def fail_notification(**kwargs):
+        request = httpx.Request("POST", f"https://api.telegram.org/{secret}")
+        response = httpx.Response(503, request=request, text=secret)
+        raise httpx.HTTPStatusError(
+            f"notifier leaked {secret}", request=request, response=response
+        )
+
+    def fail_status_write(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        review_module,
+        "_update_critical_notification_delivery",
+        fail_status_write,
+    )
+    monkeypatch.setattr(review_module.logger, "propagate", True)
+    caplog.set_level(logging.ERROR, logger=review_module.__name__)
+    review_module.logger.addHandler(caplog.handler)
+    try:
+        asyncio.run(run_semantic_review_once(
+            factory,
+            config=AiRecognitionConfig(),
+            notifier=fail_notification,
+            reviewer=lambda *args, **kwargs: _run(raw_id, mimo, payload),
+            now=NOW,
+        ))
+    finally:
+        review_module.logger.removeHandler(caplog.handler)
+
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.notification_status == "scheduled"
+    assert secret not in caplog.text
+    assert "HTTPStatusError status=503" in caplog.text
 
 
 def test_worker_does_not_duplicate_claimed_notification(tmp_path):

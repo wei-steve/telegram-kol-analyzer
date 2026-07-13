@@ -26,16 +26,11 @@ from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.models import RawMessage
-from telegram_kol_research.models import RecognitionDecision
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.message_recognition import MessageRecognitionResult
-from telegram_kol_research.semantic_disagreement_review import (
-    SemanticReviewDecision,
-    SemanticReviewRun,
-)
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_bot_commands import (
     _log_system_operator_callback_processed,
@@ -122,81 +117,34 @@ def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypa
         sent.append(kwargs)
 
     async def fake_semantic_review_runner(**kwargs):
-        with app.state.session_factory() as session:
-            raw_message = RawMessage(
-                chat_id=88,
-                message_id=12,
-                sender_name="Demo",
-                text="BTC 全部出局",
-            )
-            session.add(raw_message)
-            session.flush()
-            session.add(
-                RecognitionDecision(
-                    raw_message_id=raw_message.id,
-                    input_kind="text",
-                    authoritative_model="mimo-v2.5",
-                    authoritative_status="非策略",
-                    authoritative_payload_json=json.dumps(
-                        {
-                            "reason": "MiMo 识别为空仓退出",
-                            "lifecycle_event": {"event_type": "exit_position"},
-                        },
-                        ensure_ascii=False,
-                    ),
-                    agreement_status="disagreed",
-                    differences_json='["full_vs_partial_exit"]',
-                    automation_status="submitted",
-                    automation_reason="close_position",
-                    prompt_versions_json="{}",
-                    comparison_status="completed",
-                    disagreement_severity="critical",
-                    comparison_payload_json="{}",
-                )
-            )
-            session.commit()
-            raw_message_id = raw_message.id
-        review_payload = {
-            "independent_action": {
-                "action_type": "exit_full",
-                "target_lifecycle_id": None,
-                "symbol": "BTC",
-                "side": None,
-                "stop_loss": None,
-                "take_profit": None,
-                "management_action": "close_position",
-            },
-            "evidence": ["全部出局"],
+        payload = {
+            "chat_id": 88,
+            "message_id": 12,
+            "sender_name": "Demo",
+            "posted_at": None,
+            "text": "BTC 全部出局",
+            "agreement_status": "disagreed",
             "conflict_types": ["urgent_exit_missed"],
-            "material_disagreement": True,
-            "suggested_severity": "critical",
-            "confidence": 0.99,
-            "reason": "DeepSeek 独立复核认为需要退出",
+            "deepseek": {
+                "status": "exit_full",
+                "kind": "semantic_review",
+                "reason": "DeepSeek 独立复核认为需要退出",
+                "evidence": ["全部出局"],
+                "conflict_types": ["urgent_exit_missed"],
+            },
+            "mimo": {
+                "status": "exit_full",
+                "kind": "authoritative",
+                "reason": "MiMo 识别为空仓退出",
+            },
+            "automation": {
+                "status": "submitted",
+                "reason": "close_position",
+            },
         }
-        with app.state.session_factory() as session:
-            decision = session.query(RecognitionDecision).filter_by(
-                raw_message_id=raw_message_id
-            ).one()
-            decision.comparison_payload_json = json.dumps(
-                review_payload, ensure_ascii=False
-            )
-            session.commit()
         await kwargs["notifier"](
-            raw_message_id=raw_message_id,
-            review=SemanticReviewRun(
-                raw_message_id=raw_message_id,
-                model="deepseek-review",
-                review_payload=review_payload,
-                auxiliary_payload=review_payload,
-                decision=SemanticReviewDecision(
-                    agreement_status="disagreed",
-                    severity="critical",
-                    conflict_types=("urgent_exit_missed",),
-                    differences=("MiMo missed exit",),
-                    reason="critical exit disagreement",
-                ),
-                prompt_versions={"trading.disagreement.semantic_review": 8},
-            ),
+            raw_message_id=1,
+            payload=payload,
         )
         started.set()
         await asyncio.Event().wait()

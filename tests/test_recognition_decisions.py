@@ -1,4 +1,5 @@
 import json
+import hashlib
 from datetime import datetime, timedelta
 
 import pytest
@@ -310,9 +311,10 @@ def test_notification_claim_is_once_per_raw_message_and_survives_resaves(tmp_pat
         compared_at=datetime(2026, 7, 13, 12, 0),
     )
 
-    assert claim_critical_notification(
-        session_factory, raw_message_id=raw_id, fingerprint="first"
-    ) is True
+    first_claim = claim_critical_notification(
+        session_factory, raw_message_id=raw_id
+    )
+    assert first_claim is not None
     update_recognition_execution_outcome(
         session_factory,
         raw_message_id=raw_id,
@@ -321,16 +323,17 @@ def test_notification_claim_is_once_per_raw_message_and_survives_resaves(tmp_pat
         notification_status="sent",
     )
     assert claim_critical_notification(
-        session_factory, raw_message_id=raw_id, fingerprint="first"
-    ) is False
+        session_factory, raw_message_id=raw_id
+    ) is None
     save_pending_authoritative_decision(session_factory, original)
     assert claim_critical_notification(
-        session_factory, raw_message_id=raw_id, fingerprint="second"
-    ) is False
+        session_factory, raw_message_id=raw_id
+    ) is None
 
     with session_factory() as session:
         row = session.query(RecognitionDecision).one()
-        assert row.notification_fingerprint == "first"
+        assert row.notification_fingerprint == first_claim.fingerprint
+        assert row.notification_payload_json == first_claim.payload_json
         assert row.notification_status == "sent"
 
 
@@ -359,8 +362,8 @@ def test_failed_notification_delivery_keeps_original_claim_reserved(tmp_path):
         session.commit()
 
     assert claim_critical_notification(
-        session_factory, raw_message_id=raw_id, fingerprint="replacement"
-    ) is False
+        session_factory, raw_message_id=raw_id
+    ) is None
 
 
 def test_changed_authoritative_payload_resets_comparison_and_execution_outcome(tmp_path):
@@ -388,9 +391,10 @@ def test_changed_authoritative_payload_resets_comparison_and_execution_outcome(t
         automation_status="submitted",
         automation_reason="close_position",
     )
-    assert claim_critical_notification(
-        session_factory, raw_message_id=raw_id, fingerprint="old-review"
+    old_claim = claim_critical_notification(
+        session_factory, raw_message_id=raw_id
     )
+    assert old_claim is not None
 
     save_pending_authoritative_decision(
         session_factory,
@@ -404,8 +408,136 @@ def test_changed_authoritative_payload_resets_comparison_and_execution_outcome(t
         assert row.auxiliary_payload_json is None
         assert row.automation_status is None
         assert row.automation_reason is None
-        assert row.notification_fingerprint == "old-review"
+        assert row.notification_fingerprint == old_claim.fingerprint
+        assert row.notification_payload_json == old_claim.payload_json
         assert row.notification_status == "scheduled"
+
+
+def test_critical_notification_claim_freezes_generation_a_across_rerecognition(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id = _raw_message(session_factory)
+    with session_factory() as session:
+        raw = session.get(RawMessage, raw_id)
+        raw.text = "generation A source"
+        raw.sender_name = "source A"
+        session.commit()
+    _save_and_finalize(
+        session_factory,
+        _record(
+            raw_id,
+            {
+                "reason": "authority A",
+                "lifecycle_event": {"event_type": "exit_position"},
+            },
+        ),
+    )
+    claim = _claim(session_factory)
+    complete_semantic_review(
+        session_factory,
+        raw_message_id=raw_id,
+        claim_token=claim.token,
+        model="deepseek-A",
+        auxiliary_payload={},
+        comparison_payload={
+            "independent_action": {"action_type": "exit_partial"},
+            "conflict_types": ["full_vs_partial_exit"],
+            "evidence": ["evidence A"],
+            "reason": "review A",
+        },
+        agreement_status="disagreed",
+        severity="critical",
+        differences=["action_type"],
+        prompt_versions={},
+        compared_at=datetime(2026, 7, 13, 12, 0),
+    )
+
+    notification = claim_critical_notification(
+        session_factory, raw_message_id=raw_id
+    )
+    assert notification is not None
+
+    with session_factory() as session:
+        raw = session.get(RawMessage, raw_id)
+        row = session.query(RecognitionDecision).one()
+        raw.text = "generation B source"
+        row.authoritative_payload_json = json.dumps(
+            {"reason": "authority B"}, ensure_ascii=False, sort_keys=True
+        )
+        row.comparison_payload_json = json.dumps(
+            {
+                "conflict_types": ["symbol"],
+                "evidence": ["evidence B"],
+                "reason": "review B",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        row.automation_status = "skipped"
+        row.automation_reason = "generation B"
+        session.commit()
+
+    assert notification.payload["source"]["text"] == "generation A source"
+    assert notification.payload["authoritative"]["payload"]["reason"] == "authority A"
+    assert notification.payload["comparison"]["payload"]["evidence"] == ["evidence A"]
+    assert notification.payload["automation"] == {
+        "status": "skipped",
+        "reason": "test_setup",
+    }
+    assert notification.fingerprint == hashlib.sha256(
+        notification.payload_json.encode("utf-8")
+    ).hexdigest()
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.notification_payload_json == notification.payload_json
+        assert row.notification_fingerprint == notification.fingerprint
+
+
+def test_critical_notification_claim_uses_generation_b_if_it_wins_before_claim(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id = _raw_message(session_factory)
+    _save_and_finalize(session_factory, _record(raw_id, {"reason": "authority A"}))
+    claim = _claim(session_factory)
+    complete_semantic_review(
+        session_factory,
+        raw_message_id=raw_id,
+        claim_token=claim.token,
+        model="deepseek-A",
+        auxiliary_payload={},
+        comparison_payload={"conflict_types": ["actionability"], "evidence": ["A"]},
+        agreement_status="disagreed",
+        severity="critical",
+        differences=["action_type"],
+        prompt_versions={},
+        compared_at=datetime(2026, 7, 13, 12, 0),
+    )
+    with session_factory() as session:
+        raw = session.get(RawMessage, raw_id)
+        row = session.query(RecognitionDecision).one()
+        raw.text = "generation B source"
+        row.authoritative_payload_json = json.dumps(
+            {"reason": "authority B"}, ensure_ascii=False, sort_keys=True
+        )
+        row.comparison_payload_json = json.dumps(
+            {"conflict_types": ["symbol"], "evidence": ["B"]},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        row.automation_status = "submitted"
+        row.automation_reason = "generation B"
+        session.commit()
+
+    notification = claim_critical_notification(
+        session_factory, raw_message_id=raw_id
+    )
+
+    assert notification is not None
+    assert notification.payload["source"]["text"] == "generation B source"
+    assert notification.payload["authoritative"]["payload"]["reason"] == "authority B"
+    assert notification.payload["comparison"]["payload"]["evidence"] == ["B"]
+    assert notification.payload["automation"] == {
+        "status": "submitted",
+        "reason": "generation B",
+    }
 
 
 def test_stale_completion_cannot_overwrite_changed_authoritative_payload(tmp_path):

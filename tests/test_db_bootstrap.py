@@ -76,6 +76,7 @@ def test_database_bootstrap_creates_recognition_decisions_table(tmp_path):
         "comparison_claim_token",
         "compared_at",
         "notification_fingerprint",
+        "notification_payload_json",
         "created_at",
         "updated_at",
     }.issubset(columns)
@@ -148,6 +149,7 @@ def test_database_bootstrap_backfills_recognition_decisions_semantic_review_as_c
         "comparison_claim_token",
         "compared_at",
         "notification_fingerprint",
+        "notification_payload_json",
     } <= columns
     assert status == "completed"
 

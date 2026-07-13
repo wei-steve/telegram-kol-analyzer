@@ -113,6 +113,9 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "notification_fingerprint": (
             "ALTER TABLE recognition_decisions ADD COLUMN notification_fingerprint VARCHAR(64)"
         ),
+        "notification_payload_json": (
+            "ALTER TABLE recognition_decisions ADD COLUMN notification_payload_json TEXT"
+        ),
     },
     "ai_prompt_versions": {
         "validated_at": "ALTER TABLE ai_prompt_versions ADD COLUMN validated_at DATETIME",
