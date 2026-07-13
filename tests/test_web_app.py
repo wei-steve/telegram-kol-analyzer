@@ -1,5 +1,8 @@
+import asyncio
 import json
 import re
+import threading
+import time
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -31,6 +34,152 @@ from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_bot_commands import (
     _log_system_operator_callback_processed,
 )
+
+
+def test_semantic_review_worker_lifespan_starts_once_without_telegram_and_stops_first(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "groups.yaml"
+    config_path.write_text(
+        "groups:\n"
+        "  - chat_title: Demo Group\n"
+        "    chat_id: 77\n"
+        "    enabled: true\n"
+        "    ai_strategy_enabled: false\n",
+        encoding="utf-8",
+    )
+    ai_config_path = tmp_path / "ai_recognition.yaml"
+    started = threading.Event()
+    calls = []
+    shutdown_order = []
+
+    async def fake_semantic_review_runner(**kwargs):
+        calls.append(kwargs)
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            shutdown_order.append("semantic_review_stopped")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        live_target_titles=set(),
+        telegram_client=None,
+        group_config=load_group_config(config_path),
+        group_config_path=config_path,
+        ai_recognition_config_path=ai_config_path,
+        semantic_review_runner=fake_semantic_review_runner,
+    )
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="system-token",
+        chat_id="system-chat",
+    )
+    broker_type = type(app.state.live_update_broker)
+    original_close = broker_type.close
+
+    def record_resource_close(broker):
+        shutdown_order.append("resources_closed")
+        original_close(broker)
+
+    monkeypatch.setattr(broker_type, "close", record_resource_close)
+
+    with TestClient(app) as client:
+        assert started.wait(timeout=1)
+        assert len(calls) == 1
+        assert calls[0]["session_factory"] is app.state.session_factory
+        assert calls[0]["config_path"] == ai_config_path
+        assert callable(calls[0]["notifier"])
+        assert app.state.semantic_review_task is not None
+
+        response = client.post(
+            "/api/groups/77/automation",
+            json={"ai_strategy_enabled": True},
+        )
+
+        assert response.status_code == 200
+        assert len(calls) == 1
+
+    assert app.state.semantic_review_task is None
+    assert shutdown_order == ["semantic_review_stopped", "resources_closed"]
+
+
+def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypatch):
+    started = threading.Event()
+    sent = []
+    bot_config = SystemOperatorBotConfig(
+        bot_token="system-token",
+        chat_id="system-chat",
+    )
+    app = None
+
+    async def fake_sender(**kwargs):
+        sent.append(kwargs)
+
+    async def fake_semantic_review_runner(**kwargs):
+        with app.state.session_factory() as session:
+            raw_message = RawMessage(
+                chat_id=88,
+                message_id=12,
+                sender_name="Demo",
+                text="BTC 全部出局",
+            )
+            session.add(raw_message)
+            session.commit()
+            raw_message_id = raw_message.id
+        await kwargs["notifier"](
+            raw_message_id=raw_message_id,
+            review=SimpleNamespace(
+                auxiliary_payload={"recognition_result": "非策略"},
+                review_payload={"reason": "DeepSeek 独立复核认为需要退出"},
+            ),
+        )
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "telegram_kol_research.web_app.send_ai_recognition_conflict_review",
+        fake_sender,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        semantic_review_runner=fake_semantic_review_runner,
+    )
+    app.state.system_operator_bot_config = bot_config
+
+    with TestClient(app):
+        assert started.wait(timeout=1)
+
+    assert len(sent) == 1
+    assert sent[0]["config"] is bot_config
+    assert sent[0]["payload"]["chat_id"] == 88
+    assert sent[0]["payload"]["message_id"] == 12
+    assert sent[0]["payload"]["text"] == "BTC 全部出局"
+
+
+def test_semantic_review_worker_failure_is_logged(tmp_path):
+    failed = threading.Event()
+
+    async def failing_semantic_review_runner(**kwargs):
+        failed.set()
+        raise RuntimeError("semantic worker crashed")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        semantic_review_runner=failing_semantic_review_runner,
+    )
+
+    log_path = app.state.log_directory / "telegram-kol.log"
+    with TestClient(app) as client:
+        assert failed.wait(timeout=1)
+        for _ in range(20):
+            log_text = log_path.read_text(encoding="utf-8")
+            if "semantic_review_task exited with error" in log_text:
+                break
+            client.get("/api/freshness")
+            time.sleep(0.01)
+
+    assert "Background task semantic_review_task exited with error" in log_text
+    assert "semantic worker crashed" in log_text
 
 
 def test_root_page_renders_successfully(tmp_path):

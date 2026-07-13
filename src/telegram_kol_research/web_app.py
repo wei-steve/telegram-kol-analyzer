@@ -53,7 +53,11 @@ from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.message_recognition import recognize_message_now
-from telegram_kol_research.models import AiPromptTestRun, ExecutionBinding
+from telegram_kol_research.models import (
+    AiPromptTestRun,
+    ExecutionBinding,
+    RecognitionDecision,
+)
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.prompt_composition import (
@@ -105,6 +109,7 @@ from telegram_kol_research.recovery_live_submit import submit_recovery_order_liv
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_runner import run_recovery_dry_run
+from telegram_kol_research.semantic_disagreement_review import run_semantic_review_loop
 from telegram_kol_research.strategy_alerts import (
     StrategyAlertConfig,
     load_strategy_alert_config,
@@ -182,6 +187,60 @@ def _log_background_task_result(task_name: str):
             logger.exception("Background task %s exited with error", task_name, exc_info=exc)
 
     return _callback
+
+
+def _build_semantic_review_notifier(app: FastAPI):
+    config = app.state.system_operator_bot_config
+    if not isinstance(config, SystemOperatorBotConfig):
+        return None
+
+    async def notify(*, raw_message_id: int, review: Any) -> None:
+        with app.state.session_factory() as session:
+            raw_message = session.get(RawMessage, raw_message_id)
+            decision = (
+                session.query(RecognitionDecision)
+                .filter(RecognitionDecision.raw_message_id == raw_message_id)
+                .one_or_none()
+            )
+            if raw_message is None:
+                logger.warning(
+                    "Semantic review notification skipped; raw message %s was not found",
+                    raw_message_id,
+                )
+                return
+            raw_payload = (
+                decision.authoritative_payload_json if decision is not None else "{}"
+            )
+            try:
+                authoritative_payload = json.loads(raw_payload or "{}")
+            except (TypeError, ValueError):
+                authoritative_payload = {}
+            payload = {
+                "chat_id": raw_message.chat_id,
+                "message_id": raw_message.message_id,
+                "posted_at": raw_message.posted_at,
+                "text": raw_message.text,
+                "agreement_status": "disagreed",
+                "deepseek": {
+                    "status": review.auxiliary_payload.get("recognition_result") or "-",
+                    "kind": "semantic_review",
+                    "reason": review.review_payload.get("reason") or "-",
+                },
+                "mimo": {
+                    "status": (
+                        decision.authoritative_status if decision is not None else "-"
+                    ),
+                    "kind": "authoritative",
+                    "reason": authoritative_payload.get("reason") or "-",
+                },
+                "automation": {
+                    "status": decision.automation_status if decision is not None else "-",
+                    "reason": decision.automation_reason if decision is not None else None,
+                },
+            }
+        await send_ai_recognition_conflict_review(config=config, payload=payload)
+
+    return notify
 
 
 def _build_trader_dashboard_state(
@@ -1628,6 +1687,7 @@ def create_web_app(
     deepcoin_reconcile_startup_delay_seconds: int = 5,
     message_recognizer=None,
     ai_recognition_config_path: str | Path | None = None,
+    semantic_review_runner=None,
 ) -> FastAPI:
     """Create the minimal FastAPI app used by the web command."""
 
@@ -1638,7 +1698,18 @@ def create_web_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # ── lifecycle monitor (started first; no dependency on Telegram client) ──
+        if app.state.semantic_review_task is None:
+            app.state.semantic_review_task = asyncio.create_task(
+                app.state.semantic_review_runner(
+                    session_factory=app.state.session_factory,
+                    config_path=app.state.ai_recognition_config_path,
+                    notifier=_build_semantic_review_notifier(app),
+                )
+            )
+            app.state.semantic_review_task.add_done_callback(
+                _log_background_task_result("semantic_review_task")
+            )
+        # ── lifecycle monitor (no dependency on Telegram client) ──
         app.state.lifecycle_monitor_http = httpx.AsyncClient(timeout=10.0)
         expiry_review_notifier = None
         if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
@@ -1730,6 +1801,16 @@ def create_web_app(
         try:
             yield
         finally:
+            semantic_review_task = app.state.semantic_review_task
+            if semantic_review_task is not None:
+                semantic_review_task.cancel()
+                try:
+                    await semantic_review_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.semantic_review_task = None
             # ── lifecycle monitor shutdown ──
             lcm_task = app.state.lifecycle_monitor_task
             if lcm_task is not None:
@@ -1851,6 +1932,8 @@ def create_web_app(
         app.state.session_factory,
         load_ai_recognition_config(app.state.ai_recognition_config_path),
     )
+    app.state.semantic_review_runner = semantic_review_runner or run_semantic_review_loop
+    app.state.semantic_review_task = None
     app.state.authoritative_processor = lambda raw_message_id: _run_authoritative_processor(
         app,
         raw_message_id=raw_message_id,

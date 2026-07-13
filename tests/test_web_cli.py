@@ -13,7 +13,9 @@ def test_web_command_is_available_in_help():
     assert "alerts" in result.stdout
 
 
-def test_web_command_passes_enabled_target_titles_to_web_app(tmp_path, monkeypatch):
+def test_web_command_starts_app_for_semantic_review_without_telegram_credentials(
+    tmp_path, monkeypatch
+):
     config_path = tmp_path / "groups.yaml"
     config_path.write_text(
         """
