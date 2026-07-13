@@ -1,6 +1,6 @@
 # Telegram KOL Deepcoin Auto-Trading Context
 
-Last updated: 2026-06-12
+Last updated: 2026-07-13
 
 This document preserves the project context for future sessions. It intentionally does not store API keys, secret keys, passphrases, phone numbers, bot tokens, or chat IDs.
 
@@ -188,6 +188,17 @@ KOL control:
 
 AI must be configurable per task in a local config file.
 
+Recognition authority as of 2026-07-13:
+
+- MiMo is the single authoritative recognizer for text, images, and combined text-image messages.
+- The MiMo prompt contains the accumulated strategy/lifecycle rules previously used by DeepSeek, plus image-grounding requirements for visible text, chart annotations, direction, prices, and image quality.
+- DeepSeek runs only as an auxiliary comparison for text-only messages. Its result never overrides MiMo and cannot independently authorize a live mutation.
+- A MiMo/DeepSeek disagreement does not pause execution. The persisted MiMo result continues immediately through the existing risk and exact-position safeguards, while a Telegram operator alert records the disagreement and execution outcome.
+- If MiMo fails on text or image input, no automatic action is allowed. A text-only DeepSeek result may be displayed for reference, but remains non-authoritative; image input has no fallback recognizer.
+- Realtime listener, manual recognition, and periodic missed-message recovery must all call the same authoritative processor. Newly inserted Telegram `(chat_id, message_id)` keys are the idempotency boundary for recovery.
+
+Recognition, requested execution, submitted exchange action, and confirmed exchange state are separate facts. For a lifecycle with an active Deepcoin binding, an exit message records `management_action=exit_requested` and keeps the lifecycle active. Only Deepcoin reconciliation may finalize it as exited after the exact bound position/order is confirmed absent.
+
 Expected AI tasks:
 
 - Cheap text filter/classifier.
@@ -202,7 +213,7 @@ Context strategy:
 
 - Some tasks are one-shot per message.
 - Some tasks should use context, such as recent messages from the same KOL or thread when interpreting updates like `平仓`, `止损放...`, `剩余半仓`, or `这个单子`.
-- DeepSeek or other cached-context providers may be useful for cost savings.
+- DeepSeek or another text model may be used for auxiliary validation or cost analysis, but not as the execution authority.
 
 ## Runtime Requirements
 

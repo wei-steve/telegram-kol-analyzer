@@ -51,3 +51,16 @@ Design and implementation references:
 - `docs/plans/2026-07-12-shared-group-context.md`
 - `docs/plans/2026-07-13-lazy-workbench-loading-design.md`
 - `docs/plans/2026-07-13-lazy-workbench-loading.md`
+
+## MiMo-authoritative recognition and exit safety
+
+All production recognition paths use MiMo as the authority for text and media. Text-only messages additionally run DeepSeek as a non-authoritative comparison. A disagreement sends an operator alert after the MiMo result has continued into automation; it must never block an urgent stop-loss, take-profit, or full-exit instruction. MiMo failure blocks automatic mutation and is itself notified.
+
+The unified MiMo prompt incorporates the established DeepSeek strategy and lifecycle rules and adds explicit image-reading instructions. Decisions and model comparisons are persisted in `recognition_decisions`, including automation and notification outcomes.
+
+For a live-bound Deepcoin strategy, recognizing or submitting an exit is not proof that the position is closed. The lifecycle records `exit_requested` and remains active until exchange reconciliation confirms the exact bound position and any live entry order are absent. This rule applies to realtime, manual-recognition, and missed-message recovery paths.
+
+Design and implementation plan:
+
+- `docs/superpowers/specs/2026-07-13-mimo-authoritative-recognition-design.md`
+- `docs/superpowers/plans/2026-07-13-mimo-authoritative-recognition.md`
