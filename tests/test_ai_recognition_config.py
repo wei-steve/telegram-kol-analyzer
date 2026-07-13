@@ -5,9 +5,30 @@ from telegram_kol_research.ai_recognition_config import (
     AiModelConfig,
     AiProviderConfig,
     AiRecognitionConfig,
+    build_authoritative_mimo_prompt,
     load_ai_recognition_config,
     save_ai_recognition_config,
 )
+
+
+def test_authoritative_mimo_prompt_inherits_all_text_experience_and_image_rules():
+    prompt = build_authoritative_mimo_prompt(
+        AiRecognitionConfig(
+            recognition_prompt="CUSTOM ENTRY EXPERIENCE",
+            lifecycle_event_prompt="CUSTOM EXIT EXPERIENCE",
+            mimo_direct_prompt="CUSTOM IMAGE EXPERIENCE",
+        )
+    )
+
+    assert "CUSTOM ENTRY EXPERIENCE" in prompt
+    assert "CUSTOM EXIT EXPERIENCE" in prompt
+    assert "CUSTOM IMAGE EXPERIENCE" in prompt
+    assert "input_reading" in prompt
+    assert "lifecycle_event" in prompt
+    assert "不要补全图片" in prompt
+    assert "recognition_result" in prompt
+    assert "exit_position" in prompt
+    assert "两个维度相互独立" in prompt
 
 
 def test_load_ai_recognition_config_uses_defaults_when_file_is_missing(tmp_path):

@@ -16,14 +16,16 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.ai_recognition_config import (
     AiModelConfig,
     AiRecognitionConfig,
+    build_authoritative_mimo_prompt,
     load_ai_recognition_config,
 )
 from telegram_kol_research.media_retention import resolve_media_path
-from telegram_kol_research.models import MediaAsset, RawMessage, RecognitionExperiment, utc_now
+from telegram_kol_research.models import MediaAsset, RawMessage, RecognitionExperiment, StrategyLifecycle, utc_now
 
 
 MIMO_DIRECT_EXPERIMENT_NAME = "mimo_direct_v1"
 MIMO_DIRECT_PROMPT_VERSION = "mimo_direct_v1"
+MIMO_AUTHORITATIVE_PROMPT_VERSION = "mimo_authoritative_v1"
 MIMO_EXPERIMENT_STATUSES = {
     "是策略",
     "非策略",
@@ -82,6 +84,27 @@ class ExperimentRunStats:
     skipped_no_input: int = 0
     succeeded: int = 0
     failed: int = 0
+
+
+@dataclass(frozen=True)
+class MimoAuthoritativeResult:
+    raw_message_id: int
+    payload: dict[str, Any]
+    input_kind: str
+    model: str
+    status: str
+    error_message: str | None = None
+
+    @property
+    def is_actionable(self) -> bool:
+        if self.error_message or self.status == "识别失败":
+            return False
+        lifecycle = self.payload.get("lifecycle_event")
+        if isinstance(lifecycle, dict):
+            event_type = str(lifecycle.get("event_type") or "none")
+            if event_type != "none" and float(lifecycle.get("confidence") or 0.0) >= 0.7:
+                return True
+        return self.status == "是策略" and float(self.payload.get("confidence") or 0.0) >= 0.7
 
 
 def run_mimo_direct_experiment(
@@ -208,6 +231,89 @@ def run_mimo_direct_for_message(
         return result
 
 
+def run_mimo_authoritative_for_message(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    ai_recognition_config: AiRecognitionConfig | None = None,
+    ai_recognition_config_path: str | Path = "config/ai_recognition.yaml",
+    media_root: str | Path = "data/media",
+) -> MimoAuthoritativeResult:
+    config = ai_recognition_config or load_ai_recognition_config(ai_recognition_config_path)
+    model_config = _find_mimo_model(config)
+    if model_config is None or not model_config.provider.is_configured:
+        return MimoAuthoritativeResult(
+            raw_message_id=raw_message_id,
+            payload={},
+            input_kind="unknown",
+            model=(model_config.model if model_config is not None else "mimo-v2.5"),
+            status="识别失败",
+            error_message="MiMo model is not configured",
+        )
+
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, raw_message_id)
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        media_assets = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.raw_message_id == raw_message.id)
+            .order_by(MediaAsset.id.asc())
+            .all()
+        )
+        input_kind = _resolve_input_kind(raw_message, media_assets, media_root=media_root)
+        if input_kind == "empty":
+            return MimoAuthoritativeResult(
+                raw_message_id=raw_message_id,
+                payload={},
+                input_kind=input_kind,
+                model=model_config.model,
+                status="识别失败",
+                error_message="message has no readable text or image",
+            )
+        payload: dict[str, Any] = {}
+        error_message: str | None = None
+        try:
+            payload = _call_mimo_direct_model(
+                raw_message=raw_message,
+                media_assets=media_assets,
+                model_config=model_config,
+                prompt=build_authoritative_mimo_prompt(config),
+                media_root=media_root,
+                context_text=_build_authoritative_context(session, raw_message),
+            )
+            _validate_authoritative_payload(payload)
+        except Exception as exc:
+            payload = {}
+            error_message = str(exc)
+        experiment = _upsert_experiment_result(
+            session,
+            raw_message=raw_message,
+            model_config=model_config,
+            input_kind=input_kind,
+            payload=payload,
+            error_message=error_message,
+            prompt_version=MIMO_AUTHORITATIVE_PROMPT_VERSION,
+        )
+        session.commit()
+        return MimoAuthoritativeResult(
+            raw_message_id=raw_message_id,
+            payload=payload,
+            input_kind=input_kind,
+            model=model_config.model,
+            status=experiment.status,
+            error_message=error_message,
+        )
+
+
+def _validate_authoritative_payload(payload: dict[str, Any]) -> None:
+    if str(payload.get("recognition_result") or "") not in {"是策略", "非策略", "识别失败"}:
+        raise ValueError("MiMo response has invalid recognition_result")
+    for field in ("strategy", "lifecycle_event", "input_reading"):
+        if not isinstance(payload.get(field), dict):
+            raise ValueError(f"MiMo response missing {field}")
+
+
 def _load_experiment_messages(
     session,
     *,
@@ -240,6 +346,7 @@ def _call_mimo_direct_model(
     model_config: AiModelConfig,
     prompt: str,
     media_root: str | Path,
+    context_text: str = "",
 ) -> dict[str, Any]:
     headers = {"Content-Type": "application/json"}
     if model_config.api_key:
@@ -250,6 +357,7 @@ def _call_mimo_direct_model(
         prompt=prompt,
         model=model_config.model,
         media_root=media_root,
+        context_text=context_text,
     )
     with httpx.Client(timeout=model_config.timeout_seconds) as client:
         response = client.post(
@@ -274,6 +382,7 @@ def _build_mimo_payload(
     model: str,
     prompt: str = MIMO_DIRECT_PROMPT,
     media_root: str | Path = "data/media",
+    context_text: str = "",
 ) -> dict[str, Any]:
     user_text = (
         f"Message metadata:\n"
@@ -282,6 +391,8 @@ def _build_mimo_payload(
         f"sender={raw_message.sender_name or 'Unknown'}\n\n"
         f"Text/caption:\n{(raw_message.text or '').strip() or '(empty)'}"
     )
+    if context_text.strip():
+        user_text = f"{user_text}\n\n{context_text.strip()}"
     user_parts: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
     for media_asset in media_assets:
         data_url = _media_asset_to_data_url(media_asset, media_root=media_root)
@@ -297,6 +408,55 @@ def _build_mimo_payload(
     }
 
 
+def _build_authoritative_context(session, raw_message: RawMessage) -> str:
+    recent = (
+        session.query(RawMessage)
+        .filter(RawMessage.chat_id == raw_message.chat_id)
+        .filter(RawMessage.id != raw_message.id)
+        .order_by(RawMessage.posted_at.desc(), RawMessage.message_id.desc())
+        .limit(20)
+        .all()
+    )
+    recent_rows = [
+        {
+            "message_id": row.message_id,
+            "text": (row.text or "").strip(),
+        }
+        for row in reversed(recent)
+        if (row.text or "").strip()
+    ]
+    active = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.chat_id == raw_message.chat_id)
+        .filter(StrategyLifecycle.lifecycle_status.in_(["pending_entry", "entered", "expired"]))
+        .order_by(StrategyLifecycle.signal_at.desc())
+        .limit(20)
+        .all()
+    )
+    active_rows = [
+        {
+            "lifecycle_id": row.id,
+            "source_message_id": row.message_id,
+            "symbol": row.symbol,
+            "side": row.side,
+            "status": row.lifecycle_status,
+            "entry_range_low": row.entry_range_low,
+            "entry_range_high": row.entry_range_high,
+            "stop_loss": row.stop_loss,
+            "take_profit": row.take_profit,
+        }
+        for row in active
+    ]
+    return "\n".join(
+        [
+            "Recent context:",
+            json.dumps(recent_rows, ensure_ascii=False, sort_keys=True),
+            "Active strategies:",
+            json.dumps(active_rows, ensure_ascii=False, sort_keys=True),
+        ]
+    )
+
+
 def _upsert_experiment_result(
     session,
     *,
@@ -305,6 +465,7 @@ def _upsert_experiment_result(
     input_kind: str,
     payload: dict[str, Any],
     error_message: str | None,
+    prompt_version: str = MIMO_DIRECT_PROMPT_VERSION,
 ) -> RecognitionExperiment:
     existing = (
         session.query(RecognitionExperiment)
@@ -320,7 +481,7 @@ def _upsert_experiment_result(
             raw_message_id=raw_message.id,
             experiment_name=MIMO_DIRECT_EXPERIMENT_NAME,
             model=model_config.model,
-            prompt_version=MIMO_DIRECT_PROMPT_VERSION,
+            prompt_version=prompt_version,
             input_kind=input_kind,
             status="识别失败",
             created_at=now,
@@ -332,7 +493,7 @@ def _upsert_experiment_result(
     if status not in MIMO_EXPERIMENT_STATUSES:
         status = "识别失败"
     existing.model = model_config.model
-    existing.prompt_version = MIMO_DIRECT_PROMPT_VERSION
+    existing.prompt_version = prompt_version
     existing.input_kind = input_kind
     existing.status = status
     existing.reason = str(payload.get("reason") or "").strip() or None

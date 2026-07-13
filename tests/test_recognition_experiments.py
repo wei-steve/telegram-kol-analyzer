@@ -5,12 +5,166 @@ import httpx
 
 from telegram_kol_research.ai_recognition_config import AiModelConfig, AiRecognitionConfig
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import MediaAsset, MessageRecognition, RawMessage, RecognitionExperiment, SignalCandidate
+from telegram_kol_research.models import MediaAsset, MessageRecognition, RawMessage, RecognitionExperiment, SignalCandidate, StrategyLifecycle
 from telegram_kol_research.recognition_experiments import (
     _build_mimo_payload,
+    run_mimo_authoritative_for_message,
     run_mimo_direct_for_message,
     run_mimo_direct_experiment,
 )
+
+
+def test_run_mimo_authoritative_for_message_returns_unified_actionable_result(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=9, text="现价62800附近出局")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    payload = {
+        "recognition_result": "非策略",
+        "reason": "当前消息要求出局",
+        "strategy": {},
+        "lifecycle_event": {
+            "event_type": "exit_position",
+            "target_lifecycle_id": 439,
+            "symbol": "BTC",
+            "side": "short",
+            "confidence": 0.95,
+            "reason": "现价出局",
+        },
+        "input_reading": {"observed_text": "现价62800附近出局", "image_quality": "none"},
+        "confidence": 0.95,
+    }
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        lambda **kwargs: payload,
+    )
+
+    result = run_mimo_authoritative_for_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(
+            ai_models=[
+                AiModelConfig(
+                    id="mimo-v2.5",
+                    label="MiMo",
+                    base_url="https://api.xiaomimimo.com/v1",
+                    api_key="key",
+                    model="mimo-v2.5",
+                    supports_text=True,
+                    supports_image=True,
+                )
+            ]
+        ),
+    )
+
+    assert result.status == "非策略"
+    assert result.input_kind == "text"
+    assert result.model == "mimo-v2.5"
+    assert result.payload["lifecycle_event"]["event_type"] == "exit_position"
+    assert result.is_actionable is True
+
+
+def test_run_mimo_authoritative_for_message_contains_failure(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=10, text="BTC short")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    def fail(**kwargs):
+        raise TimeoutError("mimo timeout")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        fail,
+    )
+    result = run_mimo_authoritative_for_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(
+            ai_models=[
+                AiModelConfig(
+                    id="mimo-v2.5",
+                    label="MiMo",
+                    base_url="https://api.xiaomimimo.com/v1",
+                    model="mimo-v2.5",
+                )
+            ]
+        ),
+    )
+
+    assert result.status == "识别失败"
+    assert result.is_actionable is False
+    assert "mimo timeout" in (result.error_message or "")
+
+
+def test_run_mimo_authoritative_includes_recent_context_and_active_strategies(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(RawMessage(chat_id=100, message_id=7, text="BTC short 63500"))
+        current = RawMessage(chat_id=100, message_id=8, text="现价出局")
+        session.add(current)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=7,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 13, 1, 0, tzinfo=UTC),
+                entered_at=datetime(2026, 7, 13, 1, 1, tzinfo=UTC),
+            )
+        )
+        session.commit()
+        raw_id = current.id
+
+    captured = {}
+
+    def fake_call(**kwargs):
+        captured.update(kwargs)
+        return {
+            "recognition_result": "非策略",
+            "reason": "exit",
+            "strategy": {},
+            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+            "input_reading": {"observed_text": "现价出局", "image_quality": "none"},
+            "confidence": 0.8,
+        }
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        fake_call,
+    )
+    run_mimo_authoritative_for_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(
+            ai_models=[
+                AiModelConfig(
+                    id="mimo-v2.5",
+                    label="MiMo",
+                    base_url="https://api.xiaomimimo.com/v1",
+                    model="mimo-v2.5",
+                )
+            ]
+        ),
+    )
+
+    context_text = captured["context_text"]
+    assert "Recent context" in context_text
+    assert "BTC short 63500" in context_text
+    assert "Active strategies" in context_text
+    assert '"symbol": "BTC"' in context_text
+    assert "api_key" not in context_text
 
 
 def test_build_mimo_payload_uses_raw_image_without_ocr_text(tmp_path):

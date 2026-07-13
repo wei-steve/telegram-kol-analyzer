@@ -181,6 +181,53 @@ PRICE_SHORTHAND_NORMALIZATION_INSTRUCTION = """
 """.strip()
 
 
+MIMO_AUTHORITATIVE_OUTPUT_INSTRUCTIONS = """
+【MiMo 权威识别输出】
+你必须同时完成“新开仓识别”和“已有策略生命周期事件识别”。这两个维度相互独立：
+- 一条“出局/平仓/止盈/止损离场”消息不是新开仓，recognition_result 可以是“非策略”，同时 lifecycle_event.event_type 必须是 exit_position。
+- 持仓管理消息不得因为“不是新开仓”而遗漏生命周期事件。
+
+图片与图文要求：
+- 直接读取图片中可见的文字、表格、交易所截图、标注、箭头、标签和图表点位。
+- 必须结合当前正文/caption 与图片整体判断，不要只看其中一个。
+- 不要补全图片或文字中没有的币种、方向、价格、止损、止盈或关联策略。
+- 图片模糊、裁切、遮挡、无法读取或内部矛盾时，输出识别失败或低置信度，禁止猜测。
+
+只输出一个 JSON 对象：
+{
+  "recognition_result": "是策略 | 非策略 | 识别失败",
+  "reason": "当前消息的核心判断依据",
+  "strategy": {
+    "symbol": null,
+    "side": null,
+    "entry": null,
+    "stop_loss": null,
+    "take_profit": null,
+    "leverage": null,
+    "order_type": null
+  },
+  "lifecycle_event": {
+    "event_type": "none | entry_confirm | cancel_entry | exit_position | position_update",
+    "target_lifecycle_id": null,
+    "symbol": null,
+    "side": null,
+    "entry_price": null,
+    "exit_price": null,
+    "stop_loss": null,
+    "take_profit": null,
+    "management_action": null,
+    "confidence": 0.0,
+    "reason": "生命周期判断依据"
+  },
+  "input_reading": {
+    "observed_text": "从当前文字和图片中实际读到的关键内容",
+    "image_quality": "clear | blurry | cropped | unreadable | none"
+  },
+  "confidence": 0.0
+}
+""".strip()
+
+
 @dataclass(frozen=True)
 class AiProviderConfig:
     base_url: str = ""
@@ -225,6 +272,20 @@ class AiRecognitionConfig:
     ai_models: list[AiModelConfig] = field(default_factory=list)
     active_text_model_id: str = ""
     active_image_model_id: str = ""
+
+
+def build_authoritative_mimo_prompt(config: AiRecognitionConfig) -> str:
+    """Compose all text experience plus MiMo-only multimodal instructions."""
+
+    sections = [
+        config.recognition_prompt,
+        NORMALIZED_STRATEGY_OUTPUT_INSTRUCTIONS,
+        config.lifecycle_event_prompt,
+        PRICE_SHORTHAND_NORMALIZATION_INSTRUCTION,
+        config.mimo_direct_prompt,
+        MIMO_AUTHORITATIVE_OUTPUT_INSTRUCTIONS,
+    ]
+    return "\n\n".join(section.strip() for section in sections if section.strip())
 
 
 @dataclass(frozen=True)
