@@ -11,6 +11,7 @@ from telegram_kol_research.prompt_registry import (
     get_prompt_detail,
     list_prompt_definitions,
     publish_prompt_draft,
+    record_prompt_validation,
     record_prompt_invocation,
     resolve_active_prompt,
     rollback_prompt,
@@ -97,6 +98,13 @@ def test_publish_draft_atomically_supersedes_active_version(tmp_path):
         change_note="publish me",
     )
     assert detail.draft_version is not None
+    record_prompt_validation(
+        factory,
+        "trading.analysis.shared",
+        expected_draft_version_id=detail.draft_version.id,
+        success=True,
+        errors=(),
+    )
 
     published = publish_prompt_draft(
         factory,
@@ -136,6 +144,13 @@ def test_rollback_creates_a_new_auditable_published_version(tmp_path):
         change_note="second",
     )
     assert draft.draft_version is not None
+    record_prompt_validation(
+        factory,
+        "trading.analysis.shared",
+        expected_draft_version_id=draft.draft_version.id,
+        success=True,
+        errors=(),
+    )
     current = publish_prompt_draft(
         factory,
         "trading.analysis.shared",
@@ -157,6 +172,53 @@ def test_rollback_creates_a_new_auditable_published_version(tmp_path):
     }
     assert restored.active_version.source_version_id == original.active_version.id
     assert [item.version_number for item in restored.history] == [3, 2, 1]
+
+
+def test_publish_rejects_a_draft_without_successful_validation(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    seed_prompt_definition(factory, _seed())
+    detail = save_prompt_draft(
+        factory,
+        "trading.analysis.shared",
+        content="not validated",
+        change_note="unsafe",
+    )
+
+    with pytest.raises(PromptRegistryConflict, match="successful validation"):
+        publish_prompt_draft(
+            factory,
+            "trading.analysis.shared",
+            expected_draft_version_id=detail.draft_version.id,
+        )
+
+
+def test_editing_a_validated_draft_clears_validation_state(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    seed_prompt_definition(factory, _seed())
+    detail = save_prompt_draft(
+        factory,
+        "trading.analysis.shared",
+        content="validated draft",
+        change_note="first",
+    )
+    validated = record_prompt_validation(
+        factory,
+        "trading.analysis.shared",
+        expected_draft_version_id=detail.draft_version.id,
+        success=True,
+        errors=(),
+    )
+    assert validated.draft_version.validated_at is not None
+
+    edited = save_prompt_draft(
+        factory,
+        "trading.analysis.shared",
+        content="edited again",
+        change_note="second",
+    )
+
+    assert edited.draft_version.validated_at is None
+    assert edited.draft_version.validation_result is None
 
 
 def test_scoped_prompts_are_unique_per_chat(tmp_path):

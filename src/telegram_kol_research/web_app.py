@@ -55,16 +55,29 @@ from telegram_kol_research.message_recognition import recognize_message_now
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import StrategyLifecycle
-from telegram_kol_research.prompt_composition import render_registered_prompt
+from telegram_kol_research.prompt_composition import (
+    render_registered_prompt,
+    validate_prompt_content,
+)
 from telegram_kol_research.prompt_defaults import (
     GROUP_RESEARCH_PROMPT,
     RESEARCH_CHAT_SYSTEM_PROMPT,
     seed_default_prompt_registry,
+    seed_group_research_prompt,
 )
 from telegram_kol_research.prompt_registry import (
+    PromptDetail,
     PromptInvocationRecord,
+    PromptRegistryConflict,
+    PromptRegistryError,
     PromptRegistryNotFound,
+    get_prompt_detail,
+    list_prompt_definitions,
+    publish_prompt_draft,
     record_prompt_invocation,
+    record_prompt_validation,
+    rollback_prompt,
+    save_prompt_draft,
 )
 from telegram_kol_research.recognition_profiles import list_recognition_profiles
 from telegram_kol_research.llm_chat import (
@@ -2853,6 +2866,168 @@ def create_web_app(
             ),
         }
 
+    @app.get("/api/ai-prompts")
+    def list_ai_prompts(chat_id: int | None = None):
+        details = list_prompt_definitions(
+            app.state.session_factory,
+            chat_id=chat_id,
+        )
+        return {"items": [_prompt_detail_response(item) for item in details]}
+
+    @app.get("/api/ai-prompts/{prompt_key}")
+    def get_ai_prompt(prompt_key: str, chat_id: int | None = None):
+        try:
+            detail = get_prompt_detail(
+                app.state.session_factory,
+                prompt_key,
+                chat_id=chat_id,
+            )
+        except PromptRegistryNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _prompt_detail_response(detail)
+
+    @app.get("/api/ai-prompts/{prompt_key}/history")
+    def get_ai_prompt_history(prompt_key: str, chat_id: int | None = None):
+        try:
+            detail = get_prompt_detail(
+                app.state.session_factory,
+                prompt_key,
+                chat_id=chat_id,
+            )
+        except PromptRegistryNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "prompt_key": detail.prompt_key,
+            "chat_id": detail.scope_chat_id,
+            "items": [_prompt_version_response(item) for item in detail.history],
+        }
+
+    @app.put("/api/ai-prompts/{prompt_key}/draft")
+    def update_ai_prompt_draft(
+        prompt_key: str,
+        payload: dict[str, Any],
+        chat_id: int | None = None,
+    ):
+        if prompt_key == GROUP_RESEARCH_PROMPT and chat_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="chat_id is required for group research prompts",
+            )
+        try:
+            detail = save_prompt_draft(
+                app.state.session_factory,
+                prompt_key,
+                content=str(payload.get("content") or ""),
+                change_note=str(payload.get("change_note") or ""),
+                chat_id=chat_id,
+                expected_active_version_id=_int_or_none(
+                    payload.get("expected_active_version_id")
+                ),
+            )
+        except PromptRegistryNotFound as exc:
+            if prompt_key != GROUP_RESEARCH_PROMPT or chat_id is None:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            seed_group_research_prompt(
+                app.state.session_factory,
+                chat_id=chat_id,
+            )
+            detail = save_prompt_draft(
+                app.state.session_factory,
+                prompt_key,
+                content=str(payload.get("content") or ""),
+                change_note=str(payload.get("change_note") or ""),
+                chat_id=chat_id,
+            )
+        except PromptRegistryConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PromptRegistryError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _prompt_detail_response(detail)
+
+    @app.post("/api/ai-prompts/{prompt_key}/validate")
+    def validate_ai_prompt_draft(
+        prompt_key: str,
+        payload: dict[str, Any],
+        chat_id: int | None = None,
+    ):
+        try:
+            detail = get_prompt_detail(
+                app.state.session_factory,
+                prompt_key,
+                chat_id=chat_id,
+            )
+            expected_draft_id = int(payload.get("expected_draft_version_id"))
+            if (
+                detail.draft_version is None
+                or detail.draft_version.id != expected_draft_id
+            ):
+                raise PromptRegistryConflict("draft version changed")
+            result = validate_prompt_content(
+                prompt_key,
+                detail.draft_version.content,
+                validation_profile=detail.validation_profile,
+                required_variables=detail.required_variables,
+            )
+            record_prompt_validation(
+                app.state.session_factory,
+                prompt_key,
+                expected_draft_version_id=expected_draft_id,
+                success=result.success,
+                errors=result.errors,
+                chat_id=chat_id,
+            )
+        except PromptRegistryNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PromptRegistryConflict, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"success": result.success, "errors": list(result.errors)}
+
+    @app.post("/api/ai-prompts/{prompt_key}/publish")
+    def publish_ai_prompt(
+        prompt_key: str,
+        payload: dict[str, Any],
+        chat_id: int | None = None,
+    ):
+        try:
+            detail = publish_prompt_draft(
+                app.state.session_factory,
+                prompt_key,
+                expected_draft_version_id=int(
+                    payload.get("expected_draft_version_id")
+                ),
+                chat_id=chat_id,
+            )
+        except PromptRegistryNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PromptRegistryConflict, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _prompt_detail_response(detail)
+
+    @app.post("/api/ai-prompts/{prompt_key}/rollback")
+    def rollback_ai_prompt(
+        prompt_key: str,
+        payload: dict[str, Any],
+        chat_id: int | None = None,
+    ):
+        try:
+            detail = rollback_prompt(
+                app.state.session_factory,
+                prompt_key,
+                source_version_id=int(payload.get("source_version_id")),
+                change_note=str(payload.get("change_note") or ""),
+                expected_active_version_id=int(
+                    payload.get("expected_active_version_id")
+                ),
+                chat_id=chat_id,
+            )
+        except PromptRegistryNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PromptRegistryConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (PromptRegistryError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _prompt_detail_response(detail)
+
     @app.post("/api/ai-recognition-config")
     def update_ai_recognition_config(payload: dict[str, Any]):
         existing_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
@@ -3510,6 +3685,51 @@ def _static_asset_version() -> int:
         )
         & 0x7FFFFFFF
     )
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def _prompt_version_response(version: Any) -> dict[str, Any]:
+    return {
+        "id": version.id,
+        "version_number": version.version_number,
+        "content": version.content,
+        "status": version.status,
+        "change_note": version.change_note,
+        "source_version_id": version.source_version_id,
+        "validated_at": _datetime_to_iso(version.validated_at),
+        "validation_result": version.validation_result,
+        "created_at": _datetime_to_iso(version.created_at),
+        "updated_at": _datetime_to_iso(version.updated_at),
+        "published_at": _datetime_to_iso(version.published_at),
+    }
+
+
+def _prompt_detail_response(detail: PromptDetail) -> dict[str, Any]:
+    return {
+        "definition_id": detail.definition_id,
+        "prompt_key": detail.prompt_key,
+        "display_name": detail.display_name,
+        "description": detail.description,
+        "category": detail.category,
+        "scope_key": detail.scope_key,
+        "scope_chat_id": detail.scope_chat_id,
+        "consumers": list(detail.consumers),
+        "required_variables": list(detail.required_variables),
+        "validation_profile": detail.validation_profile,
+        "enabled": detail.enabled,
+        "active_version": _prompt_version_response(detail.active_version),
+        "draft_version": (
+            _prompt_version_response(detail.draft_version)
+            if detail.draft_version is not None
+            else None
+        ),
+        "history": [_prompt_version_response(item) for item in detail.history],
+    }
 
 
 def _datetime_to_iso(value: datetime | None) -> str | None:

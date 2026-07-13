@@ -212,6 +212,8 @@ class AiPromptVersion(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     change_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     source_version_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    validated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    validation_result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

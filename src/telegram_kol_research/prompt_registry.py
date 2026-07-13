@@ -54,6 +54,8 @@ class PromptVersionView:
     status: str
     change_note: str | None
     source_version_id: int | None
+    validated_at: object | None
+    validation_result: dict | None
     created_at: object
     updated_at: object
     published_at: object | None
@@ -122,6 +124,12 @@ def _version_view(row: AiPromptVersion) -> PromptVersionView:
         status=row.status,
         change_note=row.change_note,
         source_version_id=row.source_version_id,
+        validated_at=row.validated_at,
+        validation_result=(
+            json.loads(row.validation_result_json)
+            if row.validation_result_json
+            else None
+        ),
         created_at=row.created_at,
         updated_at=row.updated_at,
         published_at=row.published_at,
@@ -319,6 +327,8 @@ def save_prompt_draft(
             draft.content = normalized
             draft.change_note = change_note.strip() or None
             draft.updated_at = now
+            draft.validated_at = None
+            draft.validation_result_json = None
         definition.updated_at = now
         session.commit()
         return _load_detail(session, definition)
@@ -342,6 +352,13 @@ def publish_prompt_draft(
         )
         if draft is None or draft.id != expected_draft_version_id:
             raise PromptRegistryConflict("draft version changed")
+        validation_result = (
+            json.loads(draft.validation_result_json)
+            if draft.validation_result_json
+            else None
+        )
+        if draft.validated_at is None or not validation_result or not validation_result.get("success"):
+            raise PromptRegistryConflict("draft requires successful validation")
         active = session.get(AiPromptVersion, definition.active_version_id)
         if active is not None:
             active.status = "superseded"
@@ -350,6 +367,38 @@ def publish_prompt_draft(
         draft.published_at = now
         draft.updated_at = now
         definition.active_version_id = draft.id
+        definition.updated_at = now
+        session.commit()
+        return _load_detail(session, definition)
+
+
+def record_prompt_validation(
+    session_factory: sessionmaker,
+    prompt_key: str,
+    *,
+    expected_draft_version_id: int,
+    success: bool,
+    errors: tuple[str, ...],
+    chat_id: int | None = None,
+) -> PromptDetail:
+    now = utc_now()
+    with session_factory() as session:
+        definition = _get_definition(session, prompt_key, chat_id)
+        draft = (
+            session.query(AiPromptVersion)
+            .filter(AiPromptVersion.prompt_definition_id == definition.id)
+            .filter(AiPromptVersion.status == "draft")
+            .one_or_none()
+        )
+        if draft is None or draft.id != expected_draft_version_id:
+            raise PromptRegistryConflict("draft version changed")
+        draft.validated_at = now
+        draft.validation_result_json = json.dumps(
+            {"success": success, "errors": list(errors)},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        draft.updated_at = now
         definition.updated_at = now
         session.commit()
         return _load_detail(session, definition)
