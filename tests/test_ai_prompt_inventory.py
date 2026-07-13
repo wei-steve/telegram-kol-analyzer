@@ -1,5 +1,11 @@
 from pathlib import Path
 
+from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
+from telegram_kol_research.prompt_defaults import (
+    SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
+    build_prompt_seeds_from_legacy,
+)
+
 
 SRC = Path(__file__).parents[1] / "src/telegram_kol_research"
 AI_CALL_MODULES = {
@@ -9,6 +15,15 @@ AI_CALL_MODULES = {
     "llm_chat.py",
     "strategy_alerts.py",
 }
+
+
+def test_prompt_inventory_contains_semantic_disagreement_review():
+    keys = {
+        seed.prompt_key
+        for seed in build_prompt_seeds_from_legacy(AiRecognitionConfig())
+    }
+
+    assert SEMANTIC_DISAGREEMENT_REVIEW_PROMPT in keys
 
 
 def test_every_ai_call_site_uses_prompt_registry_without_embedded_business_prompts():

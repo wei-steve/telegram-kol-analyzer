@@ -9,10 +9,12 @@ from telegram_kol_research.prompt_composition import (
     validate_prompt_content,
 )
 from telegram_kol_research.prompt_defaults import (
+    DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
     DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
     MIMO_VISION_PROMPT,
     SHARED_TRADING_PROMPT,
     STRATEGY_ALERT_PROMPT,
+    SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
 )
 from telegram_kol_research.prompt_registry import PromptSeed, seed_prompt_definition
 
@@ -143,6 +145,87 @@ def test_mimo_vision_validation_rejects_json_output_instruction():
 
     assert result.success is False
     assert any("输出结构" in error for error in result.errors)
+
+
+def test_semantic_disagreement_review_validation_accepts_default_prompt():
+    result = validate_prompt_content(
+        SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
+        DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
+        validation_profile="semantic_disagreement_review",
+        required_variables=(),
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.parametrize(
+    "marker",
+    (
+        '"independent_action"',
+        '"target_lifecycle_id"',
+        '"evidence"',
+        '"conflict_types"',
+        '"material_disagreement"',
+        '"reason"',
+    ),
+)
+def test_semantic_disagreement_review_validation_rejects_missing_schema_marker(marker):
+    result = validate_prompt_content(
+        SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
+        DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT.replace(marker, ""),
+        validation_profile="semantic_disagreement_review",
+        required_variables=(),
+    )
+
+    assert result.success is False
+    assert any(marker in error for error in result.errors)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    (
+        "entry_confirm",
+        "exit_partial",
+        "critical",
+        "urgent_exit_missed",
+        "wording_only",
+        "不得声称能够读取图片像素",
+        "不得修改交易",
+        "必须引用当前消息中的证据",
+    ),
+)
+def test_semantic_disagreement_review_validation_rejects_weakened_safety_contract(marker):
+    result = validate_prompt_content(
+        SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
+        DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT.replace(marker, ""),
+        validation_profile="semantic_disagreement_review",
+        required_variables=(),
+    )
+
+    assert result.success is False
+    assert any(marker in error for error in result.errors)
+
+
+@pytest.mark.parametrize(
+    "closed_contract",
+    (
+        "none | entry | entry_confirm | cancel_entry | exit_full | exit_partial | position_update",
+        "none | normal | critical",
+        "actionability, action_family, full_vs_partial_exit, symbol, side, "
+        "target_lifecycle, stop_intent, urgent_exit_missed, execution_unresolved, "
+        "non_material_price_detail, wording_only",
+    ),
+)
+def test_semantic_disagreement_review_validation_requires_closed_enums(closed_contract):
+    result = validate_prompt_content(
+        SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
+        DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT.replace(closed_contract, ""),
+        validation_profile="semantic_disagreement_review",
+        required_variables=(),
+    )
+
+    assert result.success is False
+    assert any("闭合枚举" in error for error in result.errors)
 
 
 def test_strict_template_renderer_rejects_missing_and_unknown_variables():

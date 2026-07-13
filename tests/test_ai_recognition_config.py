@@ -11,9 +11,11 @@ from telegram_kol_research.ai_recognition_config import (
 )
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.prompt_defaults import (
+    DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
     DEFAULT_MIMO_VISION_PROMPT,
     DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
     MIMO_VISION_PROMPT,
+    SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
     SHARED_TRADING_PROMPT,
     build_prompt_seeds_from_legacy,
     seed_default_prompt_registry,
@@ -34,6 +36,60 @@ def test_default_trading_templates_have_strict_boundaries():
     assert "交易所截图" in DEFAULT_MIMO_VISION_PROMPT
     assert '"recognition_result"' not in DEFAULT_MIMO_VISION_PROMPT
     assert '"lifecycle_event"' not in DEFAULT_MIMO_VISION_PROMPT
+
+
+def test_semantic_disagreement_review_prompt_has_closed_evidence_based_contract():
+    prompt = DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT
+
+    for marker in (
+        '"independent_action"',
+        '"action_type"',
+        '"target_lifecycle_id"',
+        '"symbol"',
+        '"side"',
+        '"stop_loss"',
+        '"take_profit"',
+        '"management_action"',
+        '"evidence"',
+        '"conflict_types"',
+        '"material_disagreement"',
+        '"suggested_severity"',
+        '"confidence"',
+        '"reason"',
+    ):
+        assert marker in prompt
+    assert "独立解读当前消息" in prompt
+    assert "必须引用当前消息中的证据" in prompt
+    assert "不得修改交易" in prompt
+    assert "不得声称能够读取图片像素" in prompt
+    assert "none | entry | entry_confirm | cancel_entry | exit_full | exit_partial | position_update" in prompt
+    assert "none | normal | critical" in prompt
+    for conflict_type in (
+        "actionability",
+        "action_family",
+        "full_vs_partial_exit",
+        "symbol",
+        "side",
+        "target_lifecycle",
+        "stop_intent",
+        "urgent_exit_missed",
+        "execution_unresolved",
+        "non_material_price_detail",
+        "wording_only",
+    ):
+        assert conflict_type in prompt
+
+
+def test_semantic_disagreement_review_prompt_seed_is_registered_for_deepseek():
+    seeds = build_prompt_seeds_from_legacy(AiRecognitionConfig())
+    seed = {item.prompt_key: item for item in seeds}[
+        SEMANTIC_DISAGREEMENT_REVIEW_PROMPT
+    ]
+
+    assert seed.category == "notification"
+    assert seed.consumers == ("deepseek_disagreement_review",)
+    assert seed.required_variables == ()
+    assert seed.validation_profile == "semantic_disagreement_review"
 
 
 def test_build_prompt_seeds_from_legacy_preserves_custom_text_experience():

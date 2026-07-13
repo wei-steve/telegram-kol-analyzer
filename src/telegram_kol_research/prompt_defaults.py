@@ -22,6 +22,7 @@ MIMO_VISION_PROMPT = "trading.analysis.mimo_vision"
 RESEARCH_CHAT_SYSTEM_PROMPT = "research.chat.system"
 STRATEGY_ALERT_PROMPT = "strategy.alert.classifier"
 GROUP_RESEARCH_PROMPT = "research.chat.group"
+SEMANTIC_DISAGREEMENT_REVIEW_PROMPT = "trading.disagreement.semantic_review"
 
 
 DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
@@ -127,6 +128,46 @@ sender_name={sender_name}
 first_line={first_line}
 message_text:
 {message_text}
+""".strip()
+
+
+DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT = """
+你是 DeepSeek 语义分歧复核器。你的唯一任务是独立解读当前消息，再评估已给出的两份识别结果是否存在有实质影响的语义分歧。不要做行情预测，不要补全当前消息中没有的事实。
+
+【证据与权限边界】
+- 必须引用当前消息中的证据；evidence 只写当前消息中支持独立判断的短引文或可核对事实，没有证据时保持空数组并降低置信度。
+- 这个复核仅供通知与人工审查，不得修改交易、阻断交易、取消交易或授权任何交易动作。
+- 你只能读取提供给你的文本、结构化识别结果和文本化图片摘要；不得声称能够读取图片像素，不得根据未提供的图片内容推断。
+
+【独立动作判断】
+- action_type 只能是：none | entry | entry_confirm | cancel_entry | exit_full | exit_partial | position_update。
+- 无法从当前消息独立确定时输出 none，不要把模型结果本身当成当前消息的证据。
+- target_lifecycle_id、symbol、side、stop_loss、take_profit 和 management_action 无明确依据时输出 null。
+
+【冲突分类】
+- conflict_types 只能包含以下闭合词汇，不得创建其他值：actionability, action_family, full_vs_partial_exit, symbol, side, target_lifecycle, stop_intent, urgent_exit_missed, execution_unresolved, non_material_price_detail, wording_only。
+- 仅有会改变是否可执行、动作家族、全平与部分退出、标的/方向/目标策略、止损意图、紧急退出遗漏或执行状态的分歧，才可将 material_disagreement 设为 true。
+- 仅价格细节差异或措辞差异分别用 non_material_price_detail 或 wording_only，且 material_disagreement 为 false。
+- suggested_severity 只能是 none | normal | critical；紧急退出遗漏或会造成危险执行的实质分歧才能使用 critical。
+
+只输出一个 JSON 对象，不要输出解释文字，不得添加额外字段：
+{
+  "independent_action": {
+    "action_type": "none | entry | entry_confirm | cancel_entry | exit_full | exit_partial | position_update",
+    "target_lifecycle_id": null,
+    "symbol": null,
+    "side": null,
+    "stop_loss": null,
+    "take_profit": null,
+    "management_action": null
+  },
+  "evidence": [],
+  "conflict_types": [],
+  "material_disagreement": false,
+  "suggested_severity": "none | normal | critical",
+  "confidence": 0.0,
+  "reason": ""
+}
 """.strip()
 
 
@@ -247,6 +288,16 @@ def build_prompt_seeds_from_legacy(
             ),
             validation_profile="strategy_alert",
             content=DEFAULT_STRATEGY_ALERT_PROMPT,
+        ),
+        PromptSeed(
+            prompt_key=SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
+            display_name="DeepSeek 语义分歧复核",
+            description="独立复核 MiMo 与 DeepSeek 识别差异，仅用于通知。",
+            category="notification",
+            consumers=("deepseek_disagreement_review",),
+            required_variables=(),
+            validation_profile="semantic_disagreement_review",
+            content=DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
         ),
     ]
 
