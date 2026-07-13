@@ -104,6 +104,9 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "comparison_started_at": (
             "ALTER TABLE recognition_decisions ADD COLUMN comparison_started_at DATETIME"
         ),
+        "comparison_claim_token": (
+            "ALTER TABLE recognition_decisions ADD COLUMN comparison_claim_token VARCHAR(64)"
+        ),
         "compared_at": (
             "ALTER TABLE recognition_decisions ADD COLUMN compared_at DATETIME"
         ),

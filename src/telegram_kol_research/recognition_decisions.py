@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import and_, or_, update
 from sqlalchemy.orm import sessionmaker
@@ -26,6 +27,12 @@ class RecognitionDecisionRecord:
     agreement_status: str
     differences: list[str]
     prompt_versions: dict[str, dict[str, int]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SemanticReviewClaim:
+    raw_message_id: int
+    token: str
 
 
 def _json(value: Any) -> str:
@@ -129,6 +136,7 @@ def save_pending_authoritative_decision(
             row.comparison_attempts = 0
             row.comparison_next_attempt_at = None
             row.comparison_started_at = None
+            row.comparison_claim_token = None
             row.compared_at = None
         else:
             prompt_versions = json.loads(row.prompt_versions_json)
@@ -162,7 +170,7 @@ def claim_next_semantic_review(
     *,
     now: datetime,
     stale_before: datetime,
-) -> int | None:
+) -> SemanticReviewClaim | None:
     """Atomically claim the oldest eligible semantic comparison."""
 
     with session_factory() as session:
@@ -176,6 +184,7 @@ def claim_next_semantic_review(
             ).scalar_one_or_none()
             if raw_message_id is None:
                 return None
+            claim_token = uuid4().hex
             result = session.execute(
                 update(RecognitionDecision)
                 .where(
@@ -185,13 +194,17 @@ def claim_next_semantic_review(
                 .values(
                     comparison_status="running",
                     comparison_started_at=now,
+                    comparison_claim_token=claim_token,
                     comparison_next_attempt_at=None,
                     updated_at=now,
                 )
             )
             if result.rowcount == 1:
                 session.commit()
-                return raw_message_id
+                return SemanticReviewClaim(
+                    raw_message_id=raw_message_id,
+                    token=claim_token,
+                )
             session.rollback()
 
 
@@ -199,6 +212,7 @@ def complete_semantic_review(
     session_factory: sessionmaker,
     *,
     raw_message_id: int,
+    claim_token: str,
     model: str,
     auxiliary_payload: dict[str, Any],
     comparison_payload: dict[str, Any],
@@ -207,65 +221,84 @@ def complete_semantic_review(
     differences: list[str],
     prompt_versions: dict[str, int],
     compared_at: datetime,
-) -> None:
+) -> bool:
     with session_factory() as session:
-        row = (
-            session.query(RecognitionDecision)
+        prompt_versions_json = session.execute(
+            session.query(RecognitionDecision.prompt_versions_json)
             .filter_by(raw_message_id=raw_message_id)
-            .one_or_none()
-        )
-        if row is None:
+            .statement
+        ).scalar_one_or_none()
+        if prompt_versions_json is None:
             raise LookupError(f"Recognition decision not found for raw message {raw_message_id}")
-        if row.comparison_status != "running":
-            raise RuntimeError(
-                f"Semantic review for raw message {raw_message_id} is not claimed"
-            )
-        row.auxiliary_model = model
-        row.auxiliary_status = str(auxiliary_payload.get("recognition_result") or "") or None
-        row.auxiliary_payload_json = _json(auxiliary_payload)
-        row.agreement_status = agreement_status
-        row.differences_json = _json(differences)
-        merged_prompt_versions = json.loads(row.prompt_versions_json)
+        merged_prompt_versions = json.loads(prompt_versions_json)
         merged_prompt_versions.update(prompt_versions)
-        row.prompt_versions_json = _json(merged_prompt_versions)
-        row.comparison_status = "completed"
-        row.disagreement_severity = severity
-        row.comparison_model = model
-        row.comparison_payload_json = _json(comparison_payload)
-        row.comparison_error = None
-        row.comparison_next_attempt_at = None
-        row.comparison_started_at = None
-        row.compared_at = compared_at
-        row.updated_at = compared_at
+        result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == raw_message_id,
+                RecognitionDecision.comparison_status == "running",
+                RecognitionDecision.comparison_claim_token == claim_token,
+            )
+            .values(
+                auxiliary_model=model,
+                auxiliary_status=(
+                    str(auxiliary_payload.get("recognition_result") or "") or None
+                ),
+                auxiliary_payload_json=_json(auxiliary_payload),
+                agreement_status=agreement_status,
+                differences_json=_json(differences),
+                prompt_versions_json=_json(merged_prompt_versions),
+                comparison_status="completed",
+                disagreement_severity=severity,
+                comparison_model=model,
+                comparison_payload_json=_json(comparison_payload),
+                comparison_error=None,
+                comparison_next_attempt_at=None,
+                comparison_started_at=None,
+                comparison_claim_token=None,
+                compared_at=compared_at,
+                updated_at=compared_at,
+            )
+        )
         session.commit()
+        return result.rowcount == 1
 
 
 def fail_semantic_review(
     session_factory: sessionmaker,
     *,
     raw_message_id: int,
+    claim_token: str,
     error: str,
     next_attempt_at: datetime | None,
-) -> None:
+) -> bool:
     with session_factory() as session:
-        row = (
-            session.query(RecognitionDecision)
-            .filter_by(raw_message_id=raw_message_id)
-            .one_or_none()
-        )
-        if row is None:
+        exists = session.query(RecognitionDecision.id).filter_by(
+            raw_message_id=raw_message_id
+        ).first()
+        if exists is None:
             raise LookupError(f"Recognition decision not found for raw message {raw_message_id}")
-        if row.comparison_status != "running":
-            raise RuntimeError(
-                f"Semantic review for raw message {raw_message_id} is not claimed"
+        result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == raw_message_id,
+                RecognitionDecision.comparison_status == "running",
+                RecognitionDecision.comparison_claim_token == claim_token,
             )
-        row.comparison_status = "pending" if next_attempt_at is not None else "failed"
-        row.comparison_error = error
-        row.comparison_attempts += 1
-        row.comparison_next_attempt_at = next_attempt_at
-        row.comparison_started_at = None
-        row.updated_at = utc_now()
+            .values(
+                comparison_status=(
+                    "pending" if next_attempt_at is not None else "failed"
+                ),
+                comparison_error=error,
+                comparison_attempts=RecognitionDecision.comparison_attempts + 1,
+                comparison_next_attempt_at=next_attempt_at,
+                comparison_started_at=None,
+                comparison_claim_token=None,
+                updated_at=utc_now(),
+            )
+        )
         session.commit()
+        return result.rowcount == 1
 
 
 def claim_critical_notification(

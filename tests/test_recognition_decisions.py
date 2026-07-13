@@ -1,12 +1,11 @@
 import json
 from datetime import datetime, timedelta
 
-import pytest
-
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import RawMessage, RecognitionDecision
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
+    SemanticReviewClaim,
     claim_critical_notification,
     claim_next_semantic_review,
     complete_semantic_review,
@@ -47,6 +46,7 @@ def _claim(session_factory):
         session_factory, now=now, stale_before=now - timedelta(minutes=5)
     )
     assert claimed is not None
+    assert isinstance(claimed, SemanticReviewClaim)
     return claimed
 
 
@@ -66,7 +66,8 @@ def test_comparison_completion_preserves_automation_outcome(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
     save_pending_authoritative_decision(session_factory, _record(raw_id))
-    assert _claim(session_factory) == raw_id
+    claim = _claim(session_factory)
+    assert claim.raw_message_id == raw_id
     update_recognition_execution_outcome(
         session_factory,
         raw_message_id=raw_id,
@@ -77,6 +78,7 @@ def test_comparison_completion_preserves_automation_outcome(tmp_path):
     complete_semantic_review(
         session_factory,
         raw_message_id=raw_id,
+        claim_token=claim.token,
         model="deepseek-v4-flash",
         auxiliary_payload={"lifecycle_event": {"event_type": "none"}},
         comparison_payload={"material": True},
@@ -101,17 +103,22 @@ def test_only_one_worker_claims_pending_review_and_stale_work_is_reclaimable(tmp
     save_pending_authoritative_decision(session_factory, _record(raw_id))
     now = datetime(2026, 7, 13, 12, 0)
 
-    assert claim_next_semantic_review(
+    first = claim_next_semantic_review(
         session_factory, now=now, stale_before=now - timedelta(minutes=5)
-    ) == raw_id
+    )
+    assert first is not None
+    assert first.raw_message_id == raw_id
     assert claim_next_semantic_review(
         session_factory, now=now, stale_before=now - timedelta(minutes=5)
     ) is None
-    assert claim_next_semantic_review(
+    reclaimed = claim_next_semantic_review(
         session_factory,
         now=now + timedelta(minutes=10),
         stale_before=now + timedelta(minutes=5),
-    ) == raw_id
+    )
+    assert reclaimed is not None
+    assert reclaimed.raw_message_id == raw_id
+    assert reclaimed.token != first.token
 
 
 def test_failure_tracks_attempt_and_only_requeues_with_retry_time(tmp_path):
@@ -122,17 +129,21 @@ def test_failure_tracks_attempt_and_only_requeues_with_retry_time(tmp_path):
     save_pending_authoritative_decision(session_factory, _record(terminal_id))
     retry_at = datetime(2026, 7, 13, 12, 30)
 
-    assert _claim(session_factory) == retry_id
+    retry_claim = _claim(session_factory)
+    assert retry_claim.raw_message_id == retry_id
     fail_semantic_review(
         session_factory,
         raw_message_id=retry_id,
+        claim_token=retry_claim.token,
         error="timeout",
         next_attempt_at=retry_at,
     )
-    assert _claim(session_factory) == terminal_id
+    terminal_claim = _claim(session_factory)
+    assert terminal_claim.raw_message_id == terminal_id
     fail_semantic_review(
         session_factory,
         raw_message_id=terminal_id,
+        claim_token=terminal_claim.token,
         error="invalid payload",
         next_attempt_at=None,
     )
@@ -150,10 +161,12 @@ def test_notification_claim_is_once_per_raw_message_and_survives_resaves(tmp_pat
     raw_id = _raw_message(session_factory)
     original = _record(raw_id)
     save_pending_authoritative_decision(session_factory, original)
-    assert _claim(session_factory) == raw_id
+    claim = _claim(session_factory)
+    assert claim.raw_message_id == raw_id
     complete_semantic_review(
         session_factory,
         raw_message_id=raw_id,
+        claim_token=claim.token,
         model="deepseek",
         auxiliary_payload={},
         comparison_payload={},
@@ -192,10 +205,12 @@ def test_failed_notification_delivery_keeps_original_claim_reserved(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
     save_pending_authoritative_decision(session_factory, _record(raw_id))
-    assert _claim(session_factory) == raw_id
+    claim = _claim(session_factory)
+    assert claim.raw_message_id == raw_id
     complete_semantic_review(
         session_factory,
         raw_message_id=raw_id,
+        claim_token=claim.token,
         model="deepseek",
         auxiliary_payload={},
         comparison_payload={},
@@ -219,10 +234,12 @@ def test_changed_authoritative_payload_resets_comparison_not_execution_or_notifi
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
     save_pending_authoritative_decision(session_factory, _record(raw_id))
-    assert _claim(session_factory) == raw_id
+    claim = _claim(session_factory)
+    assert claim.raw_message_id == raw_id
     complete_semantic_review(
         session_factory,
         raw_message_id=raw_id,
+        claim_token=claim.token,
         model="deepseek",
         auxiliary_payload={},
         comparison_payload={"old": True},
@@ -262,27 +279,29 @@ def test_stale_completion_cannot_overwrite_changed_authoritative_payload(tmp_pat
     raw_id = _raw_message(session_factory)
     save_pending_authoritative_decision(session_factory, _record(raw_id))
     now = datetime(2026, 7, 13, 12, 0)
-    assert claim_next_semantic_review(
+    stale_claim = claim_next_semantic_review(
         session_factory, now=now, stale_before=now - timedelta(minutes=5)
-    ) == raw_id
+    )
+    assert stale_claim is not None
+    assert stale_claim.raw_message_id == raw_id
     save_pending_authoritative_decision(
         session_factory,
         _record(raw_id, {"lifecycle_event": {"event_type": "position_update"}}),
     )
 
-    with pytest.raises(RuntimeError, match="not claimed"):
-        complete_semantic_review(
-            session_factory,
-            raw_message_id=raw_id,
-            model="deepseek",
-            auxiliary_payload={"lifecycle_event": {"event_type": "none"}},
-            comparison_payload={"stale": True},
-            agreement_status="disagreed",
-            severity="critical",
-            differences=["status"],
-            prompt_versions={"deepseek": 4},
-            compared_at=now + timedelta(minutes=1),
-        )
+    assert complete_semantic_review(
+        session_factory,
+        raw_message_id=raw_id,
+        claim_token=stale_claim.token,
+        model="deepseek",
+        auxiliary_payload={"lifecycle_event": {"event_type": "none"}},
+        comparison_payload={"stale": True},
+        agreement_status="disagreed",
+        severity="critical",
+        differences=["status"],
+        prompt_versions={"deepseek": 4},
+        compared_at=now + timedelta(minutes=1),
+    ) is False
 
     with session_factory() as session:
         row = session.query(RecognitionDecision).one()
@@ -302,10 +321,12 @@ def test_prompt_versions_merge_across_authoritative_resave_and_comparison(tmp_pa
         }
     )
     save_pending_authoritative_decision(session_factory, updated)
-    assert _claim(session_factory) == raw_id
+    claim = _claim(session_factory)
+    assert claim.raw_message_id == raw_id
     complete_semantic_review(
         session_factory,
         raw_message_id=raw_id,
+        claim_token=claim.token,
         model="deepseek",
         auxiliary_payload={},
         comparison_payload={},
@@ -321,3 +342,70 @@ def test_prompt_versions_merge_across_authoritative_resave_and_comparison(tmp_pa
             "deepseek": 4,
             "mimo": {"trading.analysis.shared": 5},
         }
+
+
+def test_stale_worker_cannot_complete_or_fail_after_new_worker_reclaims(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id = _raw_message(session_factory)
+    save_pending_authoritative_decision(session_factory, _record(raw_id))
+    started_at = datetime(2026, 7, 13, 12, 0)
+    worker_a = claim_next_semantic_review(
+        session_factory,
+        now=started_at,
+        stale_before=started_at - timedelta(minutes=5),
+    )
+    worker_b = claim_next_semantic_review(
+        session_factory,
+        now=started_at + timedelta(minutes=10),
+        stale_before=started_at + timedelta(minutes=5),
+    )
+    assert worker_a is not None
+    assert worker_b is not None
+    assert worker_a.token != worker_b.token
+
+    assert complete_semantic_review(
+        session_factory,
+        raw_message_id=raw_id,
+        claim_token=worker_a.token,
+        model="deepseek-a",
+        auxiliary_payload={"worker": "a"},
+        comparison_payload={"worker": "a"},
+        agreement_status="disagreed",
+        severity="critical",
+        differences=["stale"],
+        prompt_versions={"deepseek": 1},
+        compared_at=started_at + timedelta(minutes=11),
+    ) is False
+    assert fail_semantic_review(
+        session_factory,
+        raw_message_id=raw_id,
+        claim_token=worker_a.token,
+        error="stale worker failed",
+        next_attempt_at=None,
+    ) is False
+
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.comparison_status == "running"
+        assert row.comparison_claim_token == worker_b.token
+        assert row.comparison_error is None
+
+    assert complete_semantic_review(
+        session_factory,
+        raw_message_id=raw_id,
+        claim_token=worker_b.token,
+        model="deepseek-b",
+        auxiliary_payload={"worker": "b"},
+        comparison_payload={"worker": "b"},
+        agreement_status="agreed",
+        severity="none",
+        differences=[],
+        prompt_versions={"deepseek": 2},
+        compared_at=started_at + timedelta(minutes=12),
+    ) is True
+
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.comparison_status == "completed"
+        assert row.comparison_claim_token is None
+        assert json.loads(row.comparison_payload_json) == {"worker": "b"}

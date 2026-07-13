@@ -73,6 +73,7 @@ def test_database_bootstrap_creates_recognition_decisions_table(tmp_path):
         "comparison_attempts",
         "comparison_next_attempt_at",
         "comparison_started_at",
+        "comparison_claim_token",
         "compared_at",
         "notification_fingerprint",
         "created_at",
@@ -144,6 +145,7 @@ def test_database_bootstrap_backfills_recognition_decisions_semantic_review_as_c
         "comparison_attempts",
         "comparison_next_attempt_at",
         "comparison_started_at",
+        "comparison_claim_token",
         "compared_at",
         "notification_fingerprint",
     } <= columns

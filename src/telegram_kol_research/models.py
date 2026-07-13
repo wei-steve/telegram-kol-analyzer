@@ -168,6 +168,7 @@ class RecognitionDecision(Base):
         DateTime, nullable=True
     )
     comparison_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    comparison_claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     compared_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     notification_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
