@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from decimal import Decimal
 
 import pytest
@@ -91,6 +92,9 @@ def decide(mimo: dict[str, object], review: dict[str, object], **kwargs):
         review_payload=review,
         automation=kwargs.pop("automation", {"text_evidence": "message body"}),
         input_kind=kwargs.pop("input_kind", "text"),
+        current_message_text=kwargs.pop(
+            "current_message_text", "message body 止损推到62800"
+        ),
         **kwargs,
     )
 
@@ -108,7 +112,7 @@ def test_equivalent_numeric_formats_are_none():
         symbol="BTC",
         side="多",
         stop_loss=61000,
-        take_profit=[Decimal("63000.0"), "64000"],
+        take_profit="63000.0 / 64000",
     )
 
     decision = decide(mimo, review)
@@ -251,6 +255,66 @@ def test_deepseek_cannot_downgrade_code_critical_floor():
 
 
 @pytest.mark.parametrize(
+    ("mimo_action", "review_action"),
+    [
+        ("move_stop_to_protect", "remove_stop_loss"),
+        ("tighten_stop_loss", "widen_stop_loss"),
+        ("remove_stop_loss", "move_stop_to_entry"),
+    ],
+)
+def test_opposite_stop_protection_intent_is_deterministically_critical(
+    mimo_action, review_action
+):
+    decision = decide(
+        mimo_payload(
+            event_type="position_update",
+            management_action=mimo_action,
+        ),
+        review_payload(
+            action_type="position_update",
+            management_action=review_action,
+            suggested_severity="none",
+            confidence=0.1,
+        ),
+    )
+
+    assert decision.severity == "critical"
+    assert "stop_intent" in decision.conflict_types
+
+
+@pytest.mark.parametrize("automation_status", ["skipped", "failed"])
+def test_grounded_urgent_action_with_unresolved_execution_is_critical(
+    automation_status,
+):
+    message = "现价62800附近全部出局，空仓等待。"
+    decision = decide(
+        mimo_payload(
+            event_type="exit_position",
+            target_lifecycle_id=41,
+            symbol="BTC",
+            side="short",
+            management_action="exit_requested",
+        ),
+        review_payload(
+            action_type="exit_full",
+            target_lifecycle_id=41,
+            symbol="BTC",
+            side="short",
+            management_action="exit_requested",
+            evidence=["全部出局"],
+            suggested_severity="none",
+            confidence=0.1,
+        ),
+        automation={"status": automation_status, "text_evidence": message},
+        current_message_text=message,
+    )
+
+    assert decision.severity == "critical"
+    assert decision.agreement_status == "disagreed"
+    assert "execution_unresolved" in decision.conflict_types
+
+
+@pytest.mark.parametrize(
     "changes",
     [
         {"conflict_types": ["wording_only"]},
@@ -300,6 +364,7 @@ def test_supported_evidenced_high_confidence_escalation_is_critical():
             suggested_severity="critical",
             confidence=0.80,
         ),
+        current_message_text="现在把止损推到62800保护利润",
     )
 
     assert decision.severity == "critical"
@@ -325,9 +390,73 @@ def test_image_review_without_text_evidence_cannot_be_critical():
         ),
         input_kind="image",
         automation={"text_evidence": ""},
+        current_message_text="",
     )
 
     assert decision.severity == "normal"
+
+
+def test_hallucinated_or_automation_only_evidence_cannot_escalate_critical():
+    decision = decide(
+        mimo_payload(
+            event_type="position_update",
+            management_action="move_stop_to_entry",
+            stop_loss="62800",
+        ),
+        review_payload(
+            action_type="position_update",
+            management_action="move_stop_to_entry",
+            stop_loss=62800,
+            evidence=["全部出局"],
+            conflict_types=["stop_intent"],
+            material_disagreement=True,
+            suggested_severity="critical",
+            confidence=0.99,
+        ),
+        current_message_text="现在把止损推到62800保护利润",
+        automation={
+            "has_independent_text_evidence": True,
+            "text_evidence": "全部出局",
+        },
+    )
+
+    assert decision.severity == "normal"
+
+
+def test_image_bearing_input_requires_grounded_caption_text_to_escalate():
+    review = review_payload(
+        action_type="position_update",
+        management_action="move_stop_to_entry",
+        stop_loss=62800,
+        evidence=["止损推到62800"],
+        conflict_types=["stop_intent"],
+        material_disagreement=True,
+        suggested_severity="critical",
+        confidence=0.99,
+    )
+    mimo = mimo_payload(
+        event_type="position_update",
+        management_action="move_stop_to_entry",
+        stop_loss="62800",
+    )
+
+    without_caption = decide(
+        mimo,
+        review,
+        input_kind="text+image",
+        current_message_text="",
+        automation={"has_independent_text_evidence": True},
+    )
+    with_caption = decide(
+        mimo,
+        review,
+        input_kind="text+image",
+        current_message_text="图中策略补充：止损推到62800",
+        automation={},
+    )
+
+    assert without_caption.severity == "normal"
+    assert with_caption.severity == "critical"
 
 
 def test_action_synonyms_and_management_token_order_normalize():
@@ -353,4 +482,60 @@ def test_validate_review_payload_rejects_open_vocabulary():
     payload = review_payload(conflict_types=["invented_conflict"])
 
     with pytest.raises(ValueError, match="conflict_types"):
+        validate_review_payload(payload)
+
+
+@pytest.mark.parametrize("invalid_confidence", ["0.9", True, Decimal("0.9")])
+def test_validate_review_payload_rejects_non_json_number_confidence(
+    invalid_confidence,
+):
+    payload = review_payload(confidence=invalid_confidence)
+
+    with pytest.raises(ValueError, match="confidence"):
+        validate_review_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("target_lifecycle_id", {"id": 1}),
+        ("target_lifecycle_id", [1]),
+        ("symbol", {"value": "BTC"}),
+        ("symbol", ["BTC"]),
+        ("side", {"value": "long"}),
+        ("stop_loss", {"value": 62800}),
+        ("stop_loss", [62800]),
+        ("take_profit", [64000, 65000]),
+        ("management_action", ["move_stop_to_entry"]),
+    ],
+)
+def test_validate_review_payload_rejects_action_container_fields(
+    field, invalid_value
+):
+    payload = review_payload()
+    payload = deepcopy(payload)
+    payload["independent_action"][field] = invalid_value
+
+    with pytest.raises(ValueError, match=field):
+        validate_review_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("evidence", "not-an-array"),
+        ("evidence", [1]),
+        ("conflict_types", "wording_only"),
+        ("conflict_types", [1]),
+        ("material_disagreement", "false"),
+        ("reason", ["not", "a", "string"]),
+    ],
+)
+def test_validate_review_payload_rejects_invalid_array_boolean_and_string_types(
+    field, invalid_value
+):
+    payload = review_payload()
+    payload[field] = invalid_value
+
+    with pytest.raises(ValueError, match=field):
         validate_review_payload(payload)

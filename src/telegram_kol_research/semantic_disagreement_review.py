@@ -64,6 +64,28 @@ _PARTIAL_MANAGEMENT_ACTIONS = frozenset(
         "分批止盈",
     }
 )
+_PROTECTIVE_STOP_ACTIONS = frozenset(
+    {
+        "move_stop_to_protect",
+        "move_stop_to_entry",
+        "protective_stop",
+        "protect_profit",
+        "tighten_stop",
+        "tighten_stop_loss",
+    }
+)
+_WEAKENING_STOP_ACTIONS = frozenset(
+    {
+        "cancel_stop",
+        "cancel_stop_loss",
+        "loosen_stop",
+        "loosen_stop_loss",
+        "remove_stop",
+        "remove_stop_loss",
+        "widen_stop",
+        "widen_stop_loss",
+    }
+)
 _NUMBER = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:万|w)?$", re.IGNORECASE)
 _PRICE_SEPARATOR = re.compile(r"\s*(?:/|／|~|～|至|到|—|–|-)\s*")
 
@@ -176,8 +198,19 @@ def validate_review_payload(payload: dict[str, Any]) -> None:
     }
     if not isinstance(action, dict) or set(action) != action_fields:
         raise ValueError("independent_action fields do not match the closed contract")
-    if _token(action.get("action_type")) not in ACTION_TYPES:
+    if not isinstance(action.get("action_type"), str) or _token(
+        action.get("action_type")
+    ) not in ACTION_TYPES:
         raise ValueError("invalid independent_action.action_type")
+    for field in ("target_lifecycle_id", "symbol", "side", "stop_loss", "take_profit"):
+        value = action[field]
+        if isinstance(value, bool) or (
+            value is not None and not isinstance(value, (str, int, float))
+        ):
+            raise ValueError(f"independent_action.{field} must be a scalar or null")
+    management_action = action["management_action"]
+    if management_action is not None and not isinstance(management_action, str):
+        raise ValueError("independent_action.management_action must be a string or null")
     evidence = payload["evidence"]
     if not isinstance(evidence, list) or not all(isinstance(item, str) for item in evidence):
         raise ValueError("evidence must be a list of strings")
@@ -190,16 +223,14 @@ def validate_review_payload(payload: dict[str, Any]) -> None:
         raise ValueError("conflict_types contains an unsupported value")
     if not isinstance(payload["material_disagreement"], bool):
         raise ValueError("material_disagreement must be a boolean")
-    if _token(payload["suggested_severity"]) not in SEVERITIES:
+    if not isinstance(payload["suggested_severity"], str) or _token(
+        payload["suggested_severity"]
+    ) not in SEVERITIES:
         raise ValueError("invalid suggested_severity")
     confidence = payload["confidence"]
-    if isinstance(confidence, bool):
-        raise ValueError("confidence must be numeric")
-    try:
-        numeric_confidence = float(confidence)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("confidence must be numeric") from exc
-    if not 0 <= numeric_confidence <= 1:
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        raise ValueError("confidence must be an int or float")
+    if not 0 <= confidence <= 1:
         raise ValueError("confidence must be between 0 and 1")
     if not isinstance(payload["reason"], str):
         raise ValueError("reason must be a string")
@@ -211,18 +242,27 @@ def decide_semantic_severity(
     review_payload: dict[str, Any],
     automation: dict[str, Any],
     input_kind: str,
+    current_message_text: str,
     critical_confidence: float = 0.80,
 ) -> SemanticReviewDecision:
     """Classify disagreement while preserving deterministic safety floors."""
 
     validate_review_payload(review_payload)
+    if not isinstance(current_message_text, str):
+        raise ValueError("current_message_text must be a string")
     if not 0 <= critical_confidence <= 1:
         raise ValueError("critical_confidence must be between 0 and 1")
 
     mimo = normalize_mimo_action(mimo_payload)
     review = _normalize_review_action(review_payload["independent_action"])
     differences = _action_differences(mimo, review)
-    deterministic_conflicts = _deterministic_conflicts(mimo, review)
+    deterministic_conflicts = _deterministic_conflicts(
+        mimo,
+        review,
+        review_payload=review_payload,
+        automation=automation,
+        current_message_text=current_message_text,
+    )
     review_conflicts = tuple(
         _token(item) for item in review_payload["conflict_types"]
     )
@@ -232,14 +272,14 @@ def decide_semantic_severity(
     model_critical = _allows_model_critical(
         review_payload,
         review_conflicts=review_conflicts,
-        automation=automation,
         input_kind=input_kind,
+        current_message_text=current_message_text,
         critical_confidence=critical_confidence,
     )
     review_claims_difference = bool(
         review_payload["material_disagreement"] or review_conflicts
     )
-    disagreed = bool(differences or review_claims_difference)
+    disagreed = bool(differences or review_claims_difference or deterministic_conflicts)
 
     if code_critical:
         severity = "critical"
@@ -310,7 +350,12 @@ def _action_differences(
 
 
 def _deterministic_conflicts(
-    mimo: dict[str, Any], review: dict[str, Any]
+    mimo: dict[str, Any],
+    review: dict[str, Any],
+    *,
+    review_payload: dict[str, Any],
+    automation: dict[str, Any],
+    current_message_text: str,
 ) -> tuple[str, ...]:
     mimo_action = mimo["action_type"]
     review_action = review["action_type"]
@@ -333,6 +378,17 @@ def _deterministic_conflicts(
         ):
             if mimo[field] != review[field]:
                 conflicts.append(conflict)
+    if _opposite_stop_intent(
+        mimo["management_action"], review["management_action"]
+    ):
+        conflicts.append("stop_intent")
+    if (
+        _token(automation.get("status") or automation.get("execution_status"))
+        in {"skipped", "failed"}
+        and _supports_urgent_or_risk_reduction(review)
+        and _has_grounded_evidence(review_payload, current_message_text)
+    ):
+        conflicts.append("execution_unresolved")
     return _ordered_unique(conflicts)
 
 
@@ -340,8 +396,8 @@ def _allows_model_critical(
     review_payload: dict[str, Any],
     *,
     review_conflicts: tuple[str, ...],
-    automation: dict[str, Any],
     input_kind: str,
+    current_message_text: str,
     critical_confidence: float,
 ) -> bool:
     if _token(review_payload["suggested_severity"]) != "critical":
@@ -353,21 +409,52 @@ def _allows_model_critical(
     evidence = review_payload["evidence"]
     if not any(item.strip() for item in evidence):
         return False
+    if not _has_grounded_evidence(review_payload, current_message_text):
+        return False
     if float(review_payload["confidence"]) < critical_confidence:
         return False
-    if "image" in _token(input_kind) or _token(input_kind) in {"photo", "media"}:
-        return _has_text_evidence(automation)
+    if (
+        "image" in _token(input_kind) or _token(input_kind) in {"photo", "media"}
+    ) and not current_message_text.strip():
+        return False
     return True
 
 
-def _has_text_evidence(automation: dict[str, Any]) -> bool:
-    if automation.get("has_independent_text_evidence") is True:
+def _opposite_stop_intent(
+    mimo_actions: tuple[str, ...], review_actions: tuple[str, ...]
+) -> bool:
+    return bool(
+        (
+            _PROTECTIVE_STOP_ACTIONS.intersection(mimo_actions)
+            and _WEAKENING_STOP_ACTIONS.intersection(review_actions)
+        )
+        or (
+            _WEAKENING_STOP_ACTIONS.intersection(mimo_actions)
+            and _PROTECTIVE_STOP_ACTIONS.intersection(review_actions)
+        )
+    )
+
+
+def _supports_urgent_or_risk_reduction(action: dict[str, Any]) -> bool:
+    if action["action_type"] in {"exit_full", "exit_partial", "cancel_entry"}:
         return True
-    for key in ("text_evidence", "message_text", "source_text"):
-        value = automation.get(key)
-        if isinstance(value, str) and value.strip():
-            return True
-    return False
+    return bool(_PROTECTIVE_STOP_ACTIONS.intersection(action["management_action"]))
+
+
+def _has_grounded_evidence(
+    review_payload: dict[str, Any], current_text: str
+) -> bool:
+    haystack = _evidence_text(current_text)
+    if not haystack:
+        return False
+    return any(
+        (needle := _evidence_text(item)) and needle in haystack
+        for item in review_payload["evidence"]
+    )
+
+
+def _evidence_text(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "")).casefold()
 
 
 def _normalize_management_action(value: Any) -> tuple[str, ...]:
