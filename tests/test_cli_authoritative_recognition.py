@@ -2,6 +2,8 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from telegram_kol_research.cli import (
     SyncMode,
     _process_raw_messages_with_mimo_authority,
@@ -190,6 +192,78 @@ def test_cli_mimo_failure_notification_does_not_block_later_messages(
         (raw_ids[1], "scheduled"),
         (raw_ids[1], "failed"),
     }
+
+
+def test_cli_drains_scheduled_failure_alert_when_later_processing_raises(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        first = RawMessage(chat_id=1, message_id=30, sender_name="峰哥", text="first")
+        second = RawMessage(chat_id=1, message_id=31, sender_name="峰哥", text="second")
+        session.add_all([first, second])
+        session.commit()
+        raw_ids = [first.id, second.id]
+
+    audit: list[str] = []
+    sent: list[int] = []
+
+    def fake_processor(*args, **kwargs):
+        if kwargs["raw_message_id"] == raw_ids[1]:
+            raise ValueError("second processing failed")
+        return SimpleNamespace(
+            assessment=SimpleNamespace(
+                agreement_status="authoritative_failed",
+                differences=[],
+                mimo=SimpleNamespace(
+                    model="mimo-v2.5",
+                    status="识别失败",
+                    payload={},
+                    error_message="timeout",
+                ),
+                deepseek_payload=None,
+            ),
+            automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
+        )
+
+    async def slow_sender(*, config, payload):
+        await asyncio.sleep(0.05)
+        sent.append(payload["message_id"])
+
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.load_ai_recognition_config",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.process_authoritative_message",
+        fake_processor,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.send_ai_recognition_conflict_review",
+        slow_sender,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.update_recognition_execution_outcome",
+        lambda *args, **kwargs: audit.append(kwargs["notification_status"]),
+    )
+
+    with pytest.raises(ValueError, match="second processing failed"):
+        asyncio.run(
+            _process_raw_messages_with_mimo_authority(
+                session_factory,
+                raw_message_ids=raw_ids,
+                ai_recognition_config_path=Path("ai.yaml"),
+                media_root=tmp_path / "media",
+                system_operator_bot_config=SimpleNamespace(
+                    bot_token="token",
+                    chat_id="chat",
+                ),
+            )
+        )
+
+    assert sent == [30]
+    assert audit == ["scheduled", "sent"]
 
 
 def test_cli_sync_passes_custom_media_root_to_telegram_download(tmp_path, monkeypatch):

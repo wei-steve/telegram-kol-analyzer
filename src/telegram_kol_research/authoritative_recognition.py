@@ -17,6 +17,7 @@ from telegram_kol_research.message_recognition import (
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
+    claim_authoritative_execution,
     finalize_authoritative_automation_outcome,
     save_pending_authoritative_decision,
     save_recognition_decision,
@@ -171,6 +172,17 @@ def process_authoritative_message(
         ai_recognition_config=ai_recognition_config,
         media_root=media_root,
     )
+    if assessment.agreement_status != "authoritative_failed":
+        if assessment.authoritative_generation is None:
+            raise RuntimeError("authoritative execution generation is missing")
+        if not claim_authoritative_execution(
+            session_factory,
+            raw_message_id=raw_message_id,
+            authoritative_generation=assessment.authoritative_generation,
+        ):
+            raise RuntimeError(
+                "authoritative execution claim failed for stale generation"
+            )
     recognition = apply_authoritative_assessment(session_factory, assessment)
     if assessment.agreement_status == "authoritative_failed":
         automation = {
@@ -206,8 +218,6 @@ def process_authoritative_message(
             automation_reason=automation_reason,
         )
     else:
-        if assessment.authoritative_generation is None:
-            raise RuntimeError("authoritative execution generation is missing")
         finalized = finalize_authoritative_automation_outcome(
             session_factory,
             raw_message_id=raw_message_id,

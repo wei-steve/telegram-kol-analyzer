@@ -8,6 +8,7 @@ from telegram_kol_research.models import RawMessage, RecognitionDecision
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
     SemanticReviewClaim,
+    claim_authoritative_execution,
     claim_critical_notification,
     claim_next_semantic_review,
     complete_semantic_review,
@@ -55,6 +56,11 @@ def _claim(session_factory):
 
 def _save_and_finalize(session_factory, record):
     saved = save_pending_authoritative_decision(session_factory, record)
+    assert claim_authoritative_execution(
+        session_factory,
+        raw_message_id=record.raw_message_id,
+        authoritative_generation=saved.comparison_claim_token,
+    )
     return finalize_authoritative_automation_outcome(
         session_factory,
         raw_message_id=record.raw_message_id,
@@ -76,6 +82,20 @@ def test_new_authoritative_decision_is_unclaimable_until_automation_finalizes(tm
     assert saved.auxiliary_payload_json is None
     assert saved.comparison_attempts == 0
     now = datetime(2026, 7, 13, 12, 0)
+    assert claim_next_semantic_review(
+        session_factory,
+        now=now,
+        stale_before=now - timedelta(minutes=5),
+    ) is None
+
+    assert claim_authoritative_execution(
+        session_factory,
+        raw_message_id=raw_id,
+        authoritative_generation=saved.comparison_claim_token,
+    )
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.comparison_status == "execution_running"
     assert claim_next_semantic_review(
         session_factory,
         now=now,
@@ -124,6 +144,11 @@ def test_stale_automation_generation_cannot_publish_new_rerecognition(tmp_path):
         assert row.comparison_status == "execution_pending"
         assert row.automation_status is None
 
+    assert claim_authoritative_execution(
+        session_factory,
+        raw_message_id=raw_id,
+        authoritative_generation=second.comparison_claim_token,
+    )
     finalized = finalize_authoritative_automation_outcome(
         session_factory,
         raw_message_id=raw_id,

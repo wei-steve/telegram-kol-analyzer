@@ -170,58 +170,60 @@ async def _process_raw_messages_with_mimo_authority(
             .all()
         }
     notification_tasks: list[asyncio.Task[None]] = []
-    for raw_message_id in raw_message_ids:
-        processing_result = await asyncio.to_thread(
-            process_authoritative_message,
-            session_factory,
-            raw_message_id=raw_message_id,
-            ai_recognition_config=config,
-            media_root=media_root,
-            auto_trade_executor=None,
-        )
-        # Successful MiMo decisions remain pending for the Web service's
-        # semantic-review worker. CLI parse has no live worker of its own.
-        if (
-            processing_result.assessment.agreement_status != "authoritative_failed"
-            or not system_operator_bot_enabled(system_operator_bot_config)
-        ):
-            continue
-        with session_factory() as session:
-            raw_message = session.get(RawMessage, raw_message_id)
-            if raw_message is None:
-                continue
-            payload = _build_authoritative_notification_payload(
-                raw_message=raw_message,
-                chat_title=raw_message.sender_name,
-                processing_result=processing_result,
+    try:
+        for raw_message_id in raw_message_ids:
+            processing_result = await asyncio.to_thread(
+                process_authoritative_message,
+                session_factory,
+                raw_message_id=raw_message_id,
+                ai_recognition_config=config,
+                media_root=media_root,
+                auto_trade_executor=None,
             )
-        if payload is None:
-            continue
-        outcome_kwargs = {
-            "raw_message_id": raw_message_id,
-            "automation_status": str(
-                processing_result.automation.get("status") or "unknown"
-            ),
-            "automation_reason": processing_result.automation.get("reason"),
-        }
-        await asyncio.to_thread(
-            update_recognition_execution_outcome,
-            session_factory,
-            **outcome_kwargs,
-            notification_status="scheduled",
-        )
-        notification_tasks.append(
-            asyncio.create_task(
-                _deliver_cli_authoritative_failure_notification(
-                    session_factory=session_factory,
-                    config=system_operator_bot_config,
-                    payload=payload,
-                    outcome_kwargs=outcome_kwargs,
+            # Successful MiMo decisions remain pending for the Web service's
+            # semantic-review worker. CLI parse has no live worker of its own.
+            if (
+                processing_result.assessment.agreement_status != "authoritative_failed"
+                or not system_operator_bot_enabled(system_operator_bot_config)
+            ):
+                continue
+            with session_factory() as session:
+                raw_message = session.get(RawMessage, raw_message_id)
+                if raw_message is None:
+                    continue
+                payload = _build_authoritative_notification_payload(
+                    raw_message=raw_message,
+                    chat_title=raw_message.sender_name,
+                    processing_result=processing_result,
+                )
+            if payload is None:
+                continue
+            outcome_kwargs = {
+                "raw_message_id": raw_message_id,
+                "automation_status": str(
+                    processing_result.automation.get("status") or "unknown"
+                ),
+                "automation_reason": processing_result.automation.get("reason"),
+            }
+            await asyncio.to_thread(
+                update_recognition_execution_outcome,
+                session_factory,
+                **outcome_kwargs,
+                notification_status="scheduled",
+            )
+            notification_tasks.append(
+                asyncio.create_task(
+                    _deliver_cli_authoritative_failure_notification(
+                        session_factory=session_factory,
+                        config=system_operator_bot_config,
+                        payload=payload,
+                        outcome_kwargs=outcome_kwargs,
+                    )
                 )
             )
-        )
-    if notification_tasks:
-        await asyncio.gather(*notification_tasks)
+    finally:
+        if notification_tasks:
+            await asyncio.gather(*notification_tasks, return_exceptions=True)
     with session_factory() as session:
         after_ids = {
             row[0]

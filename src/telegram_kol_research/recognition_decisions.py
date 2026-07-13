@@ -136,45 +136,101 @@ def save_pending_authoritative_decision(
                 updated_at=now,
             )
             session.add(row)
+            session.commit()
+            session.refresh(row)
+            session.expunge(row)
+            return row
 
-        row.input_kind = record.input_kind
-        row.authoritative_model = record.authoritative_model
-        row.authoritative_status = record.authoritative_status
-        row.authoritative_payload_json = payload_json
-        if not preserve_completed_review:
-            row.auxiliary_model = None
-            row.auxiliary_status = None
-            row.auxiliary_payload_json = None
-            row.agreement_status = "pending"
-            row.differences_json = "[]"
-            row.prompt_versions_json = _json(record.prompt_versions)
-            row.comparison_status = "execution_pending"
-            row.disagreement_severity = None
-            row.comparison_model = None
-            row.comparison_payload_json = None
-            row.comparison_error = None
-            row.comparison_attempts = 0
-            row.comparison_next_attempt_at = None
-            row.comparison_started_at = None
-            row.comparison_claim_token = authoritative_generation
-            row.compared_at = None
-        else:
+        if row.comparison_status == "execution_running":
+            raise RuntimeError("authoritative execution is already in progress")
+
+        observed_status = row.comparison_status
+        observed_token = row.comparison_claim_token
+        values: dict[str, Any] = {
+            "input_kind": record.input_kind,
+            "authoritative_model": record.authoritative_model,
+            "authoritative_status": record.authoritative_status,
+            "authoritative_payload_json": payload_json,
+            "comparison_status": "execution_pending",
+            "comparison_started_at": None,
+            "comparison_claim_token": authoritative_generation,
+            "comparison_next_attempt_at": None,
+            "automation_status": None,
+            "automation_reason": None,
+            "updated_at": now,
+        }
+        if preserve_completed_review:
             prompt_versions = json.loads(row.prompt_versions_json)
             prompt_versions.update(record.prompt_versions)
-            row.prompt_versions_json = _json(prompt_versions)
-            row.comparison_status = "execution_pending"
-            row.comparison_started_at = None
-            row.comparison_claim_token = authoritative_generation
-            row.comparison_next_attempt_at = None
-        # Automation belongs to this exact authoritative generation. Never let
-        # a worker observe the outcome from an earlier execution attempt.
-        row.automation_status = None
-        row.automation_reason = None
-        row.updated_at = now
+            values["prompt_versions_json"] = _json(prompt_versions)
+        else:
+            values.update(
+                auxiliary_model=None,
+                auxiliary_status=None,
+                auxiliary_payload_json=None,
+                agreement_status="pending",
+                differences_json="[]",
+                prompt_versions_json=_json(record.prompt_versions),
+                disagreement_severity=None,
+                comparison_model=None,
+                comparison_payload_json=None,
+                comparison_error=None,
+                comparison_attempts=0,
+                compared_at=None,
+            )
+        expected_token = (
+            RecognitionDecision.comparison_claim_token.is_(None)
+            if observed_token is None
+            else RecognitionDecision.comparison_claim_token == observed_token
+        )
+        result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == record.raw_message_id,
+                RecognitionDecision.comparison_status == observed_status,
+                expected_token,
+            )
+            .values(**values)
+        )
+        if result.rowcount != 1:
+            session.rollback()
+            raise RuntimeError(
+                "authoritative decision changed or execution is already in progress"
+            )
         session.commit()
-        session.refresh(row)
-        session.expunge(row)
-        return row
+        saved = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == record.raw_message_id)
+            .one()
+        )
+        session.expunge(saved)
+        return saved
+
+
+def claim_authoritative_execution(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    authoritative_generation: str,
+) -> bool:
+    """Claim the exact persisted generation before any trading-state mutation."""
+
+    with session_factory() as session:
+        result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == raw_message_id,
+                RecognitionDecision.comparison_status == "execution_pending",
+                RecognitionDecision.comparison_claim_token
+                == authoritative_generation,
+            )
+            .values(
+                comparison_status="execution_running",
+                updated_at=utc_now(),
+            )
+        )
+        session.commit()
+        return result.rowcount == 1
 
 
 def finalize_authoritative_automation_outcome(
@@ -193,7 +249,7 @@ def finalize_authoritative_automation_outcome(
             update(RecognitionDecision)
             .where(
                 RecognitionDecision.raw_message_id == raw_message_id,
-                RecognitionDecision.comparison_status == "execution_pending",
+                RecognitionDecision.comparison_status == "execution_running",
                 RecognitionDecision.comparison_claim_token
                 == authoritative_generation,
             )
@@ -215,7 +271,7 @@ def finalize_authoritative_automation_outcome(
         if result.rowcount != 1:
             session.rollback()
             raise RuntimeError(
-                "authoritative generation is stale or no longer execution-pending"
+                "authoritative generation is stale or no longer execution-running"
             )
         session.commit()
         row = (
