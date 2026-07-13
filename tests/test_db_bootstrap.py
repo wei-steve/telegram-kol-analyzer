@@ -17,6 +17,37 @@ def test_database_bootstrap_creates_tables(tmp_path):
     assert engine is not None
 
 
+def test_database_bootstrap_creates_recognition_decisions_table(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(recognition_decisions)").fetchall()
+    }
+    conn.close()
+
+    assert {
+        "raw_message_id",
+        "input_kind",
+        "authoritative_model",
+        "authoritative_status",
+        "authoritative_payload_json",
+        "auxiliary_model",
+        "auxiliary_status",
+        "auxiliary_payload_json",
+        "agreement_status",
+        "differences_json",
+        "automation_status",
+        "automation_reason",
+        "notification_status",
+        "notification_error",
+        "created_at",
+        "updated_at",
+    }.issubset(columns)
+
+
 def test_database_bootstrap_creates_trading_settings_table(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     engine = session_factory.kw["bind"]

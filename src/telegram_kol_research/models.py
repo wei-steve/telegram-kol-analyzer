@@ -130,6 +130,35 @@ class RecognitionExperiment(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class RecognitionDecision(Base):
+    __tablename__ = "recognition_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_message_id",
+            name="uq_recognition_decisions_raw_message_id",
+        ),
+        Index("ix_recognition_decisions_agreement_updated", "agreement_status", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(ForeignKey("raw_messages.id"), index=True)
+    input_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    authoritative_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    authoritative_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    authoritative_payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    auxiliary_model: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    auxiliary_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    auxiliary_payload_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    agreement_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    differences_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    automation_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    automation_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notification_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    notification_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class TradeIdea(Base):
     __tablename__ = "trade_ideas"
 
