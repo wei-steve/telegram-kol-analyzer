@@ -64,3 +64,13 @@ Design and implementation plan:
 
 - `docs/superpowers/specs/2026-07-13-mimo-authoritative-recognition-design.md`
 - `docs/superpowers/plans/2026-07-13-mimo-authoritative-recognition.md`
+
+## Web-managed AI prompts
+
+All AI business prompts now belong to the versioned database registry. The shared trading template A covers new-strategy judgment and the full strategy lifecycle; MiMo alone adds image template B. Runtime context C remains dynamically generated. Therefore DeepSeek uses `A + C`, while authoritative MiMo uses `A + B + C`.
+
+Use the Web prompt center for browsing and editing. Saving produces a non-live draft. Publication requires validation, and trading prompts also require a side-effect-free historical comparison. Every live AI invocation records exact version IDs. Per-group research prompts are server-scoped; an old `telegram-workbench:prompt:<chatId>` browser value may be imported as a draft but is never sent directly to the model or automatically published.
+
+The old YAML prompt fields are compatibility seed inputs only. Database versions take precedence and runtime call sites must not compose prompts from YAML. Model/API configuration remains in YAML, while API keys must never appear in prompt APIs or rendered HTML.
+
+Operational details, table names, rollback boundaries, and production checks are documented in `docs/context/ai-prompt-registry.md`.

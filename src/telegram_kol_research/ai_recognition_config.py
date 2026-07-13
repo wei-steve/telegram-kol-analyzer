@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import warnings
 
 import yaml
 
@@ -387,6 +388,19 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
     raw_data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw_data, dict):
         return AiRecognitionConfig()
+    if any(
+        key in raw_data
+        for key in (
+            "recognition_prompt",
+            "lifecycle_event_prompt",
+            "mimo_direct_prompt",
+        )
+    ):
+        warnings.warn(
+            "YAML AI prompt fields are deprecated seed inputs; runtime prompts come from the database registry.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     recognition_prompt = _with_price_shorthand_instruction(
         _with_normalized_strategy_output_instructions(

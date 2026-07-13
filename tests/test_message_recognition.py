@@ -2804,8 +2804,8 @@ def test_mimo_image_recognition_uses_caption_and_raw_image_without_ocr(
     assert request["model"] == "mimo-v2.5"
     system_prompt = request["messages"][0]["content"]
     assert "Use strict DeepSeek text rules." in system_prompt
-    assert "Use MiMo direct prompt." in system_prompt
-    assert "\u5fc5\u987b\u7ed3\u5408\u6587\u5b57\u8bed\u5883\u4e0e\u56fe\u7247\u5185\u5bb9\u6574\u4f53\u5224\u65ad" in system_prompt
+    assert "Use MiMo direct prompt." not in system_prompt
+    assert "\u5fc5\u987b\u7ed3\u5408\u5f53\u524d\u6b63\u6587/caption \u4e0e\u56fe\u7247\u6574\u4f53\u5224\u65ad" in system_prompt
     user_content = request["messages"][1]["content"]
     assert isinstance(user_content, list)
     assert source_text in user_content[0]["text"]

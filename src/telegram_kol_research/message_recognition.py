@@ -145,6 +145,13 @@ def recognize_message_now(
     """Run V1 immediate recognition for one raw message and persist the result."""
 
     config = ai_recognition_config or load_ai_recognition_config(ai_recognition_config_path)
+    seed_default_prompt_registry(session_factory, config)
+    deepseek_system_prompt = compose_trading_prompt(
+        session_factory, model_kind="deepseek", context=""
+    ).system_prompt
+    mimo_system_prompt = compose_trading_prompt(
+        session_factory, model_kind="mimo", context=""
+    ).system_prompt
     with session_factory() as session:
         raw_message = session.get(RawMessage, raw_message_id)
         if raw_message is None:
@@ -182,6 +189,7 @@ def recognize_message_now(
                 session,
                 raw_message=raw_message,
                 config=config,
+                system_prompt=deepseek_system_prompt,
             )
             if ai_event_result is not None:
                 _upsert_recognition(session, ai_event_result, engine=config.text_provider.model)
@@ -230,6 +238,7 @@ def recognize_message_now(
                     media_assets=media_assets,
                     config=config,
                     session=session,
+                    text_system_prompt=deepseek_system_prompt,
                 )
             else:
                 result = _recognize_with_ai_provider(
@@ -238,6 +247,7 @@ def recognize_message_now(
                     config=config,
                     provider=config.image_provider,
                     parse_source="image_ai",
+                    system_prompt=mimo_system_prompt,
                 )
                 _persist_ai_result(session, raw_message, result, engine=config.image_provider.model)
             session.commit()
@@ -250,6 +260,7 @@ def recognize_message_now(
                 config=config,
                 provider=config.text_provider,
                 parse_source="text_ai",
+                system_prompt=deepseek_system_prompt,
             )
             _persist_ai_result(session, raw_message, result, engine=config.text_provider.model)
             session.commit()
@@ -455,6 +466,7 @@ def _recognize_with_glm_ocr(
     media_assets: list[MediaAsset],
     config: AiRecognitionConfig,
     session,
+    text_system_prompt: str,
 ) -> MessageRecognitionResult:
     """Recognize image messages using GLM-OCR in a two-step pipeline.
 
@@ -519,6 +531,7 @@ def _recognize_with_glm_ocr(
             raw_message=raw_message,
             merged_text=merged_text,
             config=config,
+            system_prompt=text_system_prompt,
         )
         if (
             caption
@@ -544,6 +557,7 @@ def _recognize_with_glm_ocr(
                     raw_message=raw_message,
                     merged_text=caption,
                     config=config,
+                    system_prompt=text_system_prompt,
                 )
             except Exception:
                 text_only_result = None
@@ -592,13 +606,14 @@ def _recognize_text_with_ai_provider(
     raw_message: RawMessage,
     merged_text: str,
     config: AiRecognitionConfig,
+    system_prompt: str,
 ) -> MessageRecognitionResult:
     """Send plain text (already merged with OCR output) through the text AI
     provider for strategy recognition."""
     payload = _build_ai_recognition_payload(
         raw_message=raw_message,
         media_assets=[],
-        prompt=config.recognition_prompt,
+        prompt=system_prompt,
         model=config.text_provider.model,
     )
     # Override the user message content with the merged text
@@ -635,6 +650,7 @@ def _recognize_with_ai_provider(
     config: AiRecognitionConfig,
     provider: AiProviderConfig,
     parse_source: str,
+    system_prompt: str,
 ) -> MessageRecognitionResult:
     if media_assets and not any(_media_asset_to_data_url(asset) for asset in media_assets):
         return MessageRecognitionResult(
@@ -645,11 +661,7 @@ def _recognize_with_ai_provider(
     payload = _build_ai_recognition_payload(
         raw_message=raw_message,
         media_assets=media_assets,
-        prompt=(
-            _build_multimodal_recognition_prompt(config)
-            if media_assets
-            else config.recognition_prompt
-        ),
+        prompt=system_prompt,
         model=provider.model,
     )
     headers = {"Content-Type": "application/json"}
@@ -670,27 +682,6 @@ def _recognize_with_ai_provider(
         raw_message_id=raw_message.id,
         payload=parsed,
         parse_source=parse_source,
-    )
-
-
-def _build_multimodal_recognition_prompt(config: AiRecognitionConfig) -> str:
-    text_prompt = config.recognition_prompt.strip()
-    image_prompt = config.mimo_direct_prompt.strip()
-    if not text_prompt:
-        return image_prompt
-    if not image_prompt or image_prompt in text_prompt:
-        return text_prompt
-    return "\n\n".join(
-        [
-            text_prompt,
-            (
-                "多模态补充要求：当前消息可能同时包含文字/caption 和图片。"
-                "必须结合文字语境与图片内容整体判断，不要只识别图片中的文字；"
-                "如果文字说明这是盈利、复盘、参考或历史截图，而图片里是旧策略，"
-                "应按非策略处理。"
-            ),
-            image_prompt,
-        ]
     )
 
 
@@ -736,45 +727,12 @@ def _chat_completions_url(base_url: str) -> str:
     return f"{normalized}/v1/chat/completions"
 
 
-LIFECYCLE_EVENT_PROMPT = """
-你是 Telegram 加密货币 KOL 策略生命周期事件判定器。
-你会收到：当前消息、同群最近的活跃策略列表、以及最近聊天上下文。
-
-你的任务不是识别新策略，而是判断“当前消息”是否在改变某一条已有策略的状态。
-
-只允许输出 JSON，不要输出解释文本：
-{
-  "event_type": "none | entry_confirm | cancel_entry | exit_position | position_update",
-  "target_lifecycle_id": null,
-  "symbol": null,
-  "side": null,
-  "entry_price": null,
-  "exit_price": null,
-  "stop_loss": null,
-  "take_profit": null,
-  "management_action": null,
-  "confidence": 0.0,
-  "reason": "一句话说明判断依据"
-}
-
-判定规则：
-- entry_confirm：当前消息是在通知之前 pending_entry 策略现在/现价/市价/直接入场，或明确说已经进场。
-- cancel_entry：当前消息是在取消之前 pending_entry 限价挂单或等待入场策略，例如取消限价、撤单、取消挂单、等后续信号。
-- exit_position：当前消息是在关闭已 entered 策略，例如平仓、全平、离场、临时离场、止盈了、止损了、先出来、保本出局、成本附近保本出局、保本走、成本走、breakeven exit。
-- position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、分批止盈30%、按比例止盈、减仓一半、减仓30%、持仓收益达到100%后分批止盈、带保护、保护止损、上移止损、推保护、继续持有。“回成本了，注意保护成本，平加仓”表示减仓一半并将止损移至成本价，management_action 应输出 partial_take_profit, move_stop_to_protect。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
-- none：普通聊天、行情观点、广告、复盘、联系方式、无法确定目标策略、或只是识别新策略但不改变已有策略。
-- 必须优先依据当前消息，不要把上下文里的旧消息当成当前动作。
-- 如果能明确对应活跃策略，请输出 target_lifecycle_id。
-- 如果不能唯一对应，event_type 必须为 none 或 confidence 低于 0.7。
-- confidence 低于 0.7 时，系统不会执行状态变更。
-""".strip()
-
-
 def _apply_ai_lifecycle_event_if_matched(
     session,
     *,
     raw_message: RawMessage,
     config: AiRecognitionConfig,
+    system_prompt: str,
 ) -> MessageRecognitionResult | None:
     context = _load_lifecycle_event_context(session, raw_message)
     if not context["active_strategies"]:
@@ -785,6 +743,7 @@ def _apply_ai_lifecycle_event_if_matched(
             raw_message=raw_message,
             context=context,
             config=config,
+            system_prompt=system_prompt,
         )
     except Exception:
         return None
@@ -906,6 +865,7 @@ def _call_lifecycle_event_ai(
     raw_message: RawMessage,
     context: dict[str, Any],
     config: AiRecognitionConfig,
+    system_prompt: str,
 ) -> dict[str, Any]:
     provider = config.text_provider
     payload = {
@@ -913,7 +873,7 @@ def _call_lifecycle_event_ai(
         "messages": [
             {
                 "role": "system",
-                "content": config.lifecycle_event_prompt.strip() or LIFECYCLE_EVENT_PROMPT,
+                "content": system_prompt,
             },
             {
                 "role": "user",
@@ -945,7 +905,9 @@ def _call_lifecycle_event_ai(
         )
         response.raise_for_status()
         data = response.json()
-    return _parse_ai_result_json(_extract_ai_content(data))
+    parsed = _parse_ai_result_json(_extract_ai_content(data))
+    lifecycle = parsed.get("lifecycle_event")
+    return lifecycle if isinstance(lifecycle, dict) else parsed
 
 
 def _apply_lifecycle_event_decision(

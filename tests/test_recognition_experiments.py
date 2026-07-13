@@ -362,8 +362,8 @@ def test_run_mimo_direct_experiment_persists_side_channel_only(tmp_path, monkeyp
             assert headers["Authorization"] == "Bearer mimo-key"
             assert json["model"] == "mimo-v2.5"
             system_prompt = json["messages"][0]["content"]
-            assert "Use MiMo prompt from config." in system_prompt
-            assert "MiMo 对照实验要求" in system_prompt
+            assert "Use MiMo prompt from config." not in system_prompt
+            assert "图片与图文补充规则" in system_prompt
             return FakeResponse()
 
     monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", FakeClient)

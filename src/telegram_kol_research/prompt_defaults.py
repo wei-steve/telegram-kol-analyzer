@@ -34,11 +34,12 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
 - 如果完整的新开仓参数已经明确，不要仅因“可以考虑”“参考”“正常我不做单”等弱提示判为非策略。
 - 如果正文明确是“会员单盈利、已盈利、做个参考、复盘”，完整参数只是历史信号回顾，应按历史策略或复盘处理，不要创建新策略。
 
-【生命周期事件】
+【生命周期事件与仓位管理】
 - entry_confirm：此前 pending_entry 策略现在/现价/市价/直接入场，或明确已经进场。
 - cancel_entry：取消此前 pending_entry 挂单或等待入场策略，例如取消限价、撤单、不进了、等后续信号。
 - exit_position：关闭已 entered 策略，例如平仓、全平、清仓、出局、离场、临时离场、止盈了、止损了、先出来、保本走、成本走、breakeven exit。
 - position_update：管理已 entered 策略但没有完全离场，例如提前止盈一半、第一止盈位、分批止盈30%、减仓一半、推保护、移动止损、调整止盈止损、继续持有。
+- “第一止盈点来了”、“已到第一目标”且对应已有持仓时，属于仓位管理 position_update，不是新开仓。
 - “第一止盈位 60950，移动止损至成本价”属于 position_update，不能判为完整退出。
 - “回成本了，注意保护成本，平加仓”表示减仓并把止损移动到成本保护，management_action 输出 partial_take_profit, move_stop_to_protect。
 - 无法唯一对应目标策略时，event_type 输出 none 或置信度低于 0.7。
