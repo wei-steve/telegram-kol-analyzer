@@ -78,6 +78,38 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
             "ALTER TABLE recognition_decisions "
             "ADD COLUMN prompt_versions_json TEXT NOT NULL DEFAULT '{}'"
         ),
+        "comparison_status": (
+            "ALTER TABLE recognition_decisions "
+            "ADD COLUMN comparison_status VARCHAR(32) NOT NULL DEFAULT 'completed'"
+        ),
+        "disagreement_severity": (
+            "ALTER TABLE recognition_decisions ADD COLUMN disagreement_severity VARCHAR(32)"
+        ),
+        "comparison_model": (
+            "ALTER TABLE recognition_decisions ADD COLUMN comparison_model VARCHAR(128)"
+        ),
+        "comparison_payload_json": (
+            "ALTER TABLE recognition_decisions ADD COLUMN comparison_payload_json TEXT"
+        ),
+        "comparison_error": (
+            "ALTER TABLE recognition_decisions ADD COLUMN comparison_error TEXT"
+        ),
+        "comparison_attempts": (
+            "ALTER TABLE recognition_decisions "
+            "ADD COLUMN comparison_attempts INTEGER NOT NULL DEFAULT 0"
+        ),
+        "comparison_next_attempt_at": (
+            "ALTER TABLE recognition_decisions ADD COLUMN comparison_next_attempt_at DATETIME"
+        ),
+        "comparison_started_at": (
+            "ALTER TABLE recognition_decisions ADD COLUMN comparison_started_at DATETIME"
+        ),
+        "compared_at": (
+            "ALTER TABLE recognition_decisions ADD COLUMN compared_at DATETIME"
+        ),
+        "notification_fingerprint": (
+            "ALTER TABLE recognition_decisions ADD COLUMN notification_fingerprint VARCHAR(64)"
+        ),
     },
     "ai_prompt_versions": {
         "validated_at": "ALTER TABLE ai_prompt_versions ADD COLUMN validated_at DATETIME",

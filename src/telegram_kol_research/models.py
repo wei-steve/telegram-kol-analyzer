@@ -156,6 +156,20 @@ class RecognitionDecision(Base):
     notification_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     notification_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     prompt_versions_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    comparison_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="completed"
+    )
+    disagreement_severity: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    comparison_model: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    comparison_payload_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    comparison_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    comparison_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    comparison_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    comparison_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    compared_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    notification_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 

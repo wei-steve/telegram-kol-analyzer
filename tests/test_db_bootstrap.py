@@ -65,9 +65,89 @@ def test_database_bootstrap_creates_recognition_decisions_table(tmp_path):
         "notification_status",
         "notification_error",
         "prompt_versions_json",
+        "comparison_status",
+        "disagreement_severity",
+        "comparison_model",
+        "comparison_payload_json",
+        "comparison_error",
+        "comparison_attempts",
+        "comparison_next_attempt_at",
+        "comparison_started_at",
+        "compared_at",
+        "notification_fingerprint",
         "created_at",
         "updated_at",
     }.issubset(columns)
+
+
+def test_database_bootstrap_backfills_recognition_decisions_semantic_review_as_completed(
+    tmp_path,
+):
+    database_path = tmp_path / "research.db"
+    conn = sqlite3.connect(database_path)
+    conn.execute(
+        """
+        CREATE TABLE recognition_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            raw_message_id INTEGER NOT NULL UNIQUE,
+            input_kind VARCHAR(32) NOT NULL,
+            authoritative_model VARCHAR(128) NOT NULL,
+            authoritative_status VARCHAR(32) NOT NULL,
+            authoritative_payload_json TEXT NOT NULL,
+            auxiliary_model VARCHAR(128),
+            auxiliary_status VARCHAR(32),
+            auxiliary_payload_json TEXT,
+            agreement_status VARCHAR(32) NOT NULL,
+            differences_json TEXT NOT NULL DEFAULT '[]',
+            automation_status VARCHAR(32),
+            automation_reason TEXT,
+            notification_status VARCHAR(32),
+            notification_error TEXT,
+            prompt_versions_json TEXT NOT NULL DEFAULT '{}',
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO recognition_decisions (
+            raw_message_id, input_kind, authoritative_model, authoritative_status,
+            authoritative_payload_json, agreement_status, created_at, updated_at
+        ) VALUES (
+            1, 'text', 'mimo', '非策略', '{}', 'unknown',
+            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(recognition_decisions)").fetchall()
+    }
+    status = conn.execute(
+        "SELECT comparison_status FROM recognition_decisions WHERE raw_message_id = 1"
+    ).fetchone()[0]
+    conn.close()
+
+    assert {
+        "comparison_status",
+        "disagreement_severity",
+        "comparison_model",
+        "comparison_payload_json",
+        "comparison_error",
+        "comparison_attempts",
+        "comparison_next_attempt_at",
+        "comparison_started_at",
+        "compared_at",
+        "notification_fingerprint",
+    } <= columns
+    assert status == "completed"
 
 
 def test_database_bootstrap_creates_trading_settings_table(tmp_path):
