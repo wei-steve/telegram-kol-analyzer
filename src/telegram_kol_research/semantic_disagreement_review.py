@@ -826,7 +826,8 @@ def decide_semantic_severity(
         critical_confidence=critical_confidence,
     )
     review_claims_difference = bool(
-        review_payload["material_disagreement"] or review_conflicts
+        review_payload["material_disagreement"]
+        or any(conflict != "wording_only" for conflict in review_conflicts)
     )
     disagreed = bool(differences or review_claims_difference or deterministic_conflicts)
 

@@ -460,6 +460,23 @@ def test_same_action_with_different_reason_is_none():
     assert decision.agreement_status == "agreed"
 
 
+def test_wording_only_conflict_with_equivalent_actions_is_none():
+    decision = decide(
+        mimo_payload(event_type="entry_confirm", target_lifecycle_id=17),
+        review_payload(
+            action_type="entry_confirm",
+            target_lifecycle_id="17",
+            conflict_types=["wording_only"],
+            material_disagreement=False,
+            suggested_severity="none",
+            reason="Only the explanation wording differs",
+        ),
+    )
+
+    assert decision.severity == "none"
+    assert decision.agreement_status == "agreed"
+
+
 def test_noncritical_take_profit_detail_is_normal():
     decision = decide(
         mimo_payload(
