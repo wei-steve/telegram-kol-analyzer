@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -18,6 +19,7 @@ from telegram_kol_research.models import MediaAsset, RawMessage
 from telegram_kol_research.raw_ingest import normalize_message_payload, persist_normalized_messages
 from telegram_kol_research.raw_ingest import repair_history_checkpoints
 from telegram_kol_research.recognition_experiments import run_mimo_direct_for_message
+from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
 from telegram_kol_research.strategy_alerts import process_strategy_alert_for_record
 from telegram_kol_research.system_operator_bot import (
     send_ai_recognition_conflict_review,
@@ -34,6 +36,9 @@ from telegram_kol_research.telegram_client import (
 from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidates
 
 
+logger = logging.getLogger(__name__)
+
+
 async def persist_live_message_event(
     *,
     event: Any,
@@ -48,6 +53,7 @@ async def persist_live_message_event(
     ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
+    authoritative_processor: Callable[[int], Any] | None = None,
     system_operator_bot_config: Any | None = None,
     system_operator_conflict_sender=send_ai_recognition_conflict_review,
 ) -> dict[str, int]:
@@ -118,35 +124,58 @@ async def persist_live_message_event(
                 .one_or_none()
             )
         if raw_message is not None:
-            recog_result = await asyncio.to_thread(
-                recognize_message_now,
-                session_factory,
-                raw_message_id=raw_message.id,
-                ai_recognition_config=live_ai_config,
-            )
-            mimo_result = await asyncio.to_thread(
-                run_mimo_direct_for_message,
-                session_factory,
-                raw_message_id=raw_message.id,
-                ai_recognition_config=live_ai_config,
-                media_root=media_root,
-            )
-            conflict_payload = _build_ai_recognition_conflict_payload(
-                raw_message=raw_message,
-                chat_title=chat_title,
-                deepseek_result=recog_result,
-                mimo_result=mimo_result,
-            )
-            if conflict_payload is not None and system_operator_bot_enabled(system_operator_bot_config):
-                await system_operator_conflict_sender(
-                    config=system_operator_bot_config,
-                    payload=conflict_payload,
+            if authoritative_processor is not None:
+                processing_result = await asyncio.to_thread(
+                    authoritative_processor,
+                    raw_message.id,
                 )
-                return stats
-            # ── exit signal → lifecycle monitor ──
-            if auto_trade_executor is not None:
-                await asyncio.to_thread(auto_trade_executor, raw_message.id)
-            if lifecycle_monitor is not None and recog_result is not None:
+                recog_result = processing_result.recognition
+                conflict_payload = _build_authoritative_notification_payload(
+                    raw_message=raw_message,
+                    chat_title=chat_title,
+                    processing_result=processing_result,
+                )
+                if conflict_payload is not None and system_operator_bot_enabled(
+                    system_operator_bot_config
+                ):
+                    _schedule_authoritative_notification(
+                        session_factory=session_factory,
+                        raw_message_id=raw_message.id,
+                        sender=system_operator_conflict_sender,
+                        config=system_operator_bot_config,
+                        payload=conflict_payload,
+                    )
+            else:
+                recog_result = await asyncio.to_thread(
+                    recognize_message_now,
+                    session_factory,
+                    raw_message_id=raw_message.id,
+                    ai_recognition_config=live_ai_config,
+                )
+                mimo_result = await asyncio.to_thread(
+                    run_mimo_direct_for_message,
+                    session_factory,
+                    raw_message_id=raw_message.id,
+                    ai_recognition_config=live_ai_config,
+                    media_root=media_root,
+                )
+                conflict_payload = _build_ai_recognition_conflict_payload(
+                    raw_message=raw_message,
+                    chat_title=chat_title,
+                    deepseek_result=recog_result,
+                    mimo_result=mimo_result,
+                )
+                if conflict_payload is not None and system_operator_bot_enabled(system_operator_bot_config):
+                    await system_operator_conflict_sender(
+                        config=system_operator_bot_config,
+                        payload=conflict_payload,
+                    )
+                    return stats
+                if auto_trade_executor is not None:
+                    await asyncio.to_thread(auto_trade_executor, raw_message.id)
+            # Legacy lifecycle hook remains for callers that have not adopted
+            # the authoritative processor. MiMo application owns this in production.
+            if authoritative_processor is None and lifecycle_monitor is not None and recog_result is not None:
                 ai_payload = recog_result.ai_payload or {}
                 strategy_kind = ai_payload.get("strategy_kind")
                 if strategy_kind == "exit":
@@ -177,6 +206,86 @@ async def persist_live_message_event(
             recognition_result=recog_result,
         )
     return stats
+
+
+def _build_authoritative_notification_payload(
+    *,
+    raw_message: RawMessage,
+    chat_title: str | None,
+    processing_result: Any,
+) -> dict[str, Any] | None:
+    assessment = processing_result.assessment
+    if assessment.agreement_status not in {"disagreed", "authoritative_failed"}:
+        return None
+    mimo_payload = assessment.mimo.payload if isinstance(assessment.mimo.payload, dict) else {}
+    deepseek_payload = (
+        assessment.deepseek_payload
+        if isinstance(assessment.deepseek_payload, dict)
+        else {}
+    )
+    return {
+        "chat_title": chat_title,
+        "chat_id": raw_message.chat_id,
+        "message_id": raw_message.message_id,
+        "posted_at": raw_message.posted_at,
+        "text": raw_message.text,
+        "agreement_status": assessment.agreement_status,
+        "differences": assessment.differences,
+        "deepseek": {
+            "status": deepseek_payload.get("recognition_result") or "-",
+            "kind": "auxiliary",
+            "reason": deepseek_payload.get("reason") or "-",
+        },
+        "mimo": {
+            "status": assessment.mimo.status,
+            "kind": "authoritative",
+            "reason": mimo_payload.get("reason") or assessment.mimo.error_message or "-",
+        },
+        "automation": processing_result.automation,
+    }
+
+
+def _schedule_authoritative_notification(
+    *,
+    session_factory,
+    raw_message_id: int,
+    sender,
+    config,
+    payload: dict[str, Any],
+) -> None:
+    update_recognition_execution_outcome(
+        session_factory,
+        raw_message_id=raw_message_id,
+        automation_status=str(payload.get("automation", {}).get("status") or "unknown"),
+        automation_reason=payload.get("automation", {}).get("reason"),
+        notification_status="scheduled",
+    )
+
+    async def send_in_background() -> None:
+        try:
+            await sender(config=config, payload=payload)
+        except Exception as exc:  # pragma: no cover - network failure path
+            logger.exception("authoritative recognition notification failed")
+            await asyncio.to_thread(
+                update_recognition_execution_outcome,
+                session_factory,
+                raw_message_id=raw_message_id,
+                automation_status=str(payload.get("automation", {}).get("status") or "unknown"),
+                automation_reason=payload.get("automation", {}).get("reason"),
+                notification_status="failed",
+                notification_error=str(exc),
+            )
+        else:
+            await asyncio.to_thread(
+                update_recognition_execution_outcome,
+                session_factory,
+                raw_message_id=raw_message_id,
+                automation_status=str(payload.get("automation", {}).get("status") or "unknown"),
+                automation_reason=payload.get("automation", {}).get("reason"),
+                notification_status="sent",
+            )
+
+    asyncio.create_task(send_in_background())
 
 
 def _build_ai_recognition_conflict_payload(
@@ -245,6 +354,7 @@ async def run_live_listener(
     ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
+    authoritative_processor: Callable[[int], Any] | None = None,
     system_operator_bot_config: Any | None = None,
 ) -> None:
     """Attach Telethon new-message handlers and keep the client alive."""
@@ -273,6 +383,7 @@ async def run_live_listener(
             ai_recognition_config_path=ai_recognition_config_path,
             lifecycle_monitor=lifecycle_monitor,
             auto_trade_executor=auto_trade_executor,
+            authoritative_processor=authoritative_processor,
             system_operator_bot_config=system_operator_bot_config,
         )
 
@@ -304,6 +415,7 @@ def launch_live_listener_task(
     ai_recognition_config_path: str | Path | None = None,
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
+    authoritative_processor: Callable[[int], Any] | None = None,
     system_operator_bot_config: Any | None = None,
 ) -> asyncio.Task[None]:
     """Schedule the realtime listener in the current event loop."""
@@ -322,6 +434,7 @@ def launch_live_listener_task(
             "ai_recognition_config_path": ai_recognition_config_path,
             "lifecycle_monitor": lifecycle_monitor,
             "auto_trade_executor": auto_trade_executor,
+            "authoritative_processor": authoritative_processor,
             "system_operator_bot_config": system_operator_bot_config,
         },
     )

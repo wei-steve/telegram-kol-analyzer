@@ -83,11 +83,14 @@ def test_format_ai_recognition_conflict_review_message_includes_both_model_resul
         }
     )
 
-    assert "AI识别分歧复核" in message
+    assert "AI识别分歧告警" in message
     assert "比特币飞扬 11分组" in message
     assert "#3885" in message
     assert "DeepSeek: 非策略 / non_strategy" in message
     assert "MiMo: 取消入场 / strategy_related" in message
+    assert "权威结果: MiMo" in message
+    assert "已按 MiMo 结果继续" in message
+    assert "已暂停" not in message
     assert "今日两次BTC策略都没有入场" in message
 
 

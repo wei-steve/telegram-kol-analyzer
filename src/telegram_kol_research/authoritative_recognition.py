@@ -17,6 +17,7 @@ from telegram_kol_research.message_recognition import (
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
     save_recognition_decision,
+    update_recognition_execution_outcome,
 )
 from telegram_kol_research.recognition_experiments import (
     MimoAuthoritativeResult,
@@ -31,6 +32,13 @@ class AuthoritativeAssessment:
     deepseek_payload: dict[str, Any] | None
     agreement_status: str
     differences: list[str]
+
+
+@dataclass(frozen=True)
+class AuthoritativeProcessingResult:
+    assessment: AuthoritativeAssessment
+    recognition: MessageRecognitionResult
+    automation: dict[str, Any]
 
 
 def compare_assessments(
@@ -137,4 +145,51 @@ def apply_authoritative_assessment(
         payload=assessment.mimo.payload,
         model=assessment.mimo.model,
         error_message=assessment.mimo.error_message,
+    )
+
+
+def process_authoritative_message(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    ai_recognition_config: AiRecognitionConfig,
+    media_root: str | Path,
+    auto_trade_executor=None,
+) -> AuthoritativeProcessingResult:
+    """Apply MiMo first, then immediately hand its persisted result to automation."""
+
+    assessment = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=ai_recognition_config,
+        media_root=media_root,
+    )
+    recognition = apply_authoritative_assessment(session_factory, assessment)
+    if assessment.agreement_status == "authoritative_failed":
+        automation = {
+            "status": "skipped",
+            "reason": "mimo_authoritative_failed",
+        }
+    elif auto_trade_executor is None:
+        automation = {"status": "skipped", "reason": "auto_trade_not_configured"}
+    else:
+        outcome = auto_trade_executor(raw_message_id)
+        automation = outcome if isinstance(outcome, dict) else {
+            "status": "completed",
+            "reason": None,
+        }
+    update_recognition_execution_outcome(
+        session_factory,
+        raw_message_id=raw_message_id,
+        automation_status=str(automation.get("status") or "unknown"),
+        automation_reason=(
+            str(automation.get("reason"))
+            if automation.get("reason") is not None
+            else None
+        ),
+    )
+    return AuthoritativeProcessingResult(
+        assessment=assessment,
+        recognition=recognition,
+        automation=automation,
     )

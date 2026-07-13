@@ -29,6 +29,7 @@ except (
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
+from telegram_kol_research.authoritative_recognition import process_authoritative_message
 from telegram_kol_research.app_logging import (
     configure_application_logging,
     read_log_page,
@@ -54,7 +55,6 @@ from telegram_kol_research.message_recognition import recognize_message_now
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import StrategyLifecycle
-from telegram_kol_research.recognition_experiments import run_mimo_direct_for_message
 from telegram_kol_research.recognition_profiles import list_recognition_profiles
 from telegram_kol_research.llm_chat import (
     build_proxy_chat_payload,
@@ -115,7 +115,8 @@ from telegram_kol_research.lifecycle_monitor import (
     LifecycleMonitorConfig,
 )
 from telegram_kol_research.telegram_live_listener import (
-    _build_ai_recognition_conflict_payload,
+    _build_authoritative_notification_payload,
+    _schedule_authoritative_notification,
     launch_live_listener_task,
     run_live_listener,
 )
@@ -1564,6 +1565,17 @@ def _run_auto_trade_executor(app: FastAPI, *, raw_message_id: int) -> dict[str, 
         return {"status": "failed", "reason": "auto_trade_executor_error"}
 
 
+def _run_authoritative_processor(app: FastAPI, *, raw_message_id: int):
+    ai_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
+    return process_authoritative_message(
+        app.state.session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=ai_config,
+        media_root=app.state.media_root,
+        auto_trade_executor=app.state.auto_trade_executor,
+    )
+
+
 def create_web_app(
     database_path: str | Path,
     media_root: str | Path | None = None,
@@ -1666,6 +1678,7 @@ def create_web_app(
                 ai_recognition_config_path=app.state.ai_recognition_config_path,
                 lifecycle_monitor=app.state.lifecycle_monitor,
                 auto_trade_executor=app.state.auto_trade_executor,
+                authoritative_processor=app.state.authoritative_processor,
                 system_operator_bot_config=app.state.system_operator_bot_config,
             )
             app.state.reconcile_task = asyncio.create_task(
@@ -1802,6 +1815,10 @@ def create_web_app(
         if ai_recognition_config_path is not None
         else Path("config/ai_recognition.yaml")
     )
+    app.state.authoritative_processor = lambda raw_message_id: _run_authoritative_processor(
+        app,
+        raw_message_id=raw_message_id,
+    )
     app.state.reconcile_interval_seconds = reconcile_interval_seconds
     app.state.reconcile_startup_delay_seconds = (
         15
@@ -1847,6 +1864,7 @@ def create_web_app(
                 ai_recognition_config_path=app.state.ai_recognition_config_path,
                 lifecycle_monitor=app.state.lifecycle_monitor,
                 auto_trade_executor=app.state.auto_trade_executor,
+                authoritative_processor=app.state.authoritative_processor,
                 system_operator_bot_config=app.state.system_operator_bot_config,
             )
         reconcile_task = app.state.reconcile_task
@@ -2769,57 +2787,50 @@ def create_web_app(
         ).to_dict()
 
     @app.post("/api/messages/{raw_message_id}/recognize")
-    def recognize_message(raw_message_id: int):
+    async def recognize_message(raw_message_id: int):
         try:
-            ai_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
-            result = app.state.message_recognizer(
-                app.state.session_factory,
-                raw_message_id=raw_message_id,
-                ai_recognition_config=ai_config,
+            processing_result = await asyncio.to_thread(
+                app.state.authoritative_processor,
+                raw_message_id,
             )
-            mimo_result = run_mimo_direct_for_message(
-                app.state.session_factory,
-                raw_message_id=raw_message_id,
-                ai_recognition_config=ai_config,
-                media_root=app.state.media_root,
-            )
-            conflict_payload = None
             with app.state.session_factory() as session:
                 raw_message = session.get(RawMessage, raw_message_id)
                 if raw_message is None:
                     raise LookupError(f"Raw message {raw_message_id} not found")
-                conflict_payload = _build_ai_recognition_conflict_payload(
+                conflict_payload = _build_authoritative_notification_payload(
                     raw_message=raw_message,
                     chat_title=raw_message.sender_name,
-                    deepseek_result=result,
-                    mimo_result=mimo_result,
+                    processing_result=processing_result,
                 )
             if conflict_payload is not None and system_operator_bot_enabled(
                 app.state.system_operator_bot_config
             ):
-                asyncio.run(
-                    send_ai_recognition_conflict_review(
-                        app.state.system_operator_bot_config,
-                        conflict_payload,
-                    )
+                _schedule_authoritative_notification(
+                    session_factory=app.state.session_factory,
+                    raw_message_id=raw_message_id,
+                    sender=send_ai_recognition_conflict_review,
+                    config=app.state.system_operator_bot_config,
+                    payload=conflict_payload,
                 )
-                auto_trade_result = {
-                    "status": "skipped",
-                    "reason": "ai_recognition_conflict",
-                }
-            else:
-                auto_trade_result = app.state.auto_trade_executor(raw_message_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        result = processing_result.recognition
         return {
             "raw_message_id": result.raw_message_id,
             "status": result.status,
             "summary": result.summary,
             "reason": result.reason,
-            "auto_trade": auto_trade_result,
-            "ai_conflict": conflict_payload is not None,
+            "auto_trade": processing_result.automation,
+            "ai_conflict": processing_result.assessment.agreement_status == "disagreed",
+            "authoritative_model": processing_result.assessment.mimo.model,
+            "agreement_status": processing_result.assessment.agreement_status,
+            "differences": processing_result.assessment.differences,
+            "notification_scheduled": (
+                conflict_payload is not None
+                and system_operator_bot_enabled(app.state.system_operator_bot_config)
+            ),
         }
 
     @app.post("/api/ai-recognition-config")

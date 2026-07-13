@@ -85,8 +85,14 @@ def format_ai_recognition_conflict_review_message(payload: dict[str, Any]) -> st
     text = str(payload.get("text") or "").strip()
     if len(text) > 700:
         text = text[:697] + "..."
+    automation = payload.get("automation") if isinstance(payload.get("automation"), dict) else {}
+    agreement_status = str(payload.get("agreement_status") or "disagreed")
+    if agreement_status == "authoritative_failed":
+        handling = "处理: MiMo 权威识别失败，未执行自动交易；DeepSeek 结果仅供参考。"
+    else:
+        handling = "处理: 已按 MiMo 结果继续，未等待人工复核。"
     lines = [
-        "【AI识别分歧复核】",
+        "【AI识别分歧告警】",
         f"群组: {payload.get('chat_title') or payload.get('group_label') or '-'}",
         f"群ID: {payload.get('chat_id') or '-'}",
         f"消息: #{payload.get('message_id') or '-'}",
@@ -95,7 +101,9 @@ def format_ai_recognition_conflict_review_message(payload: dict[str, Any]) -> st
         f"DeepSeek原因: {_format_value(deepseek.get('reason'))}",
         f"MiMo: {_format_value(mimo.get('status'))} / {_format_value(mimo.get('kind'))}",
         f"MiMo原因: {_format_value(mimo.get('reason'))}",
-        "处理: 两个模型判断不一致，已暂停该消息的自动交易和普通策略提醒，请人工复核。",
+        "权威结果: MiMo",
+        f"自动化结果: {_format_value(automation.get('status'))} / {_format_value(automation.get('reason'))}",
+        handling,
         "原文:",
         text or "-",
     ]

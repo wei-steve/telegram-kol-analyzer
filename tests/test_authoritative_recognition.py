@@ -2,8 +2,10 @@ from datetime import UTC, datetime
 
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.authoritative_recognition import (
+    AuthoritativeAssessment,
     apply_authoritative_assessment,
     assess_message_authoritatively,
+    process_authoritative_message,
 )
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
@@ -158,3 +160,109 @@ def test_mimo_failure_never_applies_deepseek_action(tmp_path, monkeypatch):
     assert result.status == "识别失败"
     with session_factory() as session:
         assert session.query(SignalCandidate).count() == 0
+
+
+def test_process_authoritative_message_applies_mimo_before_auto_trade(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=3, text="现价出局")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    events: list[str] = []
+    assessment = AuthoritativeAssessment(
+        raw_message_id=raw_id,
+        mimo=MimoAuthoritativeResult(
+            raw_message_id=raw_id,
+            payload={"recognition_result": "非策略", "lifecycle_event": {"event_type": "exit_position"}},
+            input_kind="text",
+            model="mimo-v2.5",
+            status="非策略",
+        ),
+        deepseek_payload={"recognition_result": "非策略", "lifecycle_event": {"event_type": "none"}},
+        agreement_status="disagreed",
+        differences=["lifecycle_event.event_type"],
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.assess_message_authoritatively",
+        lambda *args, **kwargs: assessment,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
+        lambda *args, **kwargs: events.append("apply_mimo") or object(),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.update_recognition_execution_outcome",
+        lambda *args, **kwargs: None,
+    )
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        auto_trade_executor=lambda message_id: events.append("auto_trade")
+        or {"status": "executed", "reason": "close_submitted"},
+    )
+
+    assert events == ["apply_mimo", "auto_trade"]
+    assert result.assessment.agreement_status == "disagreed"
+    assert result.automation == {"status": "executed", "reason": "close_submitted"}
+
+
+def test_process_authoritative_message_skips_auto_trade_when_mimo_fails(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=4, text="BTC short")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    assessment = AuthoritativeAssessment(
+        raw_message_id=raw_id,
+        mimo=MimoAuthoritativeResult(
+            raw_message_id=raw_id,
+            payload={},
+            input_kind="text",
+            model="mimo-v2.5",
+            status="识别失败",
+            error_message="timeout",
+        ),
+        deepseek_payload={"recognition_result": "是策略"},
+        agreement_status="authoritative_failed",
+        differences=[],
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.assess_message_authoritatively",
+        lambda *args, **kwargs: assessment,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.update_recognition_execution_outcome",
+        lambda *args, **kwargs: None,
+    )
+    auto_trade_calls: list[int] = []
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        auto_trade_executor=auto_trade_calls.append,
+    )
+
+    assert auto_trade_calls == []
+    assert result.automation == {
+        "status": "skipped",
+        "reason": "mimo_authoritative_failed",
+    }

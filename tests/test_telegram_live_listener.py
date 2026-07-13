@@ -291,3 +291,75 @@ def test_persist_live_message_event_sends_system_review_on_ai_disagreement(
     assert payload["mimo"]["kind"] == "strategy_related"
     assert alert_calls == []
     assert auto_trade_calls == []
+
+
+def test_authoritative_live_path_executes_mimo_before_nonblocking_disagreement_notice(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    broker = LiveUpdateBroker()
+    events: list[str] = []
+    notice_started = asyncio.Event()
+    keep_notice_pending = asyncio.Event()
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
+        lambda *args, **kwargs: None,
+    )
+
+    def authoritative_processor(raw_message_id):
+        events.extend(["apply_mimo", "auto_trade"])
+        return SimpleNamespace(
+            assessment=SimpleNamespace(
+                agreement_status="disagreed",
+                differences=["lifecycle_event.event_type"],
+                mimo=SimpleNamespace(
+                    status="非策略",
+                    payload={
+                        "reason": "MiMo识别为立即出局",
+                        "lifecycle_event": {"event_type": "exit_position"},
+                    },
+                    model="mimo-v2.5",
+                    error_message=None,
+                ),
+                deepseek_payload={
+                    "recognition_result": "非策略",
+                    "reason": "DeepSeek未识别为退出",
+                    "lifecycle_event": {"event_type": "none"},
+                },
+            ),
+            recognition=MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="非策略",
+                reason="MiMo识别为立即出局",
+                parse_source="mimo_authoritative",
+            ),
+            automation={"status": "executed", "reason": "close_submitted"},
+        )
+
+    async def slow_system_sender(**kwargs):
+        events.append("notification_started")
+        notice_started.set()
+        await keep_notice_pending.wait()
+
+    async def scenario():
+        await persist_live_message_event(
+            event=_FakeEvent(),
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            chat_title="峰哥",
+            ai_recognition_config=AiRecognitionConfig(),
+            authoritative_processor=authoritative_processor,
+            system_operator_bot_config=SystemOperatorBotConfig(
+                bot_token="system-token",
+                chat_id="system-chat",
+            ),
+            system_operator_conflict_sender=slow_system_sender,
+        )
+        await asyncio.wait_for(notice_started.wait(), timeout=1)
+        assert events == ["apply_mimo", "auto_trade", "notification_started"]
+        keep_notice_pending.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())

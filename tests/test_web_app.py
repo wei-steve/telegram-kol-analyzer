@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
@@ -1342,6 +1343,25 @@ def test_message_recognition_api_updates_message_result(tmp_path):
         session.commit()
         raw_message_id = raw_message.id
 
+    def fake_authoritative_processor(message_id):
+        result = app.state.message_recognizer(
+            app.state.session_factory,
+            raw_message_id=message_id,
+            ai_recognition_config=AiRecognitionConfig(),
+        )
+        return SimpleNamespace(
+            recognition=result,
+            assessment=SimpleNamespace(
+                agreement_status="agreed",
+                differences=[],
+                mimo=SimpleNamespace(model="mimo-v2.5", payload={}, status=result.status),
+                deepseek_payload=None,
+            ),
+            automation={"status": "skipped", "reason": "test"},
+        )
+
+    app.state.authoritative_processor = fake_authoritative_processor
+
     client = TestClient(app)
     response = client.post(f"/api/messages/{raw_message_id}/recognize")
 
@@ -1373,6 +1393,25 @@ def test_message_recognition_api_runs_auto_trade_executor_after_recognition(tmp_
         session.add(raw_message)
         session.commit()
         raw_message_id = raw_message.id
+
+    def fake_authoritative_processor(message_id):
+        result = app.state.message_recognizer(
+            app.state.session_factory,
+            raw_message_id=message_id,
+            ai_recognition_config=AiRecognitionConfig(),
+        )
+        return SimpleNamespace(
+            recognition=result,
+            assessment=SimpleNamespace(
+                agreement_status="agreed",
+                differences=[],
+                mimo=SimpleNamespace(model="mimo-v2.5", payload={}, status=result.status),
+                deepseek_payload=None,
+            ),
+            automation=app.state.auto_trade_executor(message_id),
+        )
+
+    app.state.authoritative_processor = fake_authoritative_processor
 
     client = TestClient(app)
     response = client.post(f"/api/messages/{raw_message_id}/recognize")
@@ -1414,24 +1453,12 @@ def test_message_recognition_api_sends_system_review_on_ai_disagreement(
     )
     sent_reviews: list[tuple[SystemOperatorBotConfig, dict]] = []
 
-    monkeypatch.setattr(
-        "telegram_kol_research.web_app.run_mimo_direct_for_message",
-        lambda *args, **kwargs: SimpleNamespace(
-            status="是策略",
-            reason="MiMo认为这是取消旧挂单",
-            confidence=0.92,
-            strategy_json={},
-            error_message=None,
-            input_kind="text",
-        ),
-    )
-
-    async def fake_conflict_sender(config, payload):
-        sent_reviews.append((config, payload))
+    def fake_schedule_authoritative_notification(**kwargs):
+        sent_reviews.append((kwargs["config"], kwargs["payload"]))
 
     monkeypatch.setattr(
-        "telegram_kol_research.web_app.send_ai_recognition_conflict_review",
-        fake_conflict_sender,
+        "telegram_kol_research.web_app._schedule_authoritative_notification",
+        fake_schedule_authoritative_notification,
     )
 
     with app.state.session_factory() as session:
@@ -1445,22 +1472,41 @@ def test_message_recognition_api_sends_system_review_on_ai_disagreement(
         session.commit()
         raw_message_id = raw_message.id
 
+    def fake_authoritative_processor(message_id):
+        return SimpleNamespace(
+            recognition=fake_recognizer(raw_message_id=message_id),
+            assessment=SimpleNamespace(
+                agreement_status="disagreed",
+                differences=["lifecycle_event.event_type"],
+                mimo=SimpleNamespace(
+                    model="mimo-v2.5",
+                    status="是策略",
+                    payload={"reason": "MiMo认为这是取消旧挂单"},
+                    error_message=None,
+                ),
+                deepseek_payload={
+                    "recognition_result": "非策略",
+                    "reason": "DeepSeek认为只是取消说明",
+                },
+            ),
+            automation=app.state.auto_trade_executor(message_id),
+        )
+
+    app.state.authoritative_processor = fake_authoritative_processor
+
     client = TestClient(app)
     response = client.post(f"/api/messages/{raw_message_id}/recognize")
 
     assert response.status_code == 200
     assert response.json()["ai_conflict"] is True
-    assert response.json()["auto_trade"] == {
-        "status": "skipped",
-        "reason": "ai_recognition_conflict",
-    }
-    assert auto_trade_calls == []
+    assert response.json()["auto_trade"] == {"status": "submitted"}
+    assert auto_trade_calls == [raw_message_id]
     assert len(sent_reviews) == 1
     config, payload = sent_reviews[0]
     assert config.chat_id == "system-chat"
     assert payload["message_id"] == 3885
-    assert payload["deepseek"]["kind"] == "non_strategy"
-    assert payload["mimo"]["kind"] == "strategy_related"
+    assert payload["deepseek"]["kind"] == "auxiliary"
+    assert payload["mimo"]["kind"] == "authoritative"
 
 
 def test_strategy_mid_panel_loads_only_visible_strategy_list(tmp_path, monkeypatch):
