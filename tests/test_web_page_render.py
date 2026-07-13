@@ -18,6 +18,49 @@ from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.web_app import create_web_app
+
+
+def test_dashboard_renders_versioned_prompt_center_without_api_keys(tmp_path):
+    config_path = tmp_path / "ai.yaml"
+    config_path.write_text(
+        """
+mode: ai_provider
+text_provider:
+  base_url: https://example.test/v1
+  api_key: never-render-this-secret
+  model: deepseek-test
+image_provider:
+  base_url: https://example.test/v1
+  api_key: never-render-this-image-secret
+  model: mimo-test
+""".strip(),
+        encoding="utf-8",
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        ai_recognition_config_path=config_path,
+    )
+
+    response = TestClient(app).get("/")
+
+    assert response.status_code == 200
+    assert "data-ai-prompt-center" in response.text
+    assert "data-ai-prompt-list" in response.text
+    assert "data-ai-prompt-mobile-select" in response.text
+    assert "data-ai-prompt-detail" in response.text
+    for control in (
+        "data-ai-prompt-save-draft",
+        "data-ai-prompt-validate",
+        "data-ai-prompt-test",
+        "data-ai-prompt-publish",
+        "data-ai-prompt-history",
+        "data-ai-prompt-rollback",
+    ):
+        assert control in response.text
+    assert "DeepSeek = A + C" in response.text
+    assert "MiMo = A + B + C" in response.text
+    assert "never-render-this-secret" not in response.text
+    assert "never-render-this-image-secret" not in response.text
 from telegram_kol_research.web_app import _exchange_order_row
 
 

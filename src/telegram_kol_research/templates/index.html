@@ -61,7 +61,9 @@
   </section>
 
   <section class="dashboard-tab-panel" data-dashboard-panel="prompt">
-    <section class="panel ai-recognition-panel" data-ai-recognition-prompt>
+    {% include "_ai_prompt_center.html" %}
+    {# Legacy YAML prompt editor retained only in source history; runtime editing now uses the registry. #}
+    <section class="panel ai-recognition-panel" data-ai-recognition-prompt hidden>
       <div class="panel-heading">
         <div>
           <h2>AI识别提示词</h2>
@@ -190,7 +192,7 @@
               <input type="hidden" data-ai-model-id value="{{ model.id }}" />
               <label>Display name<input data-ai-model-label value="{{ model.label }}" placeholder="Display name" /></label>
               <label>Base URL<input data-ai-model-base-url value="{{ model.base_url }}" placeholder="https://api.example.com/v1" /></label>
-              <label>API Key<input data-ai-model-api-key value="{{ model.api_key }}" placeholder="sk-..." /></label>
+              <label>API Key<input data-ai-model-api-key value="" placeholder="{% if model.api_key %}已配置（留空保持不变）{% else %}sk-...{% endif %}" autocomplete="off" /></label>
               <label>Model<input data-ai-model-name value="{{ model.model }}" placeholder="model-name" /></label>
               <label>Timeout seconds<input data-ai-model-timeout type="number" min="1" value="{{ model.timeout_seconds }}" /></label>
               <div class="ai-model-capabilities">

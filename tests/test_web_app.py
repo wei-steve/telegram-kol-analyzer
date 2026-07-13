@@ -1863,8 +1863,10 @@ def test_ai_recognition_config_api_saves_model_list_and_active_selection(tmp_pat
     payload = response.json()
     assert payload["active_text_model_id"] == "deepseek-v4-flash"
     assert payload["active_image_model_id"] == "mimo-v2.5"
-    assert payload["text_provider"]["api_key"] == "deepseek-key"
-    assert payload["image_provider"]["api_key"] == "mimo-key"
+    assert payload["text_provider"]["api_key"] == ""
+    assert payload["image_provider"]["api_key"] == ""
+    assert payload["text_provider"]["api_key_configured"] is True
+    assert payload["image_provider"]["api_key_configured"] is True
 
 
 def test_recovery_dry_run_api_persists_decisions_with_configured_gate_provider(tmp_path):

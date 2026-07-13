@@ -3118,9 +3118,15 @@ def create_web_app(
                     or existing_config.mimo_direct_prompt
                 ),
                 mode=str(payload.get("mode") or "ai_provider"),
-                text_provider=_provider_config_from_payload(payload.get("text_provider")),
-                image_provider=_provider_config_from_payload(payload.get("image_provider")),
-                ai_models=_model_configs_from_payload(payload.get("ai_models")),
+                text_provider=_provider_config_from_payload(
+                    payload.get("text_provider"), existing_config.text_provider
+                ),
+                image_provider=_provider_config_from_payload(
+                    payload.get("image_provider"), existing_config.image_provider
+                ),
+                ai_models=_model_configs_from_payload(
+                    payload.get("ai_models"), existing_config.ai_models
+                ),
                 active_text_model_id=str(payload.get("active_text_model_id") or ""),
                 active_image_model_id=str(payload.get("active_image_model_id") or ""),
             ),
@@ -3806,12 +3812,15 @@ def _datetime_to_iso(value: datetime | None) -> str | None:
     return value.isoformat()
 
 
-def _provider_config_from_payload(payload: Any) -> AiProviderConfig:
+def _provider_config_from_payload(
+    payload: Any,
+    existing: AiProviderConfig | None = None,
+) -> AiProviderConfig:
     if not isinstance(payload, dict):
-        return AiProviderConfig()
+        return existing or AiProviderConfig()
     return AiProviderConfig(
         base_url=str(payload.get("base_url") or ""),
-        api_key=str(payload.get("api_key") or ""),
+        api_key=str(payload.get("api_key") or (existing.api_key if existing else "")),
         model=str(payload.get("model") or ""),
         timeout_seconds=float(payload.get("timeout_seconds") or 60),
     )
@@ -3836,25 +3845,32 @@ def _ai_prompt_payload_value(payload: dict[str, Any], prompt_id: str) -> str | N
 def _provider_config_response(config: AiProviderConfig) -> dict[str, Any]:
     return {
         "base_url": config.base_url,
-        "api_key": config.api_key,
+        "api_key": "",
+        "api_key_configured": bool(config.api_key),
         "model": config.model,
         "timeout_seconds": config.timeout_seconds,
     }
 
 
-def _model_configs_from_payload(payload: Any) -> list[AiModelConfig]:
+def _model_configs_from_payload(
+    payload: Any,
+    existing: list[AiModelConfig] | None = None,
+) -> list[AiModelConfig]:
     if not isinstance(payload, list):
-        return []
+        return list(existing or [])
     models: list[AiModelConfig] = []
+    existing_by_id = {model.id: model for model in (existing or [])}
     for item in payload:
         if not isinstance(item, dict):
             continue
+        model_id = str(item.get("id") or item.get("model") or "")
+        prior = existing_by_id.get(model_id)
         models.append(
             AiModelConfig(
-                id=str(item.get("id") or item.get("model") or ""),
+                id=model_id,
                 label=str(item.get("label") or item.get("model") or item.get("id") or ""),
                 base_url=str(item.get("base_url") or ""),
-                api_key=str(item.get("api_key") or ""),
+                api_key=str(item.get("api_key") or (prior.api_key if prior else "")),
                 model=str(item.get("model") or ""),
                 timeout_seconds=float(item.get("timeout_seconds") or 60),
                 supports_text=bool(item.get("supports_text", True)),
@@ -3869,7 +3885,8 @@ def _model_config_response(config: AiModelConfig) -> dict[str, Any]:
         "id": config.id,
         "label": config.label,
         "base_url": config.base_url,
-        "api_key": config.api_key,
+        "api_key": "",
+        "api_key_configured": bool(config.api_key),
         "model": config.model,
         "timeout_seconds": config.timeout_seconds,
         "supports_text": config.supports_text,

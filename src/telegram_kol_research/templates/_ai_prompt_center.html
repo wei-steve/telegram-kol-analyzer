@@ -1,0 +1,74 @@
+<section class="panel ai-recognition-panel ai-prompt-center" data-ai-prompt-center>
+  <div class="panel-heading">
+    <div>
+      <h2>AI 提示词中心</h2>
+      <p class="ai-helper-text">所有 AI 环节统一在这里浏览和编辑。保存只生成草稿；校验和历史消息测试通过后才能发布。</p>
+    </div>
+    <button type="button" class="secondary-button" data-dashboard-tab="main">返回主界面</button>
+  </div>
+
+  <div class="prompt-composition-guide" aria-label="模型提示词组合">
+    <span><strong>DeepSeek = A + C</strong><small>统一交易规则 + 当前消息/策略上下文</small></span>
+    <span><strong>MiMo = A + B + C</strong><small>统一交易规则 + 图片规则 + 当前消息/图片/策略上下文</small></span>
+  </div>
+
+  <label class="prompt-mobile-selector">
+    选择提示词
+    <select data-ai-prompt-mobile-select aria-label="选择 AI 提示词"></select>
+  </label>
+
+  <div class="prompt-center-layout">
+    <aside class="prompt-registry-list" data-ai-prompt-list aria-label="AI 提示词列表">
+      <p class="ai-helper-text">正在加载提示词…</p>
+    </aside>
+
+    <article class="prompt-registry-detail" data-ai-prompt-detail hidden>
+      <header class="prompt-detail-header">
+        <div>
+          <span class="ai-prompt-tag" data-ai-prompt-category></span>
+          <h3 data-ai-prompt-title></h3>
+          <p data-ai-prompt-description></p>
+        </div>
+        <div class="prompt-version-badges">
+          <span data-ai-prompt-active-badge></span>
+          <span data-ai-prompt-draft-badge></span>
+        </div>
+      </header>
+
+      <div class="prompt-editor-tabs" role="tablist">
+        <button type="button" class="is-active" data-ai-prompt-view="draft">草稿编辑</button>
+        <button type="button" data-ai-prompt-view="active">当前生效版本</button>
+      </div>
+      <label>
+        提示词内容
+        <textarea rows="20" data-ai-prompt-draft></textarea>
+      </label>
+      <label>
+        修改说明
+        <textarea rows="3" data-ai-prompt-change-note placeholder="说明修改目的、影响范围和回滚依据"></textarea>
+      </label>
+
+      <div class="prompt-actions prompt-registry-actions">
+        <button type="button" data-ai-prompt-save-draft>保存草稿</button>
+        <button type="button" class="secondary-button" data-ai-prompt-validate>校验</button>
+        <button type="button" class="secondary-button" data-ai-prompt-test>历史消息测试</button>
+        <button type="button" class="danger-button" data-ai-prompt-publish disabled>发布</button>
+        <button type="button" class="secondary-button" data-ai-prompt-history>历史版本</button>
+        <button type="button" class="danger-button" data-ai-prompt-rollback>回滚</button>
+      </div>
+
+      <section class="prompt-test-controls" data-ai-prompt-test-controls>
+        <label>历史消息数据库 ID（逗号分隔，最多 20 条）<input data-ai-prompt-test-message-ids placeholder="例如 123, 456" /></label>
+        <div>
+          <label><input type="checkbox" value="mimo" data-ai-prompt-test-model checked /> MiMo</label>
+          <label><input type="checkbox" value="deepseek" data-ai-prompt-test-model checked /> DeepSeek</label>
+        </div>
+      </section>
+
+      <button type="button" class="secondary-button" data-ai-prompt-import-legacy hidden>导入为草稿</button>
+      <p class="ai-recognition-save-status" data-ai-prompt-status aria-live="polite"></p>
+      <pre class="prompt-comparison-result" data-ai-prompt-comparison hidden></pre>
+      <section class="prompt-history-list" data-ai-prompt-history-list hidden></section>
+    </article>
+  </div>
+</section>

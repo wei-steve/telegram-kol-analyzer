@@ -1,6 +1,11 @@
 let latestFreshnessSnapshot = null;
 let currentSelectedChatId = null;
 let groupSwitchRequestId = 0;
+let promptCenterRequestId = 0;
+const PROMPT_API_ACTIONS = ['/draft', '/validate', '/test', '/publish', '/history', '/rollback'];
+let promptCenterState = {
+  items: [], selected: null, validated: false, tested: false, chatId: null,
+};
 let hasDeferredMessageRefresh = false;
 let recoveryRefreshPromise = null;
 
@@ -1314,6 +1319,9 @@ function bindDashboardTabs() {
       if (menu) {
         menu.open = false;
       }
+      if (tab === 'prompt') {
+        loadAiPromptCenter();
+      }
     });
   });
 }
@@ -1805,6 +1813,290 @@ function bindAiRecognitionPromptForm() {
     }
   });
   bindAiRecognitionConfigForm();
+}
+
+function promptApiPath(promptKey, action = '', chatId = null) {
+  const suffix = action ? `/${action}` : '';
+  const query = chatId ? `?chat_id=${encodeURIComponent(chatId)}` : '';
+  return `/api/ai-prompts/${encodeURIComponent(promptKey)}${suffix}${query}`;
+}
+
+async function promptApiRequest(url, options = {}) {
+  const response = await fetch(url, options);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+  return payload;
+}
+
+function setPromptCenterStatus(message, isError = false) {
+  const status = document.querySelector('[data-ai-prompt-status]');
+  if (!status) return;
+  status.textContent = message || '';
+  status.classList.toggle('is-error', isError);
+}
+
+function selectedPromptChatId(item = promptCenterState.selected) {
+  return item?.scope_chat_id || null;
+}
+
+async function loadAiPromptCenter() {
+  const root = document.querySelector('[data-ai-prompt-center]');
+  if (!root) return;
+  const requestId = ++promptCenterRequestId;
+  const chatId = getSelectedChatId();
+  const query = chatId ? `?chat_id=${encodeURIComponent(chatId)}` : '';
+  try {
+    const payload = await promptApiRequest(`/api/ai-prompts${query}`);
+    if (requestId !== promptCenterRequestId) return;
+    promptCenterState.items = payload.items || [];
+    promptCenterState.chatId = chatId || null;
+    renderPromptRegistryList();
+    const previousKey = promptCenterState.selected?.prompt_key;
+    const next = promptCenterState.items.find((item) => item.prompt_key === previousKey)
+      || promptCenterState.items[0];
+    if (next) selectPromptDefinition(next.prompt_key, next.scope_chat_id);
+  } catch (error) {
+    setPromptCenterStatus(error.message || '提示词列表加载失败', true);
+  }
+}
+
+function renderPromptRegistryList() {
+  const list = document.querySelector('[data-ai-prompt-list]');
+  const select = document.querySelector('[data-ai-prompt-mobile-select]');
+  if (!list || !select) return;
+  list.replaceChildren();
+  select.replaceChildren();
+  promptCenterState.items.forEach((item) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'prompt-registry-item';
+    button.dataset.promptKey = item.prompt_key;
+    if (item.scope_chat_id) button.dataset.chatId = String(item.scope_chat_id);
+    const title = document.createElement('strong');
+    title.textContent = item.display_name;
+    const meta = document.createElement('small');
+    meta.textContent = `${item.category} · v${item.active_version.version_number}${item.draft_version ? ' · 有草稿' : ''}`;
+    button.append(title, meta);
+    button.addEventListener('click', () => selectPromptDefinition(item.prompt_key, item.scope_chat_id));
+    list.append(button);
+
+    const option = document.createElement('option');
+    option.value = `${item.prompt_key}|${item.scope_chat_id || ''}`;
+    option.textContent = item.display_name;
+    select.append(option);
+  });
+  const legacy = loadGroupPrompt(promptCenterState.chatId);
+  const hasScoped = promptCenterState.items.some((item) => item.prompt_key === 'research.chat.group');
+  if (legacy && promptCenterState.chatId && !hasScoped) {
+    const option = document.createElement('option');
+    option.value = `research.chat.group|${promptCenterState.chatId}`;
+    option.textContent = '群组专属研究提示词（待导入）';
+    select.append(option);
+  }
+  if (!select.dataset.bound) {
+    select.dataset.bound = 'true';
+    select.addEventListener('change', () => {
+      const [key, scopedChatId] = select.value.split('|');
+      selectPromptDefinition(key, scopedChatId ? Number(scopedChatId) : null);
+    });
+  }
+}
+
+async function selectPromptDefinition(promptKey, chatId = null) {
+  const requestId = ++promptCenterRequestId;
+  try {
+    const detail = await promptApiRequest(promptApiPath(promptKey, '', chatId));
+    if (requestId !== promptCenterRequestId) return;
+    promptCenterState.selected = detail;
+    promptCenterState.validated = Boolean(detail.draft_version?.validation_result?.success);
+    promptCenterState.tested = false;
+    renderPromptDetail();
+  } catch (error) {
+    if (promptKey === 'research.chat.group' && chatId && loadGroupPrompt(chatId)) {
+      renderLegacyGroupPromptImport(chatId);
+      return;
+    }
+    setPromptCenterStatus(error.message, true);
+  }
+}
+
+function renderPromptDetail() {
+  const detail = document.querySelector('[data-ai-prompt-detail]');
+  const item = promptCenterState.selected;
+  if (!detail || !item) return;
+  detail.hidden = false;
+  detail.querySelector('[data-ai-prompt-title]').textContent = item.display_name;
+  detail.querySelector('[data-ai-prompt-description]').textContent = item.description;
+  detail.querySelector('[data-ai-prompt-category]').textContent = item.category;
+  detail.querySelector('[data-ai-prompt-active-badge]').textContent = `生效 v${item.active_version.version_number}`;
+  detail.querySelector('[data-ai-prompt-draft-badge]').textContent = item.draft_version
+    ? `草稿 v${item.draft_version.version_number}` : '无草稿';
+  const editor = detail.querySelector('[data-ai-prompt-draft]');
+  editor.readOnly = false;
+  editor.value = item.draft_version?.content || item.active_version.content;
+  detail.querySelector('[data-ai-prompt-change-note]').value = item.draft_version?.change_note || '';
+  detail.querySelector('[data-ai-prompt-publish]').disabled = !promptCenterState.validated;
+  detail.querySelector('[data-ai-prompt-import-legacy]').hidden = true;
+  detail.querySelectorAll('[data-ai-prompt-view]').forEach((button) => {
+    button.classList.toggle('is-active', button.dataset.aiPromptView === 'draft');
+  });
+  document.querySelectorAll('[data-ai-prompt-list] [data-prompt-key]').forEach((button) => {
+    button.classList.toggle('is-active', button.dataset.promptKey === item.prompt_key
+      && Number(button.dataset.chatId || 0) === Number(item.scope_chat_id || 0));
+  });
+  const select = document.querySelector('[data-ai-prompt-mobile-select]');
+  if (select) select.value = `${item.prompt_key}|${item.scope_chat_id || ''}`;
+  setPromptCenterStatus(promptCenterState.validated ? '草稿已通过校验' : '');
+}
+
+function renderLegacyGroupPromptImport(chatId) {
+  const detail = document.querySelector('[data-ai-prompt-detail]');
+  if (!detail) return;
+  promptCenterState.selected = { prompt_key: 'research.chat.group', scope_chat_id: chatId };
+  detail.hidden = false;
+  detail.querySelector('[data-ai-prompt-title]').textContent = '群组专属研究提示词';
+  detail.querySelector('[data-ai-prompt-description]').textContent = '检测到浏览器旧版群组提示词，可导入服务器草稿。';
+  detail.querySelector('[data-ai-prompt-draft]').value = loadGroupPrompt(chatId);
+  detail.querySelector('[data-ai-prompt-import-legacy]').hidden = false;
+  setPromptCenterStatus('旧版提示词不会自动发布');
+}
+
+function promptDiffSummary(item) {
+  const active = item?.active_version?.content || '';
+  const draft = item?.draft_version?.content || '';
+  return `当前生效 v${item.active_version.version_number} (${active.length} 字)\n`
+    + `待发布草稿 v${item.draft_version?.version_number || '?'} (${draft.length} 字)\n\n`
+    + '发布后下一次 AI 调用将使用草稿内容。';
+}
+
+function bindAiPromptCenter() {
+  const root = document.querySelector('[data-ai-prompt-center]');
+  if (!root || root.dataset.bound) return;
+  root.dataset.bound = 'true';
+  const editor = root.querySelector('[data-ai-prompt-draft]');
+  editor.addEventListener('input', () => {
+    promptCenterState.validated = false;
+    promptCenterState.tested = false;
+    root.querySelector('[data-ai-prompt-publish]').disabled = true;
+    setPromptCenterStatus('内容已修改，请重新保存并校验');
+  });
+  root.querySelectorAll('[data-ai-prompt-view]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const activeView = button.dataset.aiPromptView === 'active';
+      editor.value = activeView
+        ? promptCenterState.selected.active_version.content
+        : (promptCenterState.selected.draft_version?.content || promptCenterState.selected.active_version.content);
+      editor.readOnly = activeView;
+      root.querySelectorAll('[data-ai-prompt-view]').forEach((item) => item.classList.toggle('is-active', item === button));
+    });
+  });
+  root.querySelector('[data-ai-prompt-save-draft]').addEventListener('click', async () => {
+    const item = promptCenterState.selected;
+    try {
+      const detail = await promptApiRequest(promptApiPath(item.prompt_key, 'draft', selectedPromptChatId(item)), {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: editor.value, change_note: root.querySelector('[data-ai-prompt-change-note]').value,
+          expected_active_version_id: item.active_version?.id }),
+      });
+      promptCenterState.selected = detail;
+      promptCenterState.validated = false;
+      renderPromptDetail();
+      setPromptCenterStatus('草稿已保存，未发布');
+    } catch (error) { setPromptCenterStatus(error.message, true); }
+  });
+  root.querySelector('[data-ai-prompt-validate]').addEventListener('click', async () => {
+    const item = promptCenterState.selected;
+    try {
+      const result = await promptApiRequest(promptApiPath(item.prompt_key, 'validate', selectedPromptChatId(item)), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected_draft_version_id: item.draft_version?.id }),
+      });
+      promptCenterState.validated = result.success;
+      root.querySelector('[data-ai-prompt-publish]').disabled = !result.success;
+      setPromptCenterStatus(result.success ? '校验通过' : result.errors.join('；'), !result.success);
+    } catch (error) { setPromptCenterStatus(error.message, true); }
+  });
+  root.querySelector('[data-ai-prompt-test]').addEventListener('click', async () => {
+    const item = promptCenterState.selected;
+    const rawIds = root.querySelector('[data-ai-prompt-test-message-ids]').value.split(',')
+      .map((value) => Number(value.trim())).filter(Boolean);
+    const modelKinds = Array.from(root.querySelectorAll('[data-ai-prompt-test-model]:checked')).map((input) => input.value);
+    try {
+      const result = await promptApiRequest(promptApiPath(item.prompt_key, 'test'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ draft_version_id: item.draft_version?.id, raw_message_ids: rawIds, model_kinds: modelKinds }),
+      });
+      promptCenterState.tested = result.items.some((row) => !row.error_message);
+      const output = root.querySelector('[data-ai-prompt-comparison]');
+      output.textContent = JSON.stringify(result.items, null, 2);
+      output.hidden = false;
+      setPromptCenterStatus(promptCenterState.tested ? '历史消息测试完成' : '历史消息测试失败', !promptCenterState.tested);
+    } catch (error) { setPromptCenterStatus(error.message, true); }
+  });
+  root.querySelector('[data-ai-prompt-publish]').addEventListener('click', async () => {
+    const item = promptCenterState.selected;
+    if (!window.confirm(`${promptDiffSummary(item)}\n\n确认发布？`)) return;
+    try {
+      const detail = await promptApiRequest(promptApiPath(item.prompt_key, 'publish', selectedPromptChatId(item)), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected_draft_version_id: item.draft_version?.id }),
+      });
+      promptCenterState.selected = detail;
+      promptCenterState.validated = false;
+      renderPromptDetail();
+      setPromptCenterStatus('已发布，新版本已生效');
+    } catch (error) { setPromptCenterStatus(error.message, true); }
+  });
+  root.querySelector('[data-ai-prompt-history]').addEventListener('click', () => renderPromptHistory());
+  root.querySelector('[data-ai-prompt-rollback]').addEventListener('click', () => {
+    renderPromptHistory();
+    setPromptCenterStatus('请在历史版本中选择要回滚的已发布版本');
+  });
+  root.querySelector('[data-ai-prompt-import-legacy]').addEventListener('click', async () => {
+    const item = promptCenterState.selected;
+    try {
+      await promptApiRequest(promptApiPath(item.prompt_key, 'draft', item.scope_chat_id), {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: loadGroupPrompt(item.scope_chat_id), change_note: '从旧版浏览器群组提示词导入' }),
+      });
+      setPromptCenterStatus('已导入为草稿，未发布');
+      loadAiPromptCenter();
+    } catch (error) { setPromptCenterStatus(error.message, true); }
+  });
+  loadAiPromptCenter();
+}
+
+function renderPromptHistory() {
+  const root = document.querySelector('[data-ai-prompt-center]');
+  const container = root.querySelector('[data-ai-prompt-history-list]');
+  const item = promptCenterState.selected;
+  container.replaceChildren();
+  (item.history || []).forEach((version) => {
+    const row = document.createElement('div');
+    const label = document.createElement('span');
+    label.textContent = `v${version.version_number} · ${version.status} · ${version.change_note || '无说明'}`;
+    const rollback = document.createElement('button');
+    rollback.type = 'button';
+    rollback.className = 'secondary-button';
+    rollback.textContent = '回滚到此版本';
+    rollback.disabled = !['published', 'superseded'].includes(version.status) || version.id === item.active_version.id;
+    rollback.addEventListener('click', async () => {
+      if (!window.confirm(`确认以 v${version.version_number} 创建新的生效版本？\n提示词回滚不会回滚应用代码。`)) return;
+      try {
+        const detail = await promptApiRequest(promptApiPath(item.prompt_key, 'rollback', selectedPromptChatId(item)), {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source_version_id: version.id, expected_active_version_id: item.active_version.id,
+            change_note: `Web 回滚到 v${version.version_number}` }),
+        });
+        promptCenterState.selected = detail;
+        renderPromptDetail();
+        renderPromptHistory();
+      } catch (error) { setPromptCenterStatus(error.message, true); }
+    });
+    row.append(label, rollback);
+    container.append(row);
+  });
+  container.hidden = false;
 }
 
 function bindAiRecognitionConfigForm() {
@@ -2320,7 +2612,6 @@ async function submitAiQuestion(event) {
   const form = event.currentTarget;
   const questionInput = form.querySelector('[name="question"]');
   const chatId = getSelectedChatId();
-  const groupPromptInput = document.querySelector('[data-group-prompt]');
   const question = questionInput ? questionInput.value.trim() : '';
 
   if (!question) {
@@ -2344,7 +2635,6 @@ async function submitAiQuestion(event) {
       body: JSON.stringify({
         question,
         chat_id: Number(chatId),
-        group_prompt: groupPromptInput ? groupPromptInput.value : '',
       }),
     });
     const payload = await response.json();
@@ -2898,6 +3188,7 @@ window.addEventListener('DOMContentLoaded', () => {
   bindTradingSettingsForm();
   bindStrategyFilterBadges();
   bindAiRecognitionPromptForm();
+  bindAiPromptCenter();
   bindAiModelSelectionForm();
   bindGroupPromptEditor();
   bindClearAiHistory();
