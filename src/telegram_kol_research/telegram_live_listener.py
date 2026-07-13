@@ -8,6 +8,8 @@ import logging
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from sqlalchemy import tuple_
+
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig, load_ai_recognition_config
 from telegram_kol_research.candidates import persist_text_signal_candidates
 from telegram_kol_research.message_recognition import (
@@ -15,7 +17,7 @@ from telegram_kol_research.message_recognition import (
     recognize_message_now,
     recognize_records_with_ai_config,
 )
-from telegram_kol_research.models import MediaAsset, RawMessage
+from telegram_kol_research.models import MediaAsset, RawMessage, SignalCandidate
 from telegram_kol_research.raw_ingest import normalize_message_payload, persist_normalized_messages
 from telegram_kol_research.raw_ingest import repair_history_checkpoints
 from telegram_kol_research.recognition_experiments import run_mimo_direct_for_message
@@ -467,6 +469,9 @@ async def run_reconcile_once(
     strategy_alert_config: Any | None = None,
     strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
     strategy_alert_processor=process_strategy_alert_for_record,
+    authoritative_processor: Callable[[int], Any] | None = None,
+    system_operator_bot_config: Any | None = None,
+    system_operator_conflict_sender=send_ai_recognition_conflict_review,
     discover_dialogs_fn=discover_dialogs,
     fetch_dialog_messages_fn=fetch_dialog_messages,
 ) -> dict[str, int]:
@@ -544,12 +549,55 @@ async def run_reconcile_once(
             broker=broker,
         )
         inserted_messages += stats["inserted_messages"]
-        candidate_stats = recognize_records_with_ai_config(
-            session_factory,
-            filter_records_by_inserted_message_keys(records, stats),
-            fallback_recognizer=persist_text_signal_candidates,
-        )
-        inserted_candidates += candidate_stats["inserted_candidates"]
+        inserted_records = filter_records_by_inserted_message_keys(records, stats)
+        recognition_by_key: dict[tuple[int, int], Any] = {}
+        if authoritative_processor is not None:
+            inserted_keys = stats.get("inserted_message_keys") or []
+            with session_factory() as session:
+                raw_messages = (
+                    session.query(RawMessage)
+                    .filter(
+                        tuple_(RawMessage.chat_id, RawMessage.message_id).in_(inserted_keys)
+                    )
+                    .all()
+                    if inserted_keys
+                    else []
+                )
+                candidate_count_before = session.query(SignalCandidate).count()
+            for raw_message in raw_messages:
+                processing_result = await asyncio.to_thread(
+                    authoritative_processor,
+                    raw_message.id,
+                )
+                key = (raw_message.chat_id, raw_message.message_id)
+                recognition_by_key[key] = processing_result.recognition
+                notification_payload = _build_authoritative_notification_payload(
+                    raw_message=raw_message,
+                    chat_title=str(dialog.get("title") or ""),
+                    processing_result=processing_result,
+                )
+                if notification_payload is not None and system_operator_bot_enabled(
+                    system_operator_bot_config
+                ):
+                    _schedule_authoritative_notification(
+                        session_factory=session_factory,
+                        raw_message_id=raw_message.id,
+                        sender=system_operator_conflict_sender,
+                        config=system_operator_bot_config,
+                        payload=notification_payload,
+                    )
+            with session_factory() as session:
+                inserted_candidates += max(
+                    0,
+                    session.query(SignalCandidate).count() - candidate_count_before,
+                )
+        else:
+            candidate_stats = recognize_records_with_ai_config(
+                session_factory,
+                inserted_records,
+                fallback_recognizer=persist_text_signal_candidates,
+            )
+            inserted_candidates += candidate_stats["inserted_candidates"]
         trade_stats = persist_trade_ideas_from_candidates(session_factory)
         inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
         dialog_title = str(dialog.get("title") or "")
@@ -560,12 +608,15 @@ async def run_reconcile_once(
                 or strategy_alert_enabled_for_title(dialog_title)
             )
         ):
-            for record in records:
+            for record in inserted_records:
                 await strategy_alert_processor(
                     session_factory=session_factory,
                     record=record,
                     chat_title=dialog_title,
                     config=strategy_alert_config,
+                    recognition_result=recognition_by_key.get(
+                        (record.chat_id, record.message_id)
+                    ),
                 )
 
     return {
@@ -588,6 +639,8 @@ async def run_periodic_reconcile(
     operation_lock: Any | None = None,
     strategy_alert_config: Any | None = None,
     strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
+    authoritative_processor: Callable[[int], Any] | None = None,
+    system_operator_bot_config: Any | None = None,
 ) -> None:
     """Periodically replay a small recent history window for missed-message recovery."""
 
@@ -602,6 +655,8 @@ async def run_periodic_reconcile(
                 message_limit=message_limit,
                 strategy_alert_config=strategy_alert_config,
                 strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
+                authoritative_processor=authoritative_processor,
+                system_operator_bot_config=system_operator_bot_config,
             )
         else:
             async with operation_lock:
@@ -614,5 +669,7 @@ async def run_periodic_reconcile(
                     message_limit=message_limit,
                     strategy_alert_config=strategy_alert_config,
                     strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
+                    authoritative_processor=authoritative_processor,
+                    system_operator_bot_config=system_operator_bot_config,
                 )
         await asyncio.sleep(interval_seconds)

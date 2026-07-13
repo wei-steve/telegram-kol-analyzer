@@ -116,6 +116,7 @@ from telegram_kol_research.lifecycle_monitor import (
 )
 from telegram_kol_research.telegram_live_listener import (
     _build_authoritative_notification_payload,
+    _filter_callable_kwargs,
     _schedule_authoritative_notification,
     launch_live_listener_task,
     run_live_listener,
@@ -1693,6 +1694,8 @@ def create_web_app(
                     operation_lock=app.state.telegram_operation_lock,
                     strategy_alert_config=app.state.strategy_alert_config,
                     strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
+                    authoritative_processor=app.state.authoritative_processor,
+                    system_operator_bot_config=app.state.system_operator_bot_config,
                     startup_delay_seconds=app.state.reconcile_startup_delay_seconds,
                 )
             )
@@ -1881,6 +1884,8 @@ def create_web_app(
                     operation_lock=app.state.telegram_operation_lock,
                     strategy_alert_config=app.state.strategy_alert_config,
                     strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
+                    authoritative_processor=app.state.authoritative_processor,
+                    system_operator_bot_config=app.state.system_operator_bot_config,
                     startup_delay_seconds=0,
                 )
             )
@@ -3085,15 +3090,23 @@ def create_web_app(
             async with app.state.telegram_operation_lock:
                 await maybe_await(getattr(telegram_client, "connect", lambda: None)())
                 try:
+                    reconcile_kwargs = _filter_callable_kwargs(
+                        app.state.reconcile_once_runner,
+                        {
+                            "client": telegram_client,
+                            "session_factory": app.state.session_factory,
+                            "broker": app.state.live_update_broker,
+                            "target_titles": set(app.state.live_target_titles),
+                            "media_root": app.state.media_root,
+                            "strategy_alert_config": app.state.strategy_alert_config,
+                            "strategy_alert_enabled_for_title": app.state.strategy_alert_enabled_for_title,
+                            "authoritative_processor": app.state.authoritative_processor,
+                            "system_operator_bot_config": app.state.system_operator_bot_config,
+                        },
+                    )
                     return await asyncio.wait_for(
                         app.state.reconcile_once_runner(
-                            client=telegram_client,
-                            session_factory=app.state.session_factory,
-                            broker=app.state.live_update_broker,
-                            target_titles=set(app.state.live_target_titles),
-                            media_root=app.state.media_root,
-                            strategy_alert_config=app.state.strategy_alert_config,
-                            strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
+                            **reconcile_kwargs,
                         ),
                         timeout=REFRESH_TIMEOUT_SECONDS,
                     )
@@ -3402,7 +3415,7 @@ async def _run_reconcile_after_startup_delay(
 ):
     if startup_delay_seconds > 0:
         await asyncio.sleep(startup_delay_seconds)
-    await runner(**kwargs)
+    await runner(**_filter_callable_kwargs(runner, kwargs))
 
 
 def _task_failure_detail(task: asyncio.Task, *, default: str) -> str:

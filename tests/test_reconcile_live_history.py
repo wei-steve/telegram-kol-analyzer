@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import MediaAsset, RawMessage, SyncCheckpoint
@@ -90,6 +91,62 @@ def test_run_reconcile_once_persists_only_messages_newer_than_checkpoint(tmp_pat
     assert stats["inserted_messages"] == 1
     assert [message.message_id for message in raw_messages] == [78]
     assert checkpoint.last_message_id == 78
+
+
+def test_reconcile_processes_each_new_message_authoritatively_exactly_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    processed: list[int] = []
+
+    def authoritative_processor(raw_message_id):
+        processed.append(raw_message_id)
+        return SimpleNamespace(
+            recognition=SimpleNamespace(status="非策略"),
+            assessment=SimpleNamespace(
+                agreement_status="agreed",
+                differences=[],
+                mimo=SimpleNamespace(
+                    model="mimo-v2.5",
+                    status="非策略",
+                    payload={},
+                    error_message=None,
+                ),
+                deepseek_payload=None,
+            ),
+            automation={"status": "skipped", "reason": "group_not_auto_trade"},
+        )
+
+    first = __import__("asyncio").run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            authoritative_processor=authoritative_processor,
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=_fake_fetch_dialog_messages,
+        )
+    )
+    second = __import__("asyncio").run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            authoritative_processor=authoritative_processor,
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=_fake_fetch_dialog_messages,
+        )
+    )
+
+    assert first["inserted_messages"] == 2
+    assert second["inserted_messages"] == 0
+    assert len(processed) == 2
+    with session_factory() as session:
+        processed_message_ids = {
+            session.get(RawMessage, raw_message_id).message_id
+            for raw_message_id in processed
+        }
+    assert processed_message_ids == {77, 78}
 
 
 def test_run_reconcile_once_limits_media_downloads_to_new_messages(tmp_path):
