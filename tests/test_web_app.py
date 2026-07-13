@@ -7,6 +7,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
@@ -30,6 +31,10 @@ from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.message_recognition import MessageRecognitionResult
+from telegram_kol_research.semantic_disagreement_review import (
+    SemanticReviewDecision,
+    SemanticReviewRun,
+)
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_bot_commands import (
     _log_system_operator_callback_processed,
@@ -126,11 +131,38 @@ def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypa
             session.add(raw_message)
             session.commit()
             raw_message_id = raw_message.id
+        review_payload = {
+            "independent_action": {
+                "action_type": "exit_full",
+                "target_lifecycle_id": None,
+                "symbol": "BTC",
+                "side": None,
+                "stop_loss": None,
+                "take_profit": None,
+                "management_action": "close_position",
+            },
+            "evidence": ["全部出局"],
+            "conflict_types": ["urgent_exit_missed"],
+            "material_disagreement": True,
+            "suggested_severity": "critical",
+            "confidence": 0.99,
+            "reason": "DeepSeek 独立复核认为需要退出",
+        }
         await kwargs["notifier"](
             raw_message_id=raw_message_id,
-            review=SimpleNamespace(
-                auxiliary_payload={"recognition_result": "非策略"},
-                review_payload={"reason": "DeepSeek 独立复核认为需要退出"},
+            review=SemanticReviewRun(
+                raw_message_id=raw_message_id,
+                model="deepseek-review",
+                review_payload=review_payload,
+                auxiliary_payload=review_payload,
+                decision=SemanticReviewDecision(
+                    agreement_status="disagreed",
+                    severity="critical",
+                    conflict_types=("urgent_exit_missed",),
+                    differences=("MiMo missed exit",),
+                    reason="critical exit disagreement",
+                ),
+                prompt_versions={"trading.disagreement.semantic_review": 8},
             ),
         )
         started.set()
@@ -154,32 +186,113 @@ def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypa
     assert sent[0]["payload"]["chat_id"] == 88
     assert sent[0]["payload"]["message_id"] == 12
     assert sent[0]["payload"]["text"] == "BTC 全部出局"
+    assert sent[0]["payload"]["deepseek"] == {
+        "status": "exit_full",
+        "kind": "semantic_review",
+        "reason": "DeepSeek 独立复核认为需要退出",
+        "evidence": ["全部出局"],
+    }
 
 
-def test_semantic_review_worker_failure_is_logged(tmp_path):
-    failed = threading.Event()
+def test_semantic_review_worker_clean_exit_is_logged_and_restarted(tmp_path):
+    restarted = threading.Event()
+    calls = 0
+    active = 0
+    max_active = 0
 
-    async def failing_semantic_review_runner(**kwargs):
-        failed.set()
-        raise RuntimeError("semantic worker crashed")
+    async def returning_semantic_review_runner(**kwargs):
+        nonlocal calls, active, max_active
+        calls += 1
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            if calls == 1:
+                return
+            restarted.set()
+            await asyncio.Event().wait()
+        finally:
+            active -= 1
 
     app = create_web_app(
         database_path=tmp_path / "research.db",
-        semantic_review_runner=failing_semantic_review_runner,
+        semantic_review_runner=returning_semantic_review_runner,
+        semantic_review_restart_delay_seconds=0,
     )
 
     log_path = app.state.log_directory / "telegram-kol.log"
     with TestClient(app) as client:
-        assert failed.wait(timeout=1)
+        assert restarted.wait(timeout=1)
         for _ in range(20):
             log_text = log_path.read_text(encoding="utf-8")
-            if "semantic_review_task exited with error" in log_text:
+            if "Semantic review runner exited unexpectedly; restarting" in log_text:
                 break
             client.get("/api/freshness")
             time.sleep(0.01)
 
-    assert "Background task semantic_review_task exited with error" in log_text
+        assert calls == 2
+        assert max_active == 1
+
+    assert "Semantic review runner exited unexpectedly; restarting" in log_text
+
+
+def test_semantic_review_worker_failure_is_logged_and_restarted(tmp_path):
+    restarted = threading.Event()
+    calls = 0
+
+    async def failing_semantic_review_runner(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("semantic worker crashed")
+        restarted.set()
+        await asyncio.Event().wait()
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        semantic_review_runner=failing_semantic_review_runner,
+        semantic_review_restart_delay_seconds=0,
+    )
+
+    log_path = app.state.log_directory / "telegram-kol.log"
+    with TestClient(app) as client:
+        assert restarted.wait(timeout=1)
+        for _ in range(20):
+            log_text = log_path.read_text(encoding="utf-8")
+            if "Semantic review runner exited with error; restarting" in log_text:
+                break
+            client.get("/api/freshness")
+            time.sleep(0.01)
+
+    assert calls == 2
+    assert "Semantic review runner exited with error; restarting" in log_text
     assert "semantic worker crashed" in log_text
+
+
+def test_semantic_review_worker_is_cleaned_up_when_lifespan_startup_fails(
+    tmp_path, monkeypatch
+):
+    async def fake_semantic_review_runner(**kwargs):
+        await asyncio.Event().wait()
+
+    def fail_live_listener_startup(**kwargs):
+        raise RuntimeError("live listener startup failed")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.web_app.launch_live_listener_task",
+        fail_live_listener_startup,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        live_target_titles={"Demo Group"},
+        telegram_client=object(),
+        semantic_review_runner=fake_semantic_review_runner,
+    )
+
+    with pytest.raises(RuntimeError, match="live listener startup failed"):
+        with TestClient(app):
+            pass
+
+    assert app.state.semantic_review_task is None
 
 
 def test_root_page_renders_successfully(tmp_path):

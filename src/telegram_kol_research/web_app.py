@@ -215,16 +215,28 @@ def _build_semantic_review_notifier(app: FastAPI):
                 authoritative_payload = json.loads(raw_payload or "{}")
             except (TypeError, ValueError):
                 authoritative_payload = {}
+            review_payload = (
+                review.review_payload
+                if isinstance(review.review_payload, dict)
+                else review.auxiliary_payload
+            )
+            independent_action = review_payload.get("independent_action")
+            if not isinstance(independent_action, dict):
+                independent_action = {}
+            evidence = review_payload.get("evidence")
+            if not isinstance(evidence, list):
+                evidence = []
             payload = {
                 "chat_id": raw_message.chat_id,
                 "message_id": raw_message.message_id,
                 "posted_at": raw_message.posted_at,
                 "text": raw_message.text,
-                "agreement_status": "disagreed",
+                "agreement_status": review.decision.agreement_status,
                 "deepseek": {
-                    "status": review.auxiliary_payload.get("recognition_result") or "-",
+                    "status": independent_action.get("action_type") or "none",
                     "kind": "semantic_review",
-                    "reason": review.review_payload.get("reason") or "-",
+                    "reason": review_payload.get("reason") or "-",
+                    "evidence": evidence,
                 },
                 "mimo": {
                     "status": (
@@ -241,6 +253,37 @@ def _build_semantic_review_notifier(app: FastAPI):
         await send_ai_recognition_conflict_review(config=config, payload=payload)
 
     return notify
+
+
+async def _supervise_semantic_review_runner(app: FastAPI) -> None:
+    while True:
+        try:
+            await app.state.semantic_review_runner(
+                session_factory=app.state.session_factory,
+                config_path=app.state.ai_recognition_config_path,
+                notifier=_build_semantic_review_notifier(app),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Semantic review runner exited with error; restarting")
+        else:
+            logger.error("Semantic review runner exited unexpectedly; restarting")
+        await asyncio.sleep(app.state.semantic_review_restart_delay_seconds)
+
+
+async def _stop_semantic_review_task(app: FastAPI) -> None:
+    task = app.state.semantic_review_task
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+    app.state.semantic_review_task = None
 
 
 def _build_trader_dashboard_state(
@@ -1688,6 +1731,7 @@ def create_web_app(
     message_recognizer=None,
     ai_recognition_config_path: str | Path | None = None,
     semantic_review_runner=None,
+    semantic_review_restart_delay_seconds: float = 1.0,
 ) -> FastAPI:
     """Create the minimal FastAPI app used by the web command."""
 
@@ -1698,121 +1742,108 @@ def create_web_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if app.state.semantic_review_task is None:
-            app.state.semantic_review_task = asyncio.create_task(
-                app.state.semantic_review_runner(
-                    session_factory=app.state.session_factory,
-                    config_path=app.state.ai_recognition_config_path,
-                    notifier=_build_semantic_review_notifier(app),
+        try:
+            if app.state.semantic_review_task is None:
+                app.state.semantic_review_task = asyncio.create_task(
+                    _supervise_semantic_review_runner(app)
                 )
-            )
-            app.state.semantic_review_task.add_done_callback(
-                _log_background_task_result("semantic_review_task")
-            )
-        # ── lifecycle monitor (no dependency on Telegram client) ──
-        app.state.lifecycle_monitor_http = httpx.AsyncClient(timeout=10.0)
-        expiry_review_notifier = None
-        if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
-            async def expiry_review_notifier(payload):
-                group_labels = _group_label_by_chat_id(app.state.group_config)
-                payload = dict(payload)
-                payload["chat_title"] = group_labels.get(int(payload.get("chat_id") or 0))
-                await send_pending_entry_expiry_review(
-                    config=app.state.system_operator_bot_config,
-                    payload=payload,
+                app.state.semantic_review_task.add_done_callback(
+                    _log_background_task_result("semantic_review_task")
                 )
-        app.state.lifecycle_monitor = LifecycleMonitor(
-            session_factory=app.state.session_factory,
-            broker=app.state.live_update_broker,
-            config=LifecycleMonitorConfig(),
-            http_client=app.state.lifecycle_monitor_http,
-            now_provider=app.state.now_provider,
-            expiry_review_notifier=expiry_review_notifier,
-        )
-        app.state.lifecycle_monitor_task = asyncio.create_task(
-            app.state.lifecycle_monitor.run_loop()
-        )
-        app.state.deepcoin_reconcile_task = asyncio.create_task(
-            _run_reconcile_after_startup_delay(
-                runner=app.state.deepcoin_reconcile_runner,
-                startup_delay_seconds=app.state.deepcoin_reconcile_startup_delay_seconds,
-                session_factory=app.state.session_factory,
-                deepcoin_client_factory=app.state.deepcoin_client_factory,
-                interval_seconds=app.state.deepcoin_reconcile_interval_seconds,
-                now_provider=app.state.now_provider,
-            )
-        )
-        if isinstance(app.state.strategy_alert_config, StrategyAlertConfig):
-            app.state.telegram_bot_command_task = asyncio.create_task(
-                run_telegram_bot_command_loop(
-                    config=app.state.strategy_alert_config,
-                    session_factory=app.state.session_factory,
-                    group_config=app.state.group_config,
-                )
-            )
-        if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
-            app.state.system_operator_bot_command_task = asyncio.create_task(
-                run_system_operator_bot_command_loop(
-                    config=app.state.system_operator_bot_config,
-                    session_factory=app.state.session_factory,
-                    deepcoin_client_factory=app.state.deepcoin_client_factory,
-                )
-            )
-            app.state.system_operator_bot_command_task.add_done_callback(
-                _log_background_task_result("system_operator_bot_command_task")
-            )
-        if (
-            app.state.live_target_titles
-            and app.state.telegram_client is not None
-            and app.state.live_listener_task is None
-        ):
-            app.state.live_listener_task = launch_live_listener_task(
-                runner=app.state.live_listener_runner,
-                client=app.state.telegram_client,
+            # ── lifecycle monitor (no dependency on Telegram client) ──
+            app.state.lifecycle_monitor_http = httpx.AsyncClient(timeout=10.0)
+            expiry_review_notifier = None
+            if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
+                async def expiry_review_notifier(payload):
+                    group_labels = _group_label_by_chat_id(app.state.group_config)
+                    payload = dict(payload)
+                    payload["chat_title"] = group_labels.get(int(payload.get("chat_id") or 0))
+                    await send_pending_entry_expiry_review(
+                        config=app.state.system_operator_bot_config,
+                        payload=payload,
+                    )
+            app.state.lifecycle_monitor = LifecycleMonitor(
                 session_factory=app.state.session_factory,
                 broker=app.state.live_update_broker,
-                target_titles=app.state.live_target_titles,
-                media_root=app.state.media_root,
-                strategy_alert_config=app.state.strategy_alert_config,
-                strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
-                ai_recognition_config_path=app.state.ai_recognition_config_path,
-                lifecycle_monitor=app.state.lifecycle_monitor,
-                auto_trade_executor=app.state.auto_trade_executor,
-                authoritative_processor=app.state.authoritative_processor,
-                system_operator_bot_config=app.state.system_operator_bot_config,
+                config=LifecycleMonitorConfig(),
+                http_client=app.state.lifecycle_monitor_http,
+                now_provider=app.state.now_provider,
+                expiry_review_notifier=expiry_review_notifier,
             )
-            app.state.reconcile_task = asyncio.create_task(
+            app.state.lifecycle_monitor_task = asyncio.create_task(
+                app.state.lifecycle_monitor.run_loop()
+            )
+            app.state.deepcoin_reconcile_task = asyncio.create_task(
                 _run_reconcile_after_startup_delay(
-                    runner=app.state.reconcile_runner,
+                    runner=app.state.deepcoin_reconcile_runner,
+                    startup_delay_seconds=app.state.deepcoin_reconcile_startup_delay_seconds,
+                    session_factory=app.state.session_factory,
+                    deepcoin_client_factory=app.state.deepcoin_client_factory,
+                    interval_seconds=app.state.deepcoin_reconcile_interval_seconds,
+                    now_provider=app.state.now_provider,
+                )
+            )
+            if isinstance(app.state.strategy_alert_config, StrategyAlertConfig):
+                app.state.telegram_bot_command_task = asyncio.create_task(
+                    run_telegram_bot_command_loop(
+                        config=app.state.strategy_alert_config,
+                        session_factory=app.state.session_factory,
+                        group_config=app.state.group_config,
+                    )
+                )
+            if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
+                app.state.system_operator_bot_command_task = asyncio.create_task(
+                    run_system_operator_bot_command_loop(
+                        config=app.state.system_operator_bot_config,
+                        session_factory=app.state.session_factory,
+                        deepcoin_client_factory=app.state.deepcoin_client_factory,
+                    )
+                )
+                app.state.system_operator_bot_command_task.add_done_callback(
+                    _log_background_task_result("system_operator_bot_command_task")
+                )
+            if (
+                app.state.live_target_titles
+                and app.state.telegram_client is not None
+                and app.state.live_listener_task is None
+            ):
+                app.state.live_listener_task = launch_live_listener_task(
+                    runner=app.state.live_listener_runner,
                     client=app.state.telegram_client,
                     session_factory=app.state.session_factory,
                     broker=app.state.live_update_broker,
                     target_titles=app.state.live_target_titles,
                     media_root=app.state.media_root,
-                    interval_seconds=app.state.reconcile_interval_seconds,
-                    operation_lock=app.state.telegram_operation_lock,
                     strategy_alert_config=app.state.strategy_alert_config,
                     strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
+                    ai_recognition_config_path=app.state.ai_recognition_config_path,
+                    lifecycle_monitor=app.state.lifecycle_monitor,
+                    auto_trade_executor=app.state.auto_trade_executor,
                     authoritative_processor=app.state.authoritative_processor,
                     system_operator_bot_config=app.state.system_operator_bot_config,
-                    startup_delay_seconds=app.state.reconcile_startup_delay_seconds,
                 )
-            )
-        try:
+                app.state.reconcile_task = asyncio.create_task(
+                    _run_reconcile_after_startup_delay(
+                        runner=app.state.reconcile_runner,
+                        client=app.state.telegram_client,
+                        session_factory=app.state.session_factory,
+                        broker=app.state.live_update_broker,
+                        target_titles=app.state.live_target_titles,
+                        media_root=app.state.media_root,
+                        interval_seconds=app.state.reconcile_interval_seconds,
+                        operation_lock=app.state.telegram_operation_lock,
+                        strategy_alert_config=app.state.strategy_alert_config,
+                        strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
+                        authoritative_processor=app.state.authoritative_processor,
+                        system_operator_bot_config=app.state.system_operator_bot_config,
+                        startup_delay_seconds=app.state.reconcile_startup_delay_seconds,
+                    )
+                )
             yield
         finally:
-            semantic_review_task = app.state.semantic_review_task
-            if semantic_review_task is not None:
-                semantic_review_task.cancel()
-                try:
-                    await semantic_review_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    pass
-                app.state.semantic_review_task = None
+            await _stop_semantic_review_task(app)
             # ── lifecycle monitor shutdown ──
-            lcm_task = app.state.lifecycle_monitor_task
+            lcm_task = getattr(app.state, "lifecycle_monitor_task", None)
             if lcm_task is not None:
                 lcm_task.cancel()
                 try:
@@ -1820,7 +1851,7 @@ def create_web_app(
                 except asyncio.CancelledError:
                     pass
                 app.state.lifecycle_monitor_task = None
-            lcm_http = app.state.lifecycle_monitor_http
+            lcm_http = getattr(app.state, "lifecycle_monitor_http", None)
             if lcm_http is not None:
                 await lcm_http.aclose()
             # ── live listener shutdown ──
@@ -1933,6 +1964,10 @@ def create_web_app(
         load_ai_recognition_config(app.state.ai_recognition_config_path),
     )
     app.state.semantic_review_runner = semantic_review_runner or run_semantic_review_loop
+    app.state.semantic_review_restart_delay_seconds = max(
+        0.0,
+        min(float(semantic_review_restart_delay_seconds), 60.0),
+    )
     app.state.semantic_review_task = None
     app.state.authoritative_processor = lambda raw_message_id: _run_authoritative_processor(
         app,
