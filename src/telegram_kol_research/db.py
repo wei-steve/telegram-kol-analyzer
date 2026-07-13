@@ -73,6 +73,12 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
     "recognition_experiments": {
         "updated_at": "ALTER TABLE recognition_experiments ADD COLUMN updated_at DATETIME",
     },
+    "recognition_decisions": {
+        "prompt_versions_json": (
+            "ALTER TABLE recognition_decisions "
+            "ADD COLUMN prompt_versions_json TEXT NOT NULL DEFAULT '{}'"
+        ),
+    },
     "trade_signals": {
         "strategy_instance_id": "ALTER TABLE trade_signals ADD COLUMN strategy_instance_id VARCHAR(255)",
         "result_json": "ALTER TABLE trade_signals ADD COLUMN result_json TEXT",

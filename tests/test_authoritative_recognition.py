@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -86,6 +87,10 @@ def test_fengge_exit_uses_mimo_when_deepseek_disagrees(tmp_path, monkeypatch):
             input_kind="text",
             model="mimo-v2.5",
             status="非策略",
+            prompt_versions={
+                "trading.analysis.shared": 11,
+                "trading.analysis.mimo_vision": 12,
+            },
         ),
     )
     monkeypatch.setattr(
@@ -95,6 +100,7 @@ def test_fengge_exit_uses_mimo_when_deepseek_disagrees(tmp_path, monkeypatch):
             "strategy": {},
             "lifecycle_event": {"event_type": "none", "confidence": 0.1},
             "confidence": 0.8,
+            "_prompt_versions": {"trading.analysis.shared": 11},
         },
     )
 
@@ -118,6 +124,13 @@ def test_fengge_exit_uses_mimo_when_deepseek_disagrees(tmp_path, monkeypatch):
         decision = session.query(RecognitionDecision).one()
         assert decision.authoritative_model == "mimo-v2.5"
         assert decision.agreement_status == "disagreed"
+        assert json.loads(decision.prompt_versions_json) == {
+            "deepseek": {"trading.analysis.shared": 11},
+            "mimo": {
+                "trading.analysis.mimo_vision": 12,
+                "trading.analysis.shared": 11,
+            },
+        }
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         assert lifecycle.lifecycle_status == "entered"
         assert lifecycle.exit_reason is None

@@ -64,6 +64,7 @@ def test_database_bootstrap_creates_recognition_decisions_table(tmp_path):
         "automation_reason",
         "notification_status",
         "notification_error",
+        "prompt_versions_json",
         "created_at",
         "updated_at",
     }.issubset(columns)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy.orm import sessionmaker
@@ -23,6 +23,7 @@ class RecognitionDecisionRecord:
     auxiliary_payload: dict[str, Any] | None
     agreement_status: str
     differences: list[str]
+    prompt_versions: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 def _json(value: Any) -> str:
@@ -49,6 +50,7 @@ def save_recognition_decision(
                 authoritative_payload_json=_json(record.authoritative_payload),
                 agreement_status=record.agreement_status,
                 differences_json=_json(record.differences),
+                prompt_versions_json=_json(record.prompt_versions),
                 created_at=now,
                 updated_at=now,
             )
@@ -66,6 +68,7 @@ def save_recognition_decision(
         )
         row.agreement_status = record.agreement_status
         row.differences_json = _json(record.differences)
+        row.prompt_versions_json = _json(record.prompt_versions)
         row.automation_status = None
         row.automation_reason = None
         row.notification_status = None

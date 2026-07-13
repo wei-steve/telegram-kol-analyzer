@@ -30,6 +30,7 @@ def test_recognition_decision_upserts_and_tracks_outcomes(tmp_path):
             auxiliary_payload={"lifecycle_event": {"event_type": "none"}},
             agreement_status="disagreed",
             differences=["lifecycle_event.event_type"],
+            prompt_versions={"mimo": {"trading.analysis.shared": 3}},
         ),
     )
     assert saved.raw_message_id == raw_id
@@ -46,6 +47,9 @@ def test_recognition_decision_upserts_and_tracks_outcomes(tmp_path):
         row = session.query(RecognitionDecision).one()
         assert row.authoritative_model == "mimo-v2.5"
         assert json.loads(row.differences_json) == ["lifecycle_event.event_type"]
+        assert json.loads(row.prompt_versions_json) == {
+            "mimo": {"trading.analysis.shared": 3}
+        }
         assert row.automation_status == "submitted"
         assert row.automation_reason == "close_position"
         assert row.notification_status == "scheduled"

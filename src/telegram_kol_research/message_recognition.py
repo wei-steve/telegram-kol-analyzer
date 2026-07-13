@@ -36,6 +36,12 @@ from telegram_kol_research.lifecycle_exit_intents import (
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 from telegram_kol_research.recognition_profiles import BITCOIN_JUNZHANG_PROFILE
 from telegram_kol_research.parsing.text_parser import parse_signal_text
+from telegram_kol_research.prompt_composition import compose_trading_prompt
+from telegram_kol_research.prompt_defaults import seed_default_prompt_registry
+from telegram_kol_research.prompt_registry import (
+    PromptInvocationRecord,
+    record_prompt_invocation,
+)
 
 
 BLOCKED_SYMBOLS = {
@@ -1532,50 +1538,98 @@ def infer_deepseek_auxiliary(
     *,
     raw_message_id: int,
     config: AiRecognitionConfig,
+    context_text: str = "",
 ) -> dict[str, Any] | None:
     """Run text-only DeepSeek assessment without persisting or mutating state."""
 
     if not config.text_provider.is_configured:
         return None
+    seed_default_prompt_registry(session_factory, config)
+    composition = compose_trading_prompt(
+        session_factory,
+        model_kind="deepseek",
+        context=context_text,
+    )
     with session_factory() as session:
         raw_message = session.get(RawMessage, raw_message_id)
         if raw_message is None:
             raise LookupError("raw message not found")
         if not (raw_message.text or "").strip():
             return None
-        context = _load_lifecycle_event_context(session, raw_message)
-        lifecycle_event: dict[str, Any] = {"event_type": "none", "confidence": 0.0}
-        if context["active_strategies"]:
-            try:
-                lifecycle_event = _call_lifecycle_event_ai(
-                    raw_message=raw_message,
-                    context=context,
-                    config=config,
-                )
-            except Exception as exc:
-                lifecycle_event = {
-                    "event_type": "none",
-                    "confidence": 0.0,
-                    "reason": f"DeepSeek lifecycle validation failed: {exc}",
-                }
+        user_content = "\n\n".join(
+            part
+            for part in (
+                json.dumps(
+                    {
+                        "current_message": {
+                            "chat_id": raw_message.chat_id,
+                            "message_id": raw_message.message_id,
+                            "posted_at": (
+                                str(raw_message.posted_at)
+                                if raw_message.posted_at is not None
+                                else None
+                            ),
+                            "sender": raw_message.sender_name,
+                            "text": raw_message.text or "",
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                composition.context.strip(),
+            )
+            if part
+        )
+        error_message: str | None = None
         try:
-            entry_result = _recognize_with_ai_provider(
+            request_payload = _build_ai_recognition_payload(
                 raw_message=raw_message,
                 media_assets=[],
-                config=config,
-                provider=config.text_provider,
-                parse_source="deepseek_auxiliary",
+                prompt=composition.system_prompt,
+                model=config.text_provider.model,
             )
-            payload = dict(entry_result.ai_payload or {})
+            request_payload["messages"][1]["content"] = user_content
+            headers = {"Content-Type": "application/json"}
+            if config.text_provider.api_key:
+                headers["Authorization"] = f"Bearer {config.text_provider.api_key}"
+            with httpx.Client(timeout=config.text_provider.timeout_seconds) as client:
+                response = client.post(
+                    _chat_completions_url(config.text_provider.base_url),
+                    json=request_payload,
+                    headers=headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+            payload = _parse_ai_result_json(_extract_ai_content(data))
+            if not isinstance(payload.get("strategy"), dict):
+                payload["strategy"] = {}
+            if not isinstance(payload.get("lifecycle_event"), dict):
+                payload["lifecycle_event"] = {
+                    "event_type": "none",
+                    "confidence": 0.0,
+                }
         except Exception as exc:
+            error_message = str(exc)
             payload = {
                 "recognition_result": "识别失败",
-                "reason": f"DeepSeek entry validation failed: {exc}",
+                "reason": f"DeepSeek auxiliary validation failed: {exc}",
                 "strategy": {},
+                "lifecycle_event": {"event_type": "none", "confidence": 0.0},
                 "confidence": 0.0,
             }
-        payload.setdefault("strategy", {})
-        payload["lifecycle_event"] = lifecycle_event
+        record_prompt_invocation(
+            session_factory,
+            PromptInvocationRecord(
+                feature="message_recognition",
+                correlation_key=f"recognition:{raw_message_id}:deepseek",
+                raw_message_id=raw_message_id,
+                chat_id=raw_message.chat_id,
+                model=config.text_provider.model,
+                prompt_versions=composition.version_map,
+                status="failed" if error_message else "completed",
+                error_message=error_message,
+            ),
+        )
+        payload["_prompt_versions"] = composition.version_map
         return payload
 
 

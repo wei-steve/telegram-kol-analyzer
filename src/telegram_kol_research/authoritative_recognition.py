@@ -22,6 +22,7 @@ from telegram_kol_research.recognition_decisions import (
 )
 from telegram_kol_research.recognition_experiments import (
     MimoAuthoritativeResult,
+    build_authoritative_context_for_message,
     run_mimo_authoritative_for_message,
 )
 
@@ -86,19 +87,34 @@ def assess_message_authoritatively(
     ai_recognition_config: AiRecognitionConfig,
     media_root: str | Path,
 ) -> AuthoritativeAssessment:
+    context_text = build_authoritative_context_for_message(
+        session_factory,
+        raw_message_id,
+    )
     mimo = run_mimo_authoritative_for_message(
         session_factory,
         raw_message_id=raw_message_id,
         ai_recognition_config=ai_recognition_config,
         media_root=media_root,
+        context_text=context_text,
     )
     deepseek_payload = None
+    deepseek_prompt_versions: dict[str, int] = {}
     if mimo.input_kind == "text":
         deepseek_payload = infer_deepseek_auxiliary(
             session_factory,
             raw_message_id=raw_message_id,
             config=ai_recognition_config,
+            context_text=context_text,
         )
+        if deepseek_payload is not None:
+            deepseek_payload = dict(deepseek_payload)
+            versions = deepseek_payload.pop("_prompt_versions", {})
+            if isinstance(versions, dict):
+                deepseek_prompt_versions = {
+                    str(key): int(value)
+                    for key, value in versions.items()
+                }
     if mimo.error_message or mimo.status == "识别失败":
         agreement_status, differences = "authoritative_failed", []
     else:
@@ -131,6 +147,14 @@ def assess_message_authoritatively(
             auxiliary_payload=deepseek_payload,
             agreement_status=agreement_status,
             differences=differences,
+            prompt_versions={
+                "mimo": mimo.prompt_versions,
+                **(
+                    {"deepseek": deepseek_prompt_versions}
+                    if deepseek_payload is not None
+                    else {}
+                ),
+            },
         ),
     )
     return assessment

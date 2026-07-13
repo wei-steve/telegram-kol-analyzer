@@ -155,6 +155,7 @@ class RecognitionDecision(Base):
     automation_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     notification_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     notification_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    prompt_versions_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 

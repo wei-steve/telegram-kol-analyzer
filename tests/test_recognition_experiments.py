@@ -5,7 +5,8 @@ import httpx
 
 from telegram_kol_research.ai_recognition_config import AiModelConfig, AiRecognitionConfig
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import MediaAsset, MessageRecognition, RawMessage, RecognitionExperiment, SignalCandidate, StrategyLifecycle
+from telegram_kol_research.models import AiPromptInvocation, MediaAsset, MessageRecognition, RawMessage, RecognitionExperiment, SignalCandidate, StrategyLifecycle
+from telegram_kol_research.prompt_defaults import MIMO_VISION_PROMPT, SHARED_TRADING_PROMPT
 from telegram_kol_research.recognition_experiments import (
     _build_mimo_payload,
     run_mimo_authoritative_for_message,
@@ -39,9 +40,15 @@ def test_run_mimo_authoritative_for_message_returns_unified_actionable_result(
         "input_reading": {"observed_text": "现价62800附近出局", "image_quality": "none"},
         "confidence": 0.95,
     }
+    captured = {}
+
+    def fake_call(**kwargs):
+        captured.update(kwargs)
+        return payload
+
     monkeypatch.setattr(
         "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
-        lambda **kwargs: payload,
+        fake_call,
     )
 
     result = run_mimo_authoritative_for_message(
@@ -67,6 +74,17 @@ def test_run_mimo_authoritative_for_message_returns_unified_actionable_result(
     assert result.model == "mimo-v2.5"
     assert result.payload["lifecycle_event"]["event_type"] == "exit_position"
     assert result.is_actionable is True
+    assert result.prompt_versions.keys() == {
+        SHARED_TRADING_PROMPT,
+        MIMO_VISION_PROMPT,
+    }
+    assert "统一交易分析" not in captured["prompt"]
+    assert "新开仓识别" in captured["prompt"]
+    assert "图片与图文补充规则" in captured["prompt"]
+    with session_factory() as session:
+        invocation = session.query(AiPromptInvocation).one()
+        assert invocation.feature == "message_recognition"
+        assert json.loads(invocation.prompt_versions_json) == result.prompt_versions
 
 
 def test_run_mimo_authoritative_for_message_contains_failure(tmp_path, monkeypatch):

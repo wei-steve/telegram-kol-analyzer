@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -16,11 +16,16 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.ai_recognition_config import (
     AiModelConfig,
     AiRecognitionConfig,
-    build_authoritative_mimo_prompt,
     load_ai_recognition_config,
 )
 from telegram_kol_research.media_retention import resolve_media_path
 from telegram_kol_research.models import MediaAsset, RawMessage, RecognitionExperiment, StrategyLifecycle, utc_now
+from telegram_kol_research.prompt_composition import compose_trading_prompt
+from telegram_kol_research.prompt_defaults import seed_default_prompt_registry
+from telegram_kol_research.prompt_registry import (
+    PromptInvocationRecord,
+    record_prompt_invocation,
+)
 
 
 MIMO_DIRECT_EXPERIMENT_NAME = "mimo_direct_v1"
@@ -94,6 +99,7 @@ class MimoAuthoritativeResult:
     model: str
     status: str
     error_message: str | None = None
+    prompt_versions: dict[str, int] = field(default_factory=dict)
 
     @property
     def is_actionable(self) -> bool:
@@ -238,8 +244,10 @@ def run_mimo_authoritative_for_message(
     ai_recognition_config: AiRecognitionConfig | None = None,
     ai_recognition_config_path: str | Path = "config/ai_recognition.yaml",
     media_root: str | Path = "data/media",
+    context_text: str | None = None,
 ) -> MimoAuthoritativeResult:
     config = ai_recognition_config or load_ai_recognition_config(ai_recognition_config_path)
+    seed_default_prompt_registry(session_factory, config)
     model_config = _find_mimo_model(config)
     if model_config is None or not model_config.provider.is_configured:
         return MimoAuthoritativeResult(
@@ -299,14 +307,20 @@ def run_mimo_authoritative_for_message(
             )
         payload: dict[str, Any] = {}
         error_message: str | None = None
+        effective_context = context_text or _build_authoritative_context(session, raw_message)
+        composition = compose_trading_prompt(
+            session_factory,
+            model_kind="mimo",
+            context=effective_context,
+        )
         try:
             payload = _call_mimo_direct_model(
                 raw_message=raw_message,
                 media_assets=media_assets,
                 model_config=model_config,
-                prompt=build_authoritative_mimo_prompt(config),
+                prompt=composition.system_prompt,
                 media_root=media_root,
-                context_text=_build_authoritative_context(session, raw_message),
+                context_text=composition.context,
             )
             _validate_authoritative_payload(payload)
         except Exception as exc:
@@ -322,6 +336,19 @@ def run_mimo_authoritative_for_message(
             prompt_version=MIMO_AUTHORITATIVE_PROMPT_VERSION,
         )
         session.commit()
+        record_prompt_invocation(
+            session_factory,
+            PromptInvocationRecord(
+                feature="message_recognition",
+                correlation_key=f"recognition:{raw_message_id}:mimo",
+                raw_message_id=raw_message_id,
+                chat_id=raw_message.chat_id,
+                model=model_config.model,
+                prompt_versions=composition.version_map,
+                status="failed" if error_message else "completed",
+                error_message=error_message,
+            ),
+        )
         return MimoAuthoritativeResult(
             raw_message_id=raw_message_id,
             payload=payload,
@@ -329,6 +356,7 @@ def run_mimo_authoritative_for_message(
             model=model_config.model,
             status=experiment.status,
             error_message=error_message,
+            prompt_versions=composition.version_map,
         )
 
 
@@ -481,6 +509,17 @@ def _build_authoritative_context(session, raw_message: RawMessage) -> str:
             json.dumps(active_rows, ensure_ascii=False, sort_keys=True),
         ]
     )
+
+
+def build_authoritative_context_for_message(
+    session_factory: sessionmaker,
+    raw_message_id: int,
+) -> str:
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, raw_message_id)
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        return _build_authoritative_context(session, raw_message)
 
 
 def _upsert_experiment_result(
