@@ -293,15 +293,15 @@ def test_persist_live_message_event_sends_system_review_on_ai_disagreement(
     assert auto_trade_calls == []
 
 
-def test_authoritative_live_path_executes_mimo_before_nonblocking_disagreement_notice(
+def test_authoritative_live_path_returns_without_starting_semantic_review(
     tmp_path,
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
     broker = LiveUpdateBroker()
     events: list[str] = []
-    notice_started = asyncio.Event()
-    keep_notice_pending = asyncio.Event()
+    reviewer_started = asyncio.Event()
+    semantic_review_blocker = asyncio.Event()
     monkeypatch.setattr(
         "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
         lambda *args, **kwargs: None,
@@ -311,8 +311,8 @@ def test_authoritative_live_path_executes_mimo_before_nonblocking_disagreement_n
         events.extend(["apply_mimo", "auto_trade"])
         return SimpleNamespace(
             assessment=SimpleNamespace(
-                agreement_status="disagreed",
-                differences=["lifecycle_event.event_type"],
+                agreement_status="pending",
+                differences=[],
                 mimo=SimpleNamespace(
                     status="非策略",
                     payload={
@@ -322,11 +322,7 @@ def test_authoritative_live_path_executes_mimo_before_nonblocking_disagreement_n
                     model="mimo-v2.5",
                     error_message=None,
                 ),
-                deepseek_payload={
-                    "recognition_result": "非策略",
-                    "reason": "DeepSeek未识别为退出",
-                    "lifecycle_event": {"event_type": "none"},
-                },
+                deepseek_payload=None,
             ),
             recognition=MessageRecognitionResult(
                 raw_message_id=raw_message_id,
@@ -337,10 +333,9 @@ def test_authoritative_live_path_executes_mimo_before_nonblocking_disagreement_n
             automation={"status": "executed", "reason": "close_submitted"},
         )
 
-    async def slow_system_sender(**kwargs):
-        events.append("notification_started")
-        notice_started.set()
-        await keep_notice_pending.wait()
+    async def blocked_semantic_reviewer(**kwargs):
+        reviewer_started.set()
+        await semantic_review_blocker.wait()
 
     async def scenario():
         await persist_live_message_event(
@@ -355,11 +350,71 @@ def test_authoritative_live_path_executes_mimo_before_nonblocking_disagreement_n
                 bot_token="system-token",
                 chat_id="system-chat",
             ),
-            system_operator_conflict_sender=slow_system_sender,
+            system_operator_conflict_sender=blocked_semantic_reviewer,
         )
-        await asyncio.wait_for(notice_started.wait(), timeout=1)
-        assert events == ["apply_mimo", "auto_trade", "notification_started"]
-        keep_notice_pending.set()
+        assert events == ["apply_mimo", "auto_trade"]
+        assert not reviewer_started.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    broker = LiveUpdateBroker()
+    alert_started = asyncio.Event()
+    release_alert = asyncio.Event()
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
+        lambda *args, **kwargs: None,
+    )
+
+    def authoritative_processor(raw_message_id):
+        return SimpleNamespace(
+            assessment=SimpleNamespace(
+                agreement_status="authoritative_failed",
+                differences=[],
+                mimo=SimpleNamespace(
+                    status="识别失败",
+                    payload={},
+                    model="mimo-v2.5",
+                    error_message="timeout",
+                ),
+                deepseek_payload=None,
+            ),
+            recognition=MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="识别失败",
+                reason="timeout",
+                parse_source="mimo_authoritative",
+            ),
+            automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
+        )
+
+    async def blocked_failure_sender(**kwargs):
+        assert kwargs["payload"]["agreement_status"] == "authoritative_failed"
+        alert_started.set()
+        await release_alert.wait()
+
+    async def scenario():
+        await persist_live_message_event(
+            event=_FakeEvent(),
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            chat_title="峰哥",
+            ai_recognition_config=AiRecognitionConfig(),
+            authoritative_processor=authoritative_processor,
+            system_operator_bot_config=SystemOperatorBotConfig(
+                bot_token="system-token",
+                chat_id="system-chat",
+            ),
+            system_operator_conflict_sender=blocked_failure_sender,
+        )
+        await asyncio.wait_for(alert_started.wait(), timeout=1)
+        release_alert.set()
         await asyncio.sleep(0)
 
     asyncio.run(scenario())

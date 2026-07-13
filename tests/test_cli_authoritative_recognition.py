@@ -48,7 +48,7 @@ def test_cli_parse_uses_authoritative_processor_without_auto_trade(tmp_path, mon
     assert calls[0]["auto_trade_executor"] is None
 
 
-def test_cli_authoritative_disagreement_sends_operator_notification(
+def test_cli_authoritative_result_leaves_semantic_review_pending(
     tmp_path,
     monkeypatch,
 ):
@@ -62,19 +62,18 @@ def test_cli_authoritative_disagreement_sends_operator_notification(
     processing_result = SimpleNamespace(
         recognition=SimpleNamespace(status="非策略"),
         assessment=SimpleNamespace(
-            agreement_status="disagreed",
-            differences=["lifecycle_event.event_type"],
+            agreement_status="pending",
+            differences=[],
             mimo=SimpleNamespace(
                 model="mimo-v2.5",
                 status="非策略",
                 payload={"reason": "立即出局"},
                 error_message=None,
             ),
-            deepseek_payload={"recognition_result": "非策略"},
+            deepseek_payload=None,
         ),
         automation={"status": "skipped", "reason": "auto_trade_not_configured"},
     )
-    sent: list[dict] = []
     monkeypatch.setattr(
         "telegram_kol_research.cli.load_ai_recognition_config",
         lambda path: object(),
@@ -84,20 +83,10 @@ def test_cli_authoritative_disagreement_sends_operator_notification(
         lambda *args, **kwargs: processing_result,
     )
     monkeypatch.setattr(
-        "telegram_kol_research.cli._build_authoritative_notification_payload",
-        lambda **kwargs: {"message_id": 2, "automation": processing_result.automation},
-    )
-    monkeypatch.setattr(
-        "telegram_kol_research.cli.update_recognition_execution_outcome",
-        lambda *args, **kwargs: None,
-    )
-
-    async def fake_sender(**kwargs):
-        sent.append(kwargs)
-
-    monkeypatch.setattr(
         "telegram_kol_research.cli.send_ai_recognition_conflict_review",
-        fake_sender,
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("CLI parse must not run semantic review inline")
+        ),
     )
     bot_config = SimpleNamespace(bot_token="token", chat_id="chat")
 
@@ -111,8 +100,7 @@ def test_cli_authoritative_disagreement_sends_operator_notification(
         )
     )
 
-    assert len(sent) == 1
-    assert sent[0]["payload"]["message_id"] == 2
+    assert processing_result.assessment.agreement_status == "pending"
 
 
 def test_cli_sync_passes_custom_media_root_to_telegram_download(tmp_path, monkeypatch):

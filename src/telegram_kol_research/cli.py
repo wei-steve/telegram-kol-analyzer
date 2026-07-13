@@ -178,10 +178,12 @@ async def _process_raw_messages_with_mimo_authority(
             media_root=media_root,
             auto_trade_executor=None,
         )
-        if processing_result.assessment.agreement_status not in {
-            "disagreed",
-            "authoritative_failed",
-        } or not system_operator_bot_enabled(system_operator_bot_config):
+        # Successful MiMo decisions remain pending for the Web service's
+        # semantic-review worker. CLI parse has no live worker of its own.
+        if (
+            processing_result.assessment.agreement_status != "authoritative_failed"
+            or not system_operator_bot_enabled(system_operator_bot_config)
+        ):
             continue
         with session_factory() as session:
             raw_message = session.get(RawMessage, raw_message_id)

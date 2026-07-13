@@ -1,7 +1,8 @@
-"""Coordinate MiMo authority with optional DeepSeek text validation."""
+"""Run MiMo authority and enqueue successful decisions for later review."""
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,11 @@ from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.message_recognition import (
     MessageRecognitionResult,
     apply_authoritative_mimo_payload,
-    infer_deepseek_auxiliary,
 )
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
+    save_pending_authoritative_decision,
     save_recognition_decision,
     update_recognition_execution_outcome,
 )
@@ -34,6 +35,7 @@ class AuthoritativeAssessment:
     deepseek_payload: dict[str, Any] | None
     agreement_status: str
     differences: list[str]
+    semantic_review_status: str = "not_applicable"
 
 
 @dataclass(frozen=True)
@@ -98,66 +100,39 @@ def assess_message_authoritatively(
         media_root=media_root,
         context_text=context_text,
     )
-    deepseek_payload = None
-    deepseek_prompt_versions: dict[str, int] = {}
-    if mimo.input_kind == "text":
-        deepseek_payload = infer_deepseek_auxiliary(
-            session_factory,
-            raw_message_id=raw_message_id,
-            config=ai_recognition_config,
-            context_text=context_text,
-        )
-        if deepseek_payload is not None:
-            deepseek_payload = dict(deepseek_payload)
-            versions = deepseek_payload.pop("_prompt_versions", {})
-            if isinstance(versions, dict):
-                deepseek_prompt_versions = {
-                    str(key): int(value)
-                    for key, value in versions.items()
-                }
     if mimo.error_message or mimo.status == "识别失败":
         agreement_status, differences = "authoritative_failed", []
     else:
-        agreement_status, differences = compare_assessments(mimo.payload, deepseek_payload)
-    assessment = AuthoritativeAssessment(
+        agreement_status, differences = "pending", []
+    decision = RecognitionDecisionRecord(
         raw_message_id=raw_message_id,
-        mimo=mimo,
-        deepseek_payload=deepseek_payload,
+        input_kind=mimo.input_kind,
+        authoritative_model=mimo.model,
+        authoritative_status=mimo.status,
+        authoritative_payload=mimo.payload,
+        auxiliary_model=None,
+        auxiliary_status=None,
+        auxiliary_payload=None,
         agreement_status=agreement_status,
         differences=differences,
+        prompt_versions={"mimo": mimo.prompt_versions},
     )
-    save_recognition_decision(
-        session_factory,
-        RecognitionDecisionRecord(
-            raw_message_id=raw_message_id,
-            input_kind=mimo.input_kind,
-            authoritative_model=mimo.model,
-            authoritative_status=mimo.status,
-            authoritative_payload=mimo.payload,
-            auxiliary_model=(
-                ai_recognition_config.text_provider.model
-                if deepseek_payload is not None
-                else None
-            ),
-            auxiliary_status=(
-                str(deepseek_payload.get("recognition_result") or "")
-                if deepseek_payload is not None
-                else None
-            ),
-            auxiliary_payload=deepseek_payload,
-            agreement_status=agreement_status,
-            differences=differences,
-            prompt_versions={
-                "mimo": mimo.prompt_versions,
-                **(
-                    {"deepseek": deepseek_prompt_versions}
-                    if deepseek_payload is not None
-                    else {}
-                ),
-            },
-        ),
+    if agreement_status == "authoritative_failed":
+        # A failed authority is auditable and alertable, but there is no valid
+        # MiMo decision for the semantic comparison worker to review.
+        saved = save_recognition_decision(session_factory, decision)
+    else:
+        saved = save_pending_authoritative_decision(session_factory, decision)
+    return AuthoritativeAssessment(
+        raw_message_id=raw_message_id,
+        mimo=mimo,
+        # A completed prior review remains in the audit row, but never enters
+        # the synchronous return payload or execution decision.
+        deepseek_payload=None,
+        agreement_status=saved.agreement_status,
+        differences=list(json.loads(saved.differences_json or "[]")),
+        semantic_review_status=saved.comparison_status,
     )
-    return assessment
 
 
 def apply_authoritative_assessment(

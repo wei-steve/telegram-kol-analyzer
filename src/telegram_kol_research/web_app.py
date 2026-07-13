@@ -2835,13 +2835,16 @@ def create_web_app(
                 raw_message = session.get(RawMessage, raw_message_id)
                 if raw_message is None:
                     raise LookupError(f"Raw message {raw_message_id} not found")
-                conflict_payload = _build_authoritative_notification_payload(
-                    raw_message=raw_message,
-                    chat_title=raw_message.sender_name,
-                    processing_result=processing_result,
-                )
-            if conflict_payload is not None and system_operator_bot_enabled(
-                app.state.system_operator_bot_config
+                conflict_payload = None
+                if processing_result.assessment.agreement_status == "authoritative_failed":
+                    conflict_payload = _build_authoritative_notification_payload(
+                        raw_message=raw_message,
+                        chat_title=raw_message.sender_name,
+                        processing_result=processing_result,
+                    )
+            if (
+                conflict_payload is not None
+                and system_operator_bot_enabled(app.state.system_operator_bot_config)
             ):
                 _schedule_authoritative_notification(
                     session_factory=app.state.session_factory,
@@ -2864,6 +2867,18 @@ def create_web_app(
             "ai_conflict": processing_result.assessment.agreement_status == "disagreed",
             "authoritative_model": processing_result.assessment.mimo.model,
             "agreement_status": processing_result.assessment.agreement_status,
+            "semantic_review_status": (
+                getattr(
+                    processing_result.assessment,
+                    "semantic_review_status",
+                    None,
+                )
+                or (
+                    "pending"
+                    if processing_result.assessment.agreement_status == "pending"
+                    else "not_applicable"
+                )
+            ),
             "differences": processing_result.assessment.differences,
             "notification_scheduled": (
                 conflict_payload is not None

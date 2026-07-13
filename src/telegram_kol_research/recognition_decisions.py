@@ -78,6 +78,19 @@ def save_recognition_decision(
         row.agreement_status = record.agreement_status
         row.differences_json = _json(record.differences)
         row.prompt_versions_json = _json(record.prompt_versions)
+        # This compatibility save represents a terminal assessment (including
+        # MiMo transport/schema failure), never work for the semantic worker.
+        # Clear any older pending/running claim so stale candidates cannot win
+        # a race with authoritative re-recognition.
+        row.comparison_status = "completed"
+        row.disagreement_severity = None
+        row.comparison_model = None
+        row.comparison_payload_json = None
+        row.comparison_error = None
+        row.comparison_next_attempt_at = None
+        row.comparison_started_at = None
+        row.comparison_claim_token = None
+        row.compared_at = None
         row.updated_at = now
         session.commit()
         session.refresh(row)

@@ -20,7 +20,7 @@ from telegram_kol_research.models import (
 from telegram_kol_research.recognition_experiments import MimoAuthoritativeResult
 
 
-def test_fengge_exit_uses_mimo_when_deepseek_disagrees(tmp_path, monkeypatch):
+def test_fengge_exit_applies_mimo_while_semantic_review_is_pending(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         entry = RawMessage(chat_id=-1002409877375, message_id=8398, text="BTC short")
@@ -95,13 +95,10 @@ def test_fengge_exit_uses_mimo_when_deepseek_disagrees(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition.infer_deepseek_auxiliary",
-        lambda *args, **kwargs: {
-            "recognition_result": "非策略",
-            "strategy": {},
-            "lifecycle_event": {"event_type": "none", "confidence": 0.1},
-            "confidence": 0.8,
-            "_prompt_versions": {"trading.analysis.shared": 11},
-        },
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("DeepSeek must not run in the authoritative path")
+        ),
+        raising=False,
     )
 
     assessment = assess_message_authoritatively(
@@ -112,8 +109,9 @@ def test_fengge_exit_uses_mimo_when_deepseek_disagrees(tmp_path, monkeypatch):
     )
     result = apply_authoritative_assessment(session_factory, assessment)
 
-    assert assessment.agreement_status == "disagreed"
-    assert "lifecycle_event.event_type" in assessment.differences
+    assert assessment.agreement_status == "pending"
+    assert assessment.deepseek_payload is None
+    assert assessment.differences == []
     assert result.parse_source == "mimo_authoritative"
     with session_factory() as session:
         candidate = session.query(SignalCandidate).one()
@@ -123,9 +121,9 @@ def test_fengge_exit_uses_mimo_when_deepseek_disagrees(tmp_path, monkeypatch):
         assert candidate.parse_source == "mimo_authoritative"
         decision = session.query(RecognitionDecision).one()
         assert decision.authoritative_model == "mimo-v2.5"
-        assert decision.agreement_status == "disagreed"
+        assert decision.agreement_status == "pending"
+        assert decision.comparison_status == "pending"
         assert json.loads(decision.prompt_versions_json) == {
-            "deepseek": {"trading.analysis.shared": 11},
             "mimo": {
                 "trading.analysis.mimo_vision": 12,
                 "trading.analysis.shared": 11,
@@ -160,12 +158,10 @@ def test_mimo_failure_never_applies_deepseek_action(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition.infer_deepseek_auxiliary",
-        lambda *args, **kwargs: {
-            "recognition_result": "是策略",
-            "strategy": {"symbol": "BTC", "side": "short", "entry": "market"},
-            "lifecycle_event": {"event_type": "none"},
-            "confidence": 0.99,
-        },
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("DeepSeek must not run when MiMo fails")
+        ),
+        raising=False,
     )
 
     assessment = assess_message_authoritatively(
@@ -180,9 +176,130 @@ def test_mimo_failure_never_applies_deepseek_action(tmp_path, monkeypatch):
     assert result.status == "识别失败"
     with session_factory() as session:
         assert session.query(SignalCandidate).count() == 0
+        decision = session.query(RecognitionDecision).one()
+        assert decision.agreement_status == "authoritative_failed"
+        assert decision.comparison_status == "completed"
 
 
-def test_process_authoritative_message_applies_mimo_before_auto_trade(
+def test_mimo_failure_after_pending_rerecognition_cancels_stale_review(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=22, text="BTC short now")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    results = iter(
+        [
+            MimoAuthoritativeResult(
+                raw_message_id=raw_id,
+                payload={"recognition_result": "是策略"},
+                input_kind="text",
+                model="mimo-v2.5",
+                status="是策略",
+                prompt_versions={"trading.analysis.shared": 11},
+            ),
+            MimoAuthoritativeResult(
+                raw_message_id=raw_id,
+                payload={},
+                input_kind="text",
+                model="mimo-v2.5",
+                status="识别失败",
+                error_message="timeout",
+                prompt_versions={"trading.analysis.shared": 12},
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: next(results),
+    )
+
+    assess_message_authoritatively(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+    assess_message_authoritatively(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+        assert decision.agreement_status == "authoritative_failed"
+        assert decision.comparison_status == "completed"
+        assert json.loads(decision.prompt_versions_json) == {
+            "mimo": {"trading.analysis.shared": 12}
+        }
+
+
+def test_unchanged_rerecognition_reports_completed_without_requeueing_or_deepseek(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=23, text="BTC short now")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    mimo_result = MimoAuthoritativeResult(
+        raw_message_id=raw_id,
+        payload={"recognition_result": "非策略"},
+        input_kind="text",
+        model="mimo-v2.5",
+        status="非策略",
+        prompt_versions={"trading.analysis.shared": 11},
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: mimo_result,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_deepseek_auxiliary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("DeepSeek must remain deferred on re-recognition")
+        ),
+        raising=False,
+    )
+
+    first = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+        decision.agreement_status = "agreed"
+        decision.comparison_status = "completed"
+        decision.auxiliary_payload_json = '{"recognition_result":"非策略"}'
+        session.commit()
+
+    second = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+
+    assert first.semantic_review_status == "pending"
+    assert second.agreement_status == "agreed"
+    assert second.semantic_review_status == "completed"
+    assert second.deepseek_payload is None
+    with session_factory() as session:
+        assert session.query(RecognitionDecision).one().comparison_status == "completed"
+
+
+def test_process_authoritative_message_persists_pending_before_mimo_and_auto_trade(
     tmp_path,
     monkeypatch,
 ):
@@ -194,22 +311,39 @@ def test_process_authoritative_message_applies_mimo_before_auto_trade(
         raw_id = raw.id
 
     events: list[str] = []
-    assessment = AuthoritativeAssessment(
-        raw_message_id=raw_id,
-        mimo=MimoAuthoritativeResult(
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: events.append("mimo")
+        or MimoAuthoritativeResult(
             raw_message_id=raw_id,
-            payload={"recognition_result": "非策略", "lifecycle_event": {"event_type": "exit_position"}},
+            payload={
+                "recognition_result": "非策略",
+                "lifecycle_event": {"event_type": "exit_position"},
+            },
             input_kind="text",
             model="mimo-v2.5",
             status="非策略",
+            prompt_versions={"trading.analysis.shared": 11},
         ),
-        deepseek_payload={"recognition_result": "非策略", "lifecycle_event": {"event_type": "none"}},
-        agreement_status="disagreed",
-        differences=["lifecycle_event.event_type"],
     )
     monkeypatch.setattr(
-        "telegram_kol_research.authoritative_recognition.assess_message_authoritatively",
-        lambda *args, **kwargs: assessment,
+        "telegram_kol_research.authoritative_recognition.infer_deepseek_auxiliary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("DeepSeek auxiliary was invoked synchronously")
+        ),
+        raising=False,
+    )
+    from telegram_kol_research import authoritative_recognition
+
+    real_save_pending = authoritative_recognition.save_pending_authoritative_decision
+
+    def save_pending(*args, **kwargs):
+        events.append("persist_pending")
+        return real_save_pending(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.save_pending_authoritative_decision",
+        save_pending,
     )
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
@@ -234,8 +368,9 @@ def test_process_authoritative_message_applies_mimo_before_auto_trade(
         or {"status": "executed", "reason": "close_submitted"},
     )
 
-    assert events == ["apply_mimo", "auto_trade"]
-    assert result.assessment.agreement_status == "disagreed"
+    assert events == ["mimo", "persist_pending", "apply_mimo", "auto_trade"]
+    assert result.assessment.agreement_status == "pending"
+    assert result.assessment.deepseek_payload is None
     assert result.automation == {"status": "executed", "reason": "close_submitted"}
 
 
@@ -260,7 +395,7 @@ def test_process_authoritative_message_skips_auto_trade_when_mimo_fails(
             status="识别失败",
             error_message="timeout",
         ),
-        deepseek_payload={"recognition_result": "是策略"},
+        deepseek_payload=None,
         agreement_status="authoritative_failed",
         differences=[],
     )
@@ -332,7 +467,10 @@ def test_mimo_non_strategy_never_executes_stale_deepseek_candidate(tmp_path, mon
     )
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition.infer_deepseek_auxiliary",
-        lambda *args, **kwargs: {"recognition_result": "是策略"},
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("stale DeepSeek candidates must not be refreshed")
+        ),
+        raising=False,
     )
     auto_trade_calls: list[int] = []
 

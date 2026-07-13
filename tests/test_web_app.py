@@ -1424,7 +1424,7 @@ def test_message_recognition_api_runs_auto_trade_executor_after_recognition(tmp_
     }
 
 
-def test_message_recognition_api_sends_system_review_on_ai_disagreement(
+def test_message_recognition_api_reports_pending_without_scheduling_review(
     tmp_path, monkeypatch
 ):
     database_path = tmp_path / "research.db"
@@ -1451,10 +1451,8 @@ def test_message_recognition_api_sends_system_review_on_ai_disagreement(
     app.state.auto_trade_executor = lambda raw_message_id: (
         auto_trade_calls.append(raw_message_id) or {"status": "submitted"}
     )
-    sent_reviews: list[tuple[SystemOperatorBotConfig, dict]] = []
-
     def fake_schedule_authoritative_notification(**kwargs):
-        sent_reviews.append((kwargs["config"], kwargs["payload"]))
+        raise AssertionError("manual recognition must not schedule semantic review")
 
     monkeypatch.setattr(
         "telegram_kol_research.web_app._schedule_authoritative_notification",
@@ -1476,18 +1474,15 @@ def test_message_recognition_api_sends_system_review_on_ai_disagreement(
         return SimpleNamespace(
             recognition=fake_recognizer(raw_message_id=message_id),
             assessment=SimpleNamespace(
-                agreement_status="disagreed",
-                differences=["lifecycle_event.event_type"],
+                agreement_status="pending",
+                differences=[],
                 mimo=SimpleNamespace(
                     model="mimo-v2.5",
                     status="是策略",
                     payload={"reason": "MiMo认为这是取消旧挂单"},
                     error_message=None,
                 ),
-                deepseek_payload={
-                    "recognition_result": "非策略",
-                    "reason": "DeepSeek认为只是取消说明",
-                },
+                deepseek_payload=None,
             ),
             automation=app.state.auto_trade_executor(message_id),
         )
@@ -1498,15 +1493,12 @@ def test_message_recognition_api_sends_system_review_on_ai_disagreement(
     response = client.post(f"/api/messages/{raw_message_id}/recognize")
 
     assert response.status_code == 200
-    assert response.json()["ai_conflict"] is True
+    assert response.json()["ai_conflict"] is False
+    assert response.json()["agreement_status"] == "pending"
+    assert response.json()["semantic_review_status"] == "pending"
+    assert response.json()["notification_scheduled"] is False
     assert response.json()["auto_trade"] == {"status": "submitted"}
     assert auto_trade_calls == [raw_message_id]
-    assert len(sent_reviews) == 1
-    config, payload = sent_reviews[0]
-    assert config.chat_id == "system-chat"
-    assert payload["message_id"] == 3885
-    assert payload["deepseek"]["kind"] == "auxiliary"
-    assert payload["mimo"]["kind"] == "authoritative"
 
 
 def test_strategy_mid_panel_loads_only_visible_strategy_list(tmp_path, monkeypatch):

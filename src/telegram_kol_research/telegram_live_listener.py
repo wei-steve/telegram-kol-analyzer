@@ -132,14 +132,16 @@ async def persist_live_message_event(
                     raw_message.id,
                 )
                 recog_result = processing_result.recognition
-                conflict_payload = _build_authoritative_notification_payload(
-                    raw_message=raw_message,
-                    chat_title=chat_title,
-                    processing_result=processing_result,
-                )
-                if conflict_payload is not None and system_operator_bot_enabled(
-                    system_operator_bot_config
+                if (
+                    processing_result.assessment.agreement_status
+                    == "authoritative_failed"
+                    and system_operator_bot_enabled(system_operator_bot_config)
                 ):
+                    conflict_payload = _build_authoritative_notification_payload(
+                        raw_message=raw_message,
+                        chat_title=chat_title,
+                        processing_result=processing_result,
+                    )
                     _schedule_authoritative_notification(
                         session_factory=session_factory,
                         raw_message_id=raw_message.id,
@@ -217,7 +219,7 @@ def _build_authoritative_notification_payload(
     processing_result: Any,
 ) -> dict[str, Any] | None:
     assessment = processing_result.assessment
-    if assessment.agreement_status not in {"disagreed", "authoritative_failed"}:
+    if assessment.agreement_status != "authoritative_failed":
         return None
     mimo_payload = assessment.mimo.payload if isinstance(assessment.mimo.payload, dict) else {}
     deepseek_payload = (
