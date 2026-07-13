@@ -103,6 +103,95 @@ def test_cli_authoritative_result_leaves_semantic_review_pending(
     assert processing_result.assessment.agreement_status == "pending"
 
 
+def test_cli_mimo_failure_notification_does_not_block_later_messages(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        first = RawMessage(chat_id=1, message_id=20, sender_name="峰哥", text="first")
+        second = RawMessage(chat_id=1, message_id=21, sender_name="峰哥", text="second")
+        session.add_all([first, second])
+        session.commit()
+        raw_ids = [first.id, second.id]
+
+    processed: list[int] = []
+    sent: list[int] = []
+    audit: list[tuple[int, str]] = []
+
+    def fake_processor(*args, **kwargs):
+        raw_message_id = kwargs["raw_message_id"]
+        processed.append(raw_message_id)
+        return SimpleNamespace(
+            recognition=SimpleNamespace(status="识别失败"),
+            assessment=SimpleNamespace(
+                agreement_status="authoritative_failed",
+                differences=[],
+                mimo=SimpleNamespace(
+                    model="mimo-v2.5",
+                    status="识别失败",
+                    payload={},
+                    error_message="timeout",
+                ),
+                deepseek_payload=None,
+            ),
+            automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
+        )
+
+    async def delayed_sender(*, config, payload):
+        if payload["message_id"] == 20:
+            while raw_ids[1] not in processed:
+                await asyncio.sleep(0)
+        if payload["message_id"] == 21:
+            raise RuntimeError("notification unavailable")
+        sent.append(payload["message_id"])
+
+    def record_audit(*args, **kwargs):
+        audit.append((kwargs["raw_message_id"], kwargs["notification_status"]))
+
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.load_ai_recognition_config",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.process_authoritative_message",
+        fake_processor,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.update_recognition_execution_outcome",
+        record_audit,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.send_ai_recognition_conflict_review",
+        delayed_sender,
+    )
+
+    asyncio.run(
+        asyncio.wait_for(
+            _process_raw_messages_with_mimo_authority(
+                session_factory,
+                raw_message_ids=raw_ids,
+                ai_recognition_config_path=Path("ai.yaml"),
+                media_root=tmp_path / "media",
+                system_operator_bot_config=SimpleNamespace(
+                    bot_token="token",
+                    chat_id="chat",
+                ),
+            ),
+            timeout=0.5,
+        )
+    )
+
+    assert processed == raw_ids
+    assert sent == [20]
+    assert set(audit) == {
+        (raw_ids[0], "scheduled"),
+        (raw_ids[0], "sent"),
+        (raw_ids[1], "scheduled"),
+        (raw_ids[1], "failed"),
+    }
+
+
 def test_cli_sync_passes_custom_media_root_to_telegram_download(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "research.db")
     captured: dict = {}

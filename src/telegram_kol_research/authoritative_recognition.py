@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ from telegram_kol_research.message_recognition import (
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
+    finalize_authoritative_automation_outcome,
     save_pending_authoritative_decision,
     save_recognition_decision,
     update_recognition_execution_outcome,
@@ -36,6 +37,7 @@ class AuthoritativeAssessment:
     agreement_status: str
     differences: list[str]
     semantic_review_status: str = "not_applicable"
+    authoritative_generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,11 @@ def assess_message_authoritatively(
         agreement_status=saved.agreement_status,
         differences=list(json.loads(saved.differences_json or "[]")),
         semantic_review_status=saved.comparison_status,
+        authoritative_generation=(
+            saved.comparison_claim_token
+            if saved.comparison_status == "execution_pending"
+            else None
+        ),
     )
 
 
@@ -156,7 +163,7 @@ def process_authoritative_message(
     media_root: str | Path,
     auto_trade_executor=None,
 ) -> AuthoritativeProcessingResult:
-    """Apply MiMo first, then immediately hand its persisted result to automation."""
+    """Gate review until MiMo application and automation persistence finish."""
 
     assessment = assess_message_authoritatively(
         session_factory,
@@ -185,16 +192,36 @@ def process_authoritative_message(
             "status": "completed",
             "reason": None,
         }
-    update_recognition_execution_outcome(
-        session_factory,
-        raw_message_id=raw_message_id,
-        automation_status=str(automation.get("status") or "unknown"),
-        automation_reason=(
-            str(automation.get("reason"))
-            if automation.get("reason") is not None
-            else None
-        ),
+    automation_status = str(automation.get("status") or "unknown")
+    automation_reason = (
+        str(automation.get("reason"))
+        if automation.get("reason") is not None
+        else None
     )
+    if assessment.agreement_status == "authoritative_failed":
+        update_recognition_execution_outcome(
+            session_factory,
+            raw_message_id=raw_message_id,
+            automation_status=automation_status,
+            automation_reason=automation_reason,
+        )
+    else:
+        if assessment.authoritative_generation is None:
+            raise RuntimeError("authoritative execution generation is missing")
+        finalized = finalize_authoritative_automation_outcome(
+            session_factory,
+            raw_message_id=raw_message_id,
+            authoritative_generation=assessment.authoritative_generation,
+            automation_status=automation_status,
+            automation_reason=automation_reason,
+        )
+        assessment = replace(
+            assessment,
+            agreement_status=finalized.agreement_status,
+            differences=list(json.loads(finalized.differences_json or "[]")),
+            semantic_review_status=finalized.comparison_status,
+            authoritative_generation=None,
+        )
     return AuthoritativeProcessingResult(
         assessment=assessment,
         recognition=recognition,

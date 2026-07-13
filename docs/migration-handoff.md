@@ -54,7 +54,7 @@ Design and implementation references:
 
 ## MiMo-authoritative recognition and exit safety
 
-All production recognition paths use MiMo as the authority for text and media. A successful MiMo decision is persisted as pending before it is applied and continues immediately into the existing safety and automation path. DeepSeek semantic comparison runs later in the Web service worker and never sits on the execution critical path. MiMo failure blocks automatic mutation, is notified independently, and does not create a semantic-review job.
+All production recognition paths use MiMo as the authority for text and media. A successful MiMo decision is first persisted as unclaimable `execution_pending`, then applied through the existing safety and automation path. Only the same authoritative generation may atomically persist its automation outcome and transition to claimable `pending`; a stale generation or failed outcome write leaves semantic review blocked. DeepSeek semantic comparison runs later in the Web service worker and never sits on the execution critical path. MiMo failure blocks automatic mutation, is notified independently, and does not create a semantic-review job.
 
 The unified MiMo prompt incorporates the established DeepSeek strategy and lifecycle rules and adds explicit image-reading instructions. Decisions and model comparisons are persisted in `recognition_decisions`, including automation and notification outcomes.
 

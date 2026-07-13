@@ -1,6 +1,8 @@
 import json
 from datetime import datetime, timedelta
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import RawMessage, RecognitionDecision
 from telegram_kol_research.recognition_decisions import (
@@ -10,6 +12,7 @@ from telegram_kol_research.recognition_decisions import (
     claim_next_semantic_review,
     complete_semantic_review,
     fail_semantic_review,
+    finalize_authoritative_automation_outcome,
     save_pending_authoritative_decision,
     update_recognition_execution_outcome,
 )
@@ -50,22 +53,92 @@ def _claim(session_factory):
     return claimed
 
 
-def test_new_authoritative_decision_is_pending_without_auxiliary_payload(tmp_path):
+def _save_and_finalize(session_factory, record):
+    saved = save_pending_authoritative_decision(session_factory, record)
+    return finalize_authoritative_automation_outcome(
+        session_factory,
+        raw_message_id=record.raw_message_id,
+        authoritative_generation=saved.comparison_claim_token,
+        automation_status="skipped",
+        automation_reason="test_setup",
+    )
+
+
+def test_new_authoritative_decision_is_unclaimable_until_automation_finalizes(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
 
     saved = save_pending_authoritative_decision(session_factory, _record(raw_id))
 
-    assert saved.comparison_status == "pending"
+    assert saved.comparison_status == "execution_pending"
+    assert saved.comparison_claim_token
     assert saved.auxiliary_model is None
     assert saved.auxiliary_payload_json is None
     assert saved.comparison_attempts == 0
+    now = datetime(2026, 7, 13, 12, 0)
+    assert claim_next_semantic_review(
+        session_factory,
+        now=now,
+        stale_before=now - timedelta(minutes=5),
+    ) is None
+
+    finalized = finalize_authoritative_automation_outcome(
+        session_factory,
+        raw_message_id=raw_id,
+        authoritative_generation=saved.comparison_claim_token,
+        automation_status="submitted",
+        automation_reason="close_position",
+    )
+
+    assert finalized.comparison_status == "pending"
+    assert finalized.automation_status == "submitted"
+    claim = claim_next_semantic_review(
+        session_factory,
+        now=now,
+        stale_before=now - timedelta(minutes=5),
+    )
+    assert claim is not None
+    assert claim.raw_message_id == raw_id
+
+
+def test_stale_automation_generation_cannot_publish_new_rerecognition(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id = _raw_message(session_factory)
+    first = save_pending_authoritative_decision(session_factory, _record(raw_id))
+    second = save_pending_authoritative_decision(
+        session_factory,
+        _record(raw_id, {"lifecycle_event": {"event_type": "position_update"}}),
+    )
+
+    with pytest.raises(RuntimeError, match="stale"):
+        finalize_authoritative_automation_outcome(
+            session_factory,
+            raw_message_id=raw_id,
+            authoritative_generation=first.comparison_claim_token,
+            automation_status="submitted",
+            automation_reason="stale_close",
+        )
+
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.comparison_status == "execution_pending"
+        assert row.automation_status is None
+
+    finalized = finalize_authoritative_automation_outcome(
+        session_factory,
+        raw_message_id=raw_id,
+        authoritative_generation=second.comparison_claim_token,
+        automation_status="skipped",
+        automation_reason="new_generation",
+    )
+    assert finalized.comparison_status == "pending"
+    assert finalized.automation_reason == "new_generation"
 
 
 def test_comparison_completion_preserves_automation_outcome(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
-    save_pending_authoritative_decision(session_factory, _record(raw_id))
+    _save_and_finalize(session_factory, _record(raw_id))
     claim = _claim(session_factory)
     assert claim.raw_message_id == raw_id
     update_recognition_execution_outcome(
@@ -100,7 +173,7 @@ def test_comparison_completion_preserves_automation_outcome(tmp_path):
 def test_only_one_worker_claims_pending_review_and_stale_work_is_reclaimable(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
-    save_pending_authoritative_decision(session_factory, _record(raw_id))
+    _save_and_finalize(session_factory, _record(raw_id))
     now = datetime(2026, 7, 13, 12, 0)
 
     first = claim_next_semantic_review(
@@ -125,8 +198,8 @@ def test_failure_tracks_attempt_and_only_requeues_with_retry_time(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     retry_id = _raw_message(session_factory, message_id=2)
     terminal_id = _raw_message(session_factory, message_id=3)
-    save_pending_authoritative_decision(session_factory, _record(retry_id))
-    save_pending_authoritative_decision(session_factory, _record(terminal_id))
+    _save_and_finalize(session_factory, _record(retry_id))
+    _save_and_finalize(session_factory, _record(terminal_id))
     retry_at = datetime(2026, 7, 13, 12, 30)
 
     retry_claim = _claim(session_factory)
@@ -160,7 +233,7 @@ def test_notification_claim_is_once_per_raw_message_and_survives_resaves(tmp_pat
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
     original = _record(raw_id)
-    save_pending_authoritative_decision(session_factory, original)
+    _save_and_finalize(session_factory, original)
     claim = _claim(session_factory)
     assert claim.raw_message_id == raw_id
     complete_semantic_review(
@@ -204,7 +277,7 @@ def test_notification_claim_is_once_per_raw_message_and_survives_resaves(tmp_pat
 def test_failed_notification_delivery_keeps_original_claim_reserved(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
-    save_pending_authoritative_decision(session_factory, _record(raw_id))
+    _save_and_finalize(session_factory, _record(raw_id))
     claim = _claim(session_factory)
     assert claim.raw_message_id == raw_id
     complete_semantic_review(
@@ -230,10 +303,10 @@ def test_failed_notification_delivery_keeps_original_claim_reserved(tmp_path):
     ) is False
 
 
-def test_changed_authoritative_payload_resets_comparison_not_execution_or_notification(tmp_path):
+def test_changed_authoritative_payload_resets_comparison_and_execution_outcome(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
-    save_pending_authoritative_decision(session_factory, _record(raw_id))
+    _save_and_finalize(session_factory, _record(raw_id))
     claim = _claim(session_factory)
     assert claim.raw_message_id == raw_id
     complete_semantic_review(
@@ -266,10 +339,11 @@ def test_changed_authoritative_payload_resets_comparison_not_execution_or_notifi
 
     with session_factory() as session:
         row = session.query(RecognitionDecision).one()
-        assert row.comparison_status == "pending"
+        assert row.comparison_status == "execution_pending"
         assert row.comparison_payload_json is None
         assert row.auxiliary_payload_json is None
-        assert row.automation_status == "submitted"
+        assert row.automation_status is None
+        assert row.automation_reason is None
         assert row.notification_fingerprint == "old-review"
         assert row.notification_status == "scheduled"
 
@@ -277,7 +351,7 @@ def test_changed_authoritative_payload_resets_comparison_not_execution_or_notifi
 def test_stale_completion_cannot_overwrite_changed_authoritative_payload(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
-    save_pending_authoritative_decision(session_factory, _record(raw_id))
+    _save_and_finalize(session_factory, _record(raw_id))
     now = datetime(2026, 7, 13, 12, 0)
     stale_claim = claim_next_semantic_review(
         session_factory, now=now, stale_before=now - timedelta(minutes=5)
@@ -305,7 +379,7 @@ def test_stale_completion_cannot_overwrite_changed_authoritative_payload(tmp_pat
 
     with session_factory() as session:
         row = session.query(RecognitionDecision).one()
-        assert row.comparison_status == "pending"
+        assert row.comparison_status == "execution_pending"
         assert row.comparison_payload_json is None
 
 
@@ -313,14 +387,14 @@ def test_prompt_versions_merge_across_authoritative_resave_and_comparison(tmp_pa
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
     record = _record(raw_id)
-    save_pending_authoritative_decision(session_factory, record)
+    _save_and_finalize(session_factory, record)
     updated = RecognitionDecisionRecord(
         **{
             **record.__dict__,
             "prompt_versions": {"mimo": {"trading.analysis.shared": 5}},
         }
     )
-    save_pending_authoritative_decision(session_factory, updated)
+    _save_and_finalize(session_factory, updated)
     claim = _claim(session_factory)
     assert claim.raw_message_id == raw_id
     complete_semantic_review(
@@ -347,7 +421,7 @@ def test_prompt_versions_merge_across_authoritative_resave_and_comparison(tmp_pa
 def test_stale_worker_cannot_complete_or_fail_after_new_worker_reclaims(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)
-    save_pending_authoritative_decision(session_factory, _record(raw_id))
+    _save_and_finalize(session_factory, _record(raw_id))
     started_at = datetime(2026, 7, 13, 12, 0)
     worker_a = claim_next_semantic_review(
         session_factory,

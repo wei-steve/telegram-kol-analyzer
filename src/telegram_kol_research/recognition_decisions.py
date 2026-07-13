@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import and_, or_, update
+from sqlalchemy import and_, case, or_, update
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import RecognitionDecision, utc_now
@@ -113,6 +113,12 @@ def save_pending_authoritative_decision(
         )
         now = utc_now()
         changed = row is None or row.authoritative_payload_json != payload_json
+        preserve_completed_review = (
+            row is not None
+            and not changed
+            and row.comparison_status == "completed"
+        )
+        authoritative_generation = uuid4().hex
         if row is None:
             row = RecognitionDecision(
                 raw_message_id=record.raw_message_id,
@@ -123,7 +129,8 @@ def save_pending_authoritative_decision(
                 agreement_status="pending",
                 differences_json="[]",
                 prompt_versions_json=_json(record.prompt_versions),
-                comparison_status="pending",
+                comparison_status="execution_pending",
+                comparison_claim_token=authoritative_generation,
                 comparison_attempts=0,
                 created_at=now,
                 updated_at=now,
@@ -134,14 +141,14 @@ def save_pending_authoritative_decision(
         row.authoritative_model = record.authoritative_model
         row.authoritative_status = record.authoritative_status
         row.authoritative_payload_json = payload_json
-        if changed:
+        if not preserve_completed_review:
             row.auxiliary_model = None
             row.auxiliary_status = None
             row.auxiliary_payload_json = None
             row.agreement_status = "pending"
             row.differences_json = "[]"
             row.prompt_versions_json = _json(record.prompt_versions)
-            row.comparison_status = "pending"
+            row.comparison_status = "execution_pending"
             row.disagreement_severity = None
             row.comparison_model = None
             row.comparison_payload_json = None
@@ -149,15 +156,73 @@ def save_pending_authoritative_decision(
             row.comparison_attempts = 0
             row.comparison_next_attempt_at = None
             row.comparison_started_at = None
-            row.comparison_claim_token = None
+            row.comparison_claim_token = authoritative_generation
             row.compared_at = None
         else:
             prompt_versions = json.loads(row.prompt_versions_json)
             prompt_versions.update(record.prompt_versions)
             row.prompt_versions_json = _json(prompt_versions)
+            row.comparison_status = "execution_pending"
+            row.comparison_started_at = None
+            row.comparison_claim_token = authoritative_generation
+            row.comparison_next_attempt_at = None
+        # Automation belongs to this exact authoritative generation. Never let
+        # a worker observe the outcome from an earlier execution attempt.
+        row.automation_status = None
+        row.automation_reason = None
         row.updated_at = now
         session.commit()
         session.refresh(row)
+        session.expunge(row)
+        return row
+
+
+def finalize_authoritative_automation_outcome(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    authoritative_generation: str,
+    automation_status: str,
+    automation_reason: str | None,
+) -> RecognitionDecision:
+    """Atomically publish one generation's automation result for review."""
+
+    with session_factory() as session:
+        now = utc_now()
+        result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == raw_message_id,
+                RecognitionDecision.comparison_status == "execution_pending",
+                RecognitionDecision.comparison_claim_token
+                == authoritative_generation,
+            )
+            .values(
+                automation_status=automation_status,
+                automation_reason=automation_reason,
+                comparison_status=case(
+                    (
+                        RecognitionDecision.agreement_status == "pending",
+                        "pending",
+                    ),
+                    else_="completed",
+                ),
+                comparison_claim_token=None,
+                comparison_started_at=None,
+                updated_at=now,
+            )
+        )
+        if result.rowcount != 1:
+            session.rollback()
+            raise RuntimeError(
+                "authoritative generation is stale or no longer execution-pending"
+            )
+        session.commit()
+        row = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == raw_message_id)
+            .one()
+        )
         session.expunge(row)
         return row
 

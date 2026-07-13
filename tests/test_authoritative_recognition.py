@@ -2,6 +2,8 @@ import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
+
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.authoritative_recognition import (
     AuthoritativeAssessment,
@@ -18,9 +20,12 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
 )
 from telegram_kol_research.recognition_experiments import MimoAuthoritativeResult
+from telegram_kol_research.recognition_decisions import (
+    finalize_authoritative_automation_outcome,
+)
 
 
-def test_fengge_exit_applies_mimo_while_semantic_review_is_pending(tmp_path, monkeypatch):
+def test_fengge_exit_applies_mimo_while_execution_gate_is_pending(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         entry = RawMessage(chat_id=-1002409877375, message_id=8398, text="BTC short")
@@ -122,7 +127,7 @@ def test_fengge_exit_applies_mimo_while_semantic_review_is_pending(tmp_path, mon
         decision = session.query(RecognitionDecision).one()
         assert decision.authoritative_model == "mimo-v2.5"
         assert decision.agreement_status == "pending"
-        assert decision.comparison_status == "pending"
+        assert decision.comparison_status == "execution_pending"
         assert json.loads(decision.prompt_versions_json) == {
             "mimo": {
                 "trading.analysis.mimo_vision": 12,
@@ -240,7 +245,7 @@ def test_mimo_failure_after_pending_rerecognition_cancels_stale_review(
         }
 
 
-def test_unchanged_rerecognition_reports_completed_without_requeueing_or_deepseek(
+def test_unchanged_rerecognition_preserves_completed_review_through_execution_gate(
     tmp_path,
     monkeypatch,
 ):
@@ -291,10 +296,18 @@ def test_unchanged_rerecognition_reports_completed_without_requeueing_or_deepsee
         media_root=tmp_path,
     )
 
-    assert first.semantic_review_status == "pending"
+    assert first.semantic_review_status == "execution_pending"
     assert second.agreement_status == "agreed"
-    assert second.semantic_review_status == "completed"
+    assert second.semantic_review_status == "execution_pending"
     assert second.deepseek_payload is None
+    finalized = finalize_authoritative_automation_outcome(
+        session_factory,
+        raw_message_id=raw_id,
+        authoritative_generation=second.authoritative_generation,
+        automation_status="skipped",
+        automation_reason="test",
+    )
+    assert finalized.comparison_status == "completed"
     with session_factory() as session:
         assert session.query(RecognitionDecision).one().comparison_status == "completed"
 
@@ -351,8 +364,13 @@ def test_process_authoritative_message_persists_pending_before_mimo_and_auto_tra
         or SimpleNamespace(status="非策略"),
     )
     monkeypatch.setattr(
-        "telegram_kol_research.authoritative_recognition.update_recognition_execution_outcome",
-        lambda *args, **kwargs: None,
+        "telegram_kol_research.authoritative_recognition.finalize_authoritative_automation_outcome",
+        lambda *args, **kwargs: events.append("persist_automation")
+        or SimpleNamespace(
+            agreement_status="pending",
+            differences_json="[]",
+            comparison_status="pending",
+        ),
     )
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition._has_current_mimo_candidate",
@@ -368,10 +386,115 @@ def test_process_authoritative_message_persists_pending_before_mimo_and_auto_tra
         or {"status": "executed", "reason": "close_submitted"},
     )
 
-    assert events == ["mimo", "persist_pending", "apply_mimo", "auto_trade"]
+    assert events == [
+        "mimo",
+        "persist_pending",
+        "apply_mimo",
+        "auto_trade",
+        "persist_automation",
+    ]
     assert result.assessment.agreement_status == "pending"
     assert result.assessment.deepseek_payload is None
     assert result.automation == {"status": "executed", "reason": "close_submitted"}
+
+
+def test_pending_save_failure_prevents_mimo_apply_and_auto_trade(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=31, text="现价出局")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: MimoAuthoritativeResult(
+            raw_message_id=raw_id,
+            payload={"recognition_result": "非策略"},
+            input_kind="text",
+            model="mimo-v2.5",
+            status="非策略",
+        ),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.save_pending_authoritative_decision",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("MiMo must not apply after pending-save failure")
+        ),
+    )
+    auto_trade_calls: list[int] = []
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            auto_trade_executor=auto_trade_calls.append,
+        )
+
+    assert auto_trade_calls == []
+
+
+def test_outcome_persist_failure_after_submit_leaves_review_unclaimable(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=32, text="现价出局")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: MimoAuthoritativeResult(
+            raw_message_id=raw_id,
+            payload={"recognition_result": "非策略"},
+            input_kind="text",
+            model="mimo-v2.5",
+            status="非策略",
+        ),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
+        lambda *args, **kwargs: SimpleNamespace(status="非策略"),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition._has_current_mimo_candidate",
+        lambda *args, **kwargs: True,
+    )
+    submitted: list[int] = []
+
+    def fail_finalize(*args, **kwargs):
+        raise RuntimeError("outcome commit failed")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.finalize_authoritative_automation_outcome",
+        fail_finalize,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="outcome commit failed"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            auto_trade_executor=lambda message_id: submitted.append(message_id)
+            or {"status": "submitted", "reason": "close_submitted"},
+        )
+
+    assert submitted == [raw_id]
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+        assert decision.comparison_status == "execution_pending"
+        assert decision.automation_status is None
 
 
 def test_process_authoritative_message_skips_auto_trade_when_mimo_fails(

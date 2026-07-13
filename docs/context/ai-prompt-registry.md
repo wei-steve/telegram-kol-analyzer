@@ -18,7 +18,7 @@ Runtime composition is fixed:
 - MiMo authoritative recognition: `A + B + C`.
 - `C` is runtime message, image, recent-message, and active-strategy context. It is not an editable prompt version.
 
-MiMo is authoritative for both text and image messages. Its successful decision and exact prompt versions are saved as pending before MiMo-driven stop-loss, take-profit, or exit processing continues. DeepSeek auxiliary comparison is performed later by the Web service semantic-review worker; it cannot delay or override authoritative execution. A MiMo transport or schema failure remains fail-closed, uses its separate failure alert, and is not queued for semantic review.
+MiMo is authoritative for both text and image messages. Its successful decision and exact prompt versions are saved as unclaimable `execution_pending` before MiMo-driven stop-loss, take-profit, or exit processing continues. The exact authoritative generation must atomically persist its automation outcome before the row becomes semantic-review `pending`; persistence failure or a superseding re-recognition keeps stale outcomes unclaimable. DeepSeek auxiliary comparison is performed later by the Web service semantic-review worker; it cannot delay or override authoritative execution. A MiMo transport or schema failure remains fail-closed, uses its separate failure alert, and is not queued for semantic review.
 
 ## Editing lifecycle
 

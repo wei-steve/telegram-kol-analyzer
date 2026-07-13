@@ -169,6 +169,7 @@ async def _process_raw_messages_with_mimo_authority(
             .filter(SignalCandidate.parse_source == "mimo_authoritative")
             .all()
         }
+    notification_tasks: list[asyncio.Task[None]] = []
     for raw_message_id in raw_message_ids:
         processing_result = await asyncio.to_thread(
             process_authoritative_message,
@@ -209,26 +210,18 @@ async def _process_raw_messages_with_mimo_authority(
             **outcome_kwargs,
             notification_status="scheduled",
         )
-        try:
-            await send_ai_recognition_conflict_review(
-                config=system_operator_bot_config,
-                payload=payload,
+        notification_tasks.append(
+            asyncio.create_task(
+                _deliver_cli_authoritative_failure_notification(
+                    session_factory=session_factory,
+                    config=system_operator_bot_config,
+                    payload=payload,
+                    outcome_kwargs=outcome_kwargs,
+                )
             )
-        except Exception as exc:
-            await asyncio.to_thread(
-                update_recognition_execution_outcome,
-                session_factory,
-                **outcome_kwargs,
-                notification_status="failed",
-                notification_error=str(exc),
-            )
-        else:
-            await asyncio.to_thread(
-                update_recognition_execution_outcome,
-                session_factory,
-                **outcome_kwargs,
-                notification_status="sent",
-            )
+        )
+    if notification_tasks:
+        await asyncio.gather(*notification_tasks)
     with session_factory() as session:
         after_ids = {
             row[0]
@@ -238,6 +231,32 @@ async def _process_raw_messages_with_mimo_authority(
             .all()
         }
     return len(after_ids - before_ids)
+
+
+async def _deliver_cli_authoritative_failure_notification(
+    *,
+    session_factory,
+    config,
+    payload: dict,
+    outcome_kwargs: dict,
+) -> None:
+    try:
+        await send_ai_recognition_conflict_review(config=config, payload=payload)
+    except Exception as exc:
+        await asyncio.to_thread(
+            update_recognition_execution_outcome,
+            session_factory,
+            **outcome_kwargs,
+            notification_status="failed",
+            notification_error=str(exc),
+        )
+    else:
+        await asyncio.to_thread(
+            update_recognition_execution_outcome,
+            session_factory,
+            **outcome_kwargs,
+            notification_status="sent",
+        )
 
 
 def _run_parse_mode(
