@@ -201,6 +201,52 @@ def test_build_mimo_payload_uses_raw_image_without_ocr_text(tmp_path):
     assert "OLD OCR TEXT SHOULD NOT BE SENT" not in json.dumps(payload)
 
 
+def test_authoritative_mimo_fails_closed_when_declared_image_is_missing(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=9, text="BTC short caption")
+        session.add(raw)
+        session.flush()
+        session.add(
+            MediaAsset(
+                raw_message_id=raw.id,
+                kind="photo",
+                local_path="missing/9.jpg",
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+
+    model_calls: list[dict] = []
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        lambda **kwargs: model_calls.append(kwargs) or {},
+    )
+    result = run_mimo_authoritative_for_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(
+            ai_models=[
+                AiModelConfig(
+                    id="mimo-v2.5",
+                    label="MiMo",
+                    base_url="https://api.xiaomimimo.com/v1",
+                    model="mimo-v2.5",
+                )
+            ]
+        ),
+        media_root=tmp_path / "media",
+    )
+
+    assert result.input_kind == "text+image"
+    assert result.status == "识别失败"
+    assert "unavailable or unreadable" in result.error_message
+    assert model_calls == []
+
+
 def test_build_mimo_payload_skips_empty_images_and_uses_configured_prompt(tmp_path):
     media_root = tmp_path / "media"
     empty_path = media_root / "group" / "empty.jpg"

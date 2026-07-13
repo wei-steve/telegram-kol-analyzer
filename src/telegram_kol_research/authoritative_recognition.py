@@ -14,6 +14,7 @@ from telegram_kol_research.message_recognition import (
     apply_authoritative_mimo_payload,
     infer_deepseek_auxiliary,
 )
+from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
     save_recognition_decision,
@@ -170,6 +171,13 @@ def process_authoritative_message(
             "status": "skipped",
             "reason": "mimo_authoritative_failed",
         }
+    elif recognition.status == "识别失败":
+        automation = {
+            "status": "skipped",
+            "reason": "mimo_authoritative_not_safely_applied",
+        }
+    elif not _has_current_mimo_candidate(session_factory, raw_message_id):
+        automation = {"status": "skipped", "reason": "mimo_no_action"}
     elif auto_trade_executor is None:
         automation = {"status": "skipped", "reason": "auto_trade_not_configured"}
     else:
@@ -193,3 +201,14 @@ def process_authoritative_message(
         recognition=recognition,
         automation=automation,
     )
+
+
+def _has_current_mimo_candidate(session_factory: sessionmaker, raw_message_id: int) -> bool:
+    with session_factory() as session:
+        return (
+            session.query(SignalCandidate.id)
+            .filter(SignalCandidate.raw_message_id == raw_message_id)
+            .filter(SignalCandidate.parse_source == "mimo_authoritative")
+            .first()
+            is not None
+        )

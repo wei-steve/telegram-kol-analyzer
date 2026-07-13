@@ -1593,6 +1593,15 @@ def apply_authoritative_mimo_payload(
         raw_message = session.get(RawMessage, raw_message_id)
         if raw_message is None:
             raise LookupError("raw message not found")
+        # A re-recognition must never leave a prior MiMo candidate executable.
+        # Current application below promotes at most one candidate back to the
+        # authoritative parse source.
+        (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == raw_message_id)
+            .filter(SignalCandidate.parse_source == "mimo_authoritative")
+            .update({SignalCandidate.parse_source: "mimo_superseded"})
+        )
         if error_message or not payload:
             result = MessageRecognitionResult(
                 raw_message_id=raw_message_id,

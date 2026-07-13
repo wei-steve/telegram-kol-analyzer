@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.authoritative_recognition import (
@@ -199,11 +200,16 @@ def test_process_authoritative_message_applies_mimo_before_auto_trade(
     )
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
-        lambda *args, **kwargs: events.append("apply_mimo") or object(),
+        lambda *args, **kwargs: events.append("apply_mimo")
+        or SimpleNamespace(status="非策略"),
     )
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition.update_recognition_execution_outcome",
         lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition._has_current_mimo_candidate",
+        lambda *args, **kwargs: True,
     )
 
     result = process_authoritative_message(
@@ -272,3 +278,58 @@ def test_process_authoritative_message_skips_auto_trade_when_mimo_fails(
         "status": "skipped",
         "reason": "mimo_authoritative_failed",
     }
+
+
+def test_mimo_non_strategy_never_executes_stale_deepseek_candidate(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=5, text="只是复盘，不是新策略")
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                event_type="entry_signal",
+                symbol="BTC",
+                side="long",
+                parse_source="text_ai",
+                confidence=0.99,
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+
+    payload = {
+        "recognition_result": "非策略",
+        "reason": "MiMo判定为复盘",
+        "strategy": {},
+        "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+        "input_reading": {"observed_text": "只是复盘，不是新策略", "image_quality": "none"},
+        "confidence": 0.95,
+    }
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: MimoAuthoritativeResult(
+            raw_message_id=raw_id,
+            payload=payload,
+            input_kind="text",
+            model="mimo-v2.5",
+            status="非策略",
+        ),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_deepseek_auxiliary",
+        lambda *args, **kwargs: {"recognition_result": "是策略"},
+    )
+    auto_trade_calls: list[int] = []
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        auto_trade_executor=auto_trade_calls.append,
+    )
+
+    assert auto_trade_calls == []
+    assert result.automation == {"status": "skipped", "reason": "mimo_no_action"}

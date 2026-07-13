@@ -8,14 +8,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
+from sqlalchemy import tuple_
 
 from telegram_kol_research.backfill import build_backfill_windows
+from telegram_kol_research.ai_recognition_config import load_ai_recognition_config
+from telegram_kol_research.authoritative_recognition import process_authoritative_message
 from telegram_kol_research.binance_market_data import BinanceMarketDataProvider
-from telegram_kol_research.candidates import persist_text_signal_candidates
-from telegram_kol_research.message_recognition import (
-    filter_records_by_inserted_message_keys,
-    recognize_records_with_ai_config,
-)
 from telegram_kol_research.dataset_export import export_dataset_jsonl
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import load_deepcoin_contract_specs
@@ -32,8 +30,9 @@ from telegram_kol_research.llm_adjudication import (
 from telegram_kol_research.llm_import import import_llm_adjudication_results
 from telegram_kol_research.media_retention import cleanup_media_files
 from telegram_kol_research.media_dedupe import dedupe_media_assets
-from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import RawMessage, SignalCandidate
 from telegram_kol_research.models import SyncCheckpoint
+from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
 from telegram_kol_research.reporting import load_leaderboard_rows, write_report
 from telegram_kol_research.raw_ingest import (
     NormalizedMessageRecord,
@@ -58,6 +57,11 @@ from telegram_kol_research.strategy_alerts import (
     load_strategy_alert_config,
     strategy_alerts_enabled,
 )
+from telegram_kol_research.system_operator_bot import (
+    load_system_operator_bot_config,
+    send_ai_recognition_conflict_review,
+    system_operator_bot_enabled,
+)
 from telegram_kol_research.telegram_client import (
     create_telegram_client,
     discover_dialogs,
@@ -75,7 +79,11 @@ from telegram_kol_research.telegram_session_lock import (
     release_session_lock_owner,
 )
 from telegram_kol_research.time_utils import normalize_to_utc_naive
-from telegram_kol_research.telegram_live_listener import run_live_listener
+from telegram_kol_research.telegram_live_listener import (
+    _build_authoritative_notification_payload,
+    _filter_callable_kwargs,
+    run_live_listener,
+)
 from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidates
 from telegram_kol_research.web_app import create_web_app
 
@@ -142,16 +150,119 @@ def _load_normalized_records_from_db(
     return records
 
 
-def _run_parse_mode(database_path: Path) -> tuple[int, int]:
+async def _process_raw_messages_with_mimo_authority(
+    session_factory,
+    *,
+    raw_message_ids: list[int],
+    ai_recognition_config_path: Path,
+    media_root: Path,
+    system_operator_bot_config=None,
+) -> int:
+    if not raw_message_ids:
+        return 0
+    config = load_ai_recognition_config(ai_recognition_config_path)
+    with session_factory() as session:
+        before_ids = {
+            row[0]
+            for row in session.query(SignalCandidate.id)
+            .filter(SignalCandidate.raw_message_id.in_(raw_message_ids))
+            .filter(SignalCandidate.parse_source == "mimo_authoritative")
+            .all()
+        }
+    for raw_message_id in raw_message_ids:
+        processing_result = await asyncio.to_thread(
+            process_authoritative_message,
+            session_factory,
+            raw_message_id=raw_message_id,
+            ai_recognition_config=config,
+            media_root=media_root,
+            auto_trade_executor=None,
+        )
+        if processing_result.assessment.agreement_status not in {
+            "disagreed",
+            "authoritative_failed",
+        } or not system_operator_bot_enabled(system_operator_bot_config):
+            continue
+        with session_factory() as session:
+            raw_message = session.get(RawMessage, raw_message_id)
+            if raw_message is None:
+                continue
+            payload = _build_authoritative_notification_payload(
+                raw_message=raw_message,
+                chat_title=raw_message.sender_name,
+                processing_result=processing_result,
+            )
+        if payload is None:
+            continue
+        outcome_kwargs = {
+            "raw_message_id": raw_message_id,
+            "automation_status": str(
+                processing_result.automation.get("status") or "unknown"
+            ),
+            "automation_reason": processing_result.automation.get("reason"),
+        }
+        await asyncio.to_thread(
+            update_recognition_execution_outcome,
+            session_factory,
+            **outcome_kwargs,
+            notification_status="scheduled",
+        )
+        try:
+            await send_ai_recognition_conflict_review(
+                config=system_operator_bot_config,
+                payload=payload,
+            )
+        except Exception as exc:
+            await asyncio.to_thread(
+                update_recognition_execution_outcome,
+                session_factory,
+                **outcome_kwargs,
+                notification_status="failed",
+                notification_error=str(exc),
+            )
+        else:
+            await asyncio.to_thread(
+                update_recognition_execution_outcome,
+                session_factory,
+                **outcome_kwargs,
+                notification_status="sent",
+            )
+    with session_factory() as session:
+        after_ids = {
+            row[0]
+            for row in session.query(SignalCandidate.id)
+            .filter(SignalCandidate.raw_message_id.in_(raw_message_ids))
+            .filter(SignalCandidate.parse_source == "mimo_authoritative")
+            .all()
+        }
+    return len(after_ids - before_ids)
+
+
+def _run_parse_mode(
+    database_path: Path,
+    *,
+    ai_recognition_config_path: Path,
+    media_root: Path,
+) -> tuple[int, int]:
     session_factory = create_session_factory(database_path)
-    normalized_records = _load_normalized_records_from_db(database_path)
-    candidate_stats = recognize_records_with_ai_config(
-        session_factory,
-        normalized_records,
-        fallback_recognizer=persist_text_signal_candidates,
+    with session_factory() as session:
+        raw_message_ids = [
+            row[0]
+            for row in session.query(RawMessage.id)
+            .order_by(RawMessage.chat_id, RawMessage.message_id, RawMessage.id)
+            .all()
+        ]
+    inserted_candidates = asyncio.run(
+        _process_raw_messages_with_mimo_authority(
+            session_factory,
+            raw_message_ids=raw_message_ids,
+            ai_recognition_config_path=ai_recognition_config_path,
+            media_root=media_root,
+            system_operator_bot_config=load_system_operator_bot_config(),
+        )
     )
     trade_stats = persist_trade_ideas_from_candidates(session_factory)
-    return candidate_stats["inserted_candidates"], trade_stats["inserted_trade_ideas"]
+    return inserted_candidates, trade_stats["inserted_trade_ideas"]
 
 
 def _load_history_checkpoints(session_factory) -> dict[int, dict[str, int | datetime | None]]:
@@ -178,6 +289,8 @@ async def _run_telegram_sync(
     windows_by_title,
     message_limit: int,
     mode: SyncMode,
+    ai_recognition_config_path: Path,
+    media_root: Path,
 ) -> tuple[list[dict[str, str | int | bool | None]], int, int, int]:
     await ensure_telegram_login(
         client,
@@ -199,7 +312,11 @@ async def _run_telegram_sync(
     inserted_trade_ideas = 0
 
     for dialog in matched_dialogs:
-        payloads = await fetch_dialog_messages(client, dialog, limit=message_limit)
+        fetch_kwargs = _filter_callable_kwargs(
+            fetch_dialog_messages,
+            {"limit": message_limit, "media_root": media_root},
+        )
+        payloads = await fetch_dialog_messages(client, dialog, **fetch_kwargs)
         dialog_id = dialog.get("id")
         checkpoint = None
         if dialog_id is not None:
@@ -231,12 +348,23 @@ async def _run_telegram_sync(
         inserted_messages += stats["inserted_messages"]
         if mode == SyncMode.backfill:
             continue
-        candidate_stats = recognize_records_with_ai_config(
+        inserted_keys = stats.get("inserted_message_keys") or []
+        with session_factory() as session:
+            raw_message_ids = [
+                row[0]
+                for row in session.query(RawMessage.id)
+                .filter(
+                    tuple_(RawMessage.chat_id, RawMessage.message_id).in_(inserted_keys)
+                )
+                .all()
+            ] if inserted_keys else []
+        inserted_candidates += await _process_raw_messages_with_mimo_authority(
             session_factory,
-            filter_records_by_inserted_message_keys(normalized_records, stats),
-            fallback_recognizer=persist_text_signal_candidates,
+            raw_message_ids=raw_message_ids,
+            ai_recognition_config_path=ai_recognition_config_path,
+            media_root=media_root,
+            system_operator_bot_config=load_system_operator_bot_config(),
         )
-        inserted_candidates += candidate_stats["inserted_candidates"]
         trade_stats = persist_trade_ideas_from_candidates(session_factory)
         inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
 
@@ -290,6 +418,8 @@ def sync(
     database_path: Path = Path("data/research.db"),
     message_limit: int = 100,
     mode: SyncMode = SyncMode.full,
+    ai_recognition_config_path: Path = Path("config/ai_recognition.yaml"),
+    media_root: Path = Path("data/media"),
 ) -> None:
     """Sync Telegram messages."""
 
@@ -305,8 +435,13 @@ def sync(
     }
 
     if mode == SyncMode.parse:
+        session_factory = create_session_factory(database_path)
         repair_history_checkpoints(session_factory)
-        inserted_candidates, inserted_trade_ideas = _run_parse_mode(database_path)
+        inserted_candidates, inserted_trade_ideas = _run_parse_mode(
+            database_path,
+            ai_recognition_config_path=ai_recognition_config_path,
+            media_root=media_root,
+        )
         typer.echo(f"Parse only mode: read raw messages from {database_path}")
         typer.echo(
             f"Persisted {inserted_candidates} signal candidate(s) to {database_path}"
@@ -346,6 +481,8 @@ def sync(
                         windows_by_title=windows_by_title,
                         message_limit=message_limit,
                         mode=mode,
+                        ai_recognition_config_path=ai_recognition_config_path,
+                        media_root=media_root,
                     )
                 )
                 matched_titles = {str(dialog.get("title")) for dialog in matched_dialogs}

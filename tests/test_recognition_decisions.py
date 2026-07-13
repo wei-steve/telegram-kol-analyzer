@@ -67,4 +67,28 @@ def test_recognition_decision_upserts_and_tracks_outcomes(tmp_path):
     )
     with session_factory() as session:
         assert session.query(RecognitionDecision).count() == 1
-        assert session.query(RecognitionDecision).one().agreement_status == "agreed"
+        row = session.query(RecognitionDecision).one()
+        assert row.agreement_status == "agreed"
+        assert row.automation_status is None
+        assert row.notification_status is None
+        assert row.notification_error is None
+
+    update_recognition_execution_outcome(
+        session_factory,
+        raw_message_id=raw_id,
+        automation_status="submitted",
+        automation_reason="close_position",
+        notification_status="failed",
+        notification_error="timeout",
+    )
+    update_recognition_execution_outcome(
+        session_factory,
+        raw_message_id=raw_id,
+        automation_status="submitted",
+        automation_reason="close_position",
+        notification_status="sent",
+    )
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.notification_status == "sent"
+        assert row.notification_error is None

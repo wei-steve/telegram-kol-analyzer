@@ -271,6 +271,32 @@ def run_mimo_authoritative_for_message(
                 status="识别失败",
                 error_message="message has no readable text or image",
             )
+        unreadable_images = [
+            asset
+            for asset in media_assets
+            if _is_image_asset(asset)
+            and _media_asset_to_data_url(asset, media_root=media_root) is None
+        ]
+        if unreadable_images:
+            error_message = "image media is declared but unavailable or unreadable"
+            experiment = _upsert_experiment_result(
+                session,
+                raw_message=raw_message,
+                model_config=model_config,
+                input_kind=input_kind,
+                payload={},
+                error_message=error_message,
+                prompt_version=MIMO_AUTHORITATIVE_PROMPT_VERSION,
+            )
+            session.commit()
+            return MimoAuthoritativeResult(
+                raw_message_id=raw_message_id,
+                payload={},
+                input_kind=input_kind,
+                model=model_config.model,
+                status=experiment.status,
+                error_message=error_message,
+            )
         payload: dict[str, Any] = {}
         error_message: str | None = None
         try:
@@ -530,7 +556,7 @@ def _resolve_input_kind(
     media_root: str | Path = "data/media",
 ) -> str:
     has_text = bool((raw_message.text or "").strip())
-    has_image = any(_media_asset_to_data_url(asset, media_root=media_root) for asset in media_assets)
+    has_image = any(_is_image_asset(asset) for asset in media_assets)
     if has_text and has_image:
         return "text+image"
     if has_image:
@@ -538,6 +564,12 @@ def _resolve_input_kind(
     if has_text:
         return "text"
     return "empty"
+
+
+def _is_image_asset(media_asset: MediaAsset) -> bool:
+    kind = str(media_asset.kind or "").strip().lower()
+    mime_type = str(media_asset.mime_type or "").strip().lower()
+    return "photo" in kind or "image" in kind or mime_type.startswith("image/")
 
 
 def _build_mimo_experiment_prompt(config: AiRecognitionConfig) -> str:

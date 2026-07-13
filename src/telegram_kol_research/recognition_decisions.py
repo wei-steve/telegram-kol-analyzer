@@ -66,6 +66,10 @@ def save_recognition_decision(
         )
         row.agreement_status = record.agreement_status
         row.differences_json = _json(record.differences)
+        row.automation_status = None
+        row.automation_reason = None
+        row.notification_status = None
+        row.notification_error = None
         row.updated_at = now
         session.commit()
         session.refresh(row)
@@ -94,7 +98,6 @@ def update_recognition_execution_outcome(
         row.automation_reason = automation_reason
         if notification_status is not None:
             row.notification_status = notification_status
-        if notification_error is not None:
             row.notification_error = notification_error
         row.updated_at = utc_now()
         session.commit()

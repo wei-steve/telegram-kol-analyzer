@@ -16,7 +16,15 @@ from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
 from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
 from telegram_kol_research.group_config import GroupConfig
-from telegram_kol_research.models import ExecutionBinding, MediaAsset, RawMessage, SignalCandidate, Source, StrategyLifecycle
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    MediaAsset,
+    RawMessage,
+    RecognitionDecision,
+    SignalCandidate,
+    Source,
+    StrategyLifecycle,
+)
 from telegram_kol_research.price_normalization import extract_normalized_prices
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
@@ -622,15 +630,20 @@ def _load_best_entry_candidate(
     raw_message_id: int,
 ) -> tuple[RawMessage, SignalCandidate, Source | None, bool] | None:
     with session_factory() as session:
-        row = (
+        query = (
             session.query(RawMessage, SignalCandidate, Source)
             .join(SignalCandidate, SignalCandidate.raw_message_id == RawMessage.id)
             .outerjoin(Source, SignalCandidate.source_id == Source.id)
             .filter(RawMessage.id == raw_message_id)
             .filter(SignalCandidate.event_type == "entry_signal")
-            .order_by(SignalCandidate.confidence.desc(), SignalCandidate.id.asc())
-            .first()
         )
+        if session.query(RecognitionDecision.id).filter(
+            RecognitionDecision.raw_message_id == raw_message_id
+        ).first() is not None:
+            query = query.filter(SignalCandidate.parse_source == "mimo_authoritative")
+        row = query.order_by(
+            SignalCandidate.confidence.desc(), SignalCandidate.id.asc()
+        ).first()
         if row is None:
             return None
         raw_message, candidate, source = row
@@ -653,15 +666,20 @@ def _load_best_management_candidate(
     raw_message_id: int,
 ) -> tuple[RawMessage, SignalCandidate, Source | None, bool] | None:
     with session_factory() as session:
-        row = (
+        query = (
             session.query(RawMessage, SignalCandidate, Source)
             .join(SignalCandidate, SignalCandidate.raw_message_id == RawMessage.id)
             .outerjoin(Source, SignalCandidate.source_id == Source.id)
             .filter(RawMessage.id == raw_message_id)
             .filter(SignalCandidate.event_type.in_(["close_signal", "position_update"]))
-            .order_by(SignalCandidate.confidence.desc(), SignalCandidate.id.asc())
-            .first()
         )
+        if session.query(RecognitionDecision.id).filter(
+            RecognitionDecision.raw_message_id == raw_message_id
+        ).first() is not None:
+            query = query.filter(SignalCandidate.parse_source == "mimo_authoritative")
+        row = query.order_by(
+            SignalCandidate.confidence.desc(), SignalCandidate.id.asc()
+        ).first()
         if row is None:
             return None
         raw_message, candidate, source = row
