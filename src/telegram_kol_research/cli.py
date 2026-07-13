@@ -356,6 +356,7 @@ async def _run_telegram_sync(
                 .filter(
                     tuple_(RawMessage.chat_id, RawMessage.message_id).in_(inserted_keys)
                 )
+                .order_by(RawMessage.posted_at, RawMessage.message_id, RawMessage.id)
                 .all()
             ] if inserted_keys else []
         inserted_candidates += await _process_raw_messages_with_mimo_authority(

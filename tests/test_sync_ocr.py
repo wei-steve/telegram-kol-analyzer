@@ -1,15 +1,19 @@
+from datetime import date
+
 from typer.testing import CliRunner
 
 from telegram_kol_research.cli import app
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig
-from telegram_kol_research.models import MediaAsset, RawMessage, SignalCandidate
+from telegram_kol_research.models import MediaAsset, RawMessage, RecognitionDecision, SignalCandidate
 from telegram_kol_research.candidates import persist_text_signal_candidates
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 from telegram_kol_research.telegram_client import TelegramAuthConfig
 
 
-def test_sync_command_parses_caption_without_ocr_into_signal_candidate(monkeypatch, tmp_path):
+def test_sync_command_parses_caption_without_ocr_into_signal_candidate(
+    monkeypatch, tmp_path, stub_mimo_authoritative_model
+):
     config_path = tmp_path / "groups.yaml"
     database_path = tmp_path / "research.db"
     image_path = tmp_path / "media" / "77.jpg"
@@ -20,7 +24,12 @@ def test_sync_command_parses_caption_without_ocr_into_signal_candidate(monkeypat
     monkeypatch.setattr(
         "telegram_kol_research.cli.load_group_config",
         lambda path: GroupConfig(
-            groups=[TargetGroupConfig(chat_title="VIP BTC Room", enabled=True)]
+            groups=[TargetGroupConfig(
+                chat_title="VIP BTC Room",
+                enabled=True,
+                sync_start_date=date(2026, 4, 1),
+                sync_end_date=date(2026, 4, 30),
+            )]
         ),
     )
     monkeypatch.setattr(
@@ -79,11 +88,14 @@ def test_sync_command_parses_caption_without_ocr_into_signal_candidate(monkeypat
     with session_factory() as session:
         candidate = session.query(SignalCandidate).one()
         media_asset = session.query(MediaAsset).one()
+        decision = session.query(RecognitionDecision).one()
 
-    assert candidate.parse_source == "text"
+    assert candidate.parse_source == "mimo_authoritative"
     assert candidate.symbol == "BTC"
     assert candidate.side == "long"
     assert media_asset.ocr_text is None
+    assert decision.input_kind == "image"
+    assert decision.authoritative_model == "mimo-v2.5"
 
 
 def test_sync_command_skips_image_only_candidate_parsing(monkeypatch, tmp_path):
@@ -97,7 +109,12 @@ def test_sync_command_skips_image_only_candidate_parsing(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "telegram_kol_research.cli.load_group_config",
         lambda path: GroupConfig(
-            groups=[TargetGroupConfig(chat_title="VIP BTC Room", enabled=True)]
+            groups=[TargetGroupConfig(
+                chat_title="VIP BTC Room",
+                enabled=True,
+                sync_start_date=date(2026, 4, 1),
+                sync_end_date=date(2026, 4, 30),
+            )]
         ),
     )
     monkeypatch.setattr(

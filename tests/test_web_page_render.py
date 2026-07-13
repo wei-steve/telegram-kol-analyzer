@@ -317,7 +317,6 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert 'data-strategy-workflow-filter="confirmation"' in response.text
     assert 'data-strategy-workflow-filter="abnormal"' in response.text
     assert 'data-message-workflow-filter="recognized"' in response.text
-    assert "data-position-danger-zone" in response.text
     assert "data-group-link" in response.text
     assert "data-trader-dashboard" in response.text
     assert "data-detail-panel" in response.text
@@ -568,6 +567,7 @@ def test_bound_position_close_renders_exact_context_for_bound_exchange_position(
     assert "Alpha Group" in response.text
     assert "BTC long" in response.text
     assert 'data-exchange-group-section' in response.text
+    assert 'data-position-danger-zone' in response.text
     close_buttons = re.findall(
         r'<button[^>]+data-close-bound-position[^>]*>', response.text,
     )

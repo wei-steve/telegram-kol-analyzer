@@ -112,6 +112,10 @@ def test_load_ai_recognition_config_uses_defaults_when_file_is_missing(tmp_path)
     config = load_ai_recognition_config(tmp_path / "missing.yaml")
 
     assert config.mode == "local_rule_parser"
+    assert config.active_text_model_id == "deepseek-v4-flash"
+    assert config.active_image_model_id == "mimo-v2.5"
+    assert config.text_provider.is_configured is False
+    assert config.image_provider.is_configured is False
     assert config.recognition_prompt.startswith(DEFAULT_RECOGNITION_PROMPT)
     assert config.lifecycle_event_prompt.startswith(DEFAULT_LIFECYCLE_EVENT_PROMPT)
     assert config.mimo_direct_prompt.startswith(DEFAULT_MIMO_DIRECT_PROMPT)

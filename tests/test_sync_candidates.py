@@ -1,13 +1,17 @@
+from datetime import date
+
 from typer.testing import CliRunner
 
 from telegram_kol_research.cli import app
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig
-from telegram_kol_research.models import SignalCandidate
+from telegram_kol_research.models import RecognitionDecision, SignalCandidate
 from telegram_kol_research.telegram_client import TelegramAuthConfig
 
 
-def test_sync_command_persists_signal_candidates_from_text(monkeypatch, tmp_path):
+def test_sync_command_persists_signal_candidates_from_text(
+    monkeypatch, tmp_path, stub_mimo_authoritative_model
+):
     config_path = tmp_path / "groups.yaml"
     database_path = tmp_path / "research.db"
     config_path.write_text("groups: []", encoding="utf-8")
@@ -15,7 +19,12 @@ def test_sync_command_persists_signal_candidates_from_text(monkeypatch, tmp_path
     monkeypatch.setattr(
         "telegram_kol_research.cli.load_group_config",
         lambda path: GroupConfig(
-            groups=[TargetGroupConfig(chat_title="VIP BTC Room", enabled=True)]
+            groups=[TargetGroupConfig(
+                chat_title="VIP BTC Room",
+                enabled=True,
+                sync_start_date=date(2026, 4, 1),
+                sync_end_date=date(2026, 4, 30),
+            )]
         ),
     )
     monkeypatch.setattr(
@@ -76,8 +85,12 @@ def test_sync_command_persists_signal_candidates_from_text(monkeypatch, tmp_path
     session_factory = create_session_factory(database_path)
     with session_factory() as session:
         candidates = session.query(SignalCandidate).all()
+        decision = session.query(RecognitionDecision).one()
 
     assert len(candidates) == 1
     assert candidates[0].symbol == "BTC"
     assert candidates[0].side == "long"
-    assert candidates[0].review_status == "confirmed"
+    assert candidates[0].parse_source == "mimo_authoritative"
+    assert candidates[0].review_status == "pending"
+    assert decision.authoritative_model == "mimo-v2.5"
+    assert decision.authoritative_status == "是策略"

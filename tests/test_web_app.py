@@ -1667,7 +1667,7 @@ def test_strategy_mid_panel_pending_kpi_matches_actionable_list(tmp_path):
     assert "BTC" not in response.text
 
 
-def test_group_detail_logs_route_timings(tmp_path, caplog):
+def test_group_detail_logs_route_timings(tmp_path):
     database_path = tmp_path / "research.db"
     app = create_web_app(database_path=database_path)
     with app.state.session_factory() as session:
@@ -1681,29 +1681,33 @@ def test_group_detail_logs_route_timings(tmp_path, caplog):
         )
         session.commit()
 
-    caplog.set_level("INFO", logger="uvicorn.error")
     client = TestClient(app)
 
     response = client.get("/groups/88/detail")
 
     assert response.status_code == 200
-    assert "web_perf route=/groups/{chat_id}/detail chat_id=88" in caplog.text
-    assert "messages_ms=" in caplog.text
-    assert "template_ms=" in caplog.text
+    log_text = (app.state.log_directory / "telegram-kol.log").read_text(
+        encoding="utf-8"
+    )
+    assert "web_perf route=/groups/{chat_id}/detail chat_id=88" in log_text
+    assert "messages_ms=" in log_text
+    assert "template_ms=" in log_text
 
 
-def test_strategy_mid_panel_logs_route_timings(tmp_path, caplog):
+def test_strategy_mid_panel_logs_route_timings(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
-    caplog.set_level("INFO", logger="uvicorn.error")
     client = TestClient(app)
 
     response = client.get("/groups/88/strategy-mid-panel?filter=holding")
 
     assert response.status_code == 200
-    assert "web_perf route=/groups/{chat_id}/strategy-mid-panel chat_id=88" in caplog.text
-    assert "filter=holding" in caplog.text
-    assert "lifecycle_counts_ms=" in caplog.text
-    assert "holding_ms=" in caplog.text
+    log_text = (app.state.log_directory / "telegram-kol.log").read_text(
+        encoding="utf-8"
+    )
+    assert "web_perf route=/groups/{chat_id}/strategy-mid-panel chat_id=88" in log_text
+    assert "filter=holding" in log_text
+    assert "lifecycle_counts_ms=" in log_text
+    assert "holding_ms=" in log_text
 
 
 def test_ai_recognition_config_api_ignores_legacy_prompt_fields(tmp_path):

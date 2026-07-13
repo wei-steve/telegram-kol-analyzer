@@ -1,3 +1,5 @@
+from datetime import date
+
 from typer.testing import CliRunner
 
 from telegram_kol_research.cli import app
@@ -15,7 +17,12 @@ def test_sync_command_persists_raw_messages_and_checkpoint(monkeypatch, tmp_path
     monkeypatch.setattr(
         "telegram_kol_research.cli.load_group_config",
         lambda path: GroupConfig(
-            groups=[TargetGroupConfig(chat_title="VIP BTC Room", enabled=True)]
+            groups=[TargetGroupConfig(
+                chat_title="VIP BTC Room",
+                enabled=True,
+                sync_start_date=date(2026, 4, 1),
+                sync_end_date=date(2026, 4, 30),
+            )]
         ),
     )
     monkeypatch.setattr(
@@ -108,7 +115,12 @@ def test_sync_command_only_persists_messages_newer_than_history_checkpoint(monke
     monkeypatch.setattr(
         "telegram_kol_research.cli.load_group_config",
         lambda path: GroupConfig(
-            groups=[TargetGroupConfig(chat_title="VIP BTC Room", enabled=True)]
+            groups=[TargetGroupConfig(
+                chat_title="VIP BTC Room",
+                enabled=True,
+                sync_start_date=date(2026, 4, 1),
+                sync_end_date=date(2026, 4, 30),
+            )]
         ),
     )
     monkeypatch.setattr(

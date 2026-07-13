@@ -1,13 +1,23 @@
+from datetime import date
+
 from typer.testing import CliRunner
 
 from telegram_kol_research.cli import app
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig
-from telegram_kol_research.models import TradeIdea, TradeUpdate
+from telegram_kol_research.models import (
+    RecognitionDecision,
+    SignalCandidate,
+    StrategyLifecycle,
+    TradeIdea,
+    TradeUpdate,
+)
 from telegram_kol_research.telegram_client import TelegramAuthConfig
 
 
-def test_sync_command_persists_trade_ideas_from_related_candidates(monkeypatch, tmp_path):
+def test_sync_command_persists_trade_ideas_from_related_candidates(
+    monkeypatch, tmp_path, stub_mimo_authoritative_model
+):
     config_path = tmp_path / "groups.yaml"
     database_path = tmp_path / "research.db"
     config_path.write_text("groups: []", encoding="utf-8")
@@ -15,7 +25,12 @@ def test_sync_command_persists_trade_ideas_from_related_candidates(monkeypatch, 
     monkeypatch.setattr(
         "telegram_kol_research.cli.load_group_config",
         lambda path: GroupConfig(
-            groups=[TargetGroupConfig(chat_title="VIP BTC Room", enabled=True)]
+            groups=[TargetGroupConfig(
+                chat_title="VIP BTC Room",
+                enabled=True,
+                sync_start_date=date(2026, 4, 1),
+                sync_end_date=date(2026, 4, 30),
+            )]
         ),
     )
     monkeypatch.setattr(
@@ -60,8 +75,18 @@ def test_sync_command_persists_trade_ideas_from_related_candidates(monkeypatch, 
                 "message_id": 78,
                 "sender_id": 501,
                 "sender_name": "Alice Trader",
-                "text": "BTC long SL moved to 68050",
+                "text": "BTC long now entered at 68100",
                 "reply_to_msg_id": 77,
+                "posted_at": "2026-04-07T00:30:00+00:00",
+                "media": None,
+            },
+            {
+                "chat_id": 9001,
+                "message_id": 79,
+                "sender_id": 501,
+                "sender_name": "Alice Trader",
+                "text": "BTC long SL moved to 68050",
+                "reply_to_msg_id": 78,
                 "posted_at": "2026-04-07T01:00:00+00:00",
                 "media": None,
             },
@@ -87,10 +112,19 @@ def test_sync_command_persists_trade_ideas_from_related_candidates(monkeypatch, 
     with session_factory() as session:
         trade_ideas = session.query(TradeIdea).all()
         trade_updates = session.query(TradeUpdate).all()
+        decisions = session.query(RecognitionDecision).all()
+        candidates = session.query(SignalCandidate).all()
+        lifecycle = session.query(StrategyLifecycle).one()
 
     assert len(trade_ideas) == 1
     assert trade_ideas[0].symbol == "BTC"
     assert trade_ideas[0].side == "long"
-    assert trade_ideas[0].source_id is not None
-    assert len(trade_updates) == 1
-    assert trade_updates[0].update_type == "stop_loss_update"
+    assert [update.update_type for update in trade_updates] == [
+        "entry_signal",
+        "position_update",
+    ]
+    assert len(decisions) == 3
+    assert {decision.authoritative_model for decision in decisions} == {"mimo-v2.5"}
+    assert {candidate.parse_source for candidate in candidates} == {"mimo_authoritative"}
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.stop_loss == 68050

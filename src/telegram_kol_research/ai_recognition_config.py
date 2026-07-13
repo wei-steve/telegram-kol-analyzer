@@ -377,12 +377,24 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
 
     path = Path(config_path)
     if not path.exists():
+        ai_models = _normalize_ai_models(
+            [],
+            text_provider=AiProviderConfig(),
+            image_provider=AiProviderConfig(),
+        )
+        text_model = next(
+            model for model in ai_models if model.id == "deepseek-v4-flash"
+        )
+        image_model = next(model for model in ai_models if model.id == "mimo-v2.5")
         return AiRecognitionConfig(
             recognition_prompt=_with_price_shorthand_instruction(DEFAULT_RECOGNITION_PROMPT),
             lifecycle_event_prompt=_with_lifecycle_event_instructions(
                 DEFAULT_LIFECYCLE_EVENT_PROMPT
             ),
             mimo_direct_prompt=_with_mimo_direct_instructions(DEFAULT_MIMO_DIRECT_PROMPT),
+            ai_models=ai_models,
+            active_text_model_id=text_model.id,
+            active_image_model_id=image_model.id,
         )
 
     raw_data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
