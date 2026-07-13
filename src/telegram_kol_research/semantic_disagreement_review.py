@@ -188,7 +188,7 @@ def _safe_active_strategy_context(
                 and_(
                     StrategyLifecycle.exited_at.is_(None),
                     StrategyLifecycle.lifecycle_status.in_(
-                        ("pending_entry", "entered", "expired")
+                        ("pending_entry", "entered")
                     ),
                 ),
                 StrategyLifecycle.exited_at > as_of,
@@ -223,7 +223,11 @@ def _historical_lifecycle_status(
 ) -> str:
     if lifecycle.entered_at is not None and lifecycle.entered_at <= as_of:
         return "entered"
-    if lifecycle.lifecycle_status == "entered" and lifecycle.exited_at is None:
+    if (
+        lifecycle.lifecycle_status == "entered"
+        and lifecycle.entered_at is None
+        and lifecycle.exited_at is None
+    ):
         return "entered"
     return "pending_entry"
 

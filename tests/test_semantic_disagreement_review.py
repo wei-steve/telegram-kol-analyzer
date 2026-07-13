@@ -197,7 +197,44 @@ def test_review_request_is_grounded_safe_strict_and_audited(tmp_path):
             signal_at=datetime(2026, 7, 13, 9, 30),
             exited_at=datetime(2026, 7, 13, 11, 30),
         )
-        session.add_all([later_exited, future, already_exited, already_cancelled])
+        enters_after_message = StrategyLifecycle(
+            chat_id=991,
+            message_id=705,
+            symbol="XRP",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 13, 11, 30),
+            entered_at=datetime(2026, 7, 13, 12, 30),
+        )
+        expired_without_timestamp = StrategyLifecycle(
+            chat_id=991,
+            message_id=706,
+            symbol="ADA",
+            side="long",
+            lifecycle_status="expired",
+            signal_at=datetime(2026, 7, 13, 11, 40),
+            exited_at=None,
+        )
+        expires_after_message = StrategyLifecycle(
+            chat_id=991,
+            message_id=707,
+            symbol="LTC",
+            side="short",
+            lifecycle_status="expired",
+            signal_at=datetime(2026, 7, 13, 11, 20),
+            exited_at=datetime(2026, 7, 13, 12, 40),
+        )
+        session.add_all(
+            [
+                later_exited,
+                future,
+                already_exited,
+                already_cancelled,
+                enters_after_message,
+                expired_without_timestamp,
+                expires_after_message,
+            ]
+        )
         for index in range(25):
             session.add(
                 StrategyLifecycle(
@@ -211,7 +248,14 @@ def test_review_request_is_grounded_safe_strict_and_audited(tmp_path):
             )
         session.flush()
         later_exited_id = later_exited.id
-        excluded_ids = {future.id, already_exited.id, already_cancelled.id}
+        enters_after_message_id = enters_after_message.id
+        expires_after_message_id = expires_after_message.id
+        excluded_ids = {
+            future.id,
+            already_exited.id,
+            already_cancelled.id,
+            expired_without_timestamp.id,
+        }
         authoritative["lifecycle_event"]["target_lifecycle_id"] = lifecycle_id
         session.add(
             RecognitionDecision(
@@ -267,7 +311,13 @@ def test_review_request_is_grounded_safe_strict_and_audited(tmp_path):
     }
     assert len(request_context["active_strategies"]) == 20
     assert later_exited_id in context_ids
+    assert expires_after_message_id in context_ids
     assert context_ids.isdisjoint(excluded_ids)
+    historical_statuses = {
+        item["lifecycle_id"]: item["lifecycle_status"]
+        for item in request_context["active_strategies"]
+    }
+    assert historical_statuses[enters_after_message_id] == "pending_entry"
     assert request_context["mimo"]["authoritative_payload"] == authoritative
     assert request_context["mimo"]["input_reading"] == authoritative["input_reading"]
     assert request_context["automation"]["automation_status"] == "submitted"
