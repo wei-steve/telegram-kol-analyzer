@@ -942,6 +942,8 @@ def _apply_lifecycle_event_decision(
     session,
     raw_message: RawMessage,
     decision: dict[str, Any],
+    *,
+    parse_source: str = "lifecycle_ai",
 ) -> bool:
     event_type = str(decision.get("event_type") or "none").strip()
     try:
@@ -991,7 +993,7 @@ def _apply_lifecycle_event_decision(
             raw_message=raw_message,
             lifecycle=target,
             entry_price=entry_price,
-            parse_source="lifecycle_ai",
+            parse_source=parse_source,
         )
         return True
 
@@ -1005,7 +1007,7 @@ def _apply_lifecycle_event_decision(
             session,
             raw_message=raw_message,
             lifecycle=target,
-            parse_source="lifecycle_ai",
+            parse_source=parse_source,
         )
         return True
 
@@ -1028,7 +1030,7 @@ def _apply_lifecycle_event_decision(
             session,
             raw_message=raw_message,
             lifecycle=target,
-            parse_source="lifecycle_ai",
+            parse_source=parse_source,
         )
         return True
 
@@ -1076,7 +1078,7 @@ def _apply_lifecycle_event_decision(
             session,
             raw_message=raw_message,
             lifecycle=target,
-            parse_source="lifecycle_ai",
+            parse_source=parse_source,
         )
         return True
 
@@ -1505,6 +1507,129 @@ def _result_from_ai_payload(
         parse_source=parse_source,
     )
     return result
+
+
+def infer_deepseek_auxiliary(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    config: AiRecognitionConfig,
+) -> dict[str, Any] | None:
+    """Run text-only DeepSeek assessment without persisting or mutating state."""
+
+    if not config.text_provider.is_configured:
+        return None
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, raw_message_id)
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        if not (raw_message.text or "").strip():
+            return None
+        context = _load_lifecycle_event_context(session, raw_message)
+        lifecycle_event: dict[str, Any] = {"event_type": "none", "confidence": 0.0}
+        if context["active_strategies"]:
+            try:
+                lifecycle_event = _call_lifecycle_event_ai(
+                    raw_message=raw_message,
+                    context=context,
+                    config=config,
+                )
+            except Exception as exc:
+                lifecycle_event = {
+                    "event_type": "none",
+                    "confidence": 0.0,
+                    "reason": f"DeepSeek lifecycle validation failed: {exc}",
+                }
+        try:
+            entry_result = _recognize_with_ai_provider(
+                raw_message=raw_message,
+                media_assets=[],
+                config=config,
+                provider=config.text_provider,
+                parse_source="deepseek_auxiliary",
+            )
+            payload = dict(entry_result.ai_payload or {})
+        except Exception as exc:
+            payload = {
+                "recognition_result": "识别失败",
+                "reason": f"DeepSeek entry validation failed: {exc}",
+                "strategy": {},
+                "confidence": 0.0,
+            }
+        payload.setdefault("strategy", {})
+        payload["lifecycle_event"] = lifecycle_event
+        return payload
+
+
+def apply_authoritative_mimo_payload(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    payload: dict[str, Any],
+    model: str,
+    error_message: str | None = None,
+) -> MessageRecognitionResult:
+    """Persist only the authoritative MiMo interpretation."""
+
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, raw_message_id)
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        if error_message or not payload:
+            result = MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="识别失败",
+                reason=error_message or "MiMo authoritative recognition failed",
+                ai_payload=payload,
+                parse_source="mimo_authoritative",
+            )
+            _upsert_recognition(session, result, engine=model)
+            session.commit()
+            return result
+
+        lifecycle_event = (
+            payload.get("lifecycle_event")
+            if isinstance(payload.get("lifecycle_event"), dict)
+            else {"event_type": "none", "confidence": 0.0}
+        )
+        event_type = str(lifecycle_event.get("event_type") or "none")
+        if event_type != "none":
+            applied = _apply_lifecycle_event_decision(
+                session,
+                raw_message,
+                lifecycle_event,
+                parse_source="mimo_authoritative",
+            )
+            result = MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status=str(payload.get("recognition_result") or "非策略"),
+                reason=str(lifecycle_event.get("reason") or payload.get("reason") or "").strip() or None,
+                ai_payload=payload,
+                parse_source="mimo_authoritative",
+            )
+            if not applied:
+                result = MessageRecognitionResult(
+                    raw_message_id=raw_message_id,
+                    status="识别失败",
+                    reason="MiMo lifecycle event could not be applied safely",
+                    ai_payload=payload,
+                    parse_source="mimo_authoritative",
+                )
+            _upsert_recognition(session, result, engine=model)
+            session.commit()
+            return result
+
+        result = _result_from_ai_payload(
+            raw_message_id=raw_message_id,
+            payload=payload,
+            parse_source="mimo_authoritative",
+        )
+        if result.status == "是策略":
+            _persist_ai_result(session, raw_message, result, engine=model)
+        else:
+            _upsert_recognition(session, result, engine=model)
+        session.commit()
+        return result
 
 
 def _format_ai_strategy_summary(strategy: dict[str, Any]) -> str | None:
