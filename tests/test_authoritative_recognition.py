@@ -568,6 +568,102 @@ def test_running_generation_blocks_new_process_until_it_finalizes(tmp_path, monk
         assert decision.automation_reason == "generation-a"
 
 
+def test_running_generation_rejects_nested_mimo_failure_without_overwrite(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=35, text="现价出局")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    from telegram_kol_research import authoritative_recognition
+
+    results = iter(
+        [
+            MimoAuthoritativeResult(
+                raw_message_id=raw_id,
+                payload={"recognition_result": "非策略", "reason": "generation-a"},
+                input_kind="text",
+                model="mimo-v2.5",
+                status="非策略",
+            ),
+            MimoAuthoritativeResult(
+                raw_message_id=raw_id,
+                payload={},
+                input_kind="text",
+                model="mimo-v2.5",
+                status="识别失败",
+                error_message="nested timeout",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: next(results),
+    )
+    applied: list[str] = []
+    auto_trade_calls: list[int] = []
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
+        lambda *args, **kwargs: applied.append("applied")
+        or SimpleNamespace(status="非策略"),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition._has_current_mimo_candidate",
+        lambda *args, **kwargs: True,
+    )
+    real_claim = authoritative_recognition.claim_authoritative_execution
+    running_generation: str | None = None
+
+    def claim_then_attempt_failed_process(*args, **kwargs):
+        nonlocal running_generation
+        running_generation = kwargs["authoritative_generation"]
+        assert real_claim(*args, **kwargs) is True
+        with pytest.raises(RuntimeError, match="in progress|running"):
+            process_authoritative_message(
+                session_factory,
+                raw_message_id=raw_id,
+                ai_recognition_config=AiRecognitionConfig(),
+                media_root=tmp_path,
+                auto_trade_executor=auto_trade_calls.append,
+            )
+        with session_factory() as session:
+            decision = session.query(RecognitionDecision).one()
+            assert decision.comparison_status == "execution_running"
+            assert decision.comparison_claim_token == running_generation
+            assert decision.agreement_status == "pending"
+            assert decision.authoritative_status == "非策略"
+            assert json.loads(decision.authoritative_payload_json)["reason"] == "generation-a"
+            assert decision.automation_status is None
+        return True
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.claim_authoritative_execution",
+        claim_then_attempt_failed_process,
+    )
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        auto_trade_executor=lambda message_id: auto_trade_calls.append(message_id)
+        or {"status": "submitted", "reason": "generation-a"},
+    )
+
+    assert applied == ["applied"]
+    assert auto_trade_calls == [raw_id]
+    assert result.automation["reason"] == "generation-a"
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+        assert decision.comparison_status == "pending"
+        assert decision.comparison_claim_token is None
+        assert decision.automation_reason == "generation-a"
+
+
 def test_pending_save_failure_prevents_mimo_apply_and_auto_trade(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

@@ -20,7 +20,7 @@ from telegram_kol_research.recognition_decisions import (
     claim_authoritative_execution,
     finalize_authoritative_automation_outcome,
     save_pending_authoritative_decision,
-    save_recognition_decision,
+    save_terminal_authoritative_decision,
     update_recognition_execution_outcome,
 )
 from telegram_kol_research.recognition_experiments import (
@@ -123,7 +123,7 @@ def assess_message_authoritatively(
     if agreement_status == "authoritative_failed":
         # A failed authority is auditable and alertable, but there is no valid
         # MiMo decision for the semantic comparison worker to review.
-        saved = save_recognition_decision(session_factory, decision)
+        saved = save_terminal_authoritative_decision(session_factory, decision)
     else:
         saved = save_pending_authoritative_decision(session_factory, decision)
     return AuthoritativeAssessment(

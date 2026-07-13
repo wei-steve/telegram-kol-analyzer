@@ -15,6 +15,7 @@ from telegram_kol_research.recognition_decisions import (
     fail_semantic_review,
     finalize_authoritative_automation_outcome,
     save_pending_authoritative_decision,
+    save_terminal_authoritative_decision,
     update_recognition_execution_outcome,
 )
 
@@ -158,6 +159,40 @@ def test_stale_automation_generation_cannot_publish_new_rerecognition(tmp_path):
     )
     assert finalized.comparison_status == "pending"
     assert finalized.automation_reason == "new_generation"
+
+
+def test_terminal_authoritative_failure_preserves_notification_metadata(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id = _raw_message(session_factory)
+    save_pending_authoritative_decision(session_factory, _record(raw_id))
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        row.notification_fingerprint = "existing-alert"
+        row.notification_status = "sent"
+        session.commit()
+
+    failed = save_terminal_authoritative_decision(
+        session_factory,
+        RecognitionDecisionRecord(
+            raw_message_id=raw_id,
+            input_kind="text",
+            authoritative_model="mimo-v2.5",
+            authoritative_status="识别失败",
+            authoritative_payload={},
+            auxiliary_model=None,
+            auxiliary_status=None,
+            auxiliary_payload=None,
+            agreement_status="authoritative_failed",
+            differences=[],
+            prompt_versions={"mimo": {"trading.analysis.shared": 12}},
+        ),
+    )
+
+    assert failed.comparison_status == "completed"
+    assert failed.comparison_claim_token is None
+    assert failed.agreement_status == "authoritative_failed"
+    assert failed.notification_fingerprint == "existing-alert"
+    assert failed.notification_status == "sent"
 
 
 def test_comparison_completion_preserves_automation_outcome(tmp_path):

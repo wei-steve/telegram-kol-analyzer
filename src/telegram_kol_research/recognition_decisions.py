@@ -39,10 +39,12 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def save_recognition_decision(
+def save_terminal_authoritative_decision(
     session_factory: sessionmaker,
     record: RecognitionDecisionRecord,
 ) -> RecognitionDecision:
+    """Atomically save fail-closed authority without displacing an executor."""
+
     with session_factory() as session:
         row = (
             session.query(RecognitionDecision)
@@ -60,42 +62,73 @@ def save_recognition_decision(
                 agreement_status=record.agreement_status,
                 differences_json=_json(record.differences),
                 prompt_versions_json=_json(record.prompt_versions),
+                comparison_status="completed",
                 created_at=now,
                 updated_at=now,
             )
             session.add(row)
-        row.input_kind = record.input_kind
-        row.authoritative_model = record.authoritative_model
-        row.authoritative_status = record.authoritative_status
-        row.authoritative_payload_json = _json(record.authoritative_payload)
-        row.auxiliary_model = record.auxiliary_model
-        row.auxiliary_status = record.auxiliary_status
-        row.auxiliary_payload_json = (
-            _json(record.auxiliary_payload)
-            if record.auxiliary_payload is not None
-            else None
+            session.commit()
+            session.refresh(row)
+            session.expunge(row)
+            return row
+
+        if row.comparison_status == "execution_running":
+            raise RuntimeError("authoritative execution is already in progress")
+
+        observed_status = row.comparison_status
+        observed_token = row.comparison_claim_token
+        expected_token = (
+            RecognitionDecision.comparison_claim_token.is_(None)
+            if observed_token is None
+            else RecognitionDecision.comparison_claim_token == observed_token
         )
-        row.agreement_status = record.agreement_status
-        row.differences_json = _json(record.differences)
-        row.prompt_versions_json = _json(record.prompt_versions)
-        # This compatibility save represents a terminal assessment (including
-        # MiMo transport/schema failure), never work for the semantic worker.
-        # Clear any older pending/running claim so stale candidates cannot win
-        # a race with authoritative re-recognition.
-        row.comparison_status = "completed"
-        row.disagreement_severity = None
-        row.comparison_model = None
-        row.comparison_payload_json = None
-        row.comparison_error = None
-        row.comparison_next_attempt_at = None
-        row.comparison_started_at = None
-        row.comparison_claim_token = None
-        row.compared_at = None
-        row.updated_at = now
+        result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == record.raw_message_id,
+                RecognitionDecision.comparison_status == observed_status,
+                expected_token,
+            )
+            .values(
+                input_kind=record.input_kind,
+                authoritative_model=record.authoritative_model,
+                authoritative_status=record.authoritative_status,
+                authoritative_payload_json=_json(record.authoritative_payload),
+                auxiliary_model=record.auxiliary_model,
+                auxiliary_status=record.auxiliary_status,
+                auxiliary_payload_json=(
+                    _json(record.auxiliary_payload)
+                    if record.auxiliary_payload is not None
+                    else None
+                ),
+                agreement_status=record.agreement_status,
+                differences_json=_json(record.differences),
+                prompt_versions_json=_json(record.prompt_versions),
+                comparison_status="completed",
+                disagreement_severity=None,
+                comparison_model=None,
+                comparison_payload_json=None,
+                comparison_error=None,
+                comparison_next_attempt_at=None,
+                comparison_started_at=None,
+                comparison_claim_token=None,
+                compared_at=None,
+                updated_at=now,
+            )
+        )
+        if result.rowcount != 1:
+            session.rollback()
+            raise RuntimeError(
+                "authoritative decision changed or execution is already in progress"
+            )
         session.commit()
-        session.refresh(row)
-        session.expunge(row)
-        return row
+        saved = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == record.raw_message_id)
+            .one()
+        )
+        session.expunge(saved)
+        return saved
 
 
 def save_pending_authoritative_decision(
