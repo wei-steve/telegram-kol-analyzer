@@ -228,6 +228,27 @@ def test_semantic_disagreement_review_validation_requires_closed_enums(closed_co
     assert any("闭合枚举" in error for error in result.errors)
 
 
+@pytest.mark.parametrize(
+    "directive",
+    (
+        "只输出一个 JSON 对象",
+        "不得添加额外字段",
+    ),
+)
+def test_semantic_disagreement_review_validation_requires_closed_json_directives(
+    directive,
+):
+    result = validate_prompt_content(
+        SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
+        DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT.replace(directive, ""),
+        validation_profile="semantic_disagreement_review",
+        required_variables=(),
+    )
+
+    assert result.success is False
+    assert any(directive in error for error in result.errors)
+
+
 def test_strict_template_renderer_rejects_missing_and_unknown_variables():
     with pytest.raises(PromptCompositionError, match="missing template variables"):
         render_template_strict("Hello {name}")

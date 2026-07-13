@@ -174,6 +174,8 @@ def validate_prompt_content(
             "必须引用当前消息中的证据",
             "不得修改交易",
             "不得声称能够读取图片像素",
+            "只输出一个 JSON 对象",
+            "不得添加额外字段",
         )
         required_closed_contracts = (
             "none | entry | entry_confirm | cancel_entry | exit_full | "
