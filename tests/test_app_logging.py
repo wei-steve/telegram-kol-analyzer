@@ -14,10 +14,20 @@ def test_configure_application_logging_writes_rotating_utf8_log_once(tmp_path: P
 
     assert path == tmp_path / "telegram-kol.log"
     assert "accepted message_id=42" in path.read_text(encoding="utf-8")
-    assert len(logging.getLogger("telegram_kol_research").handlers) == 2
+    application_handlers = [
+        handler
+        for handler in logging.getLogger("telegram_kol_research").handlers
+        if getattr(handler, "_telegram_kol_application_handler", False)
+    ]
+    assert len(application_handlers) == 2
 
     configure_application_logging(tmp_path)
-    assert len(logging.getLogger("telegram_kol_research").handlers) == 2
+    application_handlers = [
+        handler
+        for handler in logging.getLogger("telegram_kol_research").handlers
+        if getattr(handler, "_telegram_kol_application_handler", False)
+    ]
+    assert len(application_handlers) == 2
 
 
 def test_read_log_page_returns_latest_entries_and_keeps_traceback_attached(
