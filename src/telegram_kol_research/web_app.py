@@ -55,6 +55,17 @@ from telegram_kol_research.message_recognition import recognize_message_now
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import StrategyLifecycle
+from telegram_kol_research.prompt_composition import render_registered_prompt
+from telegram_kol_research.prompt_defaults import (
+    GROUP_RESEARCH_PROMPT,
+    RESEARCH_CHAT_SYSTEM_PROMPT,
+    seed_default_prompt_registry,
+)
+from telegram_kol_research.prompt_registry import (
+    PromptInvocationRecord,
+    PromptRegistryNotFound,
+    record_prompt_invocation,
+)
 from telegram_kol_research.recognition_profiles import list_recognition_profiles
 from telegram_kol_research.llm_chat import (
     build_proxy_chat_payload,
@@ -1818,6 +1829,10 @@ def create_web_app(
         if ai_recognition_config_path is not None
         else Path("config/ai_recognition.yaml")
     )
+    seed_default_prompt_registry(
+        app.state.session_factory,
+        load_ai_recognition_config(app.state.ai_recognition_config_path),
+    )
     app.state.authoritative_processor = lambda raw_message_id: _run_authoritative_processor(
         app,
         raw_message_id=raw_message_id,
@@ -3031,7 +3046,6 @@ def create_web_app(
             raise HTTPException(status_code=422, detail="chat_id is required")
 
         chat_id = int(chat_id_value)
-        group_prompt = str(payload.get("group_prompt") or "").strip() or None
         message_limit = extract_recent_message_limit(question) or 50
         messages = load_group_messages(
             app.state.session_factory,
@@ -3040,18 +3054,53 @@ def create_web_app(
         )
         scope_context = build_scope_context(list(reversed(messages)))
         config = app.state.llm_proxy_config
+        system = render_registered_prompt(
+            app.state.session_factory,
+            RESEARCH_CHAT_SYSTEM_PROMPT,
+        )
+        group = None
+        try:
+            group = render_registered_prompt(
+                app.state.session_factory,
+                GROUP_RESEARCH_PROMPT,
+                chat_id=chat_id,
+            )
+        except PromptRegistryNotFound:
+            pass
+        group_prompt = group.content if group is not None else None
+        version_map = dict(system.version_map)
+        if group is not None:
+            version_map.update(group.version_map)
+        invocation_status = "success"
+        invocation_error = None
         try:
             answer = app.state.chat_requester(
                 config=config,
                 question=question,
                 scope_context=scope_context,
+                system_prompt=system.content,
                 group_prompt=group_prompt,
             )
         except httpx.HTTPError as exc:
+            invocation_status = "error"
+            invocation_error = str(exc)
             raise HTTPException(
                 status_code=502,
                 detail=_build_chat_proxy_error_detail(exc),
             ) from exc
+        finally:
+            record_prompt_invocation(
+                app.state.session_factory,
+                PromptInvocationRecord(
+                    feature="research_chat",
+                    correlation_key=f"research_chat:{chat_id}:{time.time_ns()}",
+                    chat_id=chat_id,
+                    model=config.model,
+                    prompt_versions=version_map,
+                    status=invocation_status,
+                    error_message=invocation_error,
+                ),
+            )
         return {
             "answer": answer,
             "scope_mode": "current_group",
@@ -3060,6 +3109,7 @@ def create_web_app(
                 question=question,
                 scope_context=scope_context,
                 model=config.model,
+                system_prompt=system.content,
                 group_prompt=group_prompt,
             ),
             "sources": build_source_reference_map(messages),

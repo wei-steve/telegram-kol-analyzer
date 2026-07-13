@@ -240,9 +240,10 @@ def build_prompt_seeds_from_legacy(
 
 def seed_default_prompt_registry(
     session_factory: sessionmaker,
-    legacy_config: AiRecognitionConfig,
+    legacy_config: AiRecognitionConfig | None = None,
 ) -> list[PromptDetail]:
+    config = legacy_config or AiRecognitionConfig()
     return [
         seed_prompt_definition(session_factory, seed)
-        for seed in build_prompt_seeds_from_legacy(legacy_config)
+        for seed in build_prompt_seeds_from_legacy(config)
     ]

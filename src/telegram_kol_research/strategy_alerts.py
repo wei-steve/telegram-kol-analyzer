@@ -16,6 +16,9 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.llm_chat import _load_env_file_values
 from telegram_kol_research.models import RawMessage, SignalCandidate, StrategyAlert, StrategyLifecycle
+from telegram_kol_research.prompt_composition import render_registered_prompt, render_template_strict
+from telegram_kol_research.prompt_defaults import STRATEGY_ALERT_PROMPT, seed_default_prompt_registry
+from telegram_kol_research.prompt_registry import PromptInvocationRecord, record_prompt_invocation
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 from telegram_kol_research.time_utils import utc_naive_to_local
 
@@ -106,6 +109,7 @@ def strategy_alerts_enabled(config: StrategyAlertConfig) -> bool:
 
 def build_strategy_alert_prompt(
     *,
+    template: str,
     chat_title: str,
     sender_name: str | None,
     text: str,
@@ -117,20 +121,12 @@ def build_strategy_alert_prompt(
     if len(trimmed_text) > max_chars:
         trimmed_text = f"{trimmed_text[:max_chars].rstrip()}\n[truncated]"
     first_line = trimmed_text.splitlines()[0].strip() if trimmed_text else ""
-    return "\n".join(
-        [
-            "Classify one Telegram trading-group message.",
-            "Goal: identify entry or exit strategy messages. Prefer recall over precision.",
-            "Extract kol_label from the first line when it names a trader; otherwise use an empty string.",
-            'strategy_kind must be one of: "entry", "exit", "other".',
-            "confidence must be a number from 0 to 1, for example 0.85. Do not return words like high, medium, low, 高, 中, or 低.",
-            "Return compact JSON only with keys: is_strategy, strategy_kind, confidence, kol_label, reason_short.",
-            f"chat_title={chat_title}",
-            f"sender_name={sender_name or ''}",
-            f"first_line={first_line}",
-            "message_text:",
-            trimmed_text,
-        ]
+    return render_template_strict(
+        template,
+        chat_title=chat_title,
+        sender_name=sender_name or "",
+        first_line=first_line,
+        message_text=trimmed_text,
     )
 
 
@@ -475,18 +471,31 @@ async def process_strategy_alert_for_record(
         )
         return {"status": "skipped_empty_text"}
 
-    prompt = build_strategy_alert_prompt(
-        chat_title=chat_title,
-        sender_name=record.sender_name,
-        text=text,
-        max_chars=config.max_chars,
+    seed_default_prompt_registry(session_factory)
+    trimmed_text = text
+    if len(trimmed_text) > config.max_chars:
+        trimmed_text = f"{trimmed_text[:config.max_chars].rstrip()}\n[truncated]"
+    rendered = render_registered_prompt(
+        session_factory,
+        STRATEGY_ALERT_PROMPT,
+        variables={
+            "chat_title": chat_title,
+            "sender_name": record.sender_name or "",
+            "first_line": trimmed_text.splitlines()[0].strip(),
+            "message_text": trimmed_text,
+        },
     )
+    prompt = rendered.content
+    invocation_status = "success"
+    invocation_error = None
     try:
         content = await _retry_async(
             lambda: llm_requester(config=config, prompt=prompt),
             attempts=3,
         )
     except Exception as exc:
+        invocation_status = "error"
+        invocation_error = str(exc)
         _update_alert(
             session_factory,
             record=record,
@@ -494,6 +503,21 @@ async def process_strategy_alert_for_record(
             error_message=str(exc),
         )
         return {"status": "ai_failed", "error": str(exc)}
+    finally:
+        raw_message, _, _ = _load_alert_context(session_factory, record)
+        record_prompt_invocation(
+            session_factory,
+            PromptInvocationRecord(
+                feature="strategy_alert",
+                correlation_key=f"strategy_alert:{record.chat_id}:{record.message_id}",
+                raw_message_id=raw_message.id if raw_message is not None else None,
+                chat_id=record.chat_id,
+                model=config.llm_model,
+                prompt_versions=rendered.version_map,
+                status=invocation_status,
+                error_message=invocation_error,
+            ),
+        )
 
     decision = parse_alert_decision(content)
     should_send = (

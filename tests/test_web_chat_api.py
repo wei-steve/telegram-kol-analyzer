@@ -5,7 +5,9 @@ import httpx
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.llm_chat import LLMProxyConfig
-from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import AiPromptInvocation, RawMessage
+from telegram_kol_research.prompt_defaults import GROUP_RESEARCH_PROMPT
+from telegram_kol_research.prompt_registry import PromptSeed, seed_prompt_definition
 from telegram_kol_research.telegram_session_lock import TelegramSessionLockError
 from telegram_kol_research.web_app import create_web_app
 
@@ -368,8 +370,28 @@ def test_chat_api_accepts_question_and_chat_scope(tmp_path):
         session.add(RawMessage(chat_id=1, message_id=10, text="hello source"))
         session.commit()
 
+    scoped = seed_prompt_definition(
+        session_factory,
+        PromptSeed(
+            prompt_key=GROUP_RESEARCH_PROMPT,
+            display_name="Group research",
+            description="Group-specific research instruction",
+            category="research",
+            consumers=("research_chat",),
+            required_variables=(),
+            validation_profile="plain_system",
+            content="Only analyze the currently selected trader.",
+            scope_chat_id=1,
+        ),
+    )
+    captured = {}
     app = create_web_app(database_path=database_path)
-    app.state.chat_requester = lambda **_: "Proxy answer [1]"
+
+    def fake_requester(**kwargs):
+        captured.update(kwargs)
+        return "Proxy answer [1]"
+
+    app.state.chat_requester = fake_requester
     app.state.llm_proxy_config = LLMProxyConfig(
         base_url="http://proxy.test",
         api_key="secret",
@@ -383,7 +405,7 @@ def test_chat_api_accepts_question_and_chat_scope(tmp_path):
         json={
             "question": "Summarize",
             "chat_id": 1,
-            "group_prompt": "Prioritize recent changes",
+            "group_prompt": "This unversioned value must be ignored",
         },
     )
 
@@ -391,10 +413,17 @@ def test_chat_api_accepts_question_and_chat_scope(tmp_path):
     assert response.json()["answer"] == "Proxy answer [1]"
     assert response.json()["sources"][0]["raw_message_id"] is not None
     assert response.json()["sources"][0]["label"].startswith("[1]")
+    assert "Telegram 交易群研究助手" in captured["system_prompt"]
+    assert captured["group_prompt"] == "Only analyze the currently selected trader."
     assert (
         response.json()["proxy_payload"]["messages"][1]["content"]
-        == "Group prompt:\nPrioritize recent changes"
+        == "Group prompt:\nOnly analyze the currently selected trader."
     )
+    with session_factory() as session:
+        invocation = session.query(AiPromptInvocation).one()
+    assert invocation.feature == "research_chat"
+    assert invocation.chat_id == 1
+    assert str(scoped.active_version.id) in invocation.prompt_versions_json
 
 
 def test_chat_api_defaults_to_latest_50_messages_for_current_group(

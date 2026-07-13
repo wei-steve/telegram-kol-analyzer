@@ -14,11 +14,15 @@ def test_build_proxy_chat_payload_matches_openai_compatible_shape():
         question="Summarize this group",
         scope_context="message context",
         model="gpt-test",
+        system_prompt="Published research system",
         group_prompt="Prioritize recent changes",
     )
 
     assert payload["model"] == "gpt-test"
-    assert payload["messages"][0]["role"] == "system"
+    assert payload["messages"][0] == {
+        "role": "system",
+        "content": "Published research system",
+    }
     assert (
         payload["messages"][1]["content"] == "Group prompt:\nPrioritize recent changes"
     )
@@ -51,6 +55,7 @@ def test_request_grounded_chat_answer_reads_openai_compatible_response():
         ),
         question="Summarize this group",
         scope_context="message context",
+        system_prompt="Published research system",
         client=httpx.Client(transport=transport),
     )
 
@@ -85,6 +90,7 @@ def test_request_grounded_chat_answer_raises_for_image_input_error_text_in_succe
             ),
             question="Summarize this group",
             scope_context="message context",
+            system_prompt="Published research system",
             client=httpx.Client(transport=transport),
         )
 
@@ -171,13 +177,14 @@ def test_request_grounded_chat_answer_retries_with_supported_proxy_model():
         config=config,
         question="Summarize this group",
         scope_context="message context",
+        system_prompt="Published research system",
         client=httpx.Client(transport=transport),
     )
 
     assert answer == "Fallback answer [1]"
     assert config.model == "gpt-5.4-mini"
     assert requests == [
-        ("chat", '{"model":"gpt-4.1-mini","messages":[{"role":"system","content":"You are an analyst for Telegram trading group research. Answer using only the provided source context and cite sources like [1], [2]."},{"role":"user","content":"Source context:\\nmessage context"},{"role":"user","content":"Summarize this group"}]}'),
+        ("chat", '{"model":"gpt-4.1-mini","messages":[{"role":"system","content":"Published research system"},{"role":"user","content":"Source context:\\nmessage context"},{"role":"user","content":"Summarize this group"}]}'),
         ("models", ""),
-        ("chat", '{"model":"gpt-5.4-mini","messages":[{"role":"system","content":"You are an analyst for Telegram trading group research. Answer using only the provided source context and cite sources like [1], [2]."},{"role":"user","content":"Source context:\\nmessage context"},{"role":"user","content":"Summarize this group"}]}'),
+        ("chat", '{"model":"gpt-5.4-mini","messages":[{"role":"system","content":"Published research system"},{"role":"user","content":"Source context:\\nmessage context"},{"role":"user","content":"Summarize this group"}]}'),
     ]

@@ -6,7 +6,8 @@ import httpx
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_recognition import MessageRecognitionResult
-from telegram_kol_research.models import RawMessage, SignalCandidate, StrategyAlert, StrategyLifecycle
+from telegram_kol_research.models import AiPromptInvocation, RawMessage, SignalCandidate, StrategyAlert, StrategyLifecycle
+from telegram_kol_research.prompt_defaults import DEFAULT_STRATEGY_ALERT_PROMPT
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord, persist_normalized_messages
 from telegram_kol_research.strategy_alerts import (
     AlertDecision,
@@ -53,6 +54,7 @@ def test_build_strategy_alert_prompt_keeps_context_short_and_first_line_visible(
     long_text = "Trader Zhang\n" + ("BTC long " * 400)
 
     prompt = build_strategy_alert_prompt(
+        template=DEFAULT_STRATEGY_ALERT_PROMPT,
         chat_title="VIP BTC Room",
         sender_name="Alice",
         text=long_text,
@@ -152,7 +154,10 @@ def test_process_strategy_alert_forwards_once_and_persists_ai_result(tmp_path):
     persist_normalized_messages(session_factory, [record])
     sent_messages: list[str] = []
 
+    captured_prompts: list[str] = []
+
     async def llm_requester(*args, **kwargs):
+        captured_prompts.append(kwargs["prompt"])
         return '{"is_strategy":true,"strategy_kind":"entry","confidence":0.75,"kol_label":"Trader A","reason_short":"entry"}'
 
     async def bot_sender(*, config, text):
@@ -182,13 +187,18 @@ def test_process_strategy_alert_forwards_once_and_persists_ai_result(tmp_path):
     assert first["status"] == "sent"
     assert second["status"] == "already_sent"
     assert len(sent_messages) == 1
+    assert "chat_title=VIP BTC Room" in captured_prompts[0]
     assert sent_messages[0].startswith("KOL群组：VIP BTC Room")
     assert "原文：\nTrader A\nBTC long now" in sent_messages[0]
     with session_factory() as session:
         stored = session.query(StrategyAlert).one()
+        invocation = session.query(AiPromptInvocation).one()
     assert stored.ai_confidence == 0.75
     assert stored.strategy_kind == "entry"
     assert stored.forwarded_at is not None
+    assert invocation.feature == "strategy_alert"
+    assert invocation.model == "cheap-model"
+    assert "strategy.alert.classifier" in invocation.prompt_versions_json
 
 
 def test_process_strategy_alert_retries_ai_and_bot_failures(tmp_path):

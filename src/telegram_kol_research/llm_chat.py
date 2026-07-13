@@ -99,17 +99,15 @@ def extract_recent_message_limit(question: str) -> int | None:
 
 
 def build_proxy_chat_payload(
-    *, question: str, scope_context: str, model: str, group_prompt: str | None = None
+    *, question: str, scope_context: str, model: str, system_prompt: str,
+    group_prompt: str | None = None
 ) -> dict[str, Any]:
     """Build an OpenAI-compatible chat payload for the proxy."""
 
     messages: list[dict[str, str]] = [
         {
             "role": "system",
-            "content": (
-                "You are an analyst for Telegram trading group research. "
-                "Answer using only the provided source context and cite sources like [1], [2]."
-            ),
+            "content": system_prompt.strip(),
         }
     ]
     if group_prompt and group_prompt.strip():
@@ -161,6 +159,7 @@ def request_grounded_chat_answer(
     config: LLMProxyConfig,
     question: str,
     scope_context: str,
+    system_prompt: str,
     group_prompt: str | None = None,
     client: httpx.Client | None = None,
 ) -> str:
@@ -177,6 +176,7 @@ def request_grounded_chat_answer(
             config=config,
             question=question,
             scope_context=scope_context,
+            system_prompt=system_prompt,
             group_prompt=group_prompt,
             headers=headers,
         )
@@ -201,6 +201,7 @@ def _request_chat_completion(
     config: LLMProxyConfig,
     question: str,
     scope_context: str,
+    system_prompt: str,
     group_prompt: str | None,
     headers: dict[str, str],
 ) -> dict[str, Any]:
@@ -208,6 +209,7 @@ def _request_chat_completion(
         question=question,
         scope_context=scope_context,
         model=config.model,
+        system_prompt=system_prompt,
         group_prompt=group_prompt,
     )
     response = active_client.post(
@@ -232,6 +234,7 @@ def _request_chat_completion(
             question=question,
             scope_context=scope_context,
             model=config.model,
+            system_prompt=system_prompt,
             group_prompt=group_prompt,
         )
         response = active_client.post(
