@@ -29,6 +29,10 @@ from telegram_kol_research.models import (
     TradeIdea,
     utc_now,
 )
+from telegram_kol_research.lifecycle_exit_intents import (
+    has_live_execution_binding,
+    record_lifecycle_exit_intent,
+)
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 from telegram_kol_research.recognition_profiles import BITCOIN_JUNZHANG_PROFILE
 from telegram_kol_research.parsing.text_parser import parse_signal_text
@@ -1018,6 +1022,20 @@ def _apply_lifecycle_event_decision(
             and _lifecycle_has_live_execution_binding(session, target)
         )
     ):
+        if _lifecycle_has_live_execution_binding(session, target):
+            record_lifecycle_exit_intent(
+                session,
+                target,
+                exit_message_id=raw_message.message_id,
+                reason=str(decision.get("reason") or "").strip() or None,
+            )
+            _upsert_close_signal_candidate(
+                session,
+                raw_message=raw_message,
+                lifecycle=target,
+                parse_source=parse_source,
+            )
+            return True
         target.lifecycle_status = "exited"
         target.exit_reason = "kol_signal"
         target.exited_at = event_at
@@ -2044,6 +2062,20 @@ def _apply_bitcoin_junzhang_close_if_matched(session, raw_message: RawMessage, t
     )
     if lifecycle is None:
         return False
+    if _lifecycle_has_live_execution_binding(session, lifecycle):
+        record_lifecycle_exit_intent(
+            session,
+            lifecycle,
+            exit_message_id=raw_message.message_id,
+            reason=text,
+        )
+        _upsert_close_signal_candidate(
+            session,
+            raw_message=raw_message,
+            lifecycle=lifecycle,
+            parse_source=BITCOIN_JUNZHANG_PARSE_SOURCE,
+        )
+        return True
     lifecycle.lifecycle_status = "exited"
     lifecycle.exit_reason = "kol_signal"
     lifecycle.exited_at = raw_message.posted_at or utc_now()
@@ -2237,21 +2269,7 @@ def _apply_entry_confirmation_signal_if_matched(
 
 
 def _lifecycle_has_live_execution_binding(session, lifecycle: StrategyLifecycle) -> bool:
-    if lifecycle.execution_binding_id is not None:
-        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
-        if binding is not None and binding.status in {"open", "active"}:
-            return True
-    return (
-        session.query(ExecutionBinding.id)
-        .filter(ExecutionBinding.venue == "deepcoin")
-        .filter(ExecutionBinding.chat_id == lifecycle.chat_id)
-        .filter(ExecutionBinding.message_id == lifecycle.message_id)
-        .filter(ExecutionBinding.symbol == lifecycle.symbol.upper())
-        .filter(ExecutionBinding.side == lifecycle.side.lower())
-        .filter(ExecutionBinding.status.in_(["open", "active"]))
-        .first()
-        is not None
-    )
+    return has_live_execution_binding(session, lifecycle)
 
 
 def _apply_exit_signal_if_matched(
@@ -2290,6 +2308,20 @@ def _apply_exit_signal_if_matched(
 
     lifecycle = matches[0]
     exited_at = raw_message.posted_at or utc_now()
+    if _lifecycle_has_live_execution_binding(session, lifecycle):
+        record_lifecycle_exit_intent(
+            session,
+            lifecycle,
+            exit_message_id=raw_message.message_id,
+            reason=text,
+        )
+        _upsert_close_signal_candidate(
+            session,
+            raw_message=raw_message,
+            lifecycle=lifecycle,
+            parse_source="exit_heuristic",
+        )
+        return True
     lifecycle.lifecycle_status = "exited"
     lifecycle.exit_reason = "kol_signal"
     lifecycle.exited_at = exited_at
@@ -2360,6 +2392,14 @@ def _apply_cancel_signal_if_matched(
     exited_at = raw_message.posted_at or utc_now()
     cancelled_lifecycles = matches if cancel_all_matches else [latest]
     for lifecycle in cancelled_lifecycles:
+        if _lifecycle_has_live_execution_binding(session, lifecycle):
+            record_lifecycle_exit_intent(
+                session,
+                lifecycle,
+                exit_message_id=raw_message.message_id,
+                reason=text,
+            )
+            continue
         entered_after_cancel_message = _lifecycle_entered_after_message(lifecycle, raw_message)
         lifecycle.lifecycle_status = "exited"
         lifecycle.exit_reason = "cancelled"

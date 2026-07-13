@@ -112,6 +112,60 @@ def test_lifecycle_monitor_skips_simulated_exit_for_live_execution_binding(tmp_p
     assert lifecycle.exited_at is None
 
 
+def test_kol_exit_keeps_live_bound_lifecycle_entered_until_reconcile(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="fengge",
+            chat_id=88,
+            message_id=8400,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            status="active",
+            pos_id="pos-live",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=8400,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 13, 1, 0, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 13, 1, 1, tzinfo=UTC),
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    monitor = LifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        now_provider=lambda: datetime(2026, 7, 13, 4, 22, tzinfo=UTC),
+    )
+    matched = asyncio.run(
+        monitor.on_new_exit_signal(
+            chat_id=88,
+            symbol="BTC",
+            side="short",
+            message_id=8401,
+        )
+    )
+
+    assert matched
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert lifecycle.lifecycle_status == "entered"
+        assert lifecycle.exit_reason is None
+        assert lifecycle.exited_at is None
+        assert lifecycle.exit_signal_message_id == 8401
+        assert lifecycle.management_signal_message_id == 8401
+        assert lifecycle.management_action == "exit_requested"
+
+
 def test_lifecycle_backfill_keeps_entered_record_with_entry_evidence(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

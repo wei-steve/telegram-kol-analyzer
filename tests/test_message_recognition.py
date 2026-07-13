@@ -895,8 +895,9 @@ def test_recognize_message_now_cancels_expired_order_with_live_binding(tmp_path)
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         candidate = session.query(SignalCandidate).one()
 
-    assert lifecycle.lifecycle_status == "exited"
-    assert lifecycle.exit_reason == "cancelled"
+    assert lifecycle.lifecycle_status == "expired"
+    assert lifecycle.exit_reason == "expired"
+    assert lifecycle.management_action == "exit_requested"
     assert lifecycle.exit_signal_message_id == 443
     assert candidate.event_type == "close_signal"
     assert candidate.parse_source == "cancel_heuristic"
@@ -1541,9 +1542,11 @@ def test_ai_lifecycle_event_exits_expired_strategy_when_live_binding_exists(tmp_
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         candidate = session.query(SignalCandidate).one()
 
-    assert lifecycle.lifecycle_status == "exited"
-    assert lifecycle.exit_reason == "kol_signal"
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.exit_reason is None
+    assert lifecycle.exited_at is None
     assert lifecycle.exit_signal_message_id == 443
+    assert lifecycle.management_action == "exit_requested"
     assert candidate.event_type == "close_signal"
 
 

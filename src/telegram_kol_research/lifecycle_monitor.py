@@ -25,6 +25,10 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.live_updates import LiveUpdateBroker
+from telegram_kol_research.lifecycle_exit_intents import (
+    has_live_execution_binding,
+    record_lifecycle_exit_intent,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     RawMessage,
@@ -344,6 +348,22 @@ class LifecycleMonitor:
                     chat_id, symbol, side,
                 )
                 return False
+
+            if has_live_execution_binding(session, matching):
+                record_lifecycle_exit_intent(
+                    session,
+                    matching,
+                    exit_message_id=message_id,
+                    reason="KOL exit signal awaiting exchange reconciliation.",
+                    updated_at=self._now(),
+                )
+                session.commit()
+                logger.info(
+                    "Exit intent recorded for live-bound lifecycle=%s message=%s",
+                    matching.id,
+                    message_id,
+                )
+                return True
 
             matching.lifecycle_status = "exited"
             matching.exit_reason = "kol_signal"

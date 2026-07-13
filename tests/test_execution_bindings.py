@@ -1483,7 +1483,7 @@ def test_reconcile_revives_cancelled_stale_binding_when_positions_fill_later(tmp
     assert lifecycle.exited_at is None
 
 
-def test_reconcile_does_not_reopen_lifecycle_closed_by_kol_exit_signal(tmp_path):
+def test_reconcile_reopens_legacy_kol_exit_while_bound_position_is_still_active(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     upsert_execution_binding(
         session_factory,
@@ -1548,9 +1548,12 @@ def test_reconcile_does_not_reopen_lifecycle_closed_by_kol_exit_signal(tmp_path)
 
     assert binding.status == "active"
     assert lifecycle.execution_binding_id == binding.id
-    assert lifecycle.lifecycle_status == "exited"
-    assert lifecycle.exit_reason == "kol_signal"
-    assert lifecycle.exited_at == datetime(2026, 7, 7, 22, 49)
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.exit_reason is None
+    assert lifecycle.exited_at is None
+    assert lifecycle.exit_signal_message_id == 3870
+    assert lifecycle.management_signal_message_id == 3870
+    assert lifecycle.management_action == "exit_requested"
 
 
 def test_reconcile_revives_expired_keep_order_when_position_fills_later(tmp_path):
@@ -1919,6 +1922,56 @@ def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, bi
     assert binding.last_exchange_status == "manual_closed_or_not_found_on_exchange"
     assert lifecycle.lifecycle_status == "exited"
     assert lifecycle.exit_reason == "manual"
+
+
+def test_sync_closed_position_finalizes_pending_kol_exit_exactly_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(pos_id="pos-closed", status="active"),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+                entered_at=datetime(2026, 6, 30, 9, 1),
+                execution_binding_id=binding_id,
+                exit_signal_message_id=8401,
+                management_signal_message_id=8401,
+                management_action="exit_requested",
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return []
+
+    closed_at = datetime(2026, 6, 30, 10, 0)
+    first = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=FakeClient(),
+        synced_at=closed_at,
+    )
+    second = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=FakeClient(),
+        synced_at=datetime(2026, 6, 30, 10, 1),
+    )
+
+    assert first.manually_closed == 1
+    assert second.manually_closed == 0
+    with session_factory() as session:
+        lifecycle = session.query(StrategyLifecycle).one()
+        assert lifecycle.lifecycle_status == "exited"
+        assert lifecycle.exit_reason == "kol_signal"
+        assert lifecycle.exited_at == closed_at
+        assert lifecycle.exit_signal_message_id == 8401
 
 
 def test_sync_manual_closed_positions_keeps_binding_open_for_unfilled_entry_leg(tmp_path):

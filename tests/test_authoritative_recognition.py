@@ -117,6 +117,12 @@ def test_fengge_exit_uses_mimo_when_deepseek_disagrees(tmp_path, monkeypatch):
         decision = session.query(RecognitionDecision).one()
         assert decision.authoritative_model == "mimo-v2.5"
         assert decision.agreement_status == "disagreed"
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert lifecycle.lifecycle_status == "entered"
+        assert lifecycle.exit_reason is None
+        assert lifecycle.exited_at is None
+        assert lifecycle.exit_signal_message_id == 8401
+        assert lifecycle.management_action == "exit_requested"
 
 
 def test_mimo_failure_never_applies_deepseek_action(tmp_path, monkeypatch):

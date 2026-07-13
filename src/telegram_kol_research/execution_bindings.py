@@ -652,7 +652,11 @@ def sync_manual_closed_deepcoin_positions(
             )
             if lifecycle is not None and lifecycle.lifecycle_status == "entered":
                 lifecycle.lifecycle_status = "exited"
-                lifecycle.exit_reason = "manual"
+                lifecycle.exit_reason = (
+                    "kol_signal"
+                    if lifecycle.management_action == "exit_requested"
+                    else "manual"
+                )
                 lifecycle.exited_at = now
                 lifecycle.updated_at = now
                 if lifecycle.trade_idea_id is not None:
@@ -1655,6 +1659,16 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
         row.last_exchange_status = "expired_pending_entry_not_attributed"
         return False
     lifecycle.execution_binding_id = row.id
+    if (
+        row.status == "active"
+        and lifecycle.lifecycle_status == "exited"
+        and lifecycle.exit_reason == "kol_signal"
+    ):
+        lifecycle.lifecycle_status = "entered"
+        lifecycle.exit_reason = None
+        lifecycle.exited_at = None
+        lifecycle.management_action = "exit_requested"
+        lifecycle.management_signal_message_id = lifecycle.exit_signal_message_id
     if _is_terminal_exited_lifecycle(lifecycle) and not (
         row.status == "active" and lifecycle.exit_reason == "manual"
     ):
