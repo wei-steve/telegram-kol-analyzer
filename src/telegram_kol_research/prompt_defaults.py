@@ -130,16 +130,26 @@ message_text:
 """.strip()
 
 
+def _legacy_custom_content(value: str, default: str) -> str:
+    normalized = value.strip()
+    baseline = default.strip()
+    if not normalized or normalized == baseline:
+        return ""
+    if normalized.startswith(baseline):
+        return normalized[len(baseline):].strip()
+    return normalized
+
+
 def _legacy_shared_content(config: AiRecognitionConfig) -> str:
-    recognition = config.recognition_prompt.strip()
-    lifecycle = config.lifecycle_event_prompt.strip()
-    uses_default_recognition = (
-        not recognition or recognition.startswith(DEFAULT_RECOGNITION_PROMPT)
+    recognition = _legacy_custom_content(
+        config.recognition_prompt,
+        DEFAULT_RECOGNITION_PROMPT,
     )
-    uses_default_lifecycle = (
-        not lifecycle or lifecycle.startswith(DEFAULT_LIFECYCLE_EVENT_PROMPT)
+    lifecycle = _legacy_custom_content(
+        config.lifecycle_event_prompt,
+        DEFAULT_LIFECYCLE_EVENT_PROMPT,
     )
-    if uses_default_recognition and uses_default_lifecycle:
+    if not recognition and not lifecycle:
         return DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
     legacy_parts = [
         part
@@ -184,9 +194,9 @@ def _legacy_image_notes(value: str) -> str:
 def build_prompt_seeds_from_legacy(
     config: AiRecognitionConfig,
 ) -> list[PromptSeed]:
-    image_notes = _legacy_image_notes(config.mimo_direct_prompt)
-    if config.mimo_direct_prompt.strip().startswith(DEFAULT_MIMO_DIRECT_PROMPT):
-        image_notes = ""
+    image_notes = _legacy_image_notes(
+        _legacy_custom_content(config.mimo_direct_prompt, DEFAULT_MIMO_DIRECT_PROMPT)
+    )
     vision_content = "\n\n".join(
         part
         for part in (image_notes, DEFAULT_MIMO_VISION_PROMPT)

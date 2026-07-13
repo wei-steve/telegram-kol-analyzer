@@ -3,10 +3,16 @@ import json
 import pytest
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import AiPromptDefinition, AiPromptInvocation, AiPromptVersion
+from telegram_kol_research.models import (
+    AiPromptDefinition,
+    AiPromptInvocation,
+    AiPromptTestRun,
+    AiPromptVersion,
+)
 from telegram_kol_research.prompt_registry import (
     PromptInvocationRecord,
     PromptRegistryConflict,
+    PromptRegistryValidationError,
     PromptSeed,
     get_prompt_detail,
     list_prompt_definitions,
@@ -80,12 +86,40 @@ def test_save_draft_reuses_the_single_draft_version(tmp_path):
         "trading.analysis.shared",
         content="draft two",
         change_note="second",
+        expected_draft_updated_at=first.draft_version.updated_at,
     )
 
     assert first.draft_version is not None
     assert second.draft_version is not None
     assert second.draft_version.id == first.draft_version.id
     assert second.draft_version.content == "draft two"
+
+
+def test_save_draft_rejects_stale_draft_timestamp(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    seed_prompt_definition(factory, _seed())
+    first = save_prompt_draft(
+        factory,
+        "trading.analysis.shared",
+        content="draft one",
+        change_note="first",
+    )
+    save_prompt_draft(
+        factory,
+        "trading.analysis.shared",
+        content="draft two",
+        change_note="second",
+        expected_draft_updated_at=first.draft_version.updated_at,
+    )
+
+    with pytest.raises(PromptRegistryConflict, match="draft version changed"):
+        save_prompt_draft(
+            factory,
+            "trading.analysis.shared",
+            content="stale overwrite",
+            change_note="stale",
+            expected_draft_updated_at=first.draft_version.updated_at,
+        )
 
 
 def test_publish_draft_atomically_supersedes_active_version(tmp_path):
@@ -110,6 +144,7 @@ def test_publish_draft_atomically_supersedes_active_version(tmp_path):
         factory,
         "trading.analysis.shared",
         expected_draft_version_id=detail.draft_version.id,
+        expected_active_version_id=original.active_version.id,
     )
 
     assert published.draft_version is None
@@ -155,6 +190,7 @@ def test_rollback_creates_a_new_auditable_published_version(tmp_path):
         factory,
         "trading.analysis.shared",
         expected_draft_version_id=draft.draft_version.id,
+        expected_active_version_id=original.active_version.id,
     )
 
     restored = rollback_prompt(
@@ -189,6 +225,33 @@ def test_publish_rejects_a_draft_without_successful_validation(tmp_path):
             factory,
             "trading.analysis.shared",
             expected_draft_version_id=detail.draft_version.id,
+            expected_active_version_id=detail.active_version.id,
+        )
+
+
+def test_publish_rejects_empty_change_note_even_after_validation(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    original = seed_prompt_definition(factory, _seed())
+    detail = save_prompt_draft(
+        factory,
+        "trading.analysis.shared",
+        content="validated content",
+        change_note="",
+    )
+    record_prompt_validation(
+        factory,
+        "trading.analysis.shared",
+        expected_draft_version_id=detail.draft_version.id,
+        success=True,
+        errors=(),
+    )
+
+    with pytest.raises(PromptRegistryValidationError, match="change note is required"):
+        publish_prompt_draft(
+            factory,
+            "trading.analysis.shared",
+            expected_draft_version_id=detail.draft_version.id,
+            expected_active_version_id=original.active_version.id,
         )
 
 
@@ -215,10 +278,44 @@ def test_editing_a_validated_draft_clears_validation_state(tmp_path):
         "trading.analysis.shared",
         content="edited again",
         change_note="second",
+        expected_draft_updated_at=validated.draft_version.updated_at,
     )
 
     assert edited.draft_version.validated_at is None
     assert edited.draft_version.validation_result is None
+
+
+def test_editing_a_draft_invalidates_its_historical_test_runs(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    seed_prompt_definition(factory, _seed())
+    detail = save_prompt_draft(
+        factory,
+        "trading.analysis.shared",
+        content="first tested content",
+        change_note="first",
+    )
+    with factory() as session:
+        session.add(
+            AiPromptTestRun(
+                prompt_definition_id=detail.definition_id,
+                draft_version_id=detail.draft_version.id,
+                model="mimo-v2.5",
+                status="completed",
+                differences_json="[]",
+            )
+        )
+        session.commit()
+
+    save_prompt_draft(
+        factory,
+        "trading.analysis.shared",
+        content="second untested content",
+        change_note="second",
+        expected_draft_updated_at=detail.draft_version.updated_at,
+    )
+
+    with factory() as session:
+        assert session.query(AiPromptTestRun).count() == 0
 
 
 def test_scoped_prompts_are_unique_per_chat(tmp_path):

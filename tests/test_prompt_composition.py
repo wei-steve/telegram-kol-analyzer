@@ -9,6 +9,7 @@ from telegram_kol_research.prompt_composition import (
     validate_prompt_content,
 )
 from telegram_kol_research.prompt_defaults import (
+    DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
     MIMO_VISION_PROMPT,
     SHARED_TRADING_PROMPT,
     STRATEGY_ALERT_PROMPT,
@@ -90,7 +91,7 @@ def test_shared_trading_validation_requires_canonical_schema():
     )
     valid = validate_prompt_content(
         SHARED_TRADING_PROMPT,
-        '{"recognition_result": "", "strategy": {}, "lifecycle_event": {}}',
+        DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
         validation_profile="trading_shared",
         required_variables=(),
     )
@@ -98,6 +99,19 @@ def test_shared_trading_validation_requires_canonical_schema():
     assert invalid.success is False
     assert any("recognition_result" in error for error in invalid.errors)
     assert valid.success is True
+
+
+def test_shared_trading_validation_rejects_partial_schema_and_missing_enums():
+    result = validate_prompt_content(
+        SHARED_TRADING_PROMPT,
+        '{"recognition_result": "", "strategy": {}, "lifecycle_event": {}}',
+        validation_profile="trading_shared",
+        required_variables=(),
+    )
+
+    assert result.success is False
+    assert any("target_lifecycle_id" in error for error in result.errors)
+    assert any("exit_position" in error for error in result.errors)
 
 
 def test_mimo_vision_validation_rejects_a_second_output_contract():
@@ -117,6 +131,18 @@ def test_mimo_vision_validation_rejects_a_second_output_contract():
     assert invalid.success is False
     assert any("输出结构" in error for error in invalid.errors)
     assert valid.success is True
+
+
+def test_mimo_vision_validation_rejects_json_output_instruction():
+    result = validate_prompt_content(
+        MIMO_VISION_PROMPT,
+        "读取图片并只输出 JSON 对象。",
+        validation_profile="mimo_vision",
+        required_variables=(),
+    )
+
+    assert result.success is False
+    assert any("输出结构" in error for error in result.errors)
 
 
 def test_strict_template_renderer_rejects_missing_and_unknown_variables():

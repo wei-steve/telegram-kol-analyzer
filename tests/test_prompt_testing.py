@@ -130,6 +130,37 @@ def test_draft_test_stores_model_failure_without_production_writes(tmp_path):
         assert session.query(AiPromptTestRun).one().status == "failed"
 
 
+def test_draft_test_rejects_parseable_but_invalid_model_payload(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    seed_default_prompt_registry(factory, AiRecognitionConfig())
+    with factory() as session:
+        message = RawMessage(chat_id=1, message_id=2, text="hello")
+        session.add(message)
+        session.commit()
+        raw_id = message.id
+    detail = save_prompt_draft(
+        factory,
+        SHARED_TRADING_PROMPT,
+        content=DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT + "\nDRAFT",
+        change_note="invalid payload test",
+    )
+
+    result = run_prompt_draft_test(
+        factory,
+        prompt_key=SHARED_TRADING_PROMPT,
+        draft_version_id=detail.draft_version.id,
+        raw_message_id=raw_id,
+        model_kind="mimo",
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        model_caller=lambda **_: {"unexpected": "json"},
+    )
+
+    assert "invalid recognition_result" in result.error_message
+    with factory() as session:
+        assert session.query(AiPromptTestRun).one().status == "failed"
+
+
 def test_mimo_vision_draft_test_forwards_readable_image_assets(tmp_path):
     media_root = tmp_path / "media"
     image_path = media_root / "group" / "chart.jpg"

@@ -51,7 +51,10 @@ def test_prompt_api_requires_validation_before_publish_and_supports_rollback(tmp
 
     published = client.post(
         "/api/ai-prompts/research.chat.system/publish",
-        json={"expected_draft_version_id": draft["id"]},
+        json={
+            "expected_draft_version_id": draft["id"],
+            "expected_active_version_id": original["id"],
+        },
     )
     assert published.status_code == 200
     current = published.json()["active_version"]

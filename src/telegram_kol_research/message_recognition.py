@@ -146,12 +146,12 @@ def recognize_message_now(
 
     config = ai_recognition_config or load_ai_recognition_config(ai_recognition_config_path)
     seed_default_prompt_registry(session_factory, config)
-    deepseek_system_prompt = compose_trading_prompt(
+    deepseek_composition = compose_trading_prompt(
         session_factory, model_kind="deepseek", context=""
-    ).system_prompt
-    mimo_system_prompt = compose_trading_prompt(
+    )
+    mimo_composition = compose_trading_prompt(
         session_factory, model_kind="mimo", context=""
-    ).system_prompt
+    )
     with session_factory() as session:
         raw_message = session.get(RawMessage, raw_message_id)
         if raw_message is None:
@@ -189,7 +189,9 @@ def recognize_message_now(
                 session,
                 raw_message=raw_message,
                 config=config,
-                system_prompt=deepseek_system_prompt,
+                system_prompt=deepseek_composition.system_prompt,
+                session_factory=session_factory,
+                prompt_versions=deepseek_composition.version_map,
             )
             if ai_event_result is not None:
                 _upsert_recognition(session, ai_event_result, engine=config.text_provider.model)
@@ -238,29 +240,43 @@ def recognize_message_now(
                     media_assets=media_assets,
                     config=config,
                     session=session,
-                    text_system_prompt=deepseek_system_prompt,
+                    text_system_prompt=deepseek_composition.system_prompt,
+                    session_factory=session_factory,
+                    prompt_versions=deepseek_composition.version_map,
                 )
             else:
-                result = _recognize_with_ai_provider(
+                result = _invoke_with_prompt_audit(
+                    session_factory=session_factory,
                     raw_message=raw_message,
-                    media_assets=media_assets,
-                    config=config,
-                    provider=config.image_provider,
-                    parse_source="image_ai",
-                    system_prompt=mimo_system_prompt,
+                    model=config.image_provider.model,
+                    prompt_versions=mimo_composition.version_map,
+                    call=lambda: _recognize_with_ai_provider(
+                        raw_message=raw_message,
+                        media_assets=media_assets,
+                        config=config,
+                        provider=config.image_provider,
+                        parse_source="image_ai",
+                        system_prompt=mimo_composition.system_prompt,
+                    ),
                 )
                 _persist_ai_result(session, raw_message, result, engine=config.image_provider.model)
             session.commit()
             return result
 
         if (raw_message.text or "").strip() and config.text_provider.is_configured:
-            result = _recognize_with_ai_provider(
+            result = _invoke_with_prompt_audit(
+                session_factory=session_factory,
                 raw_message=raw_message,
-                media_assets=[],
-                config=config,
-                provider=config.text_provider,
-                parse_source="text_ai",
-                system_prompt=deepseek_system_prompt,
+                model=config.text_provider.model,
+                prompt_versions=deepseek_composition.version_map,
+                call=lambda: _recognize_with_ai_provider(
+                    raw_message=raw_message,
+                    media_assets=[],
+                    config=config,
+                    provider=config.text_provider,
+                    parse_source="text_ai",
+                    system_prompt=deepseek_composition.system_prompt,
+                ),
             )
             _persist_ai_result(session, raw_message, result, engine=config.text_provider.model)
             session.commit()
@@ -467,6 +483,8 @@ def _recognize_with_glm_ocr(
     config: AiRecognitionConfig,
     session,
     text_system_prompt: str,
+    session_factory: sessionmaker,
+    prompt_versions: dict[str, int],
 ) -> MessageRecognitionResult:
     """Recognize image messages using GLM-OCR in a two-step pipeline.
 
@@ -527,11 +545,17 @@ def _recognize_with_glm_ocr(
     # ── Step 2: strategy recognition on the extracted text ──────────────
     if config.text_provider.is_configured:
         # Use text AI provider for strategy recognition
-        result = _recognize_text_with_ai_provider(
+        result = _invoke_with_prompt_audit(
+            session_factory=session_factory,
             raw_message=raw_message,
-            merged_text=merged_text,
-            config=config,
-            system_prompt=text_system_prompt,
+            model=config.text_provider.model,
+            prompt_versions=prompt_versions,
+            call=lambda: _recognize_text_with_ai_provider(
+                raw_message=raw_message,
+                merged_text=merged_text,
+                config=config,
+                system_prompt=text_system_prompt,
+            ),
         )
         if (
             caption
@@ -553,11 +577,17 @@ def _recognize_with_glm_ocr(
             return result
         if caption and ocr_parts and result.status != "是策略":
             try:
-                text_only_result = _recognize_text_with_ai_provider(
+                text_only_result = _invoke_with_prompt_audit(
+                    session_factory=session_factory,
                     raw_message=raw_message,
-                    merged_text=caption,
-                    config=config,
-                    system_prompt=text_system_prompt,
+                    model=config.text_provider.model,
+                    prompt_versions=prompt_versions,
+                    call=lambda: _recognize_text_with_ai_provider(
+                        raw_message=raw_message,
+                        merged_text=caption,
+                        config=config,
+                        system_prompt=text_system_prompt,
+                    ),
                 )
             except Exception:
                 text_only_result = None
@@ -733,17 +763,25 @@ def _apply_ai_lifecycle_event_if_matched(
     raw_message: RawMessage,
     config: AiRecognitionConfig,
     system_prompt: str,
+    session_factory: sessionmaker,
+    prompt_versions: dict[str, int],
 ) -> MessageRecognitionResult | None:
     context = _load_lifecycle_event_context(session, raw_message)
     if not context["active_strategies"]:
         return None
 
     try:
-        decision = _call_lifecycle_event_ai(
+        decision = _invoke_with_prompt_audit(
+            session_factory=session_factory,
             raw_message=raw_message,
-            context=context,
-            config=config,
-            system_prompt=system_prompt,
+            model=config.text_provider.model,
+            prompt_versions=prompt_versions,
+            call=lambda: _call_lifecycle_event_ai(
+                raw_message=raw_message,
+                context=context,
+                config=config,
+                system_prompt=system_prompt,
+            ),
         )
     except Exception:
         return None
@@ -770,6 +808,36 @@ def _apply_ai_lifecycle_event_if_matched(
         ai_payload={"lifecycle_event": decision},
         parse_source="lifecycle_ai",
     )
+
+
+def _invoke_with_prompt_audit(
+    *,
+    session_factory: sessionmaker,
+    raw_message: RawMessage,
+    model: str,
+    prompt_versions: dict[str, int],
+    call,
+):
+    error_message: str | None = None
+    try:
+        return call()
+    except Exception as exc:
+        error_message = str(exc)
+        raise
+    finally:
+        record_prompt_invocation(
+            session_factory,
+            PromptInvocationRecord(
+                feature="message_recognition",
+                correlation_key=f"recognition:{raw_message.id}:legacy:{model}",
+                raw_message_id=raw_message.id,
+                chat_id=raw_message.chat_id,
+                model=model,
+                prompt_versions=prompt_versions,
+                status="failed" if error_message else "completed",
+                error_message=error_message,
+            ),
+        )
 
 
 def _load_lifecycle_event_context(session, raw_message: RawMessage) -> dict[str, Any]:

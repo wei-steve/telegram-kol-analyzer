@@ -52,6 +52,21 @@ def test_build_prompt_seeds_from_legacy_preserves_custom_text_experience():
     assert '"recognition_result"' not in by_key[MIMO_VISION_PROMPT].content
 
 
+def test_build_prompt_seeds_preserves_suffixes_appended_to_legacy_defaults():
+    seeds = build_prompt_seeds_from_legacy(
+        AiRecognitionConfig(
+            recognition_prompt=DEFAULT_RECOGNITION_PROMPT + "\nCUSTOM MARKET PLUS PRICE RULE",
+            lifecycle_event_prompt=DEFAULT_LIFECYCLE_EVENT_PROMPT + "\nCUSTOM TEMPORARY EXIT RULE",
+            mimo_direct_prompt=DEFAULT_MIMO_DIRECT_PROMPT + "\n图片自定义：优先读取持仓截图中的方向。",
+        )
+    )
+    by_key = {seed.prompt_key: seed for seed in seeds}
+
+    assert "CUSTOM MARKET PLUS PRICE RULE" in by_key[SHARED_TRADING_PROMPT].content
+    assert "CUSTOM TEMPORARY EXIT RULE" in by_key[SHARED_TRADING_PROMPT].content
+    assert "图片自定义" in by_key[MIMO_VISION_PROMPT].content
+
+
 def test_seed_default_prompt_registry_never_overwrites_active_database_version(tmp_path):
     factory = create_session_factory(tmp_path / "research.db")
     first_config = AiRecognitionConfig(

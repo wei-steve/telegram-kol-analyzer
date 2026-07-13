@@ -22,7 +22,9 @@ MiMo is authoritative for both text and image messages. DeepSeek is auxiliary on
 
 ## Editing lifecycle
 
-The Web prompt center uses `draft -> validate -> historical test -> publish`. Saving a draft never changes the active version. Editing an already validated draft clears its validation state. Trading prompts additionally require at least one completed isolated historical comparison before publication.
+The Web prompt center uses `draft -> validate -> historical test -> publish`. Saving a draft never changes the active version. Draft saves and publication use optimistic version checks, and publication requires a non-empty change note. Editing an already validated draft clears its validation state and deletes historical comparisons for that mutable draft.
+
+Trading publication accepts only tests run against the currently active companion prompt versions: A requires successful MiMo and DeepSeek coverage, while B requires MiMo coverage. B cannot be tested with DeepSeek. A later A/B publication makes older comparison baselines ineligible for publication.
 
 Historical comparisons call the model with the active and draft prompt separately and store results in `ai_prompt_test_runs`. They must never call authoritative apply, automatic trading, lifecycle mutation, execution binding, or strategy notification paths.
 
@@ -36,7 +38,7 @@ Publishing atomically supersedes the old active version. Rollback copies a selec
 - `ai_prompt_invocations`: exact prompt version IDs used by live AI calls.
 - `recognition_decisions.prompt_versions_json`: MiMo and DeepSeek versions for authoritative decisions.
 
-The database active version always wins over legacy YAML prompt fields. YAML fields are compatibility seed inputs only and must not be reintroduced at runtime call sites. Remove the fallback only after every deployed database has seeded definitions and a backup/restore procedure has been verified.
+The database active version always wins over legacy YAML prompt fields. YAML fields are compatibility seed inputs only and must not be reintroduced at runtime call sites. The legacy model/provider endpoint ignores and omits prompt fields, so the registry is the sole Web prompt authority. Remove the YAML seed fallback only after every deployed database has seeded definitions and a backup/restore procedure has been verified.
 
 ## Deployment and rollback
 

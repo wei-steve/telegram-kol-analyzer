@@ -265,10 +265,10 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert 'data-mobile-work-view="more"' in response.text
     assert 'data-mobile-work-region="overview"' in response.text
     assert "data-dashboard-tab" in response.text
-    assert "data-ai-recognition-prompt" in response.text
+    assert "data-ai-prompt-center" in response.text
     assert "data-ai-recognition-config" in response.text
     assert "data-dashboard-tab" in response.text
-    assert "data-ai-recognition-prompt" in response.text
+    assert "data-ai-recognition-prompt" not in response.text
     assert "data-ai-recognition-config" in response.text
     assert "data-ai-model-selection" in response.text
     assert "data-trading-settings-form" in response.text

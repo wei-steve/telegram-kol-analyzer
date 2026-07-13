@@ -63,6 +63,7 @@
   <section class="dashboard-tab-panel" data-dashboard-panel="prompt">
     {% include "_ai_prompt_center.html" %}
     {# Legacy YAML prompt editor retained only in source history; runtime editing now uses the registry. #}
+    {% if false %}
     <section class="panel ai-recognition-panel" data-ai-recognition-prompt hidden>
       <div class="panel-heading">
         <div>
@@ -158,6 +159,7 @@
         </div>
       </form>
     </section>
+    {% endif %}
   </section>
 
   <section class="dashboard-tab-panel" data-dashboard-panel="config">

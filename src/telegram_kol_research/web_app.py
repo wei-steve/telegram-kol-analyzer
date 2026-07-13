@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 import asyncio
+import json
 import logging
 import re
 import time
@@ -61,7 +62,9 @@ from telegram_kol_research.prompt_composition import (
 )
 from telegram_kol_research.prompt_defaults import (
     GROUP_RESEARCH_PROMPT,
+    MIMO_VISION_PROMPT,
     RESEARCH_CHAT_SYSTEM_PROMPT,
+    SHARED_TRADING_PROMPT,
     seed_default_prompt_registry,
     seed_group_research_prompt,
 )
@@ -2925,6 +2928,9 @@ def create_web_app(
                 expected_active_version_id=_int_or_none(
                     payload.get("expected_active_version_id")
                 ),
+                expected_draft_updated_at=_parse_optional_datetime(
+                    payload.get("expected_draft_updated_at")
+                ),
             )
         except PromptRegistryNotFound as exc:
             if prompt_key != GROUP_RESEARCH_PROMPT or chat_id is None:
@@ -2942,7 +2948,7 @@ def create_web_app(
             )
         except PromptRegistryConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except PromptRegistryError as exc:
+        except (PromptRegistryError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _prompt_detail_response(detail)
 
@@ -2982,6 +2988,8 @@ def create_web_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (PromptRegistryConflict, TypeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PromptRegistryError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"success": result.success, "errors": list(result.errors)}
 
     @app.post("/api/ai-prompts/{prompt_key}/publish")
@@ -2997,28 +3005,58 @@ def create_web_app(
                 chat_id=chat_id,
             )
             expected_draft_id = int(payload.get("expected_draft_version_id"))
+            expected_active_id = int(payload.get("expected_active_version_id"))
             if current.category == "trading":
+                shared = get_prompt_detail(
+                    app.state.session_factory, SHARED_TRADING_PROMPT
+                )
+                vision = get_prompt_detail(
+                    app.state.session_factory, MIMO_VISION_PROMPT
+                )
+                expected_by_model = {
+                    "deepseek": {SHARED_TRADING_PROMPT: shared.active_version.id},
+                    "mimo": {
+                        SHARED_TRADING_PROMPT: shared.active_version.id,
+                        MIMO_VISION_PROMPT: vision.active_version.id,
+                    },
+                }
+                required_models = (
+                    {"mimo", "deepseek"}
+                    if prompt_key == SHARED_TRADING_PROMPT
+                    else {"mimo"}
+                )
                 with app.state.session_factory() as session:
                     completed_tests = (
                         session.query(AiPromptTestRun)
                         .filter(AiPromptTestRun.draft_version_id == expected_draft_id)
                         .filter(AiPromptTestRun.status == "completed")
-                        .count()
+                        .all()
                     )
-                if completed_tests == 0:
+                covered_models = {
+                    row.model_kind
+                    for row in completed_tests
+                    if row.model_kind in required_models
+                    and json.loads(row.active_prompt_versions_json or "{}")
+                    == expected_by_model[row.model_kind]
+                }
+                if not required_models.issubset(covered_models):
                     raise PromptRegistryConflict(
-                        "trading prompt draft requires a completed historical test"
+                        "trading prompt draft requires current historical tests "
+                        f"for: {', '.join(sorted(required_models - covered_models))}"
                     )
             detail = publish_prompt_draft(
                 app.state.session_factory,
                 prompt_key,
                 expected_draft_version_id=expected_draft_id,
+                expected_active_version_id=expected_active_id,
                 chat_id=chat_id,
             )
         except PromptRegistryNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (PromptRegistryConflict, TypeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PromptRegistryError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _prompt_detail_response(detail)
 
     @app.post("/api/ai-prompts/{prompt_key}/test")
@@ -3040,6 +3078,24 @@ def create_web_app(
             raise HTTPException(status_code=422, detail="raw_message_ids is required")
         if len(raw_message_ids) > 20:
             raise HTTPException(status_code=422, detail="at most 20 messages per test")
+        try:
+            detail = get_prompt_detail(app.state.session_factory, prompt_key)
+        except PromptRegistryNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if detail.category != "trading":
+            raise HTTPException(
+                status_code=422, detail="historical tests support trading prompts only"
+            )
+        if detail.draft_version is None or detail.draft_version.id != draft_version_id:
+            raise HTTPException(status_code=409, detail="draft version changed")
+        if not model_kinds or any(kind not in {"mimo", "deepseek"} for kind in model_kinds):
+            raise HTTPException(status_code=422, detail="unsupported model kind")
+        if prompt_key == MIMO_VISION_PROMPT and set(model_kinds) != {"mimo"}:
+            raise HTTPException(
+                status_code=422, detail="MiMo vision prompt can only be tested with MiMo"
+            )
+        if len(raw_message_ids) * len(model_kinds) > 20:
+            raise HTTPException(status_code=422, detail="at most 20 model calls per test")
 
         config = load_ai_recognition_config(app.state.ai_recognition_config_path)
         items: list[dict[str, Any]] = []
@@ -3099,24 +3155,12 @@ def create_web_app(
     @app.post("/api/ai-recognition-config")
     def update_ai_recognition_config(payload: dict[str, Any]):
         existing_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
-        recognition_prompt = str(
-            _ai_prompt_payload_value(payload, "recognition_prompt")
-            or existing_config.recognition_prompt
-        ).strip()
-        if not recognition_prompt:
-            raise HTTPException(status_code=422, detail="recognition_prompt is required")
         config = save_ai_recognition_config(
             app.state.ai_recognition_config_path,
             AiRecognitionConfig(
-                recognition_prompt=recognition_prompt,
-                lifecycle_event_prompt=str(
-                    _ai_prompt_payload_value(payload, "lifecycle_event_prompt")
-                    or existing_config.lifecycle_event_prompt
-                ),
-                mimo_direct_prompt=str(
-                    _ai_prompt_payload_value(payload, "mimo_direct_prompt")
-                    or existing_config.mimo_direct_prompt
-                ),
+                recognition_prompt=existing_config.recognition_prompt,
+                lifecycle_event_prompt=existing_config.lifecycle_event_prompt,
+                mimo_direct_prompt=existing_config.mimo_direct_prompt,
                 mode=str(payload.get("mode") or "ai_provider"),
                 text_provider=_provider_config_from_payload(
                     payload.get("text_provider"), existing_config.text_provider
@@ -3133,10 +3177,6 @@ def create_web_app(
         )
         return {
             "mode": config.mode,
-            "recognition_prompt": config.recognition_prompt,
-            "lifecycle_event_prompt": config.lifecycle_event_prompt,
-            "mimo_direct_prompt": config.mimo_direct_prompt,
-            "prompts": build_ai_prompt_views(config),
             "active_text_model_id": config.active_text_model_id,
             "active_image_model_id": config.active_image_model_id,
             "ai_models": [_model_config_response(model) for model in config.ai_models],

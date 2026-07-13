@@ -1885,12 +1885,23 @@ function renderPromptRegistryList() {
     option.textContent = item.display_name;
     select.append(option);
   });
-  const legacy = loadGroupPrompt(promptCenterState.chatId);
   const hasScoped = promptCenterState.items.some((item) => item.prompt_key === 'research.chat.group');
-  if (legacy && promptCenterState.chatId && !hasScoped) {
+  if (promptCenterState.chatId && !hasScoped) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'prompt-registry-item';
+    button.dataset.promptKey = 'research.chat.group';
+    button.dataset.chatId = String(promptCenterState.chatId);
+    const title = document.createElement('strong');
+    title.textContent = '群组专属研究提示词';
+    const meta = document.createElement('small');
+    meta.textContent = 'research · 尚未创建';
+    button.append(title, meta);
+    button.addEventListener('click', () => selectPromptDefinition('research.chat.group', promptCenterState.chatId));
+    list.append(button);
     const option = document.createElement('option');
     option.value = `research.chat.group|${promptCenterState.chatId}`;
-    option.textContent = '群组专属研究提示词（待导入）';
+    option.textContent = '群组专属研究提示词（尚未创建）';
     select.append(option);
   }
   if (!select.dataset.bound) {
@@ -1912,7 +1923,7 @@ async function selectPromptDefinition(promptKey, chatId = null) {
     promptCenterState.tested = false;
     renderPromptDetail();
   } catch (error) {
-    if (promptKey === 'research.chat.group' && chatId && loadGroupPrompt(chatId)) {
+    if (promptKey === 'research.chat.group' && chatId) {
       renderLegacyGroupPromptImport(chatId);
       return;
     }
@@ -1937,6 +1948,14 @@ function renderPromptDetail() {
   detail.querySelector('[data-ai-prompt-change-note]').value = item.draft_version?.change_note || '';
   detail.querySelector('[data-ai-prompt-publish]').disabled = !promptCenterState.validated;
   detail.querySelector('[data-ai-prompt-import-legacy]').hidden = true;
+  const isTrading = item.category === 'trading';
+  const isVision = item.prompt_key === 'trading.analysis.mimo_vision';
+  detail.querySelector('[data-ai-prompt-test]').disabled = !isTrading;
+  detail.querySelector('[data-ai-prompt-test-controls]').hidden = !isTrading;
+  detail.querySelectorAll('[data-ai-prompt-test-model]').forEach((input) => {
+    input.disabled = !isTrading || (isVision && input.value === 'deepseek');
+    input.checked = isTrading && (input.value === 'mimo' || !isVision);
+  });
   detail.querySelectorAll('[data-ai-prompt-view]').forEach((button) => {
     button.classList.toggle('is-active', button.dataset.aiPromptView === 'draft');
   });
@@ -1955,10 +1974,17 @@ function renderLegacyGroupPromptImport(chatId) {
   promptCenterState.selected = { prompt_key: 'research.chat.group', scope_chat_id: chatId };
   detail.hidden = false;
   detail.querySelector('[data-ai-prompt-title]').textContent = '群组专属研究提示词';
-  detail.querySelector('[data-ai-prompt-description]').textContent = '检测到浏览器旧版群组提示词，可导入服务器草稿。';
-  detail.querySelector('[data-ai-prompt-draft]').value = loadGroupPrompt(chatId);
-  detail.querySelector('[data-ai-prompt-import-legacy]').hidden = false;
-  setPromptCenterStatus('旧版提示词不会自动发布');
+  const legacy = loadGroupPrompt(chatId);
+  detail.querySelector('[data-ai-prompt-description]').textContent = legacy
+    ? '检测到浏览器旧版群组提示词，可导入服务器草稿。'
+    : '为当前群组创建专属研究提示词；保存后仍需校验和发布。';
+  detail.querySelector('[data-ai-prompt-draft]').value = legacy;
+  const action = detail.querySelector('[data-ai-prompt-import-legacy]');
+  action.hidden = false;
+  action.textContent = legacy ? '导入为草稿' : '创建群组草稿';
+  detail.querySelector('[data-ai-prompt-test]').disabled = true;
+  detail.querySelector('[data-ai-prompt-test-controls]').hidden = true;
+  setPromptCenterStatus(legacy ? '旧版提示词不会自动发布' : '尚未创建');
 }
 
 function promptDiffSummary(item) {
@@ -1996,7 +2022,8 @@ function bindAiPromptCenter() {
       const detail = await promptApiRequest(promptApiPath(item.prompt_key, 'draft', selectedPromptChatId(item)), {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content: editor.value, change_note: root.querySelector('[data-ai-prompt-change-note]').value,
-          expected_active_version_id: item.active_version?.id }),
+          expected_active_version_id: item.active_version?.id,
+          expected_draft_updated_at: item.draft_version?.updated_at }),
       });
       promptCenterState.selected = detail;
       promptCenterState.validated = false;
@@ -2009,7 +2036,8 @@ function bindAiPromptCenter() {
     try {
       const result = await promptApiRequest(promptApiPath(item.prompt_key, 'validate', selectedPromptChatId(item)), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ expected_draft_version_id: item.draft_version?.id }),
+        body: JSON.stringify({ expected_draft_version_id: item.draft_version?.id,
+          expected_active_version_id: item.active_version?.id }),
       });
       promptCenterState.validated = result.success;
       root.querySelector('[data-ai-prompt-publish]').disabled = !result.success;
@@ -2057,7 +2085,9 @@ function bindAiPromptCenter() {
     try {
       await promptApiRequest(promptApiPath(item.prompt_key, 'draft', item.scope_chat_id), {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: loadGroupPrompt(item.scope_chat_id), change_note: '从旧版浏览器群组提示词导入' }),
+        body: JSON.stringify({ content: editor.value,
+          change_note: loadGroupPrompt(item.scope_chat_id)
+            ? '从旧版浏览器群组提示词导入' : '创建群组专属研究提示词' }),
       });
       setPromptCenterStatus('已导入为草稿，未发布');
       loadAiPromptCenter();
@@ -2305,7 +2335,6 @@ function getAiProviderKeyStorageKey({ target, baseUrl, model }) {
 
 function buildAiRecognitionConfigPayload() {
   const value = (selector) => document.querySelector(selector)?.value || '';
-  const promptValues = collectAiPromptValues();
   const aiModels = collectAiModelConfigs();
   const activeTextModelId = value('[data-active-text-model-id]');
   const activeImageModelId = value('[data-active-image-model-id]');
@@ -2313,9 +2342,6 @@ function buildAiRecognitionConfigPayload() {
   const activeImageModel = aiModels.find((model) => model.id === activeImageModelId) || null;
   return {
     mode: 'ai_provider',
-    recognition_prompt: promptValues.recognition_prompt || value('[data-ai-recognition-prompt-input]'),
-    lifecycle_event_prompt: promptValues.lifecycle_event_prompt || value('[data-ai-lifecycle-event-prompt-input]'),
-    mimo_direct_prompt: promptValues.mimo_direct_prompt || value('[data-ai-mimo-direct-prompt-input]'),
     active_text_model_id: activeTextModelId,
     active_image_model_id: activeImageModelId,
     ai_models: aiModels,

@@ -16,6 +16,7 @@ from telegram_kol_research.message_recognition import (
     recognize_message_now,
 )
 from telegram_kol_research.models import (
+    AiPromptInvocation,
     ExecutionBinding,
     MediaAsset,
     MessageRecognition,
@@ -260,11 +261,13 @@ def test_ai_text_recognition_preserves_labeled_entry_price_when_model_returns_ma
         candidate = session.query(SignalCandidate).one()
         lifecycle = session.query(StrategyLifecycle).one()
         recognition = session.query(MessageRecognition).one()
+        invocation = session.query(AiPromptInvocation).one()
 
     assert candidate.entry_text == expected_entry
     assert lifecycle.entry_range_low == 1730
     assert lifecycle.entry_range_high == 1730
     assert f"Entry {expected_entry}" in (recognition.summary or "")
+    assert invocation.feature == "message_recognition"
 
 
 def test_ensure_lifecycle_record_deduplicates_recent_active_same_strategy(tmp_path):

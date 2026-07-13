@@ -239,6 +239,12 @@ class AiPromptTestRun(Base):
         index=True,
     )
     model: Mapped[str] = mapped_column(String(128), nullable=False)
+    model_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="unknown"
+    )
+    active_prompt_versions_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     active_result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     draft_result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

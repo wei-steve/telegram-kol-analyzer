@@ -34,6 +34,7 @@ from telegram_kol_research.recognition_experiments import (
     _find_mimo_model,
     _is_image_asset,
     _media_asset_to_data_url,
+    _validate_authoritative_payload,
 )
 
 
@@ -76,9 +77,11 @@ def run_prompt_draft_test(
 
     shared = resolve_active_prompt(session_factory, SHARED_TRADING_PROMPT)
     vision = resolve_active_prompt(session_factory, MIMO_VISION_PROMPT)
+    active_prompt_versions = {SHARED_TRADING_PROMPT: shared.version_id}
     active_parts = [shared.content]
     draft_parts = [shared.content]
     if model_kind == "mimo":
+        active_prompt_versions[MIMO_VISION_PROMPT] = vision.version_id
         active_parts.append(vision.content)
         draft_parts.append(vision.content)
     if prompt_key == SHARED_TRADING_PROMPT:
@@ -126,6 +129,7 @@ def run_prompt_draft_test(
                 config=ai_recognition_config,
                 media_root=media_root,
             )
+            _validate_authoritative_payload(active_payload)
             draft_payload = caller(
                 model_kind=model_kind,
                 system_prompt="\n\n".join(draft_parts),
@@ -135,6 +139,7 @@ def run_prompt_draft_test(
                 config=ai_recognition_config,
                 media_root=media_root,
             )
+            _validate_authoritative_payload(draft_payload)
             _, differences = compare_assessments(active_payload, draft_payload)
         except Exception as exc:
             error_message = str(exc)
@@ -144,6 +149,10 @@ def run_prompt_draft_test(
             draft_version_id=draft_version_id,
             raw_message_id=raw_message_id,
             model=model,
+            model_kind=model_kind,
+            active_prompt_versions_json=json.dumps(
+                active_prompt_versions, ensure_ascii=False, sort_keys=True
+            ),
             status="failed" if error_message else "completed",
             active_result_json=json.dumps(active_payload, ensure_ascii=False, sort_keys=True),
             draft_result_json=json.dumps(draft_payload, ensure_ascii=False, sort_keys=True),

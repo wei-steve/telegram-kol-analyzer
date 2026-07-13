@@ -104,11 +104,30 @@ def validate_prompt_content(
         return PromptValidationResult(False, tuple(errors))
 
     if validation_profile == "trading_shared":
-        for marker in ('"recognition_result"', '"strategy"', '"lifecycle_event"'):
+        required_schema_markers = (
+            '"recognition_result"', '"reason"', '"strategy"', '"symbol"',
+            '"side"', '"entry"', '"stop_loss"', '"take_profit"',
+            '"leverage"', '"order_type"', '"lifecycle_event"',
+            '"event_type"', '"target_lifecycle_id"', '"management_action"',
+            '"input_reading"', '"observed_text"', '"image_quality"',
+            '"confidence"',
+        )
+        for marker in required_schema_markers:
             if marker not in normalized:
                 errors.append(f"统一交易模板缺少必需字段 {marker}")
+        for enum_value in (
+            "entry_confirm", "cancel_entry", "exit_position", "position_update",
+            "none", "market", "limit", "long", "short",
+        ):
+            if enum_value not in normalized:
+                errors.append(f"统一交易模板缺少必需枚举 {enum_value}")
     elif validation_profile == "mimo_vision":
-        if '"recognition_result"' in normalized or '"lifecycle_event"' in normalized:
+        forbidden_contract_markers = (
+            '"recognition_result"', '"strategy"', '"lifecycle_event"',
+            '"event_type"', '"input_reading"', "只输出一个 JSON",
+            "只输出 JSON", "Return JSON", "JSON 对象",
+        )
+        if any(marker in normalized for marker in forbidden_contract_markers):
             errors.append("MiMo 图片模板不能重新定义统一输出结构")
         if not any(
             marker in normalized.lower()

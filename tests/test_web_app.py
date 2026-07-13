@@ -1706,7 +1706,7 @@ def test_strategy_mid_panel_logs_route_timings(tmp_path, caplog):
     assert "holding_ms=" in caplog.text
 
 
-def test_ai_recognition_config_api_saves_prompt(tmp_path):
+def test_ai_recognition_config_api_ignores_legacy_prompt_fields(tmp_path):
     config_path = tmp_path / "ai_recognition.yaml"
     app = create_web_app(
         database_path=tmp_path / "research.db",
@@ -1724,18 +1724,17 @@ def test_ai_recognition_config_api_saves_prompt(tmp_path):
     )
 
     assert response.status_code == 200
-    assert response.json()["recognition_prompt"].startswith("只识别明确策略。")
-    assert response.json()["lifecycle_event_prompt"].startswith("识别生命周期事件。")
-    assert "价格简写" in response.json()["lifecycle_event_prompt"]
-    assert response.json()["mimo_direct_prompt"].startswith("直接阅读图片和文字。")
-    assert "\u5386\u53f2\u7b56\u7565\u622a\u56fe" in response.json()["mimo_direct_prompt"]
+    assert "recognition_prompt" not in response.json()
+    assert "lifecycle_event_prompt" not in response.json()
+    assert "mimo_direct_prompt" not in response.json()
+    assert "prompts" not in response.json()
     page = client.get("/")
-    assert "只识别明确策略。" in page.text
-    assert "识别生命周期事件。" in page.text
-    assert "直接阅读图片和文字。" in page.text
+    assert "只识别明确策略。" not in page.text
+    assert "识别生命周期事件。" not in page.text
+    assert "直接阅读图片和文字。" not in page.text
 
 
-def test_index_page_renders_registered_ai_prompts(tmp_path):
+def test_index_page_renders_prompt_registry_without_legacy_prompt_inputs(tmp_path):
     config_path = tmp_path / "ai_recognition.yaml"
     app = create_web_app(
         database_path=tmp_path / "research.db",
@@ -1746,18 +1745,13 @@ def test_index_page_renders_registered_ai_prompts(tmp_path):
     response = client.get("/")
 
     assert response.status_code == 200
-    assert 'data-ai-prompt-id="recognition_prompt"' in response.text
-    assert 'data-ai-prompt-id="lifecycle_event_prompt"' in response.text
-    assert 'data-ai-prompt-id="mimo_direct_prompt"' in response.text
-    assert 'data-ai-prompt-input="recognition_prompt"' in response.text
-    assert 'data-ai-prompt-input="lifecycle_event_prompt"' in response.text
-    assert 'data-ai-prompt-input="mimo_direct_prompt"' in response.text
-    assert 'name="recognition_prompt"' in response.text
-    assert 'name="lifecycle_event_prompt"' in response.text
-    assert 'name="mimo_direct_prompt"' in response.text
+    assert "data-ai-prompt-center" in response.text
+    assert 'data-ai-prompt-input="recognition_prompt"' not in response.text
+    assert 'data-ai-prompt-input="lifecycle_event_prompt"' not in response.text
+    assert 'data-ai-prompt-input="mimo_direct_prompt"' not in response.text
 
 
-def test_ai_recognition_config_api_returns_registered_ai_prompts(tmp_path):
+def test_ai_recognition_config_api_does_not_return_legacy_prompt_authority(tmp_path):
     config_path = tmp_path / "ai_recognition.yaml"
     app = create_web_app(
         database_path=tmp_path / "research.db",
@@ -1775,12 +1769,8 @@ def test_ai_recognition_config_api_returns_registered_ai_prompts(tmp_path):
     )
 
     assert response.status_code == 200
-    prompt_ids = {item["id"] for item in response.json()["prompts"]}
-    assert {"recognition_prompt", "lifecycle_event_prompt", "mimo_direct_prompt"} <= prompt_ids
-    prompt_values = {item["id"]: item["value"] for item in response.json()["prompts"]}
-    assert prompt_values["recognition_prompt"].startswith("Only strict strategies.")
-    assert prompt_values["lifecycle_event_prompt"].startswith("Only lifecycle events.")
-    assert prompt_values["mimo_direct_prompt"].startswith("Only multimodal strategies.")
+    assert "prompts" not in response.json()
+    assert "recognition_prompt" not in response.json()
 
 
 def test_ai_recognition_config_api_saves_mimo_provider(tmp_path):

@@ -397,6 +397,12 @@ def test_run_mimo_direct_experiment_persists_side_channel_only(tmp_path, monkeyp
         assert experiment.confidence == 0.9
         assert session.query(MessageRecognition).count() == 0
         assert session.query(SignalCandidate).count() == 0
+        invocation = session.query(AiPromptInvocation).one()
+        assert invocation.feature == "recognition_experiment"
+        assert set(json.loads(invocation.prompt_versions_json)) == {
+            SHARED_TRADING_PROMPT,
+            MIMO_VISION_PROMPT,
+        }
 
 
 def test_run_mimo_direct_for_message_persists_text_side_channel(tmp_path, monkeypatch):
@@ -495,6 +501,7 @@ def test_run_mimo_direct_for_message_persists_text_side_channel(tmp_path, monkey
         assert experiment.observed_text == "SOL short 73 SL 75 TP 70"
         assert session.query(MessageRecognition).count() == 0
         assert session.query(SignalCandidate).count() == 0
+        assert session.query(AiPromptInvocation).one().feature == "recognition_experiment"
 
 
 def test_run_mimo_direct_for_message_omits_empty_strategy_json(tmp_path, monkeypatch):

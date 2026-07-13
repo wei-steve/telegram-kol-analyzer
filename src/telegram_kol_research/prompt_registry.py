@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy import func
 from sqlalchemy.orm import sessionmaker
@@ -11,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.models import (
     AiPromptDefinition,
     AiPromptInvocation,
+    AiPromptTestRun,
     AiPromptVersion,
     utc_now,
 )
@@ -288,6 +290,7 @@ def save_prompt_draft(
     change_note: str,
     chat_id: int | None = None,
     expected_active_version_id: int | None = None,
+    expected_draft_updated_at: datetime | None = None,
 ) -> PromptDetail:
     normalized = content.strip()
     if not normalized:
@@ -307,6 +310,8 @@ def save_prompt_draft(
             .one_or_none()
         )
         if draft is None:
+            if expected_draft_updated_at is not None:
+                raise PromptRegistryConflict("draft version changed")
             max_version = (
                 session.query(func.max(AiPromptVersion.version_number))
                 .filter(AiPromptVersion.prompt_definition_id == definition.id)
@@ -324,11 +329,21 @@ def save_prompt_draft(
             )
             session.add(draft)
         else:
+            if (
+                expected_draft_updated_at is None
+                or draft.updated_at != expected_draft_updated_at
+            ):
+                raise PromptRegistryConflict("draft version changed")
+            content_changed = draft.content != normalized
             draft.content = normalized
             draft.change_note = change_note.strip() or None
             draft.updated_at = now
-            draft.validated_at = None
-            draft.validation_result_json = None
+            if content_changed:
+                draft.validated_at = None
+                draft.validation_result_json = None
+                session.query(AiPromptTestRun).filter(
+                    AiPromptTestRun.draft_version_id == draft.id
+                ).delete(synchronize_session=False)
         definition.updated_at = now
         session.commit()
         return _load_detail(session, definition)
@@ -339,11 +354,14 @@ def publish_prompt_draft(
     prompt_key: str,
     *,
     expected_draft_version_id: int,
+    expected_active_version_id: int,
     chat_id: int | None = None,
 ) -> PromptDetail:
     now = utc_now()
     with session_factory() as session:
         definition = _get_definition(session, prompt_key, chat_id)
+        if definition.active_version_id != expected_active_version_id:
+            raise PromptRegistryConflict("active version changed")
         draft = (
             session.query(AiPromptVersion)
             .filter(AiPromptVersion.prompt_definition_id == definition.id)
@@ -352,6 +370,8 @@ def publish_prompt_draft(
         )
         if draft is None or draft.id != expected_draft_version_id:
             raise PromptRegistryConflict("draft version changed")
+        if not (draft.change_note or "").strip():
+            raise PromptRegistryValidationError("change note is required")
         validation_result = (
             json.loads(draft.validation_result_json)
             if draft.validation_result_json

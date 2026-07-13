@@ -87,6 +87,7 @@ def run_mimo_direct_experiment(
     model_config = _find_mimo_model(config)
     if model_config is None or not model_config.provider.is_configured:
         raise RuntimeError("MiMo model is not configured in AI config.")
+    composition = _build_mimo_experiment_prompt(session_factory, config)
 
     stats = ExperimentRunStats()
     with session_factory() as session:
@@ -109,12 +110,13 @@ def run_mimo_direct_experiment(
             if actual_input_kind == "empty":
                 stats = _replace(stats, skipped_no_input=stats.skipped_no_input + 1)
                 continue
+            error_message: str | None = None
             try:
                 payload = _call_mimo_direct_model(
                     raw_message=raw_message,
                     media_assets=media_assets,
                     model_config=model_config,
-                    prompt=_build_mimo_experiment_prompt(session_factory, config),
+                    prompt=composition.system_prompt,
                     media_root=media_root,
                 )
                 _upsert_experiment_result(
@@ -127,16 +129,30 @@ def run_mimo_direct_experiment(
                 )
                 stats = _replace(stats, succeeded=stats.succeeded + 1)
             except Exception as exc:
+                error_message = str(exc)
                 _upsert_experiment_result(
                     session,
                     raw_message=raw_message,
                     model_config=model_config,
                     input_kind=actual_input_kind,
                     payload={},
-                    error_message=str(exc),
+                    error_message=error_message,
                 )
                 stats = _replace(stats, failed=stats.failed + 1)
             session.commit()
+            record_prompt_invocation(
+                session_factory,
+                PromptInvocationRecord(
+                    feature="recognition_experiment",
+                    correlation_key=f"experiment:{raw_message.id}:mimo_direct",
+                    raw_message_id=raw_message.id,
+                    chat_id=raw_message.chat_id,
+                    model=model_config.model,
+                    prompt_versions=composition.version_map,
+                    status="failed" if error_message else "completed",
+                    error_message=error_message,
+                ),
+            )
     return stats
 
 
@@ -152,6 +168,7 @@ def run_mimo_direct_for_message(
     model_config = _find_mimo_model(config)
     if model_config is None or not model_config.provider.is_configured:
         return None
+    composition = _build_mimo_experiment_prompt(session_factory, config)
 
     with session_factory() as session:
         raw_message = session.get(RawMessage, raw_message_id)
@@ -166,12 +183,13 @@ def run_mimo_direct_for_message(
         input_kind = _resolve_input_kind(raw_message, media_assets, media_root=media_root)
         if input_kind == "empty":
             return None
+        error_message: str | None = None
         try:
             payload = _call_mimo_direct_model(
                 raw_message=raw_message,
                 media_assets=media_assets,
                 model_config=model_config,
-                prompt=_build_mimo_experiment_prompt(session_factory, config),
+                prompt=composition.system_prompt,
                 media_root=media_root,
             )
             result = _upsert_experiment_result(
@@ -183,17 +201,31 @@ def run_mimo_direct_for_message(
                 error_message=None,
             )
         except Exception as exc:
+            error_message = str(exc)
             result = _upsert_experiment_result(
                 session,
                 raw_message=raw_message,
                 model_config=model_config,
                 input_kind=input_kind,
                 payload={},
-                error_message=str(exc),
+                error_message=error_message,
             )
         session.commit()
         session.refresh(result)
         session.expunge(result)
+        record_prompt_invocation(
+            session_factory,
+            PromptInvocationRecord(
+                feature="recognition_experiment",
+                correlation_key=f"experiment:{raw_message.id}:mimo_direct",
+                raw_message_id=raw_message.id,
+                chat_id=raw_message.chat_id,
+                model=model_config.model,
+                prompt_versions=composition.version_map,
+                status="failed" if error_message else "completed",
+                error_message=error_message,
+            ),
+        )
         return result
 
 
@@ -474,7 +506,7 @@ def _build_authoritative_context(session, raw_message: RawMessage) -> str:
 def build_authoritative_context_for_message(
     session_factory: sessionmaker,
     raw_message_id: int,
-) -> str:
+) -> Any:
     with session_factory() as session:
         raw_message = session.get(RawMessage, raw_message_id)
         if raw_message is None:
@@ -580,7 +612,7 @@ def _build_mimo_experiment_prompt(
         session_factory,
         model_kind="mimo",
         context="",
-    ).system_prompt
+    )
 
 
 def _has_meaningful_strategy_fields(strategy: dict[str, Any]) -> bool:
