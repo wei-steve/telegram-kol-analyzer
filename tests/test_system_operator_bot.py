@@ -1,9 +1,14 @@
+import asyncio
+
+import telegram_kol_research.system_operator_bot as operator_bot_module
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
     build_pending_entry_expiry_review_reply_markup,
     format_ai_recognition_conflict_review_message,
+    format_semantic_disagreement_notification,
     format_pending_entry_expiry_review_message,
     load_system_operator_bot_config,
+    send_semantic_disagreement_notification,
     system_operator_bot_enabled,
 )
 from telegram_kol_research.db import create_session_factory
@@ -92,6 +97,90 @@ def test_format_ai_recognition_conflict_review_message_includes_both_model_resul
     assert "已按 MiMo 结果继续" in message
     assert "已暂停" not in message
     assert "今日两次BTC策略都没有入场" in message
+
+
+def test_format_semantic_disagreement_notification_is_critical_and_evidence_backed():
+    message = format_semantic_disagreement_notification(
+        {
+            "chat_title": "峰哥高级会员群-11分组",
+            "chat_id": -1001,
+            "message_id": 8401,
+            "posted_at": datetime(2026, 7, 13, 8, 1, tzinfo=UTC),
+            "text": "现价62800附近出局，空仓等待。",
+            "mimo": {
+                "status": "exit_full",
+                "reason": "原文要求全部出局",
+            },
+            "deepseek": {
+                "status": "exit_partial",
+                "reason": "独立复核认为只是部分止盈",
+                "evidence": ["现价62800附近出局", "空仓等待"],
+            },
+            "automation": {
+                "status": "submitted",
+                "reason": "close_position",
+            },
+            "conflict_types": ["full_vs_partial_exit"],
+        }
+    )
+
+    assert "【AI语义严重分歧】" in message
+    assert "原始来源: 峰哥高级会员群-11分组 / -1001 / #8401" in message
+    assert "权威结果: MiMo / exit_full / 原文要求全部出局" in message
+    assert "自动化结果: submitted / close_position" in message
+    assert "复核结果: DeepSeek / exit_partial / 独立复核认为只是部分止盈" in message
+    assert "冲突类型: full_vs_partial_exit" in message
+    assert "依据: 现价62800附近出局；空仓等待" in message
+    assert "已按MiMo结果继续，未等待人工复核" in message
+    assert "消息已处理，不需要审批" in message
+
+
+def test_format_semantic_disagreement_notification_truncates_source_and_evidence():
+    source = "原文" + "甲" * 2_000 + "SOURCE_END"
+    evidence = "证据" + "乙" * 2_000 + "EVIDENCE_END"
+
+    message = format_semantic_disagreement_notification(
+        {
+            "text": source,
+            "mimo": {"status": "exit_full"},
+            "deepseek": {"status": "exit_partial", "evidence": [evidence]},
+            "automation": {"status": "submitted", "reason": "close_position"},
+            "conflict_types": ["full_vs_partial_exit"],
+        }
+    )
+
+    assert "SOURCE_END" not in message
+    assert "EVIDENCE_END" not in message
+    assert message.count("...") >= 2
+    assert len(message) < 3_000
+
+
+def test_send_semantic_disagreement_notification_is_read_only(monkeypatch):
+    sent = []
+
+    async def fake_send(**kwargs):
+        sent.append(kwargs)
+
+    monkeypatch.setattr(operator_bot_module, "send_system_operator_bot_message", fake_send)
+    config = SystemOperatorBotConfig(bot_token="token", chat_id="chat")
+
+    asyncio.run(
+        send_semantic_disagreement_notification(
+            config=config,
+            payload={
+                "text": "全部出局",
+                "mimo": {"status": "exit_full"},
+                "deepseek": {"status": "none", "evidence": ["全部出局"]},
+                "automation": {"status": "submitted", "reason": "close_position"},
+                "conflict_types": ["urgent_exit_missed"],
+            },
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0]["config"] is config
+    assert sent[0].get("reply_markup") is None
+    assert "inline_keyboard" not in sent[0]
 
 
 def test_bot_http_timeout_allows_long_polling_read_to_finish():

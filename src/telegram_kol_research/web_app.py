@@ -109,7 +109,10 @@ from telegram_kol_research.recovery_live_submit import submit_recovery_order_liv
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_runner import run_recovery_dry_run
-from telegram_kol_research.semantic_disagreement_review import run_semantic_review_loop
+from telegram_kol_research.semantic_disagreement_review import (
+    normalize_mimo_action,
+    run_semantic_review_loop,
+)
 from telegram_kol_research.strategy_alerts import (
     StrategyAlertConfig,
     load_strategy_alert_config,
@@ -120,6 +123,7 @@ from telegram_kol_research.system_operator_bot import (
     load_system_operator_bot_config,
     send_ai_recognition_conflict_review,
     send_pending_entry_expiry_review,
+    send_semantic_disagreement_notification,
     system_operator_bot_enabled,
 )
 from telegram_kol_research.time_utils import DEFAULT_LOCAL_TIMEZONE
@@ -215,10 +219,22 @@ def _build_semantic_review_notifier(app: FastAPI):
                 authoritative_payload = json.loads(raw_payload or "{}")
             except (TypeError, ValueError):
                 authoritative_payload = {}
+            persisted_review_payload: dict[str, Any] | None = None
+            if decision is not None and decision.comparison_payload_json:
+                try:
+                    candidate = json.loads(decision.comparison_payload_json)
+                except (TypeError, ValueError):
+                    candidate = None
+                if isinstance(candidate, dict):
+                    persisted_review_payload = candidate
             review_payload = (
-                review.review_payload
-                if isinstance(review.review_payload, dict)
-                else review.auxiliary_payload
+                persisted_review_payload
+                if persisted_review_payload is not None
+                else (
+                    review.review_payload
+                    if isinstance(review.review_payload, dict)
+                    else review.auxiliary_payload
+                )
             )
             independent_action = review_payload.get("independent_action")
             if not isinstance(independent_action, dict):
@@ -229,19 +245,20 @@ def _build_semantic_review_notifier(app: FastAPI):
             payload = {
                 "chat_id": raw_message.chat_id,
                 "message_id": raw_message.message_id,
+                "sender_name": raw_message.sender_name,
                 "posted_at": raw_message.posted_at,
                 "text": raw_message.text,
                 "agreement_status": review.decision.agreement_status,
+                "conflict_types": list(review.decision.conflict_types),
                 "deepseek": {
                     "status": independent_action.get("action_type") or "none",
                     "kind": "semantic_review",
                     "reason": review_payload.get("reason") or "-",
                     "evidence": evidence,
+                    "conflict_types": list(review.decision.conflict_types),
                 },
                 "mimo": {
-                    "status": (
-                        decision.authoritative_status if decision is not None else "-"
-                    ),
+                    "status": normalize_mimo_action(authoritative_payload)["action_type"],
                     "kind": "authoritative",
                     "reason": authoritative_payload.get("reason") or "-",
                 },
@@ -250,7 +267,7 @@ def _build_semantic_review_notifier(app: FastAPI):
                     "reason": decision.automation_reason if decision is not None else None,
                 },
             }
-        await send_ai_recognition_conflict_review(config=config, payload=payload)
+        await send_semantic_disagreement_notification(config=config, payload=payload)
 
     return notify
 

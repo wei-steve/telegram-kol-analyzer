@@ -80,12 +80,20 @@ def format_pending_entry_expiry_review_message(payload: dict[str, Any]) -> str:
 
 
 def format_ai_recognition_conflict_review_message(payload: dict[str, Any]) -> str:
-    deepseek = payload.get("deepseek") if isinstance(payload.get("deepseek"), dict) else {}
+    deepseek = (
+        payload.get("deepseek")
+        if isinstance(payload.get("deepseek"), dict)
+        else {}
+    )
     mimo = payload.get("mimo") if isinstance(payload.get("mimo"), dict) else {}
     text = str(payload.get("text") or "").strip()
     if len(text) > 700:
         text = text[:697] + "..."
-    automation = payload.get("automation") if isinstance(payload.get("automation"), dict) else {}
+    automation = (
+        payload.get("automation")
+        if isinstance(payload.get("automation"), dict)
+        else {}
+    )
     agreement_status = str(payload.get("agreement_status") or "disagreed")
     if agreement_status == "authoritative_failed":
         handling = "处理: MiMo 权威识别失败，未执行自动交易；DeepSeek 结果仅供参考。"
@@ -106,6 +114,64 @@ def format_ai_recognition_conflict_review_message(payload: dict[str, Any]) -> st
         handling,
         "原文:",
         text or "-",
+    ]
+    return "\n".join(lines)
+
+
+def format_semantic_disagreement_notification(payload: dict[str, Any]) -> str:
+    """Format a final critical semantic review as a read-only audit notice."""
+
+    deepseek = payload.get("deepseek") if isinstance(payload.get("deepseek"), dict) else {}
+    mimo = payload.get("mimo") if isinstance(payload.get("mimo"), dict) else {}
+    automation = payload.get("automation") if isinstance(payload.get("automation"), dict) else {}
+    evidence = deepseek.get("evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    grounded_evidence = "；".join(
+        str(item).strip() for item in evidence if str(item).strip()
+    )
+    conflict_types = payload.get("conflict_types")
+    if not isinstance(conflict_types, list):
+        conflict_types = deepseek.get("conflict_types")
+    if not isinstance(conflict_types, list):
+        conflict_types = []
+    conflicts = ", ".join(
+        str(item).strip() for item in conflict_types if str(item).strip()
+    )
+    source_label = (
+        payload.get("chat_title")
+        or payload.get("group_label")
+        or payload.get("sender_name")
+        or "-"
+    )
+    source = (
+        f"{source_label} / {payload.get('chat_id') or '-'} / "
+        f"#{payload.get('message_id') or '-'}"
+    )
+    lines = [
+        "【AI语义严重分歧】",
+        f"原始来源: {source}",
+        f"时间: {_format_local_time(payload.get('posted_at'))}",
+        (
+            "权威结果: MiMo / "
+            f"{_format_value(mimo.get('status'))} / "
+            f"{_truncate_text(mimo.get('reason'), limit=400)}"
+        ),
+        (
+            "自动化结果: "
+            f"{_format_value(automation.get('status'))} / "
+            f"{_truncate_text(automation.get('reason'), limit=400)}"
+        ),
+        (
+            "复核结果: DeepSeek / "
+            f"{_format_value(deepseek.get('status'))} / "
+            f"{_truncate_text(deepseek.get('reason'), limit=400)}"
+        ),
+        f"冲突类型: {_truncate_text(conflicts, limit=400)}",
+        f"依据: {_truncate_text(grounded_evidence, limit=700)}",
+        "处理状态: 已按MiMo结果继续，未等待人工复核；消息已处理，不需要审批。",
+        "原文:",
+        _truncate_text(payload.get("text"), limit=900),
     ]
     return "\n".join(lines)
 
@@ -178,6 +244,18 @@ async def send_ai_recognition_conflict_review(
     )
 
 
+async def send_semantic_disagreement_notification(
+    *,
+    config: SystemOperatorBotConfig,
+    payload: dict[str, Any],
+) -> None:
+    await send_system_operator_bot_message(
+        config=config,
+        text=format_semantic_disagreement_notification(payload),
+        reply_markup=None,
+    )
+
+
 def _format_range(low: Any, high: Any) -> str:
     if low is None and high is None:
         return "-"
@@ -194,6 +272,15 @@ def _format_value(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value)
+
+
+def _truncate_text(value: Any, *, limit: int) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
 
 
 def _format_local_time(value: Any) -> str:

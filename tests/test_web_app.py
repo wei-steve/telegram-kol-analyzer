@@ -26,6 +26,7 @@ from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import RecognitionDecision
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import SignalCandidate
@@ -129,6 +130,30 @@ def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypa
                 text="BTC 全部出局",
             )
             session.add(raw_message)
+            session.flush()
+            session.add(
+                RecognitionDecision(
+                    raw_message_id=raw_message.id,
+                    input_kind="text",
+                    authoritative_model="mimo-v2.5",
+                    authoritative_status="非策略",
+                    authoritative_payload_json=json.dumps(
+                        {
+                            "reason": "MiMo 识别为空仓退出",
+                            "lifecycle_event": {"event_type": "exit_position"},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    agreement_status="disagreed",
+                    differences_json='["full_vs_partial_exit"]',
+                    automation_status="submitted",
+                    automation_reason="close_position",
+                    prompt_versions_json="{}",
+                    comparison_status="completed",
+                    disagreement_severity="critical",
+                    comparison_payload_json="{}",
+                )
+            )
             session.commit()
             raw_message_id = raw_message.id
         review_payload = {
@@ -148,6 +173,14 @@ def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypa
             "confidence": 0.99,
             "reason": "DeepSeek 独立复核认为需要退出",
         }
+        with app.state.session_factory() as session:
+            decision = session.query(RecognitionDecision).filter_by(
+                raw_message_id=raw_message_id
+            ).one()
+            decision.comparison_payload_json = json.dumps(
+                review_payload, ensure_ascii=False
+            )
+            session.commit()
         await kwargs["notifier"](
             raw_message_id=raw_message_id,
             review=SemanticReviewRun(
@@ -169,7 +202,7 @@ def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypa
         await asyncio.Event().wait()
 
     monkeypatch.setattr(
-        "telegram_kol_research.web_app.send_ai_recognition_conflict_review",
+        "telegram_kol_research.web_app.send_semantic_disagreement_notification",
         fake_sender,
     )
     app = create_web_app(
@@ -185,12 +218,24 @@ def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypa
     assert sent[0]["config"] is bot_config
     assert sent[0]["payload"]["chat_id"] == 88
     assert sent[0]["payload"]["message_id"] == 12
+    assert sent[0]["payload"]["sender_name"] == "Demo"
     assert sent[0]["payload"]["text"] == "BTC 全部出局"
     assert sent[0]["payload"]["deepseek"] == {
         "status": "exit_full",
         "kind": "semantic_review",
         "reason": "DeepSeek 独立复核认为需要退出",
         "evidence": ["全部出局"],
+        "conflict_types": ["urgent_exit_missed"],
+    }
+    assert sent[0]["payload"]["conflict_types"] == ["urgent_exit_missed"]
+    assert sent[0]["payload"]["mimo"] == {
+        "status": "exit_full",
+        "kind": "authoritative",
+        "reason": "MiMo 识别为空仓退出",
+    }
+    assert sent[0]["payload"]["automation"] == {
+        "status": "submitted",
+        "reason": "close_position",
     }
 
 

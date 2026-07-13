@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from datetime import datetime, timedelta
 
@@ -10,6 +11,7 @@ from telegram_kol_research.models import RawMessage, RecognitionDecision
 from telegram_kol_research.recognition_decisions import claim_next_semantic_review
 import telegram_kol_research.semantic_disagreement_review as review_module
 from telegram_kol_research.semantic_disagreement_review import (
+    SemanticReviewDecision,
     SemanticReviewRun,
     decide_semantic_severity,
     run_semantic_review_loop,
@@ -196,7 +198,7 @@ def test_worker_notifies_only_critical(tmp_path):
     ))
     assert notified == [raw_id]
 
-    second_factory, second_id, second_mimo = _setup(tmp_path / "normal")
+    second_factory, second_id, second_mimo = _setup(tmp_path / "none")
     asyncio.run(run_semantic_review_once(
         second_factory,
         config=AiRecognitionConfig(),
@@ -205,6 +207,194 @@ def test_worker_notifies_only_critical(tmp_path):
         now=NOW,
     ))
     assert notified == [raw_id]
+
+
+def test_worker_does_not_notify_final_normal_review(tmp_path):
+    factory, raw_id, mimo = _setup(tmp_path)
+    run = SemanticReviewRun(
+        raw_message_id=raw_id,
+        model="deepseek-review",
+        review_payload=_review_payload(),
+        auxiliary_payload={"recognition_result": "非策略"},
+        decision=SemanticReviewDecision(
+            agreement_status="disagreed",
+            severity="normal",
+            conflict_types=("wording_only",),
+            differences=("reason",),
+            reason="non-material wording difference",
+        ),
+        prompt_versions={"trading.disagreement.semantic_review": 8},
+    )
+    notified = []
+
+    asyncio.run(run_semantic_review_once(
+        factory,
+        config=AiRecognitionConfig(),
+        notifier=lambda **kwargs: notified.append(kwargs),
+        reviewer=lambda *args, **kwargs: run,
+        now=NOW,
+    ))
+
+    assert notified == []
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.disagreement_severity == "normal"
+        assert row.notification_status is None
+
+
+def test_worker_does_not_notify_failed_review(tmp_path):
+    factory, _, _ = _setup(tmp_path)
+    notified = []
+
+    asyncio.run(run_semantic_review_once(
+        factory,
+        config=AiRecognitionConfig(),
+        notifier=lambda **kwargs: notified.append(kwargs),
+        reviewer=lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError("invalid semantic response")
+        ),
+        now=NOW,
+        max_attempts=1,
+    ))
+
+    assert notified == []
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.comparison_status == "failed"
+        assert row.notification_status is None
+
+def test_worker_persists_sent_status_and_canonical_fingerprint(tmp_path):
+    factory, raw_id, mimo = _setup(tmp_path, text="全部出局")
+    payload = _review_payload(action_type="exit_full", critical=True)
+    observed = []
+
+    def notifier(**kwargs):
+        with factory() as session:
+            row = session.query(RecognitionDecision).one()
+            observed.append((row.notification_status, row.automation_status))
+
+    asyncio.run(run_semantic_review_once(
+        factory,
+        config=AiRecognitionConfig(),
+        notifier=notifier,
+        reviewer=lambda *args, **kwargs: _run(raw_id, mimo, payload),
+        now=NOW,
+    ))
+
+    canonical = json.dumps(
+        {
+            "authoritative_payload": mimo,
+            "comparison_payload": payload,
+            "raw_message_id": raw_id,
+            "severity": "critical",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert observed == [("scheduled", "submitted")]
+        assert row.notification_status == "sent"
+        assert row.notification_error is None
+        assert row.notification_fingerprint == hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest()
+        assert row.automation_status == "submitted"
+        assert row.automation_reason == "preserve me"
+
+
+@pytest.mark.parametrize("existing_status", ["scheduled", "sent"])
+def test_worker_recovery_never_resends_claimed_notification(tmp_path, existing_status):
+    factory, raw_id, mimo = _setup(tmp_path, text="全部出局")
+    payload = _review_payload(action_type="exit_full", critical=True)
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        row.notification_fingerprint = "existing-claim"
+        row.notification_status = existing_status
+        session.commit()
+    notified = []
+
+    asyncio.run(run_semantic_review_once(
+        factory,
+        config=AiRecognitionConfig(),
+        notifier=lambda **kwargs: notified.append(kwargs),
+        reviewer=lambda *args, **kwargs: _run(raw_id, mimo, payload),
+        now=NOW,
+    ))
+
+    assert notified == []
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.notification_fingerprint == "existing-claim"
+        assert row.notification_status == existing_status
+        assert row.automation_status == "submitted"
+        assert row.automation_reason == "preserve me"
+
+
+def test_worker_failed_notification_is_final_and_does_not_change_automation(tmp_path):
+    factory, raw_id, mimo = _setup(tmp_path, text="全部出局")
+    payload = _review_payload(action_type="exit_full", critical=True)
+
+    def fail_notification(**kwargs):
+        raise TimeoutError("telegram timeout")
+
+    asyncio.run(run_semantic_review_once(
+        factory,
+        config=AiRecognitionConfig(),
+        notifier=fail_notification,
+        reviewer=lambda *args, **kwargs: _run(raw_id, mimo, payload),
+        now=NOW,
+    ))
+
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.notification_status == "failed"
+        assert row.notification_error == "telegram timeout"
+        assert row.automation_status == "submitted"
+        assert row.automation_reason == "preserve me"
+
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        row.comparison_status = "pending"
+        row.comparison_next_attempt_at = None
+        session.commit()
+    notified = []
+    asyncio.run(run_semantic_review_once(
+        factory,
+        config=AiRecognitionConfig(),
+        notifier=lambda **kwargs: notified.append(kwargs),
+        reviewer=lambda *args, **kwargs: _run(raw_id, mimo, payload),
+        now=NOW + timedelta(minutes=1),
+    ))
+    assert notified == []
+
+
+def test_notification_delivery_status_update_never_overwrites_newer_automation(tmp_path):
+    factory, raw_id, mimo = _setup(tmp_path, text="全部出局")
+    payload = _review_payload(action_type="exit_full", critical=True)
+
+    def notifier(**kwargs):
+        with factory() as session:
+            row = session.query(RecognitionDecision).one()
+            assert row.notification_status == "scheduled"
+            row.automation_status = "reconciled"
+            row.automation_reason = "position_absent"
+            session.commit()
+
+    asyncio.run(run_semantic_review_once(
+        factory,
+        config=AiRecognitionConfig(),
+        notifier=notifier,
+        reviewer=lambda *args, **kwargs: _run(raw_id, mimo, payload),
+        now=NOW,
+    ))
+
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.notification_status == "sent"
+        assert row.automation_status == "reconciled"
+        assert row.automation_reason == "position_absent"
 
 
 def test_worker_does_not_duplicate_claimed_notification(tmp_path):

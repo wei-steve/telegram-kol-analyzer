@@ -20,7 +20,7 @@ import re
 from typing import Any, Callable
 
 import httpx
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, update
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.ai_recognition_config import (
@@ -393,6 +393,64 @@ async def _notify(notifier: Callable[..., Any], **kwargs: Any) -> None:
         await result
 
 
+def _critical_notification_fingerprint(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+) -> str:
+    """Hash only the final persisted semantic-review audit fields."""
+
+    with session_factory() as session:
+        row = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == raw_message_id)
+            .one()
+        )
+        canonical_payload = {
+            "raw_message_id": raw_message_id,
+            "authoritative_payload": json.loads(row.authoritative_payload_json),
+            "comparison_payload": json.loads(row.comparison_payload_json or "{}"),
+            "severity": row.disagreement_severity,
+        }
+    canonical_json = json.dumps(
+        canonical_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
+def _update_critical_notification_delivery(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    fingerprint: str,
+    status: str,
+    error: str | None = None,
+) -> bool:
+    """Finish a reserved delivery without writing any automation fields."""
+
+    if status not in {"sent", "failed"}:
+        raise ValueError("notification delivery status must be sent or failed")
+    with session_factory() as session:
+        result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == raw_message_id,
+                RecognitionDecision.notification_fingerprint == fingerprint,
+                RecognitionDecision.notification_status == "scheduled",
+            )
+            .values(
+                notification_status=status,
+                notification_error=error,
+                updated_at=utc_now(),
+            )
+        )
+        session.commit()
+        return result.rowcount == 1
+
+
 async def run_semantic_review_once(
     session_factory: sessionmaker,
     *,
@@ -441,11 +499,11 @@ async def run_semantic_review_once(
         )
         if not completed or run.decision.severity != "critical" or notifier is None:
             return True
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                run.review_payload, ensure_ascii=False, sort_keys=True
-            ).encode("utf-8")
-        ).hexdigest()
+        fingerprint = await asyncio.to_thread(
+            _critical_notification_fingerprint,
+            session_factory,
+            raw_message_id=claim.raw_message_id,
+        )
         claimed_notification = await asyncio.to_thread(
             claim_critical_notification,
             session_factory,
@@ -459,10 +517,26 @@ async def run_semantic_review_once(
                     raw_message_id=claim.raw_message_id,
                     review=run,
                 )
-            except Exception:
+            except Exception as exc:
+                await asyncio.to_thread(
+                    _update_critical_notification_delivery,
+                    session_factory,
+                    raw_message_id=claim.raw_message_id,
+                    fingerprint=fingerprint,
+                    status="failed",
+                    error=str(exc),
+                )
                 logger.exception(
                     "Critical semantic-review notifier failed for raw_message_id=%s",
                     claim.raw_message_id,
+                )
+            else:
+                await asyncio.to_thread(
+                    _update_critical_notification_delivery,
+                    session_factory,
+                    raw_message_id=claim.raw_message_id,
+                    fingerprint=fingerprint,
+                    status="sent",
                 )
         return True
     except Exception as exc:
