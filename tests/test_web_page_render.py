@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import MediaAsset
+from telegram_kol_research.models import MessageRecognition
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import RecognitionDecision
 from telegram_kol_research.models import SignalCandidate
@@ -965,21 +966,37 @@ def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
     states = [
-        ("completed", None, "一致", "equivalent", []),
+        ("completed", "none", "agreed", "一致", "equivalent", []),
         (
             "completed",
             "normal",
+            "disagreed",
             "普通差异",
             "止盈细节不同",
             ["non_material_price_detail"],
         ),
-        ("completed", "critical", "严重分歧", "方向冲突", ["action_family"]),
-        ("execution_pending", None, "等待中", None, []),
-        ("execution_running", None, "等待中", None, []),
-        ("failed", None, "失败", None, []),
+        (
+            "completed",
+            "critical",
+            "disagreed",
+            "严重分歧",
+            "方向冲突",
+            ["action_family"],
+        ),
+        ("completed", None, "agreed", "待重新复核", None, []),
+        ("execution_pending", None, "pending", "等待中", None, []),
+        ("execution_running", None, "pending", "等待中", None, []),
+        ("failed", None, "pending", "失败", None, []),
     ]
     with session_factory() as session:
-        for index, (status, severity, _label, reason, conflict_types) in enumerate(states, 1):
+        for index, (
+            status,
+            severity,
+            agreement_status,
+            _label,
+            reason,
+            conflict_types,
+        ) in enumerate(states, 1):
             raw_message = RawMessage(chat_id=77, message_id=index, text=f"message {index}")
             session.add(raw_message)
             session.flush()
@@ -990,7 +1007,7 @@ def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
                     authoritative_model="mimo-v2.5",
                     authoritative_status="是策略",
                     authoritative_payload_json="{}",
-                    agreement_status="agreed" if severity is None else "disagreed",
+                    agreement_status=agreement_status,
                     differences_json="[]",
                     comparison_status=status,
                     disagreement_severity=severity,
@@ -1014,7 +1031,7 @@ def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
     )
 
     assert response.status_code == 200
-    for _status, _severity, label, _reason, _conflicts in states:
+    for _status, _severity, _agreement, label, _reason, _conflicts in states:
         assert f"AI复核：{label}" in response.text
     assert 'class="semantic-review semantic-review-critical"' in response.text
     assert 'role="alert"' in response.text
@@ -1031,6 +1048,66 @@ def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
     assert "never-render-provider-secret" not in response.text
     assert "never-render-frozen-token" not in response.text
     assert "provider timeout" not in response.text
+    assert "历史记录没有语义分歧等级，需重新复核" in response.text
+
+
+def test_critical_semantic_review_opens_outer_ai_disclosure_for_non_strategy(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=77,
+            message_id=20,
+            text="not actionable",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            MessageRecognition(
+                raw_message_id=raw_message.id,
+                status="非策略",
+                reason="MiMo 权威结果为非策略",
+                engine="mimo-v2.5",
+            )
+        )
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json="{}",
+                agreement_status="disagreed",
+                differences_json='["actionability"]',
+                comparison_status="completed",
+                disagreement_severity="critical",
+                comparison_model="deepseek-v4-flash",
+                comparison_payload_json=json.dumps(
+                    {
+                        "reason": "语义复核认为存在紧急退出动作",
+                        "conflict_types": ["urgent_exit_missed"],
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/detail/tab/messages"
+    )
+
+    assert response.status_code == 200
+    assert re.search(
+        r'<details\s+class="message-ai-insights is-not-strategy"\s+'
+        r'data-message-ai-insights\s+open\s*>',
+        response.text,
+    )
+    assert re.search(
+        r'<details class="semantic-review semantic-review-critical"\s+'
+        r'open role="alert" aria-label="AI复核：严重分歧"',
+        response.text,
+    )
 
 
 def test_index_page_versions_static_assets_to_avoid_stale_browser_cache(tmp_path):

@@ -509,9 +509,18 @@ def _serialize_semantic_review(
     elif status == "completed" and decision.disagreement_severity == "normal":
         severity = "normal"
         label = "普通差异"
-    elif status == "completed":
+    elif (
+        status == "completed"
+        and decision.disagreement_severity == "none"
+        and decision.agreement_status == "agreed"
+    ):
         severity = "agreed"
         label = "一致"
+    elif status == "completed":
+        severity = "unclassified"
+        label = "待重新复核"
+        reason = "历史记录没有语义分歧等级，需重新复核"
+        conflict_types = []
     else:
         severity = "pending"
         label = "等待中"

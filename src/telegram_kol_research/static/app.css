@@ -2575,6 +2575,12 @@ body {
 
 .semantic-review-agreed { border-left-color: #22c55e; color: #dcfce7; }
 .semantic-review-normal { border-left-color: #f59e0b; color: #fde68a; }
+.semantic-review-unclassified {
+  display: grid;
+  gap: 2px;
+  border-left-color: #f59e0b;
+  color: #fde68a;
+}
 .semantic-review-pending { border-left-color: #38bdf8; color: #bae6fd; }
 .semantic-review-failed { border-left-color: #ef4444; color: #fecaca; }
 
@@ -2596,6 +2602,7 @@ body {
 .semantic-review-details ul { margin: 0; }
 .semantic-review-details ul { padding-left: 18px; }
 .semantic-review-details small { color: inherit; opacity: 0.78; }
+.semantic-review-unclassified small { color: inherit; opacity: 0.82; }
 
 .recognition-comparison {
   display: grid;

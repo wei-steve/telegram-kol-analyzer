@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+import pytest
 from sqlalchemy import event
 
 from telegram_kol_research.db import create_session_factory
@@ -277,3 +278,90 @@ def test_load_group_messages_defensively_serializes_malformed_semantic_review_js
         "conflict_types": [],
         "model": "deepseek-v4-flash",
     }
+
+
+@pytest.mark.parametrize("agreement_status", ["disagreed", "unknown", "agreed"])
+def test_load_group_messages_marks_completed_legacy_review_without_severity_unclassified(
+    tmp_path, agreement_status
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(chat_id=9, message_id=1, text="legacy comparison")
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="是策略",
+                authoritative_payload_json="{}",
+                agreement_status=agreement_status,
+                differences_json='["side"]',
+                comparison_status="completed",
+                disagreement_severity=None,
+                comparison_model="legacy-field-comparison",
+                comparison_payload_json=json.dumps(
+                    {
+                        "reason": "legacy field comparison",
+                        "raw_provider_response": "never-expose-legacy-provider-data",
+                        "notification_claim_token": "never-expose-legacy-claim",
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+    review = load_group_messages(session_factory, chat_id=9, limit=10)[0][
+        "semantic_review"
+    ]
+
+    assert review == {
+        "status": "completed",
+        "severity": "unclassified",
+        "label": "待重新复核",
+        "reason": "历史记录没有语义分歧等级，需重新复核",
+        "conflict_types": [],
+        "model": "legacy-field-comparison",
+    }
+
+
+@pytest.mark.parametrize(
+    ("agreement_status", "expected_severity", "expected_label"),
+    [
+        ("agreed", "agreed", "一致"),
+        ("disagreed", "unclassified", "待重新复核"),
+        ("unknown", "unclassified", "待重新复核"),
+    ],
+)
+def test_load_group_messages_requires_agreement_for_completed_none_severity(
+    tmp_path, agreement_status, expected_severity, expected_label
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(chat_id=9, message_id=1, text="semantic comparison")
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="是策略",
+                authoritative_payload_json="{}",
+                agreement_status=agreement_status,
+                differences_json="[]",
+                comparison_status="completed",
+                disagreement_severity="none",
+                comparison_model="deepseek-v4-flash",
+                comparison_payload_json="{}",
+            )
+        )
+        session.commit()
+
+    review = load_group_messages(session_factory, chat_id=9, limit=10)[0][
+        "semantic_review"
+    ]
+
+    assert review["severity"] == expected_severity
+    assert review["label"] == expected_label

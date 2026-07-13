@@ -179,7 +179,7 @@
           <details
             class="message-ai-insights {{ ai_panel_class }}"
             data-message-ai-insights
-            {% if strategy_related %}open{% endif %}
+            {% if strategy_related or (semantic_review and semantic_review.severity == 'critical') %}open{% endif %}
           >
             <summary class="message-ai-summary">
               <span class="message-ai-summary-status">AI识别结果：{{ detection.status if detection else '待识别' }}</span>
@@ -228,6 +228,15 @@
                       {% if semantic_review.model %}<small>复核模型：{{ semantic_review.model }}</small>{% endif %}
                     </div>
                   </details>
+                {% elif semantic_review.severity == 'unclassified' %}
+                  <div
+                    class="semantic-review semantic-review-unclassified"
+                    role="status"
+                    aria-label="AI复核：{{ semantic_review.label }}"
+                  >
+                    <strong>AI复核：{{ semantic_review.label }}</strong>
+                    {% if semantic_review.reason %}<small>{{ semantic_review.reason }}</small>{% endif %}
+                  </div>
                 {% else %}
                   <div
                     class="semantic-review semantic-review-{{ semantic_review.severity }}"
