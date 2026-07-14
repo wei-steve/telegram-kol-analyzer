@@ -886,6 +886,11 @@ def _transition_leg_attribution(
                 new_state=new_state,
                 fingerprint=fingerprint,
                 evidence_json=evidence_json,
+                notification_status=(
+                    "pending"
+                    if new_state in {"attribution_conflict", "evidence_unavailable"}
+                    else None
+                ),
                 created_at=recovered_at,
             )
         )

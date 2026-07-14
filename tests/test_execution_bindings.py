@@ -525,6 +525,22 @@ def test_reconcile_api_failure_preserves_position_and_deduplicates_audit(tmp_pat
     assert leg.attribution_status == "evidence_unavailable"
     assert len(audits) == 1
     assert "positions temporarily unavailable" in audits[0].evidence_json
+    assert audits[0].notification_status == "pending"
+
+    class DifferentFailingClient(FailingClient):
+        def list_positions(self):
+            raise RuntimeError("positions authorization rejected")
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory, client=DifferentFailingClient()
+    )
+    with session_factory() as session:
+        audits = session.query(PositionAttributionAudit).order_by(
+            PositionAttributionAudit.id
+        ).all()
+    assert len(audits) == 2
+    assert audits[0].fingerprint != audits[1].fingerprint
+    assert all(row.notification_status == "pending" for row in audits)
 
 
 def test_repair_execution_order_legs_from_binding_payloads_backfills_legacy_rows(tmp_path):

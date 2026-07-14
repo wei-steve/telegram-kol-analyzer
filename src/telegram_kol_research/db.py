@@ -72,6 +72,18 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
             "ALTER TABLE execution_order_legs ADD COLUMN last_verified_at DATETIME"
         ),
     },
+    "position_attribution_audits": {
+        "notification_status": (
+            "ALTER TABLE position_attribution_audits "
+            "ADD COLUMN notification_status VARCHAR(32)"
+        ),
+        "notification_error": (
+            "ALTER TABLE position_attribution_audits ADD COLUMN notification_error TEXT"
+        ),
+        "notified_at": (
+            "ALTER TABLE position_attribution_audits ADD COLUMN notified_at DATETIME"
+        ),
+    },
     "recovery_decisions": {
         "reason_codes_json": "ALTER TABLE recovery_decisions ADD COLUMN reason_codes_json TEXT NOT NULL DEFAULT '[]'",
         "entry_range_text": "ALTER TABLE recovery_decisions ADD COLUMN entry_range_text VARCHAR(255)",

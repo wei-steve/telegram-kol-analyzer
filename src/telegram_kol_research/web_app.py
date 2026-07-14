@@ -56,6 +56,7 @@ from telegram_kol_research.message_recognition import recognize_message_now
 from telegram_kol_research.models import (
     AiPromptTestRun,
     ExecutionBinding,
+    ExecutionOrderLeg,
     RecognitionDecision,
 )
 from telegram_kol_research.models import RawMessage
@@ -120,6 +121,7 @@ from telegram_kol_research.strategy_alerts import (
 )
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
+    deliver_pending_position_attribution_incidents,
     load_system_operator_bot_config,
     send_ai_recognition_conflict_review,
     send_pending_entry_expiry_review,
@@ -444,18 +446,31 @@ def _load_deepcoin_live_position_rows(
     )
 
     with session_factory() as session:
-        bindings = (
-            session.query(ExecutionBinding)
-            .filter(ExecutionBinding.venue == "deepcoin")
-            .filter(ExecutionBinding.pos_id.isnot(None))
+        active_pos_ids = {
+            pos_id
+            for position in active_positions
+            if (pos_id := _first_position_string(position, "posId", "pos_id", "id"))
+        }
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.venue == "deepcoin")
+            .filter(ExecutionOrderLeg.pos_id.in_(active_pos_ids))
             .all()
+            if active_pos_ids
+            else []
         )
-        bindings_by_pos_id: dict[str, ExecutionBinding] = {}
-        for binding in bindings:
-            for pos_id in _split_binding_ids(binding.pos_id):
-                existing = bindings_by_pos_id.get(pos_id)
-                if existing is None or _is_preferred_live_position_binding(binding, existing):
-                    bindings_by_pos_id[pos_id] = binding
+        legs_by_pos_id = {str(leg.pos_id): leg for leg in legs if leg.pos_id}
+        binding_ids = {int(leg.execution_binding_id) for leg in legs}
+        bindings_by_id = {
+            int(binding.id): binding
+            for binding in (
+                session.query(ExecutionBinding)
+                .filter(ExecutionBinding.id.in_(binding_ids))
+                .all()
+                if binding_ids
+                else []
+            )
+        }
 
         rows: list[dict[str, object]] = []
         for position in active_positions:
@@ -486,11 +501,23 @@ def _load_deepcoin_live_position_rows(
                 stop_loss_state_text = "无止损"
             else:
                 stop_loss_state_text = None
-            binding = bindings_by_pos_id.get(pos_id or "")
-            binding_is_live = binding is not None and str(binding.status or "").lower() in {
-                "open",
-                "active",
-            }
+            ownership_leg = legs_by_pos_id.get(pos_id or "")
+            ownership_state = (
+                str(ownership_leg.attribution_status or "unassigned")
+                if ownership_leg is not None
+                else "unassigned"
+            )
+            ownership_verified = ownership_state == "verified"
+            binding = (
+                bindings_by_id.get(int(ownership_leg.execution_binding_id))
+                if ownership_leg is not None
+                else None
+            )
+            binding_is_live = bool(
+                ownership_verified
+                and binding is not None
+                and str(binding.status or "").lower() in {"open", "active"}
+            )
             lifecycle = None
             if binding is not None:
                 lifecycle = (
@@ -576,6 +603,11 @@ def _load_deepcoin_live_position_rows(
                         )
                         if binding is None
                         else []
+                    ),
+                    "persisted_attribution": _persisted_position_attribution(
+                        leg=ownership_leg,
+                        binding=binding,
+                        group_label_by_chat_id=group_label_by_chat_id,
                     ),
                 }
             )
@@ -665,12 +697,18 @@ def _annotate_exchange_snapshot_attribution(
     group_label_by_chat_id: dict[int, str],
 ) -> dict[str, Any]:
     for item in snapshot.get("positions", []):
-        item["attribution"] = _exchange_item_attribution(
-            item,
-            candidates=[*holding_positions, *pending_entry_signals],
-            group_label_by_chat_id=group_label_by_chat_id,
-            default_order_role=None,
-        )
+        item["attribution"] = item.get("persisted_attribution") or {
+            "state": "unassigned",
+            "label": "归属待确认",
+            "chat_id": None,
+            "group_name": "未归属",
+            "strategy_id": None,
+            "strategy_summary": "自动管理已冻结",
+            "source_excerpt": "",
+            "score": 0,
+            "reasons": [],
+            "order_role": None,
+        }
     for item in snapshot.get("open_orders", []):
         item["attribution"] = _exchange_item_attribution(
             item,
@@ -699,6 +737,78 @@ def _annotate_exchange_snapshot_attribution(
         "position_history": _group_exchange_items(snapshot.get("position_history", [])),
     }
     return snapshot
+
+
+def _persisted_position_attribution(
+    *,
+    leg: ExecutionOrderLeg | None,
+    binding: ExecutionBinding | None,
+    group_label_by_chat_id: dict[int, str],
+) -> dict[str, Any] | None:
+    if leg is None:
+        return None
+    try:
+        evidence = json.loads(leg.attribution_evidence_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        evidence = {}
+    if not isinstance(evidence, dict):
+        evidence = {}
+    state = str(leg.attribution_status or "unassigned")
+    verified = state == "verified" and binding is not None
+    chat_id = binding.chat_id if binding is not None else None
+    group_name = (
+        group_label_by_chat_id.get(int(chat_id))
+        if chat_id is not None
+        else None
+    )
+    if verified:
+        label = "已验证归属"
+        rendered_state = "bound"
+        strategy_instance_id = str(
+            leg.strategy_instance_id or binding.strategy_instance_id or ""
+        )
+        strategy_summary = " · ".join(
+            item
+            for item in (
+                strategy_instance_id,
+                f"{binding.symbol} {binding.side}",
+            )
+            if item
+        )
+        reasons = ["持久化 entry-leg 证据"]
+    else:
+        label = "归属待确认"
+        rendered_state = "conflict"
+        strategy_summary = "归属冲突 · 自动管理已冻结"
+        reasons = [state]
+    last_verified_at = leg.last_verified_at
+    if last_verified_at is not None:
+        if last_verified_at.tzinfo is None:
+            last_verified_at = last_verified_at.replace(tzinfo=UTC)
+        last_verified_display = last_verified_at.astimezone(
+            DEFAULT_LOCAL_TIMEZONE
+        ).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        last_verified_display = None
+    return {
+        "state": rendered_state,
+        "label": label,
+        "chat_id": chat_id,
+        "group_name": group_name or ("未确认群组" if not verified else str(chat_id)),
+        "strategy_id": leg.strategy_instance_id
+        or (binding.strategy_instance_id if binding is not None else None),
+        "strategy_summary": strategy_summary,
+        "source_excerpt": "",
+        "score": 100 if verified else 0,
+        "reasons": reasons,
+        "order_role": f"entry leg #{leg.leg_index}",
+        "evidence_type": evidence.get("evidence_type")
+        or evidence.get("evidence_source"),
+        "pos_id": leg.pos_id,
+        "last_verified_at": last_verified_display,
+        "ownership_state": state,
+        "automatic_management_frozen": not verified,
+    }
 
 
 def _exchange_item_attribution(
@@ -1769,6 +1879,7 @@ def create_web_app(
                     deepcoin_client_factory=app.state.deepcoin_client_factory,
                     interval_seconds=app.state.deepcoin_reconcile_interval_seconds,
                     now_provider=app.state.now_provider,
+                    system_operator_bot_config=app.state.system_operator_bot_config,
                 )
             )
             if isinstance(app.state.strategy_alert_config, StrategyAlertConfig):
@@ -2716,6 +2827,12 @@ def create_web_app(
                 client=client,
                 synced_at=app.state.now_provider(),
             )
+            if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
+                await deliver_pending_position_attribution_incidents(
+                    app.state.session_factory,
+                    config=app.state.system_operator_bot_config,
+                    delivered_at=app.state.now_provider(),
+                )
         except DeepcoinClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:
@@ -3852,6 +3969,7 @@ async def run_deepcoin_execution_reconcile_loop(
     deepcoin_client_factory,
     interval_seconds: int = 30,
     now_provider=None,
+    system_operator_bot_config: SystemOperatorBotConfig | None = None,
 ) -> None:
     while True:
         try:
@@ -3863,6 +3981,12 @@ async def run_deepcoin_execution_reconcile_loop(
                     client=client,
                     recovered_at=synced_at,
                 )
+                if system_operator_bot_enabled(system_operator_bot_config):
+                    await deliver_pending_position_attribution_incidents(
+                        session_factory,
+                        config=system_operator_bot_config,
+                        delivered_at=synced_at,
+                    )
             sync_manual_closed_deepcoin_positions(
                 session_factory,
                 client=client,

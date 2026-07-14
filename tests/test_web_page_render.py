@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import MediaAsset
 from telegram_kol_research.models import MessageRecognition
 from telegram_kol_research.models import RawMessage
@@ -495,6 +496,7 @@ def test_bound_position_close_renders_exact_context_for_bound_exchange_position(
         session.add(candidate)
         session.flush()
         binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:56:BTC:long",
             kol_id="group:100",
             chat_id=100,
             message_id=56,
@@ -507,6 +509,24 @@ def test_bound_position_close_renders_exact_context_for_bound_exchange_position(
         )
         session.add(binding)
         session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=2,
+                purpose="entry",
+                order_kind="market",
+                order_id="order-56",
+                pos_id="pos-live-1",
+                venue="deepcoin",
+                attribution_status="verified",
+                attribution_evidence_json=json.dumps(
+                    {"evidence_type": "exact_regular_order_id"}
+                ),
+                last_verified_at=datetime(2026, 7, 14, 8, 0, tzinfo=UTC),
+                status="active",
+            )
+        )
         session.add(
             StrategyLifecycle(
                 signal_candidate_id=candidate.id,
@@ -566,9 +586,14 @@ def test_bound_position_close_renders_exact_context_for_bound_exchange_position(
     assert response.status_code == 200
     assert 'data-exchange-view-mode="list"' in response.text
     assert 'data-exchange-view-mode="grouped"' in response.text
-    assert "已绑定" in response.text
+    assert "已验证归属" in response.text
     assert "Alpha Group" in response.text
     assert "BTC long" in response.text
+    assert "deepcoin:100:56:BTC:long" in response.text
+    assert "entry leg #2" in response.text
+    assert "exact_regular_order_id" in response.text
+    assert "pos-live-1" in response.text
+    assert "2026-07-14 16:00:00" in response.text
     assert 'data-exchange-group-section' in response.text
     assert 'data-position-danger-zone' in response.text
     close_buttons = re.findall(
@@ -582,6 +607,74 @@ def test_bound_position_close_renders_exact_context_for_bound_exchange_position(
         assert 'data-live-action-size="0.01 contracts BTCUSDT"' in button
         assert 'data-live-action-label="市价全平"' in button
     assert 'data-close-bound-position-status aria-live="polite"' in response.text
+
+
+def test_conflicted_position_renders_frozen_persisted_attribution(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:56:BTC:long",
+            kol_id="group:100",
+            chat_id=100,
+            message_id=56,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            pos_id=None,
+            status="unknown",
+        )
+        session.add(binding)
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=1,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id="trigger-56",
+                pos_id="pos-conflict",
+                venue="deepcoin",
+                attribution_status="attribution_conflict",
+                attribution_evidence_json=json.dumps(
+                    {"candidate_leg_ids": [1, 2], "evidence_type": "trigger_fill"}
+                ),
+                status="active",
+            )
+        )
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTCUSDT",
+                    "posId": "pos-conflict",
+                    "posSide": "long",
+                    "pos": "0.01",
+                    "avgPx": "62400",
+                }
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=FakeDeepcoinClient,
+        )
+    ).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "归属待确认" in response.text
+    assert "归属冲突" in response.text
+    assert "自动管理已冻结" in response.text
+    assert "data-close-bound-position" not in response.text
 
 
 def test_exchange_current_order_candidate_attribution(tmp_path):

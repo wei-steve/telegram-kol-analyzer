@@ -478,6 +478,11 @@ class PositionAttributionAudit(Base):
     new_state: Mapped[str] = mapped_column(String(32), nullable=False)
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     evidence_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    notification_status: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    notification_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 

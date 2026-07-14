@@ -617,7 +617,7 @@ def test_execution_dashboard_defaults_to_deepcoin_live_positions(tmp_path):
     assert "绑定" in response.text
 
 
-def test_execution_dashboard_labels_stale_system_binding_as_attribution_conflict(tmp_path):
+def test_execution_dashboard_does_not_treat_stale_binding_as_persisted_ownership(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):
             return [
@@ -667,8 +667,8 @@ def test_execution_dashboard_labels_stale_system_binding_as_attribution_conflict
 
     assert response.status_code == 200
     assert "pos-stale-system" in response.text
-    assert "system_attribution_conflict" in response.text
-    assert "unbound_live_position" not in response.text
+    assert "unbound_live_position" in response.text
+    assert "system_attribution_conflict" not in response.text
 
 
 def test_execution_dashboard_uses_pending_tpsl_orders_for_live_protection(tmp_path):

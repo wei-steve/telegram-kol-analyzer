@@ -444,6 +444,9 @@ def test_database_bootstrap_backfills_position_attribution_schema(tmp_path):
         "new_state",
         "fingerprint",
         "evidence_json",
+        "notification_status",
+        "notification_error",
+        "notified_at",
         "created_at",
     } <= audit_columns
     assert "uq_execution_order_legs_venue_pos" in indexes

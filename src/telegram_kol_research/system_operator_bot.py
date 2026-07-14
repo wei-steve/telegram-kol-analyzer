@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -176,6 +178,34 @@ def format_semantic_disagreement_notification(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_position_attribution_incident_message(payload: dict[str, Any]) -> str:
+    state = str(payload.get("state") or "unassigned")
+    state_label = {
+        "attribution_conflict": "归属冲突",
+        "evidence_unavailable": "归属证据暂不可用",
+    }.get(state, state)
+    candidate_leg_ids = payload.get("candidate_leg_ids")
+    if not isinstance(candidate_leg_ids, list):
+        candidate_leg_ids = []
+    source_errors = payload.get("evidence_source_errors")
+    if not isinstance(source_errors, dict):
+        source_errors = {}
+    error_text = "；".join(
+        f"{key}: {value}" for key, value in sorted(source_errors.items())
+    )
+    return "\n".join(
+        [
+            "【仓位归属异常】",
+            f"交易所: {payload.get('venue') or 'deepcoin'}",
+            f"仓位ID: {payload.get('pos_id') or '-'}",
+            f"状态: {state_label}",
+            f"候选 entry legs: {', '.join(str(item) for item in candidate_leg_ids) or '-'}",
+            f"证据源错误: {error_text or '-'}",
+            "处理状态: 自动管理已冻结，不会自动平仓或修改止盈止损。",
+        ]
+    )
+
+
 def build_pending_entry_expiry_review_reply_markup(payload: dict[str, Any]) -> dict[str, Any]:
     lifecycle_id = payload.get("lifecycle_id")
     return {
@@ -219,6 +249,75 @@ async def send_system_operator_bot_message(
             json=payload,
         )
         response.raise_for_status()
+
+
+async def deliver_pending_position_attribution_incidents(
+    session_factory,
+    *,
+    config: SystemOperatorBotConfig,
+    delivered_at: datetime | None = None,
+    limit: int = 20,
+) -> int:
+    """Claim and deliver new attribution incidents without mutating ownership."""
+
+    from telegram_kol_research.models import PositionAttributionAudit
+
+    now = delivered_at or datetime.now(UTC)
+    with session_factory() as session:
+        rows = (
+            session.query(PositionAttributionAudit)
+            .filter(PositionAttributionAudit.notification_status == "pending")
+            .order_by(PositionAttributionAudit.id.asc())
+            .limit(max(1, int(limit)))
+            .all()
+        )
+        incident_ids = [int(row.id) for row in rows]
+        for row in rows:
+            row.notification_status = "delivering"
+            row.notification_error = None
+        session.commit()
+
+    delivered = 0
+    for incident_id in incident_ids:
+        with session_factory() as session:
+            row = session.get(PositionAttributionAudit, incident_id)
+            if row is None or row.notification_status != "delivering":
+                continue
+            try:
+                evidence = json.loads(row.evidence_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                evidence = {}
+            if not isinstance(evidence, dict):
+                evidence = {}
+            payload = {
+                "venue": row.venue,
+                "pos_id": row.pos_id,
+                "state": row.new_state,
+                "candidate_leg_ids": evidence.get("candidate_leg_ids", []),
+                "evidence_source_errors": evidence.get("errors", {}),
+            }
+        try:
+            await send_system_operator_bot_message(
+                config=config,
+                text=format_position_attribution_incident_message(payload),
+            )
+        except Exception as exc:
+            with session_factory() as session:
+                row = session.get(PositionAttributionAudit, incident_id)
+                if row is not None:
+                    row.notification_status = "failed"
+                    row.notification_error = str(exc)
+                    session.commit()
+            continue
+        with session_factory() as session:
+            row = session.get(PositionAttributionAudit, incident_id)
+            if row is not None:
+                row.notification_status = "delivered"
+                row.notification_error = None
+                row.notified_at = now
+                session.commit()
+                delivered += 1
+    return delivered
 
 
 async def send_pending_entry_expiry_review(

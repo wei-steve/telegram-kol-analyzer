@@ -7,12 +7,14 @@ from telegram_kol_research.system_operator_bot import (
     format_ai_recognition_conflict_review_message,
     format_semantic_disagreement_notification,
     format_pending_entry_expiry_review_message,
+    format_position_attribution_incident_message,
+    deliver_pending_position_attribution_incidents,
     load_system_operator_bot_config,
     send_semantic_disagreement_notification,
     system_operator_bot_enabled,
 )
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
+from telegram_kol_research.models import ExecutionBinding, PositionAttributionAudit, StrategyLifecycle
 from telegram_kol_research.telegram_bot_commands import (
     _bot_http_timeout,
     _format_callback_resolution_text,
@@ -65,6 +67,94 @@ def test_system_operator_bot_disabled_without_dedicated_destination():
     assert not system_operator_bot_enabled(
         SystemOperatorBotConfig(bot_token="", chat_id="", timeout_seconds=10)
     )
+
+
+def test_format_position_attribution_incident_message_is_read_only_and_actionable():
+    message = format_position_attribution_incident_message(
+        {
+            "venue": "deepcoin",
+            "pos_id": "pos-conflict",
+            "state": "attribution_conflict",
+            "candidate_leg_ids": [12, 18],
+            "evidence_source_errors": {"trade_fills": "HTTP 502"},
+        }
+    )
+
+    assert "仓位归属异常" in message
+    assert "pos-conflict" in message
+    assert "归属冲突" in message
+    assert "12, 18" in message
+    assert "trade_fills: HTTP 502" in message
+    assert "自动管理已冻结" in message
+    assert "不会自动平仓" in message
+
+
+def test_position_attribution_incident_delivery_is_deduplicated_and_durable(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            PositionAttributionAudit(
+                venue="deepcoin",
+                pos_id="pos-conflict",
+                event_type="attribution_conflict",
+                new_state="attribution_conflict",
+                fingerprint="fingerprint-1",
+                evidence_json='{"candidate_leg_ids":[12,18]}',
+                notification_status="pending",
+            )
+        )
+        session.commit()
+
+    sent = []
+
+    async def fake_send(**kwargs):
+        sent.append(kwargs["text"])
+
+    monkeypatch.setattr(operator_bot_module, "send_system_operator_bot_message", fake_send)
+    config = SystemOperatorBotConfig(bot_token="token", chat_id="chat")
+
+    assert asyncio.run(
+        deliver_pending_position_attribution_incidents(
+            session_factory,
+            config=config,
+            delivered_at=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+        )
+    ) == 1
+    assert asyncio.run(
+        deliver_pending_position_attribution_incidents(
+            session_factory,
+            config=config,
+            delivered_at=datetime(2026, 7, 14, 12, 1, tzinfo=UTC),
+        )
+    ) == 0
+    assert len(sent) == 1
+
+    with session_factory() as session:
+        first = session.query(PositionAttributionAudit).one()
+        assert first.notification_status == "delivered"
+        session.add(
+            PositionAttributionAudit(
+                venue="deepcoin",
+                pos_id="pos-conflict",
+                event_type="attribution_conflict",
+                new_state="attribution_conflict",
+                fingerprint="fingerprint-2",
+                evidence_json='{"candidate_leg_ids":[12,18,21]}',
+                notification_status="pending",
+            )
+        )
+        session.commit()
+
+    assert asyncio.run(
+        deliver_pending_position_attribution_incidents(
+            session_factory,
+            config=config,
+            delivered_at=datetime(2026, 7, 14, 12, 2, tzinfo=UTC),
+        )
+    ) == 1
+    assert len(sent) == 2
 
 
 def test_format_ai_recognition_conflict_review_message_includes_both_model_results():
