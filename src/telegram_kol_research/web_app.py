@@ -100,6 +100,8 @@ from telegram_kol_research.execution_bindings import bind_deepcoin_position_to_l
 from telegram_kol_research.execution_bindings import list_active_positions
 from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
 from telegram_kol_research.execution_bindings import sync_manual_closed_deepcoin_positions
+from telegram_kol_research.position_attribution import PositionAttributionError
+from telegram_kol_research.position_attribution import require_manual_position_attribution_allowed
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import list_recovery_decisions
 from telegram_kol_research.recovery_execution_queue import list_recovery_execution_previews
@@ -2739,6 +2741,14 @@ def create_web_app(
         if active_position is None:
             raise HTTPException(status_code=404, detail="live position not found")
         with app.state.session_factory() as session:
+            try:
+                require_manual_position_attribution_allowed(
+                    session,
+                    venue="deepcoin",
+                    pos_id=pos_id,
+                )
+            except PositionAttributionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             existing_binding = (
                 session.query(ExecutionBinding)
                 .filter(ExecutionBinding.venue == "deepcoin")

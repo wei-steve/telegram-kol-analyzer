@@ -4,7 +4,7 @@ from telegram_kol_research.auto_trade_execution import _load_active_execution_bi
 from telegram_kol_research.auto_trade_execution import _load_active_execution_bindings
 from telegram_kol_research.auto_trade_execution import _extract_partial_close_fraction
 from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
-from telegram_kol_research.execution_bindings import ExecutionBindingRecord, upsert_execution_binding
+from telegram_kol_research.execution_bindings import ExecutionBindingRecord, ExecutionOrderLegRecord, upsert_execution_binding, upsert_execution_order_leg
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
@@ -86,6 +86,23 @@ class _FakeDeepcoinClient:
         if inst_id == "ETH-USDT-SWAP":
             return 1585.0
         return 68100.0
+
+
+def _verify_bound_position(session_factory, *, binding_id: int, pos_id: str) -> None:
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            pos_id=pos_id,
+            status="active",
+            attribution_status="verified",
+            attribution_evidence={"source": "test_fixture"},
+            last_verified_at=datetime.now(UTC),
+        ),
+    )
 
 
 def test_load_active_execution_binding_uses_kol_id_to_disambiguate(tmp_path):
@@ -682,19 +699,20 @@ def test_auto_process_message_trade_signal_blocks_low_confidence(tmp_path):
 def test_auto_process_message_trade_signal_closes_position_from_close_signal(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
-        session.add(
-            ExecutionBinding(
-                strategy_instance_id="deepcoin:100:55:BTC:long",
-                kol_id="alice",
-                chat_id=100,
-                message_id=55,
-                symbol="BTC",
-                side="long",
-                venue="deepcoin",
-                pos_id="pos-1",
-                status="active",
-            )
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:55:BTC:long",
+            kol_id="alice",
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            pos_id="pos-1",
+            status="active",
         )
+        session.add(binding)
+        session.flush()
+        binding_id = binding.id
         raw = RawMessage(
             chat_id=100,
             message_id=56,
@@ -718,6 +736,7 @@ def test_auto_process_message_trade_signal_closes_position_from_close_signal(tmp
         )
         session.commit()
         raw_message_id = raw.id
+    _verify_bound_position(session_factory, binding_id=binding_id, pos_id="pos-1")
     save_trading_settings(
         session_factory,
         {
@@ -863,10 +882,10 @@ def test_auto_process_close_signal_does_not_steal_live_position_from_other_chat(
         stale_binding = session.query(ExecutionBinding).filter_by(chat_id=999, message_id=3888).one()
 
     assert lifecycle.execution_binding_id is None
-    assert stale_binding.status == "active"
-    assert stale_binding.last_exchange_status != "expired_pending_entry_not_attributed"
-    assert other_lifecycle.lifecycle_status == "entered"
-    assert other_lifecycle.execution_binding_id == stale_binding.id
+    assert stale_binding.status == "stale"
+    assert stale_binding.last_exchange_status == "position_ownership_unassigned"
+    assert other_lifecycle.lifecycle_status == "expired"
+    assert other_lifecycle.execution_binding_id is None
 
 
 def test_auto_process_close_signal_does_not_recover_ambiguous_positions(tmp_path):
@@ -949,7 +968,7 @@ def test_auto_process_close_signal_does_not_recover_ambiguous_positions(tmp_path
     assert fake_client.orders == []
 
 
-def test_auto_process_message_trade_signal_recovers_filled_binding_before_close(tmp_path):
+def test_auto_process_message_trade_signal_does_not_guess_filled_binding_before_close(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         session.add(
@@ -1016,31 +1035,32 @@ def test_auto_process_message_trade_signal_recovers_filled_binding_before_close(
         processed_at=datetime(2026, 6, 12, 8, 6, tzinfo=UTC),
     )
 
-    assert result["status"] == "submitted"
-    assert result["management_action"] == "close_position"
-    assert fake_client.orders[0]["closePosId"] == "pos-filled"
+    assert result == {"status": "skipped", "reason": "no_execution_binding"}
+    assert fake_client.orders == []
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
-    assert binding.pos_id == "pos-filled"
-    assert binding.status == "closed"
+    assert binding.pos_id is None
+    assert binding.status == "stale"
+    assert binding.last_exchange_status == "position_ownership_unassigned"
 
 
 def test_auto_process_message_trade_signal_partially_closes_profit_percent(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
-        session.add(
-            ExecutionBinding(
-                strategy_instance_id="deepcoin:100:55:BTC:short",
-                kol_id="alice",
-                chat_id=100,
-                message_id=55,
-                symbol="BTC",
-                side="short",
-                venue="deepcoin",
-                pos_id="pos-1",
-                status="active",
-            )
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:55:BTC:short",
+            kol_id="alice",
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            pos_id="pos-1",
+            status="active",
         )
+        session.add(binding)
+        session.flush()
+        binding_id = binding.id
         raw = RawMessage(
             chat_id=100,
             message_id=56,
@@ -1066,6 +1086,7 @@ def test_auto_process_message_trade_signal_partially_closes_profit_percent(tmp_p
         )
         session.commit()
         raw_message_id = raw.id
+    _verify_bound_position(session_factory, binding_id=binding_id, pos_id="pos-1")
     save_trading_settings(
         session_factory,
         {
@@ -1112,19 +1133,20 @@ def test_auto_process_message_trade_signal_partially_closes_profit_percent(tmp_p
 def test_auto_process_message_trade_signal_adjusts_stop_loss_from_position_update(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
-        session.add(
-            ExecutionBinding(
-                strategy_instance_id="deepcoin:100:55:BTC:long",
-                kol_id="alice",
-                chat_id=100,
-                message_id=55,
-                symbol="BTC",
-                side="long",
-                venue="deepcoin",
-                pos_id="pos-1",
-                status="active",
-            )
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:55:BTC:long",
+            kol_id="alice",
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            pos_id="pos-1",
+            status="active",
         )
+        session.add(binding)
+        session.flush()
+        binding_id = binding.id
         raw = RawMessage(
             chat_id=100,
             message_id=57,
@@ -1149,6 +1171,7 @@ def test_auto_process_message_trade_signal_adjusts_stop_loss_from_position_updat
         )
         session.commit()
         raw_message_id = raw.id
+    _verify_bound_position(session_factory, binding_id=binding_id, pos_id="pos-1")
     save_trading_settings(
         session_factory,
         {

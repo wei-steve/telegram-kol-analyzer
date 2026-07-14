@@ -104,7 +104,39 @@ def _binding(session_factory, **overrides):
         "strategy_instance_id": "deepcoin:100:55:ETH:long",
     }
     values.update(overrides)
-    return upsert_execution_binding(session_factory, ExecutionBindingRecord(**values))
+    binding_id = upsert_execution_binding(session_factory, ExecutionBindingRecord(**values))
+    pos_ids = [item.strip() for item in str(values.get("pos_id") or "").split(",") if item.strip()]
+    order_ids = [
+        item.strip() for item in str(values.get("order_id") or "").split(",") if item.strip()
+    ]
+    client_order_ids = [
+        item.strip()
+        for item in str(values.get("client_order_id") or "").split(",")
+        if item.strip()
+    ]
+    for leg_index, pos_id in enumerate(pos_ids, start=1):
+        upsert_execution_order_leg(
+            session_factory,
+            ExecutionOrderLegRecord(
+                execution_binding_id=binding_id,
+                strategy_instance_id=values.get("strategy_instance_id"),
+                leg_index=leg_index,
+                purpose="entry",
+                order_kind="market",
+                order_id=order_ids[leg_index - 1] if leg_index <= len(order_ids) else None,
+                client_order_id=(
+                    client_order_ids[leg_index - 1]
+                    if leg_index <= len(client_order_ids)
+                    else None
+                ),
+                pos_id=pos_id,
+                status="active",
+                attribution_status="verified",
+                attribution_evidence={"source": "test_fixture"},
+                last_verified_at=datetime.now(UTC),
+            ),
+        )
+    return binding_id
 
 
 def _signal(session_factory, *, action, payload=None, message_id=88, kol_id="alice", symbol="ETH", side="long"):
@@ -121,6 +153,99 @@ def _signal(session_factory, *, action, payload=None, message_id=88, kol_id="ali
         payload=payload or {},
         strategy_instance_id="deepcoin:100:55:ETH:long",
     )
+
+
+@pytest.mark.parametrize(
+    ("action", "payload"),
+    [
+        ("close_position", lambda binding_id: {"binding_id": binding_id}),
+        (
+            "partial_close_and_move_stop_to_entry",
+            lambda binding_id: {"targets": [{"binding_id": binding_id, "fraction": 0.5}]},
+        ),
+        (
+            "adjust_stop_loss",
+            lambda binding_id: {"binding_id": binding_id, "stop_loss": 1577.04},
+        ),
+        (
+            "adjust_take_profit",
+            lambda binding_id: {"binding_id": binding_id, "take_profit": 1610.0},
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "attribution_status", ["unassigned", "attribution_conflict", "evidence_unavailable"]
+)
+def test_position_mutations_require_verified_ownership(
+    tmp_path, action, payload, attribution_status
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=1,
+            order_id="entry-1",
+            client_order_id="client-1",
+            pos_id="pos-1",
+            status="active",
+            attribution_status=attribution_status,
+        ),
+    )
+    trade_signal = _signal(
+        session_factory,
+        action=action,
+        payload=payload(binding_id),
+    )
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match=f"position_ownership_not_verified:{attribution_status}",
+    ):
+        execute_deepcoin_management_signal(
+            session_factory,
+            trade_signal=trade_signal,
+            deepcoin_client=client,
+        )
+
+    assert client.order_payloads == []
+    assert client.cancel_trigger_payloads == []
+    assert client.protection_payloads == []
+
+
+@pytest.mark.parametrize(
+    "attribution_status", ["unassigned", "attribution_conflict", "evidence_unavailable"]
+)
+def test_exact_bound_close_requires_verified_ownership(tmp_path, attribution_status):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=1,
+            order_id="entry-1",
+            client_order_id="client-1",
+            pos_id="pos-1",
+            status="active",
+            attribution_status=attribution_status,
+        ),
+    )
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match=f"position_ownership_not_verified:{attribution_status}",
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+        )
+
+    assert client.order_payloads == []
 
 
 def test_adjust_stop_loss_cancels_existing_position_tpsl_before_resetting(tmp_path):

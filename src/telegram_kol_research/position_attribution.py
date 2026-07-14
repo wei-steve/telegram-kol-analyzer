@@ -87,6 +87,55 @@ class AttributionResult:
     unassigned_position_ids: set[str] = field(default_factory=set)
 
 
+class PositionAttributionError(RuntimeError):
+    """Raised when a live mutation lacks unique persisted position ownership."""
+
+
+def require_verified_position_ownership(session, *, venue: str, pos_id: str):
+    """Return the sole nonterminal verified leg owning an exact exchange position."""
+
+    from telegram_kol_research.models import ExecutionOrderLeg
+
+    rows = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.venue == str(venue or "deepcoin").lower())
+        .filter(ExecutionOrderLeg.pos_id == str(pos_id))
+        .all()
+    )
+    if len(rows) != 1:
+        raise PositionAttributionError("position_ownership_not_unique")
+    leg = rows[0]
+    state = str(leg.attribution_status or "unassigned")
+    if state != "verified":
+        raise PositionAttributionError(f"position_ownership_not_verified:{state}")
+    if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+        raise PositionAttributionError("position_ownership_terminal")
+    return leg
+
+
+def require_manual_position_attribution_allowed(
+    session, *, venue: str, pos_id: str
+) -> None:
+    """Allow operator binding only when no unresolved ownership evidence exists."""
+
+    from telegram_kol_research.models import ExecutionOrderLeg
+
+    rows = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.venue == str(venue or "deepcoin").lower())
+        .filter(ExecutionOrderLeg.pos_id == str(pos_id))
+        .all()
+    )
+    states = {str(row.attribution_status or "unassigned") for row in rows}
+    for blocked_state in ("attribution_conflict", "evidence_unavailable"):
+        if blocked_state in states:
+            raise PositionAttributionError(
+                f"position attribution cannot be manually overridden:{blocked_state}"
+            )
+    if rows:
+        raise PositionAttributionError("position attribution is already recorded")
+
+
 @dataclass(frozen=True, slots=True)
 class _Edge:
     leg_id: int

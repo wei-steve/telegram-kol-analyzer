@@ -1275,6 +1275,13 @@ def bind_deepcoin_position_to_lifecycle(
                 lifecycle.updated_at = now
                 binding_id = int(binding.id)
                 session.commit()
+                _record_manual_verified_entry_leg(
+                    session_factory,
+                    binding_id=binding_id,
+                    pos_id=pos_id,
+                    position_payload=position_payload,
+                    verified_at=now,
+                )
                 return binding_id
         record = ExecutionBindingRecord(
             kol_id=f"group:{lifecycle.chat_id}",
@@ -1300,7 +1307,50 @@ def bind_deepcoin_position_to_lifecycle(
                 lifecycle.entered_at = now
             lifecycle.updated_at = now
             session.commit()
+    _record_manual_verified_entry_leg(
+        session_factory,
+        binding_id=binding_id,
+        pos_id=pos_id,
+        position_payload=position_payload,
+        verified_at=now,
+    )
     return binding_id
+
+
+def _record_manual_verified_entry_leg(
+    session_factory: sessionmaker,
+    *,
+    binding_id: int,
+    pos_id: str,
+    position_payload: dict[str, Any] | None,
+    verified_at: datetime,
+) -> None:
+    with session_factory() as session:
+        existing = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == int(binding_id))
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .order_by(ExecutionOrderLeg.leg_index.desc())
+            .first()
+        )
+        leg_index = int(existing.leg_index) + 1 if existing is not None else 1
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=leg_index,
+            purpose="entry",
+            order_kind="manual_bind",
+            pos_id=pos_id,
+            attribution_status="verified",
+            attribution_evidence={
+                "source": "manual_operator_bind",
+                "position": position_payload or {},
+            },
+            last_verified_at=verified_at,
+            status="active",
+        ),
+    )
 
 
 def upsert_execution_order_leg(

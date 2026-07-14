@@ -23,6 +23,10 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     StrategyLifecycle,
 )
+from telegram_kol_research.position_attribution import (
+    PositionAttributionError,
+    require_verified_position_ownership,
+)
 from telegram_kol_research.trade_signals import TradeSignalRecord
 
 
@@ -127,6 +131,7 @@ def partial_close_and_move_stop_to_entry(
             or not binding.pos_id
         ):
             raise DeepcoinExecutionActionError("breakeven_management_target_not_exactly_bound")
+        _require_verified_binding_positions(session_factory, binding)
         inst_id = _to_deepcoin_swap_instrument(binding.symbol)
         position = _select_bound_position(deepcoin_client.list_positions(inst_id=inst_id), binding=binding, inst_id=inst_id)
         average_entry = _position_average_entry(position)
@@ -174,6 +179,7 @@ def adjust_position_tpsl(
 
     now = executed_at or datetime.now(UTC)
     binding = _load_binding_for_signal(session_factory, trade_signal)
+    _require_verified_binding_positions(session_factory, binding)
     inst_id = _to_deepcoin_swap_instrument(binding.symbol)
     position = _select_bound_position(
         deepcoin_client.list_positions(inst_id=inst_id),
@@ -290,8 +296,13 @@ def close_position_market(
 
     now = executed_at or datetime.now(UTC)
     binding = _load_binding_for_signal(session_factory, trade_signal)
-    inst_id = _to_deepcoin_swap_instrument(binding.symbol)
     requested_pos_ids = _requested_position_ids(trade_signal.payload)
+    _require_verified_binding_positions(
+        session_factory,
+        binding,
+        requested_pos_ids=requested_pos_ids,
+    )
+    inst_id = _to_deepcoin_swap_instrument(binding.symbol)
     positions = _select_bound_positions(
         deepcoin_client.list_positions(inst_id=inst_id),
         binding=binding,
@@ -403,6 +414,11 @@ def close_bound_position_market(
         raise DeepcoinExecutionActionError("missing_pos_id")
     now = executed_at or datetime.now(UTC)
     binding = _load_exact_active_binding_for_position(session_factory, normalized_pos_id)
+    _require_verified_binding_positions(
+        session_factory,
+        binding,
+        requested_pos_ids={normalized_pos_id},
+    )
     _reserve_bound_position_close(session_factory, binding=binding, pos_id=normalized_pos_id, now=now)
     _record_bound_position_close_reservation_event(
         session_factory,
@@ -871,6 +887,28 @@ def _load_exact_active_binding_for_position(
             position_mode=row.position_mode,
             status=row.status,
         )
+
+
+def _require_verified_binding_positions(
+    session_factory: sessionmaker,
+    binding: _LoadedBinding,
+    *,
+    requested_pos_ids: set[str] | None = None,
+) -> None:
+    bound_pos_ids = set(_split_ids(binding.pos_id))
+    target_pos_ids = requested_pos_ids if requested_pos_ids is not None else bound_pos_ids
+    if not target_pos_ids or not target_pos_ids.issubset(bound_pos_ids):
+        raise DeepcoinExecutionActionError("position_ownership_not_unique")
+    try:
+        with session_factory() as session:
+            for pos_id in sorted(target_pos_ids):
+                require_verified_position_ownership(
+                    session,
+                    venue=binding.venue,
+                    pos_id=pos_id,
+                )
+    except PositionAttributionError as exc:
+        raise DeepcoinExecutionActionError(str(exc)) from exc
 
 
 def _select_bound_position(

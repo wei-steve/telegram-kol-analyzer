@@ -417,15 +417,6 @@ def _auto_process_management_signal(
             symbol=symbol,
             side=side,
         )
-        if binding is None and candidate.event_type == "close_signal":
-            binding = _recover_exit_signal_execution_binding(
-                session_factory,
-                raw_message=raw_message,
-                candidate=candidate,
-                runtime_kol_id=str(runtime_config["kol_id"]),
-                deepcoin_client=deepcoin_client,
-                recovered_at=processed_at,
-            )
         if binding is None:
             return {"status": "skipped", "reason": "no_execution_binding"}
 

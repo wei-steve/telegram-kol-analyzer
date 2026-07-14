@@ -972,6 +972,19 @@ def test_bound_position_close_api_submits_exact_live_position_and_keeps_lifecycl
             position_mode="split",
         )
         session.add_all([lifecycle, binding])
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                leg_index=1,
+                purpose="entry",
+                order_kind="market",
+                pos_id="pos-target",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="active",
+            )
+        )
         session.commit()
         lifecycle_id = lifecycle.id
         binding_id = binding.id
@@ -1326,6 +1339,86 @@ def test_bind_live_position_api_attaches_unbound_position_to_lifecycle(tmp_path)
         assert binding.pos_id == "pos-btc"
         assert binding.last_exchange_status == "manual_bound_live_position"
         assert lifecycle.execution_binding_id == binding.id
+        leg = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-btc").one()
+        assert leg.execution_binding_id == binding.id
+        assert leg.attribution_status == "verified"
+        assert leg.order_kind == "manual_bind"
+
+
+@pytest.mark.parametrize(
+    "attribution_status", ["attribution_conflict", "evidence_unavailable"]
+)
+def test_bind_live_position_api_does_not_override_unresolved_attribution(
+    tmp_path, attribution_status
+):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-btc",
+                    "posSide": "short",
+                    "pos": "9",
+                    "avgPx": "59761.2",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+    )
+    with app.state.session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 30, 9, 0),
+            entered_at=datetime(2026, 6, 30, 9, 1),
+            entry_price_actual=59761.2,
+        )
+        unresolved_binding = ExecutionBinding(
+            kol_id="unresolved",
+            chat_id=999,
+            message_id=999,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            pos_id="pos-btc",
+            status="unknown",
+        )
+        session.add_all([lifecycle, unresolved_binding])
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=unresolved_binding.id,
+                leg_index=1,
+                purpose="entry",
+                order_kind="market",
+                pos_id="pos-btc",
+                venue="deepcoin",
+                attribution_status=attribution_status,
+                status="active",
+            )
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    response = TestClient(app).post(
+        "/api/execution/bind-live-position",
+        json={"pos_id": "pos-btc", "lifecycle_id": lifecycle_id},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        f"position attribution cannot be manually overridden:{attribution_status}"
+    )
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        leg = session.query(ExecutionOrderLeg).one()
+    assert lifecycle.execution_binding_id is None
+    assert leg.attribution_status == attribution_status
 
 
 def test_bind_live_position_api_accepts_entry_range_when_actual_entry_drifted(tmp_path):
