@@ -237,6 +237,16 @@ def test_build_true_range_limit_entry_retains_two_configured_style_legs():
     assert [leg["allocation_pct"] for leg in draft["order_legs"]] == [50.0, 50.0]
 
 
+def test_build_one_tick_conservative_range_retains_two_distinct_normalized_legs():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(entry_range="63700.0-63700.1", stop_loss="62500"),
+        contract_spec=_btc_contract_spec(),
+    )
+
+    assert [leg["price"] for leg in draft["order_legs"]] == [63700.0, 63700.1]
+    assert [leg["allocation_pct"] for leg in draft["order_legs"]] == [50.0, 50.0]
+
+
 def test_build_deepcoin_order_draft_hybrid_range_entry_near_upper_edge():
     draft = build_deepcoin_order_draft(
         _payload_preview(

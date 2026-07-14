@@ -389,11 +389,13 @@ def _entry_leg_prices(
         edge = high if position_side == "long" else low
         first = _normalize_price(edge, contract_spec)
         second = _normalize_price(midpoint, contract_spec)
-        return first, second
     else:
         edge = low if position_side == "long" else high
-    first = _normalize_price(midpoint, contract_spec)
-    second = _normalize_price(edge, contract_spec)
+        first = _normalize_price(midpoint, contract_spec)
+        second = _normalize_price(edge, contract_spec)
+    if math.isclose(first, second):
+        alternate_endpoint = high if math.isclose(first, low) else low
+        second = _normalize_price(alternate_endpoint, contract_spec)
     return first, second
 
 
