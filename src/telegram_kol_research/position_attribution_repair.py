@@ -187,6 +187,10 @@ def build_position_attribution_repair_plan(
                 )
             )
 
+        terminal_leg_ids = {action.leg_id for action in terminal_actions}
+        assign_actions = [
+            action for action in assign_actions if action.leg_id not in terminal_leg_ids
+        ]
         actions = _dedupe_actions([*clear_actions, *terminal_actions, *assign_actions])
         return _build_plan(
             created_at=created_at,
@@ -203,6 +207,10 @@ def apply_position_attribution_repair_plan(
     *,
     deepcoin_client=None,
 ) -> PositionAttributionRepairResult:
+    if plan.unresolved_conflicts:
+        raise PositionAttributionRepairError(
+            "repair plan contains unresolved attribution conflicts"
+        )
     with session_factory() as session:
         applied_fingerprints = {
             row.fingerprint
@@ -217,9 +225,19 @@ def apply_position_attribution_repair_plan(
             return PositionAttributionRepairResult(applied=0, already_applied=True)
 
     if deepcoin_client is not None:
-        current_live_ids = _live_position_ids(deepcoin_client.list_positions())
-        if current_live_ids != plan.live_position_ids:
-            raise PositionAttributionRepairError("live positions changed since repair plan")
+        current_plan = build_position_attribution_repair_plan(
+            session_factory,
+            deepcoin_client=deepcoin_client,
+            now=plan.created_at,
+        )
+        if current_plan.fingerprint != plan.fingerprint:
+            if current_plan.live_position_ids != plan.live_position_ids:
+                raise PositionAttributionRepairError(
+                    "live positions changed since repair plan"
+                )
+            raise PositionAttributionRepairError(
+                "stale repair plan: exchange or database evidence changed"
+            )
 
     with session_factory() as session:
         bindings = (
@@ -338,6 +356,11 @@ def _database_fingerprint(bindings, legs) -> str:
             "bindings": [
                 {
                     "id": int(row.id),
+                    "strategy_instance_id": row.strategy_instance_id,
+                    "chat_id": int(row.chat_id),
+                    "message_id": int(row.message_id),
+                    "symbol": row.symbol,
+                    "side": row.side,
                     "pos_id": row.pos_id,
                     "status": row.status,
                     "last_exchange_status": row.last_exchange_status,
@@ -353,6 +376,10 @@ def _database_fingerprint(bindings, legs) -> str:
                     "pos_id": row.pos_id,
                     "status": row.status,
                     "attribution_status": row.attribution_status,
+                    "attribution_evidence_json": row.attribution_evidence_json,
+                    "request_json": row.request_json,
+                    "response_json": row.response_json,
+                    "terminal_reason": row.terminal_reason,
                 }
                 for row in legs
             ],

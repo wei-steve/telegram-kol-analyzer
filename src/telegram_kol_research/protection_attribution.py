@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import inf, isclose
+from math import isclose
 from typing import Any
 
 
@@ -68,7 +68,7 @@ def match_position_protection(
     exact_rows: dict[str, list[dict[str, Any]]] = {
         row.pos_id: _inline_position_protection_rows(row.raw) for row in parsed_positions
     }
-    unscoped_groups: dict[tuple[str, str, int | None], _ProtectionGroup] = {}
+    unscoped_groups: list[_ProtectionGroup] = []
     for order in tpsl_orders:
         if str(order.get("triggerOrderType") or "TPSL").upper() != "TPSL":
             continue
@@ -81,15 +81,39 @@ def match_position_protection(
         instrument_id = _instrument_id(order)
         side = _side(order)
         created_at_ms = _timestamp_ms(order)
-        key = (instrument_id, side, created_at_ms)
-        group = unscoped_groups.setdefault(
-            key,
-            _ProtectionGroup(
+        merge_candidates = [
+            candidate
+            for candidate in unscoped_groups
+            if _can_merge_protection_row(
+                    candidate,
+                    order,
+                    instrument_id=instrument_id,
+                    side=side,
+                    created_at_ms=created_at_ms,
+                    time_tolerance_ms=time_tolerance_ms,
+                )
+        ]
+        group = None
+        if merge_candidates:
+            best_distance = min(
+                _time_distance(candidate.created_at_ms, created_at_ms)
+                for candidate in merge_candidates
+            )
+            nearest = [
+                candidate
+                for candidate in merge_candidates
+                if _time_distance(candidate.created_at_ms, created_at_ms)
+                == best_distance
+            ]
+            if len(nearest) == 1:
+                group = nearest[0]
+        if group is None:
+            group = _ProtectionGroup(
                 instrument_id=instrument_id,
                 side=side,
                 created_at_ms=created_at_ms,
-            ),
-        )
+            )
+            unscoped_groups.append(group)
         group.rows.append(order)
 
     for pos_id, rows in exact_rows.items():
@@ -99,54 +123,98 @@ def match_position_protection(
                 evidence={"match": "exact_pos_id", "pos_id": pos_id},
             )
 
-    for group in unscoped_groups.values():
-        candidates: list[tuple[tuple[float, int], _Position]] = []
+    groups = list(unscoped_groups)
+    edges: list[tuple[int, str, tuple[float, int]]] = []
+    plausible_by_group: dict[int, list[_Position]] = {}
+    for group_index, group in enumerate(groups):
+        plausible: list[_Position] = []
         for position in parsed_positions:
             if position.instrument_id != group.instrument_id or position.side != group.side:
                 continue
+            plausible.append(position)
             time_distance = _time_distance(position.created_at_ms, group.created_at_ms)
-            if time_distance != inf and time_distance > max(0, int(time_tolerance_ms)):
+            if time_distance is None or time_distance > max(0, int(time_tolerance_ms)):
                 continue
-            candidates.append(
-                ((time_distance, _size_penalty(position.size, group.rows)), position)
-            )
-        if not candidates:
-            continue
-        best_rank = min(rank for rank, _position in candidates)
-        winners = [position for rank, position in candidates if rank == best_rank]
-        if len(winners) != 1:
-            for position in winners:
-                by_pos_id[position.pos_id] = PositionProtection(
-                    status="present_but_ambiguous",
-                    evidence={
-                        "match": "ambiguous",
-                        "candidate_pos_ids": sorted(item.pos_id for item in winners),
-                        "order_ids": _order_ids(group.rows),
-                        "has_stop_loss": any(
-                            _protection_price(row, "sl") is not None
-                            for row in group.rows
-                        ),
-                        "has_take_profit": any(
-                            _protection_price(row, "tp") is not None
-                            for row in group.rows
-                        ),
-                    },
-                )
-            continue
+            size_penalty = _size_penalty(position.size, group.rows)
+            if size_penalty != 0:
+                continue
+            edges.append((group_index, position.pos_id, (time_distance, size_penalty)))
+        plausible_by_group[group_index] = plausible
 
-        winner = winners[0]
-        current = by_pos_id[winner.pos_id]
-        if current.status == "verified":
-            combined_rows = [*exact_rows[winner.pos_id], *group.rows]
-        else:
-            combined_rows = list(group.rows)
-        exact_rows[winner.pos_id] = combined_rows
-        by_pos_id[winner.pos_id] = _verified_protection(
-            combined_rows,
+    assignments: dict[int, str] = {}
+    remaining = list(edges)
+    while remaining:
+        group_best = _unique_best_protection_edges(remaining, key_index=0)
+        position_best = _unique_best_protection_edges(remaining, key_index=1)
+        accepted = [
+            edge
+            for edge in remaining
+            if group_best.get(edge[0]) == edge and position_best.get(edge[1]) == edge
+        ]
+        if not accepted:
+            break
+        accepted_groups = {edge[0] for edge in accepted}
+        accepted_positions = {edge[1] for edge in accepted}
+        for group_index, pos_id, _rank in accepted:
+            assignments[group_index] = pos_id
+        remaining = [
+            edge
+            for edge in remaining
+            if edge[0] not in accepted_groups and edge[1] not in accepted_positions
+        ]
+
+    unresolved_groups = set(range(len(groups))) - set(assignments)
+    ambiguous_pos_ids = {
+        position.pos_id
+        for group_index in unresolved_groups
+        for position in plausible_by_group.get(group_index, [])
+    }
+    # An accepted assignment is also unsafe if another protection group plausibly
+    # competes for that same position. Never expose order IDs in this case.
+    for group_index, pos_id in assignments.items():
+        if any(
+            candidate.pos_id == pos_id
+            for unresolved_index in unresolved_groups
+            for candidate in plausible_by_group.get(unresolved_index, [])
+        ):
+            ambiguous_pos_ids.add(pos_id)
+
+    for group_index, pos_id in assignments.items():
+        if pos_id in ambiguous_pos_ids:
+            continue
+        group = groups[group_index]
+        rows = [*exact_rows[pos_id], *group.rows]
+        exact_rows[pos_id] = rows
+        rank = next(edge[2] for edge in edges if edge[0] == group_index and edge[1] == pos_id)
+        by_pos_id[pos_id] = _verified_protection(
+            rows,
             evidence={
-                "match": "unique_instrument_side_time",
-                "time_distance_ms": best_rank[0],
-                "size_penalty": best_rank[1],
+                "match": "mutual_unique_instrument_side_time_size",
+                "time_distance_ms": rank[0],
+                "size_penalty": rank[1],
+            },
+        )
+
+    for pos_id in ambiguous_pos_ids:
+        ambiguous_rows = [
+            row
+            for group_index, group in enumerate(groups)
+            if any(
+                candidate.pos_id == pos_id
+                for candidate in plausible_by_group.get(group_index, [])
+            )
+            for row in group.rows
+        ]
+        by_pos_id[pos_id] = PositionProtection(
+            status="present_but_ambiguous",
+            evidence={
+                "match": "ambiguous_global_assignment",
+                "has_stop_loss": any(
+                    _protection_price(row, "sl") is not None for row in ambiguous_rows
+                ),
+                "has_take_profit": any(
+                    _protection_price(row, "tp") is not None for row in ambiguous_rows
+                ),
             },
         )
 
@@ -201,19 +269,46 @@ def _size_penalty(position_size: float | None, rows: list[dict[str, Any]]) -> in
     row_sizes = [
         (row, value) for row, value in row_sizes if value is not None and value >= 0
     ]
-    sizes = [value for _row, value in row_sizes]
-    if any(value == 0 for value in sizes):
-        return 0
     tp_sizes = [
         size
         for row, size in row_sizes
         if _protection_price(row, "tp") is not None
     ]
-    if tp_sizes and isclose(sum(tp_sizes), position_size, rel_tol=1e-9, abs_tol=1e-9):
+    if tp_sizes:
+        if any(value == 0 for value in tp_sizes):
+            return 0
+        return (
+            0
+            if isclose(sum(tp_sizes), position_size, rel_tol=1e-9, abs_tol=1e-9)
+            else 1
+        )
+    sizes = [value for _row, value in row_sizes]
+    if any(value == 0 for value in sizes):
         return 0
     if any(isclose(value, position_size, rel_tol=1e-9, abs_tol=1e-9) for value in sizes):
         return 0
     return 1
+
+
+def _can_merge_protection_row(
+    group: _ProtectionGroup,
+    row: dict[str, Any],
+    *,
+    instrument_id: str,
+    side: str,
+    created_at_ms: int | None,
+    time_tolerance_ms: int,
+) -> bool:
+    if group.instrument_id != instrument_id or group.side != side:
+        return False
+    distance = _time_distance(group.created_at_ms, created_at_ms)
+    if distance is None or distance > max(0, int(time_tolerance_ms)):
+        return False
+    row_has_stop = _protection_price(row, "sl") is not None
+    group_has_stop = any(_protection_price(item, "sl") is not None for item in group.rows)
+    # One evidence group may contain one full stop and multiple partial targets.
+    # A second stop is a competing group and must remain globally ambiguous.
+    return not (row_has_stop and group_has_stop)
 
 
 def _row_has_protection(row: dict[str, Any]) -> bool:
@@ -267,9 +362,23 @@ def _timestamp_ms(row: dict[str, Any]) -> int | None:
         return None
 
 
-def _time_distance(first: int | None, second: int | None) -> float:
+def _unique_best_protection_edges(
+    edges: list[tuple[int, str, tuple[float, int]]], *, key_index: int
+) -> dict[object, tuple[int, str, tuple[float, int]]]:
+    result: dict[object, tuple[int, str, tuple[float, int]]] = {}
+    keys = {edge[key_index] for edge in edges}
+    for value in keys:
+        candidates = [edge for edge in edges if edge[key_index] == value]
+        best_rank = min(edge[2] for edge in candidates)
+        winners = [edge for edge in candidates if edge[2] == best_rank]
+        if len(winners) == 1:
+            result[value] = winners[0]
+    return result
+
+
+def _time_distance(first: int | None, second: int | None) -> float | None:
     if first is None or second is None:
-        return inf
+        return None
     return float(abs(first - second))
 
 

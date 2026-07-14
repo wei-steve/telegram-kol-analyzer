@@ -38,6 +38,15 @@ class DeepcoinClientError(RuntimeError):
     """Raised when Deepcoin credentials or API responses are invalid."""
 
 
+def _require_list_data(payload: dict[str, Any], *, endpoint: str) -> list[dict[str, Any]]:
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise DeepcoinClientError(f"invalid list response schema: {endpoint}")
+    if not all(isinstance(row, dict) for row in data):
+        raise DeepcoinClientError(f"invalid list row schema: {endpoint}")
+    return data
+
+
 @dataclass(slots=True)
 class DeepcoinCredentials:
     api_key: str
@@ -163,8 +172,7 @@ class DeepcoinRestClient:
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        data = payload.get("data")
-        return data if isinstance(data, list) else []
+        return _require_list_data(payload, endpoint=DEEPCOIN_ACCOUNT_POSITIONS_PATH)
 
     def list_open_orders(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         payload = self._request(
@@ -174,8 +182,7 @@ class DeepcoinRestClient:
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        data = payload.get("data")
-        return data if isinstance(data, list) else []
+        return _require_list_data(payload, endpoint=DEEPCOIN_ORDERS_PENDING_PATH)
 
     def list_order_history(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         payload = self._request(
@@ -185,8 +192,7 @@ class DeepcoinRestClient:
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        data = payload.get("data")
-        return data if isinstance(data, list) else []
+        return _require_list_data(payload, endpoint=DEEPCOIN_ORDERS_HISTORY_PATH)
 
     def list_trade_fills(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         payload = self._request(
@@ -196,8 +202,7 @@ class DeepcoinRestClient:
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        data = payload.get("data")
-        return data if isinstance(data, list) else []
+        return _require_list_data(payload, endpoint=DEEPCOIN_TRADE_FILLS_PATH)
 
     def get_order_history_by_id(
         self,
@@ -222,8 +227,7 @@ class DeepcoinRestClient:
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        data = payload.get("data")
-        return data if isinstance(data, list) else []
+        return _require_list_data(payload, endpoint=DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH)
 
     def list_trigger_order_history(self, *, inst_id: str) -> list[dict[str, Any]]:
         payload = self._request(
@@ -233,8 +237,7 @@ class DeepcoinRestClient:
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        data = payload.get("data")
-        return data if isinstance(data, list) else []
+        return _require_list_data(payload, endpoint=DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH)
 
     def get_trigger_order_history_by_id(
         self,

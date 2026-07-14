@@ -98,3 +98,67 @@ Use the Web prompt center for browsing and editing. Saving produces a non-live d
 The old YAML prompt fields are compatibility seed inputs only. Database versions take precedence and runtime call sites must not compose prompts from YAML. Model/API configuration remains in YAML, while API keys must never appear in prompt APIs or rendered HTML.
 
 Operational details, table names, rollback boundaries, and production checks are documented in `docs/context/ai-prompt-registry.md`.
+
+## Deepcoin position-attribution authority
+
+`execution_order_legs` is the only persisted authority that may connect a live
+Deepcoin `posId` to a KOL strategy. A live position is manageable only when one
+nonterminal entry leg uniquely owns that exact `posId` with
+`attribution_status=verified`. `execution_bindings.pos_id`, lifecycle state,
+symbol/side similarity, entry-price proximity, and the fact that only one
+position remains are not ownership proof.
+
+Reconciliation loads one coherent read-only exchange snapshot, refreshes exact
+entry-order states, runs global one-to-one matching, then derives binding and
+lifecycle state. The permitted ownership states are `verified`, `unassigned`,
+`attribution_conflict`, and `evidence_unavailable`. Every conflict or evidence
+failure freezes automatic close and TPSL mutation. API failure is never treated
+as position/order absence.
+
+Manual exchange close and cancellation are terminal facts. A manually closed
+position or cancelled entry leg cannot be revived by an old Telegram lifecycle,
+a later reconcile pass, or a same-symbol live position. All real close, partial
+close, and TPSL changes pass the same verified-ownership gate. Manual Web
+binding is an explicit operator decision, writes a `manual_bind` verified leg,
+and cannot overwrite conflict or unavailable evidence.
+
+Position protection is attributed independently from strategy ownership.
+Exact TPSL `posId` wins; otherwise the matcher uses a small time window,
+instrument, side, full-position `sz=0`, and aggregated partial TP sizes. A
+unique result may be displayed and mutated. Ambiguous protection displays
+`止损存在，归属待确认`; read failure displays `止损证据暂不可用`; neither state
+exposes cancellable order IDs. Missing timestamps, incompatible sizes, or two
+protection groups competing for one position are ambiguous and fail closed.
+Unscoped TPSL matching is global and mutual-unique across all live positions.
+
+Within the single `telegram-kol.service` process, reconciliation and management
+mutations share one authority lock from evidence read through exchange request,
+closing the validation/request race. The card-level exact-position close also
+uses a durable database reservation and revalidates verified ownership inside a
+SQLite immediate transaction before any exchange request. Reconcile preserves a
+currently reserved exact owner until that request has a recorded outcome.
+
+Attribution transitions are immutable in `position_attribution_audits`.
+Abnormal notifications use a canonical fingerprint and persist delivery status
+separately, so repeated identical reconciliation does not spam the system bot
+and notification failure never changes ownership. Claiming is a conditional
+atomic update. Delivery is intentionally at-most-once: `delivering` or `failed`
+incidents require manual investigation instead of an automatic resend whose
+exchange/network outcome could be ambiguous.
+
+Historical repair is dry-run-first:
+
+```bash
+telegram-kol-research repair-position-attribution --database-path data/research.db
+telegram-kol-research repair-position-attribution --database-path data/research.db --apply
+```
+
+Back up the database and review the dry run before `--apply`. Apply is explicit,
+transactional, audited, idempotent, refuses stale database/live-position
+evidence and unresolved conflicts, and never submits an exchange mutation.
+If a legacy database already contains duplicate `(venue,pos_id)` owners,
+bootstrap leaves the unique index pending so this read-only/dry-run repair path
+can start; runtime ownership gates still reject the duplicate. After repair,
+restart once more to create the unique index.
+Production remains fail closed until real positions, entry legs, pending orders,
+TPSL, audit incidents, service health, and server tests all agree.

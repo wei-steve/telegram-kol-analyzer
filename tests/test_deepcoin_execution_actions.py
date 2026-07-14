@@ -638,18 +638,32 @@ def test_bound_position_market_close_reserves_exact_position_before_concurrent_s
     thread.start()
     assert client.listing_started.wait(timeout=5)
 
-    with pytest.raises(DeepcoinExecutionActionError, match="close_already_reserved"):
-        close_bound_position_market(
-            session_factory,
-            pos_id="pos-1",
-            deepcoin_client=client,
-            executed_at=datetime(2026, 7, 11, 12, 1, tzinfo=UTC),
-        )
+    second_attempt_errors = []
+
+    def second_attempt():
+        try:
+            close_bound_position_market(
+                session_factory,
+                pos_id="pos-1",
+                deepcoin_client=client,
+                executed_at=datetime(2026, 7, 11, 12, 1, tzinfo=UTC),
+            )
+        except Exception as exc:
+            second_attempt_errors.append(exc)
+
+    second_thread = Thread(target=second_attempt)
+    second_thread.start()
+    assert second_thread.is_alive()
 
     client.release_listing.set()
     thread.join(timeout=5)
+    second_thread.join(timeout=5)
     assert not thread.is_alive()
+    assert not second_thread.is_alive()
     assert first_attempt_errors == []
+    assert len(second_attempt_errors) == 1
+    assert isinstance(second_attempt_errors[0], DeepcoinExecutionActionError)
+    assert "close_already_reserved" in str(second_attempt_errors[0])
     assert [payload["closePosId"] for payload in client.order_payloads] == ["pos-1"]
     events = list_execution_events(session_factory, pos_id="pos-1")
     assert [(event.action, event.status) for event in events] == [

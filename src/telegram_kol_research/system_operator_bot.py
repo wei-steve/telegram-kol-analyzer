@@ -264,18 +264,35 @@ async def deliver_pending_position_attribution_incidents(
 
     now = delivered_at or datetime.now(UTC)
     with session_factory() as session:
-        rows = (
-            session.query(PositionAttributionAudit)
+        candidate_ids = [
+            int(row_id)
+            for (row_id,) in (
+                session.query(PositionAttributionAudit.id)
             .filter(PositionAttributionAudit.notification_status == "pending")
             .order_by(PositionAttributionAudit.id.asc())
             .limit(max(1, int(limit)))
             .all()
-        )
-        incident_ids = [int(row.id) for row in rows]
-        for row in rows:
-            row.notification_status = "delivering"
-            row.notification_error = None
-        session.commit()
+            )
+        ]
+
+    incident_ids: list[int] = []
+    for incident_id in candidate_ids:
+        with session_factory() as session:
+            claimed = (
+                session.query(PositionAttributionAudit)
+                .filter(PositionAttributionAudit.id == incident_id)
+                .filter(PositionAttributionAudit.notification_status == "pending")
+                .update(
+                    {
+                        PositionAttributionAudit.notification_status: "delivering",
+                        PositionAttributionAudit.notification_error: None,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            session.commit()
+            if claimed == 1:
+                incident_ids.append(incident_id)
 
     delivered = 0
     for incident_id in incident_ids:

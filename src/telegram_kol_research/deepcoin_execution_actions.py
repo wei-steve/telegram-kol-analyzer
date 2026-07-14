@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -20,6 +21,9 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     StrategyLifecycle,
+)
+from telegram_kol_research.position_authority_lock import (
+    serialized_position_authority_mutation,
 )
 from telegram_kol_research.position_attribution import (
     PositionAttributionError,
@@ -51,6 +55,7 @@ class _LoadedBinding:
     status: str
 
 
+@serialized_position_authority_mutation
 def execute_deepcoin_management_signal(
     session_factory: sessionmaker,
     *,
@@ -100,6 +105,7 @@ def execute_deepcoin_management_signal(
     raise DeepcoinExecutionActionError(f"unsupported_trade_signal_action:{trade_signal.action}")
 
 
+@serialized_position_authority_mutation
 def partial_close_and_move_stop_to_entry(
     session_factory: sessionmaker,
     *,
@@ -166,6 +172,7 @@ def partial_close_and_move_stop_to_entry(
     return {"submitted": any(item["status"] == "submitted" for item in results), "action": trade_signal.action, "targets": results}
 
 
+@serialized_position_authority_mutation
 def adjust_position_tpsl(
     session_factory: sessionmaker,
     *,
@@ -287,6 +294,7 @@ def adjust_position_tpsl(
     }
 
 
+@serialized_position_authority_mutation
 def close_position_market(
     session_factory: sessionmaker,
     *,
@@ -397,6 +405,7 @@ def close_position_market(
     }
 
 
+@serialized_position_authority_mutation
 def close_bound_position_market(
     session_factory: sessionmaker,
     *,
@@ -535,17 +544,26 @@ def _reserve_bound_position_close(
     """Durably claim an exact position before any exchange request is made."""
 
     with session_factory() as session:
-        session.add(
-            BoundPositionCloseReservation(
-                pos_id=pos_id,
-                execution_binding_id=binding.id,
-                status="reserved",
-                created_at=now,
-                updated_at=now,
-            )
-        )
         try:
+            session.execute(text("BEGIN IMMEDIATE"))
+            require_verified_position_ownership(
+                session,
+                venue=binding.venue,
+                pos_id=pos_id,
+            )
+            session.add(
+                BoundPositionCloseReservation(
+                    pos_id=pos_id,
+                    execution_binding_id=binding.id,
+                    status="reserved",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
             session.commit()
+        except PositionAttributionError as exc:
+            session.rollback()
+            raise DeepcoinExecutionActionError(str(exc)) from exc
         except IntegrityError as exc:
             session.rollback()
             raise DeepcoinExecutionActionError("bound_position_close_already_reserved") from exc
@@ -601,6 +619,7 @@ def _record_bound_position_close_reservation_event(
     )
 
 
+@serialized_position_authority_mutation
 def cancel_entry_order(
     session_factory: sessionmaker,
     *,
@@ -706,6 +725,7 @@ def cancel_entry_order(
     }
 
 
+@serialized_position_authority_mutation
 def recreate_trigger_entry_tpsl(
     session_factory: sessionmaker,
     *,

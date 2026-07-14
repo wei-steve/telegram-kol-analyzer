@@ -2,6 +2,8 @@ import base64
 import hashlib
 import hmac
 
+import pytest
+
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinCredentials
 from telegram_kol_research.deepcoin_client import DeepcoinRestClient
@@ -140,6 +142,17 @@ def test_deepcoin_client_lists_order_and_trigger_history_with_swap_query():
         "/deepcoin/trade/orders-pending?instType=SWAP&instId=ETH-USDT-SWAP",
         "/deepcoin/trade/fills?instType=SWAP&instId=ETH-USDT-SWAP",
     ]
+
+
+def test_deepcoin_list_endpoint_rejects_non_list_data():
+    http_client = _CapturingHttpClient({"code": "0", "data": {"unexpected": []}})
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+    )
+
+    with pytest.raises(DeepcoinClientError, match="invalid list response schema"):
+        client.list_positions()
 
 
 def test_deepcoin_client_lists_swap_symbols_from_market_tickers():

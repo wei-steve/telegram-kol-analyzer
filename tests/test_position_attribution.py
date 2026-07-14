@@ -164,6 +164,27 @@ def test_exact_client_order_id_can_prove_candidate_link():
     assert result.evidence_by_leg[1]["evidence_type"] == "exact_client_order_id"
 
 
+def test_exact_order_fill_without_position_link_fields_does_not_assign():
+    fill = FillEvidence(
+        source="regular_order",
+        order_id="order-1",
+        client_order_id=None,
+        pos_id=None,
+        symbol="ETH-USDT-SWAP",
+        side="short",
+        size=None,
+        price=None,
+        created_at_ms=None,
+    )
+
+    result = match_entry_legs_to_positions(
+        [_leg(1, order_id="order-1")], [_position("pos-1", 10_000)], [fill]
+    )
+
+    assert result.assignments == {}
+    assert result.unassigned_position_ids == {"pos-1"}
+
+
 def test_cancelled_trigger_history_is_terminal_but_not_fill_evidence():
     cancelled = {
         "_evidence_source": "trigger_history",

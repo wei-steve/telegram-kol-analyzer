@@ -309,9 +309,23 @@ def _backfill_sqlite_indexes(engine: Engine) -> None:
                 text("SELECT name FROM sqlite_master WHERE type='table'")
             ).fetchall()
         }
-        for create_index_sql in SQLITE_COMPAT_INDEXES.values():
+        for index_name, create_index_sql in SQLITE_COMPAT_INDEXES.items():
             table_name = create_index_sql.rsplit(" ON ", 1)[1].split(" ", 1)[0]
             if table_name in existing_tables:
+                if (
+                    index_name == "uq_execution_order_legs_venue_pos"
+                    and connection.execute(
+                        text(
+                            "SELECT 1 FROM execution_order_legs "
+                            "WHERE pos_id IS NOT NULL AND pos_id != '' "
+                            "GROUP BY venue, pos_id HAVING COUNT(*) > 1 LIMIT 1"
+                        )
+                    ).first()
+                    is not None
+                ):
+                    # Keep the database readable so the audited repair command can
+                    # resolve legacy duplicates. Runtime ownership gates fail closed.
+                    continue
                 connection.execute(text(create_index_sql))
 
 

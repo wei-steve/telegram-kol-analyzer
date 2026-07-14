@@ -283,6 +283,13 @@ def _build_best_edge(
             continue
         if _normalize_side(fill.side) != _normalize_side(position.side):
             continue
+        if (
+            fill.pos_id is None
+            and fill.created_at_ms is None
+            and fill.size is None
+            and fill.price is None
+        ):
+            continue
         if not _compatible_size(fill.size, position.size):
             continue
         candidates.append(

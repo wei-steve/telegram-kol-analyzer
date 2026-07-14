@@ -754,7 +754,22 @@ def _persisted_position_attribution(
     if not isinstance(evidence, dict):
         evidence = {}
     state = str(leg.attribution_status or "unassigned")
-    verified = state == "verified" and binding is not None
+    terminal_leg_states = {
+        "cancelled",
+        "canceled",
+        "manually_cancelled",
+        "exchange_cancelled",
+        "rejected",
+        "expired",
+        "failed",
+        "closed",
+        "manually_closed",
+    }
+    verified = (
+        state == "verified"
+        and binding is not None
+        and str(leg.status or "").lower() not in terminal_leg_states
+    )
     chat_id = binding.chat_id if binding is not None else None
     group_name = (
         group_label_by_chat_id.get(int(chat_id))
@@ -1319,7 +1334,7 @@ def _load_deepcoin_pending_tpsl_orders(
     positions: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], bool]:
     if not hasattr(deepcoin_client, "list_trigger_orders_pending"):
-        return [], True
+        return [], False
     result: list[dict[str, Any]] = []
     evidence_available = True
     instrument_ids = {

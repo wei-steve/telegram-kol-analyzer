@@ -11,6 +11,7 @@ from telegram_kol_research.execution_bindings import (
     build_client_order_id,
     build_deepcoin_account_state,
     build_strategy_instance_id,
+    bind_deepcoin_position_to_lifecycle,
     list_execution_order_legs,
     load_deepcoin_order_bindings,
     reconcile_deepcoin_execution_bindings,
@@ -101,6 +102,45 @@ def test_database_bootstrap_creates_execution_bindings_table(tmp_path):
     assert "payload_json" in columns
     assert "recovered_at" in columns
     assert "status" in columns
+
+
+def test_legacy_duplicate_position_owners_do_not_block_repair_bootstrap(tmp_path):
+    database_path = tmp_path / "legacy-duplicates.db"
+    conn = sqlite3.connect(database_path)
+    conn.executescript(
+        """
+        CREATE TABLE execution_order_legs (
+            id INTEGER PRIMARY KEY,
+            execution_binding_id INTEGER NOT NULL,
+            strategy_instance_id VARCHAR(255),
+            leg_index INTEGER NOT NULL,
+            purpose VARCHAR(64) NOT NULL,
+            order_kind VARCHAR(64) NOT NULL,
+            order_id VARCHAR(255),
+            client_order_id VARCHAR(255),
+            pos_id VARCHAR(255),
+            status VARCHAR(32) NOT NULL,
+            request_json TEXT,
+            response_json TEXT,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL
+        );
+        INSERT INTO execution_order_legs VALUES
+          (1, 1, NULL, 1, 'entry', 'unknown', NULL, NULL, 'dup-pos', 'active', NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+          (2, 2, NULL, 1, 'entry', 'unknown', NULL, NULL, 'dup-pos', 'active', NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    indexes = {
+        row[1] for row in conn.execute("PRAGMA index_list(execution_order_legs)").fetchall()
+    }
+    conn.close()
+    assert "uq_execution_order_legs_venue_pos" not in indexes
 
 
 def test_upsert_execution_binding_updates_existing_strategy_binding(tmp_path):
@@ -1664,6 +1704,14 @@ def test_reconcile_marks_conflict_instead_of_reassigning_existing_position(tmp_p
     assert correct_legs[0].pos_id is None
     assert wrong_legs[0].attribution_status == "attribution_conflict"
     assert correct_legs[0].attribution_status == "attribution_conflict"
+    with session_factory() as session:
+        incidents = (
+            session.query(PositionAttributionAudit)
+            .filter(PositionAttributionAudit.new_state == "attribution_conflict")
+            .all()
+        )
+    assert len(incidents) == 1
+    assert incidents[0].notification_status == "pending"
 
 
 def test_reconcile_does_not_reopen_manually_exited_strategy_when_old_leg_fills(tmp_path):
@@ -2438,6 +2486,61 @@ def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, bi
     assert lifecycle.exit_reason == "manual"
 
 
+def test_reconcile_then_sync_closes_a_previously_verified_missing_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(pos_id="pos-manually-closed", status="active"),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        pos_id="pos-manually-closed",
+        status="active",
+        attribution_status="verified",
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+                entered_at=datetime(2026, 6, 30, 9, 1),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+    client = FakeClient()
+    reconcile_deepcoin_execution_bindings(
+        session_factory, client=client, recovered_at=datetime(2026, 6, 30, 9, 59)
+    )
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory, client=client, synced_at=datetime(2026, 6, 30, 10, 0)
+    )
+
+    assert result.manually_closed == 1
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.query(ExecutionOrderLeg).filter_by(execution_binding_id=binding_id).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+    assert binding.status == "closed"
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "manual"
+    assert leg.status == "manually_closed"
+    assert leg.terminal_reason == "manual_position_missing"
+
+
 def test_sync_closed_position_finalizes_pending_kol_exit_exactly_once(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
@@ -2548,3 +2651,47 @@ def test_sync_manual_closed_positions_keeps_binding_open_for_unfilled_entry_leg(
     assert binding.status == "open"
     assert binding.last_exchange_status == "entry_legs_pending_after_position_closed"
     assert lifecycle.lifecycle_status == "entered"
+
+
+def test_manual_bind_rolls_back_binding_and_lifecycle_when_leg_owner_conflicts(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    owner_binding_id = upsert_execution_binding(
+        session_factory, _binding(chat_id=999, message_id=999, status="active")
+    )
+    _add_entry_leg(
+        session_factory,
+        owner_binding_id,
+        pos_id="pos-already-owned",
+        status="active",
+        attribution_status="verified",
+    )
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 30, 9, 0),
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = int(lifecycle.id)
+
+    with pytest.raises(ValueError, match="already has a verified owner"):
+        bind_deepcoin_position_to_lifecycle(
+            session_factory,
+            lifecycle_id=lifecycle_id,
+            pos_id="pos-already-owned",
+        )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate_binding = (
+            session.query(ExecutionBinding)
+            .filter_by(chat_id=100, message_id=55, symbol="BTC", side="long")
+            .one_or_none()
+        )
+    assert lifecycle.execution_binding_id is None
+    assert lifecycle.lifecycle_status == "pending_entry"
+    assert candidate_binding is None

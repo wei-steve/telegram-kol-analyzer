@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -251,6 +252,28 @@ def test_repair_apply_rejects_stale_database_without_partial_changes(tmp_path):
     assert target.pos_id is None
 
 
+def test_repair_apply_rejects_changed_request_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_incident(session_factory)
+    client = _RepairClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+    )
+    with session_factory() as session:
+        target = session.query(ExecutionOrderLeg).filter_by(execution_binding_id=120).one()
+        target.request_json = '{"instId":"ETH-USDT-SWAP","posSide":"short","sz":"9"}'
+        session.commit()
+
+    with pytest.raises(PositionAttributionRepairError, match="stale repair plan"):
+        apply_position_attribution_repair_plan(
+            session_factory,
+            plan,
+            deepcoin_client=client,
+        )
+
+
 def test_repair_apply_rejects_changed_live_position_ids(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_incident(session_factory)
@@ -266,6 +289,51 @@ def test_repair_apply_rejects_changed_live_position_ids(tmp_path):
         apply_position_attribution_repair_plan(
             session_factory,
             plan,
+            deepcoin_client=client,
+        )
+
+
+def test_repair_apply_rejects_changed_exchange_fill_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_incident(session_factory)
+    client = _RepairClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+    )
+    original = client.list_trigger_order_history
+
+    def changed_history(*, inst_id):
+        rows = original(inst_id=inst_id)
+        rows[1] = {**rows[1], "posId": "different-position"}
+        return rows
+
+    client.list_trigger_order_history = changed_history
+
+    with pytest.raises(PositionAttributionRepairError, match="evidence changed"):
+        apply_position_attribution_repair_plan(
+            session_factory,
+            plan,
+            deepcoin_client=client,
+        )
+
+
+def test_repair_apply_rejects_unresolved_conflicts_at_core_boundary(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_incident(session_factory)
+    client = _RepairClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+    )
+    unsafe_plan = replace(plan, unresolved_conflicts=[{"leg_ids": [1, 2]}])
+
+    with pytest.raises(PositionAttributionRepairError, match="unresolved"):
+        apply_position_attribution_repair_plan(
+            session_factory,
+            unsafe_plan,
             deepcoin_client=client,
         )
 
