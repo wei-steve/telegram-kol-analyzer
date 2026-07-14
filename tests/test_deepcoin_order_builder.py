@@ -1,4 +1,9 @@
+import telegram_kol_research.deepcoin_order_builder as deepcoin_order_builder
+
 from telegram_kol_research.deepcoin_order_builder import DeepcoinOrderDraftError
+from telegram_kol_research.deepcoin_order_builder import (
+    _coalesce_equivalent_entry_legs,
+)
 from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_draft
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 
@@ -245,6 +250,89 @@ def test_build_one_tick_conservative_range_retains_two_distinct_normalized_legs(
 
     assert [leg["price"] for leg in draft["order_legs"]] == [63700.0, 63700.1]
     assert [leg["allocation_pct"] for leg in draft["order_legs"]] == [50.0, 50.0]
+
+
+def test_build_range_coalesces_equivalent_normalized_entry_legs(monkeypatch):
+    monkeypatch.setattr(
+        deepcoin_order_builder,
+        "_entry_leg_prices",
+        lambda **_kwargs: (63700.0, 63700.0),
+    )
+
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            entry_range="63700-63701",
+            stop_loss="62500",
+            entry_range_order_style="eager",
+        ),
+        contract_spec=DeepcoinContractSpec(
+            instrument_id="BTC-USDT-SWAP",
+            contract_value=0.001,
+            quantity_step=1,
+            min_quantity=1,
+            price_tick=1,
+        ),
+    )
+
+    assert draft["order_legs"] == [
+        {
+            "side": "buy",
+            "position_side": "long",
+            "order_type": "limit",
+            "price": 63700.0,
+            "allocation_pct": 100.0,
+            "risk_budget_usdt": 100.0,
+            "client_order_id": "TK649760E806ACF61",
+            "quantity": 82.0,
+            "quantity_unit": "contracts",
+            "base_asset_estimate": 0.083334,
+            "estimated_stop_loss_usdt": 98.4,
+            "merged_from_leg_indices": [1, 2],
+        }
+    ]
+
+
+def test_coalesce_equivalent_entry_legs_preserves_distinct_economic_identities():
+    base_leg = {
+        "side": "buy",
+        "position_side": "long",
+        "order_type": "limit",
+        "price": 63700.0,
+        "allocation_pct": 10.0,
+        "risk_budget_usdt": 10.0,
+        "client_order_id": "first",
+        "quantity": 8.0,
+        "quantity_unit": "contracts",
+        "base_asset_estimate": 0.008,
+        "estimated_stop_loss_usdt": 9.6,
+    }
+    variants = [
+        {**base_leg, "client_order_id": "different-price", "price": 63701.0},
+        {**base_leg, "client_order_id": "different-type", "order_type": "market"},
+        {**base_leg, "client_order_id": "different-side", "side": "sell"},
+        {**base_leg, "client_order_id": "different-position", "position_side": "short"},
+        {
+            **base_leg,
+            "client_order_id": "different-unit",
+            "quantity_unit": "base_asset_estimate",
+        },
+    ]
+
+    result = _coalesce_equivalent_entry_legs(
+        [base_leg, *variants, {**base_leg, "client_order_id": "duplicate"}]
+    )
+
+    assert [leg["client_order_id"] for leg in result] == [
+        "first",
+        "different-price",
+        "different-type",
+        "different-side",
+        "different-position",
+        "different-unit",
+    ]
+    assert result[0]["allocation_pct"] == 20.0
+    assert result[0]["merged_from_leg_indices"] == [1, 7]
+    assert all("merged_from_leg_indices" not in leg for leg in result[1:])
 
 
 def test_build_deepcoin_order_draft_hybrid_range_entry_near_upper_edge():

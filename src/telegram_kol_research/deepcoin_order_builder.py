@@ -241,6 +241,7 @@ def build_deepcoin_order_draft(
                 contract_spec=contract_spec,
             ),
         ]
+    order_legs = _coalesce_equivalent_entry_legs(order_legs)
     blocking_reason_codes = _blocking_reason_codes(
         stop_loss=stop_loss,
         contract_spec=contract_spec,
@@ -546,6 +547,48 @@ def _single_entry_leg(
         stop_loss=stop_loss,
         contract_spec=contract_spec,
     )
+
+
+def _coalesce_equivalent_entry_legs(
+    order_legs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    coalesced: list[dict[str, Any]] = []
+    key_positions: dict[tuple[Any, ...], int] = {}
+    source_indices: dict[int, list[int]] = {}
+    summed_fields = (
+        "allocation_pct",
+        "risk_budget_usdt",
+        "quantity",
+        "base_asset_estimate",
+        "estimated_stop_loss_usdt",
+    )
+
+    for leg_index, leg in enumerate(order_legs, start=1):
+        key = (
+            leg.get("order_type"),
+            leg.get("price"),
+            leg.get("side"),
+            leg.get("position_side"),
+            leg.get("quantity_unit"),
+        )
+        position = key_positions.get(key)
+        if position is None:
+            position = len(coalesced)
+            key_positions[key] = position
+            coalesced.append(dict(leg))
+            source_indices[position] = [leg_index]
+            continue
+
+        merged_leg = coalesced[position]
+        for field in summed_fields:
+            current = merged_leg.get(field)
+            incoming = leg.get(field)
+            if current is not None and incoming is not None:
+                merged_leg[field] = math.fsum((float(current), float(incoming)))
+        source_indices[position].append(leg_index)
+        merged_leg["merged_from_leg_indices"] = list(source_indices[position])
+
+    return coalesced
 
 
 def _estimated_stop_loss_usdt(
