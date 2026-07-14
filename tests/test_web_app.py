@@ -890,6 +890,56 @@ def test_execution_dashboard_renders_ambiguous_stop_truthfully(tmp_path):
     assert "无止损" not in response.text
 
 
+def test_execution_dashboard_shows_inline_stop_while_pending_tpsl_is_ambiguous(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-btc",
+                    "posSide": "short",
+                    "pos": "5",
+                    "avgPx": "64800",
+                    "slTriggerPx": "66500",
+                    "tpTriggerPx": "63300",
+                    "cTime": "10000",
+                }
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [
+                {
+                    "instId": inst_id,
+                    "posSide": "short",
+                    "sz": "5",
+                    "cTime": "10000",
+                    "triggerOrderType": "TPSL",
+                    "ordId": "position-tpsl",
+                    "slTriggerPrice": "66500",
+                },
+                {
+                    "instId": inst_id,
+                    "posSide": "short",
+                    "sz": "7",
+                    "cTime": "20000",
+                    "triggerOrderType": "TPSL",
+                    "ordId": "other-tpsl",
+                    "slTriggerPrice": "66500",
+                },
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+
+    response = TestClient(app).get("/execution")
+
+    assert response.status_code == 200
+    assert "止损: 66500" in response.text
+    assert "止损存在，归属待确认" not in response.text
+
+
 def test_execution_dashboard_renders_tpsl_evidence_error_truthfully(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):

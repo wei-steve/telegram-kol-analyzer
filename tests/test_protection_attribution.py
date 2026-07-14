@@ -177,6 +177,41 @@ def test_ambiguous_extra_order_blocks_mutation_even_with_one_exact_order():
     assert result.by_pos_id["pos-a"].can_mutate is False
 
 
+def test_inline_position_prices_remain_visible_when_pending_orders_are_ambiguous():
+    result = match_position_protection(
+        [
+            _position(
+                "pos-a",
+                size="5",
+                created_at="10000",
+                slTriggerPx="66500",
+                tpTriggerPx="63300",
+            )
+        ],
+        [
+            _tpsl(
+                created_at="10000",
+                size="5",
+                ordId="position-tpsl",
+                slTriggerPrice="66500",
+            ),
+            _tpsl(
+                created_at="20000",
+                size="7",
+                ordId="other-tpsl",
+                slTriggerPrice="66500",
+            ),
+        ],
+    )
+
+    protection = result.by_pos_id["pos-a"]
+    assert protection.status == "present_but_ambiguous"
+    assert protection.stop_loss == 66500
+    assert protection.take_profits == [63300]
+    assert protection.order_ids == []
+    assert protection.can_mutate is False
+
+
 def test_missing_tpsl_evidence_is_not_reported_as_absent():
     result = match_position_protection(
         [_position("pos-api-error")],

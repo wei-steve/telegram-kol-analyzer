@@ -205,10 +205,17 @@ def match_position_protection(
             )
             for row in group.rows
         ]
+        inline = _verified_protection(
+            exact_rows[pos_id],
+            evidence={"match": "inline_position"},
+        )
         by_pos_id[pos_id] = PositionProtection(
             status="present_but_ambiguous",
+            stop_loss=inline.stop_loss,
+            take_profits=inline.take_profits,
             evidence={
                 "match": "ambiguous_global_assignment",
+                "has_inline_position_protection": bool(exact_rows[pos_id]),
                 "has_stop_loss": any(
                     _protection_price(row, "sl") is not None for row in ambiguous_rows
                 ),

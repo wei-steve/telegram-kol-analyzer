@@ -478,12 +478,12 @@ def _load_deepcoin_live_position_rows(
             protection = protection_match.by_pos_id.get(pos_id or "")
             stop_loss_value = (
                 protection.stop_loss
-                if protection is not None and protection.status == "verified"
+                if protection is not None
                 else None
             )
             take_profit_values = (
                 protection.take_profits
-                if protection is not None and protection.status == "verified"
+                if protection is not None
                 else []
             )
             take_profit_value = take_profit_values[0] if take_profit_values else None
@@ -492,6 +492,7 @@ def _load_deepcoin_live_position_rows(
             if (
                 protection_status == "present_but_ambiguous"
                 and protection is not None
+                and stop_loss_value is None
                 and protection.evidence.get("has_stop_loss")
             ):
                 stop_loss_state_text = "止损存在，归属待确认"
