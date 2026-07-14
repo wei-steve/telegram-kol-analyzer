@@ -12,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
+from telegram_kol_research.deepcoin_order_builder import _coalesce_equivalent_entry_legs
 from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
@@ -341,7 +342,7 @@ def _submit_recovery_signal_direct(
                 "client_order_id": client_order_id,
                 "order_id": order_id,
                 "pos_id": pos_id,
-                "request": order_payload,
+                "request": _persisted_order_request(order_payload, leg),
                 "response": response,
                 "protection_request": protection_payload,
                 "protection_response": protection_response,
@@ -430,13 +431,21 @@ def _submission_order_legs(
     draft: dict[str, Any],
     order_legs: list[Any],
 ) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for leg in order_legs:
-        if not isinstance(leg, dict):
-            result.append(leg)
-            continue
-        result.append(leg)
-    return result
+    copied_legs = [dict(leg) if isinstance(leg, dict) else leg for leg in order_legs]
+    if not all(isinstance(leg, dict) for leg in copied_legs):
+        return copied_legs
+    return _coalesce_equivalent_entry_legs(copied_legs)
+
+
+def _persisted_order_request(
+    order_payload: dict[str, Any],
+    leg: dict[str, Any],
+) -> dict[str, Any]:
+    persisted_request = dict(order_payload)
+    merged_from_leg_indices = leg.get("merged_from_leg_indices")
+    if isinstance(merged_from_leg_indices, list):
+        persisted_request["merged_from_leg_indices"] = list(merged_from_leg_indices)
+    return persisted_request
 
 
 def _split_quantity_by_allocations(

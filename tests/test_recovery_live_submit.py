@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
@@ -312,6 +313,16 @@ def _persist_ready_market_item(session_factory):
     )
 
 
+def _replace_queued_order_legs(session_factory, signal_id, order_legs):
+    with session_factory() as session:
+        signal = session.get(TradeSignal, signal_id)
+        payload = json.loads(signal.payload_json)
+        payload["deepcoin_order_draft"]["order_legs"] = order_legs
+        signal.payload_json = json.dumps(payload)
+        session.commit()
+    return payload["deepcoin_order_draft"]
+
+
 def test_build_deepcoin_place_order_payload_maps_limit_leg():
     payload = build_deepcoin_place_order_payload(
         {
@@ -600,6 +611,89 @@ def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):
     with session_factory() as session:
         assert session.query(ExecutionBinding).count() == 1
         assert session.query(TradeSignal).filter_by(id=signal.id).one().status == "submitted"
+
+
+def test_process_live_coalesces_equivalent_legacy_trigger_legs_before_submission(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    first_leg, second_leg = signal.payload["deepcoin_order_draft"]["order_legs"]
+    legacy_legs = [
+        dict(first_leg),
+        {
+            **first_leg,
+            "client_order_id": second_leg["client_order_id"],
+        },
+    ]
+    queued_draft = _replace_queued_order_legs(
+        session_factory,
+        signal.id,
+        legacy_legs,
+    )
+    fake_client = _FakeDeepcoinClient()
+
+    result = process_next_trade_signal_live(
+        session_factory,
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert result["order_count"] == 1
+    assert len(fake_client.trigger_payloads) == 1
+    assert fake_client.trigger_payloads[0]["sz"] == str(
+        first_leg["quantity"] + first_leg["quantity"]
+    )
+    assert "merged_from_leg_indices" not in fake_client.trigger_payloads[0]
+    assert result["deepcoin_order_draft"] == queued_draft
+    assert len(result["deepcoin_order_draft"]["order_legs"]) == 2
+    with session_factory() as session:
+        legs = session.query(ExecutionOrderLeg).all()
+    assert len(legs) == 1
+    assert json.loads(legs[0].request_json)["merged_from_leg_indices"] == [1, 2]
+
+
+def test_process_live_preserves_distinct_price_legacy_trigger_legs(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    first_leg, second_leg = signal.payload["deepcoin_order_draft"]["order_legs"]
+    assert first_leg["price"] != second_leg["price"]
+    _replace_queued_order_legs(
+        session_factory,
+        signal.id,
+        [dict(first_leg), dict(second_leg)],
+    )
+    fake_client = _FakeDeepcoinClient()
+
+    result = process_next_trade_signal_live(
+        session_factory,
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert result["order_count"] == 2
+    assert [payload["triggerPrice"] for payload in fake_client.trigger_payloads] == [
+        str(first_leg["price"]),
+        str(second_leg["price"]),
+    ]
+    with session_factory() as session:
+        assert session.query(ExecutionOrderLeg).count() == 2
 
 
 def test_market_submit_persists_binding_when_position_protection_fails(tmp_path):
