@@ -34,12 +34,19 @@ def _position(pos_id, created_at_ms):
     )
 
 
-def _fill(order_id, created_at_ms, *, source="regular_order", client_order_id=None):
+def _fill(
+    order_id,
+    created_at_ms,
+    *,
+    source="regular_order",
+    client_order_id=None,
+    pos_id=None,
+):
     return FillEvidence(
         source=source,
         order_id=order_id,
         client_order_id=client_order_id,
-        pos_id=None,
+        pos_id=pos_id,
         symbol="ETH-USDT-SWAP",
         side="short",
         size=1.5,
@@ -59,7 +66,7 @@ def test_incident_assigns_both_smart_legs_and_excludes_cancelled_horse_leg():
         _position("1001124083099498", trigger_time),
     ]
     evidence = [
-        _fill("smart-market", market_time),
+        _fill("smart-market", market_time, pos_id="1001124083084014"),
         _fill("smart-trigger", trigger_time, source="trigger_fill"),
         _fill("horse-trigger", trigger_time, source="trigger_fill"),
     ]
@@ -80,7 +87,9 @@ def test_exact_time_beats_one_second_distance():
     legs = [_leg(1, order_id="order-1")]
     positions = [_position("exact", 10_000), _position("one-second", 11_000)]
 
-    result = match_entry_legs_to_positions(legs, positions, [_fill("order-1", 10_000)])
+    result = match_entry_legs_to_positions(
+        legs, positions, [_fill("order-1", 10_000, source="trigger_fill")]
+    )
 
     assert result.assignments == {1: "exact"}
 
@@ -89,7 +98,9 @@ def test_one_second_beats_sixty_nine_seconds_distance():
     legs = [_leg(1, order_id="order-1")]
     positions = [_position("one-second", 11_000), _position("sixty-nine", 79_000)]
 
-    result = match_entry_legs_to_positions(legs, positions, [_fill("order-1", 10_000)])
+    result = match_entry_legs_to_positions(
+        legs, positions, [_fill("order-1", 10_000, source="trigger_fill")]
+    )
 
     assert result.assignments == {1: "one-second"}
 
@@ -97,7 +108,7 @@ def test_one_second_beats_sixty_nine_seconds_distance():
 def test_tied_direct_evidence_is_reported_as_conflict():
     legs = [_leg(1, order_id="order-1"), _leg(2, order_id="order-1")]
     positions = [_position("pos-1", 10_000)]
-    evidence = [_fill("order-1", 10_000)]
+    evidence = [_fill("order-1", 10_000, source="trigger_fill")]
 
     result = match_entry_legs_to_positions(legs, positions, evidence)
 
@@ -110,7 +121,10 @@ def test_tied_direct_evidence_is_reported_as_conflict():
 def test_matching_is_independent_of_input_order():
     legs = [_leg(1, order_id="order-1"), _leg(2, order_id="order-2")]
     positions = [_position("pos-1", 10_000), _position("pos-2", 20_000)]
-    evidence = [_fill("order-1", 10_000), _fill("order-2", 20_000)]
+    evidence = [
+        _fill("order-1", 10_000, source="trigger_fill"),
+        _fill("order-2", 20_000, source="trigger_fill"),
+    ]
 
     forward = match_entry_legs_to_positions(legs, positions, evidence)
     reverse = match_entry_legs_to_positions(
@@ -147,7 +161,7 @@ def test_one_position_is_never_assigned_to_two_legs():
     positions = [_position("pos-1", 10_000)]
 
     result = match_entry_legs_to_positions(
-        legs, positions, [_fill("order-2", 10_000)]
+        legs, positions, [_fill("order-2", 10_000, source="trigger_fill")]
     )
 
     assert result.assignments == {1: "pos-1"}
@@ -156,12 +170,12 @@ def test_one_position_is_never_assigned_to_two_legs():
 
 def test_exact_client_order_id_can_prove_candidate_link():
     leg = _leg(1, client_order_id="client-1")
-    fill = _fill("exchange-order", 10_000, client_order_id="client-1")
+    fill = _fill("pos-1", 10_000, client_order_id="client-1")
 
     result = match_entry_legs_to_positions([leg], [_position("pos-1", 10_000)], [fill])
 
     assert result.assignments == {1: "pos-1"}
-    assert result.evidence_by_leg[1]["evidence_type"] == "exact_client_order_id"
+    assert result.evidence_by_leg[1]["evidence_type"] == "direct_order_position_id"
 
 
 def test_exact_order_fill_without_position_link_fields_does_not_assign():
@@ -185,6 +199,72 @@ def test_exact_order_fill_without_position_link_fields_does_not_assign():
     assert result.unassigned_position_ids == {"pos-1"}
 
 
+def test_exact_order_fill_without_timestamp_cannot_attach_to_later_position():
+    fill = FillEvidence(
+        source="trade_fill",
+        order_id="order-1",
+        client_order_id=None,
+        pos_id=None,
+        symbol="ETH-USDT-SWAP",
+        side="short",
+        size=1.5,
+        price=1770.0,
+        created_at_ms=None,
+    )
+
+    result = match_entry_legs_to_positions(
+        [_leg(1, order_id="order-1")], [_position("later-pos", 10_000)], [fill]
+    )
+
+    assert result.assignments == {}
+    assert result.unassigned_position_ids == {"later-pos"}
+
+
+def test_exact_order_fill_outside_position_link_window_does_not_assign():
+    order_time = 10_000
+    twenty_hours_later = order_time + 20 * 60 * 60 * 1000
+
+    result = match_entry_legs_to_positions(
+        [_leg(1, order_id="order-1")],
+        [_position("later-pos", twenty_hours_later)],
+        [_fill("order-1", order_time)],
+    )
+
+    assert result.assignments == {}
+    assert result.unassigned_position_ids == {"later-pos"}
+
+
+def test_regular_fill_near_in_time_without_direct_position_link_does_not_assign():
+    order_time = 1_000_000
+
+    result = match_entry_legs_to_positions(
+        [_leg(89, order_id="old-order")],
+        [_position("new-unrelated-position", order_time + 1_000)],
+        [_fill("old-order", order_time)],
+    )
+
+    assert result.assignments == {}
+    assert result.unassigned_position_ids == {"new-unrelated-position"}
+
+
+def test_successful_current_trigger_beats_old_regular_order_for_reopened_position():
+    position_time = 1_780_434_230_000
+    old_leg = _leg(120, order_id="old-market-order")
+    current_trigger_leg = _leg(124, order_id="current-trigger")
+    position = _position("current-position", position_time)
+    evidence = [
+        _fill("old-market-order", position_time - 20 * 60 * 60 * 1000),
+        _fill("current-trigger", position_time - 1_000, source="trigger_fill"),
+    ]
+
+    result = match_entry_legs_to_positions(
+        [old_leg, current_trigger_leg], [position], evidence
+    )
+
+    assert result.assignments == {124: "current-position"}
+    assert 120 not in result.assignments
+
+
 def test_cancelled_trigger_history_is_terminal_but_not_fill_evidence():
     cancelled = {
         "_evidence_source": "trigger_history",
@@ -197,6 +277,49 @@ def test_cancelled_trigger_history_is_terminal_but_not_fill_evidence():
 
     assert classify_leg_exchange_state(cancelled) == "manually_cancelled"
     assert is_fill_evidence(cancelled) is False
+
+
+def test_successful_trigger_history_is_explicit_fill_evidence():
+    successful = {
+        "_evidence_source": "trigger_fill",
+        "ordId": "trigger-1",
+        "triggerTime": "1784034229",
+        "errorCode": "0",
+    }
+    failed = {**successful, "errorCode": "4"}
+    not_triggered = {**successful, "triggerTime": "0"}
+    misleading_filled_failure = {
+        **successful,
+        "state": "filled",
+        "triggerTime": "0",
+        "errorCode": "4",
+    }
+
+    assert is_fill_evidence(successful) is True
+    assert is_fill_evidence(failed) is False
+    assert is_fill_evidence(not_triggered) is False
+    assert is_fill_evidence(misleading_filled_failure) is False
+
+
+def test_successful_trigger_without_size_cannot_authorize_position():
+    fill = FillEvidence(
+        source="trigger_fill",
+        order_id="trigger-1",
+        client_order_id=None,
+        pos_id=None,
+        symbol="ETH-USDT-SWAP",
+        side="short",
+        size=None,
+        price=1770.0,
+        created_at_ms=10_000,
+    )
+
+    result = match_entry_legs_to_positions(
+        [_leg(1, order_id="trigger-1")], [_position("position-1", 10_000)], [fill]
+    )
+
+    assert result.assignments == {}
+    assert result.unassigned_position_ids == {"position-1"}
 
 
 def test_only_explicit_order_fill_or_fills_endpoint_row_is_fill_evidence():

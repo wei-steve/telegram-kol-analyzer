@@ -1091,6 +1091,9 @@ def test_bound_position_close_api_submits_exact_live_position_and_keeps_lifecycl
                 pos_id="pos-target",
                 venue="deepcoin",
                 attribution_status="verified",
+                attribution_evidence_json=(
+                    '{"policy_version":2,"evidence_type":"test_verified_entry"}'
+                ),
                 status="active",
             )
         )
@@ -1198,7 +1201,7 @@ def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):
                 },
                 {
                     "instId": "ETH-USDT-SWAP",
-                    "posId": "pos-limit",
+                    "posId": "order-limit",
                     "posSide": "short",
                     "pos": "6.4",
                     "avgPx": "1624.5",
@@ -1276,7 +1279,9 @@ def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):
                     venue="deepcoin",
                     status="active",
                     attribution_status="verified",
-                    attribution_evidence_json='{"evidence_type":"test_verified_entry"}',
+                    attribution_evidence_json=(
+                        '{"policy_version":2,"evidence_type":"test_verified_entry"}'
+                    ),
                 ),
                 ExecutionOrderLeg(
                     execution_binding_id=binding.id,
@@ -1309,7 +1314,7 @@ def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):
 
         assert lifecycle.lifecycle_status == "entered"
         assert binding.status == "active"
-        assert binding.pos_id == "pos-market,pos-limit"
+        assert binding.pos_id == "pos-market,order-limit"
 
 
 def test_execution_sync_api_keeps_payload_only_position_unassigned(tmp_path):

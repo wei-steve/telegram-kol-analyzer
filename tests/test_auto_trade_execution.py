@@ -99,7 +99,7 @@ def _verify_bound_position(session_factory, *, binding_id: int, pos_id: str) -> 
             pos_id=pos_id,
             status="active",
             attribution_status="verified",
-            attribution_evidence={"source": "test_fixture"},
+            attribution_evidence={"policy_version": 2, "source": "test_fixture"},
             last_verified_at=datetime.now(UTC),
         ),
     )

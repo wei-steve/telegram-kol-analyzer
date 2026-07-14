@@ -14,7 +14,7 @@ from telegram_kol_research.execution_bindings import list_execution_order_legs
 from telegram_kol_research.execution_bindings import upsert_execution_binding
 from telegram_kol_research.execution_bindings import upsert_execution_order_leg
 from telegram_kol_research.execution_events import list_execution_events
-from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
+from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg, StrategyLifecycle
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import save_trading_settings
@@ -132,7 +132,7 @@ def _binding(session_factory, **overrides):
                 pos_id=pos_id,
                 status="active",
                 attribution_status="verified",
-                attribution_evidence={"source": "test_fixture"},
+                attribution_evidence={"policy_version": 2, "source": "test_fixture"},
                 last_verified_at=datetime.now(UTC),
             ),
         )
@@ -246,6 +246,61 @@ def test_exact_bound_close_requires_verified_ownership(tmp_path, attribution_sta
         )
 
     assert client.order_payloads == []
+
+
+def test_exact_bound_close_rejects_legacy_weak_verified_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=1,
+            order_id="entry-1",
+            client_order_id="client-1",
+            pos_id="pos-1",
+            status="active",
+            attribution_status="verified",
+            attribution_evidence={"evidence_type": "exact_regular_order_id"},
+        ),
+    )
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="position_ownership_evidence_not_authoritative",
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+        )
+
+    assert client.order_payloads == []
+
+
+def test_exact_bound_close_accepts_explicit_legacy_manual_bind(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=binding_id
+        ).one()
+        leg.order_kind = "manual_bind"
+        leg.order_id = None
+        leg.response_json = None
+        leg.attribution_evidence_json = '{"source":"manual_operator_bind"}'
+        session.commit()
+    client = _FakeDeepcoinClient()
+
+    result = close_bound_position_market(
+        session_factory,
+        pos_id="pos-1",
+        deepcoin_client=client,
+    )
+
+    assert result["submitted"] is True
+    assert len(client.order_payloads) == 1
 
 
 def test_adjust_stop_loss_cancels_existing_position_tpsl_before_resetting(tmp_path):

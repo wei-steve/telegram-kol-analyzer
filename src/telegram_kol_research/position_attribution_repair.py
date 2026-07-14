@@ -25,6 +25,7 @@ from telegram_kol_research.models import (
 from telegram_kol_research.position_attribution import (
     TERMINAL_ENTRY_LEG_STATES,
     classify_leg_exchange_state,
+    has_authoritative_persisted_position,
     match_entry_legs_to_positions,
 )
 
@@ -127,6 +128,25 @@ def build_position_attribution_repair_plan(
         terminal_actions: list[PositionAttributionRepairAction] = []
         assign_actions: list[PositionAttributionRepairAction] = []
 
+        assigned_leg_ids = {int(leg_id) for leg_id in attribution.assignments}
+        for leg in legs:
+            if (
+                str(leg.attribution_status or "") == "verified"
+                and leg.pos_id
+                and not has_authoritative_persisted_position(leg)
+                and int(leg.id) not in assigned_leg_ids
+            ):
+                clear_actions.append(
+                    _action(
+                        "clear_untrusted_verified_position",
+                        leg,
+                        new_pos_id=None,
+                        new_status=str(leg.status),
+                        new_attribution_status="unassigned",
+                        evidence={"reason": "legacy_weak_verified_evidence"},
+                    )
+                )
+
         for target_leg_id, pos_id in sorted(attribution.assignments.items()):
             if int(target_leg_id) in conflict_leg_ids:
                 continue
@@ -136,7 +156,11 @@ def build_position_attribution_repair_plan(
                 for leg in legs
                 if leg.pos_id == pos_id and int(leg.id) != int(target_leg_id)
             ]
-            if any(str(leg.attribution_status or "") == "verified" for leg in existing_owners):
+            if any(
+                str(leg.attribution_status or "") == "verified"
+                and has_authoritative_persisted_position(leg)
+                for leg in existing_owners
+            ):
                 continue
             for old_leg in existing_owners:
                 clear_actions.append(
@@ -149,7 +173,11 @@ def build_position_attribution_repair_plan(
                         evidence={"replacement_leg_id": int(target_leg_id)},
                     )
                 )
-            if target_leg.pos_id != pos_id or str(target_leg.attribution_status) != "verified":
+            if (
+                target_leg.pos_id != pos_id
+                or str(target_leg.attribution_status) != "verified"
+                or not has_authoritative_persisted_position(target_leg)
+            ):
                 assign_actions.append(
                     _action(
                         "assign_verified_position",

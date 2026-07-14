@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+import json
 from math import inf, isclose
 from typing import Iterable
 
@@ -12,6 +13,8 @@ DIRECT_POS_ID = 0
 EXACT_REGULAR_ORDER_ID = 1
 EXACT_CLIENT_ORDER_ID = 2
 UNIQUE_TRIGGER_FILL = 3
+MAX_TRIGGER_POSITION_LINK_TIME_DISTANCE_MS = 5_000
+ATTRIBUTION_POLICY_VERSION = 2
 
 TERMINAL_ENTRY_LEG_STATES = frozenset(
     {
@@ -108,9 +111,64 @@ def require_verified_position_ownership(session, *, venue: str, pos_id: str):
     state = str(leg.attribution_status or "unassigned")
     if state != "verified":
         raise PositionAttributionError(f"position_ownership_not_verified:{state}")
+    if not has_authoritative_persisted_position(leg):
+        raise PositionAttributionError("position_ownership_evidence_not_authoritative")
     if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
         raise PositionAttributionError("position_ownership_terminal")
     return leg
+
+
+def has_authoritative_persisted_position(leg) -> bool:
+    """Return whether a persisted leg may authorize live position mutation."""
+
+    pos_id = str(getattr(leg, "pos_id", None) or "")
+    if not pos_id:
+        return False
+    order_id = str(getattr(leg, "order_id", None) or "")
+    if order_id and order_id == pos_id:
+        return True
+    response_pos_id = _find_position_id_in_json(getattr(leg, "response_json", None))
+    if response_pos_id == pos_id:
+        return True
+    try:
+        evidence = json.loads(getattr(leg, "attribution_evidence_json", None) or "{}")
+    except (TypeError, ValueError):
+        return False
+    if (
+        str(getattr(leg, "order_kind", None) or "") == "manual_bind"
+        and isinstance(evidence, dict)
+        and evidence.get("source") == "manual_operator_bind"
+    ):
+        return True
+    return bool(
+        isinstance(evidence, dict)
+        and evidence.get("policy_version") == ATTRIBUTION_POLICY_VERSION
+    )
+
+
+def _find_position_id_in_json(value: str | None) -> str | None:
+    try:
+        payload = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return None
+
+    def find(item) -> str | None:
+        if isinstance(item, dict):
+            for key in ("posId", "pos_id", "positionId"):
+                if item.get(key) not in (None, ""):
+                    return str(item[key])
+            for nested in item.values():
+                found = find(nested)
+                if found:
+                    return found
+        elif isinstance(item, list):
+            for nested in item:
+                found = find(nested)
+                if found:
+                    return found
+        return None
+
+    return find(payload)
 
 
 def require_manual_position_attribution_allowed(
@@ -170,6 +228,14 @@ def is_fill_evidence(row: dict[str, object]) -> bool:
     """Return true only for explicit fill state or a row known to come from fills."""
 
     state = classify_leg_exchange_state(row)
+    if state in {"manually_cancelled", "exchange_cancelled"}:
+        return False
+    if str(row.get("_evidence_source") or "").lower() == "trigger_fill":
+        try:
+            trigger_time = int(float(row.get("triggerTime") or 0))
+        except (TypeError, ValueError):
+            trigger_time = 0
+        return trigger_time > 0 and str(row.get("errorCode") or "") == "0"
     if state in {"filled", "partially_filled"}:
         return True
     if str(row.get("_evidence_source") or "").lower() != "trade_fill":
@@ -220,6 +286,7 @@ def match_entry_legs_to_positions(
         for edge in accepted:
             assignments[edge.leg_id] = edge.pos_id
             evidence_by_leg[edge.leg_id] = {
+                "policy_version": ATTRIBUTION_POLICY_VERSION,
                 "evidence_type": edge.evidence_type,
                 "evidence_source": edge.evidence_source,
                 "rank": {
@@ -283,13 +350,21 @@ def _build_best_edge(
             continue
         if _normalize_side(fill.side) != _normalize_side(position.side):
             continue
-        if (
-            fill.pos_id is None
-            and fill.created_at_ms is None
-            and fill.size is None
-            and fill.price is None
-        ):
-            continue
+        direct_order_position_id = bool(
+            fill.order_id and str(fill.order_id) == str(position.pos_id)
+        )
+        if fill.pos_id is None and not direct_order_position_id:
+            if fill.source != "trigger_fill":
+                continue
+            if fill.size is None or position.size is None:
+                continue
+            if fill.created_at_ms is None or position.created_at_ms is None:
+                continue
+            if (
+                abs(fill.created_at_ms - position.created_at_ms)
+                > MAX_TRIGGER_POSITION_LINK_TIME_DISTANCE_MS
+            ):
+                continue
         if not _compatible_size(fill.size, position.size):
             continue
         candidates.append(
@@ -297,12 +372,20 @@ def _build_best_edge(
                 leg_id=leg.leg_id,
                 pos_id=position.pos_id,
                 rank=MatchRank(
-                    DIRECT_POS_ID if fill.pos_id else tier,
+                    DIRECT_POS_ID if fill.pos_id or direct_order_position_id else tier,
                     _distance(fill.created_at_ms, position.created_at_ms),
                     _distance(fill.size, position.size),
                     _distance(fill.price, position.average_price),
                 ),
-                evidence_type="direct_pos_id" if fill.pos_id else evidence_type,
+                evidence_type=(
+                    "direct_pos_id"
+                    if fill.pos_id
+                    else (
+                        "direct_order_position_id"
+                        if direct_order_position_id
+                        else evidence_type
+                    )
+                ),
                 evidence_source=fill.source,
             )
         )

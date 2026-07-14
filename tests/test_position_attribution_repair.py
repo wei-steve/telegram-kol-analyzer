@@ -73,6 +73,7 @@ class _RepairClient:
                 "sz": "1.5",
                 "px": "1840",
                 "triggerTime": "1782788876000",
+                "errorCode": "0",
             },
         ]
 
@@ -182,6 +183,113 @@ def test_repair_plan_is_read_only_and_preserves_live_trigger(tmp_path):
     assert wrong.status == "active"
     assert target.pos_id is None
     assert shuqin.status == "open"
+
+
+def test_repair_plan_clears_legacy_weak_verified_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:9:9:ETH:short",
+            kol_id="legacy",
+            chat_id=9,
+            message_id=9,
+            symbol="ETH",
+            side="short",
+            venue="deepcoin",
+            pos_id="later-position",
+            status="active",
+        )
+        session.add(binding)
+        session.commit()
+        binding_id = int(binding.id)
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=1,
+            order_id="old-order",
+            pos_id="later-position",
+            status="active",
+            attribution_status="verified",
+            attribution_evidence={"evidence_type": "exact_regular_order_id"},
+            request={"instId": "ETH-USDT-SWAP", "posSide": "short", "sz": "1.5"},
+        ),
+    )
+    client = _RepairClient()
+    client.positions = [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "later-position",
+            "posSide": "short",
+            "pos": "1.5",
+            "avgPx": "1840",
+            "cTime": "1782788876000",
+        }
+    ]
+
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+    )
+
+    assert [(action.action, action.leg_id) for action in plan.actions] == [
+        ("clear_untrusted_verified_position", 1)
+    ]
+    assert plan.actions[0].new_pos_id is None
+    assert plan.actions[0].new_attribution_status == "unassigned"
+
+
+def test_repair_plan_preserves_explicit_legacy_manual_bind(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:9:10:ETH:short",
+            kol_id="manual",
+            chat_id=9,
+            message_id=10,
+            symbol="ETH",
+            side="short",
+            venue="deepcoin",
+            pos_id="manual-position",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=int(binding.id),
+                leg_index=1,
+                purpose="entry",
+                order_kind="manual_bind",
+                pos_id="manual-position",
+                venue="deepcoin",
+                status="active",
+                attribution_status="verified",
+                attribution_evidence_json='{"source":"manual_operator_bind"}',
+            )
+        )
+        session.commit()
+    client = _RepairClient()
+    client.positions = [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "manual-position",
+            "posSide": "short",
+            "pos": "1.5",
+            "avgPx": "1840",
+            "cTime": "1782788876000",
+        }
+    ]
+
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+    )
+
+    assert plan.actions == ()
+    assert plan.unresolved_conflicts == []
 
 
 def test_repair_apply_is_atomic_audited_and_idempotent(tmp_path):

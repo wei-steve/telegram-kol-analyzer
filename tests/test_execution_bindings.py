@@ -71,7 +71,10 @@ def _add_entry_leg(
             status=status,
             attribution_status=attribution_status,
             attribution_evidence=(
-                {"evidence_type": "test_verified_entry"}
+                {
+                    "policy_version": 2,
+                    "evidence_type": "test_verified_entry",
+                }
                 if attribution_status == "verified"
                 else None
             ),
@@ -412,7 +415,7 @@ def test_reconcile_global_attribution_is_independent_of_binding_creation_order(t
                 return [
                     {
                         "instId": "ETH-USDT-SWAP",
-                        "posId": "pos-market",
+                        "posId": "market-order",
                         "posSide": "short",
                         "pos": "1.5",
                         "avgPx": "1770",
@@ -420,7 +423,7 @@ def test_reconcile_global_attribution_is_independent_of_binding_creation_order(t
                     },
                     {
                         "instId": "ETH-USDT-SWAP",
-                        "posId": "pos-trigger",
+                        "posId": "trigger-order",
                         "posSide": "short",
                         "pos": "1.5",
                         "avgPx": "1770",
@@ -475,8 +478,8 @@ def test_reconcile_global_attribution_is_independent_of_binding_creation_order(t
             }
 
     expected = {
-        "market": ("pos-market", "verified"),
-        "trigger": ("pos-trigger", "verified"),
+        "market": ("market-order", "verified"),
+        "trigger": ("trigger-order", "verified"),
     }
     assert run_case("forward.db", ["market", "trigger"]) == expected
     assert run_case("reverse.db", ["trigger", "market"]) == expected
@@ -1057,7 +1060,7 @@ def test_reconcile_uses_order_history_to_pick_position_when_symbol_side_ambiguou
             return [
                 {
                     "instId": "BTC-USDT-SWAP",
-                    "posId": "pos-correct",
+                    "posId": "order-filled",
                     "posSide": "long",
                     "pos": "9",
                     "avgPx": "68100",
@@ -1104,7 +1107,7 @@ def test_reconcile_uses_order_history_to_pick_position_when_symbol_side_ambiguou
         binding = session.query(ExecutionBinding).one()
 
     assert binding.status == "active"
-    assert binding.pos_id == "pos-correct"
+    assert binding.pos_id == "order-filled"
     assert binding.last_exchange_status == "position_ownership_verified"
 
 
@@ -1145,7 +1148,7 @@ def test_reconcile_updates_matching_order_leg_with_recovered_position_id(tmp_pat
             return [
                 {
                     "instId": "BTC-USDT-SWAP",
-                    "posId": "pos-correct",
+                    "posId": "order-filled",
                     "posSide": "long",
                     "pos": "9",
                     "avgPx": "68100",
@@ -1180,11 +1183,59 @@ def test_reconcile_updates_matching_order_leg_with_recovered_position_id(tmp_pat
 
     legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
     assert [(leg.order_id, leg.client_order_id, leg.pos_id, leg.status) for leg in legs] == [
-        ("order-filled", "client-filled", "pos-correct", "active")
+        ("order-filled", "client-filled", "order-filled", "active")
     ]
 
 
-def test_reconcile_maps_multiple_bound_positions_back_to_matching_order_legs(tmp_path):
+def test_reconcile_does_not_grandfather_legacy_weak_verified_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(order_id="old-order", pos_id="later-position", status="active"),
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=1,
+            order_id="old-order",
+            pos_id="later-position",
+            status="active",
+            attribution_status="verified",
+            attribution_evidence={"evidence_type": "exact_regular_order_id"},
+            request={"instId": "BTC-USDT-SWAP", "posSide": "long", "sz": "7"},
+        ),
+    )
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "later-position",
+                    "posSide": "long",
+                    "pos": "7",
+                    "avgPx": "62900",
+                    "cTime": "1784043117000",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+    reconcile_deepcoin_execution_bindings(session_factory, client=FakeClient())
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.query(ExecutionOrderLeg).one()
+
+    assert binding.pos_id is None
+    assert binding.status == "unknown"
+    assert leg.pos_id == "later-position"
+    assert leg.attribution_status == "attribution_conflict"
+
+
+def test_reconcile_maps_multiple_current_policy_positions_back_to_matching_order_legs(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
         session_factory,
@@ -1232,7 +1283,9 @@ def test_reconcile_maps_multiple_bound_positions_back_to_matching_order_legs(tmp
         ):
             leg.pos_id = pos_id
             leg.attribution_status = "verified"
-            leg.attribution_evidence_json = '{"evidence_type":"legacy_verified"}'
+            leg.attribution_evidence_json = (
+                '{"policy_version":2,"evidence_type":"verified_by_current_policy"}'
+            )
             leg.status = "active"
         session.commit()
 
@@ -1345,13 +1398,15 @@ def test_reconcile_uses_trigger_history_to_pick_position_after_trigger_entry_fil
                     {
                         "instId": "BTC-USDT-SWAP",
                         "ordId": "trigger-entry",
-                        "state": "filled",
                         "side": "sell",
                     "posSide": "short",
                     "sz": "10",
                     "px": "61351",
-                    "triggerTime": "1782995766000",
+                    # Deepcoin trigger history may return seconds while cTime/uTime
+                    # and position timestamps use milliseconds.
+                    "triggerTime": "1782995766",
                     "uTime": "1782995766000",
+                    "errorCode": "0",
                 }
             ]
 
@@ -1433,7 +1488,7 @@ def test_reconcile_appends_filled_second_leg_position_id(tmp_path):
                 },
                 {
                     "instId": "ETH-USDT-SWAP",
-                    "posId": "pos-limit",
+                    "posId": "order-limit",
                     "posSide": "short",
                     "pos": "6.4",
                     "avgPx": "1624.5",
@@ -1471,7 +1526,7 @@ def test_reconcile_appends_filled_second_leg_position_id(tmp_path):
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
 
-    assert binding.pos_id == "pos-market,pos-limit"
+    assert binding.pos_id == "pos-market,order-limit"
     assert binding.last_exchange_status == "position_ownership_verified"
 
 
@@ -1559,7 +1614,8 @@ def test_reconcile_recovers_each_trigger_leg_despite_fill_slippage(tmp_path):
                     "side": "sell",
                     "sz": "3.7",
                     "px": "1765",
-                    "triggerTime": "1783648112000",
+                        "triggerTime": "1783648112000",
+                        "errorCode": "0",
                 },
                     {
                         "instId": "ETH-USDT-SWAP",
@@ -1569,7 +1625,8 @@ def test_reconcile_recovers_each_trigger_leg_despite_fill_slippage(tmp_path):
                     "side": "sell",
                     "sz": "4.2",
                     "px": "1767.5",
-                    "triggerTime": "1783648113000",
+                        "triggerTime": "1783648113000",
+                        "errorCode": "0",
                 },
             ]
 
@@ -1676,7 +1733,8 @@ def test_reconcile_marks_conflict_instead_of_reassigning_existing_position(tmp_p
                     "side": "sell",
                     "sz": "3.7",
                     "px": "1790",
-                    "triggerTime": "1783354072000",
+                        "triggerTime": "1783354072000",
+                        "errorCode": "0",
                 },
                     {
                         "instId": "ETH-USDT-SWAP",
@@ -1686,7 +1744,8 @@ def test_reconcile_marks_conflict_instead_of_reassigning_existing_position(tmp_p
                     "side": "sell",
                     "sz": "3.7",
                     "px": "1765",
-                    "triggerTime": "1783648112000",
+                        "triggerTime": "1783648112000",
+                        "errorCode": "0",
                 },
             ]
 
@@ -1805,7 +1864,8 @@ def test_reconcile_does_not_reopen_manually_exited_strategy_when_old_leg_fills(t
                     "side": "sell",
                     "sz": "3.9",
                     "px": "1766",
-                    "triggerTime": "1783648112000",
+                        "triggerTime": "1783648112000",
+                        "errorCode": "0",
                 }
             ]
 
@@ -1877,7 +1937,7 @@ def test_reconcile_recovers_second_leg_when_first_leg_is_no_longer_active(tmp_pa
             return [
                 {
                     "instId": "ETH-USDT-SWAP",
-                    "posId": "pos-limit",
+                    "posId": "order-limit",
                     "posSide": "short",
                     "pos": "6.4",
                     "avgPx": "1624.5",
@@ -1918,7 +1978,7 @@ def test_reconcile_recovers_second_leg_when_first_leg_is_no_longer_active(tmp_pa
         lifecycle = session.query(StrategyLifecycle).one()
 
     assert binding.status == "active"
-    assert binding.pos_id == "pos-limit"
+    assert binding.pos_id == "order-limit"
     assert lifecycle.lifecycle_status == "entered"
 
 
@@ -2151,7 +2211,7 @@ def test_reconcile_revives_expired_keep_order_when_position_fills_later(tmp_path
             return [
                 {
                     "instId": "BTC-USDT-SWAP",
-                    "posId": "pos-keep",
+                    "posId": "order-keep",
                     "posSide": "short",
                     "pos": "25",
                     "avgPx": "60950",
@@ -2191,7 +2251,7 @@ def test_reconcile_revives_expired_keep_order_when_position_fills_later(tmp_path
         lifecycle = session.query(StrategyLifecycle).one()
 
     assert binding.status == "active"
-    assert binding.pos_id == "pos-keep"
+    assert binding.pos_id == "order-keep"
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.exit_reason is None
     assert lifecycle.exited_at is None

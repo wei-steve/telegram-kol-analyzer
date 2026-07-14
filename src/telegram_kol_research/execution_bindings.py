@@ -23,11 +23,13 @@ from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionAttributionAudit
 from telegram_kol_research.position_attribution import (
+    ATTRIBUTION_POLICY_VERSION,
     FillEvidence,
     LegEvidence,
     PositionEvidence,
     TERMINAL_ENTRY_LEG_STATES,
     classify_leg_exchange_state,
+    has_authoritative_persisted_position,
     is_fill_evidence,
     match_entry_legs_to_positions,
 )
@@ -798,7 +800,10 @@ def _position_evidence(row: dict[str, Any]) -> PositionEvidence | None:
 
 def _leg_evidence(leg: ExecutionOrderLeg, *, binding: ExecutionBinding) -> LegEvidence:
     direct_pos_id = None
-    if str(leg.attribution_status or "") == "verified":
+    if (
+        str(leg.attribution_status or "") == "verified"
+        and has_authoritative_persisted_position(leg)
+    ):
         direct_pos_id = leg.pos_id
     response_pos_id = _position_id_from_response_json(leg.response_json)
     if response_pos_id:
@@ -1373,6 +1378,7 @@ def bind_deepcoin_position_to_lifecycle(
                         attribution_status="verified",
                         attribution_evidence_json=_compact_json(
                             {
+                                "policy_version": ATTRIBUTION_POLICY_VERSION,
                                 "source": "manual_operator_bind",
                                 "position": position_payload or {},
                             }
@@ -2018,6 +2024,9 @@ def _to_float(value: Any) -> float | None:
 
 def _to_int(value: Any) -> int | None:
     try:
-        return int(float(value))
+        parsed = int(float(value))
     except (TypeError, ValueError):
         return None
+    if 0 < abs(parsed) < 100_000_000_000:
+        return parsed * 1000
+    return parsed

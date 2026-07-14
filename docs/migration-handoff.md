@@ -115,6 +115,13 @@ lifecycle state. The permitted ownership states are `verified`, `unassigned`,
 failure freezes automatic close and TPSL mutation. API failure is never treated
 as position/order absence.
 
+An exact order/client ID proves which fill belongs to a leg, but does not by
+itself prove which later position that fill opened. Regular fills require either
+an explicit `fill.posId` or Deepcoin's direct `order_id == posId` identity.
+Successful trigger history requires nonzero `triggerTime`, `errorCode=0`, an
+exact size match, a position created within five seconds, and a global
+mutual-unique result. Time/size/price proximity alone never authorizes ownership.
+
 Manual exchange close and cancellation are terminal facts. A manually closed
 position or cancelled entry leg cannot be revived by an old Telegram lifecycle,
 a later reconcile pass, or a same-symbol live position. All real close, partial
