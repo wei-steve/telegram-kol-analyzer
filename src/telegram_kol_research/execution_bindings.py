@@ -17,7 +17,12 @@ from telegram_kol_research.deepcoin_readonly import (
     DeepcoinReadOnlyClient,
 )
 from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.position_attribution import (
+    TERMINAL_ENTRY_LEG_STATES,
+    is_fill_evidence,
+)
 
 PENDING_ENTRY_RECOVERY_WINDOW_HOURS = 6
 
@@ -276,6 +281,7 @@ def reconcile_deepcoin_execution_bindings(
             .order_by(ExecutionBinding.id.asc())
             .all()
         )
+        _apply_recorded_terminal_entry_events(session, rows=rows, updated_at=now)
         rows = [
             row
             for row in rows
@@ -510,6 +516,8 @@ def _refresh_order_legs_from_binding_row(
     )
     recovered_by_order_id = order_leg_position_ids or {}
     for leg in legs:
+        if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+            continue
         recovered_pos_id = recovered_by_order_id.get(str(leg.order_id or ""))
         if recovered_pos_id is None:
             recovered_pos_id = recovered_by_order_id.get(str(leg.client_order_id or ""))
@@ -529,6 +537,8 @@ def _refresh_order_legs_from_binding_row(
     if len(legs) != 1:
         return
     for leg in legs:
+        if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+            continue
         leg_order_id = str(leg.order_id or "")
         leg_client_order_id = str(leg.client_order_id or "")
         if leg_order_id not in order_ids and leg_client_order_id not in client_order_ids:
@@ -560,6 +570,8 @@ def _refresh_multi_position_order_legs(
     }
     used_pos_ids: set[str] = set()
     for leg in sorted(legs, key=lambda item: int(item.leg_index or 0)):
+        if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+            continue
         submitted_order = submitted_orders_by_leg_index.get(int(leg.leg_index or 0))
         if not submitted_order:
             continue
@@ -1390,7 +1402,12 @@ def _load_order_evidence(
         instrument_id=instrument_id,
         cache=trigger_history_cache,
     )
-    for row in [*history_rows, *fill_rows, *trigger_history_rows]:
+    sourced_rows = [
+        *((row, "order_history") for row in history_rows),
+        *((row, "trade_fill") for row in fill_rows),
+        *((row, "trigger_history") for row in trigger_history_rows),
+    ]
+    for row, source in sourced_rows:
         row_order_ids = {
             value
             for value in (
@@ -1401,8 +1418,9 @@ def _load_order_evidence(
         }
         if not row_order_ids.intersection(order_ids):
             continue
-        if _is_history_fill_evidence(row):
-            evidence.append(row)
+        sourced_row = {**row, "_evidence_source": source}
+        if is_fill_evidence(sourced_row):
+            evidence.append(sourced_row)
     return evidence
 
 
@@ -1429,16 +1447,6 @@ def _cached_client_rows(
         rows = []
     cache[instrument_id] = [row for row in rows if isinstance(row, dict)]
     return cache[instrument_id]
-
-
-def _is_history_fill_evidence(row: dict[str, Any]) -> bool:
-    state = str(row.get("state") or row.get("status") or "").lower()
-    if state and state not in {"filled", "partially_filled", "partial_filled", "done"}:
-        return False
-    return any(
-        _to_float(row.get(key)) is not None
-        for key in ("fillPx", "avgPx", "fillSz", "sz")
-    )
 
 
 def _position_matches_order_evidence(position: dict[str, Any], evidence: dict[str, Any]) -> bool:
@@ -1737,9 +1745,57 @@ def _binding_has_unresolved_entry_leg(session, row: ExecutionBinding) -> bool:
         .all()
     )
     if legs:
-        leg_pos_ids = {str(leg.pos_id) for leg in legs if leg.pos_id}
-        return not leg_pos_ids or len(leg_pos_ids) < len(legs)
+        eligible_legs = [
+            leg
+            for leg in legs
+            if str(leg.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
+        ]
+        if not eligible_legs:
+            return False
+        leg_pos_ids = {str(leg.pos_id) for leg in eligible_legs if leg.pos_id}
+        return not leg_pos_ids or len(leg_pos_ids) < len(eligible_legs)
     return len(_split_ids(row.order_id)) > len(_split_ids(row.pos_id))
+
+
+def _apply_recorded_terminal_entry_events(
+    session,
+    *,
+    rows: list[ExecutionBinding],
+    updated_at: datetime,
+) -> None:
+    binding_ids = [int(row.id) for row in rows]
+    if not binding_ids:
+        return
+    events = (
+        session.query(ExecutionEvent)
+        .filter(ExecutionEvent.execution_binding_id.in_(binding_ids))
+        .filter(ExecutionEvent.action.in_(["cancel_trigger_entry", "cancel_regular_entry"]))
+        .order_by(ExecutionEvent.id.asc())
+        .all()
+    )
+    for event in events:
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == event.execution_binding_id)
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .all()
+        )
+        for leg in legs:
+            if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+                continue
+            order_matches = bool(
+                event.order_id and leg.order_id and str(event.order_id) == str(leg.order_id)
+            )
+            client_order_matches = bool(
+                event.client_order_id
+                and leg.client_order_id
+                and str(event.client_order_id) == str(leg.client_order_id)
+            )
+            if not order_matches and not client_order_matches:
+                continue
+            leg.status = "exchange_cancelled"
+            leg.terminal_reason = str(event.action)
+            leg.updated_at = updated_at
 
 
 def _is_terminal_exited_lifecycle(lifecycle: Any) -> bool:

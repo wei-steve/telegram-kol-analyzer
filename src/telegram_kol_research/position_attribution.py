@@ -13,6 +13,26 @@ EXACT_REGULAR_ORDER_ID = 1
 EXACT_CLIENT_ORDER_ID = 2
 UNIQUE_TRIGGER_FILL = 3
 
+TERMINAL_ENTRY_LEG_STATES = frozenset(
+    {
+        "cancelled",
+        "manually_cancelled",
+        "exchange_cancelled",
+        "manually_closed",
+        "closed",
+        "expired",
+        "invalidated",
+    }
+)
+
+_FILLED_STATES = frozenset({"filled", "done", "completed"})
+_PARTIAL_FILL_STATES = frozenset({"partially_filled", "partial_filled", "partial"})
+_CANCELLED_STATES = frozenset(
+    {"cancelled", "canceled", "cancel", "revoked", "rejected", "expired"}
+)
+_OPEN_STATES = frozenset({"live", "open", "pending", "submitted"})
+_CANCEL_EVENT_ACTIONS = frozenset({"cancel_trigger_entry", "cancel_regular_entry"})
+
 
 @dataclass(frozen=True, slots=True)
 class LegEvidence:
@@ -74,6 +94,41 @@ class _Edge:
     rank: MatchRank
     evidence_type: str
     evidence_source: str
+
+
+def classify_leg_exchange_state(
+    row: dict[str, object],
+    *,
+    cancel_event_action: str | None = None,
+) -> str:
+    """Classify an entry order without inferring fills from numeric fields."""
+
+    if str(cancel_event_action or "").lower() in _CANCEL_EVENT_ACTIONS:
+        return "exchange_cancelled"
+    state = str(row.get("state") or row.get("status") or "").strip().lower()
+    if state in _CANCELLED_STATES:
+        return "manually_cancelled"
+    if state in _FILLED_STATES:
+        return "filled"
+    if state in _PARTIAL_FILL_STATES:
+        return "partially_filled"
+    if state in _OPEN_STATES:
+        return "pending"
+    return "unknown"
+
+
+def is_fill_evidence(row: dict[str, object]) -> bool:
+    """Return true only for explicit fill state or a row known to come from fills."""
+
+    state = classify_leg_exchange_state(row)
+    if state in {"filled", "partially_filled"}:
+        return True
+    if str(row.get("_evidence_source") or "").lower() != "trade_fill":
+        return False
+    return any(
+        row.get(key) not in (None, "")
+        for key in ("tradeId", "fillId", "execId", "ordId", "orderId", "fillSz")
+    )
 
 
 def match_entry_legs_to_positions(

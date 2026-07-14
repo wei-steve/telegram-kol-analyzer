@@ -19,7 +19,12 @@ from telegram_kol_research.execution_bindings import (
     upsert_execution_binding,
     upsert_execution_order_leg,
 )
-from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg, StrategyLifecycle
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionEvent,
+    ExecutionOrderLeg,
+    StrategyLifecycle,
+)
 
 
 def _binding(**overrides):
@@ -189,6 +194,107 @@ def test_execution_order_leg_allows_multiple_unassigned_positions(tmp_path):
         session.commit()
 
         assert session.query(ExecutionOrderLeg).count() == 2
+
+
+@pytest.mark.parametrize("terminal_status", ["manually_cancelled", "exchange_cancelled"])
+def test_reconcile_never_reopens_terminal_entry_leg_from_old_signal(
+    tmp_path, terminal_status
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            symbol="ETH",
+            side="short",
+            order_id="old-trigger",
+            client_order_id="old-client",
+            status="closed",
+        ),
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=1,
+            order_kind="trigger_limit",
+            order_id="old-trigger",
+            client_order_id="old-client",
+            status=terminal_status,
+            terminal_reason=terminal_status,
+        ),
+    )
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "unrelated-live-position",
+                    "posSide": "short",
+                    "pos": "1.5",
+                    "avgPx": "1770",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+    reconcile_deepcoin_execution_bindings(session_factory, client=FakeClient())
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.query(ExecutionOrderLeg).one()
+    assert binding.status == "closed"
+    assert binding.pos_id is None
+    assert leg.status == terminal_status
+    assert leg.pos_id is None
+
+
+def test_reconcile_marks_leg_exchange_cancelled_from_recorded_cancel_event(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(order_id="trigger-1", client_order_id="client-1", status="closed"),
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=1,
+            order_kind="trigger_limit",
+            order_id="trigger-1",
+            client_order_id="client-1",
+            status="submitted",
+        ),
+    )
+    with session_factory() as session:
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=binding_id,
+                venue="deepcoin",
+                action="cancel_trigger_entry",
+                status="submitted",
+                order_id="trigger-1",
+                client_order_id="client-1",
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+    reconcile_deepcoin_execution_bindings(session_factory, client=FakeClient())
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.query(ExecutionOrderLeg).one()
+    assert binding.status == "closed"
+    assert leg.status == "exchange_cancelled"
+    assert leg.terminal_reason == "cancel_trigger_entry"
 
 
 def test_repair_execution_order_legs_from_binding_payloads_backfills_legacy_rows(tmp_path):
@@ -925,10 +1031,11 @@ def test_reconcile_uses_trigger_history_to_pick_position_after_trigger_entry_fil
         def list_trigger_order_history(self, *, inst_id=None):
             assert inst_id == "BTC-USDT-SWAP"
             return [
-                {
-                    "instId": "BTC-USDT-SWAP",
-                    "ordId": "trigger-entry",
-                    "side": "sell",
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "ordId": "trigger-entry",
+                        "state": "filled",
+                        "side": "sell",
                     "posSide": "short",
                     "sz": "10",
                     "px": "61351",
@@ -1113,19 +1220,21 @@ def test_reconcile_recovers_each_trigger_leg_despite_fill_slippage(tmp_path):
         def list_trigger_order_history(self, *, inst_id=None):
             assert inst_id == "ETH-USDT-SWAP"
             return [
-                {
-                    "instId": "ETH-USDT-SWAP",
-                    "ordId": "trigger-37",
-                    "posSide": "short",
+                    {
+                        "instId": "ETH-USDT-SWAP",
+                        "ordId": "trigger-37",
+                        "state": "filled",
+                        "posSide": "short",
                     "side": "sell",
                     "sz": "3.7",
                     "px": "1765",
                     "triggerTime": "1783648112000",
                 },
-                {
-                    "instId": "ETH-USDT-SWAP",
-                    "ordId": "trigger-42",
-                    "posSide": "short",
+                    {
+                        "instId": "ETH-USDT-SWAP",
+                        "ordId": "trigger-42",
+                        "state": "filled",
+                        "posSide": "short",
                     "side": "sell",
                     "sz": "4.2",
                     "px": "1767.5",
@@ -1219,19 +1328,21 @@ def test_reconcile_reassigns_position_from_weak_old_trigger_match(tmp_path):
         def list_trigger_order_history(self, *, inst_id=None):
             assert inst_id == "ETH-USDT-SWAP"
             return [
-                {
-                    "instId": "ETH-USDT-SWAP",
-                    "ordId": "old-trigger",
-                    "posSide": "short",
+                    {
+                        "instId": "ETH-USDT-SWAP",
+                        "ordId": "old-trigger",
+                        "state": "filled",
+                        "posSide": "short",
                     "side": "sell",
                     "sz": "3.7",
                     "px": "1790",
                     "triggerTime": "1783354072000",
                 },
-                {
-                    "instId": "ETH-USDT-SWAP",
-                    "ordId": "current-trigger",
-                    "posSide": "short",
+                    {
+                        "instId": "ETH-USDT-SWAP",
+                        "ordId": "current-trigger",
+                        "state": "filled",
+                        "posSide": "short",
                     "side": "sell",
                     "sz": "3.7",
                     "px": "1765",
@@ -1336,10 +1447,11 @@ def test_reconcile_revives_closed_binding_when_pending_trigger_leg_fills(tmp_pat
         def list_trigger_order_history(self, *, inst_id=None):
             assert inst_id == "ETH-USDT-SWAP"
             return [
-                {
-                    "instId": "ETH-USDT-SWAP",
-                    "ordId": "pending-trigger",
-                    "posSide": "short",
+                    {
+                        "instId": "ETH-USDT-SWAP",
+                        "ordId": "pending-trigger",
+                        "state": "filled",
+                        "posSide": "short",
                     "side": "sell",
                     "sz": "3.9",
                     "px": "1766",

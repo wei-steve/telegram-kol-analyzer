@@ -2,6 +2,8 @@ from telegram_kol_research.position_attribution import (
     FillEvidence,
     LegEvidence,
     PositionEvidence,
+    classify_leg_exchange_state,
+    is_fill_evidence,
     match_entry_legs_to_positions,
 )
 
@@ -160,3 +162,49 @@ def test_exact_client_order_id_can_prove_candidate_link():
 
     assert result.assignments == {1: "pos-1"}
     assert result.evidence_by_leg[1]["evidence_type"] == "exact_client_order_id"
+
+
+def test_cancelled_trigger_history_is_terminal_but_not_fill_evidence():
+    cancelled = {
+        "_evidence_source": "trigger_history",
+        "state": "cancelled",
+        "ordId": "trigger-1",
+        "sz": "1.5",
+        "px": "1770",
+        "triggerTime": "10000",
+    }
+
+    assert classify_leg_exchange_state(cancelled) == "manually_cancelled"
+    assert is_fill_evidence(cancelled) is False
+
+
+def test_only_explicit_order_fill_or_fills_endpoint_row_is_fill_evidence():
+    explicit_fill = {
+        "_evidence_source": "order_history",
+        "state": "filled",
+        "ordId": "order-1",
+    }
+    trade_fill = {
+        "_evidence_source": "trade_fill",
+        "ordId": "order-2",
+        "fillSz": "1.5",
+    }
+    numeric_only_history = {
+        "_evidence_source": "trigger_history",
+        "ordId": "order-3",
+        "sz": "1.5",
+        "px": "1770",
+    }
+
+    assert is_fill_evidence(explicit_fill) is True
+    assert is_fill_evidence(trade_fill) is True
+    assert is_fill_evidence(numeric_only_history) is False
+
+
+def test_recorded_cancel_event_classifies_as_exchange_cancelled():
+    assert (
+        classify_leg_exchange_state(
+            {"state": "cancelled"}, cancel_event_action="cancel_trigger_entry"
+        )
+        == "exchange_cancelled"
+    )
