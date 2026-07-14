@@ -55,6 +55,9 @@ def build_deepcoin_order_draft(
         payload_preview.get("entry_range"),
         symbol=symbol,
     )
+    entry_low = _normalize_price(entry_low, contract_spec)
+    entry_high = _normalize_price(entry_high, contract_spec)
+    single_entry_price = math.isclose(entry_low, entry_high)
 
     source = payload_preview.get("source") or {}
     source_kol_id = source.get("kol_id")
@@ -105,34 +108,21 @@ def build_deepcoin_order_draft(
             max_deviation_pct=market_entry_deviation_pct,
             contract_spec=contract_spec,
         )
-        if order_type == "limit"
+        if order_type == "limit" and not single_entry_price
         else None
     )
-    if order_type == "market":
+    if order_type == "market" or single_entry_price:
         reference_price = _normalize_price((entry_low + entry_high) / 2, contract_spec)
         order_legs = [
-            _order_leg(
-                side=open_side,
+            _single_entry_leg(
+                open_side=open_side,
                 position_side=position_side,
                 order_type=order_type,
                 price=reference_price,
-                client_order_id=build_client_order_id(
-                    strategy_instance_id=strategy_instance_id,
-                    leg_index=1,
-                    kol_code=source_kol_code,
-                    message_id=source_message_id,
-                ),
-                allocation_pct=100.0,
-                risk_budget_usdt=_leg_risk_budget(
-                    risk_budget=risk_budget,
-                    allocation_pct=100.0,
-                ),
-                quantity=_estimate_leg_quantity(
-                    risk_budget=risk_budget,
-                    allocation_pct=100.0,
-                    entry_price=reference_price,
-                    stop_loss=stop_loss,
-                ),
+                strategy_instance_id=strategy_instance_id,
+                source_kol_code=source_kol_code,
+                source_message_id=source_message_id,
+                risk_budget=risk_budget,
                 stop_loss=stop_loss,
                 contract_spec=contract_spec,
             ),
@@ -514,6 +504,46 @@ def _order_leg(
     if estimated_loss is not None:
         leg["estimated_stop_loss_usdt"] = estimated_loss
     return leg
+
+
+def _single_entry_leg(
+    *,
+    open_side: str,
+    position_side: str,
+    order_type: str,
+    price: float,
+    strategy_instance_id: str,
+    source_kol_code: str | None,
+    source_message_id: int,
+    risk_budget: float,
+    stop_loss: float | None,
+    contract_spec: DeepcoinContractSpec | None,
+) -> dict[str, Any]:
+    return _order_leg(
+        side=open_side,
+        position_side=position_side,
+        order_type=order_type,
+        price=price,
+        client_order_id=build_client_order_id(
+            strategy_instance_id=strategy_instance_id,
+            leg_index=1,
+            kol_code=source_kol_code,
+            message_id=source_message_id,
+        ),
+        allocation_pct=100.0,
+        risk_budget_usdt=_leg_risk_budget(
+            risk_budget=risk_budget,
+            allocation_pct=100.0,
+        ),
+        quantity=_estimate_leg_quantity(
+            risk_budget=risk_budget,
+            allocation_pct=100.0,
+            entry_price=price,
+            stop_loss=stop_loss,
+        ),
+        stop_loss=stop_loss,
+        contract_spec=contract_spec,
+    )
 
 
 def _estimated_stop_loss_usdt(

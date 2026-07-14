@@ -514,7 +514,8 @@ def test_auto_process_message_trade_signal_accepts_nearby_single_entry_price(tmp
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
     assert fake_client.orders == []
-    assert len(fake_client.trigger_orders) == 2
+    assert len(fake_client.trigger_orders) == 1
+    assert fake_client.trigger_orders[0]["orderType"] == "limit"
 
 
 def test_auto_process_nearby_single_entry_uses_market_when_price_is_close(tmp_path):
@@ -559,6 +560,7 @@ def test_auto_process_nearby_single_entry_uses_market_when_price_is_close(tmp_pa
     assert result["entry_execution_type"] == "market"
     assert len(fake_client.orders) == 1
     assert fake_client.orders[0]["ordType"] == "market"
+    assert fake_client.trigger_orders == []
     assert fake_client.protections[0]["posId"] == "pos-1"
 
 
@@ -592,8 +594,8 @@ def test_auto_process_nearby_single_entry_keeps_limit_when_price_is_far(tmp_path
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
     assert fake_client.orders == []
-    assert len(fake_client.trigger_orders) == 2
-    assert [order["orderType"] for order in fake_client.trigger_orders] == ["limit", "limit"]
+    assert len(fake_client.trigger_orders) == 1
+    assert fake_client.trigger_orders[0]["orderType"] == "limit"
 
 
 def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_path):

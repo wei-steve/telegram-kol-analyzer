@@ -208,6 +208,35 @@ def test_build_deepcoin_order_draft_builds_single_market_order_leg():
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
 
 
+def test_build_single_price_limit_entry_as_one_full_risk_leg():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(entry_range="63700-63700", stop_loss="62500"),
+        contract_spec=_btc_contract_spec(),
+    )
+
+    assert len(draft["order_legs"]) == 1
+    assert draft["order_legs"][0]["price"] == 63700.0
+    assert draft["order_legs"][0]["allocation_pct"] == 100.0
+    assert draft["order_legs"][0]["risk_budget_usdt"] == 100.0
+    assert draft["order_legs"][0]["client_order_id"].endswith("1")
+    assert draft["order_legs"][0]["quantity"] == 83
+
+
+def test_build_true_range_limit_entry_retains_two_configured_style_legs():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            entry_range="63300-63700",
+            stop_loss="62500",
+            entry_range_order_style="eager",
+        ),
+        contract_spec=_btc_contract_spec(),
+    )
+
+    assert [leg["price"] for leg in draft["order_legs"]] == [63700.0, 63500.0]
+    assert [leg["order_type"] for leg in draft["order_legs"]] == ["limit", "limit"]
+    assert [leg["allocation_pct"] for leg in draft["order_legs"]] == [50.0, 50.0]
+
+
 def test_build_deepcoin_order_draft_hybrid_range_entry_near_upper_edge():
     draft = build_deepcoin_order_draft(
         _payload_preview(
