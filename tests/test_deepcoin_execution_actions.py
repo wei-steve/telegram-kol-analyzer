@@ -324,6 +324,15 @@ def test_adjust_position_tpsl_refuses_unattributed_pending_tpsl_orders(tmp_path)
         payload={"binding_id": binding_id, "stop_loss": 1577.04},
     )
     client = _FakeDeepcoinClient()
+    client.positions.append(
+        {
+            "posId": "pos-other",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.1",
+            "cTime": "1000",
+        }
+    )
     for order in client.trigger_pending:
         order.pop("posId")
 
@@ -336,6 +345,31 @@ def test_adjust_position_tpsl_refuses_unattributed_pending_tpsl_orders(tmp_path)
 
     assert client.cancel_trigger_payloads == []
     assert client.protection_payloads == []
+
+
+def test_adjust_position_tpsl_accepts_uniquely_attributed_unscoped_orders(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    trade_signal = _signal(
+        session_factory,
+        action="adjust_stop_loss",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+    )
+    client = _FakeDeepcoinClient()
+    for order in client.trigger_pending:
+        order.pop("posId")
+
+    result = adjust_position_tpsl(
+        session_factory,
+        trade_signal=trade_signal,
+        deepcoin_client=client,
+    )
+
+    assert result["cancelled_tpsl_order_ids"] == ["tp-old", "sl-old"]
+    assert [item["ordId"] for item in client.cancel_trigger_payloads] == [
+        "tp-old",
+        "sl-old",
+    ]
 
 
 def test_process_trade_signal_live_closes_bound_position_with_close_pos_id(tmp_path):

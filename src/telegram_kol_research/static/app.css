@@ -864,6 +864,18 @@ body {
   overflow-wrap: anywhere;
 }
 
+.exchange-metric-grid .protection-state--present_but_ambiguous {
+  color: #fbbf24;
+}
+
+.exchange-metric-grid .protection-state--evidence_unavailable {
+  color: #cbd5e1;
+}
+
+.exchange-metric-grid .protection-state--unprotected {
+  color: #fca5a5;
+}
+
 .exchange-empty {
   margin: 0;
   padding: 28px 12px;

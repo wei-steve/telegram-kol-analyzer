@@ -12,8 +12,6 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_order_matching import (
     extract_pending_protection_orders,
-    pending_tpsl_order_ids_for_position,
-    select_position_tpsl_orders,
 )
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
@@ -27,6 +25,7 @@ from telegram_kol_research.position_attribution import (
     PositionAttributionError,
     require_verified_position_ownership,
 )
+from telegram_kol_research.protection_attribution import match_position_protection
 from telegram_kol_research.trade_signals import TradeSignalRecord
 
 
@@ -181,19 +180,22 @@ def adjust_position_tpsl(
     binding = _load_binding_for_signal(session_factory, trade_signal)
     _require_verified_binding_positions(session_factory, binding)
     inst_id = _to_deepcoin_swap_instrument(binding.symbol)
+    live_positions = deepcoin_client.list_positions(inst_id=inst_id)
     position = _select_bound_position(
-        deepcoin_client.list_positions(inst_id=inst_id),
+        live_positions,
         binding=binding,
         inst_id=inst_id,
     )
     pending = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
-    if _has_unattributed_pending_tpsl_for_position(position=position, pending_trigger_orders=pending):
+    pos_id = _first_string(position, "posId", "pos_id", "id")
+    protection = match_position_protection(live_positions, pending).by_pos_id.get(pos_id or "")
+    if protection is not None and protection.status == "present_but_ambiguous":
         raise DeepcoinExecutionActionError("ambiguous_pending_position_tpsl")
-    old_tpsl_rows = select_position_tpsl_orders(position=position, pending_trigger_orders=pending)
-    old_order_ids = pending_tpsl_order_ids_for_position(
-        position=position,
-        pending_trigger_orders=pending,
-    )
+    old_order_ids = protection.order_ids if protection is not None else []
+    old_order_id_set = set(old_order_ids)
+    old_tpsl_rows = [
+        row for row in pending if _order_id_from_payload(row) in old_order_id_set
+    ]
     if require_existing and not old_order_ids:
         raise DeepcoinExecutionActionError("no_existing_position_tpsl_to_adjust")
 
@@ -921,25 +923,6 @@ def _select_bound_position(
     if len(matches) == 1:
         return matches[0]
     raise DeepcoinExecutionActionError("ambiguous_bound_position")
-
-
-def _has_unattributed_pending_tpsl_for_position(
-    *,
-    position: dict[str, Any],
-    pending_trigger_orders: list[dict[str, Any]],
-) -> bool:
-    inst_id = str(position.get("instId") or "").upper()
-    side = _normalize_side(str(position.get("posSide") or position.get("side") or ""))
-    for order in pending_trigger_orders:
-        if str(order.get("triggerOrderType") or "").upper() != "TPSL":
-            continue
-        if str(order.get("instId") or "").upper() != inst_id:
-            continue
-        if _normalize_side(str(order.get("posSide") or order.get("side") or "")) != side:
-            continue
-        if not _first_string(order, "posId", "pos_id", "positionId"):
-            return True
-    return False
 
 
 def _select_bound_positions(

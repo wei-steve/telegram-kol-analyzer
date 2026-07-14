@@ -810,6 +810,115 @@ def test_execution_dashboard_matches_zero_size_tpsl_orders_by_position_time(tmp_
     assert "无保护单" not in response.text
 
 
+def test_execution_dashboard_matches_tpsl_one_second_after_position(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-smart-market",
+                    "posSide": "long",
+                    "pos": "1.5",
+                    "avgPx": "1840",
+                    "cTime": "1782788876000",
+                }
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [
+                {
+                    "instId": inst_id,
+                    "posSide": "long",
+                    "sz": "0",
+                    "cTime": "1782788877000",
+                    "triggerOrderType": "TPSL",
+                    "ordId": "sl-smart-market",
+                    "slTriggerPrice": "1820",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+
+    response = TestClient(app).get("/execution")
+
+    assert response.status_code == 200
+    assert "pos-smart-market" in response.text
+    assert "止损: 1820" in response.text
+    assert "无止损" not in response.text
+
+
+def test_execution_dashboard_renders_ambiguous_stop_truthfully(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": pos_id,
+                    "posSide": "long",
+                    "pos": "1.5",
+                    "avgPx": "1840",
+                    "cTime": "1782788876000",
+                }
+                for pos_id in ("pos-a", "pos-b")
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [
+                {
+                    "instId": inst_id,
+                    "posSide": "long",
+                    "sz": "0",
+                    "cTime": "1782788877000",
+                    "triggerOrderType": "TPSL",
+                    "ordId": "sl-ambiguous",
+                    "slTriggerPrice": "1820",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+
+    response = TestClient(app).get("/execution")
+
+    assert response.status_code == 200
+    assert response.text.count("止损存在，归属待确认") == 2
+    assert "无止损" not in response.text
+
+
+def test_execution_dashboard_renders_tpsl_evidence_error_truthfully(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-evidence-error",
+                    "posSide": "long",
+                    "pos": "1.5",
+                    "avgPx": "1840",
+                    "cTime": "1782788876000",
+                }
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            raise RuntimeError("tpsl unavailable")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+
+    response = TestClient(app).get("/execution")
+
+    assert response.status_code == 200
+    assert "止损证据暂不可用" in response.text
+    assert "无止损" not in response.text
+
+
 def test_manual_close_api_marks_lifecycle_and_binding_closed(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
     with app.state.session_factory() as session:

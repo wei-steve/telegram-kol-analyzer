@@ -102,6 +102,7 @@ from telegram_kol_research.execution_bindings import reconcile_deepcoin_executio
 from telegram_kol_research.execution_bindings import sync_manual_closed_deepcoin_positions
 from telegram_kol_research.position_attribution import PositionAttributionError
 from telegram_kol_research.position_attribution import require_manual_position_attribution_allowed
+from telegram_kol_research.protection_attribution import match_position_protection
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import list_recovery_decisions
 from telegram_kol_research.recovery_execution_queue import list_recovery_execution_previews
@@ -432,9 +433,14 @@ def _load_deepcoin_live_position_rows(
     ]
     if not active_positions:
         return []
-    tpsl_orders_by_position_key = _load_deepcoin_tpsl_orders_by_position_key(
+    tpsl_orders, tpsl_evidence_available = _load_deepcoin_pending_tpsl_orders(
         deepcoin_client,
         active_positions,
+    )
+    protection_match = match_position_protection(
+        active_positions,
+        tpsl_orders,
+        evidence_available=tpsl_evidence_available,
     )
 
     with session_factory() as session:
@@ -454,24 +460,32 @@ def _load_deepcoin_live_position_rows(
         rows: list[dict[str, object]] = []
         for position in active_positions:
             pos_id = _first_position_string(position, "posId", "pos_id", "id")
-            protection_key = _deepcoin_position_protection_key(position)
-            tpsl_order = tpsl_orders_by_position_key.get(
-                protection_key
-            ) or tpsl_orders_by_position_key.get(
-                (
-                    protection_key[0],
-                    protection_key[1],
-                    "*",
-                    protection_key[3],
-                )
+            protection = protection_match.by_pos_id.get(pos_id or "")
+            stop_loss_value = (
+                protection.stop_loss
+                if protection is not None and protection.status == "verified"
+                else None
             )
-            stop_loss_value = _deepcoin_tpsl_price(tpsl_order, "sl")
-            if stop_loss_value is None:
-                stop_loss_value = _deepcoin_position_tpsl_price(position, "sl")
-            take_profit_value = _deepcoin_tpsl_price(tpsl_order, "tp")
-            if take_profit_value is None:
-                take_profit_value = _deepcoin_position_tpsl_price(position, "tp")
+            take_profit_values = (
+                protection.take_profits
+                if protection is not None and protection.status == "verified"
+                else []
+            )
+            take_profit_value = take_profit_values[0] if take_profit_values else None
             has_protection = stop_loss_value is not None or take_profit_value is not None
+            protection_status = protection.status if protection is not None else "absent"
+            if (
+                protection_status == "present_but_ambiguous"
+                and protection is not None
+                and protection.evidence.get("has_stop_loss")
+            ):
+                stop_loss_state_text = "止损存在，归属待确认"
+            elif protection_status == "evidence_unavailable":
+                stop_loss_state_text = "止损证据暂不可用"
+            elif stop_loss_value is None:
+                stop_loss_state_text = "无止损"
+            else:
+                stop_loss_state_text = None
             binding = bindings_by_pos_id.get(pos_id or "")
             binding_is_live = binding is not None and str(binding.status or "").lower() in {
                 "open",
@@ -516,8 +530,18 @@ def _load_deepcoin_live_position_rows(
                     "lifecycle_status": lifecycle.lifecycle_status if lifecycle is not None else None,
                     "entry_price_actual": _float_or_none(position.get("avgPx")),
                     "stop_loss_text": _position_text_value(stop_loss_value),
-                    "take_profit_text": _position_text_value(take_profit_value),
-                    "protection_status": "protected" if has_protection else "unprotected",
+                    "stop_loss_state_text": stop_loss_state_text,
+                    "take_profit_text": "/".join(
+                        _position_text_value(value) or "" for value in take_profit_values
+                    ) or None,
+                    "protection_status": (
+                        "protected"
+                        if protection_status == "verified" and has_protection
+                        else "unprotected" if protection_status == "absent" else protection_status
+                    ),
+                    "protection_mutation_allowed": bool(
+                        protection is not None and protection.can_mutate
+                    ),
                     "execution_status": (
                         binding.status
                         if binding_is_live
@@ -1168,9 +1192,26 @@ def _load_deepcoin_tpsl_orders_by_position_key(
     deepcoin_client,
     positions: list[dict[str, Any]],
 ) -> dict[tuple[str, str, str, str], dict[str, Any]]:
-    if not hasattr(deepcoin_client, "list_trigger_orders_pending"):
-        return {}
+    orders, _evidence_available = _load_deepcoin_pending_tpsl_orders(
+        deepcoin_client,
+        positions,
+    )
     orders_by_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for order in orders:
+        for key in _deepcoin_tpsl_order_position_keys(order):
+            current = orders_by_key.get(key)
+            orders_by_key[key] = _merge_deepcoin_tpsl_orders(current, order)
+    return orders_by_key
+
+
+def _load_deepcoin_pending_tpsl_orders(
+    deepcoin_client,
+    positions: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    if not hasattr(deepcoin_client, "list_trigger_orders_pending"):
+        return [], True
+    result: list[dict[str, Any]] = []
+    evidence_available = True
     instrument_ids = {
         str(position.get("instId") or "")
         for position in positions
@@ -1181,14 +1222,13 @@ def _load_deepcoin_tpsl_orders_by_position_key(
             orders = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
         except Exception:
             logger.exception("Deepcoin pending trigger order load failed for %s", inst_id)
+            evidence_available = False
             continue
         for order in orders:
             if str(order.get("triggerOrderType") or "").upper() != "TPSL":
                 continue
-            for key in _deepcoin_tpsl_order_position_keys(order):
-                current = orders_by_key.get(key)
-                orders_by_key[key] = _merge_deepcoin_tpsl_orders(current, order)
-    return orders_by_key
+            result.append(order)
+    return result, evidence_available
 
 
 def _deepcoin_position_protection_key(position: dict[str, Any]) -> tuple[str, str, str, str]:
