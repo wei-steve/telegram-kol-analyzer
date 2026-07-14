@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -421,6 +421,13 @@ class ExecutionOrderLeg(Base):
         Index("ix_execution_order_legs_order", "order_id"),
         Index("ix_execution_order_legs_client_order", "client_order_id"),
         Index("ix_execution_order_legs_pos", "pos_id"),
+        Index(
+            "uq_execution_order_legs_venue_pos",
+            "venue",
+            "pos_id",
+            unique=True,
+            sqlite_where=text("pos_id IS NOT NULL AND pos_id != ''"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -434,11 +441,44 @@ class ExecutionOrderLeg(Base):
     order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     client_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     pos_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    attribution_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="unassigned", index=True
+    )
+    attribution_evidence_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    terminal_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="submitted", index=True)
     request_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class PositionAttributionAudit(Base):
+    __tablename__ = "position_attribution_audits"
+    __table_args__ = (
+        Index("ix_position_attribution_audits_binding", "execution_binding_id"),
+        Index("ix_position_attribution_audits_leg", "execution_order_leg_id"),
+        Index("ix_position_attribution_audits_position", "venue", "pos_id"),
+        UniqueConstraint("fingerprint", name="uq_position_attribution_audits_fingerprint"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    execution_binding_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=True
+    )
+    execution_order_leg_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=True
+    )
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    pos_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    prior_state: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    new_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
 class ExecutionEvent(Base):

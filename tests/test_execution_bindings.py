@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
@@ -133,6 +134,61 @@ def test_upsert_execution_order_leg_tracks_deepcoin_ids_per_leg(tmp_path):
     with session_factory() as session:
         stored = session.query(ExecutionOrderLeg).one()
     assert stored.request_json == '{"instId":"BTC-USDT-SWAP","sz":"5"}'
+
+
+def test_execution_order_leg_position_ownership_is_unique(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(session_factory, _binding())
+
+    with session_factory() as session:
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=binding_id,
+                    leg_index=1,
+                    purpose="entry",
+                    venue="deepcoin",
+                    pos_id="pos-1",
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=binding_id,
+                    leg_index=2,
+                    purpose="entry",
+                    venue="deepcoin",
+                    pos_id="pos-1",
+                ),
+            ]
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_execution_order_leg_allows_multiple_unassigned_positions(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(session_factory, _binding())
+
+    with session_factory() as session:
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=binding_id,
+                    leg_index=1,
+                    purpose="entry",
+                    venue="deepcoin",
+                    pos_id=None,
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=binding_id,
+                    leg_index=2,
+                    purpose="entry",
+                    venue="deepcoin",
+                    pos_id=None,
+                ),
+            ]
+        )
+        session.commit()
+
+        assert session.query(ExecutionOrderLeg).count() == 2
 
 
 def test_repair_execution_order_legs_from_binding_payloads_backfills_legacy_rows(tmp_path):

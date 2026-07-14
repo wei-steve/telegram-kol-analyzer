@@ -373,9 +373,80 @@ def test_database_bootstrap_creates_execution_order_legs_table(tmp_path):
         "status",
         "request_json",
         "response_json",
+        "venue",
+        "attribution_status",
+        "attribution_evidence_json",
+        "terminal_reason",
+        "last_verified_at",
     }.issubset(columns)
     assert "ix_execution_order_legs_binding" in indexes
     assert "ix_execution_order_legs_pos" in indexes
+    assert "uq_execution_order_legs_venue_pos" in indexes
+
+
+def test_database_bootstrap_backfills_position_attribution_schema(tmp_path):
+    database_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(database_path)
+    conn.execute(
+        """
+        CREATE TABLE execution_order_legs (
+            id INTEGER PRIMARY KEY,
+            execution_binding_id INTEGER NOT NULL,
+            strategy_instance_id VARCHAR(255),
+            leg_index INTEGER NOT NULL,
+            purpose VARCHAR(64) NOT NULL,
+            order_kind VARCHAR(64) NOT NULL DEFAULT 'unknown',
+            order_id VARCHAR(255),
+            client_order_id VARCHAR(255),
+            pos_id VARCHAR(255),
+            status VARCHAR(32) NOT NULL DEFAULT 'submitted',
+            request_json TEXT,
+            response_json TEXT,
+            created_at DATETIME,
+            updated_at DATETIME
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    leg_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(execution_order_legs)").fetchall()
+    }
+    audit_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(position_attribution_audits)").fetchall()
+    }
+    indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(execution_order_legs)").fetchall()
+    }
+    conn.close()
+
+    assert {
+        "venue",
+        "attribution_status",
+        "attribution_evidence_json",
+        "terminal_reason",
+        "last_verified_at",
+    } <= leg_columns
+    assert {
+        "execution_binding_id",
+        "execution_order_leg_id",
+        "venue",
+        "pos_id",
+        "event_type",
+        "prior_state",
+        "new_state",
+        "fingerprint",
+        "evidence_json",
+        "created_at",
+    } <= audit_columns
+    assert "uq_execution_order_legs_venue_pos" in indexes
 
 
 def test_database_bootstrap_enables_sqlite_busy_timeout(tmp_path):

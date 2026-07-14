@@ -53,6 +53,25 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "status": "ALTER TABLE execution_bindings ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'open'",
         "updated_at": "ALTER TABLE execution_bindings ADD COLUMN updated_at DATETIME",
     },
+    "execution_order_legs": {
+        "venue": (
+            "ALTER TABLE execution_order_legs "
+            "ADD COLUMN venue VARCHAR(64) NOT NULL DEFAULT 'deepcoin'"
+        ),
+        "attribution_status": (
+            "ALTER TABLE execution_order_legs "
+            "ADD COLUMN attribution_status VARCHAR(32) NOT NULL DEFAULT 'unassigned'"
+        ),
+        "attribution_evidence_json": (
+            "ALTER TABLE execution_order_legs ADD COLUMN attribution_evidence_json TEXT"
+        ),
+        "terminal_reason": (
+            "ALTER TABLE execution_order_legs ADD COLUMN terminal_reason VARCHAR(64)"
+        ),
+        "last_verified_at": (
+            "ALTER TABLE execution_order_legs ADD COLUMN last_verified_at DATETIME"
+        ),
+    },
     "recovery_decisions": {
         "reason_codes_json": "ALTER TABLE recovery_decisions ADD COLUMN reason_codes_json TEXT NOT NULL DEFAULT '[]'",
         "entry_range_text": "ALTER TABLE recovery_decisions ADD COLUMN entry_range_text VARCHAR(255)",
@@ -188,6 +207,11 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
     "ix_execution_order_legs_pos": (
         "CREATE INDEX IF NOT EXISTS ix_execution_order_legs_pos "
         "ON execution_order_legs (pos_id)"
+    ),
+    "uq_execution_order_legs_venue_pos": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_order_legs_venue_pos "
+        "ON execution_order_legs (venue, pos_id) "
+        "WHERE pos_id IS NOT NULL AND pos_id != ''"
     ),
     "ix_execution_events_strategy_created": (
         "CREATE INDEX IF NOT EXISTS ix_execution_events_strategy_created "

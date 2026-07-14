@@ -51,6 +51,11 @@ class ExecutionOrderLegRecord:
     order_id: str | None = None
     client_order_id: str | None = None
     pos_id: str | None = None
+    venue: str = "deepcoin"
+    attribution_status: str | None = None
+    attribution_evidence: dict[str, Any] | None = None
+    terminal_reason: str | None = None
+    last_verified_at: datetime | None = None
     status: str = "submitted"
     request: dict[str, Any] | None = None
     response: dict[str, Any] | None = None
@@ -68,6 +73,11 @@ class ExecutionOrderLegSnapshot:
     client_order_id: str | None
     pos_id: str | None
     status: str
+    venue: str = "deepcoin"
+    attribution_status: str = "unassigned"
+    attribution_evidence: dict[str, Any] | None = None
+    terminal_reason: str | None = None
+    last_verified_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -744,6 +754,7 @@ def upsert_execution_order_leg(
 
     request_json = _compact_json(record.request)
     response_json = _compact_json(record.response)
+    attribution_evidence_json = _compact_json(record.attribution_evidence)
     purpose = str(record.purpose or "entry").lower()
     order_kind = str(record.order_kind or "unknown").lower()
     now = datetime.now(UTC)
@@ -766,11 +777,20 @@ def upsert_execution_order_leg(
             session.flush()
 
         row.strategy_instance_id = record.strategy_instance_id
+        row.venue = str(record.venue or "deepcoin").lower()
         row.order_kind = order_kind
         row.order_id = record.order_id
         row.client_order_id = record.client_order_id
         row.pos_id = record.pos_id
         row.status = str(record.status or "submitted").lower()
+        if record.attribution_status is not None:
+            row.attribution_status = str(record.attribution_status).lower()
+        if attribution_evidence_json is not None:
+            row.attribution_evidence_json = attribution_evidence_json
+        if record.terminal_reason is not None:
+            row.terminal_reason = record.terminal_reason
+        if record.last_verified_at is not None:
+            row.last_verified_at = record.last_verified_at
         if request_json is not None:
             row.request_json = request_json
         if response_json is not None:
@@ -805,6 +825,11 @@ def list_execution_order_legs(
                 client_order_id=row.client_order_id,
                 pos_id=row.pos_id,
                 status=row.status,
+                venue=row.venue,
+                attribution_status=row.attribution_status,
+                attribution_evidence=_parse_json_object(row.attribution_evidence_json),
+                terminal_reason=row.terminal_reason,
+                last_verified_at=row.last_verified_at,
             )
             for row in rows
         ]
@@ -1045,6 +1070,13 @@ def _compact_json(value: dict[str, Any] | None) -> str | None:
     if value is None:
         return None
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _parse_json_object(value: str | None) -> dict[str, Any] | None:
+    if not value:
+        return None
+    parsed = json.loads(value)
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _first_string(payload: dict[str, Any], *keys: str) -> str | None:
