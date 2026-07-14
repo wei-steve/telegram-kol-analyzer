@@ -15,6 +15,48 @@ def test_cli_help_renders():
     assert "sync" in result.stdout
     assert "report" in result.stdout
     assert "recovery-dry-run" in result.stdout
+    assert "repair-position-attribution" in result.stdout
+
+
+def test_repair_position_attribution_cli_defaults_to_dry_run(tmp_path, monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    class EmptyDeepcoinClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
+            return []
+
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: EmptyDeepcoinClient(),
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["repair-position-attribution", "--database-path", str(database_path)],
+    )
+
+    assert result.exit_code == 0
+    assert "DRY RUN" in result.stdout
+    assert '"actions": []' in result.stdout
 
 
 def test_repair_execution_order_legs_cli_backfills_legacy_bindings(tmp_path):

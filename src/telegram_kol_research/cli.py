@@ -3,6 +3,7 @@
 import asyncio
 import json
 import shutil
+from dataclasses import asdict
 from enum import Enum
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,8 +18,13 @@ from telegram_kol_research.binance_market_data import BinanceMarketDataProvider
 from telegram_kol_research.dataset_export import export_dataset_jsonl
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import load_deepcoin_contract_specs
+from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.execution_bindings import (
     repair_execution_order_legs_from_binding_payloads,
+)
+from telegram_kol_research.position_attribution_repair import (
+    apply_position_attribution_repair_plan,
+    build_position_attribution_repair_plan,
 )
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
@@ -619,6 +625,42 @@ def repair_execution_order_legs(
     session_factory = create_session_factory(database_path)
     repaired = repair_execution_order_legs_from_binding_payloads(session_factory)
     typer.echo(f"Repaired {repaired} execution order leg(s) in {database_path}")
+
+
+@app.command("repair-position-attribution")
+def repair_position_attribution(
+    database_path: Path = Path("data/research.db"),
+    apply: bool = typer.Option(False, "--apply"),
+) -> None:
+    """Plan or explicitly apply audited position-attribution repairs."""
+
+    session_factory = create_session_factory(database_path)
+    client = build_deepcoin_client_from_env()
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime.now(UTC),
+    )
+    typer.echo("APPLY" if apply else "DRY RUN")
+    typer.echo(
+        json.dumps(
+            asdict(plan),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
+    if not apply:
+        return
+    if plan.unresolved_conflicts:
+        typer.echo("Refusing apply: unresolved attribution conflicts remain.", err=True)
+        raise typer.Exit(code=2)
+    result = apply_position_attribution_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+    )
+    typer.echo(f"Applied {result.applied} repair action(s).")
 
 
 def _build_recovery_market_provider(market_provider: str):

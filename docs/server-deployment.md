@@ -90,6 +90,39 @@ systemctl restart telegram-kol.service
 The repair is idempotent. Re-running it updates the same `(binding, purpose,
 leg_index)` rows instead of creating duplicates.
 
+### Repair Deepcoin position attribution
+
+Keep automation fail closed while repairing ownership. Back up SQLite before
+reviewing or applying a plan:
+
+```bash
+cd /opt/telegram-kol-analyzer
+. .venv/bin/activate
+cp data/research.db "data/research.db.$(date +%Y%m%d-%H%M%S).bak"
+telegram-kol-research repair-position-attribution --database-path data/research.db
+```
+
+The command is a read-only dry run unless `--apply` is supplied. Review every
+old/new position owner, terminal leg transition, evidence summary, and
+unresolved conflict. It never submits an exchange order or cancellation.
+
+Only after the dry-run output matches the current Deepcoin positions and order
+history, apply the exact freshly rebuilt plan:
+
+```bash
+telegram-kol-research repair-position-attribution \
+  --database-path data/research.db \
+  --apply
+systemctl restart telegram-kol.service
+```
+
+Apply refuses a stale database fingerprint, changed live position IDs, API
+evidence errors, or unresolved attribution conflicts. After restart, run the
+dry run again and repeat read-only reconciliation. Verify live positions,
+entry-leg ownership, group labels, pending orders, and TPSL independently.
+Re-enable automatic management only when every live position has one verified
+entry leg and no attribution incident remains pending.
+
 ## Data And Secrets
 
 Do not commit runtime data or secrets to GitHub. Keep these on the server:
