@@ -28,6 +28,7 @@ from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
+from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.message_recognition import MessageRecognitionResult
@@ -1067,6 +1068,14 @@ def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):
             return [
                 {
                     "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-market",
+                    "posSide": "short",
+                    "pos": "4.3",
+                    "avgPx": "1616.8",
+                    "cTime": "100000",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
                     "posId": "pos-limit",
                     "posSide": "short",
                     "pos": "6.4",
@@ -1131,6 +1140,35 @@ def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):
             pos_id="pos-market",
         )
         session.add_all([lifecycle, binding])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="order-market",
+                    client_order_id="client-market",
+                    pos_id="pos-market",
+                    venue="deepcoin",
+                    status="active",
+                    attribution_status="verified",
+                    attribution_evidence_json='{"evidence_type":"test_verified_entry"}',
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    leg_index=2,
+                    purpose="entry",
+                    order_kind="limit",
+                    order_id="order-limit",
+                    client_order_id="client-limit",
+                    venue="deepcoin",
+                    status="open",
+                    attribution_status="unassigned",
+                ),
+            ]
+        )
         session.commit()
         lifecycle_id = lifecycle.id
         binding_id = binding.id
@@ -1152,7 +1190,7 @@ def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):
         assert binding.pos_id == "pos-market,pos-limit"
 
 
-def test_execution_sync_api_binds_trigger_limit_position_before_execution_page_render(tmp_path):
+def test_execution_sync_api_keeps_payload_only_position_unassigned(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self, *, inst_id=None):
             return [
@@ -1232,12 +1270,12 @@ def test_execution_sync_api_binds_trigger_limit_position_before_execution_page_r
     sync_response = client.post("/api/execution/sync-deepcoin")
 
     assert sync_response.status_code == 200
-    assert sync_response.json()["reconciled_active"] == 1
+    assert sync_response.json()["reconciled_active"] == 0
     page_response = client.get("/execution")
     assert page_response.status_code == 200
     assert "1001123877920316" in page_response.text
     assert "舒琴会员群-11分组" in page_response.text
-    assert "unbound_live_position" not in page_response.text
+    assert "unbound_live_position" in page_response.text
 
 
 def test_bind_live_position_api_attaches_unbound_position_to_lifecycle(tmp_path):

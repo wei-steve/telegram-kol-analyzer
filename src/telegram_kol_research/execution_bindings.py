@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -19,9 +19,15 @@ from telegram_kol_research.deepcoin_readonly import (
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.models import PositionAttributionAudit
 from telegram_kol_research.position_attribution import (
+    FillEvidence,
+    LegEvidence,
+    PositionEvidence,
     TERMINAL_ENTRY_LEG_STATES,
+    classify_leg_exchange_state,
     is_fill_evidence,
+    match_entry_legs_to_positions,
 )
 
 PENDING_ENTRY_RECOVERY_WINDOW_HOURS = 6
@@ -98,6 +104,17 @@ class ManualCloseSyncResult:
     checked: int = 0
     manually_closed: int = 0
     skipped_without_pos_id: int = 0
+
+
+@dataclass(slots=True)
+class _ReconcileSnapshot:
+    positions: list[dict[str, Any]] = field(default_factory=list)
+    open_orders: list[dict[str, Any]] = field(default_factory=list)
+    pending_trigger_orders: list[dict[str, Any]] = field(default_factory=list)
+    order_history: list[dict[str, Any]] = field(default_factory=list)
+    trade_fills: list[dict[str, Any]] = field(default_factory=list)
+    trigger_history: list[dict[str, Any]] = field(default_factory=list)
+    errors: dict[str, str] = field(default_factory=dict)
 
 
 def build_strategy_instance_id(
@@ -250,209 +267,737 @@ def reconcile_deepcoin_execution_bindings(
     client: DeepcoinReadOnlyClient,
     recovered_at: datetime | None = None,
 ) -> ExecutionReconciliationResult:
-    """Refresh persisted Deepcoin bindings against exchange open orders/positions.
-
-    This is intentionally read-only against Deepcoin: on process restart it
-    marks locally known strategies as active/open/stale using the exchange's
-    current state, so later close/TP/SL handling can continue from durable data.
-    """
+    """Reconcile one coherent exchange snapshot through global leg attribution."""
 
     now = recovered_at or datetime.now(UTC)
-    positions = client.list_positions()
-    orders = client.list_open_orders()
-    positions_by_pos_id = {
-        _first_string(position, "posId", "pos_id", "id"): position
-        for position in positions
-        if _first_string(position, "posId", "pos_id", "id")
-    }
-    active_positions = [position for position in positions if _has_nonzero_size(position)]
-
-    result = ExecutionReconciliationResult()
     with session_factory() as session:
-        rows = (
+        instruments = {
+            f"{str(symbol or '').upper()}-USDT-SWAP"
+            for (symbol,) in session.query(ExecutionBinding.symbol)
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .all()
+            if str(symbol or "").strip()
+        }
+    snapshot = _load_reconcile_snapshot(client, instruments=instruments)
+    return _apply_reconcile_snapshot(session_factory, snapshot=snapshot, recovered_at=now)
+
+
+def _load_reconcile_snapshot(
+    client: DeepcoinReadOnlyClient,
+    *,
+    instruments: set[str],
+) -> _ReconcileSnapshot:
+    snapshot = _ReconcileSnapshot()
+    snapshot.positions = _read_snapshot_rows(
+        client, method_name="list_positions", source="positions", errors=snapshot.errors
+    )
+    snapshot.open_orders = _read_snapshot_rows(
+        client, method_name="list_open_orders", source="open_orders", errors=snapshot.errors
+    )
+    snapshot.pending_trigger_orders = _read_instrument_snapshot_rows(
+        client,
+        method_name="list_trigger_orders_pending",
+        source="pending_trigger_orders",
+        instruments=instruments,
+        errors=snapshot.errors,
+    )
+    snapshot.order_history = _read_instrument_snapshot_rows(
+        client,
+        method_name="list_order_history",
+        source="order_history",
+        instruments=instruments,
+        errors=snapshot.errors,
+    )
+    snapshot.trade_fills = _read_instrument_snapshot_rows(
+        client,
+        method_name="list_trade_fills",
+        source="trade_fills",
+        instruments=instruments,
+        errors=snapshot.errors,
+    )
+    snapshot.trigger_history = _read_instrument_snapshot_rows(
+        client,
+        method_name="list_trigger_order_history",
+        source="trigger_history",
+        instruments=instruments,
+        errors=snapshot.errors,
+    )
+    return snapshot
+
+
+def _read_snapshot_rows(
+    client: DeepcoinReadOnlyClient,
+    *,
+    method_name: str,
+    source: str,
+    errors: dict[str, str],
+) -> list[dict[str, Any]]:
+    method = getattr(client, method_name, None)
+    if method is None:
+        return []
+    try:
+        rows = method()
+    except Exception as exc:
+        errors[source] = str(exc)
+        return []
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def _read_instrument_snapshot_rows(
+    client: DeepcoinReadOnlyClient,
+    *,
+    method_name: str,
+    source: str,
+    instruments: set[str],
+    errors: dict[str, str],
+) -> list[dict[str, Any]]:
+    method = getattr(client, method_name, None)
+    if method is None:
+        return []
+    result: list[dict[str, Any]] = []
+    called_without_instrument = False
+    for instrument_id in sorted(instruments):
+        try:
+            rows = method(inst_id=instrument_id)
+        except TypeError:
+            if called_without_instrument:
+                continue
+            called_without_instrument = True
+            try:
+                rows = method()
+            except Exception as exc:
+                errors[source] = str(exc)
+                return result
+        except Exception as exc:
+            errors[f"{source}:{instrument_id}"] = str(exc)
+            continue
+        if isinstance(rows, list):
+            result.extend(row for row in rows if isinstance(row, dict))
+        if called_without_instrument:
+            break
+    return _deduplicate_exchange_rows(result)
+
+
+def _deduplicate_exchange_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        fingerprint = json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        result.append(row)
+    return result
+
+
+def _apply_reconcile_snapshot(
+    session_factory: sessionmaker,
+    *,
+    snapshot: _ReconcileSnapshot,
+    recovered_at: datetime,
+) -> ExecutionReconciliationResult:
+    result = ExecutionReconciliationResult()
+    active_positions = [row for row in snapshot.positions if _has_nonzero_size(row)]
+    live_position_ids = {
+        pos_id
+        for row in active_positions
+        if (pos_id := _first_string(row, "posId", "pos_id", "id"))
+    }
+    with session_factory() as session:
+        bindings = (
             session.query(ExecutionBinding)
             .filter(ExecutionBinding.venue == "deepcoin")
             .filter(
-                or_(
-                    ExecutionBinding.status.in_(["open", "active", "unknown", "stale"]),
-                    ExecutionBinding.status == "closed",
+                ExecutionBinding.status.in_(
+                    ["open", "active", "unknown", "stale", "closed", "cancelled"]
                 )
             )
-            .order_by(ExecutionBinding.id.asc())
             .all()
         )
-        _apply_recorded_terminal_entry_events(session, rows=rows, updated_at=now)
-        rows = [
-            row
-            for row in rows
-            if row.status != "closed" or _binding_has_unresolved_entry_leg(session, row)
-        ]
-        trigger_orders = _load_pending_trigger_orders(client, rows=rows)
-        all_orders = [*orders, *trigger_orders]
-        orders_by_order_id = {
-            _first_string(order, "ordId", "orderId", "order_id", "id"): order
-            for order in all_orders
-            if _first_string(order, "ordId", "orderId", "order_id", "id")
-        }
-        orders_by_client_order_id = {
-            _first_string(order, "clOrdId", "clientOrderId", "client_order_id"): order
-            for order in all_orders
-            if _first_string(order, "clOrdId", "clientOrderId", "client_order_id")
-        }
-        bound_pos_ids = {
-            pos_id
-            for binding in rows
-            for pos_id in _split_ids(binding.pos_id)
-        }
-        order_history_cache: dict[str, list[dict[str, Any]]] = {}
-        trade_fills_cache: dict[str, list[dict[str, Any]]] = {}
-        trigger_history_cache: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
-            row.strategy_instance_id = row.strategy_instance_id or build_strategy_instance_id(
-                venue=row.venue,
-                chat_id=row.chat_id,
-                message_id=row.message_id,
-                symbol=row.symbol,
-                side=row.side,
-            )
-            position = _lookup_position_by_any_id(positions_by_pos_id, row.pos_id)
-            order = _lookup_order_by_any_id(orders_by_order_id, row.order_id)
-            if order is None:
-                order = _lookup_order_by_any_id(orders_by_client_order_id, row.client_order_id)
-            recovered_position_from_payload = (
-                _select_position_from_submitted_order_payload(
-                    row,
-                    active_positions=active_positions,
-                    bound_pos_ids=bound_pos_ids,
-                )
-                if position is None
-                else None
-            )
+        _ensure_legacy_entry_legs(session, bindings=bindings, updated_at=recovered_at)
+        _apply_recorded_terminal_entry_events(session, rows=bindings, updated_at=recovered_at)
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .join(ExecutionBinding, ExecutionBinding.id == ExecutionOrderLeg.execution_binding_id)
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .all()
+        )
+        bindings_by_id = {int(binding.id): binding for binding in bindings}
 
-            if position is not None and _has_nonzero_size(position):
-                recovered_pos_ids = _select_additional_positions_from_order_evidence(
-                    row,
-                    client=client,
-                    active_positions=active_positions,
-                    bound_pos_ids=bound_pos_ids,
-                    order_history_cache=order_history_cache,
-                    trade_fills_cache=trade_fills_cache,
-                    trigger_history_cache=trigger_history_cache,
+        if snapshot.errors:
+            for leg in legs:
+                if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+                    continue
+                evidence = {"errors": dict(sorted(snapshot.errors.items()))}
+                _transition_leg_attribution(
+                    session,
+                    leg=leg,
+                    event_type="evidence_unavailable",
+                    new_state="evidence_unavailable",
+                    evidence=evidence,
+                    recovered_at=recovered_at,
                 )
-                if recovered_pos_ids:
-                    row.pos_id = _join_unique_ids([*_split_ids(row.pos_id), *recovered_pos_ids])
-                    bound_pos_ids.update(recovered_pos_ids)
-                    row.last_exchange_status = "position_active_recovered_additional_pos_id"
-                else:
-                    row.last_exchange_status = "position_active"
-                row.status = "active"
-                if _attach_binding_to_lifecycle(session, row, now):
-                    result.active += 1
-                else:
-                    result.stale += 1
-            elif recovered_position_from_payload is not None:
-                recovered_pos_id = _first_string(
-                    recovered_position_from_payload, "posId", "pos_id", "id"
+            for binding in bindings:
+                binding.last_exchange_status = "position_attribution_evidence_unavailable"
+                binding.recovered_at = recovered_at
+                binding.updated_at = recovered_at
+                _count_reconcile_binding(result, binding)
+            result.updated = len(bindings)
+            session.commit()
+            return result
+
+        _refresh_exact_entry_leg_states(
+            legs,
+            snapshot=snapshot,
+            recovered_at=recovered_at,
+        )
+        position_rows = [_position_evidence(row) for row in active_positions]
+        position_rows = [row for row in position_rows if row is not None]
+        fill_rows = _snapshot_fill_evidence(
+            snapshot,
+            legs=legs,
+            bindings_by_id=bindings_by_id,
+        )
+        leg_rows = [
+            _leg_evidence(leg, binding=bindings_by_id[int(leg.execution_binding_id)])
+            for leg in legs
+        ]
+        attribution = match_entry_legs_to_positions(leg_rows, position_rows, fill_rows)
+        legs_by_id = {int(leg.id): leg for leg in legs}
+        conflict_leg_ids = {
+            int(leg_id)
+            for conflict in attribution.conflicts
+            for leg_id in conflict.get("leg_ids", [])
+        }
+        assignments = dict(attribution.assignments)
+        manual_terminal_binding_ids = _manual_terminal_binding_ids(
+            session, bindings=bindings
+        )
+        existing_owner_by_position = {
+            str(leg.pos_id): int(leg.id)
+            for leg in legs
+            if leg.pos_id not in (None, "")
+        }
+        for leg_id, pos_id in list(assignments.items()):
+            leg = legs_by_id[leg_id]
+            if int(leg.execution_binding_id) in manual_terminal_binding_ids:
+                conflict_leg_ids.add(leg_id)
+                assignments.pop(leg_id, None)
+                continue
+            existing_owner = existing_owner_by_position.get(pos_id)
+            contradicted = bool(leg.pos_id and str(leg.pos_id) != str(pos_id))
+            owned_elsewhere = existing_owner is not None and existing_owner != leg_id
+            if not contradicted and not owned_elsewhere:
+                continue
+            conflict_leg_ids.add(leg_id)
+            if existing_owner is not None:
+                conflict_leg_ids.add(existing_owner)
+            assignments.pop(leg_id, None)
+
+        for leg_id, pos_id in sorted(assignments.items()):
+            leg = legs_by_id[leg_id]
+            evidence = attribution.evidence_by_leg[leg_id]
+            _transition_leg_attribution(
+                session,
+                leg=leg,
+                event_type="ownership_verified",
+                new_state="verified",
+                evidence=evidence,
+                recovered_at=recovered_at,
+                pos_id=pos_id,
+            )
+            leg.status = "active"
+            leg.terminal_reason = None
+
+        for leg in legs:
+            leg_id = int(leg.id)
+            if leg_id in assignments:
+                continue
+            if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+                continue
+            if leg_id in conflict_leg_ids or leg.pos_id:
+                _transition_leg_attribution(
+                    session,
+                    leg=leg,
+                    event_type="attribution_conflict",
+                    new_state="attribution_conflict",
+                    evidence={"candidate_leg_ids": sorted(conflict_leg_ids)},
+                    recovered_at=recovered_at,
                 )
-                row.pos_id = recovered_pos_id
-                row.status = "active"
-                row.last_exchange_status = "position_active_recovered_from_submitted_order_payload"
-                bound_pos_ids.add(str(recovered_pos_id))
-                if _attach_binding_to_lifecycle(session, row, now):
-                    result.active += 1
-                else:
-                    result.stale += 1
-            elif order is not None and _is_open_order_state(order):
-                row.status = "open"
-                row.last_exchange_status = (
-                    "trigger_order_open" if order in trigger_orders else "order_open"
-                )
-                result.open += 1
             else:
-                recovered_pos_ids = _select_additional_positions_from_order_evidence(
-                    row,
-                    client=client,
-                    active_positions=active_positions,
-                    bound_pos_ids=bound_pos_ids,
-                    order_history_cache=order_history_cache,
-                    trade_fills_cache=trade_fills_cache,
-                    trigger_history_cache=trigger_history_cache,
-                )
-                if recovered_pos_ids:
-                    existing_pos_ids = _split_ids(row.pos_id)
-                    row.pos_id = _join_unique_ids([*_split_ids(row.pos_id), *recovered_pos_ids])
-                    row.status = "active"
-                    row.last_exchange_status = (
-                        "position_active_recovered_from_filled_order"
-                        if not existing_pos_ids and len(recovered_pos_ids) == 1
-                        else "position_active_recovered_additional_pos_id"
-                    )
-                    bound_pos_ids.update(recovered_pos_ids)
-                    if _attach_binding_to_lifecycle(session, row, now):
-                        result.active += 1
-                    else:
-                        result.stale += 1
-                else:
-                    recovered_position = _select_position_from_order_evidence(
-                        row,
-                        client=client,
-                        active_positions=active_positions,
-                        bound_pos_ids=bound_pos_ids,
-                        order_history_cache=order_history_cache,
-                        trade_fills_cache=trade_fills_cache,
-                        trigger_history_cache=trigger_history_cache,
-                    )
-                    recovered_status = "position_active_recovered_from_filled_order"
-                    if recovered_position is None:
-                        recovered_position = recovered_position_from_payload
-                        recovered_status = "position_active_recovered_from_submitted_order_payload"
-                    if recovered_position is None:
-                        recovered_position = _select_recovered_position_for_unbound_binding(
-                            row,
-                            rows=rows,
-                            active_positions=active_positions,
-                            bound_pos_ids=bound_pos_ids,
-                        )
-                        recovered_status = "position_active_recovered_without_pos_id"
-                    if recovered_position is not None:
-                        recovered_pos_id = _first_string(recovered_position, "posId", "pos_id", "id")
-                        row.pos_id = recovered_pos_id
-                        row.status = "active"
-                        row.last_exchange_status = recovered_status
-                        bound_pos_ids.add(str(recovered_pos_id))
-                        if _attach_binding_to_lifecycle(session, row, now):
-                            result.active += 1
-                        else:
-                            result.stale += 1
-                    else:
-                        row.status = "stale"
-                        row.last_exchange_status = "not_found_on_exchange"
-                        result.stale += 1
-            row.recovered_at = now
-            row.updated_at = now
-            order_leg_position_ids = _recover_order_leg_position_ids(
-                row,
-                client=client,
-                active_positions=active_positions,
-                bound_pos_ids=bound_pos_ids,
-                order_history_cache=order_history_cache,
-                trade_fills_cache=trade_fills_cache,
-                trigger_history_cache=trigger_history_cache,
+                leg.attribution_status = "unassigned"
+                leg.attribution_evidence_json = None
+
+        for binding in bindings:
+            binding.strategy_instance_id = binding.strategy_instance_id or build_strategy_instance_id(
+                venue=binding.venue,
+                chat_id=binding.chat_id,
+                message_id=binding.message_id,
+                symbol=binding.symbol,
+                side=binding.side,
             )
-            _remove_reassigned_position_ids(
+            binding_legs = [
+                leg for leg in legs if int(leg.execution_binding_id) == int(binding.id)
+            ]
+            _derive_binding_from_entry_legs(
                 session,
-                owner=row,
-                pos_ids=set(order_leg_position_ids.values()),
+                binding=binding,
+                legs=binding_legs,
+                live_position_ids=live_position_ids,
+                recovered_at=recovered_at,
             )
-            _refresh_order_legs_from_binding_row(
-                session,
-                row,
-                active_positions=active_positions,
-                order_leg_position_ids=order_leg_position_ids,
-            )
-            result.updated += 1
+            _count_reconcile_binding(result, binding)
+        result.updated = len(bindings)
         session.commit()
     return result
+
+
+def _manual_terminal_binding_ids(
+    session,
+    *,
+    bindings: list[ExecutionBinding],
+) -> set[int]:
+    from telegram_kol_research.models import StrategyLifecycle
+
+    binding_keys = {
+        (int(binding.chat_id), int(binding.message_id), str(binding.symbol), str(binding.side)): int(
+            binding.id
+        )
+        for binding in bindings
+    }
+    latest_by_key: dict[tuple[int, int, str, str], Any] = {}
+    for lifecycle in session.query(StrategyLifecycle).order_by(StrategyLifecycle.id.asc()).all():
+        key = (
+            int(lifecycle.chat_id),
+            int(lifecycle.message_id),
+            str(lifecycle.symbol),
+            str(lifecycle.side),
+        )
+        if key in binding_keys:
+            latest_by_key[key] = lifecycle
+    return {
+        binding_keys[key]
+        for key, lifecycle in latest_by_key.items()
+        if str(lifecycle.lifecycle_status or "") == "exited"
+        and str(lifecycle.exit_reason or "") == "manual"
+    }
+
+
+def _ensure_legacy_entry_legs(
+    session,
+    *,
+    bindings: list[ExecutionBinding],
+    updated_at: datetime,
+) -> None:
+    existing_binding_ids = {
+        int(binding_id)
+        for (binding_id,) in session.query(ExecutionOrderLeg.execution_binding_id)
+        .filter(ExecutionOrderLeg.purpose == "entry")
+        .all()
+    }
+    for binding in bindings:
+        if int(binding.id) in existing_binding_ids:
+            continue
+        submitted_orders = _submitted_orders_from_binding_payload(binding)
+        if submitted_orders:
+            definitions = []
+            for index, submitted in enumerate(submitted_orders, start=1):
+                definitions.append(
+                    {
+                        "leg_index": int(submitted.get("leg_index") or index),
+                        "order_kind": str(
+                            submitted.get("execution_type") or submitted.get("order_kind") or "unknown"
+                        ).lower(),
+                        "order_id": _first_string(
+                            submitted, "order_id", "ordId", "orderId", "id"
+                        ),
+                        "client_order_id": _first_string(
+                            submitted, "client_order_id", "clOrdId", "clientOrderId"
+                        ),
+                        "request_json": _compact_json(
+                            submitted.get("request")
+                            if isinstance(submitted.get("request"), dict)
+                            else None
+                        ),
+                        "response_json": _compact_json(
+                            submitted.get("response")
+                            if isinstance(submitted.get("response"), dict)
+                            else None
+                        ),
+                    }
+                )
+        else:
+            order_ids = _split_ids(binding.order_id)
+            client_order_ids = _split_ids(binding.client_order_id)
+            count = max(len(order_ids), len(client_order_ids))
+            definitions = [
+                {
+                    "leg_index": index + 1,
+                    "order_kind": "unknown",
+                    "order_id": order_ids[index] if index < len(order_ids) else None,
+                    "client_order_id": (
+                        client_order_ids[index] if index < len(client_order_ids) else None
+                    ),
+                    "request_json": None,
+                    "response_json": None,
+                }
+                for index in range(count)
+            ]
+        for definition in definitions:
+            session.add(
+                ExecutionOrderLeg(
+                    execution_binding_id=int(binding.id),
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=int(definition["leg_index"]),
+                    purpose="entry",
+                    order_kind=str(definition["order_kind"]),
+                    order_id=definition["order_id"],
+                    client_order_id=definition["client_order_id"],
+                    venue=str(binding.venue or "deepcoin"),
+                    status="open" if binding.status in {"open", "unknown"} else binding.status,
+                    attribution_status="unassigned",
+                    request_json=definition["request_json"],
+                    response_json=definition["response_json"],
+                    created_at=updated_at,
+                    updated_at=updated_at,
+                )
+            )
+        existing_binding_ids.add(int(binding.id))
+    session.flush()
+
+
+def _refresh_exact_entry_leg_states(
+    legs: list[ExecutionOrderLeg],
+    *,
+    snapshot: _ReconcileSnapshot,
+    recovered_at: datetime,
+) -> None:
+    pending_rows = [*snapshot.open_orders, *snapshot.pending_trigger_orders]
+    history_rows = [*snapshot.order_history, *snapshot.trigger_history]
+    for leg in legs:
+        if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+            continue
+        pending = next((row for row in pending_rows if _exchange_row_matches_leg(row, leg)), None)
+        if pending is not None:
+            leg.status = "pending"
+            leg.updated_at = recovered_at
+            continue
+        history = next((row for row in history_rows if _exchange_row_matches_leg(row, leg)), None)
+        if history is None:
+            if str(leg.status or "").lower() in {"open", "submitted"}:
+                leg.status = "unknown"
+                leg.updated_at = recovered_at
+            continue
+        state = classify_leg_exchange_state(history)
+        if state != "unknown":
+            leg.status = state
+            if state in TERMINAL_ENTRY_LEG_STATES:
+                leg.terminal_reason = state
+            leg.updated_at = recovered_at
+
+
+def _exchange_row_matches_leg(row: dict[str, Any], leg: ExecutionOrderLeg) -> bool:
+    order_id = _first_string(row, "ordId", "orderId", "order_id", "id")
+    client_order_id = _first_string(row, "clOrdId", "clientOrderId", "client_order_id")
+    return bool(
+        (order_id and leg.order_id and order_id == str(leg.order_id))
+        or (
+            client_order_id
+            and leg.client_order_id
+            and client_order_id == str(leg.client_order_id)
+        )
+    )
+
+
+def _position_evidence(row: dict[str, Any]) -> PositionEvidence | None:
+    pos_id = _first_string(row, "posId", "pos_id", "id")
+    if not pos_id:
+        return None
+    return PositionEvidence(
+        pos_id=pos_id,
+        symbol=str(row.get("instId") or row.get("symbol") or ""),
+        side=_normalize_position_side(str(row.get("posSide") or row.get("side") or "")),
+        size=_to_float(row.get("pos") if row.get("pos") not in (None, "") else row.get("size")),
+        average_price=_to_float(
+            row.get("avgPx") or row.get("avgPrice") or row.get("openAvgPx")
+        ),
+        created_at_ms=_to_int(row.get("cTime") or row.get("uTime")),
+    )
+
+
+def _leg_evidence(leg: ExecutionOrderLeg, *, binding: ExecutionBinding) -> LegEvidence:
+    direct_pos_id = None
+    if str(leg.attribution_status or "") == "verified":
+        direct_pos_id = leg.pos_id
+    response_pos_id = _position_id_from_response_json(leg.response_json)
+    if response_pos_id:
+        direct_pos_id = response_pos_id
+    return LegEvidence(
+        leg_id=int(leg.id),
+        binding_id=int(binding.id),
+        venue=str(leg.venue or binding.venue or "deepcoin"),
+        symbol=str(binding.symbol or ""),
+        side=str(binding.side or ""),
+        order_id=leg.order_id,
+        client_order_id=leg.client_order_id,
+        pos_id=direct_pos_id,
+        requested_size=_requested_leg_size(leg.request_json),
+        terminal=str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES,
+    )
+
+
+def _snapshot_fill_evidence(
+    snapshot: _ReconcileSnapshot,
+    *,
+    legs: list[ExecutionOrderLeg],
+    bindings_by_id: dict[int, ExecutionBinding],
+) -> list[FillEvidence]:
+    sourced_rows = [
+        *((row, "regular_order") for row in snapshot.order_history),
+        *((row, "trade_fill") for row in snapshot.trade_fills),
+        *((row, "trigger_fill") for row in snapshot.trigger_history),
+    ]
+    result: list[FillEvidence] = []
+    for row, source in sourced_rows:
+        sourced_row = {**row, "_evidence_source": "trade_fill" if source == "trade_fill" else source}
+        if not is_fill_evidence(sourced_row):
+            continue
+        matching_legs = [leg for leg in legs if _exchange_row_matches_leg(row, leg)]
+        if not matching_legs:
+            continue
+        for leg in matching_legs:
+            binding = bindings_by_id[int(leg.execution_binding_id)]
+            result.append(
+                FillEvidence(
+                    source=source,
+                    order_id=_first_string(row, "ordId", "orderId", "order_id", "id"),
+                    client_order_id=_first_string(
+                        row, "clOrdId", "clientOrderId", "client_order_id"
+                    ),
+                    pos_id=_first_string(row, "posId", "pos_id", "positionId"),
+                    symbol=str(row.get("instId") or f"{binding.symbol}-USDT-SWAP"),
+                    side=_normalize_position_side(
+                        str(row.get("posSide") or row.get("side") or binding.side)
+                    ),
+                    size=_to_float(
+                        row.get("fillSz")
+                        or row.get("accFillSz")
+                        or row.get("sz")
+                        or row.get("size")
+                    ),
+                    price=_to_float(
+                        row.get("fillPx")
+                        or row.get("avgPx")
+                        or row.get("px")
+                        or row.get("price")
+                    ),
+                    created_at_ms=_to_int(
+                        row.get("fillTime")
+                        or row.get("triggerTime")
+                        or row.get("cTime")
+                        or row.get("uTime")
+                        or row.get("ts")
+                    ),
+                )
+            )
+    return result
+
+
+def _requested_leg_size(request_json: str | None) -> float | None:
+    try:
+        payload = json.loads(request_json or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return _to_float(payload.get("sz") or payload.get("size") or payload.get("quantity"))
+
+
+def _position_id_from_response_json(response_json: str | None) -> str | None:
+    try:
+        payload = json.loads(response_json or "{}")
+    except (TypeError, ValueError):
+        return None
+
+    def find(value: Any) -> str | None:
+        if isinstance(value, dict):
+            for key in ("posId", "pos_id", "positionId"):
+                if value.get(key) not in (None, ""):
+                    return str(value[key])
+            for nested in value.values():
+                found = find(nested)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for nested in value:
+                found = find(nested)
+                if found:
+                    return found
+        return None
+
+    return find(payload)
+
+
+def _transition_leg_attribution(
+    session,
+    *,
+    leg: ExecutionOrderLeg,
+    event_type: str,
+    new_state: str,
+    evidence: dict[str, Any],
+    recovered_at: datetime,
+    pos_id: str | None = None,
+) -> None:
+    evidence_json = json.dumps(
+        evidence, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    fingerprint_payload = {
+        "binding_id": int(leg.execution_binding_id),
+        "leg_id": int(leg.id),
+        "venue": str(leg.venue or "deepcoin"),
+        "pos_id": pos_id if pos_id is not None else leg.pos_id,
+        "event_type": event_type,
+        "new_state": new_state,
+        "evidence": evidence,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    exists = (
+        session.query(PositionAttributionAudit.id)
+        .filter(PositionAttributionAudit.fingerprint == fingerprint)
+        .first()
+    )
+    if exists is None:
+        session.add(
+            PositionAttributionAudit(
+                execution_binding_id=int(leg.execution_binding_id),
+                execution_order_leg_id=int(leg.id),
+                venue=str(leg.venue or "deepcoin"),
+                pos_id=pos_id if pos_id is not None else leg.pos_id,
+                event_type=event_type,
+                prior_state=str(leg.attribution_status or "unassigned"),
+                new_state=new_state,
+                fingerprint=fingerprint,
+                evidence_json=evidence_json,
+                created_at=recovered_at,
+            )
+        )
+    if pos_id is not None:
+        leg.pos_id = str(pos_id)
+    leg.attribution_status = new_state
+    leg.attribution_evidence_json = evidence_json
+    if new_state == "verified":
+        leg.last_verified_at = recovered_at
+    leg.updated_at = recovered_at
+
+
+def _derive_binding_from_entry_legs(
+    session,
+    *,
+    binding: ExecutionBinding,
+    legs: list[ExecutionOrderLeg],
+    live_position_ids: set[str],
+    recovered_at: datetime,
+) -> None:
+    verified_live_pos_ids = [
+        str(leg.pos_id)
+        for leg in sorted(legs, key=lambda item: int(item.leg_index or 0))
+        if leg.pos_id
+        and str(leg.attribution_status or "") == "verified"
+        and str(leg.pos_id) in live_position_ids
+    ]
+    has_unavailable = any(
+        str(leg.attribution_status or "") == "evidence_unavailable" for leg in legs
+    )
+    has_conflict = any(
+        str(leg.attribution_status or "") == "attribution_conflict" for leg in legs
+    )
+    has_pending = any(
+        str(leg.status or "").lower()
+        in {"open", "pending", "submitted", "partially_filled", "partial"}
+        for leg in legs
+    )
+    all_terminal = bool(legs) and all(
+        str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES for leg in legs
+    )
+    if verified_live_pos_ids:
+        binding.pos_id = _join_unique_ids(verified_live_pos_ids)
+        binding.status = "active"
+        binding.last_exchange_status = "position_ownership_verified"
+        _attach_binding_to_lifecycle(session, binding, recovered_at)
+    elif has_unavailable:
+        binding.last_exchange_status = "position_attribution_evidence_unavailable"
+    elif has_conflict:
+        trusted_pos_ids = [
+            str(leg.pos_id)
+            for leg in legs
+            if leg.pos_id
+            and str(leg.attribution_status or "") in {"verified", "evidence_unavailable"}
+        ]
+        binding.pos_id = _join_unique_ids(trusted_pos_ids) or None
+        binding.status = "unknown"
+        binding.last_exchange_status = "position_attribution_conflict"
+    elif has_pending:
+        binding.pos_id = None
+        binding.status = "open"
+        binding.last_exchange_status = "entry_order_pending"
+        _mark_lifecycle_pending(session, binding=binding, updated_at=recovered_at)
+    elif all_terminal:
+        binding.pos_id = None
+        binding.status = "closed"
+        binding.last_exchange_status = "entry_legs_terminal"
+        _cancel_missing_entry_lifecycle(session, binding, recovered_at)
+    else:
+        binding.pos_id = None
+        binding.status = "stale"
+        binding.last_exchange_status = "position_ownership_unassigned"
+    binding.recovered_at = recovered_at
+    binding.updated_at = recovered_at
+
+
+def _mark_lifecycle_pending(
+    session,
+    *,
+    binding: ExecutionBinding,
+    updated_at: datetime,
+) -> None:
+    from telegram_kol_research.models import StrategyLifecycle
+
+    lifecycle = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.chat_id == binding.chat_id)
+        .filter(StrategyLifecycle.message_id == binding.message_id)
+        .filter(StrategyLifecycle.symbol == binding.symbol)
+        .filter(StrategyLifecycle.side == binding.side)
+        .order_by(StrategyLifecycle.id.desc())
+        .first()
+    )
+    if lifecycle is None or _is_terminal_exited_lifecycle(lifecycle):
+        return
+    lifecycle.execution_binding_id = int(binding.id)
+    lifecycle.lifecycle_status = "pending_entry"
+    lifecycle.exit_reason = None
+    lifecycle.exited_at = None
+    lifecycle.updated_at = updated_at
+
+
+def _count_reconcile_binding(
+    result: ExecutionReconciliationResult,
+    binding: ExecutionBinding,
+) -> None:
+    if binding.status == "active":
+        result.active += 1
+    elif binding.status == "open":
+        result.open += 1
+    else:
+        result.stale += 1
 
 
 def _load_pending_trigger_orders(
@@ -1630,47 +2175,6 @@ def _position_matches_submitted_order_payload(
         matched_fields += 1
 
     return matched_fields >= 2
-
-
-def _select_recovered_position_for_unbound_binding(
-    row: ExecutionBinding,
-    *,
-    rows: list[ExecutionBinding],
-    active_positions: list[dict[str, Any]],
-    bound_pos_ids: set[str],
-) -> dict[str, Any] | None:
-    if _split_ids(row.pos_id):
-        return None
-    order_ids = set(_split_ids(row.order_id)) | set(_split_ids(row.client_order_id))
-    if not order_ids:
-        return None
-    target_symbol = str(row.symbol or "").upper()
-    target_side = str(row.side or "").lower()
-    candidates = [
-        position
-        for position in active_positions
-        if _first_string(position, "posId", "pos_id", "id") not in bound_pos_ids
-        and _symbol_from_inst_id(position.get("instId")) == target_symbol
-        and _normalize_position_side(
-            str(position.get("posSide") or position.get("side") or "")
-        )
-        == target_side
-    ]
-    if not candidates:
-        return None
-
-    competing_rows = [
-        other
-        for other in rows
-        if other.id != row.id
-        and not _split_ids(other.pos_id)
-        and str(other.symbol or "").upper() == target_symbol
-        and str(other.side or "").lower() == target_side
-        and other.status in {"open", "active", "unknown"}
-    ]
-    if not competing_rows and len(candidates) == 1:
-        return candidates[0]
-    return None
 
 
 def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: datetime) -> bool:
