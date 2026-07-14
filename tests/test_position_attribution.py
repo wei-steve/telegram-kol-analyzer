@@ -1,8 +1,12 @@
+import pytest
+
 from telegram_kol_research.position_attribution import (
     FillEvidence,
     LegEvidence,
     PositionEvidence,
     classify_leg_exchange_state,
+    classify_equivalent_attribution_components,
+    filter_candidate_edges_by_entry_protection,
     is_fill_evidence,
     match_entry_legs_to_positions,
 )
@@ -52,6 +56,247 @@ def _fill(
         size=1.5,
         price=1770.0,
         created_at_ms=created_at_ms,
+    )
+
+
+def _equivalent_leg(leg_id, *, binding_id=100, **overrides):
+    values = {
+        "leg_id": leg_id,
+        "binding_id": binding_id,
+        "venue": "deepcoin",
+        "symbol": "ETH-USDT-SWAP",
+        "side": "short",
+        "order_id": f"order-{leg_id}",
+        "client_order_id": f"client-{leg_id}",
+        "pos_id": None,
+        "requested_size": 1.5,
+        "terminal": False,
+        "strategy_instance_id": "strategy-1",
+        "entry_price": 1770.0,
+        "stop_loss": 1820.0,
+        "take_profits": (1700.0, 1650.0),
+        "margin_mode": "cross",
+        "position_mode": "split",
+        "order_kind": "trigger_limit",
+        "has_successful_entry_evidence": True,
+    }
+    values.update(overrides)
+    return LegEvidence(**values)
+
+
+def _equivalent_position(pos_id, **overrides):
+    values = {
+        "pos_id": pos_id,
+        "symbol": "ETH-USDT-SWAP",
+        "side": "short",
+        "size": 1.5,
+        "average_price": 1770.0,
+        "created_at_ms": 10_000,
+        "entry_price": 1770.0,
+        "stop_loss": 1820.0,
+        "take_profits": (1700.0, 1650.0),
+        "margin_mode": "cross",
+        "position_mode": "split",
+    }
+    values.update(overrides)
+    return PositionEvidence(**values)
+
+
+def _closed_2x2_edges():
+    return {(leg_id, pos_id) for leg_id in (1, 2) for pos_id in ("pos-1", "pos-2")}
+
+
+def test_equivalent_closed_2x2_component_is_classified_without_assignments():
+    legs = [_equivalent_leg(1), _equivalent_leg(2)]
+    positions = [_equivalent_position("pos-1"), _equivalent_position("pos-2")]
+    components = classify_equivalent_attribution_components(
+        legs,
+        positions,
+        _closed_2x2_edges(),
+    )
+
+    assert [(item.leg_ids, item.position_ids) for item in components] == [
+        ((1, 2), ("pos-1", "pos-2"))
+    ]
+    assert match_entry_legs_to_positions(legs, positions, []).assignments == {}
+
+
+def test_equivalent_component_rejects_cross_binding_graph():
+    components = classify_equivalent_attribution_components(
+        [_equivalent_leg(1), _equivalent_leg(2, binding_id=101)],
+        [_equivalent_position("pos-1"), _equivalent_position("pos-2")],
+        _closed_2x2_edges(),
+    )
+
+    assert components == ()
+
+
+@pytest.mark.parametrize(
+    ("leg_overrides", "position_overrides"),
+    [
+        ({"requested_size": 2.0}, {}),
+        ({"entry_price": 1771.0}, {}),
+        ({"take_profits": (1690.0,)}, {}),
+        ({"stop_loss": 1830.0}, {}),
+        ({"symbol": "BTC-USDT-SWAP"}, {}),
+        ({"side": "long"}, {}),
+        ({"margin_mode": "isolated"}, {}),
+        ({"position_mode": "net"}, {}),
+        ({"order_kind": "market"}, {}),
+    ],
+)
+def test_equivalent_component_rejects_unequal_economic_signatures(
+    leg_overrides, position_overrides
+):
+    components = classify_equivalent_attribution_components(
+        [_equivalent_leg(1), _equivalent_leg(2, **leg_overrides)],
+        [
+            _equivalent_position("pos-1"),
+            _equivalent_position("pos-2", **position_overrides),
+        ],
+        _closed_2x2_edges(),
+    )
+
+    assert components == ()
+
+
+def test_equivalent_component_rejects_terminal_leg():
+    components = classify_equivalent_attribution_components(
+        [_equivalent_leg(1), _equivalent_leg(2, terminal=True)],
+        [_equivalent_position("pos-1"), _equivalent_position("pos-2")],
+        _closed_2x2_edges(),
+    )
+
+    assert components == ()
+
+
+def test_equivalent_component_rejects_candidate_edge_outside_evidence_population():
+    components = classify_equivalent_attribution_components(
+        [_equivalent_leg(1), _equivalent_leg(2)],
+        [_equivalent_position("pos-1"), _equivalent_position("pos-2")],
+        {*_closed_2x2_edges(), (1, "outside-position")},
+    )
+
+    assert components == ()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"evidence_available": False},
+        {},
+    ],
+)
+def test_equivalent_component_rejects_api_failure_or_missing_fill_evidence(kwargs):
+    legs = [_equivalent_leg(1), _equivalent_leg(2)]
+    if not kwargs:
+        legs[1] = _equivalent_leg(2, has_successful_entry_evidence=False)
+
+    components = classify_equivalent_attribution_components(
+        legs,
+        [_equivalent_position("pos-1"), _equivalent_position("pos-2")],
+        _closed_2x2_edges(),
+        **kwargs,
+    )
+
+    assert components == ()
+
+
+def test_equivalent_component_rejects_authoritative_outside_owner():
+    components = classify_equivalent_attribution_components(
+        [_equivalent_leg(1), _equivalent_leg(2)],
+        [_equivalent_position("pos-1"), _equivalent_position("pos-2")],
+        _closed_2x2_edges(),
+        authoritative_owner_by_position={"pos-1": 99},
+    )
+
+    assert components == ()
+
+
+def test_distinct_direct_protection_filters_edges_to_mutual_unique_components():
+    legs = [
+        _equivalent_leg(1, stop_loss=1820.0, take_profits=(1700.0,)),
+        _equivalent_leg(2, stop_loss=1830.0, take_profits=(1690.0,)),
+    ]
+    positions = [
+        _equivalent_position("pos-1", stop_loss=1820.0, take_profits=(1700.0,)),
+        _equivalent_position("pos-2", stop_loss=1830.0, take_profits=(1690.0,)),
+    ]
+
+    filtered = filter_candidate_edges_by_entry_protection(
+        legs, positions, _closed_2x2_edges()
+    )
+    components = classify_equivalent_attribution_components(
+        legs, positions, _closed_2x2_edges()
+    )
+
+    assert filtered == frozenset({(1, "pos-1"), (2, "pos-2")})
+    assert [(item.leg_ids, item.position_ids) for item in components] == [
+        ((1,), ("pos-1",)),
+        ((2,), ("pos-2",)),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("leg_overrides", "position_overrides"),
+    [
+        ({}, {}),
+        ({"stop_loss": None, "take_profits": ()}, {}),
+        ({}, {"stop_loss": None, "take_profits": ()}),
+    ],
+)
+def test_equal_or_missing_protection_does_not_break_candidate_tie(
+    leg_overrides, position_overrides
+):
+    legs = [
+        _equivalent_leg(1, **leg_overrides),
+        _equivalent_leg(2, **leg_overrides),
+    ]
+    positions = [
+        _equivalent_position("pos-1", **position_overrides),
+        _equivalent_position("pos-2", **position_overrides),
+    ]
+
+    assert filter_candidate_edges_by_entry_protection(
+        legs, positions, _closed_2x2_edges()
+    ) == frozenset(_closed_2x2_edges())
+    if leg_overrides or position_overrides:
+        assert (
+            classify_equivalent_attribution_components(
+                legs, positions, _closed_2x2_edges()
+            )
+            == ()
+        )
+
+
+def test_post_entry_protection_mutation_disables_protection_identity():
+    legs = [
+        _equivalent_leg(
+            1,
+            stop_loss=1820.0,
+            take_profits=(1700.0,),
+            protection_mutated=True,
+        ),
+        _equivalent_leg(
+            2,
+            stop_loss=1830.0,
+            take_profits=(1690.0,),
+            protection_mutated=True,
+        ),
+    ]
+    positions = [
+        _equivalent_position("pos-1", stop_loss=1820.0, take_profits=(1700.0,)),
+        _equivalent_position("pos-2", stop_loss=1830.0, take_profits=(1690.0,)),
+    ]
+
+    assert filter_candidate_edges_by_entry_protection(
+        legs, positions, _closed_2x2_edges()
+    ) == frozenset(_closed_2x2_edges())
+    assert (
+        classify_equivalent_attribution_components(
+            legs, positions, _closed_2x2_edges()
+        )
+        == ()
     )
 
 

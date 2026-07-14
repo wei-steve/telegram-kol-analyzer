@@ -489,8 +489,20 @@ def _apply_reconcile_snapshot(
             legs=legs,
             bindings_by_id=bindings_by_id,
         )
+        mutated_binding_ids = _post_entry_protection_mutated_binding_ids(
+            session, binding_ids=set(bindings_by_id)
+        )
         leg_rows = [
-            _leg_evidence(leg, binding=bindings_by_id[int(leg.execution_binding_id)])
+            _leg_evidence(
+                leg,
+                binding=bindings_by_id[int(leg.execution_binding_id)],
+                has_successful_entry_evidence=_leg_has_successful_fill_evidence(
+                    leg, fill_rows
+                ),
+                protection_mutated=(
+                    int(leg.execution_binding_id) in mutated_binding_ids
+                ),
+            )
             for leg in legs
             if not (leg.pos_id and str(leg.pos_id) in reserved_pos_ids)
         ]
@@ -786,19 +798,31 @@ def _position_evidence(row: dict[str, Any]) -> PositionEvidence | None:
     pos_id = _first_string(row, "posId", "pos_id", "id")
     if not pos_id:
         return None
+    average_price = _to_float(
+        row.get("avgPx") or row.get("avgPrice") or row.get("openAvgPx")
+    )
     return PositionEvidence(
         pos_id=pos_id,
         symbol=str(row.get("instId") or row.get("symbol") or ""),
         side=_normalize_position_side(str(row.get("posSide") or row.get("side") or "")),
         size=_to_float(row.get("pos") if row.get("pos") not in (None, "") else row.get("size")),
-        average_price=_to_float(
-            row.get("avgPx") or row.get("avgPrice") or row.get("openAvgPx")
-        ),
+        average_price=average_price,
         created_at_ms=_to_int(row.get("cTime") or row.get("uTime")),
+        entry_price=average_price,
+        stop_loss=_to_float(row.get("slTriggerPx")),
+        take_profits=_direct_price_tuple(row.get("tpTriggerPx")),
+        margin_mode=_optional_margin_mode(row.get("mgnMode")),
+        position_mode=_optional_position_mode(row.get("mrgPosition")),
     )
 
 
-def _leg_evidence(leg: ExecutionOrderLeg, *, binding: ExecutionBinding) -> LegEvidence:
+def _leg_evidence(
+    leg: ExecutionOrderLeg,
+    *,
+    binding: ExecutionBinding,
+    has_successful_entry_evidence: bool = False,
+    protection_mutated: bool = False,
+) -> LegEvidence:
     direct_pos_id = None
     if (
         str(leg.attribution_status or "") == "verified"
@@ -808,6 +832,7 @@ def _leg_evidence(leg: ExecutionOrderLeg, *, binding: ExecutionBinding) -> LegEv
     response_pos_id = _position_id_from_response_json(leg.response_json)
     if response_pos_id:
         direct_pos_id = response_pos_id
+    signature = _leg_economic_signature(leg, binding=binding)
     return LegEvidence(
         leg_id=int(leg.id),
         binding_id=int(binding.id),
@@ -817,8 +842,17 @@ def _leg_evidence(leg: ExecutionOrderLeg, *, binding: ExecutionBinding) -> LegEv
         order_id=leg.order_id,
         client_order_id=leg.client_order_id,
         pos_id=direct_pos_id,
-        requested_size=_requested_leg_size(leg.request_json),
+        requested_size=signature["requested_size"],
         terminal=str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES,
+        strategy_instance_id=(leg.strategy_instance_id or binding.strategy_instance_id),
+        entry_price=signature["entry_price"],
+        stop_loss=signature["stop_loss"],
+        take_profits=signature["take_profits"],
+        margin_mode=_optional_margin_mode(binding.margin_mode),
+        position_mode=_optional_position_mode(binding.position_mode),
+        order_kind=_optional_string(leg.order_kind),
+        has_successful_entry_evidence=has_successful_entry_evidence,
+        protection_mutated=protection_mutated,
     )
 
 
@@ -879,14 +913,155 @@ def _snapshot_fill_evidence(
     return result
 
 
-def _requested_leg_size(request_json: str | None) -> float | None:
+def _leg_has_successful_fill_evidence(
+    leg: ExecutionOrderLeg, evidence: list[FillEvidence]
+) -> bool:
+    return any(
+        bool(
+            leg.order_id
+            and row.order_id
+            and str(leg.order_id) == str(row.order_id)
+        )
+        or bool(
+            leg.client_order_id
+            and row.client_order_id
+            and str(leg.client_order_id) == str(row.client_order_id)
+        )
+        for row in evidence
+    )
+
+
+def _post_entry_protection_mutated_binding_ids(
+    session, *, binding_ids: set[int]
+) -> set[int]:
+    if not binding_ids:
+        return set()
+    rows = (
+        session.query(
+            ExecutionEvent.execution_binding_id,
+            ExecutionEvent.action,
+            ExecutionEvent.reason,
+        )
+        .filter(ExecutionEvent.execution_binding_id.in_(binding_ids))
+        .filter(
+            ExecutionEvent.action.in_(
+                {
+                    "adjust_position_tpsl",
+                    "cancel_position_tpsl",
+                    "set_position_tpsl",
+                }
+            )
+        )
+        .all()
+    )
+    return {
+        int(binding_id)
+        for binding_id, action, reason in rows
+        if binding_id is not None
+        and not (action == "set_position_tpsl" and reason == "entry_protection")
+    }
+
+
+def _leg_economic_signature(
+    leg: ExecutionOrderLeg, *, binding: ExecutionBinding
+) -> dict[str, Any]:
+    request = _safe_json_object(leg.request_json)
+    binding_payload = _safe_json_object(binding.payload_json)
+    draft = binding_payload.get("draft")
+    if not isinstance(draft, dict):
+        draft = binding_payload
+    draft_leg = next(
+        (
+            row
+            for row in draft.get("order_legs", [])
+            if isinstance(row, dict)
+            and _plain_int(row.get("leg_index")) == int(leg.leg_index)
+        ),
+        {},
+    )
+    requested_size = _to_float(
+        request.get("sz")
+        or request.get("size")
+        or request.get("quantity")
+        or draft_leg.get("quantity")
+        or draft_leg.get("sz")
+    )
+    entry_price = _to_float(
+        request.get("px")
+        or request.get("price")
+        or request.get("triggerPx")
+        or draft_leg.get("price")
+    )
+    stop_loss = _to_float(
+        request.get("slTriggerPx")
+        or request.get("stop_loss")
+        or draft.get("stop_loss")
+    )
+    take_profits = _direct_price_tuple(
+        request.get("tpTriggerPx") or request.get("take_profits")
+    )
+    if not take_profits:
+        take_profits = tuple(
+            price
+            for row in draft.get("take_profit_legs", [])
+            if isinstance(row, dict)
+            for price in [_to_float(row.get("price"))]
+            if price is not None
+        )
+    return {
+        "requested_size": requested_size,
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "take_profits": take_profits,
+    }
+
+
+def _safe_json_object(value: str | None) -> dict[str, Any]:
     try:
-        payload = json.loads(request_json or "{}")
+        payload = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _plain_int(value: Any) -> int | None:
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
-    if not isinstance(payload, dict):
+
+
+def _direct_price_tuple(value: Any) -> tuple[float, ...]:
+    values = value if isinstance(value, (list, tuple)) else [value]
+    result = tuple(price for item in values if (price := _to_float(item)) is not None)
+    return result
+
+
+def _optional_string(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    return text or None
+
+
+def _optional_margin_mode(value: Any) -> str | None:
+    text = _optional_string(value)
+    if text is None:
         return None
-    return _to_float(payload.get("sz") or payload.get("size") or payload.get("quantity"))
+    if text in {"cross", "crossed", "full", "全仓"}:
+        return "cross"
+    if text in {"isolated", "fixed", "逐仓"}:
+        return "isolated"
+    return None
+
+
+def _optional_position_mode(value: Any) -> str | None:
+    text = _optional_string(value)
+    if text is None:
+        return None
+    if text in {"split", "hedge", "long_short", "分仓"}:
+        return "split"
+    if text in {"net", "merged", "one_way", "合仓"}:
+        return "net"
+    return None
 
 
 def _position_id_from_response_json(response_json: str | None) -> str | None:

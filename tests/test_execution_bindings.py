@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import datetime
 
@@ -8,6 +9,9 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
     ExecutionBindingRecord,
     ExecutionOrderLegRecord,
+    _leg_evidence,
+    _position_evidence,
+    _post_entry_protection_mutated_binding_ids,
     build_client_order_id,
     build_deepcoin_account_state,
     build_strategy_instance_id,
@@ -105,6 +109,123 @@ def test_database_bootstrap_creates_execution_bindings_table(tmp_path):
     assert "payload_json" in columns
     assert "recovered_at" in columns
     assert "status" in columns
+
+
+def test_position_evidence_uses_only_direct_normalized_position_fields():
+    evidence = _position_evidence(
+        {
+            "posId": "pos-1",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "short",
+            "pos": "1.5",
+            "avgPx": "1770.0000001",
+            "slTriggerPx": "1820",
+            "tpTriggerPx": "1700",
+            "mgnMode": "cross",
+            "mrgPosition": "split",
+            "draft": {"stop_loss": 9999, "take_profit": 1},
+        }
+    )
+
+    assert evidence is not None
+    assert evidence.entry_price == 1770.0000001
+    assert evidence.stop_loss == 1820.0
+    assert evidence.take_profits == (1700.0,)
+    assert evidence.margin_mode == "cross"
+    assert evidence.position_mode == "split"
+
+
+def test_leg_evidence_normalizes_request_draft_binding_modes_and_fill_state():
+    binding = ExecutionBinding(
+        id=7,
+        strategy_instance_id="strategy-7",
+        kol_id="alice",
+        chat_id=100,
+        message_id=55,
+        symbol="ETH",
+        side="short",
+        venue="deepcoin",
+        margin_mode="cross",
+        position_mode="split",
+        payload_json=json.dumps(
+            {
+                "draft": {
+                    "order_legs": [
+                        {"leg_index": 2, "price": 1770.0, "quantity": 1.5}
+                    ],
+                    "stop_loss": 1820.0,
+                    "take_profit_legs": [{"price": 1700.0}, {"price": 1650.0}],
+                }
+            }
+        ),
+        status="open",
+    )
+    leg = ExecutionOrderLeg(
+        id=9,
+        execution_binding_id=7,
+        strategy_instance_id=None,
+        leg_index=2,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="order-9",
+        client_order_id="client-9",
+        venue="deepcoin",
+        status="open",
+        request_json=json.dumps({"instId": "ETH-USDT-SWAP", "sz": "1.5"}),
+    )
+
+    evidence = _leg_evidence(
+        leg,
+        binding=binding,
+        has_successful_entry_evidence=True,
+        protection_mutated=False,
+    )
+
+    assert evidence.strategy_instance_id == "strategy-7"
+    assert evidence.requested_size == 1.5
+    assert evidence.entry_price == 1770.0
+    assert evidence.stop_loss == 1820.0
+    assert evidence.take_profits == (1700.0, 1650.0)
+    assert evidence.margin_mode == "cross"
+    assert evidence.position_mode == "split"
+    assert evidence.order_kind == "trigger_limit"
+    assert evidence.has_successful_entry_evidence is True
+    assert evidence.protection_mutated is False
+
+
+def test_recorded_post_entry_protection_mutation_is_loaded_but_initial_setup_is_not(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(session_factory, _binding(symbol="ETH"))
+    initial_only_binding_id = upsert_execution_binding(
+        session_factory, _binding(symbol="ETH", message_id=56)
+    )
+    with session_factory() as session:
+        session.add_all(
+            [
+                ExecutionEvent(
+                    execution_binding_id=initial_only_binding_id,
+                    venue="deepcoin",
+                    action="set_position_tpsl",
+                    reason="entry_protection",
+                    status="submitted",
+                ),
+                ExecutionEvent(
+                    execution_binding_id=binding_id,
+                    venue="deepcoin",
+                    action="adjust_position_tpsl",
+                    reason="adjust_stop_loss",
+                    status="submitted",
+                ),
+            ]
+        )
+        session.commit()
+        mutated = _post_entry_protection_mutated_binding_ids(
+            session, binding_ids={binding_id, initial_only_binding_id}
+        )
+
+    assert mutated == {binding_id}
 
 
 def test_legacy_duplicate_position_owners_do_not_block_repair_bootstrap(tmp_path):

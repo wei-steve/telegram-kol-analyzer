@@ -6,7 +6,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 import json
 from math import inf, isclose
-from typing import Iterable
+from typing import Iterable, Mapping
 
 
 DIRECT_POS_ID = 0
@@ -15,6 +15,8 @@ EXACT_CLIENT_ORDER_ID = 2
 UNIQUE_TRIGGER_FILL = 3
 MAX_TRIGGER_POSITION_LINK_TIME_DISTANCE_MS = 5_000
 ATTRIBUTION_POLICY_VERSION = 2
+ECONOMIC_REL_TOLERANCE = 1e-6
+ECONOMIC_ABS_TOLERANCE = 1e-8
 
 TERMINAL_ENTRY_LEG_STATES = frozenset(
     {
@@ -49,6 +51,15 @@ class LegEvidence:
     pos_id: str | None
     requested_size: float | None
     terminal: bool
+    strategy_instance_id: str | None = None
+    entry_price: float | None = None
+    stop_loss: float | None = None
+    take_profits: tuple[float, ...] = ()
+    margin_mode: str | None = None
+    position_mode: str | None = None
+    order_kind: str | None = None
+    has_successful_entry_evidence: bool = False
+    protection_mutated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +70,12 @@ class PositionEvidence:
     size: float | None
     average_price: float | None
     created_at_ms: int | None
+    entry_price: float | None = None
+    stop_loss: float | None = None
+    take_profits: tuple[float, ...] = ()
+    margin_mode: str | None = None
+    position_mode: str | None = None
+    order_kind: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +105,14 @@ class AttributionResult:
     evidence_by_leg: dict[int, dict[str, object]] = field(default_factory=dict)
     conflicts: list[dict[str, object]] = field(default_factory=list)
     unassigned_position_ids: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True, slots=True)
+class EquivalentAttributionComponent:
+    """A closed equivalent candidate population, never an ownership assignment."""
+
+    leg_ids: tuple[int, ...]
+    position_ids: tuple[str, ...]
 
 
 class PositionAttributionError(RuntimeError):
@@ -310,6 +335,224 @@ def match_entry_legs_to_positions(
         conflicts=conflicts,
         unassigned_position_ids={position.pos_id for position in position_rows}
         - assigned_position_ids,
+    )
+
+
+def classify_equivalent_attribution_components(
+    legs: Iterable[LegEvidence],
+    positions: Iterable[PositionEvidence],
+    candidate_edges: Iterable[tuple[int, str]],
+    *,
+    authoritative_owner_by_position: Mapping[str, int] | None = None,
+    evidence_available: bool = True,
+) -> tuple[EquivalentAttributionComponent, ...]:
+    """Classify closed equivalent components without assigning their members."""
+
+    if not evidence_available:
+        return ()
+    legs_by_id = {leg.leg_id: leg for leg in legs}
+    positions_by_id = {position.pos_id: position for position in positions}
+    edge_rows = {(int(leg_id), str(pos_id)) for leg_id, pos_id in candidate_edges}
+    if not edge_rows:
+        return ()
+
+    known_edges = {
+        edge
+        for edge in edge_rows
+        if edge[0] in legs_by_id and edge[1] in positions_by_id
+    }
+    if len(known_edges) != len(edge_rows):
+        return ()
+    known_edges = set(
+        filter_candidate_edges_by_entry_protection(
+            legs_by_id.values(), positions_by_id.values(), known_edges
+        )
+    )
+    if not known_edges:
+        return ()
+
+    adjacency: dict[tuple[str, object], set[tuple[str, object]]] = defaultdict(set)
+    for leg_id, pos_id in known_edges:
+        leg_node = ("leg", leg_id)
+        position_node = ("position", pos_id)
+        adjacency[leg_node].add(position_node)
+        adjacency[position_node].add(leg_node)
+
+    owners = {
+        str(pos_id): int(leg_id)
+        for pos_id, leg_id in (authoritative_owner_by_position or {}).items()
+    }
+    result: list[EquivalentAttributionComponent] = []
+    seen: set[tuple[str, object]] = set()
+    for start in sorted(adjacency, key=lambda item: (item[0], str(item[1]))):
+        if start in seen:
+            continue
+        queue = deque([start])
+        component_leg_ids: set[int] = set()
+        component_position_ids: set[str] = set()
+        while queue:
+            node = queue.popleft()
+            if node in seen:
+                continue
+            seen.add(node)
+            if node[0] == "leg":
+                component_leg_ids.add(int(node[1]))
+            else:
+                component_position_ids.add(str(node[1]))
+            queue.extend(adjacency[node] - seen)
+
+        component_legs = [legs_by_id[leg_id] for leg_id in component_leg_ids]
+        component_positions = [
+            positions_by_id[pos_id] for pos_id in component_position_ids
+        ]
+        if len(component_legs) != len(component_positions):
+            continue
+        if len({leg.binding_id for leg in component_legs}) != 1:
+            continue
+        strategy_ids = {leg.strategy_instance_id for leg in component_legs}
+        if None in strategy_ids or len(strategy_ids) != 1:
+            continue
+        if any(
+            leg.terminal or not leg.has_successful_entry_evidence
+            for leg in component_legs
+        ):
+            continue
+        if any(
+            owners.get(position.pos_id) is not None
+            and owners[position.pos_id] not in component_leg_ids
+            for position in component_positions
+        ):
+            continue
+        if not _equivalent_economic_population(component_legs, component_positions):
+            continue
+        result.append(
+            EquivalentAttributionComponent(
+                leg_ids=tuple(sorted(component_leg_ids)),
+                position_ids=tuple(sorted(component_position_ids)),
+            )
+        )
+    return tuple(sorted(result, key=lambda item: (item.leg_ids, item.position_ids)))
+
+
+def filter_candidate_edges_by_entry_protection(
+    legs: Iterable[LegEvidence],
+    positions: Iterable[PositionEvidence],
+    candidate_edges: Iterable[tuple[int, str]],
+) -> frozenset[tuple[int, str]]:
+    """Use immutable direct TP/SL only to remove incompatible candidate edges."""
+
+    legs_by_id = {leg.leg_id: leg for leg in legs}
+    positions_by_id = {position.pos_id: position for position in positions}
+    result: set[tuple[int, str]] = set()
+    for leg_id, pos_id in candidate_edges:
+        edge = (int(leg_id), str(pos_id))
+        leg = legs_by_id.get(edge[0])
+        position = positions_by_id.get(edge[1])
+        if leg is None or position is None:
+            result.add(edge)
+            continue
+        if leg.protection_mutated or _entry_protection_compatible(leg, position):
+            result.add(edge)
+    return frozenset(result)
+
+
+def _entry_protection_compatible(
+    leg: LegEvidence, position: PositionEvidence
+) -> bool:
+    if (
+        leg.stop_loss is not None
+        and position.stop_loss is not None
+        and not _numbers_equivalent(leg.stop_loss, position.stop_loss)
+    ):
+        return False
+    if (
+        leg.take_profits
+        and position.take_profits
+        and not _number_tuples_equivalent(leg.take_profits, position.take_profits)
+    ):
+        return False
+    return True
+
+
+def _equivalent_economic_population(
+    legs: list[LegEvidence], positions: list[PositionEvidence]
+) -> bool:
+    if not legs or not positions:
+        return False
+    first_leg = legs[0]
+    if any(not _leg_signatures_equivalent(first_leg, leg) for leg in legs[1:]):
+        return False
+    return all(
+        _leg_position_signatures_equivalent(first_leg, position)
+        for position in positions
+    )
+
+
+def _leg_signatures_equivalent(left: LegEvidence, right: LegEvidence) -> bool:
+    return bool(
+        left.venue.lower() == right.venue.lower()
+        and _normalize_instrument(left.symbol) == _normalize_instrument(right.symbol)
+        and _normalize_side(left.side) == _normalize_side(right.side)
+        and _numbers_equivalent(left.requested_size, right.requested_size)
+        and _numbers_equivalent(left.entry_price, right.entry_price)
+        and _numbers_equivalent(left.stop_loss, right.stop_loss)
+        and _number_tuples_equivalent(left.take_profits, right.take_profits)
+        and left.margin_mode == right.margin_mode
+        and left.position_mode == right.position_mode
+        and left.order_kind == right.order_kind
+    )
+
+
+def _leg_position_signatures_equivalent(
+    leg: LegEvidence, position: PositionEvidence
+) -> bool:
+    required_values = (
+        leg.requested_size,
+        leg.entry_price,
+        leg.stop_loss,
+        position.size,
+        position.entry_price,
+        position.stop_loss,
+        leg.margin_mode,
+        leg.position_mode,
+        position.margin_mode,
+        position.position_mode,
+    )
+    if any(value is None for value in required_values):
+        return False
+    if not leg.take_profits or not position.take_profits:
+        return False
+    return bool(
+        _normalize_instrument(leg.symbol) == _normalize_instrument(position.symbol)
+        and _normalize_side(leg.side) == _normalize_side(position.side)
+        and _numbers_equivalent(leg.requested_size, position.size)
+        and _numbers_equivalent(leg.entry_price, position.entry_price)
+        and _numbers_equivalent(leg.stop_loss, position.stop_loss)
+        and _number_tuples_equivalent(leg.take_profits, position.take_profits)
+        and leg.margin_mode == position.margin_mode
+        and leg.position_mode == position.position_mode
+    )
+
+
+def _numbers_equivalent(left: float | None, right: float | None) -> bool:
+    if left is None or right is None:
+        return left is right
+    return isclose(
+        float(left),
+        float(right),
+        rel_tol=ECONOMIC_REL_TOLERANCE,
+        abs_tol=ECONOMIC_ABS_TOLERANCE,
+    )
+
+
+def _number_tuples_equivalent(
+    left: tuple[float, ...], right: tuple[float, ...]
+) -> bool:
+    if len(left) != len(right):
+        return False
+    return all(
+        _numbers_equivalent(left_value, right_value)
+        for left_value, right_value in zip(sorted(left), sorted(right), strict=True)
     )
 
 
