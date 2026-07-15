@@ -135,6 +135,22 @@ def plan_historical_attribution_cleanup(
                 )
             )
             continue
+        pending_order_ids = _matching_pending_order_ids(
+            component,
+            bindings_by_id=bindings_by_id,
+            pending_rows=[*snapshot.open_orders, *snapshot.pending_trigger_orders],
+        )
+        if pending_order_ids:
+            conflicts.append(
+                _conflict(
+                    "historical_pending_order_active",
+                    component,
+                    component_lifecycles,
+                    pos_ids=(pos_id,),
+                    evidence={"pending_order_ids": sorted(pending_order_ids)},
+                )
+            )
+            continue
 
         terminal_evidence = {
             binding_id: terminal_evidence_for_binding(
@@ -383,6 +399,34 @@ def exchange_active_position_ids(snapshot) -> set[str]:
         if pos_id:
             result.add(pos_id)
     return result
+
+
+def _matching_pending_order_ids(
+    component,
+    *,
+    bindings_by_id: dict[int, Any],
+    pending_rows,
+) -> set[str]:
+    component_order_ids = _entry_order_ids(component)
+    for leg in component:
+        binding = bindings_by_id.get(int(leg.execution_binding_id))
+        if binding is None:
+            continue
+        for raw in (binding.order_id, binding.client_order_id):
+            if value := _string(raw):
+                component_order_ids.add(value)
+    matched: set[str] = set()
+    for row in pending_rows:
+        row_ids = _row_strings(
+            row,
+            "ordId",
+            "orderId",
+            "clOrdId",
+            "clientOrderId",
+            "algoId",
+        )
+        matched.update(component_order_ids & row_ids)
+    return matched
 
 
 def _terminal_leg_state(evidence: dict[str, object]) -> str:

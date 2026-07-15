@@ -184,6 +184,33 @@ def test_live_or_pending_exchange_identity_blocks_historical_cleanup(
     assert decision.conflicts[0].reason == "historical_position_still_exchange_active"
 
 
+@pytest.mark.parametrize("snapshot_field", ["open_orders", "pending_trigger_orders"])
+def test_pending_order_identity_without_pos_id_blocks_historical_cleanup(
+    snapshot_field,
+):
+    decision = _decision(
+        bindings=[_binding(row_id=10)],
+        legs=[_leg(row_id=1, binding_id=10, pos_id="p1", order_id="entry-1")],
+        lifecycles=[
+            _lifecycle(row_id=100, binding_id=10, status="exited", exit_reason="manual")
+        ],
+        snapshot=_snapshot(
+            **{
+                snapshot_field: [
+                    {
+                        "ordId": "entry-1",
+                        "state": "live",
+                        "triggerOrderType": "NORMAL",
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert decision.actions == ()
+    assert decision.conflicts[0].reason == "historical_pending_order_active"
+
+
 def test_entered_lifecycle_without_exact_terminal_evidence_is_unresolved():
     decision = _decision(
         bindings=[_binding(row_id=96)],
