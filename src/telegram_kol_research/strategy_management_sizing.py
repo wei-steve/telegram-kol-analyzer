@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from typing import Iterable
 
 
@@ -61,31 +61,38 @@ def allocate_close_sizes(
     target_steps = (aggregate_target / step).to_integral_value(
         rounding=ROUND_FLOOR
     )
-    if target_steps <= 0 or target_steps * step < minimum * len(current):
+    minimum_steps = (minimum / step).to_integral_value(rounding=ROUND_CEILING)
+    capacity_steps = tuple(
+        (value / step).to_integral_value(rounding=ROUND_FLOOR)
+        for value in current
+    )
+    if (
+        target_steps <= 0
+        or target_steps < minimum_steps * len(current)
+        or any(capacity < minimum_steps for capacity in capacity_steps)
+    ):
         raise ManagementSizingError("aggregate_target_below_minimum")
 
     ideal_step_counts = [value * close_fraction / step for value in current]
-    planned_steps = [
-        value.to_integral_value(rounding=ROUND_FLOOR)
-        for value in ideal_step_counts
-    ]
+    planned_steps = [minimum_steps for _ in current]
     remaining_steps = int(target_steps - sum(planned_steps, Decimal("0")))
-    ranked_indexes = sorted(
-        range(len(current)),
-        key=lambda index: (
-            -(ideal_step_counts[index] - planned_steps[index]),
-            index,
-        ),
-    )
-    for index in ranked_indexes:
-        if remaining_steps == 0:
-            break
-        proposed = (planned_steps[index] + 1) * step
-        if proposed <= current[index]:
-            planned_steps[index] += 1
-            remaining_steps -= 1
-    if remaining_steps:
-        raise ManagementSizingError("aggregate_target_not_allocatable")
+    while remaining_steps:
+        eligible = [
+            index
+            for index, capacity in enumerate(capacity_steps)
+            if planned_steps[index] < capacity
+        ]
+        if not eligible:
+            raise ManagementSizingError("aggregate_target_not_allocatable")
+        index = max(
+            eligible,
+            key=lambda candidate: (
+                ideal_step_counts[candidate] - planned_steps[candidate],
+                -candidate,
+            ),
+        )
+        planned_steps[index] += 1
+        remaining_steps -= 1
 
     planned = tuple(step_count * step for step_count in planned_steps)
     if (

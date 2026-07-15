@@ -72,13 +72,22 @@ def test_allocate_close_sizes_never_over_closes_a_position():
     assert all(Decimal(close) <= Decimal(size) for close, size in zip(planned, ("1", "9")))
 
 
-def test_allocate_close_sizes_fails_whole_batch_when_each_position_cannot_participate():
+def test_allocate_close_sizes_reserves_minimum_for_every_participating_position():
+    assert _sizing().allocate_close_sizes(
+        ("1", "1", "8"),
+        fraction=Decimal("0.5"),
+        quantity_step="1",
+        min_quantity="1",
+    ) == ("1", "1", "3")
+
+
+def test_allocate_close_sizes_fails_when_one_position_cannot_meet_its_minimum():
     sizing = _sizing()
 
     with pytest.raises(sizing.ManagementSizingError):
         sizing.allocate_close_sizes(
-            ("1", "1", "8"),
+            ("0.5", "9.5"),
             fraction=Decimal("0.5"),
-            quantity_step="1",
+            quantity_step="0.5",
             min_quantity="1",
         )
