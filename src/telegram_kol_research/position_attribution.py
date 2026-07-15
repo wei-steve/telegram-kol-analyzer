@@ -287,6 +287,14 @@ def _validated_equivalent_assignment_populations(
         ]
     except (TypeError, ValueError, OverflowError):
         return None
+    binding_ids = {item.binding_id for item in legs}
+    strategy_instance_ids = {item.strategy_instance_id for item in legs}
+    if len(binding_ids) != 1 or len(strategy_instance_ids) != 1:
+        return None
+    if signature["binding_id"] != next(iter(binding_ids)):
+        return None
+    if signature["strategy_instance_id"] != next(iter(strategy_instance_ids)):
+        return None
     if not _equivalent_economic_population(legs, positions):
         return None
     if signature != _equivalence_signature(legs, positions):

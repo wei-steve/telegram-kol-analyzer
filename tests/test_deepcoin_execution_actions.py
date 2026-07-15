@@ -507,6 +507,60 @@ def test_reviewed_equivalent_assignment_rejects_stale_other_component_leg(tmp_pa
     assert client.order_payloads == []
 
 
+@pytest.mark.parametrize("drift", ["binding", "strategy"])
+def test_reviewed_equivalent_assignment_rejects_coordinated_cross_owner_component(
+    tmp_path, drift
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    _persist_reviewed_equivalent_assignments(session_factory)
+    with session_factory() as session:
+        legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.id).all()
+        evidence = json.loads(legs[0].attribution_evidence_json)
+        if drift == "binding":
+            other_binding = ExecutionBinding(
+                kol_id="other-owner",
+                chat_id=200,
+                message_id=99,
+                symbol="ETH",
+                side="long",
+                status="active",
+                strategy_instance_id="deepcoin:100:55:ETH:long",
+            )
+            session.add(other_binding)
+            session.flush()
+            legs[1].execution_binding_id = other_binding.id
+            evidence["equivalence_signature"]["leg_population"][1][
+                "binding_id"
+            ] = other_binding.id
+        else:
+            legs[1].strategy_instance_id = "deepcoin:other:ETH:long"
+            evidence["equivalence_signature"]["leg_population"][1][
+                "strategy_instance_id"
+            ] = "deepcoin:other:ETH:long"
+        for leg in legs:
+            leg.attribution_evidence_json = json.dumps(evidence)
+        session.commit()
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="position_ownership_evidence_not_authoritative",
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+        )
+
+    assert client.order_payloads == []
+
+
 def test_adjust_stop_loss_cancels_existing_position_tpsl_before_resetting(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = _binding(session_factory)
