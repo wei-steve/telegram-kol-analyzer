@@ -190,6 +190,34 @@ def test_partial_position_history_is_not_terminal_evidence():
     assert decision.conflicts[0].reason == "historical_terminal_evidence_missing"
 
 
+def test_persisted_position_partial_history_blocks_order_id_fallback():
+    decision = _decision(
+        bindings=[_binding(row_id=10)],
+        legs=[
+            _leg(
+                row_id=1,
+                binding_id=10,
+                pos_id="persisted-position",
+                order_id="different-order-position",
+                status="active",
+            )
+        ],
+        lifecycles=[_lifecycle(row_id=100, binding_id=10, status="entered")],
+        snapshot=_snapshot(
+            position_history=[
+                _position_history_row(
+                    posId="persisted-position",
+                    closePos="3",
+                ),
+                _position_history_row(posId="different-order-position"),
+            ]
+        ),
+    )
+
+    assert decision.actions == ()
+    assert decision.conflicts[0].reason == "historical_terminal_evidence_missing"
+
+
 @pytest.mark.parametrize("original", ["0", "0.0", "not-a-number", None])
 def test_zero_or_malformed_original_position_is_not_terminal_evidence(original):
     decision = _decision(

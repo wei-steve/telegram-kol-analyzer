@@ -415,6 +415,7 @@ def terminal_evidence_for_leg(
     expected_side = _string(getattr(binding, "side", None))
     if expected_instrument is None or expected_side is None:
         return None
+    persisted_pos_id = _string(leg.pos_id)
     for candidate in candidates:
         candidate_rows = [
             row
@@ -437,6 +438,11 @@ def terminal_evidence_for_leg(
             is not None
         ]
         if not fully_closed:
+            if (
+                not persisted_position_is_redundant
+                and candidate == persisted_pos_id
+            ):
+                return None
             continue
         stable_rows = {
             json.dumps(

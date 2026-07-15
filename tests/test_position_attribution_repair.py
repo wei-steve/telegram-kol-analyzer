@@ -503,6 +503,43 @@ def test_repair_plan_rejects_position_history_row_for_different_requested_id(
     ]
 
 
+@pytest.mark.parametrize(
+    "invalid_payload",
+    [
+        {"data": "not-a-list"},
+        [_closed_position_history_row("actual-order-pos"), "not-a-row"],
+    ],
+    ids=["non-list", "non-dict-row"],
+)
+def test_repair_plan_rejects_invalid_position_history_response_schema(
+    tmp_path, invalid_payload
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_history_candidates(session_factory)
+    client = _HistoricalCleanupClient()
+    client.position_history[("BTC-USDT-SWAP", "actual-order-pos")] = (
+        invalid_payload
+    )
+
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 12, 0, tzinfo=UTC),
+    )
+
+    assert plan.actions == ()
+    assert plan.historical_actions == ()
+    assert plan.unresolved_conflicts == [
+        {
+            "evidence_source_errors": {
+                "position_history:BTC-USDT-SWAP:actual-order-pos": (
+                    "invalid list response schema"
+                )
+            }
+        }
+    ]
+
+
 def test_exact_history_changes_exchange_and_plan_fingerprints(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_exact_history_candidates(session_factory)
@@ -1372,6 +1409,56 @@ def test_historical_cleanup_apply_commits_clear_then_terminalize_chain(tmp_path)
         "active",
     ]
     assert [audit.new_state for audit in audits] == ["unassigned", "closed"]
+
+
+def test_historical_cleanup_apply_rejects_terminalize_before_clear_atomically(
+    tmp_path,
+):
+    session_factory = _seed_historical_duplicate_fixture(tmp_path)
+    with session_factory() as session:
+        redundant_leg = session.get(ExecutionOrderLeg, 2)
+        redundant_leg.status = "active"
+        session.commit()
+    client = _historical_duplicate_client()
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+    historical_actions = list(plan.historical_actions)
+    clear_index = next(
+        index
+        for index, action in enumerate(historical_actions)
+        if action.leg_id == 2
+        and action.action == "clear_redundant_historical_position"
+    )
+    terminalize_index = next(
+        index
+        for index, action in enumerate(historical_actions)
+        if action.leg_id == 2
+        and action.action == "terminalize_historical_entry_leg"
+    )
+    historical_actions[clear_index], historical_actions[terminalize_index] = (
+        historical_actions[terminalize_index],
+        historical_actions[clear_index],
+    )
+    reordered_plan = replace(
+        plan,
+        historical_actions=tuple(historical_actions),
+    )
+    before = _historical_fixture_state(session_factory)
+
+    with pytest.raises(PositionAttributionRepairError, match="stale repair plan"):
+        apply_position_attribution_repair_plan(
+            session_factory,
+            reordered_plan,
+            deepcoin_client=client,
+            expected_fingerprint=reordered_plan.fingerprint,
+        )
+
+    assert _historical_fixture_state(session_factory) == before
+    with session_factory() as session:
+        assert session.query(PositionAttributionAudit).count() == 0
 
 
 def test_historical_cleanup_apply_rejects_unplanned_terminalize_pos_drift(tmp_path):

@@ -907,10 +907,17 @@ def _apply_historical_cleanup_action(
         if leg is None:
             raise PositionAttributionRepairError("stale repair plan: leg missing")
         planned_clear = planned_clears_by_leg.get(action.leg_id)
-        follows_matching_clear = (
+        clear_precedes_terminalize = (
             planned_clear is not None
             and plan.historical_actions.index(planned_clear)
             < plan.historical_actions.index(action)
+        )
+        if planned_clear is not None and not clear_precedes_terminalize:
+            raise PositionAttributionRepairError(
+                "stale repair plan: historical action dependency changed"
+            )
+        follows_matching_clear = (
+            clear_precedes_terminalize
             and planned_clear.old_pos_id == action.old_pos_id
             and leg.pos_id == planned_clear.new_pos_id
         )
