@@ -655,7 +655,7 @@ def repair_position_attribution(
     )
     if not apply:
         return
-    if plan.actions and not expected_fingerprint:
+    if plan.has_actions and not expected_fingerprint:
         typer.echo(
             "Refusing apply: --expected-fingerprint is required for a nonempty plan.",
             err=True,

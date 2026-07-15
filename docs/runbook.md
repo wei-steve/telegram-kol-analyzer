@@ -261,6 +261,45 @@ operation. Never reuse a saved plan after a manual exchange action. Never edit
 the production database directly or bypass the planner/fingerprint checks to
 force an attribution, terminal state, manual state, or stale-record cleanup.
 
+The dry-run JSON separates current attribution repairs in `actions` from
+evidence-backed legacy cleanup in `historical_actions`. Historical cleanup may
+clear a redundant old `pos_id`, terminalize an entry leg, close its exact
+binding, exit its execution-backed lifecycle, or install the partial unique
+ownership index. Review every old/new value and its terminal evidence. Confirm
+that none of `live_position_ids` appears in `historical_actions` and that no
+pending regular, trigger, or position-linked TPSL order is being treated as
+history.
+
+`unresolved_conflicts` is an apply blocker. A missing live position is not
+terminal evidence; an `entered` lifecycle remains unchanged unless an exact
+completed close reservation, successful close event, terminal lifecycle, or
+matching exchange cancellation proves the transition. Research-only
+lifecycles without an execution binding are outside this repair workflow.
+
+A nonempty plan of either action type requires the exact
+`--expected-fingerprint` from the reviewed dry run. Zero actions authorizes no
+database mutation. After an approved apply, verify that no duplicate ownership
+groups remain and that the database constraint exists:
+
+```bash
+sqlite3 -readonly data/research.db <<'SQL'
+SELECT venue, pos_id, COUNT(*) AS owner_count
+FROM execution_order_legs
+WHERE pos_id IS NOT NULL AND pos_id != ''
+GROUP BY venue, pos_id
+HAVING COUNT(*) > 1;
+
+SELECT name, sql
+FROM sqlite_master
+WHERE type = 'index'
+  AND name = 'uq_execution_order_legs_venue_pos';
+SQL
+```
+
+The first query must return no rows and the second must return exactly the
+partial unique index. Also recheck live positions, Web holding counts, service
+health, and the global automatic-trading switch independently.
+
 The operator manually closed the two unattributed positions suspected to belong
 to Miya on 2026-07-15, before this change was pushed or deployed. Therefore all
 older Miya repair output and fingerprints are void. After deployment:

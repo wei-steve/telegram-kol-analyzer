@@ -106,6 +106,22 @@ The command is a read-only dry run unless `--apply` is supplied. Review every
 old/new position owner, terminal leg transition, evidence summary, and
 unresolved conflict. It never submits an exchange order or cancellation.
 
+Dry-run output includes `historical_actions`. Before approving any of them:
+
+- confirm no current `live_position_ids` appears in a historical action;
+- verify the exact lifecycle, execution event, close reservation, or exchange
+  cancellation used as terminal evidence;
+- confirm pending regular, trigger, and position-linked TPSL orders are absent
+  from the cleanup component;
+- review every affected leg, binding, and lifecycle old/new state;
+- treat every `unresolved_conflicts` row as an apply blocker; and
+- keep the global automatic-trading switch false.
+
+If the plan contains `install_position_ownership_unique_index`, it must be the
+last historical action and every planned redundant ownership clear must be
+reviewed first. Index creation and all cleanup actions share one transaction;
+an index or audit failure rolls the transaction back.
+
 Only after the dry-run output matches the current Deepcoin positions and order
 history, apply the exact freshly rebuilt plan:
 
@@ -124,6 +140,13 @@ dry run again and repeat read-only reconciliation. Verify live positions,
 entry-leg ownership, group labels, pending orders, and TPSL independently.
 Re-enable automatic management only when every live position has one verified
 entry leg and no attribution incident remains pending.
+
+For historical cleanup, additionally require zero rows from the duplicate
+`(venue, pos_id)` query and verify that
+`uq_execution_order_legs_venue_pos` exists in `sqlite_master`. Do not apply a
+nonzero historical plan as part of deployment review; deployment stops after a
+fresh dry run until the operator separately approves the exact actions and
+fingerprint.
 
 ## Data And Secrets
 
