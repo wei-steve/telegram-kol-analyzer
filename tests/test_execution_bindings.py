@@ -221,7 +221,7 @@ def test_successful_fill_does_not_cross_match_duplicate_client_id_when_order_dif
         )
     ]
 
-    assert _leg_has_successful_fill_evidence(leg, evidence) is False
+    assert _leg_has_successful_fill_evidence(leg, evidence, legs=[leg]) is False
 
 
 def test_successful_fill_requires_at_least_one_shared_identifier():
@@ -250,7 +250,129 @@ def test_successful_fill_requires_at_least_one_shared_identifier():
         )
     ]
 
-    assert _leg_has_successful_fill_evidence(leg, evidence) is False
+    assert _leg_has_successful_fill_evidence(leg, evidence, legs=[leg]) is False
+
+
+@pytest.mark.parametrize("identifier_kind", ["client", "order"])
+def test_successful_fill_rejects_identifier_shared_by_multiple_legs(identifier_kind):
+    shared_order_id = "duplicate-order" if identifier_kind == "order" else None
+    shared_client_id = "duplicate-client" if identifier_kind == "client" else None
+    legs = [
+        ExecutionOrderLeg(
+            id=leg_id,
+            execution_binding_id=7,
+            leg_index=leg_id,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id=shared_order_id,
+            client_order_id=shared_client_id,
+            venue="deepcoin",
+            status="open",
+        )
+        for leg_id in (1, 2)
+    ]
+    evidence = [
+        FillEvidence(
+            source="regular_order",
+            order_id=shared_order_id,
+            client_order_id=shared_client_id,
+            pos_id=None,
+            symbol="ETH-USDT-SWAP",
+            side="short",
+            size=1.5,
+            price=1770.0,
+            created_at_ms=10_000,
+        )
+    ]
+
+    assert all(
+        not _leg_has_successful_fill_evidence(leg, evidence, legs=legs)
+        for leg in legs
+    )
+
+
+def test_successful_fill_accepts_unique_identifier_within_current_legs():
+    unique_leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=7,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id=None,
+        client_order_id="unique-client",
+        venue="deepcoin",
+        status="open",
+    )
+    other_leg = ExecutionOrderLeg(
+        id=2,
+        execution_binding_id=7,
+        leg_index=2,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id=None,
+        client_order_id="other-client",
+        venue="deepcoin",
+        status="open",
+    )
+    evidence = [
+        FillEvidence(
+            source="regular_order",
+            order_id=None,
+            client_order_id="unique-client",
+            pos_id=None,
+            symbol="ETH-USDT-SWAP",
+            side="short",
+            size=1.5,
+            price=1770.0,
+            created_at_ms=10_000,
+        )
+    ]
+
+    assert _leg_has_successful_fill_evidence(
+        unique_leg, evidence, legs=[unique_leg, other_leg]
+    )
+
+
+def test_successful_fill_accepts_matching_order_and_client_pair():
+    matching_leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=7,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="order-1",
+        client_order_id="duplicate-client",
+        venue="deepcoin",
+        status="open",
+    )
+    other_leg = ExecutionOrderLeg(
+        id=2,
+        execution_binding_id=7,
+        leg_index=2,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="order-2",
+        client_order_id="duplicate-client",
+        venue="deepcoin",
+        status="open",
+    )
+    evidence = [
+        FillEvidence(
+            source="regular_order",
+            order_id="order-1",
+            client_order_id="duplicate-client",
+            pos_id=None,
+            symbol="ETH-USDT-SWAP",
+            side="short",
+            size=1.5,
+            price=1770.0,
+            created_at_ms=10_000,
+        )
+    ]
+
+    assert _leg_has_successful_fill_evidence(
+        matching_leg, evidence, legs=[matching_leg, other_leg]
+    )
 
 
 @pytest.mark.parametrize("invalid_list_value", [None, "not-a-list", {"bad": "shape"}])

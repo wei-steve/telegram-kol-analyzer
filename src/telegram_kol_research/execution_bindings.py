@@ -497,7 +497,7 @@ def _apply_reconcile_snapshot(
                 leg,
                 binding=bindings_by_id[int(leg.execution_binding_id)],
                 has_successful_entry_evidence=_leg_has_successful_fill_evidence(
-                    leg, fill_rows
+                    leg, fill_rows, legs=legs
                 ),
                 protection_mutated=(
                     int(leg.execution_binding_id) in mutated_binding_ids
@@ -914,22 +914,37 @@ def _snapshot_fill_evidence(
 
 
 def _leg_has_successful_fill_evidence(
-    leg: ExecutionOrderLeg, evidence: list[FillEvidence]
+    leg: ExecutionOrderLeg,
+    evidence: list[FillEvidence],
+    *,
+    legs: list[ExecutionOrderLeg],
 ) -> bool:
     for row in evidence:
-        shared_identifiers = [
-            (str(leg_value), str(row_value))
-            for leg_value, row_value in (
-                (leg.order_id, row.order_id),
-                (leg.client_order_id, row.client_order_id),
-            )
-            if leg_value not in (None, "") and row_value not in (None, "")
+        matching_legs = [
+            candidate
+            for candidate in legs
+            if _leg_identifiers_match_fill(candidate, row)
         ]
-        if shared_identifiers and all(
-            leg_value == row_value for leg_value, row_value in shared_identifiers
-        ):
+        if len(matching_legs) == 1 and int(matching_legs[0].id) == int(leg.id):
             return True
     return False
+
+
+def _leg_identifiers_match_fill(
+    leg: ExecutionOrderLeg, evidence: FillEvidence
+) -> bool:
+    shared_identifiers = [
+        (str(leg_value), str(evidence_value))
+        for leg_value, evidence_value in (
+            (leg.order_id, evidence.order_id),
+            (leg.client_order_id, evidence.client_order_id),
+        )
+        if leg_value not in (None, "") and evidence_value not in (None, "")
+    ]
+    return bool(shared_identifiers) and all(
+        leg_value == evidence_value
+        for leg_value, evidence_value in shared_identifiers
+    )
 
 
 def _post_entry_protection_mutated_binding_ids(
