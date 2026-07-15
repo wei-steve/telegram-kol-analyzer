@@ -792,7 +792,15 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
 
 @pytest.mark.parametrize(
     "mutation",
-    ["errors", "missing", "size_drift", "extra", "wrong_instrument", "wrong_side"],
+    [
+        "errors",
+        "missing",
+        "size_drift",
+        "extra",
+        "wrong_instrument",
+        "wrong_side",
+        "missing_pos_id",
+    ],
 )
 def test_all_planned_restart_snapshot_must_match_exact_frozen_positions(
     tmp_path, mutation
@@ -838,6 +846,14 @@ def test_all_planned_restart_snapshot_must_match_exact_frozen_positions(
         positions[0]["instId"] = "ETH-USDT-SWAP"
     elif mutation == "wrong_side":
         positions[0]["posSide"] = "long"
+    elif mutation == "missing_pos_id":
+        positions.append(
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "1",
+            }
+        )
 
     with pytest.raises(ManagementBatchExecutionError, match="restart_snapshot"):
         validate_management_restart_snapshot(
@@ -893,6 +909,169 @@ def test_all_planned_restart_size_drift_freezes_batch_with_zero_exchange_write(
     assert result.recovered == 1
     assert stored.status == "recovery_required"
     assert stored.reason_code == "management_restart_snapshot_validation_failed"
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("mutation", ["size_drift", "manual_close", "snapshot_error"])
+def test_fresh_ready_claim_revalidates_exchange_before_first_write(tmp_path, mutation):
+    from telegram_kol_research.strategy_management_worker import (
+        run_strategy_management_worker_tick,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory, sizes=("1", "2"))
+    positions = [
+        {
+            "posId": "pos-1",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "pos": "2",
+        },
+        {
+            "posId": "pos-2",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "pos": "4",
+        },
+    ]
+    errors = {}
+    if mutation == "size_drift":
+        positions[0]["pos"] = "1"
+    elif mutation == "manual_close":
+        positions.pop(0)
+    else:
+        errors["positions"] = "timeout"
+    client = _FakeClient(session_factory)
+
+    result = run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: client,
+        snapshot_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            positions=positions, errors=errors
+        ),
+        processed_at=NOW,
+    )
+
+    stored = load_management_batch(session_factory, batch.id)
+    assert result.recovered == 1
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "management_restart_snapshot_validation_failed"
+    assert client.calls == []
+
+
+def test_restart_validator_ignores_other_exact_strategy_same_instrument_and_side(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        validate_management_restart_snapshot,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory, sizes=("1", "2"))
+    with session_factory() as session:
+        other = ExecutionBinding(
+            strategy_instance_id="deepcoin:200:20:BTC:short",
+            kol_id="bob",
+            chat_id=200,
+            message_id=20,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            pos_id="pos-other",
+            status="active",
+        )
+        session.add(other)
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=other.id,
+                strategy_instance_id=other.strategy_instance_id,
+                leg_index=0,
+                purpose="entry",
+                order_kind="market",
+                order_id="entry-other",
+                pos_id="pos-other",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="active",
+            )
+        )
+        session.commit()
+    snapshot = SimpleNamespace(
+        positions=[
+            {
+                "posId": "pos-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "2",
+            },
+            {
+                "posId": "pos-2",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "4",
+            },
+            {
+                "posId": "pos-other",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "3",
+            },
+        ],
+        errors={},
+    )
+
+    validate_management_restart_snapshot(
+        session_factory, batch_id=batch.id, snapshot=snapshot
+    )
+
+    from telegram_kol_research.strategy_management_worker import (
+        run_strategy_management_worker_tick,
+    )
+
+    client = _FakeClient(session_factory)
+    result = run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: client,
+        snapshot_loader=lambda *_args, **_kwargs: snapshot,
+        processed_at=NOW,
+    )
+
+    assert result.executed == 1
+    assert [payload["closePosId"] for payload, _status in client.calls] == [
+        "pos-1",
+        "pos-2",
+    ]
+    with session_factory() as session:
+        other_binding = session.query(ExecutionBinding).filter_by(chat_id=200).one()
+        other_leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=other_binding.id
+        ).one()
+        assert other_binding.status == "active"
+        assert other_leg.status == "active"
+
+
+def test_ready_snapshot_loader_exception_freezes_with_zero_exchange_write(tmp_path):
+    from telegram_kol_research.strategy_management_worker import (
+        run_strategy_management_worker_tick,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory, sizes=("1", "2"))
+    client = _FakeClient(session_factory)
+
+    result = run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: client,
+        snapshot_loader=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("snapshot unavailable")
+        ),
+        processed_at=NOW,
+    )
+
+    stored = load_management_batch(session_factory, batch.id)
+    assert result.recovered == 1
+    assert stored.status == "recovery_required"
     assert client.calls == []
 
 

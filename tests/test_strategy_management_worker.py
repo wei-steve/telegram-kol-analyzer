@@ -13,6 +13,7 @@ from telegram_kol_research.strategy_management_executor import (
 )
 from telegram_kol_research.strategy_management_batches import load_management_batch
 from telegram_kol_research.strategy_management_worker import (
+    StrategyManagementWorkerCursor,
     run_strategy_management_worker_tick,
 )
 
@@ -71,8 +72,9 @@ def test_worker_claims_ready_batch_once_across_racing_ticks(tmp_path):
         return run_strategy_management_worker_tick(
             session_factory,
             deepcoin_client_factory=lambda: object(),
-            batch_lister=lister,
-            executor=execute,
+                batch_lister=lister,
+                executor=execute,
+                restart_validator=lambda *_args, **_kwargs: None,
             max_batches=1,
             processed_at=NOW,
         )
@@ -159,6 +161,8 @@ def test_recovery_required_is_paused_and_other_strategies_are_independent():
         batch_lister=lambda *_args, **_kwargs: batches,
         claimer=lambda *_args, **kwargs: kwargs["batch_id"] == 2,
         executor=lambda *_args, **kwargs: executed.append(kwargs["batch_id"]),
+        snapshot_loader=lambda *_args, **_kwargs: object(),
+        restart_validator=lambda *_args, **_kwargs: None,
         processed_at=NOW,
     )
 
@@ -208,6 +212,8 @@ def test_batch_failure_does_not_stop_later_bounded_work():
         batch_lister=lambda *_args, **_kwargs: batches,
         claimer=lambda *_args, **_kwargs: True,
         executor=execute,
+        snapshot_loader=lambda *_args, **_kwargs: object(),
+        restart_validator=lambda *_args, **_kwargs: None,
         max_batches=2,
         processed_at=NOW,
     )
@@ -360,8 +366,73 @@ def test_old_reconciling_backlog_does_not_starve_later_ready_strategy(tmp_path):
         snapshot_loader=lambda *_args, **_kwargs: object(),
         reconciler=lambda *_args, **_kwargs: None,
         executor=lambda *_args, **kwargs: executed.append(kwargs["batch_id"]),
+        restart_validator=lambda *_args, **_kwargs: None,
         max_batches=2,
         processed_at=NOW,
     )
 
     assert ready_id in executed
+
+
+def test_max_one_cursor_gives_recovery_a_bounded_live_tick():
+    cursor = StrategyManagementWorkerCursor()
+    ready = _batch(batch_id=1, strategy="deepcoin:1:1:BTC:short", status="ready")
+    recovery = _batch(
+        batch_id=2,
+        strategy="deepcoin:2:2:BTC:short",
+        status="reconciling",
+        legs=(SimpleNamespace(status="submitted"),),
+    )
+    events = []
+
+    def lister(*_args, **kwargs):
+        return [recovery] if kwargs["prefer_recovery"] else [ready]
+
+    common = dict(
+        deepcoin_client_factory=lambda: object(),
+        batch_lister=lister,
+        claimer=lambda *_args, **_kwargs: True,
+        snapshot_loader=lambda *_args, **_kwargs: object(),
+        reconciler=lambda *_args, **_kwargs: events.append("recovery"),
+        executor=lambda *_args, **_kwargs: events.append("ready"),
+        restart_validator=lambda *_args, **_kwargs: None,
+        max_batches=1,
+        cursor=cursor,
+        processed_at=NOW,
+    )
+    run_strategy_management_worker_tick(object(), **common)
+    run_strategy_management_worker_tick(object(), **common)
+
+    assert events == ["ready", "recovery"]
+
+
+def test_disabled_shadow_max_one_prioritizes_recovery_and_never_claims_ready():
+    cursor = StrategyManagementWorkerCursor()
+    recovery = _batch(
+        batch_id=2,
+        strategy="deepcoin:2:2:BTC:short",
+        status="reconciling",
+        legs=(SimpleNamespace(status="submitted"),),
+    )
+    events = []
+
+    result = run_strategy_management_worker_tick(
+        object(),
+        deepcoin_client_factory=lambda: object(),
+        batch_lister=lambda *_args, **kwargs: (
+            [recovery]
+            if kwargs["prefer_recovery"]
+            else (_ for _ in ()).throw(AssertionError("ready lane selected"))
+        ),
+        claimer=lambda *_args, **_kwargs: events.append("claim") or True,
+        snapshot_loader=lambda *_args, **_kwargs: object(),
+        reconciler=lambda *_args, **_kwargs: events.append("recovery"),
+        executor=lambda *_args, **_kwargs: events.append("write"),
+        max_batches=1,
+        cursor=cursor,
+        allow_execution=False,
+        processed_at=NOW,
+    )
+
+    assert result.recovered == 1
+    assert events == ["recovery"]

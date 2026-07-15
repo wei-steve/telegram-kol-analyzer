@@ -40,6 +40,9 @@ _PROTECTION_ACTIONS = frozenset(
 _PROTECTION_PHASE_LEG_STATUSES = frozenset(
     {"succeeded", "restored", "recovery_required"}
 )
+_CLOSE_ACTIONS = frozenset(
+    {"partial_close", "full_close", "full_exit", "partial_then_break_even"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +53,13 @@ class StrategyManagementWorkerResult:
     paused: int = 0
     skipped: int = 0
     failed: int = 0
+
+
+@dataclass(slots=True)
+class StrategyManagementWorkerCursor:
+    """In-process lane rotation; database claims remain concurrency authority."""
+
+    next_lane: str = "executable"
 
 
 def run_strategy_management_worker_tick(
@@ -65,13 +75,25 @@ def run_strategy_management_worker_tick(
     reconciler: Callable[..., Any] = reconcile_strategy_management_batches,
     executor: Callable[..., Any] = execute_management_batch,
     restart_validator: Callable[..., None] = validate_management_restart_snapshot,
+    cursor: StrategyManagementWorkerCursor | None = None,
 ) -> StrategyManagementWorkerResult:
     """Process a bounded amount of work, isolating every durable batch failure."""
 
     limit = max(0, int(max_batches))
     if limit == 0:
         return StrategyManagementWorkerResult()
-    batches = list(batch_lister(session_factory, limit=limit))[:limit]
+    prefer_recovery = not allow_execution or (
+        cursor is not None and cursor.next_lane == "recovery"
+    )
+    batches = list(
+        batch_lister(
+            session_factory,
+            limit=limit,
+            prefer_recovery=prefer_recovery,
+        )
+    )[:limit]
+    if cursor is not None and allow_execution and limit == 1:
+        cursor.next_lane = "executable" if prefer_recovery else "recovery"
     counts = {
         "discovered": len(batches),
         "recovered": 0,
@@ -113,6 +135,29 @@ def run_strategy_management_worker_tick(
                 ):
                     counts["skipped"] += 1
                     continue
+                if batch.status == "ready" and batch.effective_action in _CLOSE_ACTIONS:
+                    try:
+                        restart_validator(
+                            session_factory,
+                            batch_id=batch.id,
+                            snapshot=snapshot_loader(
+                                session_factory, client=get_client()
+                            ),
+                        )
+                    except ManagementBatchExecutionError as exc:
+                        if not str(exc).startswith("restart_snapshot"):
+                            raise
+                        _freeze_restart_snapshot_failure(
+                            session_factory, batch_id=batch.id, frozen_at=now
+                        )
+                        counts["recovered"] += 1
+                        continue
+                    except Exception:
+                        _freeze_restart_snapshot_failure(
+                            session_factory, batch_id=batch.id, frozen_at=now
+                        )
+                        counts["recovered"] += 1
+                        continue
                 executor(
                     session_factory,
                     batch_id=batch.id,
@@ -127,11 +172,11 @@ def run_strategy_management_worker_tick(
 
             # A restart path must establish exchange truth before it decides
             # whether any durable state can advance or any request can run.
-            current_snapshot = get_snapshot()
             if _is_composite_protection_phase(batch):
                 if not allow_execution:
                     counts["skipped"] += 1
                     continue
+                current_snapshot = get_snapshot()
                 executor(
                     session_factory,
                     batch_id=batch.id,
@@ -141,6 +186,7 @@ def run_strategy_management_worker_tick(
                 counts["recovered"] += 1
                 continue
             if batch.status != "executing" or _has_submission_evidence(batch):
+                current_snapshot = get_snapshot()
                 reconciler(
                     session_factory,
                     snapshot=current_snapshot,
@@ -156,24 +202,24 @@ def run_strategy_management_worker_tick(
                 counts["skipped"] += 1
                 continue
             try:
+                current_snapshot = snapshot_loader(
+                    session_factory, client=get_client()
+                )
                 restart_validator(
                     session_factory,
                     batch_id=batch.id,
                     snapshot=current_snapshot,
                 )
             except ManagementBatchExecutionError:
-                frozen = transition_batch(
-                    session_factory,
-                    batch.id,
-                    expected_statuses={"executing"},
-                    new_status="recovery_required",
-                    transitioned_at=now,
-                    reason_code="management_restart_snapshot_validation_failed",
+                _freeze_restart_snapshot_failure(
+                    session_factory, batch_id=batch.id, frozen_at=now
                 )
-                if not frozen:
-                    raise RuntimeError(
-                        "management_restart_snapshot_freeze_conflict"
-                    )
+                counts["recovered"] += 1
+                continue
+            except Exception:
+                _freeze_restart_snapshot_failure(
+                    session_factory, batch_id=batch.id, frozen_at=now
+                )
                 counts["recovered"] += 1
                 continue
             executor(
@@ -205,6 +251,7 @@ async def run_strategy_management_worker_loop(
 ) -> None:
     """Run bounded ticks forever; cancellation is owned by the Web lifespan."""
 
+    cursor = StrategyManagementWorkerCursor()
     while True:
         try:
             settings = load_trading_settings(session_factory)
@@ -213,6 +260,7 @@ async def run_strategy_management_worker_loop(
                 deepcoin_client_factory=deepcoin_client_factory,
                 max_batches=max_batches,
                 allow_execution=settings.live_management_execution_enabled,
+                cursor=cursor,
                 processed_at=(
                     now_provider() if now_provider is not None else datetime.now(UTC)
                 ),
@@ -277,3 +325,17 @@ def _persist_deterministic_pre_submit_failure(
         transitioned_at=failed_at,
         reason_code="management_pre_submit_validation_failed",
     )
+
+
+def _freeze_restart_snapshot_failure(
+    session_factory, *, batch_id: int, frozen_at: datetime
+) -> None:
+    if not transition_batch(
+        session_factory,
+        int(batch_id),
+        expected_statuses={"executing"},
+        new_status="recovery_required",
+        transitioned_at=frozen_at,
+        reason_code="management_restart_snapshot_validation_failed",
+    ):
+        raise RuntimeError("management_restart_snapshot_freeze_conflict")

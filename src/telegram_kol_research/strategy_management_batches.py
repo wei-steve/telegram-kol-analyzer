@@ -419,7 +419,10 @@ def list_recoverable_batches(
 
 
 def list_worker_batches(
-    session_factory: sessionmaker, *, limit: int = 10
+    session_factory: sessionmaker,
+    *,
+    limit: int = 10,
+    prefer_recovery: bool = False,
 ) -> list[ManagementBatchRecord]:
     """Return bounded automatic work; operator-paused states are never eligible."""
 
@@ -440,16 +443,18 @@ def list_worker_batches(
 
         executable = load_lane({"ready", "protection_ready"})
         recovery = load_lane(RECOVERABLE_BATCH_STATUSES)
+        lanes = (
+            (recovery, executable) if prefer_recovery else (executable, recovery)
+        )
         batches = []
         # Independent lanes prevent an old reconciliation backlog from hiding
         # fresh exact-strategy work behind one global SQL LIMIT.
-        while len(batches) < limit and (executable or recovery):
-            if executable:
-                batches.append(executable.pop(0))
-                if len(batches) >= limit:
-                    break
-            if recovery:
-                batches.append(recovery.pop(0))
+        while len(batches) < limit and any(lanes):
+            for lane in lanes:
+                if lane:
+                    batches.append(lane.pop(0))
+                    if len(batches) >= limit:
+                        break
         return [_batch_to_record(session, batch) for batch in batches]
 
 

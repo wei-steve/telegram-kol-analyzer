@@ -379,6 +379,7 @@ def _execute_protection_batch(
         inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
         live_positions = list(deepcoin_client.list_positions(inst_id=inst_id))
         positions_by_id = _preflight_exact_protection_positions(
+            session_factory=session_factory,
             batch=batch,
             binding=binding,
             live_positions=live_positions,
@@ -589,6 +590,7 @@ def _execute_protection_batch(
 
 def _preflight_exact_protection_positions(
     *,
+    session_factory: sessionmaker,
     batch: ManagementBatchRecord,
     binding: ExecutionBinding,
     live_positions: list[dict[str, Any]],
@@ -600,6 +602,9 @@ def _preflight_exact_protection_positions(
         live_positions=live_positions,
         inst_id=inst_id,
         error_prefix="protection_preflight",
+        ignored_owned_pos_ids=_other_exact_strategy_position_ids(
+            session_factory, batch=batch, binding=binding
+        ),
     )
     for leg in batch.legs:
         position = positions_by_id[leg.pos_id]
@@ -633,8 +638,20 @@ def _preflight_exact_position_identity(
     live_positions: list[dict[str, Any]],
     inst_id: str,
     error_prefix: str,
+    ignored_owned_pos_ids: set[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     expected_pos_ids = {leg.pos_id for leg in batch.legs}
+    ignored = set(ignored_owned_pos_ids or ()) - expected_pos_ids
+    if any(
+        _first_text(row, "instId", "inst_id") == inst_id
+        and (_first_text(row, "posSide", "pos_side", "side") or "").lower()
+        == binding.side.lower()
+        and _first_text(row, "posId", "pos_id", "id") is None
+        for row in live_positions
+    ):
+        raise ManagementBatchExecutionError(
+            f"{error_prefix}_position_ambiguous"
+        )
     bound_pos_ids = {
         value.strip()
         for value in str(binding.pos_id or "").split(",")
@@ -651,6 +668,7 @@ def _preflight_exact_position_identity(
         and (_first_text(row, "posSide", "pos_side", "side") or "").lower()
         == binding.side.lower()
         and (pos_id := _first_text(row, "posId", "pos_id", "id")) is not None
+        and str(pos_id) not in ignored
     }
     if relevant_live_ids != expected_pos_ids:
         raise ManagementBatchExecutionError(
@@ -659,6 +677,8 @@ def _preflight_exact_position_identity(
     positions_by_id: dict[str, dict[str, Any]] = {}
     for row in live_positions:
         pos_id = _first_text(row, "posId", "pos_id", "id")
+        if pos_id in ignored:
+            continue
         if pos_id not in expected_pos_ids:
             continue
         if (
@@ -696,6 +716,9 @@ def validate_management_restart_snapshot(
         live_positions=list(getattr(snapshot, "positions", [])),
         inst_id=inst_id,
         error_prefix="restart_snapshot",
+        ignored_owned_pos_ids=_other_exact_strategy_position_ids(
+            session_factory, batch=batch, binding=binding
+        ),
     )
     for leg in batch.legs:
         if not _decimal_equal(
@@ -705,6 +728,57 @@ def validate_management_restart_snapshot(
             raise ManagementBatchExecutionError(
                 "restart_snapshot_position_size_drift"
             )
+
+
+def _other_exact_strategy_position_ids(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+    binding: ExecutionBinding,
+) -> set[str]:
+    """Return only uniquely verified live positions owned by another binding."""
+
+    with session_factory() as session:
+        rows = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .filter(ExecutionOrderLeg.pos_id.is_not(None))
+            .filter(ExecutionOrderLeg.execution_binding_id != batch.execution_binding_id)
+            .all()
+        )
+        by_pos: dict[str, list[ExecutionOrderLeg]] = {}
+        for row in rows:
+            if (
+                str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+                or row.terminal_reason is not None
+            ):
+                continue
+            by_pos.setdefault(str(row.pos_id), []).append(row)
+
+        owned: set[str] = set()
+        for pos_id, candidates in by_pos.items():
+            if len(candidates) != 1:
+                continue
+            row = candidates[0]
+            other = session.get(ExecutionBinding, row.execution_binding_id)
+            bound_ids = {
+                value.strip()
+                for value in str(other.pos_id if other is not None else "").split(",")
+                if value.strip()
+            }
+            if (
+                other is not None
+                and other.status in {"active", "open", "partial"}
+                and row.attribution_status == "verified"
+                and str(row.status or "").lower()
+                in {"active", "open", "filled", "partial_closed"}
+                and row.strategy_instance_id == other.strategy_instance_id
+                and other.symbol.upper() == binding.symbol.upper()
+                and other.side.lower() == binding.side.lower()
+                and pos_id in bound_ids
+            ):
+                owned.add(pos_id)
+        return owned
 
 
 def _preflight_exact_protection_rows(
