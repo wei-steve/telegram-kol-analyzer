@@ -266,10 +266,10 @@ def _group_config():
     ("mode", "auto_trade_enabled", "expected_status", "expected_reason"),
     [
         ("shadow", False, "shadow_planned", None),
-        ("live", True, "blocked", "management_executor_unavailable"),
+        ("live", True, "reconciling", "close_submissions_pending_reconciliation"),
     ],
 )
-def test_management_planning_never_writes_before_batch_executor_exists(
+def test_management_planning_shadows_or_executes_only_the_durable_batch(
     tmp_path,
     monkeypatch,
     mode,
@@ -415,16 +415,20 @@ def test_management_planning_never_writes_before_batch_executor_exists(
     assert result["status"] == expected_status
     if expected_reason is None:
         assert result["management_action"] == "full_exit"
-    else:
+    elif mode == "live":
         assert result["reason"] == expected_reason
         from telegram_kol_research.models import StrategyManagementBatch
 
         with session_factory() as session:
             batch = session.get(StrategyManagementBatch, result["batch_id"])
-            assert batch.status == "blocked"
-            assert batch.reason_code == "management_executor_unavailable"
+            assert batch.status == "reconciling"
+            assert batch.reason_code == "close_submissions_pending_reconciliation"
     assert isinstance(result["batch_id"], int)
-    assert fake_client.orders == []
+    assert len(fake_client.orders) == (1 if mode == "live" else 0)
+    if mode == "live":
+        assert fake_client.orders[0]["closePosId"] == "pos-shadow"
+        assert fake_client.orders[0]["ordType"] == "market"
+        assert len(fake_client.orders[0]["clOrdId"]) <= 20
     assert fake_client.trigger_orders == []
     assert fake_client.protections == []
     assert fake_client.cancel_orders == []

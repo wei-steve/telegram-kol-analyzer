@@ -67,15 +67,14 @@ def execute_deepcoin_management_signal(
     """Execute one non-entry Deepcoin trade signal from the durable queue."""
 
     action = trade_signal.action.lower()
-    if action in {"close_position", "exit_position", "temporary_exit", "temporary_close"}:
+    if action in {
+        "close_position",
+        "exit_position",
+        "temporary_exit",
+        "temporary_close",
+        "partial_close_and_move_stop_to_entry",
+    }:
         return close_position_market(
-            session_factory,
-            trade_signal=trade_signal,
-            deepcoin_client=deepcoin_client,
-            executed_at=executed_at,
-        )
-    if action == "partial_close_and_move_stop_to_entry":
-        return partial_close_and_move_stop_to_entry(
             session_factory,
             trade_signal=trade_signal,
             deepcoin_client=deepcoin_client,
@@ -314,114 +313,28 @@ def close_position_market(
     deepcoin_client: DeepcoinTradingClientProtocol,
     executed_at: datetime | None = None,
 ) -> dict[str, Any]:
-    """Close a bound split-position by market order using closePosId."""
+    """Delegate legacy close requests through a durable management batch."""
 
-    now = executed_at or datetime.now(UTC)
-    binding = _load_binding_for_signal(session_factory, trade_signal)
-    requested_pos_ids = _requested_position_ids(trade_signal.payload)
-    _require_verified_binding_positions(
+    payload = trade_signal.payload if isinstance(trade_signal.payload, dict) else {}
+    batch_id = payload.get("management_batch_id") or payload.get("batch_id")
+    if batch_id in (None, ""):
+        raise DeepcoinExecutionActionError("legacy_management_signal_requires_batch")
+    try:
+        normalized_batch_id = int(batch_id)
+    except (TypeError, ValueError) as exc:
+        raise DeepcoinExecutionActionError(
+            "legacy_management_signal_requires_batch"
+        ) from exc
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    return execute_management_batch(
         session_factory,
-        binding,
-        requested_pos_ids=requested_pos_ids,
+        batch_id=normalized_batch_id,
+        deepcoin_client=deepcoin_client,
+        executed_at=executed_at,
     )
-    inst_id = _to_deepcoin_swap_instrument(binding.symbol)
-    live_positions = deepcoin_client.list_positions(inst_id=inst_id)
-    positions = _select_bound_positions(
-        live_positions,
-        binding=binding,
-        inst_id=inst_id,
-        requested_pos_ids=requested_pos_ids,
-    )
-    _require_live_position_economics(
-        session_factory,
-        binding,
-        positions,
-        snapshot_positions=live_positions,
-    )
-    submitted_orders: list[dict[str, Any]] = []
-    full_close = True
-    for position in positions:
-        current_size = _position_size(position)
-        close_size = _resolve_close_size(trade_signal.payload, current_size)
-        if close_size <= 0:
-            raise DeepcoinExecutionActionError("non_positive_close_size")
-        payload = {
-            "instId": inst_id,
-            "tdMode": _deepcoin_margin_mode(binding.margin_mode),
-            "side": "sell" if binding.side.lower() == "long" else "buy",
-            "posSide": binding.side.lower(),
-            "ordType": "market",
-            "sz": f"{close_size:g}",
-            "mrgPosition": _deepcoin_position_mode(binding.position_mode),
-            "closePosId": str(_first_string(position, "posId", "pos_id", "id") or ""),
-        }
-        if not payload["closePosId"]:
-            raise DeepcoinExecutionActionError("missing_close_pos_id")
-        response = deepcoin_client.place_order(payload)
-        order_id = _extract_order_id(response)
-        position_full_close = close_size >= current_size * 0.999
-        full_close = full_close and position_full_close
-        submitted_orders.append(
-            {
-                "order_id": order_id,
-                "pos_id": payload["closePosId"],
-                "close_size": close_size,
-                "full_close": position_full_close,
-                "request": payload,
-                "response": response,
-            }
-        )
-        record_execution_event(
-            session_factory,
-            ExecutionEventRecord(
-                execution_binding_id=binding.id,
-                trade_signal_id=trade_signal.id,
-                strategy_instance_id=binding.strategy_instance_id,
-                kol_id=binding.kol_id,
-                chat_id=binding.chat_id,
-                message_id=binding.message_id,
-                source_message_id=trade_signal.message_id,
-                symbol=binding.symbol,
-                side=binding.side,
-                action="close_position_market",
-                order_id=order_id,
-                pos_id=payload["closePosId"],
-                reason=trade_signal.action,
-                before={"position_size": current_size},
-                after={"close_size": close_size, "full_close": position_full_close},
-                request=payload,
-                response=response,
-                created_at=now,
-            ),
-        )
-    _update_binding_status(
-        session_factory,
-        binding.id,
-        status="closed" if full_close else "active",
-        last_exchange_status="close_position_submitted" if full_close else "partial_close_submitted",
-        updated_at=now,
-    )
-    for submitted_order in submitted_orders:
-        _update_entry_leg_status(
-            session_factory,
-            binding.id,
-            status="closed" if submitted_order["full_close"] else "partial_closed",
-            updated_at=now,
-            pos_id=submitted_order["pos_id"],
-        )
-    return {
-        "submitted": True,
-        "venue": "deepcoin",
-        "signal_id": trade_signal.id,
-        "action": trade_signal.action,
-        "binding_id": binding.id,
-        "order_id": ",".join(item["order_id"] for item in submitted_orders if item["order_id"]),
-        "pos_id": ",".join(item["pos_id"] for item in submitted_orders if item["pos_id"]),
-        "close_size": sum(float(item["close_size"]) for item in submitted_orders),
-        "full_close": full_close,
-        "closed_positions": submitted_orders,
-        "executed_at": now.isoformat(),
-    }
 
 
 @serialized_position_authority_mutation

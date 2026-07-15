@@ -39,10 +39,11 @@ from telegram_kol_research.recovery_scan import _resolve_signal_max_loss_usdt
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import apply_trading_settings_to_group_config
 from telegram_kol_research.trading_settings import load_trading_settings
-from telegram_kol_research.strategy_management_batches import load_management_batch
-from telegram_kol_research.strategy_management_batches import transition_batch
 from telegram_kol_research.strategy_management_planner import (
     plan_strategy_management_batch,
+)
+from telegram_kol_research.strategy_management_executor import (
+    execute_management_batch,
 )
 
 
@@ -417,24 +418,12 @@ def _auto_process_management_signal(
             "batch_id": result.batch.id,
         }
 
-    # Task 6 replaces this temporary fail-closed transition with the batch-ID
-    # executor. Never leave a ready live-mode batch for a future worker to pick up.
-    transitioned = transition_batch(
+    return execute_management_batch(
         session_factory,
-        result.batch.id,
-        expected_statuses={"ready", "executing", "reconciling"},
-        new_status="blocked",
-        transitioned_at=processed_at,
-        reason_code="management_executor_unavailable",
+        batch_id=result.batch.id,
+        deepcoin_client=deepcoin_client,
+        executed_at=processed_at,
     )
-    blocked_batch = load_management_batch(session_factory, result.batch.id)
-    if not transitioned or blocked_batch.status != "blocked":
-        raise RuntimeError("management executor unavailable batch was not blocked")
-    return {
-        "status": "blocked",
-        "reason": "management_executor_unavailable",
-        "batch_id": result.batch.id,
-    }
 
 
 def market_price_is_near_entry_edge(

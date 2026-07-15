@@ -41,6 +41,10 @@ class DeepcoinClientError(RuntimeError):
     """Raised when Deepcoin credentials or API responses are invalid."""
 
 
+class DeepcoinRequestOutcomeUnknown(DeepcoinClientError):
+    """Raised when a write may have reached Deepcoin but no result was received."""
+
+
 def _require_list_data(payload: dict[str, Any], *, endpoint: str) -> list[dict[str, Any]]:
     data = payload.get("data")
     if not isinstance(data, list):
@@ -374,9 +378,19 @@ class DeepcoinRestClient:
             response = client.request(method, request_path, content=body, headers=headers)
             response.raise_for_status()
             payload = response.json()
-        except httpx.HTTPError as exc:
+        except httpx.RequestError as exc:
+            if method.upper() == "POST":
+                raise DeepcoinRequestOutcomeUnknown(
+                    f"Deepcoin request outcome unknown: {exc}"
+                ) from exc
+            raise DeepcoinClientError(f"Deepcoin request failed: {exc}") from exc
+        except httpx.HTTPStatusError as exc:
             raise DeepcoinClientError(f"Deepcoin request failed: {exc}") from exc
         except json.JSONDecodeError as exc:
+            if method.upper() == "POST":
+                raise DeepcoinRequestOutcomeUnknown(
+                    "Deepcoin write response was not JSON"
+                ) from exc
             raise DeepcoinClientError("Deepcoin response was not JSON") from exc
         finally:
             if owns_client:

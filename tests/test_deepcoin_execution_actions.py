@@ -332,10 +332,12 @@ def test_position_mutations_require_verified_ownership(
     )
     client = _FakeDeepcoinClient()
 
-    with pytest.raises(
-        DeepcoinExecutionActionError,
-        match=f"position_ownership_not_verified:{attribution_status}",
-    ):
+    expected_error = (
+        "legacy_management_signal_requires_batch"
+        if action in {"close_position", "partial_close_and_move_stop_to_entry"}
+        else f"position_ownership_not_verified:{attribution_status}"
+    )
+    with pytest.raises(DeepcoinExecutionActionError, match=expected_error):
         execute_deepcoin_management_signal(
             session_factory,
             trade_signal=trade_signal,
@@ -345,6 +347,28 @@ def test_position_mutations_require_verified_ownership(
     assert client.order_payloads == []
     assert client.cancel_trigger_payloads == []
     assert client.protection_payloads == []
+
+
+def test_legacy_close_signal_without_management_batch_fails_closed(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="legacy_management_signal_requires_batch",
+    ):
+        execute_deepcoin_management_signal(
+            session_factory,
+            trade_signal=_signal(
+                session_factory,
+                action="close_position",
+                payload={"binding_id": binding_id, "fraction": 0.5},
+            ),
+            deepcoin_client=client,
+        )
+
+    assert client.order_payloads == []
 
 
 @pytest.mark.parametrize(
@@ -650,7 +674,7 @@ def test_requested_subset_close_freezes_when_equivalent_sibling_is_not_current(
     client.list_positions = list_positions
 
     with pytest.raises(
-        DeepcoinExecutionActionError, match="live_position_economics_changed"
+        DeepcoinExecutionActionError, match="legacy_management_signal_requires_batch"
     ):
         execute_deepcoin_management_signal(
             session_factory,
@@ -662,7 +686,7 @@ def test_requested_subset_close_freezes_when_equivalent_sibling_is_not_current(
             deepcoin_client=client,
         )
 
-    assert calls == 1
+    assert calls == 0
     assert client.order_payloads == []
 
 
@@ -1233,7 +1257,7 @@ def test_adjust_position_tpsl_accepts_uniquely_attributed_unscoped_orders(tmp_pa
     ]
 
 
-def test_process_trade_signal_live_closes_bound_position_with_close_pos_id(tmp_path):
+def test_process_trade_signal_live_rejects_legacy_close_without_batch(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
     binding_id = _binding(session_factory)
@@ -1244,33 +1268,23 @@ def test_process_trade_signal_live_closes_bound_position_with_close_pos_id(tmp_p
     )
     client = _FakeDeepcoinClient()
 
-    result = process_trade_signal_live(
-        session_factory,
-        signal_id=trade_signal.id,
-        deepcoin_client=client,
-        processed_at=datetime(2026, 6, 30, 9, 5, tzinfo=UTC),
-    )
+    with pytest.raises(
+        DeepcoinExecutionActionError, match="legacy_management_signal_requires_batch"
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=trade_signal.id,
+            deepcoin_client=client,
+            processed_at=datetime(2026, 6, 30, 9, 5, tzinfo=UTC),
+        )
 
-    assert client.order_payloads == [
-        {
-            "instId": "ETH-USDT-SWAP",
-            "tdMode": "cross",
-            "side": "sell",
-            "posSide": "long",
-            "ordType": "market",
-            "sz": "0.1",
-            "mrgPosition": "split",
-            "closePosId": "pos-1",
-        }
-    ]
-    assert result["action"] == "close_position"
+    assert client.order_payloads == []
     with session_factory() as session:
         binding = session.get(ExecutionBinding, binding_id)
-        assert binding.status == "closed"
-        assert binding.last_exchange_status == "close_position_submitted"
+        assert binding.status == "active"
 
 
-def test_process_trade_signal_live_closes_all_bound_position_ids(tmp_path):
+def test_process_trade_signal_live_rejects_legacy_multi_position_close(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
     binding_id = _binding(
@@ -1301,23 +1315,22 @@ def test_process_trade_signal_live_closes_all_bound_position_ids(tmp_path):
         },
     ]
 
-    result = process_trade_signal_live(
-        session_factory,
-        signal_id=trade_signal.id,
-        deepcoin_client=client,
-    )
+    with pytest.raises(
+        DeepcoinExecutionActionError, match="legacy_management_signal_requires_batch"
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=trade_signal.id,
+            deepcoin_client=client,
+        )
 
-    assert [payload["closePosId"] for payload in client.order_payloads] == ["pos-1", "pos-2"]
-    assert [payload["sz"] for payload in client.order_payloads] == ["0.1", "0.2"]
-    assert result["pos_id"] == "pos-1,pos-2"
-    assert result["close_size"] == 0.30000000000000004
-    assert result["full_close"] is True
+    assert client.order_payloads == []
     with session_factory() as session:
         binding = session.get(ExecutionBinding, binding_id)
-        assert binding.status == "closed"
+        assert binding.status == "active"
 
 
-def test_composite_breakeven_management_reduces_each_target_then_uses_its_own_average_entry(tmp_path):
+def test_legacy_composite_breakeven_management_requires_batch(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     first_binding_id = _binding(
         session_factory,
@@ -1361,22 +1374,21 @@ def test_composite_breakeven_management_reduces_each_target_then_uses_its_own_av
         {"triggerOrderType": "TPSL", "ordId": "sl-2", "instId": "BTC-USDT-SWAP", "posSide": "short", "posId": "pos-2", "slTriggerPx": "65400", "sz": "4", "cTime": "1001"},
     ]
 
-    result = execute_deepcoin_management_signal(
-        session_factory,
-        trade_signal=signal,
-        deepcoin_client=client,
-        executed_at=datetime(2026, 7, 11, 10, 0, tzinfo=UTC),
-    )
+    with pytest.raises(
+        DeepcoinExecutionActionError, match="legacy_management_signal_requires_batch"
+    ):
+        execute_deepcoin_management_signal(
+            session_factory,
+            trade_signal=signal,
+            deepcoin_client=client,
+            executed_at=datetime(2026, 7, 11, 10, 0, tzinfo=UTC),
+        )
 
-    assert [order["closePosId"] for order in client.order_payloads] == ["pos-1", "pos-2"]
-    assert [order["sz"] for order in client.order_payloads] == ["1", "2"]
-    assert [target["status"] for target in result["targets"]] == ["submitted", "submitted"], result["targets"]
-    assert [payload["slTriggerPx"] for payload in client.protection_payloads] == ["64000.0", "64500.0"]
-    assert [payload["tpTriggerPx"] for payload in client.protection_payloads] == ["63200.0", "62500.0"]
-    assert [target["status"] for target in result["targets"]] == ["submitted", "submitted"]
+    assert client.order_payloads == []
+    assert client.protection_payloads == []
 
 
-def test_process_trade_signal_live_closes_only_requested_bound_position_id(tmp_path):
+def test_process_trade_signal_live_rejects_legacy_subset_close(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
     binding_id = _binding(
@@ -1435,35 +1447,23 @@ def test_process_trade_signal_live_closes_only_requested_bound_position_id(tmp_p
         },
     ]
 
-    result = process_trade_signal_live(
-        session_factory,
-        signal_id=trade_signal.id,
-        deepcoin_client=client,
-    )
+    with pytest.raises(
+        DeepcoinExecutionActionError, match="legacy_management_signal_requires_batch"
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=trade_signal.id,
+            deepcoin_client=client,
+        )
 
-    assert client.order_payloads == [
-        {
-            "instId": "ETH-USDT-SWAP",
-            "tdMode": "cross",
-            "side": "sell",
-            "posSide": "long",
-            "ordType": "market",
-            "sz": "0.1",
-            "mrgPosition": "split",
-            "closePosId": "pos-2",
-        }
-    ]
-    assert result["pos_id"] == "pos-2"
-    assert result["close_size"] == 0.1
-    assert result["full_close"] is False
+    assert client.order_payloads == []
     with session_factory() as session:
         binding = session.get(ExecutionBinding, binding_id)
         assert binding.status == "active"
-        assert binding.last_exchange_status == "partial_close_submitted"
     legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
     assert [(leg.leg_index, leg.pos_id, leg.status) for leg in legs] == [
         (1, "pos-1", "active"),
-        (2, "pos-2", "partial_closed"),
+        (2, "pos-2", "active"),
     ]
 
 

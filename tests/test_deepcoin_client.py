@@ -2,11 +2,13 @@ import base64
 import hashlib
 import hmac
 
+import httpx
 import pytest
 
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinCredentials
 from telegram_kol_research.deepcoin_client import DeepcoinRestClient
+from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_client import build_deepcoin_auth_headers
 from telegram_kol_research.deepcoin_client import load_deepcoin_credentials
 from telegram_kol_research.deepcoin_client import _raise_for_deepcoin_business_error
@@ -38,6 +40,12 @@ class _CapturingHttpClient:
             }
         )
         return _FakeResponse(self.payload)
+
+
+class _FailingHttpClient:
+    def request(self, method, request_path, content="", headers=None):
+        request = httpx.Request(method, f"https://api.deepcoin.test{request_path}")
+        raise httpx.ReadTimeout("lost response", request=request)
 
 
 class _FakeMonotonicClock:
@@ -111,6 +119,30 @@ def test_load_deepcoin_credentials_reads_env_values():
     assert credentials.api_secret == "secret"
     assert credentials.passphrase == "pass"
     assert credentials.base_url == "https://example.test"
+
+
+def test_client_order_timeout_preserves_unknown_write_outcome():
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(
+            api_key="key",
+            api_secret="secret",
+            passphrase="pass",
+            base_url="https://api.deepcoin.test",
+        ),
+        http_client=_FailingHttpClient(),
+        timestamp_factory=lambda: "2026-07-15T09:00:00.000Z",
+    )
+
+    with pytest.raises(DeepcoinRequestOutcomeUnknown, match="outcome unknown"):
+        client.place_order(
+            {
+                "instId": "BTC-USDT-SWAP",
+                "ordType": "market",
+                "closePosId": "pos-1",
+                "clOrdId": "TM123",
+                "sz": "1",
+            }
+        )
 
 
 def test_deepcoin_business_error_checks_nested_scode():
