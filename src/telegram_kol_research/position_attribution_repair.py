@@ -12,8 +12,10 @@ from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.execution_bindings import (
     _exchange_row_matches_leg,
+    _leg_has_successful_fill_evidence,
     _leg_evidence,
     _load_reconcile_snapshot,
+    _post_entry_protection_mutated_binding_ids,
     _position_evidence,
     _snapshot_fill_evidence,
 )
@@ -110,13 +112,27 @@ def build_position_attribution_repair_plan(
             legs=legs,
             bindings_by_id=bindings_by_id,
         )
+        mutated_binding_ids = _post_entry_protection_mutated_binding_ids(
+            session, binding_ids=set(bindings_by_id)
+        )
+        leg_rows = [
+            _leg_evidence(
+                leg,
+                binding=bindings_by_id[int(leg.execution_binding_id)],
+                has_successful_entry_evidence=_leg_has_successful_fill_evidence(
+                    leg, fill_rows, legs=legs
+                ),
+                protection_mutated=(
+                    int(leg.execution_binding_id) in mutated_binding_ids
+                ),
+            )
+            for leg in legs
+        ]
         attribution = match_entry_legs_to_positions(
-            [
-                _leg_evidence(leg, binding=bindings_by_id[int(leg.execution_binding_id)])
-                for leg in legs
-            ],
+            leg_rows,
             position_rows,
             fill_rows,
+            allow_equivalent_permutation=True,
         )
         conflict_leg_ids = {
             int(leg_id)

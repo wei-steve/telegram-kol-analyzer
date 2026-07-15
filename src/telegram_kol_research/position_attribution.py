@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 import json
 from math import inf, isclose
+import re
 from typing import Iterable, Mapping
 
 
@@ -275,6 +276,8 @@ def match_entry_legs_to_positions(
     legs: Iterable[LegEvidence],
     positions: Iterable[PositionEvidence],
     evidence: Iterable[FillEvidence],
+    *,
+    allow_equivalent_permutation: bool = False,
 ) -> AttributionResult:
     """Return only mutual-unique assignments backed by direct entry evidence."""
 
@@ -327,6 +330,54 @@ def match_entry_legs_to_positions(
             if edge.leg_id not in accepted_leg_ids and edge.pos_id not in accepted_position_ids
         ]
 
+    if allow_equivalent_permutation and remaining:
+        equivalent_components = classify_equivalent_attribution_components(
+            eligible_legs,
+            position_rows,
+            ((edge.leg_id, edge.pos_id) for edge in remaining),
+            authoritative_owner_by_position={
+                str(leg.pos_id): leg.leg_id
+                for leg in eligible_legs
+                if leg.pos_id not in (None, "")
+            },
+        )
+        canonical_leg_ids: set[int] = set()
+        canonical_position_ids: set[str] = set()
+        legs_by_id = {leg.leg_id: leg for leg in eligible_legs}
+        for component in equivalent_components:
+            if len(component.leg_ids) < 2:
+                continue
+            sorted_leg_ids = sorted(component.leg_ids)
+            sorted_position_ids = sorted(
+                component.position_ids, key=_numeric_aware_identifier_key
+            )
+            component_evidence = {
+                "policy_version": ATTRIBUTION_POLICY_VERSION,
+                "evidence_type": "equivalent_permutation_assignment",
+                "component_leg_ids": sorted_leg_ids,
+                "component_position_ids": sorted_position_ids,
+                "equivalence_signature": _equivalence_signature(
+                    [legs_by_id[leg_id] for leg_id in sorted_leg_ids]
+                ),
+                "mapping_basis": "stable_sorted_canonicalization",
+                "ownership_statement": (
+                    "binding owner proven; parent-child mapping canonicalized"
+                ),
+            }
+            for leg_id, pos_id in zip(
+                sorted_leg_ids, sorted_position_ids, strict=True
+            ):
+                assignments[leg_id] = pos_id
+                evidence_by_leg[leg_id] = dict(component_evidence)
+            canonical_leg_ids.update(sorted_leg_ids)
+            canonical_position_ids.update(sorted_position_ids)
+        remaining = [
+            edge
+            for edge in remaining
+            if edge.leg_id not in canonical_leg_ids
+            and edge.pos_id not in canonical_position_ids
+        ]
+
     conflicts = _connected_conflicts(remaining)
     assigned_position_ids = set(assignments.values())
     return AttributionResult(
@@ -336,6 +387,36 @@ def match_entry_legs_to_positions(
         unassigned_position_ids={position.pos_id for position in position_rows}
         - assigned_position_ids,
     )
+
+
+def _numeric_aware_identifier_key(value: str) -> tuple[tuple[int, object], ...]:
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in re.split(r"(\d+)", str(value))
+        if part
+    )
+
+
+def _equivalence_signature(legs: list[LegEvidence]) -> dict[str, object]:
+    leg = legs[0]
+    protection_mutated = any(item.protection_mutated for item in legs)
+    return {
+        "binding_id": leg.binding_id,
+        "strategy_instance_id": leg.strategy_instance_id,
+        "venue": leg.venue.lower(),
+        "symbol": _normalize_instrument(leg.symbol),
+        "side": _normalize_side(leg.side),
+        "requested_size": leg.requested_size,
+        "entry_price": leg.entry_price,
+        "stop_loss": None if protection_mutated else leg.stop_loss,
+        "take_profits": (
+            [] if protection_mutated else sorted(leg.take_profits)
+        ),
+        "protection_mutated": protection_mutated,
+        "margin_mode": leg.margin_mode,
+        "position_mode": leg.position_mode,
+        "order_kind": leg.order_kind,
+    }
 
 
 def classify_equivalent_attribution_components(

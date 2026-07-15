@@ -121,6 +121,74 @@ def test_equivalent_closed_2x2_component_is_classified_without_assignments():
     assert match_entry_legs_to_positions(legs, positions, []).assignments == {}
 
 
+def test_equivalent_permutation_assignment_is_explicit_stable_and_evidenced():
+    legs = [_equivalent_leg(244), _equivalent_leg(245)]
+    positions = [
+        _equivalent_position("1001124099803507"),
+        _equivalent_position("1001124099803509"),
+    ]
+    fills = [
+        _fill("order-244", 10_000, source="trigger_fill"),
+        _fill("order-245", 10_000, source="trigger_fill"),
+    ]
+
+    default_result = match_entry_legs_to_positions(legs, positions, fills)
+    result = match_entry_legs_to_positions(
+        legs,
+        positions,
+        fills,
+        allow_equivalent_permutation=True,
+    )
+    reversed_result = match_entry_legs_to_positions(
+        reversed(legs),
+        reversed(positions),
+        reversed(fills),
+        allow_equivalent_permutation=True,
+    )
+
+    expected_assignments = {
+        244: "1001124099803507",
+        245: "1001124099803509",
+    }
+    assert default_result.assignments == {}
+    assert default_result.conflicts == [
+        {
+            "leg_ids": [244, 245],
+            "position_ids": ["1001124099803507", "1001124099803509"],
+        }
+    ]
+    assert result.assignments == expected_assignments
+    assert reversed_result.assignments == expected_assignments
+    assert reversed_result.evidence_by_leg == result.evidence_by_leg
+    evidence = result.evidence_by_leg[244]
+    assert evidence["policy_version"] == 2
+    assert evidence["evidence_type"] == "equivalent_permutation_assignment"
+    assert evidence["component_leg_ids"] == [244, 245]
+    assert evidence["component_position_ids"] == [
+        "1001124099803507",
+        "1001124099803509",
+    ]
+    assert evidence["equivalence_signature"] == {
+        "binding_id": 100,
+        "entry_price": 1770.0,
+        "margin_mode": "cross",
+        "order_kind": "trigger_limit",
+        "position_mode": "split",
+        "protection_mutated": False,
+        "requested_size": 1.5,
+        "side": "short",
+        "stop_loss": 1820.0,
+        "strategy_instance_id": "strategy-1",
+        "symbol": "ETH-USDT-SWAP",
+        "take_profits": [1650.0, 1700.0],
+        "venue": "deepcoin",
+    }
+    assert evidence["mapping_basis"] == "stable_sorted_canonicalization"
+    assert evidence["ownership_statement"] == (
+        "binding owner proven; parent-child mapping canonicalized"
+    )
+
+
 def test_equivalent_component_rejects_cross_binding_graph():
     components = classify_equivalent_attribution_components(
         [_equivalent_leg(1), _equivalent_leg(2, binding_id=101)],
