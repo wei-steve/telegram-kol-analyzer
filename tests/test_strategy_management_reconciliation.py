@@ -452,6 +452,59 @@ def test_manual_close_during_full_close_reconciliation_preserves_audit(tmp_path)
 
 
 @pytest.mark.parametrize(
+    ("action", "planned", "positions"),
+    [
+        ("full_close", "2", []),
+        ("partial_close", "1", [_position("pos-1", "1")]),
+    ],
+)
+def test_entry_leg_added_after_planning_freezes_complete_identity_set(
+    action, planned, positions, tmp_path
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(
+        sf, action=action, sizes=(planned,), preflight=("2",)
+    )
+    with sf() as session:
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=batch.execution_binding_id,
+                strategy_instance_id=batch.strategy_instance_id,
+                leg_index=99,
+                purpose="entry",
+                order_kind="trigger_limit",
+                venue="deepcoin",
+                attribution_status="unassigned",
+                status="pending",
+            )
+        )
+        session.commit()
+
+    _reconcile_management(sf, positions=positions)
+
+    stored = load_management_batch(sf, batch.id)
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+        entries = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=batch.execution_binding_id, purpose="entry")
+            .order_by(ExecutionOrderLeg.leg_index)
+            .all()
+        )
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "management_reconciliation_identity_mismatch"
+    assert binding.status == "active"
+    assert lifecycle.lifecycle_status == "entered"
+    assert len(entries) == 2
+    assert entries[0].status == "active"
+    assert entries[0].terminal_reason is None
+    assert entries[1].status == "pending"
+    assert entries[1].attribution_status == "unassigned"
+    assert entries[1].pos_id is None
+
+
+@pytest.mark.parametrize(
     "symbol",
     ["BTC", "BTCUSDT", "BTC_USDT", "BTC-USDT", "BTC-USDT-SWAP"],
 )

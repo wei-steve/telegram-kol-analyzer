@@ -289,16 +289,22 @@ def _identity_is_exact(session, batch, legs) -> bool:
             or entry.terminal_reason is not None
         ):
             return False
-    exact_entry_rows = (
-        session.query(ExecutionOrderLeg.id, ExecutionOrderLeg.pos_id)
+    all_entry_rows = (
+        session.query(ExecutionOrderLeg)
         .filter(ExecutionOrderLeg.execution_binding_id == batch.execution_binding_id)
         .filter(ExecutionOrderLeg.strategy_instance_id == batch.strategy_instance_id)
         .filter(ExecutionOrderLeg.purpose == "entry")
-        .filter(ExecutionOrderLeg.attribution_status == "verified")
-        .filter(ExecutionOrderLeg.pos_id.is_not(None))
         .all()
     )
-    return {(int(row.id), str(row.pos_id)) for row in exact_entry_rows} == {
+    if any(
+        row.attribution_status != "verified"
+        or not row.pos_id
+        or str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+        or row.terminal_reason is not None
+        for row in all_entry_rows
+    ):
+        return False
+    return {(int(row.id), str(row.pos_id)) for row in all_entry_rows} == {
         (int(leg.execution_order_leg_id), str(leg.pos_id)) for leg in legs
     }
 
