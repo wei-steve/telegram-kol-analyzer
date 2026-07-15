@@ -1,3 +1,6 @@
+import ast
+import inspect
+import textwrap
 from decimal import Decimal
 
 import pytest
@@ -91,3 +94,27 @@ def test_allocate_close_sizes_fails_when_one_position_cannot_meet_its_minimum():
             quantity_step="0.5",
             min_quantity="1",
         )
+
+
+def test_allocate_close_sizes_has_no_step_count_while_loop():
+    sizing = _sizing()
+    sources = (
+        inspect.getsource(sizing.allocate_close_sizes),
+        inspect.getsource(sizing._bulk_extra_step_quotas),
+    )
+
+    for source in sources:
+        tree = ast.parse(textwrap.dedent(source))
+        assert not any(isinstance(node, ast.While) for node in ast.walk(tree))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.For) or not isinstance(node.iter, ast.Call):
+                continue
+            if not isinstance(node.iter.func, ast.Name) or node.iter.func.id != "range":
+                continue
+            range_names = {
+                child.id
+                for argument in node.iter.args
+                for child in ast.walk(argument)
+                if isinstance(child, ast.Name)
+            }
+            assert not range_names.intersection({"target", "remaining", "remaining_steps"})

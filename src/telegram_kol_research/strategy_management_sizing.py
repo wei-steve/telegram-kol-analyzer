@@ -69,30 +69,44 @@ def allocate_close_sizes(
     if (
         target_steps <= 0
         or target_steps < minimum_steps * len(current)
+        or target_steps > sum(capacity_steps, Decimal("0"))
         or any(capacity < minimum_steps for capacity in capacity_steps)
     ):
         raise ManagementSizingError("aggregate_target_below_minimum")
 
     ideal_step_counts = [value * close_fraction / step for value in current]
-    planned_steps = [minimum_steps for _ in current]
-    remaining_steps = int(target_steps - sum(planned_steps, Decimal("0")))
-    while remaining_steps:
-        eligible = [
+    extra_capacities = tuple(
+        capacity - minimum_steps for capacity in capacity_steps
+    )
+    deficit_weights = tuple(
+        max(ideal - minimum_steps, Decimal("0"))
+        for ideal in ideal_step_counts
+    )
+    exact_extras = _bulk_extra_step_quotas(
+        target_steps - minimum_steps * len(current),
+        capacities=extra_capacities,
+        weights=deficit_weights,
+    )
+    planned_steps = [
+        minimum_steps + extra.to_integral_value(rounding=ROUND_FLOOR)
+        for extra in exact_extras
+    ]
+    remainder_steps = int(target_steps - sum(planned_steps, Decimal("0")))
+    ranked_indexes = sorted(
+        (
             index
             for index, capacity in enumerate(capacity_steps)
             if planned_steps[index] < capacity
-        ]
-        if not eligible:
-            raise ManagementSizingError("aggregate_target_not_allocatable")
-        index = max(
-            eligible,
-            key=lambda candidate: (
-                ideal_step_counts[candidate] - planned_steps[candidate],
-                -candidate,
-            ),
-        )
+        ),
+        key=lambda index: (
+            -(exact_extras[index] % 1),
+            index,
+        ),
+    )
+    if remainder_steps > len(ranked_indexes):
+        raise ManagementSizingError("aggregate_target_not_allocatable")
+    for index in ranked_indexes[:remainder_steps]:
         planned_steps[index] += 1
-        remaining_steps -= 1
 
     planned = tuple(step_count * step for step_count in planned_steps)
     if (
@@ -106,3 +120,48 @@ def allocate_close_sizes(
 
 def _format_decimal(value: Decimal) -> str:
     return format(value.normalize(), "f")
+
+
+def _bulk_extra_step_quotas(
+    target: Decimal,
+    *,
+    capacities: tuple[Decimal, ...],
+    weights: tuple[Decimal, ...],
+) -> tuple[Decimal, ...]:
+    """Apportion integer-step capacity in at most one pass per leg."""
+
+    quotas = [Decimal("0") for _ in capacities]
+    active = [index for index, capacity in enumerate(capacities) if capacity > 0]
+    remaining = target
+    for _ in range(len(capacities)):
+        if remaining == 0:
+            break
+        if not active:
+            raise ManagementSizingError("aggregate_target_not_allocatable")
+        total_weight = sum((weights[index] for index in active), Decimal("0"))
+        allocation_weights = weights if total_weight > 0 else capacities
+        total_weight = sum(
+            (allocation_weights[index] for index in active), Decimal("0")
+        )
+        tentative = {
+            index: remaining * allocation_weights[index] / total_weight
+            for index in active
+        }
+        saturated = [
+            index
+            for index in active
+            if tentative[index] > capacities[index]
+        ]
+        if not saturated:
+            for index in active:
+                quotas[index] = tentative[index]
+            remaining = Decimal("0")
+            break
+        for index in saturated:
+            quotas[index] = capacities[index]
+            remaining -= capacities[index]
+        saturated_indexes = set(saturated)
+        active = [index for index in active if index not in saturated_indexes]
+    if remaining != 0:
+        raise ManagementSizingError("aggregate_target_not_allocatable")
+    return tuple(quotas)
