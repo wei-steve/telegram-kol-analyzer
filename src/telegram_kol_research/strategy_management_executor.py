@@ -109,6 +109,33 @@ def execute_management_batch(
         raise ManagementBatchExecutionError(f"batch_not_executable:{batch.status}")
     binding = _load_exact_binding(session_factory, batch)
     _require_exact_entry_legs(session_factory, batch)
+    try:
+        _require_fresh_close_write_boundary(
+            session_factory,
+            batch=batch,
+            binding=binding,
+            deepcoin_client=deepcoin_client,
+        )
+    except Exception as exc:
+        if not transition_batch(
+            session_factory,
+            batch.id,
+            expected_statuses={"executing"},
+            new_status="recovery_required",
+            transitioned_at=now,
+            reason_code=(
+                "close_final_preflight_failed"
+                if isinstance(exc, ManagementBatchExecutionError)
+                else "close_final_preflight_unavailable"
+            ),
+        ):
+            raise ManagementBatchExecutionError(
+                "management_batch_final_preflight_transition_conflict"
+            ) from exc
+        return _result(
+            load_management_batch(session_factory, batch.id),
+            reason="close_final_preflight_failed",
+        )
     # A durable reservation cannot distinguish a crash before the call from a
     # crash after a successful call. Never retry it automatically.
     for leg in batch.legs:
@@ -455,8 +482,8 @@ def _execute_protection_batch(
 
         try:
             for row in old_rows:
-                deepcoin_client.cancel_trigger_order(
-                    {"instId": inst_id, "ordId": str(row["order_id"])}
+                deepcoin_client.cancel_position_sltp(
+                    {"instType": "SWAP", "instId": inst_id, "ordId": str(row["order_id"])}
                 )
         except Exception as exc:
             transition_leg(
@@ -524,8 +551,8 @@ def _execute_protection_batch(
         restoration_error: Exception | None = None
         try:
             for order_id in created_order_ids:
-                deepcoin_client.cancel_trigger_order(
-                    {"instId": inst_id, "ordId": order_id}
+                deepcoin_client.cancel_position_sltp(
+                    {"instType": "SWAP", "instId": inst_id, "ordId": order_id}
                 )
             restore_responses = []
             for row in old_rows:
@@ -629,6 +656,37 @@ def _preflight_exact_protection_positions(
                 "protection_preflight_position_economics_drift"
             )
     return positions_by_id
+
+
+def _require_fresh_close_write_boundary(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+    binding: ExecutionBinding,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+) -> None:
+    """Re-read exact exchange positions at the shared close write boundary."""
+
+    inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
+    live_positions = list(deepcoin_client.list_positions(inst_id=inst_id))
+    positions = _preflight_exact_position_identity(
+        batch=batch,
+        binding=binding,
+        live_positions=live_positions,
+        inst_id=inst_id,
+        error_prefix="close_final_preflight",
+        ignored_owned_pos_ids=_other_exact_strategy_position_ids(
+            session_factory, batch=batch, binding=binding
+        ),
+    )
+    for leg in batch.legs:
+        if not _decimal_equal(
+            _first_text(positions[leg.pos_id], "pos", "size", "sz"),
+            leg.preflight_size,
+        ):
+            raise ManagementBatchExecutionError(
+                "close_final_preflight_position_size_drift"
+            )
 
 
 def _preflight_exact_position_identity(
@@ -868,7 +926,13 @@ def _protection_row_payload(
 ) -> dict[str, Any]:
     payload = dict(common)
     size = row.get("size")
-    if size not in (None, ""):
+    if not row.get("full_position"):
+        try:
+            parsed_size = Decimal(str(size))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ManagementBatchExecutionError("invalid_partial_protection_size") from exc
+        if not parsed_size.is_finite() or parsed_size <= 0:
+            raise ManagementBatchExecutionError("invalid_partial_protection_size")
         payload["sz"] = str(size)
     purpose = row.get("purpose")
     if purpose in {"take_profit", "stop_loss"}:

@@ -20,6 +20,7 @@ from telegram_kol_research.execution_bindings import (
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    RawMessage,
     RecognitionDecision,
     SignalCandidate,
     StrategyLifecycle,
@@ -87,6 +88,7 @@ class ManagementPlanningResult:
 
 @dataclass(frozen=True, slots=True)
 class _PlanningIdentity:
+    raw_message: RawMessage
     candidate: SignalCandidate
     recognition_decision_id: int
     recognition_decision_state: tuple[Any, ...]
@@ -534,6 +536,7 @@ def _load_exact_identity(
     candidate_id: int | None = None,
 ) -> _PlanningIdentity | ManagementPlanningResult:
     with session_factory() as session:
+        raw_message = session.get(RawMessage, raw_message_id)
         decision = (
             session.query(RecognitionDecision)
             .filter(RecognitionDecision.raw_message_id == raw_message_id)
@@ -572,6 +575,21 @@ def _load_exact_identity(
                 status="blocked",
                 reason_code="target_lifecycle_not_found",
                 target_lifecycle_id=lifecycle_id,
+            )
+        if (
+            raw_message is None
+            or candidate.raw_message_id != raw_message.id
+            or decision.raw_message_id != raw_message.id
+            or raw_message.chat_id != lifecycle.chat_id
+            or str(candidate.symbol or "").upper()
+            != str(lifecycle.symbol or "").upper()
+            or str(candidate.side or "").lower()
+            != str(lifecycle.side or "").lower()
+        ):
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="target_source_identity_mismatch",
+                target_lifecycle_id=lifecycle.id,
             )
         if lifecycle.execution_binding_id is None:
             return ManagementPlanningResult(
@@ -615,12 +633,14 @@ def _load_exact_identity(
             .order_by(ExecutionOrderLeg.leg_index.asc(), ExecutionOrderLeg.id.asc())
             .all()
         )
+        session.expunge(raw_message)
         session.expunge(candidate)
         session.expunge(lifecycle)
         session.expunge(binding)
         for leg in entry_legs:
             session.expunge(leg)
         return _PlanningIdentity(
+            raw_message=raw_message,
             candidate=candidate,
             recognition_decision_id=decision.id,
             recognition_decision_state=_recognition_decision_state(decision),
@@ -679,6 +699,7 @@ def _binding_matches_lifecycle(
 
 def _require_frozen_identity_current(session, identity: _PlanningIdentity) -> None:
     expected_candidate = identity.candidate
+    current_raw_message = session.get(RawMessage, identity.raw_message.id)
     current_candidate = session.get(SignalCandidate, expected_candidate.id)
     decision = session.get(RecognitionDecision, identity.recognition_decision_id)
     current_lifecycle = session.get(StrategyLifecycle, identity.lifecycle.id)
@@ -702,10 +723,20 @@ def _require_frozen_identity_current(session, identity: _PlanningIdentity) -> No
         .all()
     ]
     if (
-        current_candidate is None
+        current_raw_message is None
+        or current_candidate is None
         or decision is None
         or current_lifecycle is None
         or current_binding is None
+        or _raw_message_state(current_raw_message)
+        != _raw_message_state(identity.raw_message)
+        or current_candidate.raw_message_id != current_raw_message.id
+        or decision.raw_message_id != current_raw_message.id
+        or current_raw_message.chat_id != current_lifecycle.chat_id
+        or str(current_candidate.symbol or "").upper()
+        != str(current_lifecycle.symbol or "").upper()
+        or str(current_candidate.side or "").lower()
+        != str(current_lifecycle.side or "").lower()
         or _candidate_state(current_candidate) != _candidate_state(expected_candidate)
         or _recognition_decision_state(decision)
         != identity.recognition_decision_state
@@ -825,6 +856,10 @@ def _candidate_state(candidate: SignalCandidate) -> tuple[Any, ...]:
         candidate.symbol,
         candidate.side,
     )
+
+
+def _raw_message_state(raw_message: RawMessage) -> tuple[Any, ...]:
+    return (raw_message.id, raw_message.chat_id, raw_message.message_id)
 
 
 def _recognition_decision_state(decision: RecognitionDecision) -> tuple[Any, ...]:

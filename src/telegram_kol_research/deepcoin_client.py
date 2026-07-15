@@ -8,6 +8,8 @@ import hmac
 import json
 import os
 import time
+import threading
+from collections import deque
 from collections.abc import Callable
 from urllib.parse import urlencode
 from dataclasses import dataclass
@@ -32,6 +34,7 @@ DEEPCOIN_TRADE_FILLS_PATH = "/deepcoin/trade/fills"
 DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH = "/deepcoin/trade/trigger-orders-pending"
 DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH = "/deepcoin/trade/trigger-orders-history"
 DEEPCOIN_SET_POSITION_SLTP_PATH = "/deepcoin/trade/set-position-sltp"
+DEEPCOIN_CANCEL_POSITION_SLTP_PATH = "/deepcoin/trade/cancel-position-sltp"
 DEEPCOIN_ACCOUNT_POSITIONS_PATH = "/deepcoin/account/positions"
 DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH = "/deepcoin/account/positions-history"
 DEEPCOIN_MARKET_TICKERS_PATH = "/deepcoin/market/tickers"
@@ -76,6 +79,9 @@ class DeepcoinTradingClientProtocol(Protocol):
 
     def set_position_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
         """Set take-profit / stop-loss protection for an existing position."""
+
+    def cancel_position_sltp(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
+        """Cancel one existing position TPSL row by its exact order id."""
 
     def replace_order_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
         """Attach or replace take-profit / stop-loss protection for an open limit order."""
@@ -151,6 +157,59 @@ def load_deepcoin_credentials(
     )
 
 
+class DeepcoinTpslWriteLimiter:
+    """Thread-safe sliding-window limiter shared by all position TPSL writes."""
+
+    def __init__(
+        self,
+        *,
+        monotonic_factory: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        per_second: int = 15,
+        per_minute: int = 450,
+    ) -> None:
+        self._clock = monotonic_factory
+        self._sleep = sleep_fn
+        self._per_second = max(1, int(per_second))
+        self._per_minute = max(1, int(per_minute))
+        self._starts: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        with self._lock:
+            while True:
+                now = self._clock()
+                while self._starts and now - self._starts[0] >= 60.0:
+                    self._starts.popleft()
+                recent_second = [started for started in self._starts if now - started < 1.0]
+                delays: list[float] = []
+                if len(recent_second) >= self._per_second:
+                    delays.append(1.0 - (now - recent_second[-self._per_second]))
+                if len(self._starts) >= self._per_minute:
+                    delays.append(60.0 - (now - self._starts[-self._per_minute]))
+                delay = max(delays, default=0.0)
+                if delay <= 0:
+                    self._starts.append(now)
+                    return
+                self._sleep(delay)
+
+
+_TPSL_LIMITERS_LOCK = threading.Lock()
+_TPSL_LIMITERS: dict[tuple[str, str], DeepcoinTpslWriteLimiter] = {}
+
+
+def _shared_tpsl_limiter(credentials: DeepcoinCredentials) -> DeepcoinTpslWriteLimiter:
+    """Return the process-wide limiter for one API credential scope."""
+
+    key = (credentials.base_url.rstrip("/"), credentials.api_key)
+    with _TPSL_LIMITERS_LOCK:
+        limiter = _TPSL_LIMITERS.get(key)
+        if limiter is None:
+            limiter = DeepcoinTpslWriteLimiter()
+            _TPSL_LIMITERS[key] = limiter
+        return limiter
+
+
 class DeepcoinRestClient:
     """Small authenticated Deepcoin REST client."""
 
@@ -163,6 +222,7 @@ class DeepcoinRestClient:
         monotonic_factory: Callable[[], float] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
         position_history_min_interval_seconds: float = 1.05,
+        tpsl_rate_limiter: "DeepcoinTpslWriteLimiter | None" = None,
     ) -> None:
         self._credentials = credentials
         self._http_client = http_client
@@ -174,6 +234,17 @@ class DeepcoinRestClient:
             float(position_history_min_interval_seconds),
         )
         self._last_position_history_request_started_at: float | None = None
+        if tpsl_rate_limiter is not None:
+            self._tpsl_rate_limiter = tpsl_rate_limiter
+        elif monotonic_factory is not None or sleep_fn is not None:
+            # Explicit clocks are test/integration scopes and must remain
+            # deterministic. Production defaults share by credential UID.
+            self._tpsl_rate_limiter = DeepcoinTpslWriteLimiter(
+                monotonic_factory=self._monotonic_factory,
+                sleep_fn=self._sleep_fn,
+            )
+        else:
+            self._tpsl_rate_limiter = _shared_tpsl_limiter(credentials)
 
     def place_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_PLACE_ORDER_PATH, order_payload)
@@ -182,7 +253,18 @@ class DeepcoinRestClient:
         return self._request("POST", DEEPCOIN_TRIGGER_ORDER_PATH, order_payload)
 
     def set_position_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
+        self._tpsl_rate_limiter.acquire()
         return self._request("POST", DEEPCOIN_SET_POSITION_SLTP_PATH, protection_payload)
+
+    def cancel_position_sltp(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
+        required = {"instType", "instId", "ordId"}
+        if any(cancel_payload.get(key) in (None, "") for key in required):
+            raise DeepcoinClientError(
+                "cancel-position-sltp requires instType, instId, and ordId"
+            )
+        payload = {key: cancel_payload[key] for key in ("instType", "instId", "ordId")}
+        self._tpsl_rate_limiter.acquire()
+        return self._request("POST", DEEPCOIN_CANCEL_POSITION_SLTP_PATH, payload)
 
     def replace_order_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_REPLACE_ORDER_SLTP_PATH, protection_payload)

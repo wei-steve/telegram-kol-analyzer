@@ -277,6 +277,62 @@ def test_selected_lifecycle_cannot_borrow_same_symbol_binding(monkeypatch, tmp_p
     assert len(calls) == 1
 
 
+def test_cross_chat_management_raw_cannot_target_lifecycle(monkeypatch, tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(session_factory)
+    with session_factory() as session:
+        session.get(RawMessage, raw_id).chat_id = 999
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin([_position()])
+
+    result = planner.plan_strategy_management_batch(
+        session_factory, raw_message_id=raw_id, deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(), planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "target_source_identity_mismatch"
+    assert client.write_calls == []
+
+
+def test_cross_chat_lifecycle_binding_is_blocked(monkeypatch, tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_exact_management_target(session_factory)
+    with session_factory() as session:
+        session.get(ExecutionBinding, binding_id).chat_id = 999
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin([_position()])
+
+    result = planner.plan_strategy_management_batch(
+        session_factory, raw_message_id=raw_id, deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(), planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert client.write_calls == []
+
+
+def test_management_candidate_strategy_fields_must_match_target(monkeypatch, tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(session_factory)
+    with session_factory() as session:
+        session.query(SignalCandidate).filter_by(raw_message_id=raw_id).one().symbol = "ETH"
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+    result = planner.plan_strategy_management_batch(
+        session_factory, raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(), planned_at=PLANNED_AT,
+    )
+    assert result.status == "blocked"
+    assert result.reason_code == "target_source_identity_mismatch"
+
+
 def test_selected_lifecycle_rejects_stale_pointer_to_other_lifecycle_binding(
     monkeypatch, tmp_path
 ):
@@ -1095,6 +1151,33 @@ def test_final_revalidation_runs_inside_insert_transaction(monkeypatch, tmp_path
         from telegram_kol_research.models import StrategyManagementBatch
 
         assert session.query(StrategyManagementBatch).count() == 0
+
+
+def test_final_revalidation_blocks_raw_chat_change_inside_insert_transaction(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(session_factory)
+    _disable_reconciliation(monkeypatch, planner)
+    original = planner.create_management_batch_in_session
+
+    def mutate_then_create(session, *args, **kwargs):
+        with session_factory() as other_session:
+            other_session.get(RawMessage, raw_id).chat_id = 999
+            other_session.commit()
+        return original(session, *args, **kwargs)
+
+    monkeypatch.setattr(planner, "create_management_batch_in_session", mutate_then_create)
+    result = planner.plan_strategy_management_batch(
+        session_factory, raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(), planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "target_identity_changed_during_planning"
+    assert result.batch is None
 
 
 def test_final_competing_owner_error_returns_blocked_without_leaking(

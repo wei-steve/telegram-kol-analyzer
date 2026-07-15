@@ -72,6 +72,8 @@ class _FakeDeepcoinClient:
         ]
         self.open_orders = []
         self.cancel_trigger_payloads = []
+        self.actual_trigger_order_payloads = []
+        self.cancel_position_payloads = []
         self.cancel_order_payloads = []
         self.protection_payloads = []
         self.protection_outcomes = []
@@ -91,6 +93,12 @@ class _FakeDeepcoinClient:
         return []
 
     def cancel_trigger_order(self, cancel_payload):
+        self.actual_trigger_order_payloads.append(cancel_payload)
+        self.cancel_trigger_payloads.append(cancel_payload)
+        return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
+
+    def cancel_position_sltp(self, cancel_payload):
+        self.cancel_position_payloads.append(cancel_payload)
         self.cancel_trigger_payloads.append(cancel_payload)
         return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
 
@@ -1423,6 +1431,8 @@ def test_adjust_stop_loss_cancels_existing_position_tpsl_before_resetting(tmp_pa
     )
 
     assert [item["ordId"] for item in client.cancel_trigger_payloads] == ["tp-old", "sl-old"]
+    assert client.actual_trigger_order_payloads == []
+    assert all(item["instType"] == "SWAP" for item in client.cancel_position_payloads)
     assert [
         (item.get("tpTriggerPx"), item.get("slTriggerPx"), item["sz"])
         for item in client.protection_payloads

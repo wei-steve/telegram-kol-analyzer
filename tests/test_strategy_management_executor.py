@@ -255,6 +255,24 @@ class _FakeClient:
         ])
         self.calls = []
 
+    def list_positions(self, *, inst_id=None):
+        with self.session_factory() as session:
+            legs = (
+                session.query(StrategyManagementLeg)
+                .order_by(StrategyManagementLeg.leg_index)
+                .all()
+            )
+            binding = session.query(ExecutionBinding).first()
+            return [
+                {
+                    "posId": leg.pos_id,
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": binding.side,
+                    "pos": leg.preflight_size,
+                }
+                for leg in legs
+            ]
+
     def place_order(self, payload):
         with self.session_factory() as session:
             status = (
@@ -319,7 +337,7 @@ class _ProtectionClient:
             "data": {"ordId": f"close-{len(self.close_calls)}"},
         }
 
-    def cancel_trigger_order(self, payload):
+    def cancel_position_sltp(self, payload):
         self.cancel_calls.append(dict(payload))
         if self.cancel_outcomes:
             outcome = self.cancel_outcomes.pop(0)
@@ -401,6 +419,77 @@ def test_close_legs_are_committed_reserved_before_exact_market_submission(tmp_pa
         assert binding.status == "active"
         assert lifecycle.lifecycle_status == "entered"
         assert [entry.status for entry in entries] == ["active", "active"]
+
+
+@pytest.mark.parametrize("failure", ["snapshot_error", "size_drift", "missing", "extra"])
+def test_sync_live_final_close_preflight_freezes_before_place_order(
+    failure, tmp_path
+):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+
+    class Client(_FakeClient):
+        def list_positions(self, *, inst_id=None):
+            if failure == "snapshot_error":
+                raise RuntimeError("snapshot unavailable")
+            rows = super().list_positions(inst_id=inst_id)
+            if failure == "size_drift":
+                rows[0]["pos"] = "999"
+            elif failure == "missing":
+                rows.pop()
+            elif failure == "extra":
+                rows.append({
+                    "posId": "unowned-extra", "instId": "BTC-USDT-SWAP",
+                    "posSide": "short", "pos": "1",
+                })
+            return rows
+
+    client = Client(session_factory)
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert client.calls == []
+
+
+def test_final_close_preflight_allows_strict_other_strategy_position(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+    with session_factory() as session:
+        other = ExecutionBinding(
+            strategy_instance_id="deepcoin:200:20:BTC:short", kol_id="bob",
+            chat_id=200, message_id=20, symbol="BTC", side="short",
+            venue="deepcoin", pos_id="pos-other", status="active",
+        )
+        session.add(other)
+        session.flush()
+        session.add(ExecutionOrderLeg(
+            execution_binding_id=other.id,
+            strategy_instance_id=other.strategy_instance_id,
+            leg_index=0, purpose="entry", order_kind="market",
+            order_id="entry-other", pos_id="pos-other", venue="deepcoin",
+            attribution_status="verified", status="active",
+        ))
+        session.commit()
+
+    class Client(_FakeClient):
+        def list_positions(self, *, inst_id=None):
+            return super().list_positions(inst_id=inst_id) + [{
+                "posId": "pos-other", "instId": "BTC-USDT-SWAP",
+                "posSide": "short", "pos": "3",
+            }]
+
+    client = Client(session_factory)
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+    assert result["status"] == "reconciling"
+    assert len(client.calls) == 2
 
 
 def test_definite_failure_continues_later_leg_and_is_partial_failed(tmp_path):
@@ -659,6 +748,11 @@ def test_explicit_stop_replaces_every_position_and_preserves_each_take_profit(tm
     ]
     assert client.set_calls[0]["tpTriggerPxType"] == "mark"
     assert client.set_calls[1]["tpOrdPx"] == "61990"
+    assert client.set_calls[0]["sz"] == "1"
+    assert "sz" not in client.set_calls[2]
+    assert client.set_calls[3]["sz"] == "4"
+    assert "sz" not in client.set_calls[4]
+    assert all(call["instType"] == "SWAP" for call in client.cancel_calls)
 
 
 def test_break_even_uses_each_positions_own_average_entry(tmp_path):

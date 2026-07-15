@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import text
@@ -253,8 +254,10 @@ def adjust_position_tpsl(
 
     cancel_responses: list[dict[str, Any]] = []
     for order_id in old_order_ids:
-        cancel_payload = {"instId": inst_id, "ordId": str(order_id)}
-        response = deepcoin_client.cancel_trigger_order(cancel_payload)
+        cancel_payload = {
+            "instType": "SWAP", "instId": inst_id, "ordId": str(order_id)
+        }
+        response = deepcoin_client.cancel_position_sltp(cancel_payload)
         cancel_responses.append({"order_id": str(order_id), "response": response})
         record_execution_event(
             session_factory,
@@ -298,8 +301,8 @@ def adjust_position_tpsl(
             ) from replacement_error
         try:
             for new_order_id in new_order_ids:
-                deepcoin_client.cancel_trigger_order(
-                    {"instId": inst_id, "ordId": new_order_id}
+                deepcoin_client.cancel_position_sltp(
+                    {"instType": "SWAP", "instId": inst_id, "ordId": new_order_id}
                 )
             for old_row in old_row_snapshots:
                 restore_response = deepcoin_client.set_position_sltp(
@@ -1240,7 +1243,13 @@ def _build_position_tpsl_row_payload(
     common: dict[str, Any], row: dict[str, Any]
 ) -> dict[str, Any]:
     result = dict(common)
-    if row.get("size") not in (None, ""):
+    if not row.get("full_position"):
+        try:
+            size = Decimal(str(row.get("size")))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise DeepcoinExecutionActionError("invalid_partial_position_tpsl_size") from exc
+        if not size.is_finite() or size <= 0:
+            raise DeepcoinExecutionActionError("invalid_partial_position_tpsl_size")
         result["sz"] = str(row["size"])
     purpose = row.get("purpose")
     if purpose in {"take_profit", "stop_loss"}:

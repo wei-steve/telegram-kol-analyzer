@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import json
 
 import httpx
 import pytest
@@ -9,6 +10,7 @@ from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinCredentials
 from telegram_kol_research.deepcoin_client import DeepcoinRestClient
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
+from telegram_kol_research.deepcoin_client import DeepcoinTpslWriteLimiter
 from telegram_kol_research.deepcoin_client import build_deepcoin_auth_headers
 from telegram_kol_research.deepcoin_client import load_deepcoin_credentials
 from telegram_kol_research.deepcoin_client import _raise_for_deepcoin_business_error
@@ -181,6 +183,92 @@ def test_deepcoin_business_error_checks_nested_scode():
         assert "InsufficientMoney" in str(exc)
     else:
         raise AssertionError("expected nested sCode failure")
+
+
+def test_cancel_position_sltp_uses_official_contract_and_shared_write_limiter():
+    clock = _FakeMonotonicClock(0.0)
+    http_client = _CapturingHttpClient(
+        {"code": "0", "data": [{"ordId": "tp-1", "sCode": "0"}]}
+    )
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        timestamp_factory=lambda: "2026-07-15T09:00:00.000Z",
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
+    )
+
+    for index in range(16):
+        if index % 2:
+            client.cancel_position_sltp(
+                {"instType": "SWAP", "instId": "BTC-USDT-SWAP", "ordId": f"tp-{index}"}
+            )
+        else:
+            client.set_position_sltp(
+                {"instType": "SWAP", "instId": "BTC-USDT-SWAP", "posId": "pos-1", "slTriggerPx": "64000"}
+            )
+
+    cancel = http_client.requests[1]
+    assert cancel["request_path"] == "/deepcoin/trade/cancel-position-sltp"
+    assert json.loads(cancel["content"]) == {
+        "instType": "SWAP", "instId": "BTC-USDT-SWAP", "ordId": "tp-1"
+    }
+    assert clock.sleeps == [pytest.approx(1.0)]
+
+
+def test_cancel_position_sltp_rejects_nested_business_error():
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient(
+            {"code": "0", "data": [{"ordId": "tp-1", "sCode": "51000", "sMsg": "rejected"}]}
+        ),
+    )
+    with pytest.raises(DeepcoinClientError, match="51000"):
+        client.cancel_position_sltp(
+            {"instType": "SWAP", "instId": "BTC-USDT-SWAP", "ordId": "tp-1"}
+        )
+
+
+def test_two_clients_share_one_injected_tpsl_credential_limiter():
+    clock = _FakeMonotonicClock(0.0)
+    limiter = DeepcoinTpslWriteLimiter(
+        monotonic_factory=clock, sleep_fn=clock.sleep
+    )
+    credentials = DeepcoinCredentials(api_key="uid-key", api_secret="secret", passphrase="pass")
+    clients = [
+        DeepcoinRestClient(
+            credentials,
+            http_client=_CapturingHttpClient({"code": "0", "data": [{"ordId": "x", "sCode": "0"}]}),
+            tpsl_rate_limiter=limiter,
+        )
+        for _ in range(2)
+    ]
+    for index in range(16):
+        clients[index % 2].set_position_sltp(
+            {"instType": "SWAP", "instId": "BTC-USDT-SWAP", "slTriggerPx": "1"}
+        )
+    assert clock.sleeps == [pytest.approx(1.0)]
+
+
+def test_two_default_clients_share_process_limiter_by_credential_uid():
+    credentials = DeepcoinCredentials(
+        api_key="unique-default-uid", api_secret="secret", passphrase="pass",
+        base_url="https://api.deepcoin.test",
+    )
+    first = DeepcoinRestClient(credentials)
+    second = DeepcoinRestClient(credentials)
+    assert first._tpsl_rate_limiter is second._tpsl_rate_limiter
+
+
+def test_tpsl_limiter_enforces_450_per_minute_with_fake_clock():
+    clock = _FakeMonotonicClock(0.0)
+    limiter = DeepcoinTpslWriteLimiter(
+        monotonic_factory=clock, sleep_fn=clock.sleep,
+        per_second=10_000, per_minute=450,
+    )
+    for _ in range(451):
+        limiter.acquire()
+    assert clock.sleeps == [pytest.approx(60.0)]
 
 
 def test_deepcoin_client_lists_order_and_trigger_history_with_swap_query():

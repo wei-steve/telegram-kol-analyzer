@@ -115,6 +115,21 @@ lifecycle state. The permitted ownership states are `verified`, `unassigned`,
 failure freezes automatic close and TPSL mutation. API failure is never treated
 as position/order absence.
 
+Strategy-management source isolation is end to end. The management raw
+message, authoritative candidate, and recognition decision must identify the
+same raw row and chat; the target lifecycle, strategy instance, and binding
+must preserve that chat and exact lifecycle-to-binding chain. The planner
+checks this initially and again inside the atomic batch-create transaction.
+Cross-chat or stale pointers create no executable work and no Deepcoin write.
+
+Every close entry point performs a fresh exchange position read at the shared
+executor boundary after the durable claim and before any leg reservation. The
+exact owned `posId`/instrument/side/current-size set must equal the frozen
+preflight. Snapshot errors, manual closes, partial-size drift, or an unowned
+extra/missing leg durably freeze the batch as `recovery_required` with zero
+close submissions. Positions uniquely verified as another strategy's remain
+excluded only through the strict ownership allowlist.
+
 An exact order/client ID proves which fill belongs to a leg, but does not by
 itself prove which later position that fill opened. Regular fills require either
 an explicit `fill.posId` or Deepcoin's direct `order_id == posId` identity.
