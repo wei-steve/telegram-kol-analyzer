@@ -406,25 +406,54 @@ def test_reviewed_equivalent_assignments_authorize_close_and_tpsl_management(tmp
 
 
 @pytest.mark.parametrize(
-    "mutate",
+    ("case", "mutate"),
     [
-        lambda evidence, legs: evidence.pop("policy_version"),
-        lambda evidence, legs: evidence.pop("component_leg_ids"),
-        lambda evidence, legs: evidence.pop("component_position_ids"),
-        lambda evidence, legs: evidence.pop("mapping_basis"),
-        lambda evidence, legs: evidence.pop("ownership_statement"),
-        lambda evidence, legs: evidence["component_position_ids"].reverse(),
-        lambda evidence, legs: evidence["equivalence_signature"].pop("symbol"),
-        lambda evidence, legs: evidence["equivalence_signature"].pop(
-            "leg_population"
-        ),
-        lambda evidence, legs: evidence["equivalence_signature"].pop(
-            "position_population"
+        ("missing_policy", lambda evidence, legs: evidence.pop("policy_version")),
+        ("missing_legs", lambda evidence, legs: evidence.pop("component_leg_ids")),
+        ("missing_positions", lambda evidence, legs: evidence.pop("component_position_ids")),
+        ("missing_basis", lambda evidence, legs: evidence.pop("mapping_basis")),
+        ("missing_statement", lambda evidence, legs: evidence.pop("ownership_statement")),
+        ("reversed_pair", lambda evidence, legs: evidence["component_position_ids"].reverse()),
+        ("missing_signature_symbol", lambda evidence, legs: evidence["equivalence_signature"].pop("symbol")),
+        ("missing_leg_population", lambda evidence, legs: evidence["equivalence_signature"].pop("leg_population")),
+        ("missing_position_population", lambda evidence, legs: evidence["equivalence_signature"].pop("position_population")),
+        ("wrong_signature_binding", lambda evidence, legs: evidence["equivalence_signature"].update(binding_id=999)),
+        ("wrong_signature_strategy", lambda evidence, legs: evidence["equivalence_signature"].update(strategy_instance_id="forged")),
+        ("wrong_signature_venue", lambda evidence, legs: evidence["equivalence_signature"].update(venue="other")),
+        ("wrong_signature_order_kind", lambda evidence, legs: evidence["equivalence_signature"].update(order_kind="limit")),
+        ("cross_owner_leg", lambda evidence, legs: evidence["equivalence_signature"]["leg_population"][1].update(binding_id=999)),
+        ("cross_strategy_leg", lambda evidence, legs: evidence["equivalence_signature"]["leg_population"][1].update(strategy_instance_id="forged")),
+        ("other_position_symbol", lambda evidence, legs: evidence["equivalence_signature"]["position_population"][1].update(symbol="BTC-USDT-SWAP")),
+        ("current_position_side", lambda evidence, legs: evidence["equivalence_signature"]["position_population"][0].update(side="short")),
+        ("other_position_size", lambda evidence, legs: evidence["equivalence_signature"]["position_population"][1].update(size=0.2)),
+        ("current_position_entry", lambda evidence, legs: evidence["equivalence_signature"]["position_population"][0].update(entry_price=1581.0)),
+        ("other_position_margin", lambda evidence, legs: evidence["equivalence_signature"]["position_population"][1].update(margin_mode="isolated")),
+        ("current_position_mode", lambda evidence, legs: evidence["equivalence_signature"]["position_population"][0].update(position_mode="merged")),
+        ("other_position_stop", lambda evidence, legs: evidence["equivalence_signature"]["position_population"][1].update(stop_loss=1550.0)),
+        ("current_position_take_profit", lambda evidence, legs: evidence["equivalence_signature"]["position_population"][0].update(take_profits=[1610.0])),
+        (
+            "forged_member",
+            lambda evidence, legs: (
+                evidence["component_leg_ids"].append(999),
+                evidence["component_position_ids"].append("pos-3"),
+                evidence["equivalence_signature"]["leg_population"].append(
+                    {
+                        **evidence["equivalence_signature"]["leg_population"][0],
+                        "leg_id": 999,
+                    }
+                ),
+                evidence["equivalence_signature"]["position_population"].append(
+                    {
+                        **evidence["equivalence_signature"]["position_population"][0],
+                        "position_id": "pos-3",
+                    }
+                ),
+            ),
         ),
     ],
 )
 def test_reviewed_equivalent_assignment_fails_closed_when_schema_is_incomplete_or_stale(
-    tmp_path, mutate
+    tmp_path, case, mutate
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
     _binding(
@@ -434,6 +463,35 @@ def test_reviewed_equivalent_assignment_fails_closed_when_schema_is_incomplete_o
         client_order_id="client-1,client-2",
     )
     _persist_reviewed_equivalent_assignments(session_factory, mutate=mutate)
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="position_ownership_evidence_not_authoritative",
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+        )
+
+    assert client.order_payloads == []
+
+
+def test_reviewed_equivalent_assignment_rejects_stale_other_component_leg(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    _persist_reviewed_equivalent_assignments(session_factory)
+    with session_factory() as session:
+        session.query(ExecutionOrderLeg).filter_by(leg_index=2).one().pos_id = (
+            "stale-pos-2"
+        )
+        session.commit()
     client = _FakeDeepcoinClient()
 
     with pytest.raises(

@@ -39,7 +39,7 @@ from telegram_kol_research.telegram_bot_commands import (
 )
 
 
-def test_reviewed_equivalent_assignment_maps_to_dedicated_web_provenance():
+def test_incomplete_equivalent_assignment_does_not_render_reviewed_provenance():
     leg = SimpleNamespace(
         attribution_evidence_json=json.dumps(
             {
@@ -69,10 +69,10 @@ def test_reviewed_equivalent_assignment_maps_to_dedicated_web_provenance():
 
     assert attribution is not None
     assert attribution["group_name"] == "米娅 vip 会员群 11分组"
-    assert attribution["provenance_label"] == "等价腿确定性归属"
-    assert attribution["reasons"] == [
-        "已审核等价腿组件，按稳定排序确定腿/仓位映射"
-    ]
+    assert attribution["state"] == "conflict"
+    assert attribution["label"] == "归属待确认"
+    assert attribution["provenance_label"] is None
+    assert "等价腿确定性归属" not in attribution["reasons"]
 
 
 def test_semantic_review_worker_lifespan_starts_once_without_telegram_and_stops_first(

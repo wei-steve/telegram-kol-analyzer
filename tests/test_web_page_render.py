@@ -652,19 +652,51 @@ def test_reviewed_equivalent_positions_render_miya_and_deterministic_provenance(
                 "binding owner proven; parent-child mapping canonicalized"
             ),
             "equivalence_signature": {
+                "binding_id": binding.id,
+                "strategy_instance_id": binding.strategy_instance_id,
+                "venue": "deepcoin",
+                "symbol": "ETH-USDT-SWAP",
+                "side": "short",
+                "requested_size": 1.5,
+                "entry_price": 1770.0,
+                "stop_loss": 1820.0,
+                "take_profits": [1700.0],
+                "protection_mutated": False,
+                "margin_mode": "cross",
+                "position_mode": "split",
+                "order_kind": "trigger_limit",
                 "leg_population": [
                     {
                         "leg_id": leg.id,
                         "binding_id": binding.id,
                         "strategy_instance_id": binding.strategy_instance_id,
                         "venue": "deepcoin",
+                        "symbol": "ETH-USDT-SWAP",
+                        "side": "short",
+                        "requested_size": 1.5,
+                        "entry_price": 1770.0,
+                        "stop_loss": 1820.0,
+                        "take_profits": [1700.0],
+                        "margin_mode": "cross",
+                        "position_mode": "split",
                         "order_kind": "trigger_limit",
+                        "protection_mutated": False,
                     }
                     for leg in legs
                 ],
                 "position_population": [
-                    {"position_id": "pos-miya-1"},
-                    {"position_id": "pos-miya-2"},
+                    {
+                        "position_id": pos_id,
+                        "symbol": "ETH-USDT-SWAP",
+                        "side": "short",
+                        "size": 1.5,
+                        "entry_price": 1770.0,
+                        "stop_loss": 1820.0,
+                        "take_profits": [1700.0],
+                        "margin_mode": "cross",
+                        "position_mode": "split",
+                    }
+                    for pos_id in ("pos-miya-1", "pos-miya-2")
                 ],
             },
         }
@@ -691,7 +723,7 @@ def test_reviewed_equivalent_positions_render_miya_and_deterministic_provenance(
         def list_order_history(self, *, inst_id=None):
             return []
 
-    response = TestClient(
+    client = TestClient(
         create_web_app(
             database_path=database_path,
             group_config=GroupConfig(
@@ -706,7 +738,8 @@ def test_reviewed_equivalent_positions_render_miya_and_deterministic_provenance(
             ),
             deepcoin_client_factory=FakeDeepcoinClient,
         )
-    ).get("/positions-panel")
+    )
+    response = client.get("/positions-panel")
 
     assert response.status_code == 200
     assert "米娅 vip 会员群 11分组" in response.text
@@ -714,6 +747,19 @@ def test_reviewed_equivalent_positions_render_miya_and_deterministic_provenance(
     assert "已审核等价腿组件，按稳定排序确定腿/仓位映射" in response.text
     assert "Deepcoin 直接 ID 证明" not in response.text
     assert "equivalent_permutation_assignment" not in response.text
+
+    with session_factory() as session:
+        session.query(ExecutionOrderLeg).filter_by(leg_index=2).one().pos_id = (
+            "stale-pos-miya-2"
+        )
+        session.commit()
+
+    stale_response = client.get("/positions-panel")
+
+    assert stale_response.status_code == 200
+    assert "等价腿确定性归属" not in stale_response.text
+    assert "归属待确认" in stale_response.text
+    assert "等价腿归属证据不完整或已过期" in stale_response.text
 
 
 def test_conflicted_position_renders_frozen_persisted_attribution(tmp_path):

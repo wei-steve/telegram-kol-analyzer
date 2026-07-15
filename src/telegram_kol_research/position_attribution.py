@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 import json
-from math import inf, isclose
+from math import inf, isclose, isfinite
 import re
 from typing import Iterable, Mapping
 
@@ -137,14 +137,14 @@ def require_verified_position_ownership(session, *, venue: str, pos_id: str):
     state = str(leg.attribution_status or "unassigned")
     if state != "verified":
         raise PositionAttributionError(f"position_ownership_not_verified:{state}")
-    if not has_authoritative_persisted_position(leg):
+    if not has_authoritative_persisted_position(leg, session=session):
         raise PositionAttributionError("position_ownership_evidence_not_authoritative")
     if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
         raise PositionAttributionError("position_ownership_terminal")
     return leg
 
 
-def has_authoritative_persisted_position(leg) -> bool:
+def has_authoritative_persisted_position(leg, *, session=None) -> bool:
     """Return whether a persisted leg may authorize live position mutation."""
 
     pos_id = str(getattr(leg, "pos_id", None) or "")
@@ -164,7 +164,9 @@ def has_authoritative_persisted_position(leg) -> bool:
         isinstance(evidence, dict)
         and evidence.get("evidence_type") == "equivalent_permutation_assignment"
     ):
-        return _has_authoritative_equivalent_permutation_assignment(leg, evidence)
+        return _has_authoritative_equivalent_permutation_assignment(
+            leg, evidence, session=session
+        )
     if (
         str(getattr(leg, "order_kind", None) or "") == "manual_bind"
         and isinstance(evidence, dict)
@@ -178,7 +180,7 @@ def has_authoritative_persisted_position(leg) -> bool:
 
 
 def _has_authoritative_equivalent_permutation_assignment(
-    leg, evidence: Mapping[str, object]
+    leg, evidence: Mapping[str, object], *, session=None
 ) -> bool:
     """Trust only the complete reviewed canonical evidence emitted by repair."""
 
@@ -230,9 +232,30 @@ def _has_authoritative_equivalent_permutation_assignment(
     if component_position_ids[pair_index] != current_pos_id:
         return False
 
-    signature = evidence.get("equivalence_signature")
-    if not isinstance(signature, dict):
+    populations = _validated_equivalent_assignment_populations(
+        evidence.get("equivalence_signature")
+    )
+    if populations is None:
         return False
+    population_legs, population_positions = populations
+    if [item.leg_id for item in population_legs] != component_leg_ids:
+        return False
+    if [item.pos_id for item in population_positions] != component_position_ids:
+        return False
+    return _persisted_component_matches_current_database(
+        leg,
+        evidence=evidence,
+        population_legs=population_legs,
+        component_position_ids=component_position_ids,
+        session=session,
+    )
+
+
+def _validated_equivalent_assignment_populations(
+    signature,
+) -> tuple[list[LegEvidence], list[PositionEvidence]] | None:
+    """Rebuild and revalidate the exact economic evidence emitted by Task 5."""
+
     signature_keys = {
         "binding_id",
         "strategy_instance_id",
@@ -250,20 +273,29 @@ def _has_authoritative_equivalent_permutation_assignment(
         "leg_population",
         "position_population",
     }
-    if not signature_keys.issubset(signature):
-        return False
-    leg_population = signature.get("leg_population")
-    position_population = signature.get("position_population")
-    if not isinstance(leg_population, list) or not isinstance(
-        position_population, list
-    ):
-        return False
-    if len(leg_population) != len(component_leg_ids) or len(
-        position_population
-    ) != len(component_position_ids):
-        return False
+    if not isinstance(signature, dict) or set(signature) != signature_keys:
+        return None
+    leg_rows = signature.get("leg_population")
+    position_rows = signature.get("position_population")
+    if not isinstance(leg_rows, list) or not isinstance(position_rows, list):
+        return None
+    try:
+        legs = [_leg_evidence_from_persisted_population(row) for row in leg_rows]
+        positions = [
+            _position_evidence_from_persisted_population(row)
+            for row in position_rows
+        ]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not _equivalent_economic_population(legs, positions):
+        return None
+    if signature != _equivalence_signature(legs, positions):
+        return None
+    return legs, positions
 
-    leg_population_keys = {
+
+def _leg_evidence_from_persisted_population(row) -> LegEvidence:
+    expected_keys = {
         "leg_id",
         "binding_id",
         "strategy_instance_id",
@@ -279,7 +311,38 @@ def _has_authoritative_equivalent_permutation_assignment(
         "order_kind",
         "protection_mutated",
     }
-    position_population_keys = {
+    if not isinstance(row, dict) or set(row) != expected_keys:
+        raise ValueError("invalid leg population schema")
+    leg_id = _strict_int(row["leg_id"])
+    binding_id = _strict_int(row["binding_id"])
+    protection_mutated = row["protection_mutated"]
+    if not isinstance(protection_mutated, bool):
+        raise ValueError("invalid protection mutation state")
+    return LegEvidence(
+        leg_id=leg_id,
+        binding_id=binding_id,
+        strategy_instance_id=_strict_string(row["strategy_instance_id"]),
+        venue=_strict_string(row["venue"]),
+        symbol=_strict_string(row["symbol"]),
+        side=_strict_string(row["side"]),
+        order_id=None,
+        client_order_id=None,
+        pos_id=None,
+        requested_size=_strict_number(row["requested_size"]),
+        terminal=False,
+        entry_price=_strict_number(row["entry_price"]),
+        stop_loss=_optional_strict_number(row["stop_loss"]),
+        take_profits=_strict_number_tuple(row["take_profits"]),
+        margin_mode=_strict_string(row["margin_mode"]),
+        position_mode=_strict_string(row["position_mode"]),
+        order_kind=_strict_string(row["order_kind"]),
+        has_successful_entry_evidence=True,
+        protection_mutated=protection_mutated,
+    )
+
+
+def _position_evidence_from_persisted_population(row) -> PositionEvidence:
+    expected_keys = {
         "position_id",
         "symbol",
         "side",
@@ -290,31 +353,115 @@ def _has_authoritative_equivalent_permutation_assignment(
         "margin_mode",
         "position_mode",
     }
-    if any(
-        not isinstance(row, dict) or not leg_population_keys.issubset(row)
-        for row in leg_population
-    ):
-        return False
-    if any(
-        not isinstance(row, dict) or not position_population_keys.issubset(row)
-        for row in position_population
-    ):
-        return False
-    if [row["leg_id"] for row in leg_population] != component_leg_ids:
-        return False
-    if [row["position_id"] for row in position_population] != component_position_ids:
-        return False
-
-    current_leg_row = leg_population[pair_index]
-    return bool(
-        current_leg_row["binding_id"]
-        == getattr(leg, "execution_binding_id", None)
-        and current_leg_row["strategy_instance_id"]
-        == getattr(leg, "strategy_instance_id", None)
-        and str(current_leg_row["venue"] or "").lower()
-        == str(getattr(leg, "venue", None) or "").lower()
-        and current_leg_row["order_kind"] == getattr(leg, "order_kind", None)
+    if not isinstance(row, dict) or set(row) != expected_keys:
+        raise ValueError("invalid position population schema")
+    entry_price = _strict_number(row["entry_price"])
+    return PositionEvidence(
+        pos_id=_strict_string(row["position_id"]),
+        symbol=_strict_string(row["symbol"]),
+        side=_strict_string(row["side"]),
+        size=_strict_number(row["size"]),
+        average_price=entry_price,
+        created_at_ms=None,
+        entry_price=entry_price,
+        stop_loss=_optional_strict_number(row["stop_loss"]),
+        take_profits=_strict_number_tuple(row["take_profits"]),
+        margin_mode=_strict_string(row["margin_mode"]),
+        position_mode=_strict_string(row["position_mode"]),
     )
+
+
+def _persisted_component_matches_current_database(
+    leg,
+    *,
+    evidence: Mapping[str, object],
+    population_legs: list[LegEvidence],
+    component_position_ids: list[str],
+    session=None,
+) -> bool:
+    from sqlalchemy.orm import object_session
+    from sqlalchemy.orm.exc import UnmappedInstanceError
+
+    from telegram_kol_research.models import ExecutionOrderLeg
+
+    if session is None:
+        try:
+            session = object_session(leg)
+        except UnmappedInstanceError:
+            return False
+    if session is None:
+        return False
+    component_leg_ids = [item.leg_id for item in population_legs]
+    rows = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.id.in_(component_leg_ids))
+        .order_by(ExecutionOrderLeg.id)
+        .all()
+    )
+    if [int(row.id) for row in rows] != component_leg_ids:
+        return False
+    canonical_keys = {
+        "policy_version",
+        "evidence_type",
+        "component_leg_ids",
+        "component_position_ids",
+        "mapping_basis",
+        "ownership_statement",
+        "equivalence_signature",
+    }
+    canonical_evidence = {key: evidence.get(key) for key in canonical_keys}
+    for index, (row, population_leg) in enumerate(zip(rows, population_legs, strict=True)):
+        if (
+            str(row.attribution_status or "") != "verified"
+            or str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+            or str(row.purpose or "") != "entry"
+            or str(row.pos_id or "") != component_position_ids[index]
+            or int(row.execution_binding_id) != population_leg.binding_id
+            or row.strategy_instance_id != population_leg.strategy_instance_id
+            or str(row.venue or "").lower() != population_leg.venue.lower()
+            or row.order_kind != population_leg.order_kind
+        ):
+            return False
+        try:
+            row_evidence = json.loads(row.attribution_evidence_json or "{}")
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(row_evidence, dict) or {
+            key: row_evidence.get(key) for key in canonical_keys
+        } != canonical_evidence:
+            return False
+    return True
+
+
+def _strict_int(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("integer required")
+    return value
+
+
+def _strict_string(value) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("non-empty string required")
+    return value
+
+
+def _strict_number(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("finite number required")
+    result = float(value)
+    if not isfinite(result):
+        raise ValueError("finite number required")
+    return result
+
+
+def _optional_strict_number(value) -> float | None:
+    return None if value is None else _strict_number(value)
+
+
+def _strict_number_tuple(value) -> tuple[float, ...]:
+    if not isinstance(value, list):
+        raise ValueError("number list required")
+    return tuple(_strict_number(item) for item in value)
 
 
 def _find_position_id_in_json(value: str | None) -> str | None:
@@ -538,9 +685,11 @@ def match_entry_legs_to_positions(
     )
 
 
-def _numeric_aware_identifier_key(value: str) -> tuple[tuple[int, object], ...]:
+def _numeric_aware_identifier_key(
+    value: str,
+) -> tuple[tuple[int, object, str], ...]:
     return tuple(
-        (0, int(part)) if part.isdigit() else (1, part)
+        (0, int(part), part) if part.isdigit() else (1, part, part)
         for part in re.split(r"(\d+)", str(value))
         if part
     )

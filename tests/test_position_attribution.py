@@ -4,6 +4,7 @@ from telegram_kol_research.position_attribution import (
     FillEvidence,
     LegEvidence,
     PositionEvidence,
+    _numeric_aware_identifier_key,
     classify_leg_exchange_state,
     classify_equivalent_attribution_components,
     filter_candidate_edges_by_entry_protection,
@@ -249,6 +250,33 @@ def test_equivalent_permutation_assignment_is_explicit_stable_and_evidenced():
             "take_profits": [1650.0, 1700.0],
         },
     ]
+
+
+def test_equivalent_assignment_numeric_position_sort_has_a_stable_tie_breaker():
+    assert _numeric_aware_identifier_key("01") != _numeric_aware_identifier_key("1")
+    assert sorted(["1", "01"], key=_numeric_aware_identifier_key) == sorted(
+        ["01", "1"], key=_numeric_aware_identifier_key
+    )
+
+    legs = [_equivalent_leg(1), _equivalent_leg(2)]
+    positions = [_equivalent_position("1"), _equivalent_position("01")]
+    fills = [
+        _fill("order-1", 10_000, source="trigger_fill"),
+        _fill("order-2", 10_000, source="trigger_fill"),
+    ]
+
+    forward = match_entry_legs_to_positions(
+        legs, positions, fills, allow_equivalent_permutation=True
+    )
+    reversed_result = match_entry_legs_to_positions(
+        reversed(legs),
+        reversed(positions),
+        reversed(fills),
+        allow_equivalent_permutation=True,
+    )
+
+    assert forward.assignments == reversed_result.assignments
+    assert forward.evidence_by_leg == reversed_result.evidence_by_leg
 
 
 def test_equivalent_component_rejects_cross_binding_graph():

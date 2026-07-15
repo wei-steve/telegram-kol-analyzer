@@ -102,6 +102,7 @@ from telegram_kol_research.execution_bindings import list_active_positions
 from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
 from telegram_kol_research.execution_bindings import sync_manual_closed_deepcoin_positions
 from telegram_kol_research.position_attribution import PositionAttributionError
+from telegram_kol_research.position_attribution import has_authoritative_persisted_position
 from telegram_kol_research.position_attribution import require_manual_position_attribution_allowed
 from telegram_kol_research.protection_attribution import match_position_protection
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
@@ -766,10 +767,17 @@ def _persisted_position_attribution(
         "closed",
         "manually_closed",
     }
+    equivalent_evidence = (
+        evidence.get("evidence_type") == "equivalent_permutation_assignment"
+    )
+    equivalent_authoritative = (
+        not equivalent_evidence or has_authoritative_persisted_position(leg)
+    )
     verified = (
         state == "verified"
         and binding is not None
         and str(leg.status or "").lower() not in terminal_leg_states
+        and equivalent_authoritative
     )
     chat_id = binding.chat_id if binding is not None else None
     group_name = (
@@ -802,7 +810,11 @@ def _persisted_position_attribution(
         rendered_state = "conflict"
         strategy_summary = "归属冲突 · 自动管理已冻结"
         provenance_label = None
-        reasons = [state]
+        reasons = (
+            ["等价腿归属证据不完整或已过期"]
+            if equivalent_evidence
+            else [state]
+        )
     last_verified_at = leg.last_verified_at
     if last_verified_at is not None:
         if last_verified_at.tzinfo is None:
