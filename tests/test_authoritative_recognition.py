@@ -127,6 +127,10 @@ def test_fengge_exit_applies_mimo_while_execution_gate_is_pending(tmp_path, monk
         assert candidate.symbol == "BTC"
         assert candidate.side == "short"
         assert candidate.parse_source == "mimo_authoritative"
+        assert candidate.target_lifecycle_id == lifecycle_id
+        assert candidate.management_action == "full_exit"
+        assert candidate.management_fraction is None
+        assert candidate.recognition_generation == assessment.authoritative_generation
         decision = session.query(RecognitionDecision).one()
         assert decision.authoritative_model == "mimo-v2.5"
         assert decision.agreement_status == "pending"
@@ -482,6 +486,60 @@ def test_superseded_generation_never_applies_or_auto_trades(tmp_path, monkeypatc
         decision = session.query(RecognitionDecision).one()
         assert decision.comparison_status == "execution_pending"
         assert json.loads(decision.authoritative_payload_json)["reason"] == "generation-b"
+
+
+def test_authoritative_generation_supersedes_candidate_generation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=1,
+            message_id=35,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 13, 1, 0, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 13, 1, 1, tzinfo=UTC),
+        )
+        raw = RawMessage(chat_id=1, message_id=36, text="分批止盈")
+        session.add_all([lifecycle, raw])
+        session.commit()
+        lifecycle_id = lifecycle.id
+        raw_id = raw.id
+
+    payload = {
+        "recognition_result": "非策略",
+        "lifecycle_event": {
+            "event_type": "position_update",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "BTC",
+            "side": "long",
+            "management_action": "partial_take_profit",
+            "confidence": 0.95,
+            "reason": "分批止盈",
+        },
+    }
+    from telegram_kol_research.message_recognition import apply_authoritative_mimo_payload
+
+    apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_id,
+        payload=payload,
+        model="mimo-v2.5",
+        authoritative_generation="generation-a",
+    )
+    apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_id,
+        payload=payload,
+        model="mimo-v2.5",
+        authoritative_generation="generation-b",
+    )
+
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        assert candidate.parse_source == "mimo_authoritative"
+        assert candidate.target_lifecycle_id == lifecycle_id
+        assert candidate.recognition_generation == "generation-b"
 
 
 def test_running_generation_blocks_new_process_until_it_finalizes(tmp_path, monkeypatch):

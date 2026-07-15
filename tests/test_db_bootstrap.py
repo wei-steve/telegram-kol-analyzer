@@ -205,6 +205,59 @@ def test_database_bootstrap_backfills_missing_sqlite_columns(tmp_path):
     assert "review_note" in columns
 
 
+def test_database_bootstrap_backfills_signal_candidate_management_columns_without_changing_rows(
+    tmp_path,
+):
+    database_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(database_path)
+    conn.execute(
+        """
+        CREATE TABLE signal_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            raw_message_id INTEGER,
+            symbol VARCHAR(64),
+            side VARCHAR(16),
+            event_type VARCHAR(64) NOT NULL DEFAULT 'entry_signal',
+            parse_source VARCHAR(32),
+            confidence FLOAT,
+            review_status VARCHAR(32),
+            created_at DATETIME
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO signal_candidates (
+            raw_message_id, symbol, side, event_type, parse_source,
+            confidence, review_status, created_at
+        ) VALUES (7, 'BTC', 'short', 'position_update', 'legacy', 0.9, 'pending', CURRENT_TIMESTAMP)
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(signal_candidates)").fetchall()
+    }
+    row = conn.execute(
+        "SELECT raw_message_id, symbol, side, event_type, parse_source, confidence, review_status "
+        "FROM signal_candidates"
+    ).fetchone()
+    conn.close()
+
+    assert {
+        "target_lifecycle_id",
+        "management_action",
+        "management_fraction",
+        "recognition_generation",
+    } <= columns
+    assert row == (7, "BTC", "short", "position_update", "legacy", 0.9, "pending")
+
+
 def test_database_bootstrap_backfills_missing_execution_binding_columns(tmp_path):
     database_path = tmp_path / "research.db"
     conn = sqlite3.connect(database_path)

@@ -153,6 +153,7 @@ def apply_authoritative_assessment(
         payload=assessment.mimo.payload,
         model=assessment.mimo.model,
         error_message=assessment.mimo.error_message,
+        authoritative_generation=assessment.authoritative_generation,
     )
 
 

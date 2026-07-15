@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
+from telegram_kol_research import message_recognition as message_recognition_module
 from telegram_kol_research.ai_recognition_config import AiProviderConfig, AiRecognitionConfig
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_recognition import (
@@ -13,6 +14,7 @@ from telegram_kol_research.message_recognition import (
     _management_action_for_exit_downgrade,
     _result_from_ai_payload,
     _upsert_ai_signal_candidate,
+    apply_authoritative_mimo_payload,
     recognize_message_now,
 )
 from telegram_kol_research.models import (
@@ -76,6 +78,83 @@ def test_exit_downgrade_treats_andy_add_on_breakeven_message_as_combined_managem
         _chat_completions_url("https://api.deepseek.com")
         == "https://api.deepseek.com/v1/chat/completions"
     )
+
+
+def test_normalize_management_intent_extracts_explicit_management_fraction():
+    action, fraction = message_recognition_module.normalize_management_intent(
+        {
+            "event_type": "position_update",
+            "management_action": "partial_take_profit",
+        },
+        "分批止盈30％！！！",
+    )
+
+    assert action == "partial_take_profit"
+    assert fraction == pytest.approx(0.3)
+
+
+def test_normalize_management_intent_leaves_unqualified_management_fraction_unset():
+    action, fraction = message_recognition_module.normalize_management_intent(
+        {
+            "event_type": "position_update",
+            "management_action": "partial_take_profit",
+        },
+        "现在先分批止盈",
+    )
+
+    assert action == "partial_take_profit"
+    assert fraction is None
+
+
+def test_authoritative_position_update_persists_target_lifecycle_and_generation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=2124,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 19, 3, 6, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 19, 3, 7, tzinfo=UTC),
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=2131,
+            posted_at=datetime(2026, 6, 19, 10, 12, tzinfo=UTC),
+            text="空单分批止盈30%",
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "target_lifecycle_id": lifecycle_id,
+                "symbol": "ETH",
+                "side": "short",
+                "management_action": "partial_take_profit",
+                "confidence": 0.93,
+                "reason": "空单分批止盈30%",
+            },
+        },
+        model="mimo-v2.5",
+        authoritative_generation="generation-claimed-42",
+    )
+
+    assert result.parse_source == "mimo_authoritative"
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        assert candidate.target_lifecycle_id == lifecycle_id
+        assert candidate.management_action == "partial_take_profit"
+        assert candidate.management_fraction == pytest.approx(0.3)
+        assert candidate.recognition_generation == "generation-claimed-42"
 
 
 def test_recognize_message_now_persists_text_strategy_candidate(tmp_path):

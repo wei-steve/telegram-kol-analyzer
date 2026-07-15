@@ -31,6 +31,10 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
     "signal_candidates": {
         "source_id": "ALTER TABLE signal_candidates ADD COLUMN source_id INTEGER",
         "event_type": "ALTER TABLE signal_candidates ADD COLUMN event_type VARCHAR(64) NOT NULL DEFAULT 'entry_signal'",
+        "target_lifecycle_id": "ALTER TABLE signal_candidates ADD COLUMN target_lifecycle_id INTEGER",
+        "management_action": "ALTER TABLE signal_candidates ADD COLUMN management_action VARCHAR(64)",
+        "management_fraction": "ALTER TABLE signal_candidates ADD COLUMN management_fraction FLOAT",
+        "recognition_generation": "ALTER TABLE signal_candidates ADD COLUMN recognition_generation VARCHAR(64)",
         "review_note": "ALTER TABLE signal_candidates ADD COLUMN review_note TEXT",
     },
     "trade_ideas": {

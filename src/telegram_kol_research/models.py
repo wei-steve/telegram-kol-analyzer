@@ -74,6 +74,12 @@ class SignalCandidate(Base):
     symbol: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     side: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     event_type: Mapped[str] = mapped_column(String(64), default="entry_signal", nullable=False)
+    target_lifecycle_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("strategy_lifecycles.id"), nullable=True
+    )
+    management_action: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    management_fraction: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    recognition_generation: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     entry_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     stop_loss_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     take_profit_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

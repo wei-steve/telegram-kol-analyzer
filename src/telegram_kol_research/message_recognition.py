@@ -9,7 +9,7 @@ import re
 from datetime import timedelta
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 from sqlalchemy.orm import sessionmaker
@@ -984,6 +984,7 @@ def _apply_lifecycle_event_decision(
     decision: dict[str, Any],
     *,
     parse_source: str = "lifecycle_ai",
+    authoritative_generation: str | None = None,
 ) -> bool:
     event_type = str(decision.get("event_type") or "none").strip()
     try:
@@ -1009,6 +1010,11 @@ def _apply_lifecycle_event_decision(
         if not decision.get("take_profit") and decision.get("exit_price"):
             decision["take_profit"] = decision.get("exit_price")
         decision["exit_price"] = None
+
+    management_action, management_fraction = normalize_management_intent(
+        decision,
+        raw_message.text or "",
+    )
 
     target = _resolve_lifecycle_event_target(session, raw_message, decision)
     if target is None:
@@ -1070,6 +1076,9 @@ def _apply_lifecycle_event_decision(
                 raw_message=raw_message,
                 lifecycle=target,
                 parse_source=parse_source,
+                management_action=management_action,
+                management_fraction=management_fraction,
+                recognition_generation=authoritative_generation,
             )
             return True
         target.lifecycle_status = "exited"
@@ -1085,6 +1094,9 @@ def _apply_lifecycle_event_decision(
             raw_message=raw_message,
             lifecycle=target,
             parse_source=parse_source,
+            management_action=management_action,
+            management_fraction=management_fraction,
+            recognition_generation=authoritative_generation,
         )
         return True
 
@@ -1133,10 +1145,98 @@ def _apply_lifecycle_event_decision(
             raw_message=raw_message,
             lifecycle=target,
             parse_source=parse_source,
+            management_action=management_action,
+            management_fraction=management_fraction,
+            recognition_generation=authoritative_generation,
         )
         return True
 
     return False
+
+
+def normalize_management_intent(
+    decision: Mapping[str, Any],
+    text: str,
+) -> tuple[str, float | None]:
+    """Normalize an actionable lifecycle decision without inventing a fraction."""
+
+    event_type = str(decision.get("event_type") or "").strip().lower()
+    raw_action = str(decision.get("management_action") or "").strip().lower()
+    combined = " ".join(
+        str(part or "")
+        for part in (text, decision.get("reason"), raw_action)
+    ).lower()
+
+    if event_type in {"exit_position", "exit_full", "full_exit", "close_position"}:
+        return "full_exit", None
+
+    has_partial = (
+        "partial_take_profit" in raw_action
+        or _has_partial_take_profit_terms(combined)
+    )
+    has_break_even = (
+        any(
+            term in raw_action
+            for term in (
+                "move_stop_to_protect",
+                "move_stop_to_break_even",
+                "breakeven",
+                "break_even",
+            )
+        )
+        or _has_protective_stop_terms(combined)
+    )
+    fraction = _explicit_management_fraction(decision, combined) if has_partial else None
+    if has_partial and has_break_even:
+        return "partial_then_break_even", fraction
+    if has_partial:
+        return "partial_take_profit", fraction
+    if has_break_even:
+        return "move_stop_to_break_even", None
+    if (
+        decision.get("stop_loss") not in (None, "")
+        or raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}
+    ):
+        return "adjust_stop_loss", None
+    return raw_action or "position_update", None
+
+
+def _explicit_management_fraction(
+    decision: Mapping[str, Any],
+    combined_text: str,
+) -> float | None:
+    for key in ("management_fraction", "close_fraction", "fraction"):
+        normalized = _fraction_value(decision.get(key))
+        if normalized is not None:
+            return normalized
+
+    contextual_percentages = re.findall(
+        r"(?:止盈|减仓|平仓|仓位)[^\d%\uff05]{0,12}(\d+(?:\.\d+)?)\s*[%\uff05]",
+        combined_text,
+    )
+    if contextual_percentages:
+        return _fraction_value(f"{contextual_percentages[-1]}%")
+    if any(term in combined_text for term in ("一半", "半仓", "half")):
+        return 0.5
+    return None
+
+
+def _fraction_value(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    is_percent = text.endswith(("%", "％"))
+    if is_percent:
+        text = text[:-1].strip()
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        return None
+    if is_percent or numeric > 1:
+        numeric /= 100
+    if 0 < numeric <= 1:
+        return numeric
+    return None
 
 
 def _exit_decision_looks_like_management_update(
@@ -1670,6 +1770,7 @@ def apply_authoritative_mimo_payload(
     payload: dict[str, Any],
     model: str,
     error_message: str | None = None,
+    authoritative_generation: str | None = None,
 ) -> MessageRecognitionResult:
     """Persist only the authoritative MiMo interpretation."""
 
@@ -1710,6 +1811,7 @@ def apply_authoritative_mimo_payload(
                 raw_message,
                 lifecycle_event,
                 parse_source="mimo_authoritative",
+                authoritative_generation=authoritative_generation,
             )
             result = MessageRecognitionResult(
                 raw_message_id=raw_message_id,
@@ -2626,6 +2728,9 @@ def _upsert_close_signal_candidate(
     raw_message: RawMessage,
     lifecycle: StrategyLifecycle,
     parse_source: str,
+    management_action: str | None = None,
+    management_fraction: float | None = None,
+    recognition_generation: str | None = None,
 ) -> SignalCandidate:
     candidate = (
         session.query(SignalCandidate)
@@ -2644,6 +2749,10 @@ def _upsert_close_signal_candidate(
     candidate.symbol = lifecycle.symbol
     candidate.side = lifecycle.side
     candidate.event_type = "close_signal"
+    candidate.target_lifecycle_id = lifecycle.id
+    candidate.management_action = management_action
+    candidate.management_fraction = management_fraction
+    candidate.recognition_generation = recognition_generation
     candidate.confidence = max(candidate.confidence or 0.0, 0.85)
     candidate.parse_source = parse_source
     return candidate
@@ -2688,6 +2797,9 @@ def _upsert_management_signal_candidate(
     raw_message: RawMessage,
     lifecycle: StrategyLifecycle,
     parse_source: str,
+    management_action: str | None = None,
+    management_fraction: float | None = None,
+    recognition_generation: str | None = None,
 ) -> SignalCandidate:
     candidate = (
         session.query(SignalCandidate)
@@ -2706,6 +2818,10 @@ def _upsert_management_signal_candidate(
     candidate.symbol = lifecycle.symbol
     candidate.side = lifecycle.side
     candidate.event_type = "position_update"
+    candidate.target_lifecycle_id = lifecycle.id
+    candidate.management_action = management_action
+    candidate.management_fraction = management_fraction
+    candidate.recognition_generation = recognition_generation
     candidate.entry_text = None
     candidate.stop_loss_text = _format_number(lifecycle.stop_loss)
     candidate.take_profit_text = lifecycle.take_profit
