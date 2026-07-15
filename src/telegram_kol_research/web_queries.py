@@ -1815,31 +1815,42 @@ def mark_strategy_lifecycle_manual_close(
         if lifecycle is None:
             raise LookupError("strategy lifecycle not found")
 
+        matching_bindings = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .filter(ExecutionBinding.chat_id == lifecycle.chat_id)
+            .filter(ExecutionBinding.message_id == lifecycle.message_id)
+            .filter(ExecutionBinding.symbol == lifecycle.symbol)
+            .filter(ExecutionBinding.side == lifecycle.side)
+            .order_by(ExecutionBinding.id.asc())
+            .limit(2)
+            .all()
+        )
         binding = None
         if lifecycle.execution_binding_id is not None:
             candidate_binding = session.get(
                 ExecutionBinding, lifecycle.execution_binding_id
             )
-            if candidate_binding is not None and (
-                str(candidate_binding.venue or "").lower() == "deepcoin"
-                and int(candidate_binding.chat_id) == int(lifecycle.chat_id)
-                and int(candidate_binding.message_id) == int(lifecycle.message_id)
+            candidate_matches_lifecycle = (
+                candidate_binding is not None
+                and str(candidate_binding.venue or "").lower() == "deepcoin"
+                and candidate_binding.chat_id == lifecycle.chat_id
+                and candidate_binding.message_id == lifecycle.message_id
                 and str(candidate_binding.symbol) == str(lifecycle.symbol)
                 and str(candidate_binding.side) == str(lifecycle.side)
-            ):
-                binding = candidate_binding
-        if binding is None:
-            matching_bindings = (
-                session.query(ExecutionBinding)
-                .filter(ExecutionBinding.venue == "deepcoin")
-                .filter(ExecutionBinding.chat_id == lifecycle.chat_id)
-                .filter(ExecutionBinding.message_id == lifecycle.message_id)
-                .filter(ExecutionBinding.symbol == lifecycle.symbol)
-                .filter(ExecutionBinding.side == lifecycle.side)
-                .order_by(ExecutionBinding.id.asc())
-                .limit(2)
-                .all()
             )
+            explicit_binding_is_unique = (
+                candidate_matches_lifecycle
+                and len(matching_bindings) == 1
+                and int(matching_bindings[0].id) == int(candidate_binding.id)
+            )
+            if not explicit_binding_is_unique:
+                raise ValueError(
+                    "manual close requires entered lifecycle, or legacy pending_entry "
+                    "with entered_at and execution binding"
+                )
+            binding = candidate_binding
+        else:
             binding = matching_bindings[0] if len(matching_bindings) == 1 else None
         is_legacy_demoted_entry = bool(
             lifecycle.lifecycle_status == "pending_entry"

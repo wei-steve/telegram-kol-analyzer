@@ -1289,7 +1289,7 @@ def test_manual_close_rejects_never_entered_pending_without_writes(tmp_path):
         assert leg.terminal_reason is None
 
 
-def test_manual_close_rejects_legacy_pending_without_matching_deepcoin_binding(tmp_path):
+def test_manual_close_rejects_wrong_explicit_binding_even_with_matching_fallback(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
     with app.state.session_factory() as session:
         wrong_binding = ExecutionBinding(
@@ -1312,7 +1312,17 @@ def test_manual_close_rejects_legacy_pending_without_matching_deepcoin_binding(t
             status="active",
             last_exchange_status="position_active",
         )
-        session.add_all([wrong_binding, other_venue_binding])
+        matching_binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=12,
+            symbol="ETH",
+            side="short",
+            venue="deepcoin",
+            status="active",
+            last_exchange_status="position_active",
+        )
+        session.add_all([wrong_binding, other_venue_binding, matching_binding])
         session.flush()
         lifecycle = StrategyLifecycle(
             chat_id=88,
@@ -1324,11 +1334,24 @@ def test_manual_close_rejects_legacy_pending_without_matching_deepcoin_binding(t
             entered_at=datetime(2026, 7, 15, 12, 1),
             execution_binding_id=wrong_binding.id,
         )
-        session.add(lifecycle)
+        legs = [
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                leg_index=1,
+                purpose="entry",
+                venue=binding.venue,
+                status="active",
+                attribution_status="unassigned",
+            )
+            for binding in (wrong_binding, other_venue_binding, matching_binding)
+        ]
+        session.add_all([lifecycle, *legs])
         session.commit()
         lifecycle_id = lifecycle.id
         wrong_binding_id = wrong_binding.id
         other_venue_binding_id = other_venue_binding.id
+        matching_binding_id = matching_binding.id
+        leg_ids = [leg.id for leg in legs]
 
     response = TestClient(app).post(
         f"/api/strategy-lifecycles/{lifecycle_id}/manual-close",
@@ -1344,6 +1367,8 @@ def test_manual_close_rejects_legacy_pending_without_matching_deepcoin_binding(t
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         wrong_binding = session.get(ExecutionBinding, wrong_binding_id)
         other_venue_binding = session.get(ExecutionBinding, other_venue_binding_id)
+        matching_binding = session.get(ExecutionBinding, matching_binding_id)
+        legs = [session.get(ExecutionOrderLeg, leg_id) for leg_id in leg_ids]
         assert lifecycle.lifecycle_status == "pending_entry"
         assert lifecycle.exit_reason is None
         assert lifecycle.exited_at is None
@@ -1355,9 +1380,22 @@ def test_manual_close_rejects_legacy_pending_without_matching_deepcoin_binding(t
             "active",
             "position_active",
         )
+        assert (matching_binding.status, matching_binding.last_exchange_status) == (
+            "active",
+            "position_active",
+        )
+        assert [leg.status for leg in legs] == ["active", "active", "active"]
+        assert [leg.terminal_reason for leg in legs] == [None, None, None]
 
 
-def test_manual_close_rejects_ambiguous_legacy_deepcoin_bindings_without_writes(tmp_path):
+@pytest.mark.parametrize(
+    "use_explicit_binding",
+    [True, False],
+    ids=["valid-explicit-fk", "no-explicit-fk"],
+)
+def test_manual_close_rejects_duplicated_legacy_deepcoin_key_without_writes(
+    tmp_path, use_explicit_binding
+):
     database_path = tmp_path / "research.db"
     connection = sqlite3.connect(database_path)
     connection.execute(
@@ -1394,6 +1432,17 @@ def test_manual_close_rejects_ambiguous_legacy_deepcoin_bindings_without_writes(
         ]
         session.add_all(bindings)
         session.flush()
+        legs = [
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                leg_index=1,
+                purpose="entry",
+                venue="deepcoin",
+                status="active",
+                attribution_status="unassigned",
+            )
+            for binding in bindings
+        ]
         lifecycle = StrategyLifecycle(
             chat_id=88,
             message_id=13,
@@ -1402,11 +1451,13 @@ def test_manual_close_rejects_ambiguous_legacy_deepcoin_bindings_without_writes(
             lifecycle_status="pending_entry",
             signal_at=datetime(2026, 7, 15, 13, 0),
             entered_at=datetime(2026, 7, 15, 13, 1),
+            execution_binding_id=bindings[0].id if use_explicit_binding else None,
         )
-        session.add(lifecycle)
+        session.add_all([lifecycle, *legs])
         session.commit()
         lifecycle_id = lifecycle.id
         binding_ids = [binding.id for binding in bindings]
+        leg_ids = [leg.id for leg in legs]
 
     response = TestClient(app, raise_server_exceptions=False).post(
         f"/api/strategy-lifecycles/{lifecycle_id}/manual-close",
@@ -1421,6 +1472,7 @@ def test_manual_close_rejects_ambiguous_legacy_deepcoin_bindings_without_writes(
     with app.state.session_factory() as session:
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         bindings = [session.get(ExecutionBinding, binding_id) for binding_id in binding_ids]
+        legs = [session.get(ExecutionOrderLeg, leg_id) for leg_id in leg_ids]
         assert lifecycle.lifecycle_status == "pending_entry"
         assert lifecycle.exit_reason is None
         assert lifecycle.exited_at is None
@@ -1429,6 +1481,90 @@ def test_manual_close_rejects_ambiguous_legacy_deepcoin_bindings_without_writes(
             "position_active",
             "position_active",
         ]
+        assert [leg.status for leg in legs] == ["active", "active"]
+        assert [leg.terminal_reason for leg in legs] == [None, None]
+
+
+def test_manual_close_rejects_nullable_legacy_explicit_binding_without_writes(tmp_path):
+    database_path = tmp_path / "research.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE execution_bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kol_id VARCHAR(255),
+            chat_id INTEGER,
+            message_id INTEGER,
+            symbol VARCHAR(64),
+            side VARCHAR(16),
+            venue VARCHAR(64),
+            order_id VARCHAR(255),
+            created_at DATETIME
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+    app = create_web_app(database_path=database_path)
+    with app.state.session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="legacy:null-key",
+            chat_id=None,
+            message_id=14,
+            symbol="ETH",
+            side="short",
+            venue="deepcoin",
+            status="active",
+            last_exchange_status="position_active",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=14,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 15, 14, 0),
+            entered_at=datetime(2026, 7, 15, 14, 1),
+            execution_binding_id=binding.id,
+        )
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            leg_index=1,
+            purpose="entry",
+            venue="deepcoin",
+            status="active",
+            attribution_status="unassigned",
+        )
+        session.add_all([lifecycle, leg])
+        session.commit()
+        lifecycle_id = lifecycle.id
+        binding_id = binding.id
+        leg_id = leg.id
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        f"/api/strategy-lifecycles/{lifecycle_id}/manual-close",
+        json={"note": "must not apply"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "manual close requires entered lifecycle, or legacy pending_entry "
+        "with entered_at and execution binding"
+    )
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        assert lifecycle.lifecycle_status == "pending_entry"
+        assert lifecycle.exit_reason is None
+        assert lifecycle.exited_at is None
+        assert (binding.status, binding.last_exchange_status) == (
+            "active",
+            "position_active",
+        )
+        assert (leg.status, leg.terminal_reason) == ("active", None)
 
 
 def test_bound_position_close_api_rejects_unbound_or_ambiguous_position_before_order_submission(tmp_path):
