@@ -168,12 +168,17 @@ def _historical_position_candidates(bindings_by_id, legs):
     ...
 ```
 
-Only include legs where:
+Normally include legs where:
 
 - `purpose == "entry"`;
 - status is not terminal;
 - venue is Deepcoin; and
 - binding symbol can produce `<SYMBOL>-USDT-SWAP`.
+
+Additionally, include only the exact `order_id` of an already-terminal entry
+leg when its persisted `(venue, pos_id)` has more than one leg owner. This
+narrow exception supports exact proof before duplicate cleanup. Terminal
+singletons remain excluded and do not produce a missing-evidence conflict.
 
 Load each unique candidate through `list_position_history`. Store exact rows in
 the snapshot. Prefix errors with a stable key such as

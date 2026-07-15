@@ -86,6 +86,12 @@ from nonterminal Deepcoin entry legs:
 - the persisted `leg.pos_id`; and
 - the leg's exact `order_id` when it differs from the persisted position ID.
 
+Terminal entry legs remain excluded by default. The only exception is a
+terminal leg whose persisted `(venue, pos_id)` has more than one owner: that
+leg contributes its own exact `order_id` so a redundant ownership claim cannot
+be cleared without proving the competing leg's real historical position fully
+closed. A terminal singleton issues no per-ID request and creates no conflict.
+
 The second identifier is required for corrupted legacy rows such as binding 11,
 where each filled entry order is also the true split-position ID but the stored
 `pos_id` was overwritten with another binding's position.
