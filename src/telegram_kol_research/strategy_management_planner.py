@@ -7,7 +7,6 @@ import json
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
 from math import isfinite
 from typing import Any
 
@@ -25,6 +24,7 @@ from telegram_kol_research.models import (
     SignalCandidate,
     StrategyLifecycle,
     StrategyManagementBatch,
+    StrategyManagementLeg,
 )
 from telegram_kol_research.position_attribution import (
     TERMINAL_ENTRY_LEG_STATES,
@@ -41,6 +41,11 @@ from telegram_kol_research.strategy_management_batches import (
     create_management_batch,
     create_management_batch_in_session,
     load_management_batch,
+)
+from telegram_kol_research.strategy_management_sizing import (
+    ManagementSizingError,
+    allocate_close_sizes,
+    effective_action,
 )
 
 
@@ -82,6 +87,13 @@ class _PlanningIdentity:
     lifecycle: StrategyLifecycle
     binding: ExecutionBinding
     entry_legs: tuple[ExecutionOrderLeg, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PartialPolicyState:
+    round_before: int
+    frozen: bool
+    history: tuple[tuple[Any, ...], ...]
 
 
 def plan_strategy_management_batch(
@@ -179,6 +191,17 @@ def _plan_strategy_management_batch_locked(
             status=existing.status,
             reason_code=existing.reason_code,
             batch=existing,
+            target_lifecycle_id=lifecycle.id,
+        )
+
+    with session_factory() as session:
+        partial_policy_state = _load_partial_policy_state(
+            session, target_lifecycle_id=lifecycle.id
+        )
+    if partial_policy_state.frozen:
+        return ManagementPlanningResult(
+            status="blocked",
+            reason_code="prior_partial_batch_unresolved",
             target_lifecycle_id=lifecycle.id,
         )
 
@@ -336,7 +359,37 @@ def _plan_strategy_management_batch_locked(
                 "evidence": protection.evidence,
             }
 
-    effective_fraction = _effective_fraction(intent, requested_fraction)
+    partial_round_before = partial_policy_state.round_before
+    if intent == "partial_take_profit":
+        effective_action_name, effective_fraction = effective_action(
+            round_before=partial_round_before,
+            fraction=requested_fraction,
+        )
+    elif intent == "full_exit":
+        effective_action_name, effective_fraction = intent, 1.0
+    else:
+        effective_action_name, effective_fraction = intent, None
+
+    planned_close_sizes: tuple[str | None, ...]
+    if effective_fraction is None:
+        planned_close_sizes = tuple(None for _ in economics)
+    else:
+        try:
+            planned_close_sizes = allocate_close_sizes(
+                (position["size"] for position in economics),
+                fraction=effective_fraction,
+                quantity_step=contract_spec.quantity_step,
+                min_quantity=contract_spec.min_quantity,
+            )
+        except ManagementSizingError:
+            return _persist_blocked(
+                session_factory,
+                identity=identity,
+                raw_message_id=raw_message_id,
+                intent=intent,
+                reason_code="management_close_size_unsafe",
+                planned_at=now,
+            )
     target_snapshot = {
         "identity": {
             "target_lifecycle_id": lifecycle.id,
@@ -363,9 +416,7 @@ def _plan_strategy_management_batch_locked(
             pos_id=position["pos_id"],
             leg_index=index,
             preflight_size=position["size"],
-            planned_close_size=_planned_close_size(
-                position["size"], effective_fraction=effective_fraction
-            ),
+            planned_close_size=planned_close_sizes[index],
             avg_entry_price=position["avg_entry_price"],
             quantity_step=str(contract_spec.quantity_step),
             old_tpsl=protection_by_pos_id.get(position["pos_id"]),
@@ -390,16 +441,20 @@ def _plan_strategy_management_batch_locked(
                 strategy_instance_id=str(binding.strategy_instance_id),
                 execution_binding_id=binding.id,
                 intent=intent,
-                effective_action=intent,
+                effective_action=effective_action_name,
                 requested_fraction=requested_fraction,
                 effective_fraction=effective_fraction,
-                partial_round_before=0,
+                partial_round_before=partial_round_before,
                 target_fingerprint=target_fingerprint,
                 target_snapshot=target_snapshot,
                 planned_at=now,
                 legs=batch_legs,
                 validate_current_state=lambda current_session: (
-                    _require_frozen_identity_current(current_session, identity)
+                    _require_frozen_identity_and_policy_current(
+                        current_session,
+                        identity,
+                        partial_policy_state=partial_policy_state,
+                    )
                 ),
             )
             session.commit()
@@ -643,6 +698,74 @@ def _require_frozen_identity_current(session, identity: _PlanningIdentity) -> No
             )
 
 
+def _require_frozen_identity_and_policy_current(
+    session,
+    identity: _PlanningIdentity,
+    *,
+    partial_policy_state: _PartialPolicyState,
+) -> None:
+    _require_frozen_identity_current(session, identity)
+    if _load_partial_policy_state(
+        session, target_lifecycle_id=identity.lifecycle.id
+    ) != partial_policy_state:
+        raise ManagementPlanningStateChanged(
+            "target_identity_changed_during_planning"
+        )
+
+
+def _load_partial_policy_state(
+    session, *, target_lifecycle_id: int
+) -> _PartialPolicyState:
+    batches = (
+        session.query(StrategyManagementBatch)
+        .filter(StrategyManagementBatch.target_lifecycle_id == target_lifecycle_id)
+        .filter(StrategyManagementBatch.intent == "partial_take_profit")
+        .order_by(StrategyManagementBatch.id.asc())
+        .all()
+    )
+    history: list[tuple[Any, ...]] = []
+    confirmed_partials = 0
+    frozen = False
+    for batch in batches:
+        leg_states = tuple(
+            session.query(StrategyManagementLeg.id, StrategyManagementLeg.status)
+            .filter(StrategyManagementLeg.management_batch_id == batch.id)
+            .order_by(
+                StrategyManagementLeg.leg_index.asc(),
+                StrategyManagementLeg.id.asc(),
+            )
+            .all()
+        )
+        history.append(
+            (
+                batch.id,
+                batch.status,
+                batch.effective_action,
+                batch.reconciled_at,
+                batch.completed_at,
+                leg_states,
+            )
+        )
+        fully_confirmed = bool(
+            batch.effective_action == "partial_close"
+            and batch.status == "succeeded"
+            and batch.reconciled_at is not None
+            and leg_states
+            and all(status == "confirmed" for _, status in leg_states)
+        )
+        if fully_confirmed:
+            confirmed_partials += 1
+        elif batch.status not in {"blocked", "resolved"}:
+            frozen = True
+    if confirmed_partials > 1:
+        frozen = True
+    return _PartialPolicyState(
+        round_before=min(confirmed_partials, 1),
+        frozen=frozen,
+        history=tuple(history),
+    )
+
+
 def _candidate_state(candidate: SignalCandidate) -> tuple[Any, ...]:
     return (
         candidate.id,
@@ -738,6 +861,22 @@ def _persist_blocked(
         session_factory, idempotency_fingerprint=idempotency_fingerprint
     )
     if existing is None:
+        partial_round_before = 0
+        effective_action_name = intent
+        effective_fraction = None
+        if intent == "partial_take_profit":
+            with session_factory() as session:
+                policy_state = _load_partial_policy_state(
+                    session, target_lifecycle_id=lifecycle.id
+                )
+            partial_round_before = policy_state.round_before
+            if not policy_state.frozen:
+                effective_action_name, effective_fraction = effective_action(
+                    round_before=partial_round_before,
+                    fraction=candidate.management_fraction,
+                )
+        elif intent == "full_exit":
+            effective_fraction = 1.0
         target_snapshot = {
             "identity": {
                 "target_lifecycle_id": lifecycle.id,
@@ -757,10 +896,10 @@ def _persist_blocked(
             strategy_instance_id=str(binding.strategy_instance_id),
             execution_binding_id=binding.id,
             intent=intent,
-            effective_action=intent,
+            effective_action=effective_action_name,
             requested_fraction=candidate.management_fraction,
-            effective_fraction=_effective_fraction(intent, candidate.management_fraction),
-            partial_round_before=0,
+            effective_fraction=effective_fraction,
+            partial_round_before=partial_round_before,
             status="blocked",
             reason_code=reason_code,
             target_fingerprint=management_target_fingerprint(target_snapshot),
@@ -774,14 +913,6 @@ def _persist_blocked(
         batch=existing,
         target_lifecycle_id=lifecycle.id,
     )
-
-
-def _effective_fraction(intent: str, requested_fraction: float | None) -> float | None:
-    if intent == "full_exit":
-        return 1.0
-    if intent == "partial_take_profit":
-        return float(requested_fraction) if requested_fraction is not None else None
-    return None
 
 
 def normalize_requested_management_fraction(
@@ -805,12 +936,6 @@ def _exact_protection_order_id(row: dict[str, Any]) -> str | None:
         if value:
             return value
     return None
-
-
-def _planned_close_size(size: str, *, effective_fraction: float | None) -> str | None:
-    if effective_fraction is None:
-        return None
-    return format((Decimal(size) * Decimal(str(effective_fraction))).normalize(), "f")
 
 
 def _leg_by_pos_id(

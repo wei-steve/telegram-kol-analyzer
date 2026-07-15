@@ -1,0 +1,84 @@
+from decimal import Decimal
+
+import pytest
+
+
+def _sizing():
+    from telegram_kol_research import strategy_management_sizing
+
+    return strategy_management_sizing
+
+
+@pytest.mark.parametrize(
+    ("round_before", "fraction", "expected"),
+    [
+        (0, None, ("partial_close", 0.5)),
+        (0, 0.3, ("partial_close", 0.3)),
+        (1, None, ("full_close", 1.0)),
+        (1, 0.3, ("full_close", 1.0)),
+    ],
+)
+def test_effective_action_implements_two_round_policy(
+    round_before, fraction, expected
+):
+    assert _sizing().effective_action(
+        round_before=round_before, fraction=fraction
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    ("sizes", "fraction", "step", "minimum", "expected"),
+    [
+        (("6", "4"), Decimal("0.5"), "1", "1", ("3", "2")),
+        (("0.02", "0.02"), Decimal("0.5"), "0.01", "0.01", ("0.01", "0.01")),
+        (("5", "3", "2"), Decimal("0.6"), "1", "1", ("3", "2", "1")),
+        (("5", "3"), Decimal("0.5"), "1", "1", ("3", "1")),
+    ],
+)
+def test_allocate_close_sizes_uses_aggregate_target_and_stable_remainders(
+    sizes, fraction, step, minimum, expected
+):
+    assert _sizing().allocate_close_sizes(
+        sizes,
+        fraction=fraction,
+        quantity_step=step,
+        min_quantity=minimum,
+    ) == expected
+
+
+def test_allocate_close_sizes_rejects_target_below_every_leg_minimum():
+    sizing = _sizing()
+
+    with pytest.raises(sizing.ManagementSizingError):
+        sizing.allocate_close_sizes(
+            ("0.01", "0.01"),
+            fraction=Decimal("0.25"),
+            quantity_step="0.01",
+            min_quantity="0.01",
+        )
+
+
+def test_allocate_close_sizes_never_over_closes_a_position():
+    sizing = _sizing()
+
+    planned = sizing.allocate_close_sizes(
+        ("1", "9"),
+        fraction=Decimal("0.9"),
+        quantity_step="1",
+        min_quantity="1",
+    )
+
+    assert planned == ("1", "8")
+    assert all(Decimal(close) <= Decimal(size) for close, size in zip(planned, ("1", "9")))
+
+
+def test_allocate_close_sizes_fails_whole_batch_when_each_position_cannot_participate():
+    sizing = _sizing()
+
+    with pytest.raises(sizing.ManagementSizingError):
+        sizing.allocate_close_sizes(
+            ("1", "1", "8"),
+            fraction=Decimal("0.5"),
+            quantity_step="1",
+            min_quantity="1",
+        )

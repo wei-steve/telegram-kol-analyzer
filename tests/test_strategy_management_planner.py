@@ -18,6 +18,8 @@ from telegram_kol_research.models import (
     RecognitionDecision,
     SignalCandidate,
     StrategyLifecycle,
+    StrategyManagementBatch,
+    StrategyManagementLeg,
 )
 
 
@@ -670,7 +672,7 @@ def test_partial_fraction_boundary_rejects_invalid_or_corrupt_values(value):
         )
 
 
-def test_unqualified_partial_fraction_remains_unset_for_task5():
+def test_unqualified_partial_fraction_remains_unset_until_policy_resolution():
     planner = _planner()
 
     assert (
@@ -681,7 +683,7 @@ def test_unqualified_partial_fraction_remains_unset_for_task5():
     )
 
 
-def test_unqualified_partial_plan_persists_no_effective_fraction_or_close_size(
+def test_unqualified_first_partial_plan_defaults_to_half(
     monkeypatch, tmp_path
 ):
     planner = _planner()
@@ -703,8 +705,231 @@ def test_unqualified_partial_plan_persists_no_effective_fraction_or_close_size(
 
     assert result.status == "ready"
     assert result.batch.requested_fraction is None
-    assert result.batch.effective_fraction is None
-    assert [leg.planned_close_size for leg in result.batch.legs] == [None]
+    assert result.batch.effective_action == "partial_close"
+    assert result.batch.effective_fraction == 0.5
+    assert result.batch.partial_round_before == 0
+    assert [leg.planned_close_size for leg in result.batch.legs] == ["5"]
+
+
+def _persist_prior_partial_batch(
+    session_factory,
+    *,
+    raw_id,
+    lifecycle_id,
+    binding_id,
+    status,
+    reconciled,
+    leg_statuses=("confirmed",),
+):
+    with session_factory() as session:
+        decision = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == raw_id)
+            .one()
+        )
+        entry_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == binding_id)
+            .order_by(ExecutionOrderLeg.leg_index.asc())
+            .all()
+        )
+        batch = StrategyManagementBatch(
+            idempotency_fingerprint=f"prior-{status}-{len(leg_statuses)}",
+            raw_message_id=raw_id,
+            recognition_decision_id=decision.id,
+            recognition_generation="prior-generation",
+            target_lifecycle_id=lifecycle_id,
+            strategy_instance_id="deepcoin:100:20:BTC:short",
+            execution_binding_id=binding_id,
+            intent="partial_take_profit",
+            effective_action="partial_close",
+            requested_fraction=None,
+            effective_fraction=0.5,
+            partial_round_before=0,
+            status=status,
+            target_fingerprint="f" * 64,
+            target_snapshot_json="{}",
+            planned_at=PLANNED_AT,
+            reconciled_at=PLANNED_AT if reconciled else None,
+            completed_at=PLANNED_AT if status == "succeeded" else None,
+        )
+        session.add(batch)
+        session.flush()
+        for index, leg_status in enumerate(leg_statuses):
+            entry_leg = entry_legs[min(index, len(entry_legs) - 1)]
+            session.add(
+                StrategyManagementLeg(
+                    management_batch_id=batch.id,
+                    execution_order_leg_id=entry_leg.id,
+                    pos_id=str(entry_leg.pos_id),
+                    leg_index=index,
+                    status=leg_status,
+                    preflight_size="10",
+                    planned_close_size="5",
+                    quantity_step="1",
+                )
+            )
+        session.commit()
+        return batch.id
+
+
+def test_reconciled_succeeded_first_partial_promotes_second_partial_to_full_close(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_take_profit",
+        management_fraction=0.3,
+    )
+    _persist_prior_partial_batch(
+        session_factory,
+        raw_id=raw_id,
+        lifecycle_id=lifecycle_id,
+        binding_id=binding_id,
+        status="succeeded",
+        reconciled=True,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.requested_fraction == 0.3
+    assert result.batch.effective_action == "full_close"
+    assert result.batch.effective_fraction == 1.0
+    assert result.batch.partial_round_before == 1
+    assert [leg.planned_close_size for leg in result.batch.legs] == ["10"]
+
+
+@pytest.mark.parametrize(
+    ("status", "reconciled", "leg_statuses"),
+    [
+        ("submitted", False, ("submitted",)),
+        ("submit_unknown", False, ("submit_unknown",)),
+        ("failed", False, ("failed",)),
+        ("partial_failed", True, ("confirmed", "failed")),
+        ("succeeded", True, ("submitted",)),
+    ],
+)
+def test_unconfirmed_prior_partial_freezes_without_advancing_round(
+    monkeypatch, tmp_path, status, reconciled, leg_statuses
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    pos_ids = ("pos-b-1", "pos-b-2") if len(leg_statuses) == 2 else ("pos-b",)
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_take_profit",
+        pos_ids=pos_ids,
+    )
+    _persist_prior_partial_batch(
+        session_factory,
+        raw_id=raw_id,
+        lifecycle_id=lifecycle_id,
+        binding_id=binding_id,
+        status=status,
+        reconciled=reconciled,
+        leg_statuses=leg_statuses,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [_position(pos_id) for pos_id in pos_ids]
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "prior_partial_batch_unresolved"
+    assert result.batch is None
+
+
+def test_duplicate_partial_message_returns_same_batch_without_advancing_round(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory, intent="partial_take_profit", management_fraction=None
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin([_position()])
+
+    first = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+    duplicate = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert duplicate.batch.id == first.batch.id
+    assert duplicate.batch.partial_round_before == 0
+    with session_factory() as session:
+        assert session.query(StrategyManagementBatch).count() == 1
+
+
+def test_partial_round_history_is_revalidated_inside_insert_transaction(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory, intent="partial_take_profit"
+    )
+    prior_batch_id = _persist_prior_partial_batch(
+        session_factory,
+        raw_id=raw_id,
+        lifecycle_id=lifecycle_id,
+        binding_id=binding_id,
+        status="succeeded",
+        reconciled=True,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    original = planner.create_management_batch_in_session
+
+    def mutate_round_then_create(session, *args, **kwargs):
+        with session_factory() as other_session:
+            prior = other_session.get(StrategyManagementBatch, prior_batch_id)
+            prior.status = "resolved"
+            other_session.commit()
+        return original(session, *args, **kwargs)
+
+    monkeypatch.setattr(
+        planner, "create_management_batch_in_session", mutate_round_then_create
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "target_identity_changed_during_planning"
+    with session_factory() as session:
+        assert session.query(StrategyManagementBatch).count() == 1
 
 
 def test_corrupt_persisted_partial_fraction_blocks_without_batch(monkeypatch, tmp_path):
