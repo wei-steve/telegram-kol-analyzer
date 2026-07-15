@@ -200,6 +200,17 @@ failed validation returns `snapshot_unstable` and no audit data. SQLite may
 create/checkpoint sidecars only inside the temporary directory; the source DB
 and its directory remain untouched even when they are read-only.
 
+Source copying is platform-gated before reading. On Linux the source descriptor
+must open successfully with `O_NOATIME`; permission failure has no ordinary-read
+fallback and returns `snapshot_unavailable`. On macOS/APFS the command requires
+the atomic copy-on-write `clonefile(2)` capability, then hashes the private
+clone. Other platforms, unsupported volumes, or cross-volume clone failure are
+refused before a source stream is read. Access time is part of the compared
+source metadata. Main DB, WAL, and SHM evidence are processed in fixed-size
+chunks with incremental hashes; component bytes are never accumulated in
+memory. SHM remains stability evidence only, while main DB and WAL form each
+private SQLite snapshot.
+
 The command does not initialize or migrate the schema, claim or convert legacy
 signals, build a Deepcoin client, make a network call, retry work, or change
 database state. Output is capped at 100 batches and 100 returned legs per
@@ -209,6 +220,12 @@ counts, validated sizes, states, modes, leg indexes, completeness flags, and
 malformed-field flags remain clear. Pending legacy management candidates are
 streamed completely for exact counts while only bounded redacted items are
 returned.
+
+Historical JSON and decimal text are resource-bounded before parsing or fixed
+formatting. Oversized/deep payloads, non-canonical or overlong batch IDs, huge
+decimal exponents, malformed old columns, and parser resource errors are
+reported only through fixed malformed counters/flags. Raw values, exception
+text, and tracebacks are never audit output.
 
 The audit includes abnormal counts for `blocked`, `submit_unknown`,
 `partial_failed`, and `recovery_required`. Never conclude that there is no

@@ -234,7 +234,11 @@ and every `blocked`, `submit_unknown`, `partial_failed`, or
 `recovery_required` count. The audit never performs compatibility migration or
 legacy conversion. It audits only after two stable ordinary-file captures and
 two validated private temporary snapshots; SQLite never receives the production
-database path. Stop deployment review if `snapshot_status` is not `stable`,
+database path. Linux must accept `O_NOATIME` with no ordinary-read fallback;
+macOS/APFS must support atomic `clonefile(2)` into the temporary volume. Source
+components are incrementally hashed with bounded memory, and oversized JSON,
+IDs, or decimals are flagged without parser expansion or raw-value output.
+Stop deployment review if `snapshot_status` is not `stable`,
 `snapshot_validation` is not `ok`, `output_complete=false`, any scan/batch/leg
 truncation is present, legacy `complete=false`, the service is inactive, the
 SHA differs, a table/index is missing, either gate is unsafe, schema is old,

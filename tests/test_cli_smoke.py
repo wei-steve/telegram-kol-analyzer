@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import json
 import os
 import sqlite3
+import tracemalloc
 from types import SimpleNamespace
 
 from telegram_kol_research.cli import app
@@ -284,19 +285,19 @@ def test_audit_management_batches_fails_closed_when_snapshot_changes(
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE harmless (id INTEGER PRIMARY KEY)")
         connection.commit()
-    original = cli_module._read_snapshot_component
+    original = cli_module._stream_snapshot_component
     calls = 0
 
-    def changing_read(path):
+    def changing_read(path, destination):
         nonlocal calls
-        result = original(path)
+        result = original(path, destination)
         calls += 1
         if calls == 1:
             with open(database_path, "ab") as stream:
                 stream.write(b"changed")
         return result
 
-    monkeypatch.setattr(cli_module, "_read_snapshot_component", changing_read)
+    monkeypatch.setattr(cli_module, "_stream_snapshot_component", changing_read)
     result = CliRunner().invoke(
         app,
         [
@@ -337,6 +338,175 @@ def test_audit_management_batches_fails_closed_on_rollback_journal(tmp_path):
     assert payload["snapshot_status"] == "snapshot_unstable"
     assert payload["snapshot_reason"] == "rollback_journal_present"
     assert payload["output_complete"] is False
+
+
+def test_linux_noatime_open_failure_refuses_before_source_read(tmp_path, monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    source = tmp_path / "source.db"
+    destination = tmp_path / "snapshot.db"
+    source.write_bytes(b"source-bytes")
+    before = source.read_bytes(), source.stat(), sorted(p.name for p in tmp_path.iterdir())
+    real_open = os.open
+    noatime_flag = 0x40000
+
+    def refusing_open(path, flags, *args, **kwargs):
+        if os.fspath(path) == os.fspath(source) and flags & noatime_flag:
+            raise PermissionError("forced O_NOATIME failure")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", refusing_open)
+    try:
+        cli_module._stream_linux_noatime_component(
+            source, destination, noatime_flag=noatime_flag
+        )
+    except cli_module.ManagementAuditSnapshotError as exc:
+        assert exc.status == "snapshot_unavailable"
+        assert exc.reason == "noatime_open_failed"
+    else:
+        raise AssertionError("expected fail-closed no-atime refusal")
+
+    assert destination.exists() is False
+    assert source.read_bytes() == before[0]
+    assert source.stat() == before[1]
+    assert sorted(p.name for p in tmp_path.iterdir()) == before[2]
+
+
+def test_snapshot_capture_streams_to_files_and_returns_metadata_only(tmp_path):
+    import telegram_kol_research.cli as cli_module
+
+    database_path = tmp_path / "stream.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE harmless (id INTEGER PRIMARY KEY)")
+        connection.commit()
+    snapshot_root = tmp_path / "private"
+
+    metadata = cli_module._capture_source_components(database_path, snapshot_root)
+
+    assert metadata["main"]["size"] == database_path.stat().st_size
+    assert len(metadata["main"]["sha256"]) == 64
+    assert all(not isinstance(value, (bytes, bytearray)) for value in metadata.values())
+    assert (snapshot_root / "audit.db").read_bytes() == database_path.read_bytes()
+
+
+def test_snapshot_component_large_sparse_file_has_chunk_bounded_memory(tmp_path):
+    import telegram_kol_research.cli as cli_module
+
+    source = tmp_path / "large.db"
+    destination = tmp_path / "private.db"
+    with source.open("wb") as stream:
+        stream.seek(32 * 1024 * 1024 - 1)
+        stream.write(b"x")
+
+    tracemalloc.start()
+    try:
+        metadata = cli_module._stream_snapshot_component(source, destination)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert metadata["size"] == 32 * 1024 * 1024
+    assert destination.stat().st_size == metadata["size"]
+    assert peak < 8 * 1024 * 1024
+
+
+def test_audit_management_batches_maps_top_level_data_error_safely(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path = tmp_path / "data-error.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE harmless (id INTEGER PRIMARY KEY)")
+        connection.commit()
+    monkeypatch.setattr(
+        cli_module,
+        "_audit_management_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(MemoryError("secret-value")),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["snapshot_status"] == "snapshot_unavailable"
+    assert payload["snapshot_reason"] == "audit_data_validation_failed"
+    assert "secret-value" not in result.stdout
+    assert "MemoryError" not in result.stdout
+
+
+def test_audit_management_batches_resource_attack_values_are_malformed(tmp_path):
+    database_path = tmp_path / "resource-attacks.db"
+    create_session_factory(database_path)
+    deep_payload = "[" * 2000 + "0" + "]" * 2000
+    huge_id_payload = json.dumps({"management_batch_id": "9" * 5000})
+    oversized_payload = "x" * 70_000
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, idempotency_fingerprint, raw_message_id, recognition_decision_id, "
+            "recognition_generation, target_lifecycle_id, strategy_instance_id, "
+            "execution_binding_id, intent, effective_action, execution_mode, "
+            "partial_round_before, status, target_fingerprint, target_snapshot_json, "
+            "planned_at, created_at, updated_at) "
+            "VALUES (901, 'fp-901', 902, 903, 'gen', 904, 'strategy', 905, "
+            "'partial_take_profit', 'partial_close', 'shadow', 0, 'ready', 'target', "
+            "'{}', '2026-07-15 10:00:00', '2026-07-15 10:00:00', "
+            "'2026-07-15 10:00:00')"
+        )
+        for leg_id, size in ((910, "1E+100000000"), (911, "1E-100000000")):
+            connection.execute(
+                "INSERT INTO strategy_management_legs "
+                "(id, management_batch_id, execution_order_leg_id, pos_id, leg_index, "
+                "status, preflight_size, planned_close_size, created_at, updated_at) "
+                "VALUES (?, 901, ?, ?, ?, 'planned', ?, ?, "
+                "'2026-07-15 10:00:00', '2026-07-15 10:00:00')",
+                (leg_id, leg_id + 100, f"pos-{leg_id}", leg_id - 909, size, size),
+            )
+        for signal_id, payload in enumerate(
+            (huge_id_payload, deep_payload, oversized_payload), start=920
+        ):
+            connection.execute(
+                "INSERT INTO trade_signals "
+                "(id, signal_uid, source_type, venue, kol_id, chat_id, message_id, "
+                "symbol, side, action, status, payload_json, attempts, created_at, updated_at) "
+                "VALUES (?, ?, 'automatic', 'deepcoin', 'kol', -1001, ?, 'BTC', "
+                "'short', 'close_position', 'pending', ?, 0, "
+                "'2026-07-15 10:00:00', '2026-07-15 10:00:00')",
+                (signal_id, f"signal-{signal_id}", signal_id, payload),
+            )
+        connection.commit()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["legacy_pending_management"]["total"] == 3
+    assert payload["legacy_pending_management"]["malformed_payload_count"] == 3
+    assert all(leg["preflight_size"] is None for leg in payload["batches"][0]["legs"])
+    assert all(
+        leg["planned_close_size"] is None for leg in payload["batches"][0]["legs"]
+    )
+    assert "100000000" not in result.stdout
+    assert "9" * 200 not in result.stdout
 
 
 def test_audit_management_batches_handles_old_schema_without_migrating(tmp_path):

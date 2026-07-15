@@ -251,10 +251,15 @@ position) is deliberately a separate task and branch. Do not mix its historical
 attribution migration or compatibility repair into this batch rollout.
 
 The management audit preserves a zero-write source boundary: it never gives
-SQLite the production path. Two ordinary-file captures of main/WAL/SHM must
-match in component set, metadata, hash, and bytes; two private temporary copies
-must then pass `quick_check` and schema inspection. A rollback journal or any
-instability fails closed as `snapshot_unstable`. All identities in JSON and
-text output are hashed references. Counts are exact where labelled complete;
-any batch, leg, or returned-item truncation, or any false completeness flag,
-prohibits a "no residue" conclusion.
+SQLite the production path. Linux requires a successful `O_NOATIME` source
+open with no fallback; macOS/APFS requires atomic `clonefile(2)` into the
+private temporary volume; unsupported capability fails before reading as
+`snapshot_unavailable`. Two captures of main/WAL/SHM must match in component
+set, access-inclusive metadata, incremental hash, and size; both private copies
+must pass `quick_check` and schema inspection. Components are streamed in fixed
+chunks and never retained as whole byte arrays. A rollback journal or any
+instability fails closed as `snapshot_unstable`. Historical JSON, IDs, and
+decimals have parser/output resource limits and only fixed malformed flags may
+escape. All identities in JSON and text output are hashed references. Counts
+are exact where labelled complete; any batch, leg, or returned-item truncation,
+or any false completeness flag, prohibits a "no residue" conclusion.

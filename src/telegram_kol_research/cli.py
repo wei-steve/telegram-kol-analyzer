@@ -1,9 +1,11 @@
 """CLI entrypoints for the Telegram KOL research app."""
 
 import asyncio
+import ctypes
 import hashlib
 import json
 import os
+import platform
 import re
 import sqlite3
 import shutil
@@ -134,70 +136,158 @@ _MANAGEMENT_ALERT_STATES = (
     "recovery_required",
 )
 _SAFE_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_MAX_MANAGEMENT_PAYLOAD_CHARS = 65_536
+_MAX_MANAGEMENT_PAYLOAD_BYTES = 262_144
+_MAX_CANONICAL_ID_DIGITS = 20
+_MAX_CANONICAL_ID = 9_223_372_036_854_775_807
+_MAX_DECIMAL_INPUT_CHARS = 128
+_MAX_DECIMAL_DIGITS = 40
+_MAX_DECIMAL_FIXED_CHARS = 128
 
 
 class ManagementAuditSnapshotError(RuntimeError):
     """Source files could not produce two identical coherent private snapshots."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, *, status: str = "snapshot_unstable"):
         super().__init__(reason)
         self.reason = reason
+        self.status = status
 
 
-def _read_snapshot_component(path: Path) -> tuple[bytes, tuple]:
-    """Read one source component without asking SQLite to touch the source."""
+def _component_stat_signature(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_atime_ns,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
 
-    before = path.stat(follow_symlinks=False)
-    if not path.is_file() or path.is_symlink():
-        raise ManagementAuditSnapshotError("source_component_not_regular")
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    no_atime = getattr(os, "O_NOATIME", 0)
+
+def _write_all(descriptor: int, chunk: bytes) -> None:
+    offset = 0
+    while offset < len(chunk):
+        written = os.write(descriptor, chunk[offset:])
+        if written <= 0:
+            raise ManagementAuditSnapshotError(
+                "private_snapshot_write_failed", status="snapshot_unavailable"
+            )
+        offset += written
+
+
+def _stream_linux_noatime_component(
+    source: Path, destination: Path, *, noatime_flag: int
+) -> dict:
+    """Stream one Linux source fd only when O_NOATIME was accepted."""
+
+    before = source.stat(follow_symlinks=False)
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags | no_atime)
-    except PermissionError:
-        descriptor = os.open(path, flags)
+        source_fd = os.open(source, flags | noatime_flag)
+    except OSError as exc:
+        raise ManagementAuditSnapshotError(
+            "noatime_open_failed", status="snapshot_unavailable"
+        ) from exc
+    destination_fd = None
     try:
-        chunks: list[bytes] = []
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        digest = hashlib.sha256()
+        size = 0
         while True:
-            chunk = os.read(descriptor, 1024 * 1024)
+            chunk = os.read(source_fd, 1024 * 1024)
             if not chunk:
                 break
-            chunks.append(chunk)
-        descriptor_stat = os.fstat(descriptor)
+            digest.update(chunk)
+            size += len(chunk)
+            _write_all(destination_fd, chunk)
+        descriptor_stat = os.fstat(source_fd)
+    except Exception:
+        if destination.exists():
+            destination.unlink()
+        raise
     finally:
-        os.close(descriptor)
-    after = path.stat(follow_symlinks=False)
-    stable_fields_before = (
-        before.st_dev,
-        before.st_ino,
-        before.st_mode,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
-    )
-    stable_fields_after = (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    )
-    descriptor_fields = (
-        descriptor_stat.st_dev,
-        descriptor_stat.st_ino,
-        descriptor_stat.st_mode,
-        descriptor_stat.st_size,
-        descriptor_stat.st_mtime_ns,
-        descriptor_stat.st_ctime_ns,
-    )
-    if stable_fields_before != stable_fields_after or descriptor_fields != stable_fields_after:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        os.close(source_fd)
+    after = source.stat(follow_symlinks=False)
+    before_signature = _component_stat_signature(before)
+    after_signature = _component_stat_signature(after)
+    descriptor_signature = _component_stat_signature(descriptor_stat)
+    if before_signature != after_signature or descriptor_signature != after_signature:
         raise ManagementAuditSnapshotError("source_component_changed_during_read")
-    content = b"".join(chunks)
-    signature = stable_fields_after + (hashlib.sha256(content).hexdigest(),)
-    return content, signature
+    return {"stat": after_signature, "size": size, "sha256": digest.hexdigest()}
+
+
+def _hash_private_component(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+
+def _clone_darwin_component(source: Path, destination: Path) -> dict:
+    """Atomically COW-clone APFS source data without reading/updating source atime."""
+
+    before = source.stat(follow_symlinks=False)
+    try:
+        clonefile = ctypes.CDLL(None, use_errno=True).clonefile
+    except AttributeError as exc:
+        raise ManagementAuditSnapshotError(
+            "darwin_clone_unavailable", status="snapshot_unavailable"
+        ) from exc
+    clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    clonefile.restype = ctypes.c_int
+    clone_nofollow = 0x0001
+    result = clonefile(
+        os.fsencode(source), os.fsencode(destination), clone_nofollow
+    )
+    if result != 0:
+        raise ManagementAuditSnapshotError(
+            "darwin_clone_failed", status="snapshot_unavailable"
+        )
+    after = source.stat(follow_symlinks=False)
+    before_signature = _component_stat_signature(before)
+    after_signature = _component_stat_signature(after)
+    if before_signature != after_signature:
+        destination.unlink(missing_ok=True)
+        raise ManagementAuditSnapshotError("source_component_changed_during_clone")
+    size, digest = _hash_private_component(destination)
+    if size != after.st_size:
+        destination.unlink(missing_ok=True)
+        raise ManagementAuditSnapshotError("private_clone_size_mismatch")
+    return {"stat": after_signature, "size": size, "sha256": digest}
+
+
+def _stream_snapshot_component(source: Path, destination: Path) -> dict:
+    if source.is_symlink() or not source.is_file():
+        raise ManagementAuditSnapshotError("source_component_not_regular")
+    system = platform.system()
+    if system == "Darwin":
+        return _clone_darwin_component(source, destination)
+    if system == "Linux":
+        noatime_flag = getattr(os, "O_NOATIME", None)
+        if noatime_flag is None:
+            raise ManagementAuditSnapshotError(
+                "noatime_capability_unavailable", status="snapshot_unavailable"
+            )
+        return _stream_linux_noatime_component(
+            source, destination, noatime_flag=noatime_flag
+        )
+    raise ManagementAuditSnapshotError(
+        "safe_source_copy_unsupported", status="snapshot_unavailable"
+    )
 
 
 def _source_component_paths(database_path: Path) -> dict[str, Path]:
@@ -218,28 +308,22 @@ def _source_component_paths(database_path: Path) -> dict[str, Path]:
     }
 
 
-def _capture_source_components(database_path: Path) -> dict[str, tuple[bytes, tuple]]:
+def _capture_source_components(database_path: Path, snapshot_root: Path) -> dict[str, dict]:
+    snapshot_root.mkdir(mode=0o700)
     paths_before = _source_component_paths(database_path)
+    destinations = {
+        "main": snapshot_root / "audit.db",
+        "wal": snapshot_root / "audit.db-wal",
+        "shm": snapshot_root / "source-shm.evidence",
+    }
     captured = {
-        name: _read_snapshot_component(path) for name, path in paths_before.items()
+        name: _stream_snapshot_component(path, destinations[name])
+        for name, path in paths_before.items()
     }
     paths_after = _source_component_paths(database_path)
     if tuple(sorted(paths_before)) != tuple(sorted(paths_after)):
         raise ManagementAuditSnapshotError("source_component_set_changed")
     return captured
-
-
-def _write_private_snapshot(
-    root: Path, captured: dict[str, tuple[bytes, tuple]]
-) -> Path:
-    root.mkdir(mode=0o700)
-    snapshot_path = root / "audit.db"
-    snapshot_path.write_bytes(captured["main"][0])
-    if "wal" in captured:
-        (root / "audit.db-wal").write_bytes(captured["wal"][0])
-    # Do not copy source SHM. SQLite may rebuild/checkpoint only beside the
-    # private copy; the source SHM is used exclusively as stability evidence.
-    return snapshot_path
 
 
 def _validate_private_snapshot(snapshot_path: Path) -> None:
@@ -260,17 +344,18 @@ def _build_stable_private_snapshots(
     database_path: Path, temporary_root: Path
 ) -> tuple[Path, dict]:
     try:
-        first = _capture_source_components(database_path)
-        second = _capture_source_components(database_path)
+        first_root = temporary_root / "snapshot-1"
+        second_root = temporary_root / "snapshot-2"
+        first = _capture_source_components(database_path, first_root)
+        second = _capture_source_components(database_path, second_root)
     except OSError as exc:
-        raise ManagementAuditSnapshotError("source_read_failed") from exc
-    if set(first) != set(second) or any(
-        first[name][1] != second[name][1] or first[name][0] != second[name][0]
-        for name in first
-    ):
+        raise ManagementAuditSnapshotError(
+            "source_copy_failed", status="snapshot_unavailable"
+        ) from exc
+    if set(first) != set(second) or any(first[name] != second[name] for name in first):
         raise ManagementAuditSnapshotError("source_snapshots_differ")
-    first_path = _write_private_snapshot(temporary_root / "snapshot-1", first)
-    second_path = _write_private_snapshot(temporary_root / "snapshot-2", second)
+    first_path = first_root / "audit.db"
+    second_path = second_root / "audit.db"
     _validate_private_snapshot(first_path)
     _validate_private_snapshot(second_path)
     return second_path, {
@@ -282,9 +367,14 @@ def _build_stable_private_snapshots(
 
 
 def _redacted_ref(kind: str, value: object) -> str | None:
-    if value is None or str(value) == "":
+    if value is None:
         return None
-    digest = hashlib.sha256(f"{kind}:{value}".encode("utf-8")).hexdigest()[:10]
+    normalized = str(value)
+    if not normalized or len(normalized) > 256:
+        return None
+    digest = hashlib.sha256(
+        kind.encode("ascii") + b":" + normalized.encode("utf-8")
+    ).hexdigest()[:10]
     return f"{kind}:{digest}"
 
 
@@ -300,10 +390,11 @@ def _bounded_text(value: object, *, limit: int = 64) -> str | None:
 def _identity_ref(
     kind: str, value: object, malformed_fields: list[str], field: str
 ) -> str | None:
-    if value is None or str(value) == "":
+    reference = _redacted_ref(kind, value)
+    if reference is None:
         malformed_fields.append(field)
         return None
-    return _redacted_ref(kind, value)
+    return reference
 
 
 def _safe_token_value(
@@ -324,15 +415,45 @@ def _safe_decimal_value(
 ) -> str | None:
     if value in {None, ""}:
         return None
+    raw = str(value)
+    if len(raw) > _MAX_DECIMAL_INPUT_CHARS:
+        malformed_fields.append(field)
+        return None
     try:
-        normalized = Decimal(str(value))
+        normalized = Decimal(raw)
     except (InvalidOperation, ValueError):
         malformed_fields.append(field)
         return None
     if not normalized.is_finite() or normalized < 0:
         malformed_fields.append(field)
         return None
-    return format(normalized, "f")
+    decimal_tuple = normalized.as_tuple()
+    digit_count = len(decimal_tuple.digits)
+    exponent = decimal_tuple.exponent
+    if (
+        not isinstance(exponent, int)
+        or digit_count > _MAX_DECIMAL_DIGITS
+        or abs(exponent) > _MAX_DECIMAL_FIXED_CHARS
+    ):
+        malformed_fields.append(field)
+        return None
+    estimated_fixed_chars = (
+        digit_count + exponent
+        if exponent >= 0
+        else max(digit_count, -exponent) + 2
+    ) + int(decimal_tuple.sign)
+    if estimated_fixed_chars > _MAX_DECIMAL_FIXED_CHARS:
+        malformed_fields.append(field)
+        return None
+    try:
+        rendered = format(normalized, "f")
+    except (ValueError, OverflowError, MemoryError):
+        malformed_fields.append(field)
+        return None
+    if len(rendered) > _MAX_DECIMAL_FIXED_CHARS:
+        malformed_fields.append(field)
+        return None
+    return rendered
 
 
 def _safe_leg_index(
@@ -397,10 +518,19 @@ def _canonical_positive_id(payload: object, key: str) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, str) and value.isdigit() and not value.startswith("0"):
-        normalized = int(value)
-        return normalized if normalized > 0 else None
+        return value if 0 < value <= _MAX_CANONICAL_ID else None
+    if (
+        isinstance(value, str)
+        and 0 < len(value) <= _MAX_CANONICAL_ID_DIGITS
+        and value.isascii()
+        and value.isdigit()
+        and not value.startswith("0")
+    ):
+        try:
+            normalized = int(value)
+        except (ValueError, OverflowError, MemoryError):
+            return None
+        return normalized if normalized <= _MAX_CANONICAL_ID else None
     return None
 
 
@@ -465,16 +595,38 @@ def _audit_pending_legacy_management_read_only(
             scanned_count += 1
             malformed = False
             raw_payload = row["payload_json"]
-            if not isinstance(raw_payload, str) or len(raw_payload) > 1_000_000:
+            if (
+                not isinstance(raw_payload, str)
+                or len(raw_payload) > _MAX_MANAGEMENT_PAYLOAD_CHARS
+            ):
                 payload = {}
                 malformed = True
             else:
                 try:
+                    if (
+                        len(raw_payload.encode("utf-8"))
+                        > _MAX_MANAGEMENT_PAYLOAD_BYTES
+                    ):
+                        raise ValueError("payload byte limit")
                     payload = json.loads(raw_payload or "{}")
-                except (json.JSONDecodeError, TypeError):
+                except (
+                    json.JSONDecodeError,
+                    TypeError,
+                    RecursionError,
+                    ValueError,
+                    OverflowError,
+                    MemoryError,
+                ):
                     payload = {}
                     malformed = True
-            if _canonical_positive_id(payload, "management_batch_id") is not None:
+            canonical_batch_id = _canonical_positive_id(
+                payload, "management_batch_id"
+            )
+            if not isinstance(payload, dict) or (
+                "management_batch_id" in payload and canonical_batch_id is None
+            ):
+                malformed = True
+            if canonical_batch_id is not None:
                 continue
             legacy_count += 1
             malformed_payload_count += int(malformed)
@@ -1316,14 +1468,26 @@ def audit_management_batches(
         raise typer.BadParameter("output-format must be one of: text, json")
     try:
         audit = _audit_management_batches_read_only(database_path, limit=limit)
-    except (ManagementAuditSnapshotError, sqlite3.Error) as exc:
-        reason = (
-            exc.reason
-            if isinstance(exc, ManagementAuditSnapshotError)
-            else "snapshot_audit_failed"
-        )
+    except (
+        ManagementAuditSnapshotError,
+        sqlite3.Error,
+        ValueError,
+        TypeError,
+        OverflowError,
+        RecursionError,
+        MemoryError,
+    ) as exc:
+        if isinstance(exc, ManagementAuditSnapshotError):
+            snapshot_status = exc.status
+            reason = exc.reason
+        elif isinstance(exc, sqlite3.Error):
+            snapshot_status = "snapshot_unavailable"
+            reason = "snapshot_audit_failed"
+        else:
+            snapshot_status = "snapshot_unavailable"
+            reason = "audit_data_validation_failed"
         audit = {
-            "snapshot_status": "snapshot_unstable",
+            "snapshot_status": snapshot_status,
             "snapshot_validation": "not_run",
             "snapshot_reason": reason,
             "schema_status": "not_checked",
@@ -1358,7 +1522,7 @@ def audit_management_batches(
             json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True)
             if normalized_format == "json"
             else (
-                f"snapshot_status=snapshot_unstable "
+                f"snapshot_status={snapshot_status} "
                 f"snapshot_validation=not_run snapshot_reason={reason}\n"
                 "audit_payload="
                 + json.dumps(
