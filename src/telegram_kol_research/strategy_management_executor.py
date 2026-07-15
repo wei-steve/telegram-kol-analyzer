@@ -23,6 +23,7 @@ from telegram_kol_research.execution_events import (
     record_execution_event,
 )
 from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg
+from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
@@ -40,7 +41,9 @@ from telegram_kol_research.strategy_management_batches import (
 
 
 DEEPCOIN_CLIENT_ORDER_ID_MAX_LENGTH = 20
-_CLOSE_ACTIONS = frozenset({"partial_close", "full_close", "full_exit"})
+_CLOSE_ACTIONS = frozenset(
+    {"partial_close", "full_close", "full_exit", "partial_then_break_even"}
+)
 _PROTECTION_ACTIONS = frozenset({"adjust_stop_loss", "move_stop_to_break_even"})
 
 
@@ -68,7 +71,13 @@ def execute_management_batch(
 
     now = executed_at or datetime.now(UTC)
     batch = load_management_batch(session_factory, int(batch_id))
-    if batch.effective_action in _PROTECTION_ACTIONS:
+    if batch.effective_action in _PROTECTION_ACTIONS or (
+        batch.effective_action == "partial_then_break_even"
+        and (
+            batch.status == "protection_ready"
+            or batch.reason_code == "protection_phase_executing"
+        )
+    ):
         return _execute_protection_batch(
             session_factory,
             batch=batch,
@@ -92,7 +101,6 @@ def execute_management_batch(
         return _result(batch, reason="batch_already_reconciling")
     if batch.status != "executing":
         raise ManagementBatchExecutionError(f"batch_not_executable:{batch.status}")
-
     binding = _load_exact_binding(session_factory, batch)
     _require_exact_entry_legs(session_factory, batch)
     # A durable reservation cannot distinguish a crash before the call from a
@@ -271,13 +279,49 @@ def _execute_protection_batch(
     if batch.status == "ready":
         claimed = claim_ready_batch(session_factory, batch.id, claimed_at=executed_at)
         batch = claimed or load_management_batch(session_factory, batch.id)
+    elif batch.status == "protection_ready":
+        if not transition_batch(
+            session_factory,
+            batch.id,
+            expected_statuses={"protection_ready"},
+            new_status="executing",
+            transitioned_at=executed_at,
+            reason_code="protection_phase_executing",
+        ):
+            raise ManagementBatchExecutionError(
+                "management_protection_phase_claim_conflict"
+            )
+        batch = load_management_batch(session_factory, batch.id)
     if batch.status != "executing":
         raise ManagementBatchExecutionError(f"batch_not_executable:{batch.status}")
+    if any(leg.status == "reserved" for leg in batch.legs):
+        for leg in batch.legs:
+            if leg.status == "reserved":
+                transition_leg(
+                    session_factory,
+                    leg.id,
+                    expected_statuses={"reserved"},
+                    new_status="recovery_required",
+                    transitioned_at=executed_at,
+                    last_error={"reason": "reserved_protection_outcome_unknown"},
+                )
+        transition_batch(
+            session_factory,
+            batch.id,
+            expected_statuses={"executing"},
+            new_status="recovery_required",
+            transitioned_at=executed_at,
+            reason_code="reserved_protection_outcome_unknown",
+        )
+        return _result(
+            load_management_batch(session_factory, batch.id),
+            reason="reserved_protection_outcome_unknown",
+        )
 
-    binding = _load_exact_binding(session_factory, batch)
-    _require_exact_entry_legs(session_factory, batch)
-    inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
     try:
+        binding = _load_exact_binding(session_factory, batch)
+        _require_exact_entry_legs(session_factory, batch)
+        inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
         live_positions = list(deepcoin_client.list_positions(inst_id=inst_id))
         positions_by_id = _preflight_exact_protection_positions(
             batch=batch,
@@ -334,10 +378,15 @@ def _execute_protection_batch(
 
     failed_status: str | None = None
     for leg, old_rows, new_rows, common in prepared_legs:
+        expected_leg_statuses = (
+            {"confirmed"}
+            if batch.effective_action == "partial_then_break_even"
+            else {"planned"}
+        )
         if not transition_leg(
             session_factory,
             leg.id,
-            expected_statuses={"planned"},
+            expected_statuses=expected_leg_statuses,
             new_status="reserved",
             transitioned_at=executed_at,
             request={"cancel_order_ids": [row["order_id"] for row in old_rows]},
@@ -395,6 +444,24 @@ def _execute_protection_batch(
                 last_error=None,
             )
             continue
+
+        if not isinstance(replacement_error, DeepcoinDefiniteRejection):
+            transition_leg(
+                session_factory,
+                leg.id,
+                expected_statuses={"reserved"},
+                new_status="recovery_required",
+                transitioned_at=executed_at,
+                response={"rows": replacement_responses},
+                last_error={
+                    "stage": "replace_protection_outcome_unknown",
+                    "type": type(replacement_error).__name__,
+                    "message": str(replacement_error),
+                    "created_order_ids": created_order_ids,
+                },
+            )
+            failed_status = "recovery_required"
+            break
 
         restoration_error: Exception | None = None
         try:
@@ -470,10 +537,32 @@ def _preflight_exact_protection_positions(
     live_positions: list[dict[str, Any]],
     inst_id: str,
 ) -> dict[str, dict[str, Any]]:
+    expected_pos_ids = {leg.pos_id for leg in batch.legs}
+    bound_pos_ids = {
+        value.strip()
+        for value in str(binding.pos_id or "").split(",")
+        if value.strip()
+    }
+    if bound_pos_ids != expected_pos_ids:
+        raise ManagementBatchExecutionError(
+            "protection_preflight_binding_position_set_drift"
+        )
+    relevant_live_ids = {
+        str(pos_id)
+        for row in live_positions
+        if _first_text(row, "instId", "inst_id") == inst_id
+        and (_first_text(row, "posSide", "pos_side", "side") or "").lower()
+        == binding.side.lower()
+        and (pos_id := _first_text(row, "posId", "pos_id", "id")) is not None
+    }
+    if relevant_live_ids != expected_pos_ids:
+        raise ManagementBatchExecutionError(
+            "protection_preflight_live_position_set_drift"
+        )
     positions_by_id: dict[str, dict[str, Any]] = {}
     for row in live_positions:
         pos_id = _first_text(row, "posId", "pos_id", "id")
-        if pos_id not in {leg.pos_id for leg in batch.legs}:
+        if pos_id not in expected_pos_ids:
             continue
         if (
             _first_text(row, "instId", "inst_id") != inst_id
@@ -485,12 +574,23 @@ def _preflight_exact_protection_positions(
                 "protection_preflight_position_ambiguous"
             )
         positions_by_id[str(pos_id)] = row
-    if set(positions_by_id) != {leg.pos_id for leg in batch.legs}:
+    if set(positions_by_id) != expected_pos_ids:
         raise ManagementBatchExecutionError("protection_preflight_position_set_drift")
     for leg in batch.legs:
         position = positions_by_id[leg.pos_id]
+        expected_size = leg.preflight_size
+        if batch.effective_action == "partial_then_break_even":
+            try:
+                expected_size = str(
+                    Decimal(str(leg.preflight_size))
+                    - Decimal(str(leg.planned_close_size))
+                )
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise ManagementBatchExecutionError(
+                    "protection_preflight_position_economics_drift"
+                ) from exc
         if not _decimal_equal(
-            _first_text(position, "pos", "size", "sz"), leg.preflight_size
+            _first_text(position, "pos", "size", "sz"), expected_size
         ) or not _decimal_equal(
             _first_text(position, "avgPx", "avgPrice", "avg_entry_price"),
             leg.avg_entry_price,
@@ -533,7 +633,10 @@ def _preflight_exact_protection_rows(
 def _adjusted_protection_rows(
     *, batch: ManagementBatchRecord, leg: Any, old_rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    if batch.effective_action == "move_stop_to_break_even":
+    if batch.effective_action in {
+        "move_stop_to_break_even",
+        "partial_then_break_even",
+    }:
         stop_price = leg.avg_entry_price
     else:
         stop_price = (leg.planned_tpsl or {}).get("stop_loss_text")
@@ -636,6 +739,32 @@ def _require_exact_entry_legs(
     session_factory: sessionmaker, batch: ManagementBatchRecord
 ) -> None:
     with session_factory() as session:
+        all_entries = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == batch.execution_binding_id)
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .all()
+        )
+        batch_identity = {
+            (int(leg.execution_order_leg_id), str(leg.pos_id)) for leg in batch.legs
+        }
+        current_identity: set[tuple[int, str]] = set()
+        if not all_entries:
+            raise ManagementBatchExecutionError("batch_entry_set_not_exact")
+        for entry in all_entries:
+            status = str(entry.status or "").lower()
+            if (
+                entry.strategy_instance_id != batch.strategy_instance_id
+                or entry.attribution_status != "verified"
+                or not entry.pos_id
+                or status in TERMINAL_ENTRY_LEG_STATES
+                or status not in {"active", "open", "filled", "partial_closed"}
+                or entry.terminal_reason is not None
+            ):
+                raise ManagementBatchExecutionError("batch_entry_set_not_exact")
+            current_identity.add((int(entry.id), str(entry.pos_id)))
+        if current_identity != batch_identity:
+            raise ManagementBatchExecutionError("batch_entry_set_not_exact")
         for leg in batch.legs:
             entry = session.get(ExecutionOrderLeg, leg.execution_order_leg_id)
             if (

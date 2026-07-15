@@ -5,6 +5,7 @@ from threading import Event, Thread
 import pytest
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
 from telegram_kol_research.deepcoin_execution_actions import adjust_position_tpsl
 from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
@@ -70,6 +71,7 @@ class _FakeDeepcoinClient:
         self.cancel_trigger_payloads = []
         self.cancel_order_payloads = []
         self.protection_payloads = []
+        self.protection_outcomes = []
         self.order_payloads = []
         self.trigger_payloads = []
 
@@ -95,6 +97,11 @@ class _FakeDeepcoinClient:
 
     def set_position_sltp(self, protection_payload):
         self.protection_payloads.append(protection_payload)
+        if self.protection_outcomes:
+            outcome = self.protection_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
         return {"code": "0", "data": {"ordId": "tpsl-new"}}
 
     def place_order(self, order_payload):
@@ -282,11 +289,12 @@ def _signal(
     symbol="ETH",
     side="long",
     strategy_instance_id="deepcoin:100:55:ETH:long",
+    source_type="manual_operator",
 ):
     return enqueue_trade_signal(
         session_factory,
         venue="deepcoin",
-        source_type="kol_management",
+        source_type=source_type,
         kol_id=kol_id,
         chat_id=100,
         message_id=message_id,
@@ -1227,6 +1235,62 @@ def test_adjust_position_tpsl_preserves_multiple_take_profit_rows(tmp_path):
     ]
     assert client.protection_payloads[1]["tpTriggerPxType"] == "mark"
     assert client.protection_payloads[1]["tpOrdPx"] == "1615"
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [DeepcoinRequestOutcomeUnknown("response lost"), {"code": "0", "data": {}}],
+    ids=["request_unknown", "success_missing_order_id"],
+)
+def test_manual_tpsl_unknown_replacement_never_guesses_cancel_or_restore(
+    outcome, tmp_path
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    signal = _signal(
+        session_factory,
+        action="adjust_stop_loss",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+    )
+    client = _FakeDeepcoinClient()
+    client.protection_outcomes = [outcome]
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="position_tpsl_replacement_outcome_unknown",
+    ):
+        adjust_position_tpsl(
+            session_factory, trade_signal=signal, deepcoin_client=client
+        )
+
+    assert [item["ordId"] for item in client.cancel_trigger_payloads] == [
+        "tp-old",
+        "sl-old",
+    ]
+    assert len(client.protection_payloads) == 1
+
+
+def test_kol_tpsl_cannot_call_exact_manual_helper_without_batch(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    signal = _signal(
+        session_factory,
+        action="adjust_stop_loss",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+        source_type="kol_management",
+    )
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="automated_position_tpsl_requires_management_batch",
+    ):
+        adjust_position_tpsl(
+            session_factory, trade_signal=signal, deepcoin_client=client
+        )
+
+    assert client.cancel_trigger_payloads == []
+    assert client.protection_payloads == []
 
 
 def test_adjust_position_tpsl_refuses_to_append_when_existing_tpsl_is_missing(tmp_path):

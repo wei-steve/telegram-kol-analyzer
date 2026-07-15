@@ -52,7 +52,10 @@ from telegram_kol_research.strategy_management_sizing import (
 )
 
 
-PROTECTION_INTENTS = frozenset({"adjust_stop_loss", "move_stop_to_break_even"})
+PARTIAL_INTENTS = frozenset({"partial_take_profit", "partial_then_break_even"})
+PROTECTION_INTENTS = frozenset(
+    {"adjust_stop_loss", "move_stop_to_break_even", "partial_then_break_even"}
+)
 SUPPORTED_INTENTS = frozenset(
     {"partial_take_profit", "full_exit", *PROTECTION_INTENTS}
 )
@@ -290,8 +293,27 @@ def _plan_strategy_management_batch_locked(
             planned_at=now,
         )
 
+    partial_round_before = partial_policy_state.round_before
+    if intent in PARTIAL_INTENTS:
+        effective_action_name, effective_fraction = effective_action(
+            round_before=partial_round_before,
+            fraction=requested_fraction,
+        )
+        if (
+            intent == "partial_then_break_even"
+            and effective_action_name == "partial_close"
+        ):
+            effective_action_name = "partial_then_break_even"
+    elif intent == "full_exit":
+        effective_action_name, effective_fraction = intent, 1.0
+    else:
+        effective_action_name, effective_fraction = intent, None
+
     protection_by_pos_id: dict[str, dict[str, Any]] = {}
-    if intent in PROTECTION_INTENTS:
+    if (
+        intent in PROTECTION_INTENTS
+        and effective_action_name not in {"full_close", "full_exit"}
+    ):
         try:
             tpsl_orders = list(reconciliation_snapshot.pending_trigger_orders)
         except Exception:
@@ -363,17 +385,6 @@ def _plan_strategy_management_batch_locked(
                 "evidence": protection.evidence,
             }
 
-    partial_round_before = partial_policy_state.round_before
-    if intent == "partial_take_profit":
-        effective_action_name, effective_fraction = effective_action(
-            round_before=partial_round_before,
-            fraction=requested_fraction,
-        )
-    elif intent == "full_exit":
-        effective_action_name, effective_fraction = intent, 1.0
-    else:
-        effective_action_name, effective_fraction = intent, None
-
     planned_close_sizes: tuple[str | None, ...]
     if effective_fraction is None:
         planned_close_sizes = tuple(None for _ in economics)
@@ -427,6 +438,7 @@ def _plan_strategy_management_batch_locked(
             planned_tpsl=(
                 {"intent": intent, "stop_loss_text": candidate.stop_loss_text}
                 if intent in PROTECTION_INTENTS
+                and effective_action_name not in {"full_close", "full_exit"}
                 else None
             ),
             last_exchange_snapshot=position,
@@ -723,7 +735,7 @@ def _load_partial_policy_state(
     batches = (
         session.query(StrategyManagementBatch)
         .filter(StrategyManagementBatch.target_lifecycle_id == target_lifecycle_id)
-        .filter(StrategyManagementBatch.intent == "partial_take_profit")
+        .filter(StrategyManagementBatch.intent.in_(PARTIAL_INTENTS))
         .order_by(StrategyManagementBatch.id.asc())
         .all()
     )
@@ -751,11 +763,17 @@ def _load_partial_policy_state(
             )
         )
         fully_confirmed = bool(
-            batch.effective_action == "partial_close"
+            batch.effective_action in {"partial_close", "partial_then_break_even"}
             and batch.status == "succeeded"
             and batch.reconciled_at is not None
             and leg_states
-            and all(status == "confirmed" for _, status in leg_states)
+            and (
+                all(status == "confirmed" for _, status in leg_states)
+                or (
+                    batch.effective_action == "partial_then_break_even"
+                    and all(status == "succeeded" for _, status in leg_states)
+                )
+            )
         )
         if fully_confirmed:
             confirmed_partials += 1
@@ -868,7 +886,7 @@ def _persist_blocked(
         partial_round_before = 0
         effective_action_name = intent
         effective_fraction = None
-        if intent == "partial_take_profit":
+        if intent in PARTIAL_INTENTS:
             with session_factory() as session:
                 policy_state = _load_partial_policy_state(
                     session, target_lifecycle_id=lifecycle.id
@@ -922,7 +940,7 @@ def _persist_blocked(
 def normalize_requested_management_fraction(
     intent: str, value: object
 ) -> float | None:
-    if intent != "partial_take_profit":
+    if intent not in PARTIAL_INTENTS:
         return None
     if value is None:
         return None

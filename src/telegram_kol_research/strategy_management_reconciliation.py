@@ -30,7 +30,9 @@ from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 _ACTIVE_RECONCILIATION_STATUSES = frozenset(
     {"executing", "reconciling", "partial_failed", "recovery_required"}
 )
-_CLOSE_ACTIONS = frozenset({"partial_close", "full_close", "full_exit"})
+_CLOSE_ACTIONS = frozenset(
+    {"partial_close", "full_close", "full_exit", "partial_then_break_even"}
+)
 _ORDER_ID_KEYS = ("ordId", "orderId", "order_id", "id")
 _CLIENT_ORDER_ID_KEYS = ("clOrdId", "clientOrderId", "client_order_id")
 
@@ -102,14 +104,20 @@ def reconcile_strategy_management_batches(
 
             statuses = [str(leg.status or "") for leg in legs]
             if all(status == "confirmed" for status in statuses):
-                batch.status = "succeeded"
-                batch.reason_code = "management_close_exchange_confirmed"
                 batch.reconciled_at = now
-                batch.completed_at = now
                 batch.updated_at = now
+                if batch.effective_action == "partial_then_break_even":
+                    batch.status = "protection_ready"
+                    batch.reason_code = "management_close_confirmed_protection_ready"
+                    batch.completed_at = None
+                    counts["pending"] += 1
+                else:
+                    batch.status = "succeeded"
+                    batch.reason_code = "management_close_exchange_confirmed"
+                    batch.completed_at = now
+                    counts["succeeded"] += 1
                 if batch.effective_action in {"full_close", "full_exit"}:
                     _terminalize_full_close(session, batch=batch, legs=legs, now=now)
-                counts["succeeded"] += 1
             elif "failed" in statuses:
                 _freeze_batch(
                     batch,

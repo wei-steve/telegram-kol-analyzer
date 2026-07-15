@@ -10,7 +10,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinDefiniteRejection,
+    DeepcoinTradingClientProtocol,
+)
 from telegram_kol_research.deepcoin_normalization import (
     normalize_deepcoin_margin_mode as _deepcoin_margin_mode,
     normalize_deepcoin_position_mode as _deepcoin_position_mode,
@@ -49,6 +52,11 @@ class DeepcoinExecutionActionError(RuntimeError):
     """Raised when a management signal cannot be executed unambiguously."""
 
 
+_MANUAL_MANAGEMENT_SOURCE_TYPES = frozenset(
+    {"manual", "manual_operator", "operator_manual"}
+)
+
+
 @dataclass(slots=True)
 class _LoadedBinding:
     id: int
@@ -85,6 +93,15 @@ def execute_deepcoin_management_signal(
         "temporary_close",
         "partial_close_and_move_stop_to_entry",
     }:
+        return close_position_market(
+            session_factory,
+            trade_signal=trade_signal,
+            deepcoin_client=deepcoin_client,
+            executed_at=executed_at,
+        )
+    if action in {"adjust_position_tpsl", "adjust_stop_loss"} and (
+        trade_signal.source_type not in _MANUAL_MANAGEMENT_SOURCE_TYPES
+    ):
         return close_position_market(
             session_factory,
             trade_signal=trade_signal,
@@ -146,6 +163,14 @@ def adjust_position_tpsl(
     require_existing: bool = True,
 ) -> dict[str, Any]:
     """Adjust position TP/SL by canceling matched old TPSL rows before setting new rows."""
+
+    if (
+        trade_signal.action.lower() in {"adjust_position_tpsl", "adjust_stop_loss"}
+        and trade_signal.source_type not in _MANUAL_MANAGEMENT_SOURCE_TYPES
+    ):
+        raise DeepcoinExecutionActionError(
+            "automated_position_tpsl_requires_management_batch"
+        )
 
     now = executed_at or datetime.now(UTC)
     binding = _load_binding_for_signal(session_factory, trade_signal)
@@ -268,6 +293,10 @@ def adjust_position_tpsl(
             set_responses.append(set_response)
             new_order_ids.append(new_order_id)
     except Exception as replacement_error:
+        if not isinstance(replacement_error, DeepcoinDefiniteRejection):
+            raise DeepcoinExecutionActionError(
+                f"position_tpsl_replacement_outcome_unknown:{replacement_error}"
+            ) from replacement_error
         try:
             for new_order_id in new_order_ids:
                 deepcoin_client.cancel_trigger_order(
@@ -391,6 +420,11 @@ def close_position_market(
             and trade_signal.symbol.upper() == binding.symbol.upper()
             and trade_signal.side.lower() == binding.side.lower()
         )
+        if batch.effective_action in {"adjust_stop_loss", "move_stop_to_break_even"}:
+            identity_matches = identity_matches and trade_signal.action.lower() in {
+                "adjust_stop_loss",
+                "adjust_position_tpsl",
+            }
     if not identity_matches:
         raise DeepcoinExecutionActionError(
             "management_signal_batch_identity_mismatch"

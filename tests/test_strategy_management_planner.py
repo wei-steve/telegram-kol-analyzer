@@ -229,10 +229,10 @@ def _persist_exact_management_target(
                 management_action=intent,
                 management_fraction=(
                     0.3
-                    if intent == "partial_take_profit"
+                    if intent in {"partial_take_profit", "partial_then_break_even"}
                     and management_fraction == "default"
                     else management_fraction
-                    if intent == "partial_take_profit"
+                    if intent in {"partial_take_profit", "partial_then_break_even"}
                     else None
                 ),
                 recognition_generation="generation-b",
@@ -711,6 +711,60 @@ def test_unqualified_first_partial_plan_defaults_to_half(
     assert [leg.planned_close_size for leg in result.batch.legs] == ["5"]
 
 
+def test_partial_then_break_even_plans_durable_close_and_protection_phases(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="partial_then_break_even",
+        management_fraction=None,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    tpsl = [
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "tp-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "posId": "pos-b",
+            "tpTriggerPx": "61000",
+            "sz": "10",
+            "cTime": "1721000000000",
+        },
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "sl-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "posId": "pos-b",
+            "slTriggerPx": "63000",
+            "sz": "0",
+            "cTime": "1721000000000",
+        },
+    ]
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()], tpsl_orders=tpsl),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.intent == "partial_then_break_even"
+    assert result.batch.effective_action == "partial_then_break_even"
+    assert result.batch.effective_fraction == 0.5
+    assert result.batch.legs[0].planned_close_size == "5"
+    assert result.batch.legs[0].planned_tpsl == {
+        "intent": "partial_then_break_even",
+        "stop_loss_text": None,
+    }
+    assert result.batch.legs[0].old_tpsl["order_ids"] == ["tp-old", "sl-old"]
+
+
 def _persist_prior_partial_batch(
     session_factory,
     *,
@@ -807,6 +861,44 @@ def test_reconciled_succeeded_first_partial_promotes_second_partial_to_full_clos
     assert result.batch.effective_fraction == 1.0
     assert result.batch.partial_round_before == 1
     assert [leg.planned_close_size for leg in result.batch.legs] == ["10"]
+
+
+def test_second_partial_then_break_even_promotes_to_full_close_without_protection(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_then_break_even",
+        management_fraction=0.3,
+    )
+    _persist_prior_partial_batch(
+        session_factory,
+        raw_id=raw_id,
+        lifecycle_id=lifecycle_id,
+        binding_id=binding_id,
+        status="succeeded",
+        reconciled=True,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin([_position()])
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.effective_action == "full_close"
+    assert result.batch.effective_fraction == 1.0
+    assert result.batch.partial_round_before == 1
+    assert result.batch.legs[0].planned_close_size == "10"
+    assert result.batch.legs[0].planned_tpsl is None
+    assert result.batch.legs[0].old_tpsl is None
 
 
 @pytest.mark.parametrize(

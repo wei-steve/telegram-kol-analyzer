@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinDefiniteRejection,
+    DeepcoinRequestOutcomeUnknown,
+)
 from telegram_kol_research.execution_events import list_execution_events
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -129,6 +133,7 @@ def _persist_protection_batch(
     *,
     action="adjust_stop_loss",
     stop_loss="65000",
+    keep_close_plan=False,
 ):
     batch = _persist_close_batch(session_factory, sizes=("1", "2"), symbol="BTC")
     rows_by_pos = {
@@ -213,7 +218,8 @@ def _persist_protection_batch(
             legs, ("pos-1", "pos-2"), ("2", "4"), ("64000", "64500")
         ):
             rows = rows_by_pos[pos_id]
-            leg.planned_close_size = None
+            if not keep_close_plan:
+                leg.planned_close_size = None
             leg.preflight_size = size
             leg.avg_entry_price = avg_px
             leg.old_tpsl_json = json.dumps(
@@ -288,6 +294,7 @@ class _ProtectionClient:
         self.cancel_calls = []
         self.set_calls = []
         self.pending_reads = 0
+        self.close_calls = []
 
     def list_positions(self, *, inst_id=None):
         return [dict(row) for row in self.positions]
@@ -295,6 +302,13 @@ class _ProtectionClient:
     def list_trigger_orders_pending(self, *, inst_id):
         self.pending_reads += 1
         return [dict(row) for row in self.pending]
+
+    def place_order(self, payload):
+        self.close_calls.append(dict(payload))
+        return {
+            "code": "0",
+            "data": {"ordId": f"close-{len(self.close_calls)}"},
+        }
 
     def cancel_trigger_order(self, payload):
         self.cancel_calls.append(dict(payload))
@@ -696,6 +710,86 @@ def test_second_partial_promoted_to_full_exit_never_creates_new_stop(tmp_path):
     assert client.protection_payloads == []
 
 
+def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
+    tmp_path
+):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+    from telegram_kol_research.strategy_management_reconciliation import (
+        reconcile_strategy_management_batches,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory,
+        action="partial_then_break_even",
+        stop_loss=None,
+        keep_close_plan=True,
+    )
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    close_result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert close_result["status"] == "reconciling"
+    assert len(client.close_calls) == 2
+    assert client.cancel_calls == []
+    assert client.set_calls == []
+
+    stored = load_management_batch(session_factory, batch.id)
+    order_rows = [
+        {
+            "ordId": leg.exchange_order_id,
+            "clOrdId": leg.client_order_id,
+            "instId": "BTC-USDT-SWAP",
+        }
+        for leg in stored.legs
+    ]
+    snapshot = SimpleNamespace(
+        positions=[
+            {
+                "posId": "pos-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "1",
+                "avgPx": "64000",
+                "cTime": "1000",
+            },
+            {
+                "posId": "pos-2",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "2",
+                "avgPx": "64500",
+                "cTime": "1001",
+            },
+        ],
+        open_orders=[],
+        order_history=order_rows,
+        trade_fills=[],
+        errors={},
+    )
+    reconciled = reconcile_strategy_management_batches(
+        session_factory, snapshot=snapshot, reconciled_at=NOW
+    )
+    assert reconciled.pending == 1
+    assert load_management_batch(session_factory, batch.id).status == "protection_ready"
+    assert client.cancel_calls == []
+    assert client.set_calls == []
+
+    client.positions = list(snapshot.positions)
+    protection_result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert protection_result["status"] == "succeeded"
+    stops = [row for row in client.set_calls if "slTriggerPx" in row]
+    assert [(row["posId"], row["slTriggerPx"]) for row in stops] == [
+        ("pos-1", "64000"),
+        ("pos-2", "64500"),
+    ]
+
+
 @pytest.mark.parametrize("drift", ["price", "missing", "ambiguous"])
 def test_protection_preflight_drift_or_ambiguity_has_zero_cancels(drift, tmp_path):
     from telegram_kol_research.strategy_management_executor import (
@@ -793,6 +887,123 @@ def test_restore_failure_marks_recovery_required_and_stops_later_legs(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        DeepcoinRequestOutcomeUnknown("response lost"),
+        {"code": "0", "data": {}},
+    ],
+    ids=["request_unknown", "success_missing_order_id"],
+)
+def test_unknown_protection_replacement_never_cancels_or_restores(outcome, tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    client = _ProtectionClient(
+        session_factory,
+        rows_by_pos,
+        set_outcomes=[outcome],
+    )
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert [leg["status"] for leg in result["legs"]] == [
+        "recovery_required",
+        "planned",
+    ]
+    # Only the known old IDs were cancelled before the replacement call. No
+    # speculative cancel of a new ID and no restore write is permitted.
+    assert [call["ordId"] for call in client.cancel_calls] == [
+        "tp-1a",
+        "tp-1b",
+        "sl-1",
+    ]
+    assert len(client.set_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ("extra", "batch_entry_set_not_exact"),
+        ("null_pos", "batch_entry_set_not_exact"),
+        ("pending", "batch_entry_set_not_exact"),
+        ("wrong_strategy", "batch_entry_set_not_exact"),
+        ("terminal", "batch_entry_set_not_exact"),
+        ("binding_extra", "binding_position_set_drift"),
+        ("live_extra", "live_position_set_drift"),
+    ],
+)
+def test_protection_entry_or_binding_set_drift_has_zero_cancels(
+    mutation, error, tmp_path
+):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    with session_factory() as session:
+        entries = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == batch.execution_binding_id)
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .order_by(ExecutionOrderLeg.id)
+            .all()
+        )
+        if mutation == "extra":
+            session.add(
+                ExecutionOrderLeg(
+                    execution_binding_id=batch.execution_binding_id,
+                    strategy_instance_id=batch.strategy_instance_id,
+                    leg_index=9,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="entry-extra",
+                    pos_id="pos-extra",
+                    venue="deepcoin",
+                    attribution_status="verified",
+                    status="active",
+                )
+            )
+        elif mutation == "null_pos":
+            entries[1].pos_id = None
+        elif mutation == "pending":
+            entries[1].status = "pending"
+        elif mutation == "wrong_strategy":
+            entries[1].strategy_instance_id = "deepcoin:other"
+        elif mutation == "terminal":
+            entries[1].status = "closed"
+            entries[1].terminal_reason = "manual"
+        elif mutation == "binding_extra":
+            binding = session.get(ExecutionBinding, batch.execution_binding_id)
+            binding.pos_id = "pos-1,pos-2,pos-extra"
+        session.commit()
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    if mutation == "live_extra":
+        client.positions.append(
+            {
+                "posId": "pos-extra",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "1",
+                "avgPx": "64000",
+            }
+        )
+
+    with pytest.raises(ManagementBatchExecutionError, match=error):
+        execute_management_batch(
+            session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+        )
+
+    assert client.cancel_calls == []
+    assert client.set_calls == []
+
+
 @pytest.mark.parametrize("mode", ["disabled", "shadow"])
 def test_legacy_batch_delegation_requires_live_management_mode(mode, tmp_path):
     from telegram_kol_research.deepcoin_execution_actions import (
@@ -881,3 +1092,98 @@ def test_matching_legacy_signal_delegates_valid_live_batch(tmp_path):
 
     assert result["status"] == "reconciling"
     assert len(client.calls) == 2
+
+
+@pytest.mark.parametrize("mode", ["disabled", "shadow"])
+def test_automated_stop_adjustment_requires_live_batch_mode_with_zero_writes(
+    mode, tmp_path
+):
+    from telegram_kol_research.deepcoin_execution_actions import (
+        DeepcoinExecutionActionError,
+        execute_deepcoin_management_signal,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    signal = _legacy_close_signal(
+        session_factory,
+        batch,
+        action="adjust_stop_loss",
+        payload={
+            "management_batch_id": batch.id,
+            "binding_id": batch.execution_binding_id,
+        },
+    )
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True, "management_execution_mode": mode},
+    )
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    with pytest.raises(
+        DeepcoinExecutionActionError, match="management_live_execution_disabled"
+    ):
+        execute_deepcoin_management_signal(
+            session_factory, trade_signal=signal, deepcoin_client=client
+        )
+
+    assert client.cancel_calls == []
+    assert client.set_calls == []
+
+
+def test_automated_stop_adjustment_without_batch_fails_closed(tmp_path):
+    from telegram_kol_research.deepcoin_execution_actions import (
+        DeepcoinExecutionActionError,
+        execute_deepcoin_management_signal,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    signal = _legacy_close_signal(
+        session_factory,
+        batch,
+        action="adjust_stop_loss",
+        payload={"binding_id": batch.execution_binding_id},
+    )
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    with pytest.raises(
+        DeepcoinExecutionActionError, match="legacy_management_signal_requires_batch"
+    ):
+        execute_deepcoin_management_signal(
+            session_factory, trade_signal=signal, deepcoin_client=client
+        )
+
+    assert client.cancel_calls == []
+    assert client.set_calls == []
+
+
+def test_live_automated_stop_adjustment_delegates_to_exact_batch(tmp_path):
+    from telegram_kol_research.deepcoin_execution_actions import (
+        execute_deepcoin_management_signal,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    signal = _legacy_close_signal(
+        session_factory,
+        batch,
+        action="adjust_stop_loss",
+        payload={
+            "management_batch_id": batch.id,
+            "binding_id": batch.execution_binding_id,
+        },
+    )
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True, "management_execution_mode": "live"},
+    )
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    result = execute_deepcoin_management_signal(
+        session_factory, trade_signal=signal, deepcoin_client=client
+    )
+
+    assert result["status"] == "succeeded"
+    assert len(client.cancel_calls) == 5
+    assert len(client.set_calls) == 5
