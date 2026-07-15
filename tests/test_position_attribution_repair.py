@@ -1322,6 +1322,90 @@ def test_historical_cleanup_updates_exact_execution_lifecycle(tmp_path):
     assert lifecycle.exited_at == datetime(2026, 7, 15, 4, 0)
 
 
+def test_exact_exchange_position_history_persists_neutral_close_reasons(tmp_path):
+    session_factory = create_session_factory(tmp_path / "exchange-history-close.db")
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                id=96,
+                strategy_instance_id="deepcoin:96:96:BTC:long",
+                kol_id="historical",
+                chat_id=96,
+                message_id=96,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                pos_id="position-1",
+                status="unknown",
+            )
+        )
+        session.add(
+            ExecutionOrderLeg(
+                id=188,
+                execution_binding_id=96,
+                strategy_instance_id="deepcoin:96:96:BTC:long",
+                leg_index=1,
+                purpose="entry",
+                order_kind="market",
+                order_id="position-1",
+                pos_id="position-1",
+                venue="deepcoin",
+                status="active",
+                attribution_status="attribution_conflict",
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                id=420,
+                chat_id=96,
+                message_id=96,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 1),
+                entered_at=datetime(2026, 7, 1),
+                execution_binding_id=96,
+            )
+        )
+        session.commit()
+    client = _HistoricalCleanupClient()
+    client.position_history[("BTC-USDT-SWAP", "position-1")] = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "position-1",
+            "posSide": "long",
+            "mrgPosition": "split",
+            "pos": "4",
+            "closePos": "4.0",
+            "avgPx": "62500",
+            "closeAvgPx": "62790.1",
+            "pnl": "1.1604",
+            "cTime": "1784073600000",
+            "uTime": "1784077200000",
+        }
+    ]
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+
+    apply_position_attribution_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
+    )
+
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, 188)
+        lifecycle = session.get(StrategyLifecycle, 420)
+    assert leg.status == "closed"
+    assert leg.terminal_reason == "historical_exchange_position_closed"
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "exchange_closed"
+
+
 def test_unique_index_failure_rolls_back_cleanup_and_audits(tmp_path, monkeypatch):
     session_factory = _seed_historical_duplicate_fixture(tmp_path)
     client = _HistoricalCleanupClient()

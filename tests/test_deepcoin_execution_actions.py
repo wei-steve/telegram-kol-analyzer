@@ -81,6 +81,9 @@ class _FakeDeepcoinClient:
     def list_open_orders(self, *, inst_id=None):
         return self.open_orders
 
+    def list_position_history(self, *, inst_id, pos_id):
+        return []
+
     def cancel_trigger_order(self, cancel_payload):
         self.cancel_trigger_payloads.append(cancel_payload)
         return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}

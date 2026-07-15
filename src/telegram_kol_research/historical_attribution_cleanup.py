@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+import json
 from typing import Any, Iterable
 
 from telegram_kol_research.position_attribution import (
@@ -114,6 +116,7 @@ def plan_historical_attribution_cleanup(
     actions: list[HistoricalCleanupAction] = []
     conflicts: list[HistoricalCleanupConflict] = []
     terminalized_leg_ids: set[int] = set()
+    terminal_evidence_by_leg_id: dict[int, dict[str, object]] = {}
 
     for (venue, pos_id), component in sorted(legs_by_position.items()):
         component = sorted(component, key=lambda row: int(row.id))
@@ -125,13 +128,22 @@ def plan_historical_attribution_cleanup(
             for binding_id in component_binding_ids
             for lifecycle in lifecycles_by_binding.get(binding_id, [])
         ]
-        if pos_id in exchange_active_ids:
+        component_candidate_ids = {
+            value
+            for leg in component
+            for raw in (leg.pos_id, leg.order_id)
+            if (value := _string(raw)) is not None
+        }
+        active_candidate_ids = tuple(
+            sorted(component_candidate_ids & exchange_active_ids)
+        )
+        if active_candidate_ids:
             conflicts.append(
                 _conflict(
                     "historical_position_still_exchange_active",
                     component,
                     component_lifecycles,
-                    pos_ids=(pos_id,),
+                    pos_ids=active_candidate_ids,
                 )
             )
             continue
@@ -151,19 +163,21 @@ def plan_historical_attribution_cleanup(
                 )
             )
             continue
-
-        terminal_evidence = {
-            binding_id: terminal_evidence_for_binding(
-                bindings_by_id.get(binding_id),
-                pos_id=pos_id,
-                lifecycles=lifecycles_by_binding.get(binding_id, []),
-                events=events_by_binding.get(binding_id, []),
-                reservations=reservations_by_binding.get(binding_id, []),
-                history_rows=[*snapshot.order_history, *snapshot.trigger_history],
-                entry_order_ids=_entry_order_ids(legs_by_binding.get(binding_id, [])),
+        if len(component) == 1:
+            binding = bindings_by_id.get(component_binding_ids[0])
+            binding_is_terminal = str(
+                getattr(binding, "status", None) or ""
+            ).lower() in {"closed", "cancelled", "expired", "invalidated"}
+            has_candidate_history = any(
+                _string(row.get("posId")) in component_candidate_ids
+                for row in getattr(snapshot, "position_history", [])
             )
-            for binding_id in component_binding_ids
-        }
+            if binding_is_terminal and not has_candidate_history:
+                # A singleton cannot block ownership uniqueness. Leave already
+                # terminal bindings to ordinary repair instead of inventing a
+                # missing per-leg close fact from sibling order history.
+                continue
+
         exact_owners = [
             leg for leg in component if has_authoritative_persisted_position(leg)
         ]
@@ -179,10 +193,49 @@ def plan_historical_attribution_cleanup(
                     )
                 )
                 continue
+        owner_id = int(exact_owners[0].id) if len(exact_owners) == 1 else None
+        terminal_evidence = {
+            int(leg.id): terminal_evidence_for_leg(
+                leg,
+                bindings_by_id.get(int(leg.execution_binding_id)),
+                persisted_position_is_redundant=(
+                    len(component) > 1 and int(leg.id) != owner_id
+                ),
+                lifecycles=lifecycles_by_binding.get(
+                    int(leg.execution_binding_id), []
+                ),
+                events=events_by_binding.get(int(leg.execution_binding_id), []),
+                reservations=reservations_by_binding.get(
+                    int(leg.execution_binding_id), []
+                ),
+                history_rows=[*snapshot.order_history, *snapshot.trigger_history],
+                position_history_rows=getattr(snapshot, "position_history", []),
+            )
+            for leg in component
+        }
+        conflicting_history = {
+            leg_id: evidence
+            for leg_id, evidence in terminal_evidence.items()
+            if evidence is not None
+            and evidence.get("source") == "exchange_position_history_conflict"
+        }
+        if conflicting_history:
+            conflicts.append(
+                _conflict(
+                    "historical_position_history_conflict",
+                    component,
+                    component_lifecycles,
+                    pos_ids=(pos_id,),
+                    evidence={"conflicting_legs": conflicting_history},
+                )
+            )
+            continue
+
+        if len(component) > 1:
             owner = exact_owners[0]
             competing = [leg for leg in component if int(leg.id) != int(owner.id)]
             if any(
-                terminal_evidence.get(int(leg.execution_binding_id)) is None
+                terminal_evidence.get(int(leg.id)) is None
                 for leg in competing
             ):
                 conflicts.append(
@@ -208,9 +261,7 @@ def plan_historical_attribution_cleanup(
                         new_state="unassigned",
                         evidence={
                             "authoritative_leg_id": int(owner.id),
-                            "terminal_evidence": terminal_evidence[
-                                int(leg.execution_binding_id)
-                            ],
+                            "terminal_evidence": terminal_evidence[int(leg.id)],
                         },
                     )
                 )
@@ -218,7 +269,7 @@ def plan_historical_attribution_cleanup(
         for leg in component:
             if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
                 continue
-            evidence = terminal_evidence.get(int(leg.execution_binding_id))
+            evidence = terminal_evidence.get(int(leg.id))
             if evidence is None:
                 conflicts.append(
                     _conflict(
@@ -230,6 +281,7 @@ def plan_historical_attribution_cleanup(
                 )
                 continue
             terminalized_leg_ids.add(int(leg.id))
+            terminal_evidence_by_leg_id[int(leg.id)] = evidence
             actions.append(
                 HistoricalCleanupAction(
                     action="terminalize_historical_entry_leg",
@@ -288,6 +340,15 @@ def plan_historical_attribution_cleanup(
             history_rows=[*snapshot.order_history, *snapshot.trigger_history],
             entry_order_ids=_entry_order_ids(binding_legs),
         )
+        if evidence is None:
+            evidence = next(
+                (
+                    terminal_evidence_by_leg_id[int(leg.id)]
+                    for leg in sorted(binding_legs, key=lambda row: int(row.id))
+                    if int(leg.id) in terminal_evidence_by_leg_id
+                ),
+                None,
+            )
         for lifecycle in sorted(
             lifecycles_by_binding.get(binding_id, []), key=lambda row: int(row.id)
         ):
@@ -314,6 +375,121 @@ def plan_historical_attribution_cleanup(
         actions=tuple(sorted(_dedupe_actions(actions), key=_action_sort_key)),
         conflicts=tuple(sorted(_dedupe_conflicts(conflicts), key=_conflict_sort_key)),
     )
+
+
+def terminal_evidence_for_leg(
+    leg,
+    binding,
+    *,
+    persisted_position_is_redundant: bool,
+    lifecycles,
+    events,
+    reservations,
+    history_rows,
+    position_history_rows,
+) -> dict[str, object] | None:
+    """Return exact per-leg terminal proof, or an explicit history conflict."""
+
+    candidates = (
+        [_string(leg.order_id)]
+        if persisted_position_is_redundant
+        else [_string(leg.pos_id), _string(leg.order_id)]
+    )
+    candidates = list(dict.fromkeys(value for value in candidates if value))
+    if not candidates:
+        return None
+    local_evidence = terminal_evidence_for_binding(
+        binding,
+        pos_id=candidates[0] if candidates else None,
+        lifecycles=lifecycles,
+        events=events,
+        reservations=reservations,
+        history_rows=history_rows,
+        entry_order_ids=_entry_order_ids([leg]),
+    )
+    if local_evidence is not None:
+        return local_evidence
+
+    expected_instrument = _binding_instrument(binding)
+    expected_side = _string(getattr(binding, "side", None))
+    if expected_instrument is None or expected_side is None:
+        return None
+    for candidate in candidates:
+        exact_evidence = {
+            json.dumps(
+                row,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                default=str,
+            ): evidence
+            for row in position_history_rows
+            if (
+                evidence := _fully_closed_position_history_evidence(
+                    row,
+                    candidate_pos_id=candidate,
+                    expected_instrument=expected_instrument,
+                    expected_side=expected_side,
+                )
+            )
+            is not None
+        }
+        if len(exact_evidence) > 1:
+            return {
+                "source": "exchange_position_history_conflict",
+                "pos_id": candidate,
+                "rows": [
+                    exact_evidence[key]
+                    for key in sorted(exact_evidence, key=repr)
+                ],
+            }
+        if exact_evidence:
+            return next(iter(exact_evidence.values()))
+    return None
+
+
+def _fully_closed_position_history_evidence(
+    row: dict[str, Any],
+    *,
+    candidate_pos_id: str,
+    expected_instrument: str,
+    expected_side: str,
+) -> dict[str, object] | None:
+    if _string(row.get("posId")) != candidate_pos_id:
+        return None
+    if _string(row.get("instId")) != expected_instrument:
+        return None
+    if (_string(row.get("posSide")) or "").lower() != expected_side.lower():
+        return None
+    if (_string(row.get("mrgPosition")) or "").lower() != "split":
+        return None
+    try:
+        original = Decimal(str(row.get("pos")))
+        closed = Decimal(str(row.get("closePos")))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not original.is_finite() or not closed.is_finite():
+        return None
+    if original <= 0 or closed != original:
+        return None
+    return {
+        "source": "exchange_position_history",
+        "pos_id": candidate_pos_id,
+        "pos": str(row.get("pos")),
+        "close_pos": str(row.get("closePos")),
+        "avg_px": str(row.get("avgPx") or ""),
+        "close_avg_px": str(row.get("closeAvgPx") or ""),
+        "pnl": str(row.get("pnl") or ""),
+        "created_at": str(row.get("cTime") or ""),
+        "updated_at": str(row.get("uTime") or ""),
+    }
+
+
+def _binding_instrument(binding) -> str | None:
+    symbol = _string(getattr(binding, "symbol", None))
+    if symbol is None:
+        return None
+    return f"{symbol.upper()}-USDT-SWAP"
 
 
 def terminal_evidence_for_binding(
@@ -432,6 +608,8 @@ def _matching_pending_order_ids(
 def _terminal_leg_state(evidence: dict[str, object]) -> str:
     if evidence.get("source") == "exchange_cancel_history":
         return "exchange_cancelled"
+    if evidence.get("source") == "exchange_position_history":
+        return "closed"
     return "manually_closed"
 
 

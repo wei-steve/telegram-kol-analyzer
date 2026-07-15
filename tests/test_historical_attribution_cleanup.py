@@ -83,6 +83,7 @@ def _lifecycle(
 def _snapshot(**overrides):
     values = {
         "positions": [],
+        "position_history": [],
         "open_orders": [],
         "pending_trigger_orders": [],
         "order_history": [],
@@ -92,6 +93,24 @@ def _snapshot(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _position_history_row(**overrides):
+    values = {
+        "instId": "BTC-USDT-SWAP",
+        "posId": "position-1",
+        "posSide": "long",
+        "mrgPosition": "split",
+        "pos": "4",
+        "closePos": "4.0",
+        "avgPx": "62500",
+        "closeAvgPx": "62790.1",
+        "pnl": "1.1604",
+        "cTime": "1784073600000",
+        "uTime": "1784077200000",
+    }
+    values.update(overrides)
+    return values
 
 
 def _decision(
@@ -111,6 +130,242 @@ def _decision(
         reservations=list(reservations),
         snapshot=snapshot or _snapshot(),
     )
+
+
+def test_exact_fully_closed_split_position_history_is_terminal_evidence():
+    decision = _decision(
+        bindings=[_binding(row_id=10)],
+        legs=[
+            _leg(
+                row_id=1,
+                binding_id=10,
+                pos_id="position-1",
+                order_id="position-1",
+                status="active",
+            )
+        ],
+        lifecycles=[_lifecycle(row_id=100, binding_id=10, status="entered")],
+        snapshot=_snapshot(position_history=[_position_history_row()]),
+    )
+
+    terminalize = next(
+        action
+        for action in decision.actions
+        if action.action == "terminalize_historical_entry_leg"
+    )
+    assert terminalize.new_state == "closed"
+    assert terminalize.evidence["terminal_evidence"] == {
+        "source": "exchange_position_history",
+        "pos_id": "position-1",
+        "pos": "4",
+        "close_pos": "4.0",
+        "avg_px": "62500",
+        "close_avg_px": "62790.1",
+        "pnl": "1.1604",
+        "created_at": "1784073600000",
+        "updated_at": "1784077200000",
+    }
+    assert decision.conflicts == ()
+
+
+def test_partial_position_history_is_not_terminal_evidence():
+    decision = _decision(
+        bindings=[_binding(row_id=10)],
+        legs=[
+            _leg(
+                row_id=1,
+                binding_id=10,
+                pos_id="position-1",
+                order_id="position-1",
+                status="active",
+            )
+        ],
+        lifecycles=[_lifecycle(row_id=100, binding_id=10, status="entered")],
+        snapshot=_snapshot(
+            position_history=[_position_history_row(closePos="3")]
+        ),
+    )
+
+    assert decision.actions == ()
+    assert decision.conflicts[0].reason == "historical_terminal_evidence_missing"
+
+
+@pytest.mark.parametrize("original", ["0", "0.0", "not-a-number", None])
+def test_zero_or_malformed_original_position_is_not_terminal_evidence(original):
+    decision = _decision(
+        bindings=[_binding(row_id=10)],
+        legs=[
+            _leg(
+                row_id=1,
+                binding_id=10,
+                pos_id="position-1",
+                order_id="position-1",
+                status="active",
+            )
+        ],
+        lifecycles=[_lifecycle(row_id=100, binding_id=10, status="entered")],
+        snapshot=_snapshot(
+            position_history=[_position_history_row(pos=original)]
+        ),
+    )
+
+    assert decision.actions == ()
+    assert decision.conflicts[0].reason == "historical_terminal_evidence_missing"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("posId", "other-position"),
+        ("instId", "ETH-USDT-SWAP"),
+        ("posSide", "short"),
+        ("mrgPosition", "merge"),
+    ],
+)
+def test_mismatched_position_history_identity_is_not_terminal_evidence(field, value):
+    decision = _decision(
+        bindings=[_binding(row_id=10)],
+        legs=[
+            _leg(
+                row_id=1,
+                binding_id=10,
+                pos_id="position-1",
+                order_id="position-1",
+                status="active",
+            )
+        ],
+        lifecycles=[_lifecycle(row_id=100, binding_id=10, status="entered")],
+        snapshot=_snapshot(
+            position_history=[_position_history_row(**{field: value})]
+        ),
+    )
+
+    assert decision.actions == ()
+    assert decision.conflicts[0].reason == "historical_terminal_evidence_missing"
+
+
+def test_conflicting_exact_position_history_rows_are_unresolved():
+    decision = _decision(
+        bindings=[_binding(row_id=10)],
+        legs=[
+            _leg(
+                row_id=1,
+                binding_id=10,
+                pos_id="position-1",
+                order_id="position-1",
+                status="active",
+            )
+        ],
+        lifecycles=[_lifecycle(row_id=100, binding_id=10, status="entered")],
+        snapshot=_snapshot(
+            position_history=[
+                _position_history_row(),
+                _position_history_row(closeAvgPx="62800"),
+            ]
+        ),
+    )
+
+    assert decision.actions == ()
+    assert decision.conflicts[0].reason == "historical_position_history_conflict"
+
+
+@pytest.mark.parametrize(
+    ("snapshot_field", "row"),
+    [
+        ("positions", {"posId": "position-1", "pos": "4"}),
+        ("open_orders", {"ordId": "position-1", "state": "live"}),
+        (
+            "pending_trigger_orders",
+            {"ordId": "position-1", "state": "live", "triggerOrderType": "NORMAL"},
+        ),
+    ],
+)
+def test_live_or_pending_identity_blocks_fully_closed_position_history(
+    snapshot_field, row
+):
+    decision = _decision(
+        bindings=[_binding(row_id=10)],
+        legs=[
+            _leg(
+                row_id=1,
+                binding_id=10,
+                pos_id="position-1",
+                order_id="position-1",
+                status="active",
+            )
+        ],
+        lifecycles=[_lifecycle(row_id=100, binding_id=10, status="entered")],
+        snapshot=_snapshot(
+            position_history=[_position_history_row()],
+            **{snapshot_field: [row]},
+        ),
+    )
+
+    assert decision.actions == ()
+    assert decision.conflicts[0].reason in {
+        "historical_position_still_exchange_active",
+        "historical_pending_order_active",
+    }
+
+
+def test_stale_shared_position_uses_exact_fully_closed_evidence_per_leg():
+    decision = _decision(
+        bindings=[_binding(row_id=9), _binding(row_id=11)],
+        legs=[
+            _leg(
+                row_id=10,
+                binding_id=9,
+                pos_id="shared",
+                order_id="shared",
+                status="active",
+            ),
+            _leg(
+                row_id=13,
+                binding_id=11,
+                pos_id="shared",
+                order_id="actual-1",
+                status="active",
+            ),
+            _leg(
+                row_id=14,
+                binding_id=11,
+                pos_id="shared",
+                order_id="actual-2",
+                status="active",
+            ),
+        ],
+        lifecycles=[
+            _lifecycle(row_id=90, binding_id=9, status="entered"),
+            _lifecycle(row_id=110, binding_id=11, status="entered"),
+        ],
+        snapshot=_snapshot(
+            position_history=[
+                _position_history_row(posId="shared"),
+                _position_history_row(posId="actual-1"),
+                _position_history_row(posId="actual-2"),
+            ]
+        ),
+    )
+
+    clear_actions = {
+        action.leg_id: action
+        for action in decision.actions
+        if action.action == "clear_redundant_historical_position"
+    }
+    terminalize_actions = {
+        action.leg_id: action
+        for action in decision.actions
+        if action.action == "terminalize_historical_entry_leg"
+    }
+    assert sorted(clear_actions) == [13, 14]
+    assert clear_actions[13].old_pos_id == "shared"
+    assert clear_actions[14].old_pos_id == "shared"
+    assert terminalize_actions[10].new_pos_id == "shared"
+    assert terminalize_actions[10].evidence["terminal_evidence"]["pos_id"] == "shared"
+    assert terminalize_actions[13].evidence["terminal_evidence"]["pos_id"] == "actual-1"
+    assert terminalize_actions[14].evidence["terminal_evidence"]["pos_id"] == "actual-2"
+    assert not any("assign" in action.action for action in decision.actions)
+    assert decision.conflicts == ()
 
 
 def test_same_binding_duplicate_retains_only_exact_direct_owner():

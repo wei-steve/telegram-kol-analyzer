@@ -677,7 +677,8 @@ class StrategyLifecycle(Base):
     )
     # pending_entry | entered | exited | expired | invalidated | cancelled
     exit_reason: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
-    # None | stop_loss | take_profit | kol_signal | manual | expired | context_invalidated
+    # None | stop_loss | take_profit | kol_signal | manual | exchange_closed
+    # | expired | context_invalidated
 
     # Timestamps
     signal_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

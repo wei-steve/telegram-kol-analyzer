@@ -860,7 +860,16 @@ def _apply_historical_cleanup_action(
         leg = legs_by_id.get(int(action.leg_id or 0))
         if leg is None:
             raise PositionAttributionRepairError("stale repair plan: leg missing")
-        if leg.pos_id != action.old_pos_id or str(leg.status) != action.old_state:
+        was_cleared_by_plan = any(
+            planned.action == "clear_redundant_historical_position"
+            and planned.leg_id == action.leg_id
+            and planned.old_pos_id == action.old_pos_id
+            for planned in plan.historical_actions
+        )
+        valid_pos_ids = {action.old_pos_id}
+        if was_cleared_by_plan:
+            valid_pos_ids.add(None)
+        if leg.pos_id not in valid_pos_ids or str(leg.status) != action.old_state:
             raise PositionAttributionRepairError(
                 "stale repair plan: historical leg changed"
             )
@@ -869,7 +878,11 @@ def _apply_historical_cleanup_action(
             (action.evidence.get("terminal_evidence") or {}).get("source")
             or "terminal_evidence"
         )
-        leg.terminal_reason = f"historical_{source}"[:64]
+        leg.terminal_reason = (
+            "historical_exchange_position_closed"
+            if source == "exchange_position_history"
+            else f"historical_{source}"[:64]
+        )
         leg.updated_at = updated_at
         return
     if action.action == "close_historical_binding":
@@ -908,9 +921,13 @@ def _apply_historical_cleanup_action(
 
 
 def _historical_exit_reason(evidence: dict[str, object]) -> str:
+    """Map exact evidence to a supported lifecycle reason, including neutral exchange close."""
+
     terminal = evidence.get("terminal_evidence") or {}
     if isinstance(terminal, dict):
         source = str(terminal.get("source") or "")
+        if source == "exchange_position_history":
+            return "exchange_closed"
         if source in {"close_reservation", "execution_close_event"}:
             return "manual"
         reason = str(terminal.get("reason") or "")
