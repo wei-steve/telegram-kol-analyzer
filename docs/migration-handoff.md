@@ -249,3 +249,12 @@ reviewed shadow evidence.
 Deepcoin triggered-limit lineage (trigger -> generated regular order -> fill ->
 position) is deliberately a separate task and branch. Do not mix its historical
 attribution migration or compatibility repair into this batch rollout.
+
+The management audit preserves a zero-write source boundary: it never gives
+SQLite the production path. Two ordinary-file captures of main/WAL/SHM must
+match in component set, metadata, hash, and bytes; two private temporary copies
+must then pass `quick_check` and schema inspection. A rollback journal or any
+instability fails closed as `snapshot_unstable`. All identities in JSON and
+text output are hashed references. Counts are exact where labelled complete;
+any batch, leg, or returned-item truncation, or any false completeness flag,
+prohibits a "no residue" conclusion.

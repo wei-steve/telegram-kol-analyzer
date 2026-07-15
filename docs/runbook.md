@@ -191,14 +191,30 @@ telegram-kol-research audit-management-batches \
   --output-format json
 ```
 
-The command opens SQLite in read-only mode. It does not initialize or migrate
-the schema, claim or convert legacy signals, build a Deepcoin client, make a
-network call, retry work, or change database state. Output is capped at 100
-batches, hashes chat/strategy/position identifiers, and contains only safe
-database IDs, actions, states, modes, sizes, counts, and malformed-JSON flags.
-It includes abnormal counts for `blocked`, `submit_unknown`, `partial_failed`,
-and `recovery_required`, plus bounded pending legacy management signals which
-have no canonical `management_batch_id`. `management_schema_missing` or
+The command never opens the source database with SQLite. It reads the main DB
+and any WAL/SHM components as ordinary files twice, compares file sets,
+metadata, hashes, and bytes, then writes two private temporary snapshots. Both
+private copies must pass SQLite `quick_check` and schema inspection before one
+is queried. A rollback journal, active-file change, inconsistent copies, or
+failed validation returns `snapshot_unstable` and no audit data. SQLite may
+create/checkpoint sidecars only inside the temporary directory; the source DB
+and its directory remain untouched even when they are read-only.
+
+The command does not initialize or migrate the schema, claim or convert legacy
+signals, build a Deepcoin client, make a network call, retry work, or change
+database state. Output is capped at 100 batches and 100 returned legs per
+batch. Every identity is a one-way reference, including signal, message, batch,
+raw-message, lifecycle, binding, leg, chat, strategy, and position IDs. Only
+counts, validated sizes, states, modes, leg indexes, completeness flags, and
+malformed-field flags remain clear. Pending legacy management candidates are
+streamed completely for exact counts while only bounded redacted items are
+returned.
+
+The audit includes abnormal counts for `blocked`, `submit_unknown`,
+`partial_failed`, and `recovery_required`. Never conclude that there is no
+legacy or abnormal residue if `output_complete=false`, `complete=false`,
+`scan_truncated=true`, `batches_truncated=true`, any `legs_truncated=true`, or
+the legacy item list is truncated. `management_schema_missing` or
 `schema_unavailable` is an audit result, not permission to run a compatibility
 migration.
 

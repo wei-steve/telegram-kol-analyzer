@@ -3,9 +3,13 @@
 import asyncio
 import hashlib
 import json
+import os
+import re
 import sqlite3
 import shutil
+import tempfile
 from dataclasses import asdict
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from datetime import UTC, datetime
 from pathlib import Path
@@ -129,12 +133,158 @@ _MANAGEMENT_ALERT_STATES = (
     "partial_failed",
     "recovery_required",
 )
+_SAFE_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+class ManagementAuditSnapshotError(RuntimeError):
+    """Source files could not produce two identical coherent private snapshots."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _read_snapshot_component(path: Path) -> tuple[bytes, tuple]:
+    """Read one source component without asking SQLite to touch the source."""
+
+    before = path.stat(follow_symlinks=False)
+    if not path.is_file() or path.is_symlink():
+        raise ManagementAuditSnapshotError("source_component_not_regular")
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    no_atime = getattr(os, "O_NOATIME", 0)
+    try:
+        descriptor = os.open(path, flags | no_atime)
+    except PermissionError:
+        descriptor = os.open(path, flags)
+    try:
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        descriptor_stat = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = path.stat(follow_symlinks=False)
+    stable_fields_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    stable_fields_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    descriptor_fields = (
+        descriptor_stat.st_dev,
+        descriptor_stat.st_ino,
+        descriptor_stat.st_mode,
+        descriptor_stat.st_size,
+        descriptor_stat.st_mtime_ns,
+        descriptor_stat.st_ctime_ns,
+    )
+    if stable_fields_before != stable_fields_after or descriptor_fields != stable_fields_after:
+        raise ManagementAuditSnapshotError("source_component_changed_during_read")
+    content = b"".join(chunks)
+    signature = stable_fields_after + (hashlib.sha256(content).hexdigest(),)
+    return content, signature
+
+
+def _source_component_paths(database_path: Path) -> dict[str, Path]:
+    candidates = {
+        "main": database_path,
+        "wal": database_path.with_name(database_path.name + "-wal"),
+        "shm": database_path.with_name(database_path.name + "-shm"),
+        "journal": database_path.with_name(database_path.name + "-journal"),
+    }
+    if candidates["journal"].exists():
+        raise ManagementAuditSnapshotError("rollback_journal_present")
+    if not candidates["main"].exists():
+        raise ManagementAuditSnapshotError("source_database_missing")
+    return {
+        name: path
+        for name, path in candidates.items()
+        if name != "journal" and path.exists()
+    }
+
+
+def _capture_source_components(database_path: Path) -> dict[str, tuple[bytes, tuple]]:
+    paths_before = _source_component_paths(database_path)
+    captured = {
+        name: _read_snapshot_component(path) for name, path in paths_before.items()
+    }
+    paths_after = _source_component_paths(database_path)
+    if tuple(sorted(paths_before)) != tuple(sorted(paths_after)):
+        raise ManagementAuditSnapshotError("source_component_set_changed")
+    return captured
+
+
+def _write_private_snapshot(
+    root: Path, captured: dict[str, tuple[bytes, tuple]]
+) -> Path:
+    root.mkdir(mode=0o700)
+    snapshot_path = root / "audit.db"
+    snapshot_path.write_bytes(captured["main"][0])
+    if "wal" in captured:
+        (root / "audit.db-wal").write_bytes(captured["wal"][0])
+    # Do not copy source SHM. SQLite may rebuild/checkpoint only beside the
+    # private copy; the source SHM is used exclusively as stability evidence.
+    return snapshot_path
+
+
+def _validate_private_snapshot(snapshot_path: Path) -> None:
+    try:
+        with sqlite3.connect(snapshot_path) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            row = connection.execute("PRAGMA quick_check").fetchone()
+            if row is None or str(row[0]).lower() != "ok":
+                raise ManagementAuditSnapshotError("snapshot_quick_check_failed")
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'index') LIMIT 1"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise ManagementAuditSnapshotError("snapshot_validation_failed") from exc
+
+
+def _build_stable_private_snapshots(
+    database_path: Path, temporary_root: Path
+) -> tuple[Path, dict]:
+    try:
+        first = _capture_source_components(database_path)
+        second = _capture_source_components(database_path)
+    except OSError as exc:
+        raise ManagementAuditSnapshotError("source_read_failed") from exc
+    if set(first) != set(second) or any(
+        first[name][1] != second[name][1] or first[name][0] != second[name][0]
+        for name in first
+    ):
+        raise ManagementAuditSnapshotError("source_snapshots_differ")
+    first_path = _write_private_snapshot(temporary_root / "snapshot-1", first)
+    second_path = _write_private_snapshot(temporary_root / "snapshot-2", second)
+    _validate_private_snapshot(first_path)
+    _validate_private_snapshot(second_path)
+    return second_path, {
+        "snapshot_status": "stable",
+        "snapshot_validation": "ok",
+        "snapshot_copies_verified": 2,
+        "snapshot_components": sorted(first),
+    }
 
 
 def _redacted_ref(kind: str, value: object) -> str | None:
     if value is None or str(value) == "":
         return None
-    digest = hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:10]
+    digest = hashlib.sha256(f"{kind}:{value}".encode("utf-8")).hexdigest()[:10]
     return f"{kind}:{digest}"
 
 
@@ -145,6 +295,76 @@ def _bounded_text(value: object, *, limit: int = 64) -> str | None:
     if len(normalized) <= limit:
         return normalized
     return normalized[:limit] + "..."
+
+
+def _identity_ref(
+    kind: str, value: object, malformed_fields: list[str], field: str
+) -> str | None:
+    if value is None or str(value) == "":
+        malformed_fields.append(field)
+        return None
+    return _redacted_ref(kind, value)
+
+
+def _safe_token_value(
+    value: object, malformed_fields: list[str], field: str
+) -> str:
+    if value is None:
+        malformed_fields.append(field)
+        return "invalid"
+    normalized = str(value)
+    if not _SAFE_TOKEN.fullmatch(normalized):
+        malformed_fields.append(field)
+        return "invalid"
+    return normalized
+
+
+def _safe_decimal_value(
+    value: object, malformed_fields: list[str], field: str
+) -> str | None:
+    if value in {None, ""}:
+        return None
+    try:
+        normalized = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        malformed_fields.append(field)
+        return None
+    if not normalized.is_finite() or normalized < 0:
+        malformed_fields.append(field)
+        return None
+    return format(normalized, "f")
+
+
+def _safe_leg_index(
+    value: object, malformed_fields: list[str], field: str = "leg_index"
+) -> int | None:
+    if isinstance(value, bool):
+        malformed_fields.append(field)
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError):
+        malformed_fields.append(field)
+        return None
+    if normalized < 0 or str(value).strip() not in {str(normalized), f"+{normalized}"}:
+        malformed_fields.append(field)
+        return None
+    return normalized
+
+
+def _safe_timestamp(
+    value: object, malformed_fields: list[str], field: str
+) -> str | None:
+    if value in {None, ""}:
+        malformed_fields.append(field)
+        return None
+    normalized = str(value)
+    try:
+        datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        malformed_fields.append(field)
+        return None
+    return _bounded_text(normalized, limit=40)
 
 
 def _malformed_json_fields(row: sqlite3.Row, fields: tuple[str, ...]) -> list[str]:
@@ -201,62 +421,113 @@ def _audit_pending_legacy_management_read_only(
     if not _has_columns(connection, "trade_signals", required):
         return {
             "status": "schema_unavailable",
-            "total": 0,
+            "candidate_pending_count": None,
+            "scanned_count": 0,
+            "total": None,
             "returned": 0,
             "truncated": False,
+            "complete": False,
+            "scan_truncated": False,
             "malformed_payload_count": 0,
+            "malformed_row_count": 0,
+            "malformed_field_count": 0,
             "by_action": {},
             "items": [],
         }
     placeholders = ",".join("?" for _ in _MANAGEMENT_SIGNAL_ACTIONS)
-    rows = connection.execute(
+    parameters = tuple(sorted(_MANAGEMENT_SIGNAL_ACTIONS))
+    candidate_pending_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM trade_signals "
+            "WHERE venue = 'deepcoin' AND status = 'pending' "
+            f"AND action IN ({placeholders})",
+            parameters,
+        ).fetchone()[0]
+    )
+    cursor = connection.execute(
         "SELECT id, source_type, chat_id, message_id, action, status, payload_json "
         "FROM trade_signals WHERE venue = 'deepcoin' AND status = 'pending' "
-        f"AND action IN ({placeholders}) ORDER BY created_at ASC, id ASC LIMIT 5001",
-        tuple(sorted(_MANAGEMENT_SIGNAL_ACTIONS)),
-    ).fetchall()
-    scan_truncated = len(rows) > 5000
-    legacy: list[tuple[sqlite3.Row, bool]] = []
-    for row in rows[:5000]:
-        malformed = False
-        try:
-            payload = json.loads(row["payload_json"] or "{}")
-        except (json.JSONDecodeError, TypeError):
-            payload = {}
-            malformed = True
-        if _canonical_positive_id(payload, "management_batch_id") is None:
-            legacy.append((row, malformed))
-    selected = legacy[:limit]
+        f"AND action IN ({placeholders}) ORDER BY created_at ASC, id ASC",
+        parameters,
+    )
+    legacy_count = 0
+    scanned_count = 0
+    malformed_payload_count = 0
+    malformed_row_count = 0
+    malformed_field_count = 0
+    selected: list[dict] = []
     by_action: dict[str, int] = {}
-    for row, _ in legacy:
-        action = str(row["action"] or "unknown")
-        by_action[action] = by_action.get(action, 0) + 1
-    return {
-        "status": "available",
-        "total": len(legacy),
-        "returned": len(selected),
-        "truncated": scan_truncated or len(selected) < len(legacy),
-        "scan_truncated": scan_truncated,
-        "malformed_payload_count": sum(1 for _, malformed in legacy if malformed),
-        "by_action": dict(sorted(by_action.items())),
-        "items": [
-            {
-                "signal_id": int(row["id"]),
-                "action": _bounded_text(row["action"]),
-                "status": _bounded_text(row["status"]),
-                "source_type": _bounded_text(row["source_type"]),
-                "chat_ref": _redacted_ref("chat", row["chat_id"]),
-                "message_id": row["message_id"],
+    while True:
+        rows = cursor.fetchmany(500)
+        if not rows:
+            break
+        for row in rows:
+            scanned_count += 1
+            malformed = False
+            raw_payload = row["payload_json"]
+            if not isinstance(raw_payload, str) or len(raw_payload) > 1_000_000:
+                payload = {}
+                malformed = True
+            else:
+                try:
+                    payload = json.loads(raw_payload or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+                    malformed = True
+            if _canonical_positive_id(payload, "management_batch_id") is not None:
+                continue
+            legacy_count += 1
+            malformed_payload_count += int(malformed)
+            action_fields: list[str] = []
+            action = _safe_token_value(row["action"], action_fields, "action")
+            by_action[action] = by_action.get(action, 0) + 1
+            item_fields = list(action_fields)
+            item = {
+                "signal_ref": _identity_ref(
+                    "signal", row["id"], item_fields, "signal_id"
+                ),
+                "action": action,
+                "status": _safe_token_value(row["status"], item_fields, "status"),
+                "source_type": _safe_token_value(
+                    row["source_type"], item_fields, "source_type"
+                ),
+                "chat_ref": _identity_ref(
+                    "chat", row["chat_id"], item_fields, "chat_id"
+                ),
+                "message_ref": _identity_ref(
+                    "message", row["message_id"], item_fields, "message_id"
+                ),
                 "payload_status": "malformed" if malformed else "missing_batch_id",
             }
-            for row, malformed in selected
-        ],
+            if malformed:
+                item_fields.append("payload_json")
+            item["malformed_fields"] = sorted(set(item_fields))
+            if item_fields:
+                malformed_row_count += 1
+                malformed_field_count += len(set(item_fields))
+            if len(selected) < limit:
+                selected.append(item)
+    return {
+        "status": "available",
+        "candidate_pending_count": candidate_pending_count,
+        "scanned_count": scanned_count,
+        "total": legacy_count,
+        "returned": len(selected),
+        "truncated": len(selected) < legacy_count,
+        "complete": scanned_count == candidate_pending_count,
+        "scan_truncated": False,
+        "malformed_payload_count": malformed_payload_count,
+        "malformed_row_count": malformed_row_count,
+        "malformed_field_count": malformed_field_count,
+        "by_action": dict(sorted(by_action.items())),
+        "items": selected,
     }
 
 
-def _audit_management_batches_read_only(database_path: Path, *, limit: int) -> dict:
-    uri = database_path.resolve().as_uri() + "?mode=ro"
-    with sqlite3.connect(uri, uri=True) as connection:
+def _audit_management_snapshot(
+    snapshot_path: Path, *, limit: int, snapshot_info: dict
+) -> dict:
+    with sqlite3.connect(snapshot_path) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
         batch_required = {
@@ -286,6 +557,7 @@ def _audit_management_batches_read_only(database_path: Path, *, limit: int) -> d
             connection, "strategy_management_batches", batch_required
         ) and _has_columns(connection, "strategy_management_legs", leg_required)
         result = {
+            **snapshot_info,
             "schema_status": (
                 "available" if schema_available else "management_schema_missing"
             ),
@@ -296,6 +568,9 @@ def _audit_management_batches_read_only(database_path: Path, *, limit: int) -> d
             },
             "batches_returned": 0,
             "batches_truncated": False,
+            "malformed_row_count": 0,
+            "malformed_field_count": 0,
+            "output_complete": False,
             "batches": [],
         }
         if schema_available:
@@ -341,6 +616,9 @@ def _audit_management_batches_read_only(database_path: Path, *, limit: int) -> d
             ).fetchall()
             result["batches_truncated"] = len(batches) > limit
             for batch in batches[:limit]:
+                batch_fields = _malformed_json_fields(
+                    batch, ("target_snapshot_json",)
+                )
                 legs = connection.execute(
                     "SELECT id, pos_id, leg_index, status, preflight_size, "
                     "planned_close_size, last_error FROM strategy_management_legs "
@@ -348,60 +626,163 @@ def _audit_management_batches_read_only(database_path: Path, *, limit: int) -> d
                     "LIMIT 101",
                     (batch["id"],),
                 ).fetchall()
+                leg_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM strategy_management_legs "
+                        "WHERE management_batch_id = ?",
+                        (batch["id"],),
+                    ).fetchone()[0]
+                )
                 legs_truncated = len(legs) > 100
                 legs = legs[:100]
+                source_fields: list[str] = []
+                target_fields: list[str] = []
+                batch_ref = _identity_ref(
+                    "batch", batch["id"], batch_fields, "batch_id"
+                )
+                batch_status = _safe_token_value(
+                    batch["status"], batch_fields, "status"
+                )
+                intent = _safe_token_value(batch["intent"], batch_fields, "intent")
+                effective_action = _safe_token_value(
+                    batch["effective_action"], batch_fields, "effective_action"
+                )
+                execution_mode = _safe_token_value(
+                    batch["execution_mode"], batch_fields, "execution_mode"
+                )
+                planned_at = _safe_timestamp(
+                    batch["planned_at"], batch_fields, "planned_at"
+                )
+                rendered_legs: list[dict] = []
+                for leg in legs:
+                    leg_fields = _malformed_json_fields(leg, ("last_error",))
+                    rendered_legs.append(
+                        {
+                            "leg_ref": _identity_ref(
+                                "leg", leg["id"], leg_fields, "leg_id"
+                            ),
+                            "leg_index": _safe_leg_index(
+                                leg["leg_index"], leg_fields
+                            ),
+                            "status": _safe_token_value(
+                                leg["status"], leg_fields, "status"
+                            ),
+                            "pos_ref": _identity_ref(
+                                "pos", leg["pos_id"], leg_fields, "pos_id"
+                            ),
+                            "preflight_size": _safe_decimal_value(
+                                leg["preflight_size"],
+                                leg_fields,
+                                "preflight_size",
+                            ),
+                            "planned_close_size": _safe_decimal_value(
+                                leg["planned_close_size"],
+                                leg_fields,
+                                "planned_close_size",
+                            ),
+                            "malformed_fields": sorted(set(leg_fields)),
+                            "malformed_json_fields": sorted(
+                                set(
+                                    field
+                                    for field in leg_fields
+                                    if field == "last_error"
+                                )
+                            ),
+                        }
+                    )
+                    if leg_fields:
+                        result["malformed_row_count"] += 1
+                        result["malformed_field_count"] += len(set(leg_fields))
+                source = {
+                    "raw_message_ref": _identity_ref(
+                        "raw_message",
+                        batch["raw_message_id"],
+                        source_fields,
+                        "raw_message_id",
+                    ),
+                    "chat_ref": _identity_ref(
+                        "chat",
+                        batch["source_chat_id"],
+                        source_fields,
+                        "source_chat_id",
+                    ),
+                    "message_ref": _identity_ref(
+                        "message",
+                        batch["source_message_id"],
+                        source_fields,
+                        "source_message_id",
+                    ),
+                    "malformed_fields": sorted(set(source_fields)),
+                }
+                target = {
+                    "lifecycle_ref": _identity_ref(
+                        "lifecycle",
+                        batch["target_lifecycle_id"],
+                        target_fields,
+                        "target_lifecycle_id",
+                    ),
+                    "strategy_ref": _identity_ref(
+                        "strategy",
+                        batch["strategy_instance_id"],
+                        target_fields,
+                        "strategy_instance_id",
+                    ),
+                    "binding_ref": _identity_ref(
+                        "binding",
+                        batch["execution_binding_id"],
+                        target_fields,
+                        "execution_binding_id",
+                    ),
+                    "malformed_fields": sorted(set(target_fields)),
+                }
+                all_batch_fields = sorted(
+                    set(batch_fields + source_fields + target_fields)
+                )
+                if all_batch_fields:
+                    result["malformed_row_count"] += 1
+                    result["malformed_field_count"] += len(all_batch_fields)
                 result["batches"].append(
                     {
-                        "batch_id": int(batch["id"]),
-                        "status": _bounded_text(batch["status"]),
-                        "intent": _bounded_text(batch["intent"]),
-                        "effective_action": _bounded_text(batch["effective_action"]),
-                        "execution_mode": _bounded_text(batch["execution_mode"]),
-                        "planned_at": _bounded_text(batch["planned_at"]),
-                        "source": {
-                            "raw_message_id": int(batch["raw_message_id"]),
-                            "chat_ref": _redacted_ref(
-                                "chat", batch["source_chat_id"]
-                            ),
-                            "message_id": batch["source_message_id"],
-                        },
-                        "target": {
-                            "lifecycle_id": int(batch["target_lifecycle_id"]),
-                            "strategy_ref": _redacted_ref(
-                                "strategy", batch["strategy_instance_id"]
-                            ),
-                            "binding_id": int(batch["execution_binding_id"]),
-                        },
+                        "batch_ref": batch_ref,
+                        "status": batch_status,
+                        "intent": intent,
+                        "effective_action": effective_action,
+                        "execution_mode": execution_mode,
+                        "planned_at": planned_at,
+                        "source": source,
+                        "target": target,
+                        "malformed_fields": all_batch_fields,
                         "malformed_json_fields": _malformed_json_fields(
                             batch, ("target_snapshot_json",)
                         ),
+                        "leg_count": leg_count,
                         "legs_returned": len(legs),
                         "legs_truncated": legs_truncated,
-                        "legs": [
-                            {
-                                "leg_id": int(leg["id"]),
-                                "leg_index": int(leg["leg_index"]),
-                                "status": _bounded_text(leg["status"]),
-                                "pos_ref": _redacted_ref("pos", leg["pos_id"]),
-                                "preflight_size": _bounded_text(
-                                    leg["preflight_size"]
-                                ),
-                                "planned_close_size": _bounded_text(
-                                    leg["planned_close_size"]
-                                ),
-                                "malformed_json_fields": _malformed_json_fields(
-                                    leg, ("last_error",)
-                                ),
-                            }
-                            for leg in legs
-                        ],
+                        "legs": rendered_legs,
                     }
                 )
             result["batches_returned"] = len(result["batches"])
-        result["legacy_pending_management"] = (
-            _audit_pending_legacy_management_read_only(connection, limit=limit)
+        legacy = _audit_pending_legacy_management_read_only(connection, limit=limit)
+        result["legacy_pending_management"] = legacy
+        result["malformed_row_count"] += legacy["malformed_row_count"]
+        result["malformed_field_count"] += legacy["malformed_field_count"]
+        result["output_complete"] = (
+            not result["batches_truncated"]
+            and all(not batch["legs_truncated"] for batch in result["batches"])
+            and legacy["complete"]
+            and not legacy["truncated"]
         )
         return result
+
+
+def _audit_management_batches_read_only(database_path: Path, *, limit: int) -> dict:
+    with tempfile.TemporaryDirectory(prefix="management-audit-") as temporary:
+        snapshot_path, snapshot_info = _build_stable_private_snapshots(
+            database_path, Path(temporary)
+        )
+        return _audit_management_snapshot(
+            snapshot_path, limit=limit, snapshot_info=snapshot_info
+        )
 
 
 def _record_within_window(record: NormalizedMessageRecord, *, start_at, end_at) -> bool:
@@ -935,13 +1316,70 @@ def audit_management_batches(
         raise typer.BadParameter("output-format must be one of: text, json")
     try:
         audit = _audit_management_batches_read_only(database_path, limit=limit)
-    except sqlite3.OperationalError as exc:
-        typer.echo(f"Read-only audit unavailable: {exc}", err=True)
+    except (ManagementAuditSnapshotError, sqlite3.Error) as exc:
+        reason = (
+            exc.reason
+            if isinstance(exc, ManagementAuditSnapshotError)
+            else "snapshot_audit_failed"
+        )
+        audit = {
+            "snapshot_status": "snapshot_unstable",
+            "snapshot_validation": "not_run",
+            "snapshot_reason": reason,
+            "schema_status": "not_checked",
+            "limit": limit,
+            "counts": {
+                "batches_total": 0,
+                **{state: 0 for state in _MANAGEMENT_ALERT_STATES},
+            },
+            "batches_returned": 0,
+            "batches_truncated": False,
+            "malformed_row_count": 0,
+            "malformed_field_count": 0,
+            "output_complete": False,
+            "batches": [],
+            "legacy_pending_management": {
+                "status": "not_checked",
+                "candidate_pending_count": None,
+                "scanned_count": 0,
+                "total": None,
+                "returned": 0,
+                "truncated": False,
+                "complete": False,
+                "scan_truncated": False,
+                "malformed_payload_count": 0,
+                "malformed_row_count": 0,
+                "malformed_field_count": 0,
+                "by_action": {},
+                "items": [],
+            },
+        }
+        typer.echo(
+            json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True)
+            if normalized_format == "json"
+            else (
+                f"snapshot_status=snapshot_unstable "
+                f"snapshot_validation=not_run snapshot_reason={reason}\n"
+                "audit_payload="
+                + json.dumps(
+                    audit,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        )
         raise typer.Exit(code=1) from exc
     if normalized_format == "json":
         typer.echo(json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True))
         return
     counts = audit["counts"]
+    typer.echo(
+        f"snapshot_status={audit['snapshot_status']} "
+        f"snapshot_validation={audit['snapshot_validation']} "
+        f"snapshot_copies_verified={audit['snapshot_copies_verified']} "
+        f"snapshot_components={','.join(audit['snapshot_components'])}"
+    )
     typer.echo(f"Management schema: {audit['schema_status']}")
     typer.echo(
         "Batch counts: "
@@ -957,21 +1395,47 @@ def audit_management_batches(
     for batch in audit["batches"]:
         source = batch["source"]
         typer.echo(
-            f"- batch={batch['batch_id']} state={batch['status']} "
+            f"- batch={batch['batch_ref']} state={batch['status']} "
             f"action={batch['effective_action']} mode={batch['execution_mode']} "
-            f"source={source['chat_ref']}/{source['message_id']} "
-            f"legs={len(batch['legs'])}"
+            f"source={source['chat_ref']}/{source['message_ref']} "
+            f"legs_returned={batch['legs_returned']} "
+            f"legs_truncated={str(batch['legs_truncated']).lower()}"
         )
         for leg in batch["legs"]:
             typer.echo(
-                f"  leg={leg['leg_id']} pos={leg['pos_ref']} state={leg['status']} "
+                f"  leg={leg['leg_ref']} pos={leg['pos_ref']} state={leg['status']} "
                 f"size={leg['preflight_size']} close={leg['planned_close_size']}"
             )
     legacy = audit["legacy_pending_management"]
     typer.echo(
         f"Legacy pending management: status={legacy['status']} "
         f"total={legacy['total']} returned={legacy['returned']} "
-        f"truncated={str(legacy['truncated']).lower()}"
+        f"truncated={str(legacy['truncated']).lower()} "
+        f"complete={str(legacy['complete']).lower()} "
+        f"scan_truncated={str(legacy['scan_truncated']).lower()} "
+        f"candidate_pending_count={legacy['candidate_pending_count']} "
+        f"scanned_count={legacy['scanned_count']}"
+    )
+    typer.echo(
+        "by_action="
+        + json.dumps(legacy["by_action"], ensure_ascii=False, sort_keys=True)
+    )
+    for item in legacy["items"]:
+        typer.echo(
+            f"- signal={item['signal_ref']} action={item['action']} "
+            f"source={item['chat_ref']}/{item['message_ref']} "
+            f"payload_status={item['payload_status']}"
+        )
+    typer.echo(
+        f"malformed_row_count={audit['malformed_row_count']} "
+        f"malformed_field_count={audit['malformed_field_count']} "
+        f"output_complete={str(audit['output_complete']).lower()}"
+    )
+    # The compact payload makes text mode information-equivalent to JSON mode
+    # without reintroducing any raw identifier or unbounded database text.
+    typer.echo(
+        "audit_payload="
+        + json.dumps(audit, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
 
 

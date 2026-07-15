@@ -232,11 +232,16 @@ telegram-kol-research audit-management-batches \
 Review batch/leg counts, legacy pending management signals, malformed fields,
 and every `blocked`, `submit_unknown`, `partial_failed`, or
 `recovery_required` count. The audit never performs compatibility migration or
-legacy conversion. Stop deployment review if the service is inactive, the SHA
-differs, a table/index is missing, either gate is unsafe, schema is old, output
-is malformed, or ownership evidence is stale/ambiguous. Do not fix those
-conditions by enabling execution, editing production rows, retrying an unknown
-request, or placing a test order.
+legacy conversion. It audits only after two stable ordinary-file captures and
+two validated private temporary snapshots; SQLite never receives the production
+database path. Stop deployment review if `snapshot_status` is not `stable`,
+`snapshot_validation` is not `ok`, `output_complete=false`, any scan/batch/leg
+truncation is present, legacy `complete=false`, the service is inactive, the
+SHA differs, a table/index is missing, either gate is unsafe, schema is old,
+output is malformed, or ownership evidence is stale/ambiguous. A truncated
+report never proves zero residue. Do not fix those conditions by enabling
+execution, editing production rows, retrying an unknown request, or placing a
+test order.
 
 This rollout ends with both gates off. Shadow observation and especially live
 management are later changes requiring explicit approval. Live additionally
