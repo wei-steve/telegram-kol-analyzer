@@ -270,6 +270,23 @@ that none of `live_position_ids` appears in `historical_actions` and that no
 pending regular, trigger, or position-linked TPSL order is being treated as
 history.
 
+An exact Deepcoin position-history row may prove historical closure only when
+its `posId`, instrument, side, and split-position mode match the candidate, its
+original `pos` is positive, and `closePos` equals that full original size using
+exact decimal comparison. Partial closure, missing or malformed sizes,
+mismatched identity fields, conflicting duplicate rows, unavailable history,
+and any current live or pending identity remain blocking. They must appear in
+`unresolved_conflicts`; do not choose a convenient row or infer closure from
+position absence.
+
+For a stale leg competing for a duplicated historical `pos_id`, the planner may
+look up that leg's exact entry `order_id` as a historical position identifier.
+Such an order-derived ID is audit-only terminal evidence: it may support the
+reviewed `clear_redundant_historical_position` and terminalization actions, but
+must not create a current ownership assignment, populate a new live `pos_id`,
+or appear in `actions`. Review the evidence's historical identifier against the
+leg before accepting the cleanup.
+
 `unresolved_conflicts` is an apply blocker. A missing live position is not
 terminal evidence; an `entered` lifecycle remains unchanged unless an exact
 completed close reservation, successful close event, terminal lifecycle, or

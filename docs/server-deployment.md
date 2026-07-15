@@ -109,13 +109,28 @@ unresolved conflict. It never submits an exchange order or cancellation.
 Dry-run output includes `historical_actions`. Before approving any of them:
 
 - confirm no current `live_position_ids` appears in a historical action;
-- verify the exact lifecycle, execution event, close reservation, or exchange
-  cancellation used as terminal evidence;
+- verify the exact lifecycle, execution event, close reservation, exchange
+  cancellation, or fully closed position-history row used as terminal evidence;
 - confirm pending regular, trigger, and position-linked TPSL orders are absent
   from the cleanup component;
 - review every affected leg, binding, and lifecycle old/new state;
 - treat every `unresolved_conflicts` row as an apply blocker; and
 - keep the global automatic-trading switch false.
+
+A Deepcoin position-history row is fully closed evidence only when the exact
+candidate `posId`, instrument, side, and split-position mode match, the original
+`pos` is positive, and `closePos` equals the entire original size by exact
+decimal comparison. Partial closure, missing or malformed sizes, mismatched
+fields, conflicting duplicate rows, a history read failure, or any current
+live/pending identity blocks cleanup. Never infer terminal state from a missing
+live position or select one row from conflicting history.
+
+When a stale competitor shares a duplicated historical `pos_id`, its exact
+entry `order_id` may be queried as a historical position identifier. Treat that
+order-derived identifier only as auditable closure evidence for the planned
+historical clear/terminalize chain. It must not become a new live owner, a new
+persisted `pos_id`, or a current repair in `actions`; verify it remains confined
+to the affected `historical_actions` evidence.
 
 If the plan contains `install_position_ownership_unique_index`, it must be the
 last historical action and every planned redundant ownership clear must be
