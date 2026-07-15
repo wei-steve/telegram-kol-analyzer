@@ -452,14 +452,21 @@ def test_manual_close_during_full_close_reconciliation_preserves_audit(tmp_path)
 
 
 @pytest.mark.parametrize(
-    ("action", "planned", "positions"),
+    ("action", "planned", "positions", "extra_strategy"),
     [
-        ("full_close", "2", []),
-        ("partial_close", "1", [_position("pos-1", "1")]),
+        ("full_close", "2", [], "exact"),
+        ("partial_close", "1", [_position("pos-1", "1")], "exact"),
+        ("full_close", "2", [], None),
+        (
+            "partial_close",
+            "1",
+            [_position("pos-1", "1")],
+            "deepcoin:other:strategy",
+        ),
     ],
 )
 def test_entry_leg_added_after_planning_freezes_complete_identity_set(
-    action, planned, positions, tmp_path
+    action, planned, positions, extra_strategy, tmp_path
 ):
     sf = create_session_factory(tmp_path / "research.db")
     batch = _persist_batch(
@@ -469,7 +476,11 @@ def test_entry_leg_added_after_planning_freezes_complete_identity_set(
         session.add(
             ExecutionOrderLeg(
                 execution_binding_id=batch.execution_binding_id,
-                strategy_instance_id=batch.strategy_instance_id,
+                strategy_instance_id=(
+                    batch.strategy_instance_id
+                    if extra_strategy == "exact"
+                    else extra_strategy
+                ),
                 leg_index=99,
                 purpose="entry",
                 order_kind="trigger_limit",
