@@ -44,7 +44,9 @@ its own planned action chain and rolls back.
 - Do not mutate an exchange position or order.
 - Do not modify current live-position ownership.
 - Do not accept partial closes as terminal.
-- Do not infer a close reason that the exchange evidence does not provide.
+- Do not infer a causal close reason that the exchange evidence does not
+  provide. Use the neutral lifecycle reason `exchange_closed` only to record
+  that exact exchange history proves the position fully closed.
 - Do not rewrite a stale historical leg to a different persisted `pos_id` merely
   because its order ID also identifies a historical position. The true ID is
   retained in audit evidence while the stale duplicate ownership is cleared.
@@ -117,7 +119,9 @@ conflicting rows, or an API error produces no action and an unresolved conflict.
 The evidence payload records `posId`, `pos`, `closePos`, `avgPx`, `closeAvgPx`,
 `pnl`, `cTime`, and `uTime`. It never treats the row as proof of stop-loss,
 take-profit, or manual close reason because the endpoint does not identify the
-cause.
+cause. An execution-backed lifecycle that is still `entered` may transition to
+`exited` with the neutral `exit_reason = exchange_closed`; this describes the
+verified exchange state rather than its cause.
 
 ## Per-Leg Planning
 

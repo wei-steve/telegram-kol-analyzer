@@ -315,9 +315,11 @@ exact. Use order-derived position history for a redundant competitor only when
 the exact row is fully closed and matches the binding.
 
 For exchange position history, set terminal leg state to the existing neutral
-terminal state `closed`, and record
-`historical_exchange_position_closed` as the terminal reason. Do not label it
-stop-loss, take-profit, or manual without proof.
+terminal state `closed`, record `historical_exchange_position_closed` as the
+leg terminal reason, and use `exchange_closed` when an execution-backed
+`entered` lifecycle must transition to `exited`. Do not label it stop-loss,
+take-profit, or manual without proof. Extend the lifecycle reason documentation
+or model comment so `exchange_closed` is an explicit supported neutral value.
 
 **Step 7: Run planner and integration tests**
 
