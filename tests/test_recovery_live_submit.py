@@ -26,6 +26,7 @@ from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.trade_signals import enqueue_trade_signal
+from telegram_kol_research.trade_signals import canonical_management_batch_id
 
 
 class _StaticContractSpecProvider:
@@ -37,6 +38,11 @@ class _StaticContractSpecProvider:
             min_quantity=1,
             price_tick=0.1,
         )
+
+
+@pytest.mark.parametrize("payload", [None, [], "scalar", 42, 1.5, True])
+def test_canonical_management_batch_id_rejects_non_mapping_payload(payload):
+    assert canonical_management_batch_id(payload) is None
 
 
 class _FakeDeepcoinClient:
@@ -822,6 +828,101 @@ def test_process_next_entry_creates_deferred_client(tmp_path):
 
     assert factory_calls == ["called"]
     assert result["submitted"] is True
+
+
+def test_non_mapping_legacy_payload_fails_without_factory_then_queue_continues(
+    tmp_path
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    legacy = enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="kol_management",
+        kol_id="group:100",
+        chat_id=100,
+        message_id=705,
+        symbol="BTC",
+        side="short",
+        action="close_position",
+        payload={"binding_id": 12},
+    )
+    with session_factory() as session:
+        row = session.get(TradeSignal, legacy.id)
+        row.payload_json = "[]"
+        session.commit()
+    _persist_ready_item(session_factory)
+    entry = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    client = _FakeDeepcoinClient()
+    factory_calls = []
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="legacy_management_signal_requires_batch",
+    ):
+        process_next_trade_signal_live(
+            session_factory,
+            deepcoin_client_factory=lambda: factory_calls.append("called") or client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert factory_calls == []
+    with session_factory() as session:
+        legacy_row = session.get(TradeSignal, legacy.id)
+        assert legacy_row.status == "failed"
+        assert legacy_row.attempts == 1
+        assert session.get(TradeSignal, entry.id).status == "pending"
+
+    result = process_next_trade_signal_live(
+        session_factory,
+        deepcoin_client_factory=lambda: factory_calls.append("called") or client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert result["submitted"] is True
+    assert factory_calls == ["called"]
+
+
+def test_audit_lists_non_mapping_pending_management_payloads_read_only(tmp_path):
+    from telegram_kol_research.trade_signals import audit_pending_legacy_management_signals
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    payload_json_values = ["[]", '"scalar"', "null", "123"]
+    signal_ids = []
+    for index, payload_json in enumerate(payload_json_values, start=1):
+        signal = enqueue_trade_signal(
+            session_factory,
+            venue="deepcoin",
+            source_type="kol_management",
+            kol_id="group:100",
+            chat_id=100,
+            message_id=730 + index,
+            symbol="BTC",
+            side="short",
+            action="close_position",
+            payload={},
+        )
+        signal_ids.append(signal.id)
+        with session_factory() as session:
+            row = session.get(TradeSignal, signal.id)
+            row.payload_json = payload_json
+            session.commit()
+
+    report = audit_pending_legacy_management_signals(session_factory)
+
+    assert report["total"] == 4
+    assert [item["id"] for item in report["items"]] == signal_ids
+    with session_factory() as session:
+        rows = session.query(TradeSignal).order_by(TradeSignal.id).all()
+        assert [row.status for row in rows] == ["pending"] * 4
+        assert [row.payload_json for row in rows] == payload_json_values
 
 
 def _all_trade_signals(session_factory):

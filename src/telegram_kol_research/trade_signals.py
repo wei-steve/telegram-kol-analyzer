@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -46,7 +47,7 @@ class TradeSignalRecord:
     side: str
     action: str
     status: str
-    payload: dict[str, Any]
+    payload: Any
     attempts: int
     last_error: str | None = None
 
@@ -238,9 +239,11 @@ def _row_payload(row: TradeSignal) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def canonical_management_batch_id(payload: dict[str, Any]) -> int | None:
+def canonical_management_batch_id(payload: Any) -> int | None:
     """Parse only canonical positive IDs shared by audit and dispatch."""
 
+    if not isinstance(payload, Mapping):
+        return None
     batch_id = payload.get("management_batch_id")
     if isinstance(batch_id, bool):
         return None
