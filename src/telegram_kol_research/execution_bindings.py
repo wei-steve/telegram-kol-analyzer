@@ -117,6 +117,7 @@ class ManualCloseSyncResult:
 @dataclass(slots=True)
 class _ReconcileSnapshot:
     positions: list[dict[str, Any]] = field(default_factory=list)
+    position_history: list[dict[str, Any]] = field(default_factory=list)
     open_orders: list[dict[str, Any]] = field(default_factory=list)
     pending_trigger_orders: list[dict[str, Any]] = field(default_factory=list)
     order_history: list[dict[str, Any]] = field(default_factory=list)

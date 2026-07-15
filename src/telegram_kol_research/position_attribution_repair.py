@@ -130,6 +130,49 @@ def _load_local_repair_evidence(session):
     return bindings, legs, lifecycles, terminal_events, close_reservations
 
 
+def _historical_position_candidates(bindings_by_id, legs):
+    candidates: set[tuple[str, str]] = set()
+    for leg in legs:
+        if str(leg.purpose or "").lower() != "entry":
+            continue
+        if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+            continue
+        if str(leg.venue or "").lower() != "deepcoin":
+            continue
+        binding = bindings_by_id.get(int(leg.execution_binding_id))
+        if binding is None or str(binding.venue or "").lower() != "deepcoin":
+            continue
+        symbol = str(binding.symbol or "").strip().upper()
+        if not symbol:
+            continue
+        instrument = f"{symbol}-USDT-SWAP"
+        for identifier in (leg.pos_id, leg.order_id):
+            identifier = str(identifier or "").strip()
+            if identifier:
+                candidates.add((instrument, identifier))
+    return candidates
+
+
+def _load_historical_position_evidence(snapshot, deepcoin_client, candidates) -> None:
+    method = getattr(deepcoin_client, "list_position_history", None)
+    for instrument, identifier in sorted(candidates):
+        source = f"position_history:{instrument}:{identifier}"
+        if method is None:
+            snapshot.errors[source] = "list_position_history unavailable"
+            continue
+        try:
+            rows = method(inst_id=instrument, pos_id=identifier)
+        except Exception as exc:
+            snapshot.errors[source] = str(exc)
+            continue
+        if not isinstance(rows, list) or not all(
+            isinstance(row, dict) for row in rows
+        ):
+            snapshot.errors[source] = "invalid list response schema"
+            continue
+        snapshot.position_history.extend(rows)
+
+
 def build_position_attribution_repair_plan(
     session_factory,
     *,
@@ -155,6 +198,11 @@ def build_position_attribution_repair_plan(
         snapshot = _load_reconcile_snapshot(
             deepcoin_client,
             instruments=instruments,
+        )
+        _load_historical_position_evidence(
+            snapshot,
+            deepcoin_client,
+            _historical_position_candidates(bindings_by_id, legs),
         )
         if snapshot.errors:
             unresolved = [{"evidence_source_errors": dict(sorted(snapshot.errors.items()))}]
@@ -761,6 +809,7 @@ def _exchange_evidence_fingerprint(snapshot) -> str:
     return _hash(
         {
             "positions": stable_rows(snapshot.positions),
+            "position_history": stable_rows(snapshot.position_history),
             "open_orders": stable_rows(snapshot.open_orders),
             "pending_trigger_orders": stable_rows(snapshot.pending_trigger_orders),
             "order_history": stable_rows(snapshot.order_history),

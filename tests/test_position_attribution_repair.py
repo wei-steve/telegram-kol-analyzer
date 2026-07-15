@@ -38,6 +38,8 @@ class _HistoricalCleanupClient:
             }
             for pos_id in live_position_ids
         ]
+        self.position_history = {}
+        self.position_history_calls = []
 
     def list_positions(self):
         return self.positions
@@ -56,6 +58,10 @@ class _HistoricalCleanupClient:
 
     def list_trigger_order_history(self, *, inst_id):
         return []
+
+    def list_position_history(self, *, inst_id, pos_id):
+        self.position_history_calls.append((inst_id, pos_id))
+        return self.position_history.get((inst_id, pos_id), [])
 
 
 def _seed_historical_duplicate_fixture(tmp_path):
@@ -138,6 +144,102 @@ def _historical_fixture_state(session_factory):
         ]
 
 
+def _seed_exact_history_candidates(session_factory):
+    with session_factory() as session:
+        session.add_all(
+            [
+                ExecutionBinding(
+                    id=201,
+                    strategy_instance_id="deepcoin:20:201:BTC:long",
+                    kol_id="history",
+                    chat_id=20,
+                    message_id=201,
+                    symbol="BTC",
+                    side="long",
+                    venue="deepcoin",
+                    status="open",
+                ),
+                ExecutionBinding(
+                    id=202,
+                    strategy_instance_id="other:20:202:ETH:long",
+                    kol_id="history",
+                    chat_id=20,
+                    message_id=202,
+                    symbol="ETH",
+                    side="long",
+                    venue="other",
+                    status="open",
+                ),
+            ]
+        )
+        session.flush()
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=201,
+                    strategy_instance_id="deepcoin:20:201:BTC:long",
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="actual-order-pos",
+                    pos_id=None,
+                    venue="deepcoin",
+                    status="submitted",
+                    attribution_status="unassigned",
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=201,
+                    strategy_instance_id="deepcoin:20:201:BTC:long",
+                    leg_index=2,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="actual-order-pos",
+                    pos_id="stale-pos",
+                    venue="deepcoin",
+                    status="open",
+                    attribution_status="unassigned",
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=201,
+                    strategy_instance_id="deepcoin:20:201:BTC:long",
+                    leg_index=3,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="terminal-order",
+                    pos_id="terminal-pos",
+                    venue="deepcoin",
+                    status="cancelled",
+                    attribution_status="unassigned",
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=201,
+                    strategy_instance_id="deepcoin:20:201:BTC:long",
+                    leg_index=4,
+                    purpose="exit",
+                    order_kind="market",
+                    order_id="exit-order",
+                    pos_id="exit-pos",
+                    venue="deepcoin",
+                    status="submitted",
+                    attribution_status="unassigned",
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=202,
+                    strategy_instance_id="other:20:202:ETH:long",
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="other-order",
+                    pos_id="other-pos",
+                    venue="other",
+                    status="submitted",
+                    attribution_status="unassigned",
+                ),
+            ]
+        )
+        session.commit()
+
+
 class _RepairClient:
     def __init__(self):
         self.positions = [
@@ -150,6 +252,8 @@ class _RepairClient:
                 "cTime": "1782788876000",
             }
         ]
+        self.position_history = {}
+        self.position_history_calls = []
 
     def list_positions(self):
         return self.positions
@@ -198,6 +302,10 @@ class _RepairClient:
             },
         ]
 
+    def list_position_history(self, *, inst_id, pos_id):
+        self.position_history_calls.append((inst_id, pos_id))
+        return self.position_history.get((inst_id, pos_id), [])
+
 
 class _MiyaRepairClient(_RepairClient):
     def __init__(self):
@@ -216,6 +324,8 @@ class _MiyaRepairClient(_RepairClient):
             }
             for pos_id in ("1001124099803509", "1001124099803507")
         ]
+        self.position_history = {}
+        self.position_history_calls = []
 
     def list_trigger_orders_pending(self, *, inst_id):
         return []
@@ -235,6 +345,98 @@ class _MiyaRepairClient(_RepairClient):
             }
             for leg_id in (245, 244)
         ]
+
+
+def test_repair_plan_loads_unique_exact_history_for_nonterminal_entry_ids(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_history_candidates(session_factory)
+    client = _HistoricalCleanupClient()
+    expected_rows = [
+        {"instId": "BTC-USDT-SWAP", "posId": "actual-order-pos", "state": "closed"},
+        {"instId": "BTC-USDT-SWAP", "posId": "stale-pos", "state": "closed"},
+    ]
+    client.position_history = {
+        ("BTC-USDT-SWAP", "actual-order-pos"): [expected_rows[0]],
+        ("BTC-USDT-SWAP", "stale-pos"): [expected_rows[1]],
+    }
+    captured = {}
+    original = repair_module.plan_historical_attribution_cleanup
+
+    def capture_snapshot(**kwargs):
+        captured["snapshot"] = kwargs["snapshot"]
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        repair_module, "plan_historical_attribution_cleanup", capture_snapshot
+    )
+
+    build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 12, 0, tzinfo=UTC),
+    )
+
+    assert client.position_history_calls == [
+        ("BTC-USDT-SWAP", "actual-order-pos"),
+        ("BTC-USDT-SWAP", "stale-pos"),
+    ]
+    assert captured["snapshot"].position_history == expected_rows
+
+
+def test_repair_plan_exact_history_failure_is_source_error_and_blocks_actions(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_history_candidates(session_factory)
+    client = _HistoricalCleanupClient()
+
+    def fail_one_request(*, inst_id, pos_id):
+        client.position_history_calls.append((inst_id, pos_id))
+        if pos_id == "stale-pos":
+            raise RuntimeError("history unavailable")
+        return []
+
+    client.list_position_history = fail_one_request
+
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 12, 0, tzinfo=UTC),
+    )
+
+    assert plan.actions == ()
+    assert plan.historical_actions == ()
+    assert plan.unresolved_conflicts == [
+        {
+            "evidence_source_errors": {
+                "position_history:BTC-USDT-SWAP:stale-pos": "history unavailable"
+            }
+        }
+    ]
+
+
+def test_exact_history_changes_exchange_and_plan_fingerprints(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_history_candidates(session_factory)
+    client = _HistoricalCleanupClient()
+    key = ("BTC-USDT-SWAP", "stale-pos")
+    client.position_history[key] = [
+        {"instId": key[0], "posId": key[1], "closePx": "100"}
+    ]
+    now = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+
+    first = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client, now=now
+    )
+    client.position_history[key] = [
+        {"instId": key[0], "posId": key[1], "closePx": "101"}
+    ]
+    second = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client, now=now
+    )
+
+    assert second.exchange_evidence_fingerprint != first.exchange_evidence_fingerprint
+    assert second.fingerprint != first.fingerprint
 
 
 def _seed_miya_equivalent_component(session_factory):
