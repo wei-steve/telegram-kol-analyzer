@@ -447,6 +447,89 @@ def test_miya_repair_apply_is_idempotent(tmp_path):
     assert repeated.already_applied is True
 
 
+def test_repeated_miya_repair_rejects_exchange_drift(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_miya_equivalent_component(session_factory)
+    client = _MiyaRepairClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client
+    )
+    apply_position_attribution_repair_plan(
+        session_factory, plan, deepcoin_client=client
+    )
+    client.positions.pop()
+
+    with pytest.raises(PositionAttributionRepairError, match="live positions changed"):
+        apply_position_attribution_repair_plan(
+            session_factory, plan, deepcoin_client=client
+        )
+
+
+def test_repeated_miya_repair_rejects_api_error(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_miya_equivalent_component(session_factory)
+    client = _MiyaRepairClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client
+    )
+    apply_position_attribution_repair_plan(
+        session_factory, plan, deepcoin_client=client
+    )
+
+    def fail_positions():
+        raise RuntimeError("positions unavailable after apply")
+
+    client.list_positions = fail_positions
+    with pytest.raises(PositionAttributionRepairError, match="evidence unavailable"):
+        apply_position_attribution_repair_plan(
+            session_factory, plan, deepcoin_client=client
+        )
+
+
+def test_repeated_miya_repair_rejects_database_drift(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_miya_equivalent_component(session_factory)
+    client = _MiyaRepairClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client
+    )
+    apply_position_attribution_repair_plan(
+        session_factory, plan, deepcoin_client=client
+    )
+    with session_factory() as session:
+        session.query(ExecutionOrderLeg).filter_by(id=244).one().request_json = (
+            '{"instId":"ETH-USDT-SWAP","posSide":"short","sz":"9"}'
+        )
+        session.commit()
+
+    with pytest.raises(PositionAttributionRepairError, match="database evidence changed"):
+        apply_position_attribution_repair_plan(
+            session_factory, plan, deepcoin_client=client
+        )
+
+
+def test_repeated_miya_repair_rejects_binding_evidence_drift(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_miya_equivalent_component(session_factory)
+    client = _MiyaRepairClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client
+    )
+    apply_position_attribution_repair_plan(
+        session_factory, plan, deepcoin_client=client
+    )
+    with session_factory() as session:
+        session.query(ExecutionBinding).filter_by(id=123).one().margin_mode = (
+            "isolated"
+        )
+        session.commit()
+
+    with pytest.raises(PositionAttributionRepairError, match="database evidence changed"):
+        apply_position_attribution_repair_plan(
+            session_factory, plan, deepcoin_client=client
+        )
+
+
 def test_miya_repair_api_error_remains_unresolved_and_unapplied(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_miya_equivalent_component(session_factory)

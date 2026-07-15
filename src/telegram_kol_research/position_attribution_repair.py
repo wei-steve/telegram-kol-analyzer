@@ -55,6 +55,7 @@ class PositionAttributionRepairAction:
 class PositionAttributionRepairPlan:
     created_at: datetime
     live_position_ids: tuple[str, ...]
+    exchange_evidence_fingerprint: str
     actions: tuple[PositionAttributionRepairAction, ...]
     unresolved_conflicts: list[dict[str, object]]
     database_fingerprint: str
@@ -101,6 +102,7 @@ def build_position_attribution_repair_plan(
             return _build_plan(
                 created_at=created_at,
                 live_position_ids=_live_position_ids(snapshot.positions),
+                exchange_evidence_fingerprint=_exchange_evidence_fingerprint(snapshot),
                 actions=(),
                 unresolved_conflicts=unresolved,
                 database_fingerprint=database_fingerprint,
@@ -239,6 +241,7 @@ def build_position_attribution_repair_plan(
         return _build_plan(
             created_at=created_at,
             live_position_ids=_live_position_ids(snapshot.positions),
+            exchange_evidence_fingerprint=_exchange_evidence_fingerprint(snapshot),
             actions=tuple(actions),
             unresolved_conflicts=list(attribution.conflicts),
             database_fingerprint=database_fingerprint,
@@ -256,17 +259,18 @@ def apply_position_attribution_repair_plan(
             "repair plan contains unresolved attribution conflicts"
         )
     with session_factory() as session:
-        applied_fingerprints = {
-            row.fingerprint
+        applied_audits = {
+            row.fingerprint: row
             for row in session.query(PositionAttributionAudit)
             .filter(PositionAttributionAudit.event_type == "historical_repair")
             .all()
         }
-        if plan.actions and all(
-            _repair_audit_fingerprint(plan, action) in applied_fingerprints
-            for action in plan.actions
-        ):
-            return PositionAttributionRepairResult(applied=0, already_applied=True)
+    expected_audit_fingerprints = {
+        _repair_audit_fingerprint(plan, action) for action in plan.actions
+    }
+    already_applied = bool(plan.actions) and expected_audit_fingerprints.issubset(
+        applied_audits
+    )
 
     if deepcoin_client is not None:
         current_plan = build_position_attribution_repair_plan(
@@ -274,11 +278,25 @@ def apply_position_attribution_repair_plan(
             deepcoin_client=deepcoin_client,
             now=plan.created_at,
         )
-        if current_plan.fingerprint != plan.fingerprint:
-            if current_plan.live_position_ids != plan.live_position_ids:
-                raise PositionAttributionRepairError(
-                    "live positions changed since repair plan"
-                )
+        if any(
+            "evidence_source_errors" in conflict
+            for conflict in current_plan.unresolved_conflicts
+        ):
+            raise PositionAttributionRepairError(
+                "current exchange evidence unavailable"
+            )
+        if current_plan.live_position_ids != plan.live_position_ids:
+            raise PositionAttributionRepairError(
+                "live positions changed since repair plan"
+            )
+        if (
+            current_plan.exchange_evidence_fingerprint
+            != plan.exchange_evidence_fingerprint
+        ):
+            raise PositionAttributionRepairError(
+                "stale repair plan: exchange evidence changed"
+            )
+        if not already_applied and current_plan.fingerprint != plan.fingerprint:
             raise PositionAttributionRepairError(
                 "stale repair plan: exchange or database evidence changed"
             )
@@ -296,7 +314,27 @@ def apply_position_attribution_repair_plan(
             .order_by(ExecutionOrderLeg.id)
             .all()
         )
-        if _database_fingerprint(bindings, legs) != plan.database_fingerprint:
+        current_database_fingerprint = _database_fingerprint(bindings, legs)
+        if already_applied:
+            applied_state_fingerprints = {
+                _repair_audit_applied_database_fingerprint(
+                    applied_audits[fingerprint]
+                )
+                for fingerprint in expected_audit_fingerprints
+            }
+            if (
+                None in applied_state_fingerprints
+                or len(applied_state_fingerprints) != 1
+                or current_database_fingerprint
+                not in applied_state_fingerprints
+            ):
+                raise PositionAttributionRepairError(
+                    "stale repair plan: database evidence changed"
+                )
+            return PositionAttributionRepairResult(
+                applied=0, already_applied=True
+            )
+        if current_database_fingerprint != plan.database_fingerprint:
             raise PositionAttributionRepairError("stale repair plan: database evidence changed")
         legs_by_id = {int(row.id): row for row in legs}
         try:
@@ -321,8 +359,16 @@ def apply_position_attribution_repair_plan(
                     leg.last_verified_at = plan.created_at
                 if action.action == "terminal_cancelled_leg":
                     leg.terminal_reason = "historical_exchange_cancelled"
-                _insert_repair_audit(session, plan=plan, action=action, leg=leg)
             _derive_repaired_bindings(bindings, list(legs_by_id.values()), plan.created_at)
+            applied_database_fingerprint = _database_fingerprint(bindings, legs)
+            for action in plan.actions:
+                _insert_repair_audit(
+                    session,
+                    plan=plan,
+                    action=action,
+                    leg=legs_by_id[action.leg_id],
+                    applied_database_fingerprint=applied_database_fingerprint,
+                )
             session.commit()
         except IntegrityError as exc:
             session.rollback()
@@ -374,12 +420,14 @@ def _build_plan(
     *,
     created_at: datetime,
     live_position_ids: tuple[str, ...],
+    exchange_evidence_fingerprint: str,
     actions: tuple[PositionAttributionRepairAction, ...],
     unresolved_conflicts: list[dict[str, object]],
     database_fingerprint: str,
 ) -> PositionAttributionRepairPlan:
     payload = {
         "live_position_ids": live_position_ids,
+        "exchange_evidence_fingerprint": exchange_evidence_fingerprint,
         "actions": [asdict(action) for action in actions],
         "unresolved_conflicts": unresolved_conflicts,
         "database_fingerprint": database_fingerprint,
@@ -387,6 +435,7 @@ def _build_plan(
     return PositionAttributionRepairPlan(
         created_at=created_at,
         live_position_ids=live_position_ids,
+        exchange_evidence_fingerprint=exchange_evidence_fingerprint,
         actions=actions,
         unresolved_conflicts=unresolved_conflicts,
         database_fingerprint=database_fingerprint,
@@ -405,6 +454,9 @@ def _database_fingerprint(bindings, legs) -> str:
                     "message_id": int(row.message_id),
                     "symbol": row.symbol,
                     "side": row.side,
+                    "margin_mode": row.margin_mode,
+                    "position_mode": row.position_mode,
+                    "payload_json": row.payload_json,
                     "pos_id": row.pos_id,
                     "status": row.status,
                     "last_exchange_status": row.last_exchange_status,
@@ -415,6 +467,11 @@ def _database_fingerprint(bindings, legs) -> str:
                 {
                     "id": int(row.id),
                     "binding_id": int(row.execution_binding_id),
+                    "strategy_instance_id": row.strategy_instance_id,
+                    "leg_index": int(row.leg_index),
+                    "purpose": row.purpose,
+                    "order_kind": row.order_kind,
+                    "venue": row.venue,
                     "order_id": row.order_id,
                     "client_order_id": row.client_order_id,
                     "pos_id": row.pos_id,
@@ -424,11 +481,20 @@ def _database_fingerprint(bindings, legs) -> str:
                     "request_json": row.request_json,
                     "response_json": row.response_json,
                     "terminal_reason": row.terminal_reason,
+                    "last_verified_at": _fingerprint_datetime(row.last_verified_at),
                 }
                 for row in legs
             ],
         }
     )
+
+
+def _fingerprint_datetime(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat()
 
 
 def _live_position_ids(rows: list[dict[str, Any]]) -> tuple[str, ...]:
@@ -441,7 +507,34 @@ def _live_position_ids(rows: list[dict[str, Any]]) -> tuple[str, ...]:
     )
 
 
-def _insert_repair_audit(session, *, plan, action, leg) -> None:
+def _exchange_evidence_fingerprint(snapshot) -> str:
+    def stable_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(
+            rows,
+            key=lambda row: json.dumps(
+                row,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
+
+    return _hash(
+        {
+            "positions": stable_rows(snapshot.positions),
+            "open_orders": stable_rows(snapshot.open_orders),
+            "pending_trigger_orders": stable_rows(snapshot.pending_trigger_orders),
+            "order_history": stable_rows(snapshot.order_history),
+            "trade_fills": stable_rows(snapshot.trade_fills),
+            "trigger_history": stable_rows(snapshot.trigger_history),
+            "errors": dict(sorted(snapshot.errors.items())),
+        }
+    )
+
+
+def _insert_repair_audit(
+    session, *, plan, action, leg, applied_database_fingerprint: str
+) -> None:
     fingerprint = _repair_audit_fingerprint(plan, action)
     if session.query(PositionAttributionAudit.id).filter_by(fingerprint=fingerprint).first():
         return
@@ -456,7 +549,11 @@ def _insert_repair_audit(session, *, plan, action, leg) -> None:
             new_state=action.new_attribution_status,
             fingerprint=fingerprint,
             evidence_json=json.dumps(
-                {"plan": plan.fingerprint, **action.evidence},
+                {
+                    "plan": plan.fingerprint,
+                    "applied_database_fingerprint": applied_database_fingerprint,
+                    **action.evidence,
+                },
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
@@ -464,6 +561,15 @@ def _insert_repair_audit(session, *, plan, action, leg) -> None:
             created_at=plan.created_at,
         )
     )
+
+
+def _repair_audit_applied_database_fingerprint(audit) -> str | None:
+    try:
+        evidence = json.loads(audit.evidence_json or "{}")
+    except (TypeError, ValueError):
+        return None
+    value = evidence.get("applied_database_fingerprint")
+    return str(value) if value else None
 
 
 def _repair_audit_fingerprint(plan, action) -> str:

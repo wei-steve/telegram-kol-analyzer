@@ -168,7 +168,7 @@ def test_equivalent_permutation_assignment_is_explicit_stable_and_evidenced():
         "1001124099803507",
         "1001124099803509",
     ]
-    assert evidence["equivalence_signature"] == {
+    expected_common_signature = {
         "binding_id": 100,
         "entry_price": 1770.0,
         "margin_mode": "cross",
@@ -183,10 +183,72 @@ def test_equivalent_permutation_assignment_is_explicit_stable_and_evidenced():
         "take_profits": [1650.0, 1700.0],
         "venue": "deepcoin",
     }
+    assert {
+        key: evidence["equivalence_signature"][key]
+        for key in expected_common_signature
+    } == expected_common_signature
     assert evidence["mapping_basis"] == "stable_sorted_canonicalization"
     assert evidence["ownership_statement"] == (
         "binding owner proven; parent-child mapping canonicalized"
     )
+    assert evidence["equivalence_signature"]["leg_population"] == [
+        {
+            "binding_id": 100,
+            "entry_price": 1770.0,
+            "leg_id": 244,
+            "margin_mode": "cross",
+            "order_kind": "trigger_limit",
+            "position_mode": "split",
+            "protection_mutated": False,
+            "requested_size": 1.5,
+            "side": "short",
+            "stop_loss": 1820.0,
+            "strategy_instance_id": "strategy-1",
+            "symbol": "ETH-USDT-SWAP",
+            "take_profits": [1650.0, 1700.0],
+            "venue": "deepcoin",
+        },
+        {
+            "binding_id": 100,
+            "entry_price": 1770.0,
+            "leg_id": 245,
+            "margin_mode": "cross",
+            "order_kind": "trigger_limit",
+            "position_mode": "split",
+            "protection_mutated": False,
+            "requested_size": 1.5,
+            "side": "short",
+            "stop_loss": 1820.0,
+            "strategy_instance_id": "strategy-1",
+            "symbol": "ETH-USDT-SWAP",
+            "take_profits": [1650.0, 1700.0],
+            "venue": "deepcoin",
+        },
+    ]
+    assert evidence["equivalence_signature"]["position_population"] == [
+        {
+            "entry_price": 1770.0,
+            "margin_mode": "cross",
+            "position_id": "1001124099803507",
+            "position_mode": "split",
+            "side": "short",
+            "size": 1.5,
+            "stop_loss": 1820.0,
+            "symbol": "ETH-USDT-SWAP",
+            "take_profits": [1650.0, 1700.0],
+        },
+        {
+            "entry_price": 1770.0,
+            "margin_mode": "cross",
+            "position_id": "1001124099803509",
+            "position_mode": "split",
+            "side": "short",
+            "size": 1.5,
+            "stop_loss": 1820.0,
+            "symbol": "ETH-USDT-SWAP",
+            "take_profits": [1650.0, 1700.0],
+        },
+    ]
 
 
 def test_equivalent_component_rejects_cross_binding_graph():

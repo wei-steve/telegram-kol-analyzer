@@ -344,6 +344,9 @@ def match_entry_legs_to_positions(
         canonical_leg_ids: set[int] = set()
         canonical_position_ids: set[str] = set()
         legs_by_id = {leg.leg_id: leg for leg in eligible_legs}
+        positions_by_id = {
+            position.pos_id: position for position in position_rows
+        }
         for component in equivalent_components:
             if len(component.leg_ids) < 2:
                 continue
@@ -357,7 +360,8 @@ def match_entry_legs_to_positions(
                 "component_leg_ids": sorted_leg_ids,
                 "component_position_ids": sorted_position_ids,
                 "equivalence_signature": _equivalence_signature(
-                    [legs_by_id[leg_id] for leg_id in sorted_leg_ids]
+                    [legs_by_id[leg_id] for leg_id in sorted_leg_ids],
+                    [positions_by_id[pos_id] for pos_id in sorted_position_ids],
                 ),
                 "mapping_basis": "stable_sorted_canonicalization",
                 "ownership_statement": (
@@ -397,7 +401,9 @@ def _numeric_aware_identifier_key(value: str) -> tuple[tuple[int, object], ...]:
     )
 
 
-def _equivalence_signature(legs: list[LegEvidence]) -> dict[str, object]:
+def _equivalence_signature(
+    legs: list[LegEvidence], positions: list[PositionEvidence]
+) -> dict[str, object]:
     leg = legs[0]
     protection_mutated = any(item.protection_mutated for item in legs)
     return {
@@ -416,6 +422,39 @@ def _equivalence_signature(legs: list[LegEvidence]) -> dict[str, object]:
         "margin_mode": leg.margin_mode,
         "position_mode": leg.position_mode,
         "order_kind": leg.order_kind,
+        "leg_population": [
+            {
+                "leg_id": item.leg_id,
+                "binding_id": item.binding_id,
+                "strategy_instance_id": item.strategy_instance_id,
+                "venue": item.venue.lower(),
+                "symbol": _normalize_instrument(item.symbol),
+                "side": _normalize_side(item.side),
+                "requested_size": item.requested_size,
+                "entry_price": item.entry_price,
+                "stop_loss": item.stop_loss,
+                "take_profits": sorted(item.take_profits),
+                "margin_mode": item.margin_mode,
+                "position_mode": item.position_mode,
+                "order_kind": item.order_kind,
+                "protection_mutated": item.protection_mutated,
+            }
+            for item in legs
+        ],
+        "position_population": [
+            {
+                "position_id": item.pos_id,
+                "symbol": _normalize_instrument(item.symbol),
+                "side": _normalize_side(item.side),
+                "size": item.size,
+                "entry_price": item.entry_price,
+                "stop_loss": item.stop_loss,
+                "take_profits": sorted(item.take_profits),
+                "margin_mode": item.margin_mode,
+                "position_mode": item.position_mode,
+            }
+            for item in positions
+        ],
     }
 
 
