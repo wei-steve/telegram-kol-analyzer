@@ -14,6 +14,7 @@ const workbenchLoadState = {
   positions: { key: null, promise: null },
   strategies: { key: null, promise: null },
   messages: { key: null, promise: null },
+  'management-batches': { key: null, promise: null },
 };
 
 const MESSAGE_TOP_THRESHOLD = 24;
@@ -1261,6 +1262,58 @@ async function loadPositionsPanel() {
   bindLivePositionAttributionButtons();
 }
 
+function managementBatchValue(value) {
+  return value === null || value === undefined || value === '' ? '-' : String(value);
+}
+
+function renderManagementBatchCard(batch) {
+  const card = document.createElement('article');
+  card.className = `management-batch-card management-batch-${String(batch.status || 'unknown')}`;
+  const heading = document.createElement('h3');
+  heading.textContent = `Batch #${managementBatchValue(batch.batch_id)} · ${managementBatchValue(batch.status)}`;
+  const identity = document.createElement('p');
+  identity.textContent = `群 ${managementBatchValue(batch.source?.chat_title)} (${managementBatchValue(batch.source?.chat_id)}) / 消息 #${managementBatchValue(batch.source?.message_id)} / lifecycle ${managementBatchValue(batch.lifecycle_id)} / binding ${managementBatchValue(batch.execution_binding_id)}`;
+  const strategy = document.createElement('p');
+  strategy.textContent = `strategy ${managementBatchValue(batch.strategy_instance_id)} · ${managementBatchValue(batch.intent)} → ${managementBatchValue(batch.effective_action)} · round ${managementBatchValue(batch.partial_round_before)} · fraction ${managementBatchValue(batch.effective_fraction)}`;
+  const safety = document.createElement('p');
+  safety.className = 'management-batch-safety';
+  safety.textContent = [batch.mode_label, batch.safety_label].filter(Boolean).join(' · ');
+  const reason = document.createElement('p');
+  reason.textContent = `原因: ${managementBatchValue(batch.reason)}`;
+  const targets = document.createElement('p');
+  targets.textContent = `目标: ${(batch.targets || []).map((target) => `${managementBatchValue(target.pos_id)}=${managementBatchValue(target.size)}`).join(', ') || '-'}`;
+  const timestamps = document.createElement('p');
+  timestamps.textContent = `计划 ${managementBatchValue(batch.planned_at)} · 更新 ${managementBatchValue(batch.updated_at)} · 完成 ${managementBatchValue(batch.completed_at)}`;
+  const legs = document.createElement('ul');
+  legs.className = 'management-batch-legs';
+  (batch.legs || []).forEach((leg) => {
+    const item = document.createElement('li');
+    item.textContent = `leg ${managementBatchValue(leg.leg_index)} / pos ${managementBatchValue(leg.pos_id)} / ${managementBatchValue(leg.status)} / ${managementBatchValue(leg.preflight_size)} → ${managementBatchValue(leg.planned_close_size)} / clOrdId ${managementBatchValue(leg.client_order_id)} / ordId ${managementBatchValue(leg.exchange_order_id)} / protection ${JSON.stringify(leg.old_protection || [])} → ${JSON.stringify(leg.planned_protection || [])}`;
+    legs.appendChild(item);
+  });
+  card.append(heading, identity, strategy, safety, reason, targets, timestamps, legs);
+  return card;
+}
+
+async function loadManagementBatches() {
+  const container = document.querySelector('[data-lazy-workbench="management-batches"]');
+  if (!container) return;
+  const response = await fetch('/api/management-batches', { cache: 'no-store' });
+  if (!response.ok) throw new Error(`请求失败 (${response.status})`);
+  const payload = await response.json();
+  container.innerHTML = '';
+  const list = document.createElement('div');
+  list.className = 'management-batch-list';
+  (payload.batches || []).forEach((batch) => list.appendChild(renderManagementBatchCard(batch)));
+  if (!list.childElementCount) {
+    const empty = document.createElement('p');
+    empty.className = 'empty-state';
+    empty.textContent = '暂无策略管理批次';
+    list.appendChild(empty);
+  }
+  container.appendChild(list);
+}
+
 async function loadSelectedGroupDestination(view) {
   const chatId = getSelectedChatId();
   if (!chatId) return;
@@ -1290,6 +1343,8 @@ async function ensureWorkbenchViewLoaded(view, options = {}) {
       await loadHomeDashboard();
     } else if (view === 'positions') {
       await loadPositionsPanel();
+    } else if (view === 'management-batches') {
+      await loadManagementBatches();
     } else {
       await loadSelectedGroupDestination(view);
     }

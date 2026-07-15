@@ -101,6 +101,7 @@ def reconcile_strategy_management_batches(
             counts["checked"] += 1
             if not legs or not _identity_is_exact(session, batch, legs):
                 _freeze_batch(
+                    session,
                     batch,
                     status="recovery_required",
                     reason="management_reconciliation_identity_mismatch",
@@ -140,6 +141,7 @@ def reconcile_strategy_management_batches(
                     _terminalize_full_close(session, batch=batch, legs=legs, now=now)
             elif "failed" in statuses:
                 _freeze_batch(
+                    session,
                     batch,
                     status="partial_failed",
                     reason="one_or_more_close_legs_failed",
@@ -152,7 +154,13 @@ def reconcile_strategy_management_batches(
                     if "submit_unknown" in statuses
                     else "management_close_result_requires_recovery"
                 )
-                _freeze_batch(batch, status="recovery_required", reason=reason, now=now)
+                _freeze_batch(
+                    session,
+                    batch,
+                    status="recovery_required",
+                    reason=reason,
+                    now=now,
+                )
                 counts["frozen"] += 1
             elif "confirmed" in statuses:
                 if batch.effective_action in {"full_close", "full_exit"}:
@@ -164,6 +172,7 @@ def reconcile_strategy_management_batches(
                     counts["pending"] += 1
                 else:
                     _freeze_batch(
+                        session,
                         batch,
                         status="recovery_required",
                         reason="management_close_legs_partially_confirmed",
@@ -388,12 +397,17 @@ def _terminalize_full_close(session, *, batch, legs, now: datetime) -> None:
     lifecycle.updated_at = now
 
 
-def _freeze_batch(batch, *, status: str, reason: str, now: datetime) -> None:
+def _freeze_batch(session, batch, *, status: str, reason: str, now: datetime) -> None:
     batch.status = status
     batch.reason_code = reason
     batch.reconciled_at = None
     batch.completed_at = None
     batch.updated_at = now
+    from telegram_kol_research.system_operator_bot import (
+        persist_strategy_management_notification_in_session,
+    )
+
+    persist_strategy_management_notification_in_session(session, batch)
 
 
 def _positions_by_id(rows: Any) -> dict[str, list[dict[str, Any]]]:

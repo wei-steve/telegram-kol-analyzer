@@ -3077,6 +3077,20 @@ pre { white-space: pre-wrap; }
   min-height: 44px;
 }
 
+.management-batch-list { display: grid; gap: 12px; }
+.management-batch-card {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.55);
+  overflow-wrap: anywhere;
+}
+.management-batch-card h3 { margin: 0 0 8px; }
+.management-batch-card p { margin: 5px 0; }
+.management-batch-safety { color: #fbbf24; font-weight: 700; }
+.management-batch-legs { margin: 8px 0 0; padding-left: 20px; }
+
 /* ── Responsive ── */
 [data-mobile-work-nav],
 .mobile-work-nav {
@@ -3143,7 +3157,7 @@ pre { white-space: pre-wrap; }
     bottom: 0;
     left: 0;
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
     border-top: 1px solid rgba(148, 163, 184, 0.24);
     background: #0f172a;

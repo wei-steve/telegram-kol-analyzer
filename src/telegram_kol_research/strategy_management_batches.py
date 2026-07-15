@@ -240,6 +240,17 @@ def create_management_batch_in_session(
             )
         )
     session.flush()
+    if batch.status in {
+        "blocked",
+        "partial_failed",
+        "submit_unknown",
+        "recovery_required",
+    }:
+        from telegram_kol_research.system_operator_bot import (
+            persist_strategy_management_notification_in_session,
+        )
+
+        persist_strategy_management_notification_in_session(session, batch)
     return batch.id
 
 
@@ -346,6 +357,15 @@ def transition_batch(
             )
             .values(**values)
         )
+        if result.rowcount == 1 and new_status in {
+            "blocked", "partial_failed", "submit_unknown", "recovery_required"
+        }:
+            from telegram_kol_research.system_operator_bot import (
+                persist_strategy_management_notification_in_session,
+            )
+
+            batch = session.get(StrategyManagementBatch, batch_id)
+            persist_strategy_management_notification_in_session(session, batch)
         session.commit()
         return result.rowcount == 1
 

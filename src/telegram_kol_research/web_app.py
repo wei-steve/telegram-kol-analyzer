@@ -58,6 +58,8 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     RecognitionDecision,
+    StrategyManagementBatch,
+    StrategyManagementLeg,
 )
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import StrategyLifecycle
@@ -130,6 +132,7 @@ from telegram_kol_research.system_operator_bot import (
     send_ai_recognition_conflict_review,
     send_pending_entry_expiry_review,
     send_semantic_disagreement_notification,
+    run_strategy_management_notification_loop,
     system_operator_bot_enabled,
 )
 from telegram_kol_research.time_utils import DEFAULT_LOCAL_TIMEZONE
@@ -179,6 +182,152 @@ from telegram_kol_research.telegram_session_lock import (
 REFRESH_TIMEOUT_SECONDS = 180
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
 logger = logging.getLogger(__name__)
+
+_MANAGEMENT_SECRET_MARKERS = (
+    "dc-access", "authorization", "api-key", "api_key", "passphrase",
+    "secret", "raw_header", "raw_payload", "raw_response",
+)
+
+
+def _bounded_management_text(value: Any, *, limit: int = 300) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if any(marker in text.lower() for marker in _MANAGEMENT_SECRET_MARKERS):
+        return "[redacted]"
+    return text[:limit]
+
+
+def _json_value(value: Any, default):
+    try:
+        decoded = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+    return decoded
+
+
+def _safe_protection_rows(value: Any) -> list[dict[str, Any]]:
+    decoded = _json_value(value, [])
+    if isinstance(decoded, dict):
+        decoded = decoded.get("rows") or decoded.get("orders") or [decoded]
+    if not isinstance(decoded, list):
+        return []
+    safe = []
+    allowed = (
+        "purpose", "order_id", "ordId", "tpsl_id", "type", "side",
+        "trigger_price", "triggerPx", "price", "size", "status",
+    )
+    for row in decoded[:20]:
+        if not isinstance(row, dict):
+            continue
+        safe.append(
+            {
+                key: _bounded_management_text(row.get(key), limit=120)
+                for key in allowed if row.get(key) is not None
+            }
+        )
+    return safe
+
+
+def _management_batch_mode(batch: StrategyManagementBatch, snapshot: dict[str, Any]) -> str:
+    explicit = snapshot.get("mode") or snapshot.get("execution_mode")
+    if explicit == "live":
+        return "live"
+    if explicit in {"shadow", "disabled"} or batch.reason_code == "management_shadow_plan_only":
+        return "shadow"
+    return "live"
+
+
+def _management_batch_api_rows(
+    session_factory, *, chat_id: int | None, limit: int, group_labels=None
+):
+    labels = group_labels or {}
+    with session_factory() as session:
+        query = (
+            session.query(StrategyManagementBatch, RawMessage)
+            .join(RawMessage, RawMessage.id == StrategyManagementBatch.raw_message_id)
+        )
+        if chat_id is not None:
+            query = query.filter(RawMessage.chat_id == chat_id)
+        rows = query.order_by(
+            StrategyManagementBatch.planned_at.desc(), StrategyManagementBatch.id.desc()
+        ).limit(limit).all()
+        result = []
+        for batch, raw in rows:
+            snapshot = _json_value(batch.target_snapshot_json, {})
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            mode = _management_batch_mode(batch, snapshot)
+            legs = []
+            for leg in (
+                session.query(StrategyManagementLeg)
+                .filter(StrategyManagementLeg.management_batch_id == batch.id)
+                .order_by(StrategyManagementLeg.leg_index.asc(), StrategyManagementLeg.id.asc())
+                .limit(20)
+            ):
+                legs.append(
+                    {
+                        "id": leg.id,
+                        "execution_order_leg_id": leg.execution_order_leg_id,
+                        "pos_id": _bounded_management_text(leg.pos_id, limit=120),
+                        "leg_index": leg.leg_index,
+                        "status": _bounded_management_text(leg.status, limit=64),
+                        "preflight_size": _bounded_management_text(leg.preflight_size, limit=64),
+                        "planned_close_size": _bounded_management_text(leg.planned_close_size, limit=64),
+                        "avg_entry_price": _bounded_management_text(leg.avg_entry_price, limit=64),
+                        "client_order_id": _bounded_management_text(leg.client_order_id, limit=120),
+                        "exchange_order_id": _bounded_management_text(leg.exchange_order_id, limit=120),
+                        "old_protection": _safe_protection_rows(leg.old_tpsl_json),
+                        "planned_protection": _safe_protection_rows(leg.planned_tpsl_json),
+                        "last_error": _bounded_management_text(
+                            _json_value(leg.last_error, leg.last_error), limit=240
+                        ),
+                    }
+                )
+            positions = snapshot.get("positions") or snapshot.get("targets")
+            targets = []
+            if isinstance(positions, list):
+                for position in positions[:20]:
+                    if isinstance(position, dict):
+                        targets.append(
+                            {
+                                key: _bounded_management_text(position.get(key), limit=120)
+                                for key in ("pos_id", "size", "avg_entry_price")
+                                if position.get(key) is not None
+                            }
+                        )
+            result.append(
+                {
+                    "batch_id": batch.id,
+                    "mode": mode,
+                    "mode_label": "未调用交易 API" if mode == "shadow" else "实盘执行",
+                    "intent": batch.intent,
+                    "effective_action": batch.effective_action,
+                    "requested_fraction": batch.requested_fraction,
+                    "effective_fraction": batch.effective_fraction,
+                    "partial_round_before": batch.partial_round_before,
+                    "status": batch.status,
+                    "reason": _bounded_management_text(batch.reason_code, limit=240),
+                    "safety_label": "禁止自动重试" if batch.status == "recovery_required" else None,
+                    "source": {
+                        "chat_id": raw.chat_id,
+                        "chat_title": _bounded_management_text(labels.get(raw.chat_id), limit=120),
+                        "message_id": raw.message_id,
+                        "raw_message_id": raw.id,
+                    },
+                    "lifecycle_id": batch.target_lifecycle_id,
+                    "strategy_instance_id": batch.strategy_instance_id,
+                    "execution_binding_id": batch.execution_binding_id,
+                    "targets": targets,
+                    "legs": legs,
+                    "planned_at": batch.planned_at.isoformat() if batch.planned_at else None,
+                    "started_at": batch.started_at.isoformat() if batch.started_at else None,
+                    "reconciled_at": batch.reconciled_at.isoformat() if batch.reconciled_at else None,
+                    "completed_at": batch.completed_at.isoformat() if batch.completed_at else None,
+                    "updated_at": batch.updated_at.isoformat() if batch.updated_at else None,
+                }
+            )
+        return result
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -1947,6 +2096,16 @@ def create_web_app(
                     )
                 )
             if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
+                app.state.strategy_management_notification_task = asyncio.create_task(
+                    run_strategy_management_notification_loop(
+                        session_factory=app.state.session_factory,
+                        config=app.state.system_operator_bot_config,
+                        group_labels=_group_label_by_chat_id(app.state.group_config),
+                    )
+                )
+                app.state.strategy_management_notification_task.add_done_callback(
+                    _log_background_task_result("strategy_management_notification_task")
+                )
                 app.state.system_operator_bot_command_task = asyncio.create_task(
                     run_system_operator_bot_command_loop(
                         config=app.state.system_operator_bot_config,
@@ -2054,6 +2213,16 @@ def create_web_app(
                 except asyncio.CancelledError:
                     pass
                 app.state.system_operator_bot_command_task = None
+            management_notification_task = app.state.strategy_management_notification_task
+            if management_notification_task is not None:
+                management_notification_task.cancel()
+                try:
+                    await management_notification_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.strategy_management_notification_task = None
             reconcile_task = app.state.reconcile_task
             if reconcile_task is not None:
                 reconcile_task.cancel()
@@ -2161,6 +2330,7 @@ def create_web_app(
     app.state.deepcoin_reconcile_task = None
     app.state.telegram_bot_command_task = None
     app.state.system_operator_bot_command_task = None
+    app.state.strategy_management_notification_task = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client
     app.state.reconcile_once_runner = run_reconcile_once
@@ -2299,6 +2469,20 @@ def create_web_app(
             limit=limit,
             level=normalized_level,
         )
+
+    @app.get("/api/management-batches")
+    def api_management_batches(chat_id: int | None = None, limit: int = 50):
+        if not 1 <= limit <= 100:
+            raise HTTPException(status_code=422, detail="invalid management batch limit")
+        return {
+            "read_only": True,
+            "batches": _management_batch_api_rows(
+                app.state.session_factory,
+                chat_id=chat_id,
+                limit=limit,
+                group_labels=_group_label_by_chat_id(app.state.group_config),
+            ),
+        }
 
     def build_home_dashboard_context() -> dict[str, Any]:
         symbol_whitelist_by_chat_id = _symbol_whitelist_by_chat_id(app.state.group_config)

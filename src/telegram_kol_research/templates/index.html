@@ -399,6 +399,17 @@
       </section>
     </div>
   </section>
+  <section class="workbench-panel management-batches-panel" data-workbench-panel="management-batches" data-management-batches-panel>
+    <div class="panel-heading">
+      <div>
+        <h2>策略管理批次</h2>
+        <p class="ai-helper-text">只读执行审计；Shadow 标记为“未调用交易 API”，人工恢复状态标记为“禁止自动重试”。</p>
+      </div>
+    </div>
+    <div data-lazy-workbench="management-batches" aria-busy="false">
+      {% with loading_text='打开批次后加载安全摘要' %}{% include "_workbench_loading.html" %}{% endwith %}
+    </div>
+  </section>
   <section class="workbench-panel more-workbench-panel" data-workbench-panel="more">
     <h2>更多工具</h2>
     <div class="more-workbench-grid">

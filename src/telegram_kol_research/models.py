@@ -560,6 +560,33 @@ class StrategyManagementLeg(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class StrategyManagementNotification(Base):
+    """Durable, immutable delivery identity for an operator batch alert."""
+
+    __tablename__ = "strategy_management_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "management_batch_id", "state", "payload_fingerprint",
+            name="uq_strategy_management_notifications_identity",
+        ),
+        Index("ix_strategy_management_notifications_status", "status", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    management_batch_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_management_batches.id"), nullable=False, index=True
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    delivery_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class PositionAttributionAudit(Base):
     __tablename__ = "position_attribution_audits"
     __table_args__ = (

@@ -1388,6 +1388,18 @@ def test_critical_semantic_review_opens_outer_ai_disclosure_for_non_strategy(tmp
     )
 
 
+def test_management_batch_panel_is_read_only_and_has_safety_labels(tmp_path):
+    response = TestClient(create_web_app(database_path=tmp_path / "research.db")).get("/")
+    assert response.status_code == 200
+    assert 'data-workbench-panel="management-batches"' in response.text
+    assert 'data-management-batches-panel' in response.text
+    assert "策略管理批次" in response.text
+    assert "未调用交易 API" in response.text
+    assert "禁止自动重试" in response.text
+    for forbidden in ('data-management-retry', 'data-management-close', 'data-management-cancel'):
+        assert forbidden not in response.text
+
+
 def test_index_page_versions_static_assets_to_avoid_stale_browser_cache(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
     response = client.get("/")

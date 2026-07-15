@@ -1,4 +1,5 @@
 import asyncio
+import pytest
 
 import telegram_kol_research.system_operator_bot as operator_bot_module
 from telegram_kol_research.system_operator_bot import (
@@ -13,6 +14,260 @@ from telegram_kol_research.system_operator_bot import (
     send_semantic_disagreement_notification,
     system_operator_bot_enabled,
 )
+
+
+def test_management_notification_formatter_has_exact_identity_and_safety_labels():
+    message = operator_bot_module.format_strategy_management_notification(
+        {
+            "batch_id": 88,
+            "state": "recovery_required",
+            "mode": "shadow",
+            "source_chat_id": -10088,
+            "source_chat_title": "陈哥群",
+            "source_message_id": 901,
+            "raw_message_id": 71,
+            "lifecycle_id": 11,
+            "strategy_instance_id": "deepcoin:-10088:811:BTC:short",
+            "execution_binding_id": 12,
+            "intent": "adjust_stop_loss",
+            "effective_action": "replace_stop_loss",
+            "reason": "restore_failed",
+            "legs": [
+                {
+                    "leg_id": 3,
+                    "execution_order_leg_id": 4,
+                    "pos_id": "pos-1",
+                    "leg_index": 0,
+                    "status": "recovery_required",
+                    "planned_close_size": None,
+                    "last_error": "restore_failed",
+                }
+            ],
+        }
+    )
+
+    for expected in (
+        "batch #88", "-10088", "#901", "raw=71", "lifecycle=11",
+        "deepcoin:-10088:811:BTC:short", "binding=12", "adjust_stop_loss",
+        "replace_stop_loss", "pos-1", "未调用交易 API", "禁止自动重试",
+    ):
+        assert expected in message
+
+
+@pytest.mark.parametrize(
+    "state", ["blocked", "partial_failed", "submit_unknown", "recovery_required"]
+)
+def test_management_notification_formatter_covers_every_alert_state(state):
+    message = operator_bot_module.format_strategy_management_notification(
+        {
+            "batch_id": 1, "state": state, "mode": "live",
+            "source_chat_id": -1, "source_message_id": 2, "raw_message_id": 3,
+            "lifecycle_id": 4, "strategy_instance_id": "deepcoin:-1:2:BTC:long",
+            "execution_binding_id": 5, "intent": "full_exit",
+            "effective_action": "full_exit", "reason": "safe_reason", "legs": [],
+        }
+    )
+    assert state in message
+
+
+def test_management_notification_dedup_retry_and_concurrent_claim(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from telegram_kol_research.models import (
+        ExecutionBinding, ExecutionOrderLeg, RawMessage, RecognitionDecision,
+        StrategyLifecycle, StrategyManagementBatch, StrategyManagementLeg,
+        StrategyManagementNotification,
+    )
+    from telegram_kol_research.db import create_session_factory
+
+    sf = create_session_factory(tmp_path / "management-notify.db")
+    with sf() as session:
+        raw = RawMessage(chat_id=-10088, message_id=901, text="move stop")
+        session.add(raw); session.flush()
+        decision = RecognitionDecision(
+            raw_message_id=raw.id, input_kind="text", authoritative_model="mimo",
+            authoritative_status="是策略", authoritative_payload_json="{}",
+            agreement_status="authoritative_only", differences_json="[]",
+        )
+        session.add(decision); session.flush()
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:-10088:811:BTC:short", kol_id="kol",
+            chat_id=-10088, message_id=811, symbol="BTC", side="short", status="open",
+        )
+        session.add(binding); session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=-10088, message_id=811, symbol="BTC", side="short",
+            lifecycle_status="entered", signal_at=operator_bot_module.datetime.now(operator_bot_module.UTC),
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle); session.flush()
+        entry = ExecutionOrderLeg(
+            execution_binding_id=binding.id, strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0, purpose="entry", order_kind="conditional", pos_id="pos-1",
+            attribution_status="verified", status="active",
+        )
+        session.add(entry); session.flush()
+        batch = StrategyManagementBatch(
+            idempotency_fingerprint="a" * 64, raw_message_id=raw.id,
+            recognition_decision_id=decision.id, recognition_generation="g1",
+            target_lifecycle_id=lifecycle.id, strategy_instance_id=binding.strategy_instance_id,
+            execution_binding_id=binding.id, intent="adjust_stop_loss",
+            effective_action="replace_stop_loss", partial_round_before=0,
+            status="recovery_required", reason_code="restore_failed",
+            target_fingerprint="b" * 64, target_snapshot_json='{"mode":"shadow"}',
+            planned_at=operator_bot_module.datetime.now(operator_bot_module.UTC),
+        )
+        session.add(batch); session.flush()
+        session.add(StrategyManagementLeg(
+            management_batch_id=batch.id, execution_order_leg_id=entry.id,
+            pos_id="pos-1", leg_index=0, status="recovery_required",
+            planned_close_size="0.01", last_error='"restore_failed"',
+        ))
+        session.commit(); batch_id = batch.id
+
+    sent = []
+    async def fail_once(**kwargs):
+        if not sent:
+            sent.append("failed")
+            raise RuntimeError("telegram down")
+        sent.append(kwargs["text"])
+    monkeypatch.setattr(operator_bot_module, "send_system_operator_bot_message", fail_once)
+    config = operator_bot_module.SystemOperatorBotConfig("token", "chat")
+    assert operator_bot_module.asyncio.run(
+        operator_bot_module.deliver_strategy_management_notifications(sf, config=config)
+    ) == 0
+    assert operator_bot_module.asyncio.run(
+        operator_bot_module.deliver_strategy_management_notifications(sf, config=config)
+    ) == 1
+    assert operator_bot_module.asyncio.run(
+        operator_bot_module.deliver_strategy_management_notifications(sf, config=config)
+    ) == 0
+
+    with sf() as session:
+        rows = session.query(StrategyManagementNotification).all()
+        assert len(rows) == 1
+        assert rows[0].status == "delivered"
+        batch = session.get(StrategyManagementBatch, batch_id)
+        batch.reason_code = "restore_failed_after_cancel"
+        session.commit()
+
+    barrier = __import__("threading").Barrier(2)
+    winners = []
+    def enqueue_and_claim():
+        barrier.wait()
+        claim = operator_bot_module.claim_next_strategy_management_notification(sf)
+        winners.append(claim is not None)
+    operator_bot_module.enqueue_strategy_management_notifications(sf)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: enqueue_and_claim(), range(2)))
+    assert sorted(winners) == [False, True]
+
+    with sf() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        batch.status = "partial_failed"
+        session.commit()
+    operator_bot_module.enqueue_strategy_management_notifications(sf)
+    with sf() as session:
+        assert session.query(StrategyManagementNotification).count() == 3
+
+
+def test_management_submit_unknown_outbox_survives_disabled_bot_and_later_success(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import RawMessage, StrategyManagementNotification
+    from telegram_kol_research.strategy_management_batches import (
+        ManagementLegCreate, create_management_batch, transition_batch,
+    )
+
+    sf = create_session_factory(tmp_path / "transient-management-alert.db")
+    with sf() as session:
+        raw = RawMessage(chat_id=-909, message_id=51, text="close")
+        session.add(raw); session.commit(); raw_id = raw.id
+    batch = create_management_batch(
+        sf, idempotency_fingerprint="9" * 64, raw_message_id=raw_id,
+        recognition_decision_id=91, recognition_generation="g1",
+        target_lifecycle_id=92, strategy_instance_id="deepcoin:-909:41:BTC:short",
+        execution_binding_id=93, intent="full_take_profit", effective_action="full_exit",
+        requested_fraction=None, effective_fraction=1.0, partial_round_before=0,
+        target_fingerprint="8" * 64, target_snapshot={"positions": []},
+        legs=[ManagementLegCreate(
+            execution_order_leg_id=94, pos_id="pos-transient", leg_index=0,
+            status="submit_unknown", planned_close_size="0.02",
+            last_error={"reason": "submission_outcome_unknown"},
+        )], status="submit_unknown", reason_code="submission_outcome_unknown",
+    )
+    # No notifier ran while disabled; the alert event is already durable.
+    assert transition_batch(
+        sf, batch.id, expected_statuses={"submit_unknown"}, new_status="succeeded"
+    )
+    with sf() as session:
+        event = session.query(StrategyManagementNotification).one()
+        assert event.state == "submit_unknown"
+        assert event.status == "pending"
+
+    sent = []
+    async def fake_send(**kwargs):
+        sent.append(kwargs["text"])
+    monkeypatch.setattr(operator_bot_module, "send_system_operator_bot_message", fake_send)
+    delivered = asyncio.run(operator_bot_module.deliver_strategy_management_notifications(
+        sf, config=operator_bot_module.SystemOperatorBotConfig("token", "chat"),
+        group_labels={-909: "峰哥群"},
+    ))
+    assert delivered == 1
+    assert len(sent) == 1
+    assert "submit_unknown" in sent[0]
+    assert "峰哥群" in sent[0]
+    with sf() as session:
+        assert session.query(StrategyManagementNotification).count() == 1
+
+
+@pytest.mark.parametrize(
+    "state", ["blocked", "partial_failed", "submit_unknown", "recovery_required"]
+)
+def test_every_management_alert_state_is_persisted_on_create_and_transition(
+    tmp_path, state
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import RawMessage, StrategyManagementNotification
+    from telegram_kol_research.strategy_management_batches import (
+        ManagementLegCreate, create_management_batch, transition_batch,
+    )
+
+    sf = create_session_factory(tmp_path / f"outbox-{state}.db")
+    raw_ids = []
+    with sf() as session:
+        for number in (1, 2):
+            raw = RawMessage(chat_id=-700, message_id=number, text=state)
+            session.add(raw); session.flush(); raw_ids.append(raw.id)
+        session.commit()
+
+    def make(number, status):
+        return create_management_batch(
+            sf, idempotency_fingerprint=f"{number}" * 64,
+            raw_message_id=raw_ids[number - 1], recognition_decision_id=number,
+            recognition_generation="g", target_lifecycle_id=number,
+            strategy_instance_id=f"deepcoin:-700:{number}:BTC:short",
+            execution_binding_id=number, intent="full_take_profit",
+            effective_action="full_exit", requested_fraction=None,
+            effective_fraction=1.0, partial_round_before=0,
+            target_fingerprint=("a" if number == 1 else "b") * 64,
+            target_snapshot={"positions": []},
+            legs=[ManagementLegCreate(
+                execution_order_leg_id=number, pos_id=f"pos-{number}",
+                leg_index=0, status=state if status == state else "planned",
+            )], status=status, reason_code=f"reason_{state}",
+        )
+
+    make(1, state)
+    ready = make(2, "ready")
+    assert transition_batch(
+        sf, ready.id, expected_statuses={"ready"}, new_status=state,
+        reason_code=f"reason_{state}",
+    )
+    with sf() as session:
+        events = session.query(StrategyManagementNotification).all()
+        assert len(events) == 2
+        assert {event.state for event in events} == {state}
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import ExecutionBinding, PositionAttributionAudit, StrategyLifecycle
 from telegram_kol_research.telegram_bot_commands import (

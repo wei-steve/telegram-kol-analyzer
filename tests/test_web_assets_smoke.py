@@ -11,6 +11,18 @@ def test_static_assets_are_served(tmp_path):
     assert response.status_code == 200
 
 
+def test_management_batch_assets_only_load_read_only_api(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+    css = client.get("/static/app.css").text
+    assert "loadManagementBatches" in js
+    assert "'/api/management-batches'" in js or '"/api/management-batches"' in js
+    assert "method: 'POST'" not in js[js.find("loadManagementBatches"):js.find("loadManagementBatches") + 1800]
+    assert "management-batch-card" in css
+    for forbidden in ("retryManagementBatch", "closeManagementBatch", "cancelManagementBatch"):
+        assert forbidden not in js
+
+
 def test_app_js_includes_conversation_history_migration_for_legacy_image_errors(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
