@@ -102,6 +102,13 @@ cp data/research.db "data/research.db.$(date +%Y%m%d-%H%M%S).bak"
 telegram-kol-research repair-position-attribution --database-path data/research.db
 ```
 
+Exact position-history evidence is intentionally paced at no more than one
+request per 1.05 seconds, following the stricter Deepcoin endpoint limit. A
+history-heavy dry run can therefore take roughly one second per candidate; do
+not interrupt it merely because output is delayed. HTTP or schema errors still
+block every action and must not be treated as empty history or retried with
+`--apply`.
+
 The command is a read-only dry run unless `--apply` is supplied. Review every
 old/new position owner, terminal leg transition, evidence summary, and
 unresolved conflict. It never submits an exchange order or cancellation.

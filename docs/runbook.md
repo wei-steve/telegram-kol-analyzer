@@ -254,6 +254,13 @@ cd /opt/telegram-kol-analyzer
   --database-path data/research.db
 ```
 
+Exact position-history evidence is intentionally paced at no more than one
+request per 1.05 seconds, following the stricter Deepcoin endpoint limit. A
+history-heavy dry run can therefore take roughly one second per candidate; do
+not interrupt it merely because output is delayed. HTTP or schema errors still
+block every action and must not be treated as empty history or retried with
+`--apply`.
+
 Review the snapshot fingerprint, every proposed action, every conflict, and the
 absence of unrelated clears before separately authorizing `--apply`. Rebuild and
 fingerprint the live/database evidence at apply time; drift must refuse the
