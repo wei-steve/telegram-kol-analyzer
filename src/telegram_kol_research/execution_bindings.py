@@ -285,9 +285,19 @@ def reconcile_deepcoin_execution_bindings(
             snapshot = load_deepcoin_execution_reconciliation_snapshot(
                 session_factory, client=client
             )
-        return _apply_reconcile_snapshot(
+        result = _apply_reconcile_snapshot(
             session_factory, snapshot=snapshot, recovered_at=now
         )
+        # Reuse the exact snapshot after entry attribution is current. The
+        # management reconciler is read-only toward Deepcoin and never retries.
+        from telegram_kol_research.strategy_management_reconciliation import (
+            reconcile_strategy_management_batches,
+        )
+
+        reconcile_strategy_management_batches(
+            session_factory, snapshot=snapshot, reconciled_at=now
+        )
+        return result
 
 
 def load_deepcoin_execution_reconciliation_snapshot(

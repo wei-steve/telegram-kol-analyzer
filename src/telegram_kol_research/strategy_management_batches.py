@@ -294,7 +294,7 @@ def transition_batch(
         values["reason_code"] = reason_code
     if new_status == "executing":
         values["started_at"] = now
-    if new_status == "reconciling":
+    if new_status == "succeeded":
         values["reconciled_at"] = now
     if new_status in {"succeeded", "blocked", "resolved"}:
         values["completed_at"] = now
