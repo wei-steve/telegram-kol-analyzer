@@ -598,6 +598,82 @@ def test_database_bootstrap_skips_management_batch_lock_index_for_legacy_duplica
     assert rows == [(1, "ready"), (2, "recovery_required")]
 
 
+def test_database_bootstrap_skips_management_batch_idempotency_index_for_legacy_duplicates(
+    tmp_path,
+):
+    database_path = tmp_path / "legacy-idempotency-duplicates.db"
+    conn = sqlite3.connect(database_path)
+    conn.execute(
+        """
+        CREATE TABLE strategy_management_batches (
+            id INTEGER PRIMARY KEY,
+            idempotency_fingerprint VARCHAR(64) NOT NULL,
+            strategy_instance_id VARCHAR(255) NOT NULL,
+            status VARCHAR(32) NOT NULL
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO strategy_management_batches VALUES (?, ?, ?, ?)",
+        [
+            (1, "duplicate", "strategy-1", "succeeded"),
+            (2, "duplicate", "strategy-2", "blocked"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(strategy_management_batches)").fetchall()
+    }
+    rows = conn.execute(
+        "SELECT id, idempotency_fingerprint FROM strategy_management_batches ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    assert "uq_strategy_management_batches_idempotency" not in indexes
+    assert rows == [(1, "duplicate"), (2, "duplicate")]
+
+
+def test_database_bootstrap_skips_management_leg_index_for_legacy_duplicates(tmp_path):
+    database_path = tmp_path / "legacy-leg-duplicates.db"
+    conn = sqlite3.connect(database_path)
+    conn.execute(
+        """
+        CREATE TABLE strategy_management_legs (
+            id INTEGER PRIMARY KEY,
+            management_batch_id INTEGER NOT NULL,
+            pos_id VARCHAR(255) NOT NULL
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO strategy_management_legs VALUES (?, ?, ?)",
+        [(1, 10, "position-1"), (2, 10, "position-1")],
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(strategy_management_legs)").fetchall()
+    }
+    rows = conn.execute(
+        "SELECT id, management_batch_id, pos_id FROM strategy_management_legs ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    assert "uq_strategy_management_legs_batch_pos" not in indexes
+    assert rows == [(1, 10, "position-1"), (2, 10, "position-1")]
+
+
 def test_database_bootstrap_backfills_position_attribution_schema(tmp_path):
     database_path = tmp_path / "legacy.db"
     conn = sqlite3.connect(database_path)

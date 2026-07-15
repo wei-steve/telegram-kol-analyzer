@@ -5,16 +5,25 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Sequence
 
-from sqlalchemy import update
+from sqlalchemy import inspect, update
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.db import MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME
+from telegram_kol_research.db import MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME
+from telegram_kol_research.db import MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME
+from telegram_kol_research.db import REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES
 from telegram_kol_research.models import StrategyManagementBatch
 from telegram_kol_research.models import StrategyManagementLeg
 
 
 RECOVERABLE_BATCH_STATUSES = frozenset({"executing", "reconciling"})
+UNSET = object()
+
+
+class ManagementSchemaSafetyError(RuntimeError):
+    """Raised when database uniqueness cannot safely serialize mutations."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +127,7 @@ def create_management_batch(
 
     now = planned_at or datetime.now(UTC)
     with session_factory() as session:
+        _require_management_unique_indexes(session)
         batch = StrategyManagementBatch(
             idempotency_fingerprint=idempotency_fingerprint,
             raw_message_id=raw_message_id,
@@ -193,6 +203,7 @@ def claim_ready_batch(
 
     now = claimed_at or datetime.now(UTC)
     with session_factory() as session:
+        _require_management_unique_indexes(session)
         result = session.execute(
             update(StrategyManagementBatch)
             .where(
@@ -214,7 +225,7 @@ def transition_batch(
     expected_statuses: Iterable[str],
     new_status: str,
     transitioned_at: datetime | None = None,
-    reason_code: str | None = None,
+    reason_code: Any = UNSET,
 ) -> bool:
     now = transitioned_at or datetime.now(UTC)
     expected = tuple(expected_statuses)
@@ -222,9 +233,10 @@ def transition_batch(
         return False
     values: dict[str, Any] = {
         "status": new_status,
-        "reason_code": reason_code,
         "updated_at": now,
     }
+    if reason_code is not UNSET:
+        values["reason_code"] = reason_code
     if new_status == "executing":
         values["started_at"] = now
     if new_status == "reconciling":
@@ -232,6 +244,7 @@ def transition_batch(
     if new_status in {"succeeded", "blocked", "resolved"}:
         values["completed_at"] = now
     with session_factory() as session:
+        _require_management_unique_indexes(session)
         result = session.execute(
             update(StrategyManagementBatch)
             .where(
@@ -251,12 +264,12 @@ def transition_leg(
     expected_statuses: Iterable[str],
     new_status: str,
     transitioned_at: datetime | None = None,
-    client_order_id: str | None = None,
-    exchange_order_id: str | None = None,
-    request: Any = None,
-    response: Any = None,
-    last_error: Any = None,
-    last_exchange_snapshot: Any = None,
+    client_order_id: Any = UNSET,
+    exchange_order_id: Any = UNSET,
+    request: Any = UNSET,
+    response: Any = UNSET,
+    last_error: Any = UNSET,
+    last_exchange_snapshot: Any = UNSET,
 ) -> bool:
     now = transitioned_at or datetime.now(UTC)
     expected = tuple(expected_statuses)
@@ -266,13 +279,21 @@ def transition_leg(
     optional_values = {
         "client_order_id": client_order_id,
         "exchange_order_id": exchange_order_id,
-        "request_json": _encode_json(request),
-        "response_json": _encode_json(response),
-        "last_error": _encode_json(last_error),
-        "last_exchange_snapshot_json": _encode_json(last_exchange_snapshot),
+        "request_json": request,
+        "response_json": response,
+        "last_error": last_error,
+        "last_exchange_snapshot_json": last_exchange_snapshot,
     }
-    values.update({key: value for key, value in optional_values.items() if value is not None})
+    for key, value in optional_values.items():
+        if value is UNSET:
+            continue
+        values[key] = (
+            value
+            if key in {"client_order_id", "exchange_order_id"}
+            else _encode_json(value)
+        )
     with session_factory() as session:
+        _require_management_unique_indexes(session)
         result = session.execute(
             update(StrategyManagementLeg)
             .where(
@@ -384,3 +405,47 @@ def _utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _require_management_unique_indexes(session) -> None:
+    expected = {
+        MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME: (
+            "strategy_management_batches",
+            ["idempotency_fingerprint"],
+        ),
+        MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME: (
+            "strategy_management_batches",
+            ["strategy_instance_id"],
+        ),
+        MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME: (
+            "strategy_management_legs",
+            ["management_batch_id", "pos_id"],
+        ),
+    }
+    inspector = inspect(session.connection())
+    observed = {
+        index["name"]: index
+        for table_name in {table for table, _columns in expected.values()}
+        for index in inspector.get_indexes(table_name)
+    }
+    unsafe = []
+    for index_name in sorted(REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES):
+        _expected_table, expected_columns = expected[index_name]
+        index = observed.get(index_name)
+        if (
+            index is None
+            or not index.get("unique")
+            or index.get("column_names") != expected_columns
+        ):
+            unsafe.append(index_name)
+            continue
+        if index_name == MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME:
+            where = str(index.get("dialect_options", {}).get("sqlite_where", ""))
+            if session.get_bind().dialect.name == "sqlite" and "status NOT IN" not in where:
+                unsafe.append(index_name)
+    if unsafe:
+        session.rollback()
+        raise ManagementSchemaSafetyError(
+            "management database safety indexes are missing or invalid: "
+            + ", ".join(unsafe)
+        )
