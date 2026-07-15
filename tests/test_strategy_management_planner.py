@@ -99,6 +99,7 @@ def _persist_exact_management_target(
     attribution_status="verified",
     attribution_evidence=None,
     pos_ids=("pos-b",),
+    management_fraction="default",
 ):
     with session_factory() as session:
         entry_a = RawMessage(
@@ -224,7 +225,14 @@ def _persist_exact_management_target(
                 event_type="close_signal" if intent == "full_exit" else "position_update",
                 target_lifecycle_id=lifecycle_b.id,
                 management_action=intent,
-                management_fraction=0.3 if intent == "partial_take_profit" else None,
+                management_fraction=(
+                    0.3
+                    if intent == "partial_take_profit"
+                    and management_fraction == "default"
+                    else management_fraction
+                    if intent == "partial_take_profit"
+                    else None
+                ),
                 recognition_generation="generation-b",
                 parse_source="mimo_authoritative",
                 confidence=0.99,
@@ -591,6 +599,53 @@ def test_any_protection_row_without_exact_unique_id_blocks_plan(monkeypatch, tmp
     assert result.reason_code == "target_protection_order_identity_unavailable"
 
 
+def test_selected_protection_order_id_must_be_unique_across_global_snapshot(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory, intent="adjust_stop_loss"
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin(
+        [_position()],
+        tpsl_orders=[
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-b",
+                "posSide": "short",
+                "triggerOrderType": "TPSL",
+                "ordId": "duplicate-global-id",
+                "slTriggerPx": "63000",
+                "sz": "0",
+                "cTime": "1721000000000",
+            },
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": "unmatched-long-position",
+                "posSide": "long",
+                "triggerOrderType": "TPSL",
+                "ordId": "duplicate-global-id",
+                "slTriggerPx": "61000",
+                "sz": "0",
+                "cTime": "1721000000000",
+            },
+        ],
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "target_protection_order_identity_unavailable"
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -624,6 +679,32 @@ def test_unqualified_partial_fraction_remains_unset_for_task5():
         )
         is None
     )
+
+
+def test_unqualified_partial_plan_persists_no_effective_fraction_or_close_size(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="partial_take_profit",
+        management_fraction=None,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.requested_fraction is None
+    assert result.batch.effective_fraction is None
+    assert [leg.planned_close_size for leg in result.batch.legs] == [None]
 
 
 def test_corrupt_persisted_partial_fraction_blocks_without_batch(monkeypatch, tmp_path):
@@ -693,3 +774,37 @@ def test_final_revalidation_runs_inside_insert_transaction(monkeypatch, tmp_path
         from telegram_kol_research.models import StrategyManagementBatch
 
         assert session.query(StrategyManagementBatch).count() == 0
+
+
+def test_final_competing_owner_error_returns_blocked_without_leaking(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(session_factory)
+    _disable_reconciliation(monkeypatch, planner)
+    original = planner.require_verified_position_ownership
+    calls = 0
+
+    def competing_owner(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise planner.PositionAttributionError("position_ownership_not_unique")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        planner, "require_verified_position_ownership", competing_owner
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "target_identity_changed_during_planning"
+    assert result.batch is None

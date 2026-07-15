@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -279,6 +280,11 @@ def _plan_strategy_management_batch_locked(
         matches = match_position_protection(
             live_positions, tpsl_orders, evidence_available=True
         )
+        global_protection_order_id_counts = Counter(
+            order_id
+            for row in tpsl_orders
+            if (order_id := _exact_protection_order_id(row)) is not None
+        )
         seen_protection_order_ids: set[str] = set()
         for position in economics:
             protection = matches.by_pos_id.get(position["pos_id"])
@@ -298,6 +304,10 @@ def _plan_strategy_management_batch_locked(
                 not protection.rows
                 or any(order_id is None for order_id in protection_row_ids)
                 or len(set(protection_row_ids)) != len(protection_row_ids)
+                or any(
+                    global_protection_order_id_counts[str(order_id)] != 1
+                    for order_id in protection_row_ids
+                )
                 or protection.order_ids
                 != [str(order_id) for order_id in protection_row_ids]
                 or bool(
@@ -619,9 +629,14 @@ def _require_frozen_identity_current(session, identity: _PlanningIdentity) -> No
             "target_identity_changed_during_planning"
         )
     for leg in current_legs:
-        owner = require_verified_position_ownership(
-            session, venue="deepcoin", pos_id=str(leg.pos_id)
-        )
+        try:
+            owner = require_verified_position_ownership(
+                session, venue="deepcoin", pos_id=str(leg.pos_id)
+            )
+        except PositionAttributionError as exc:
+            raise ManagementPlanningStateChanged(
+                "target_identity_changed_during_planning"
+            ) from exc
         if owner.id != leg.id:
             raise ManagementPlanningStateChanged(
                 "target_identity_changed_during_planning"
@@ -765,7 +780,7 @@ def _effective_fraction(intent: str, requested_fraction: float | None) -> float 
     if intent == "full_exit":
         return 1.0
     if intent == "partial_take_profit":
-        return float(requested_fraction) if requested_fraction is not None else 0.5
+        return float(requested_fraction) if requested_fraction is not None else None
     return None
 
 
