@@ -10,6 +10,10 @@ from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 
+from telegram_kol_research.db import (
+    POSITION_OWNERSHIP_UNIQUE_INDEX_NAME,
+    ensure_position_ownership_unique_index,
+)
 from telegram_kol_research.execution_bindings import (
     _exchange_row_matches_leg,
     _leg_has_successful_fill_evidence,
@@ -306,12 +310,21 @@ def build_position_attribution_repair_plan(
             reservations=close_reservations,
             snapshot=snapshot,
         )
+        historical_actions = [*historical.actions]
+        index_action = _plan_unique_position_index_action(
+            session,
+            legs=legs,
+            historical_actions=historical_actions,
+            historical_conflicts=historical.conflicts,
+        )
+        if index_action is not None:
+            historical_actions.append(index_action)
         return _build_plan(
             created_at=created_at,
             live_position_ids=_live_position_ids(snapshot.positions),
             exchange_evidence_fingerprint=_exchange_evidence_fingerprint(snapshot),
             actions=tuple(actions),
-            historical_actions=historical.actions,
+            historical_actions=tuple(historical_actions),
             unresolved_conflicts=[
                 *list(attribution.conflicts),
                 *(
@@ -340,25 +353,30 @@ def apply_position_attribution_repair_plan(
         raise PositionAttributionRepairError(
             "reviewed fingerprint does not match the repair plan"
         )
-    if plan.actions and expected_fingerprint is None:
+    if plan.has_actions and expected_fingerprint is None:
         raise PositionAttributionRepairError(
             "reviewed fingerprint is required for a nonempty repair plan"
         )
-    if plan.actions and deepcoin_client is None:
+    if plan.has_actions and deepcoin_client is None:
         raise PositionAttributionRepairError(
             "Deepcoin client is required for a nonempty repair plan"
         )
+    all_actions = [*plan.actions, *plan.historical_actions]
     with session_factory() as session:
         applied_audits = {
             row.fingerprint: row
             for row in session.query(PositionAttributionAudit)
-            .filter(PositionAttributionAudit.event_type == "historical_repair")
+            .filter(
+                PositionAttributionAudit.event_type.in_(
+                    ["historical_repair", "historical_cleanup"]
+                )
+            )
             .all()
         }
     expected_audit_fingerprints = {
-        _repair_audit_fingerprint(plan, action) for action in plan.actions
+        _repair_audit_fingerprint(plan, action) for action in all_actions
     }
-    already_applied = bool(plan.actions) and expected_audit_fingerprints.issubset(
+    already_applied = bool(all_actions) and expected_audit_fingerprints.issubset(
         applied_audits
     )
 
@@ -424,6 +442,8 @@ def apply_position_attribution_repair_plan(
         if current_database_fingerprint != plan.database_fingerprint:
             raise PositionAttributionRepairError("stale repair plan: database evidence changed")
         legs_by_id = {int(row.id): row for row in legs}
+        bindings_by_id = {int(row.id): row for row in bindings}
+        lifecycles_by_id = {int(row.id): row for row in lifecycles}
         try:
             for action in plan.actions:
                 leg = legs_by_id.get(action.leg_id)
@@ -453,6 +473,16 @@ def apply_position_attribution_repair_plan(
                 affected_binding_ids={action.binding_id for action in plan.actions},
                 live_position_ids=set(plan.live_position_ids),
             )
+            for action in plan.historical_actions:
+                _apply_historical_cleanup_action(
+                    session,
+                    action=action,
+                    plan=plan,
+                    legs_by_id=legs_by_id,
+                    bindings_by_id=bindings_by_id,
+                    lifecycles_by_id=lifecycles_by_id,
+                )
+            session.flush()
             applied_database_fingerprint = _database_fingerprint(
                 bindings,
                 legs,
@@ -468,14 +498,24 @@ def apply_position_attribution_repair_plan(
                     leg=legs_by_id[action.leg_id],
                     applied_database_fingerprint=applied_database_fingerprint,
                 )
+            for action in plan.historical_actions:
+                _insert_historical_cleanup_audit(
+                    session,
+                    plan=plan,
+                    action=action,
+                    applied_database_fingerprint=applied_database_fingerprint,
+                )
             session.commit()
-        except IntegrityError as exc:
+        except PositionAttributionRepairError:
+            session.rollback()
+            raise
+        except (IntegrityError, RuntimeError) as exc:
             session.rollback()
             raise PositionAttributionRepairError("repair transaction failed") from exc
         except Exception:
             session.rollback()
             raise
-    return PositionAttributionRepairResult(applied=len(plan.actions))
+    return PositionAttributionRepairResult(applied=len(all_actions))
 
 
 def _action(
@@ -499,6 +539,50 @@ def _action(
         old_attribution_status=str(leg.attribution_status or "unassigned"),
         new_attribution_status=new_attribution_status,
         evidence=dict(evidence),
+    )
+
+
+def _plan_unique_position_index_action(
+    session,
+    *,
+    legs,
+    historical_actions,
+    historical_conflicts,
+) -> HistoricalCleanupAction | None:
+    index_names = {
+        str(row[1])
+        for row in session.connection()
+        .exec_driver_sql("PRAGMA index_list(execution_order_legs)")
+        .fetchall()
+    }
+    if POSITION_OWNERSHIP_UNIQUE_INDEX_NAME in index_names or historical_conflicts:
+        return None
+    projected = {
+        int(leg.id): (str(leg.venue or "deepcoin"), str(leg.pos_id))
+        for leg in legs
+        if leg.pos_id
+    }
+    for action in historical_actions:
+        if action.leg_id is None:
+            continue
+        if action.action == "clear_redundant_historical_position":
+            projected.pop(int(action.leg_id), None)
+    owners: dict[tuple[str, str], int] = {}
+    for key in projected.values():
+        owners[key] = owners.get(key, 0) + 1
+    if any(count > 1 for count in owners.values()):
+        return None
+    return HistoricalCleanupAction(
+        action="install_position_ownership_unique_index",
+        binding_id=None,
+        leg_id=None,
+        lifecycle_id=None,
+        venue="deepcoin",
+        old_pos_id=None,
+        new_pos_id=None,
+        old_state="absent",
+        new_state="present",
+        evidence={"index_name": POSITION_OWNERSHIP_UNIQUE_INDEX_NAME},
     )
 
 
@@ -687,6 +771,118 @@ def _exchange_evidence_fingerprint(snapshot) -> str:
     )
 
 
+def _apply_historical_cleanup_action(
+    session,
+    *,
+    action: HistoricalCleanupAction,
+    plan: PositionAttributionRepairPlan,
+    legs_by_id,
+    bindings_by_id,
+    lifecycles_by_id,
+) -> None:
+    updated_at = _naive_utc(plan.created_at)
+    if action.action == "clear_redundant_historical_position":
+        leg = legs_by_id.get(int(action.leg_id or 0))
+        if leg is None:
+            raise PositionAttributionRepairError("stale repair plan: leg missing")
+        if (
+            leg.pos_id != action.old_pos_id
+            or str(leg.attribution_status or "unassigned") != action.old_state
+        ):
+            raise PositionAttributionRepairError(
+                "stale repair plan: historical leg changed"
+            )
+        leg.pos_id = action.new_pos_id
+        leg.attribution_status = str(action.new_state or "unassigned")
+        leg.attribution_evidence_json = json.dumps(
+            {
+                "evidence_type": "historical_cleanup",
+                "repair_plan_fingerprint": plan.fingerprint,
+                "prior_pos_id": action.old_pos_id,
+                **action.evidence,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        leg.updated_at = updated_at
+        return
+    if action.action == "terminalize_historical_entry_leg":
+        leg = legs_by_id.get(int(action.leg_id or 0))
+        if leg is None:
+            raise PositionAttributionRepairError("stale repair plan: leg missing")
+        if leg.pos_id != action.old_pos_id or str(leg.status) != action.old_state:
+            raise PositionAttributionRepairError(
+                "stale repair plan: historical leg changed"
+            )
+        leg.status = str(action.new_state)
+        source = str(
+            (action.evidence.get("terminal_evidence") or {}).get("source")
+            or "terminal_evidence"
+        )
+        leg.terminal_reason = f"historical_{source}"[:64]
+        leg.updated_at = updated_at
+        return
+    if action.action == "close_historical_binding":
+        binding = bindings_by_id.get(int(action.binding_id or 0))
+        if binding is None:
+            raise PositionAttributionRepairError("stale repair plan: binding missing")
+        if binding.pos_id != action.old_pos_id or str(binding.status) != action.old_state:
+            raise PositionAttributionRepairError(
+                "stale repair plan: historical binding changed"
+            )
+        binding.pos_id = action.new_pos_id
+        binding.status = str(action.new_state)
+        binding.last_exchange_status = "historical_cleanup_terminal"
+        binding.updated_at = updated_at
+        return
+    if action.action == "exit_historical_lifecycle":
+        lifecycle = lifecycles_by_id.get(int(action.lifecycle_id or 0))
+        if lifecycle is None:
+            raise PositionAttributionRepairError("stale repair plan: lifecycle missing")
+        if str(lifecycle.lifecycle_status) != action.old_state:
+            raise PositionAttributionRepairError(
+                "stale repair plan: historical lifecycle changed"
+            )
+        lifecycle.lifecycle_status = str(action.new_state)
+        lifecycle.exit_reason = _historical_exit_reason(action.evidence)
+        lifecycle.exited_at = updated_at
+        lifecycle.updated_at = updated_at
+        return
+    if action.action == "install_position_ownership_unique_index":
+        session.flush()
+        ensure_position_ownership_unique_index(session.connection())
+        return
+    raise PositionAttributionRepairError(
+        f"unsupported historical cleanup action: {action.action}"
+    )
+
+
+def _historical_exit_reason(evidence: dict[str, object]) -> str:
+    terminal = evidence.get("terminal_evidence") or {}
+    if isinstance(terminal, dict):
+        source = str(terminal.get("source") or "")
+        if source in {"close_reservation", "execution_close_event"}:
+            return "manual"
+        reason = str(terminal.get("reason") or "")
+        if reason in {
+            "manual",
+            "stop_loss",
+            "take_profit",
+            "kol_signal",
+            "expired",
+            "context_invalidated",
+        }:
+            return reason
+    return "manual"
+
+
+def _naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
 def _insert_repair_audit(
     session, *, plan, action, leg, applied_database_fingerprint: str
 ) -> None:
@@ -714,6 +910,45 @@ def _insert_repair_audit(
                 sort_keys=True,
             ),
             created_at=plan.created_at,
+        )
+    )
+
+
+def _insert_historical_cleanup_audit(
+    session,
+    *,
+    plan: PositionAttributionRepairPlan,
+    action: HistoricalCleanupAction,
+    applied_database_fingerprint: str,
+) -> None:
+    fingerprint = _repair_audit_fingerprint(plan, action)
+    if session.query(PositionAttributionAudit.id).filter_by(fingerprint=fingerprint).first():
+        return
+    session.add(
+        PositionAttributionAudit(
+            execution_binding_id=action.binding_id,
+            execution_order_leg_id=action.leg_id,
+            venue=action.venue,
+            pos_id=action.new_pos_id or action.old_pos_id,
+            event_type="historical_cleanup",
+            prior_state=action.old_state,
+            new_state=str(action.new_state or action.action),
+            fingerprint=fingerprint,
+            evidence_json=json.dumps(
+                {
+                    "action": action.action,
+                    "plan": plan.fingerprint,
+                    "lifecycle_id": action.lifecycle_id,
+                    "old_pos_id": action.old_pos_id,
+                    "new_pos_id": action.new_pos_id,
+                    "applied_database_fingerprint": applied_database_fingerprint,
+                    **action.evidence,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            created_at=_naive_utc(plan.created_at),
         )
     )
 

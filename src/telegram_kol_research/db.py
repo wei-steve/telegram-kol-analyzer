@@ -11,6 +11,14 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.models import Base
 
 
+POSITION_OWNERSHIP_UNIQUE_INDEX_NAME = "uq_execution_order_legs_venue_pos"
+POSITION_OWNERSHIP_UNIQUE_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_order_legs_venue_pos "
+    "ON execution_order_legs (venue, pos_id) "
+    "WHERE pos_id IS NOT NULL AND pos_id != ''"
+)
+
+
 SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
     "raw_messages": {
         "sender_name": "ALTER TABLE raw_messages ADD COLUMN sender_name VARCHAR(255)",
@@ -220,11 +228,7 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
         "CREATE INDEX IF NOT EXISTS ix_execution_order_legs_pos "
         "ON execution_order_legs (pos_id)"
     ),
-    "uq_execution_order_legs_venue_pos": (
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_order_legs_venue_pos "
-        "ON execution_order_legs (venue, pos_id) "
-        "WHERE pos_id IS NOT NULL AND pos_id != ''"
-    ),
+    POSITION_OWNERSHIP_UNIQUE_INDEX_NAME: POSITION_OWNERSHIP_UNIQUE_INDEX_SQL,
     "ix_execution_events_strategy_created": (
         "CREATE INDEX IF NOT EXISTS ix_execution_events_strategy_created "
         "ON execution_events (strategy_instance_id, created_at)"
@@ -327,6 +331,21 @@ def _backfill_sqlite_indexes(engine: Engine) -> None:
                     # resolve legacy duplicates. Runtime ownership gates fail closed.
                     continue
                 connection.execute(text(create_index_sql))
+
+
+def ensure_position_ownership_unique_index(connection) -> None:
+    """Install the ownership index only after a fresh duplicate check."""
+
+    duplicate = connection.execute(
+        text(
+            "SELECT 1 FROM execution_order_legs "
+            "WHERE pos_id IS NOT NULL AND pos_id != '' "
+            "GROUP BY venue, pos_id HAVING COUNT(*) > 1 LIMIT 1"
+        )
+    ).first()
+    if duplicate is not None:
+        raise RuntimeError("duplicate position ownership remains")
+    connection.execute(text(POSITION_OWNERSHIP_UNIQUE_INDEX_SQL))
 
 
 def create_session_factory(database_path: str | Path) -> sessionmaker:

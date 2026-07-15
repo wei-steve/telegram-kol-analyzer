@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import sqlite3
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
@@ -23,6 +24,7 @@ from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
 )
+import telegram_kol_research.position_attribution_repair as repair_module
 
 
 class _HistoricalCleanupClient:
@@ -961,6 +963,198 @@ def test_historical_repair_fingerprint_changes_when_terminal_evidence_changes(
 
     assert second.database_fingerprint != first.database_fingerprint
     assert second.fingerprint != first.fingerprint
+
+
+def test_historical_cleanup_apply_is_atomic_audited_indexed_and_idempotent(tmp_path):
+    session_factory = _seed_historical_duplicate_fixture(tmp_path)
+    client = _HistoricalCleanupClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+
+    assert [action.action for action in plan.historical_actions] == [
+        "clear_redundant_historical_position",
+        "close_historical_binding",
+        "install_position_ownership_unique_index",
+    ]
+    result = apply_position_attribution_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
+    )
+
+    assert result.applied == 3
+    with session_factory() as session:
+        legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.id).all()
+        audits = (
+            session.query(PositionAttributionAudit)
+            .filter_by(event_type="historical_cleanup")
+            .order_by(PositionAttributionAudit.id)
+            .all()
+        )
+        indexes = {
+            row[1]
+            for row in session.connection()
+            .exec_driver_sql("PRAGMA index_list(execution_order_legs)")
+            .fetchall()
+        }
+    assert [leg.pos_id for leg in legs] == ["p1", None]
+    assert len(audits) == 3
+    assert "uq_execution_order_legs_venue_pos" in indexes
+
+    repeated = apply_position_attribution_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
+    )
+    assert repeated.applied == 0
+    assert repeated.already_applied is True
+
+    with session_factory() as session:
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=10,
+                strategy_instance_id="deepcoin:10:10:BTC:long",
+                leg_index=3,
+                purpose="entry",
+                order_kind="market",
+                order_id="duplicate-after-cleanup",
+                pos_id="p1",
+                venue="deepcoin",
+                status="active",
+                attribution_status="verified",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_historical_cleanup_updates_exact_execution_lifecycle(tmp_path):
+    session_factory = create_session_factory(tmp_path / "lifecycle-cleanup.db")
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                id=96,
+                strategy_instance_id="deepcoin:96:96:BTC:long",
+                kol_id="historical",
+                chat_id=96,
+                message_id=96,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                pos_id="old-position",
+                status="unknown",
+            )
+        )
+        session.add(
+            ExecutionOrderLeg(
+                id=188,
+                execution_binding_id=96,
+                strategy_instance_id="deepcoin:96:96:BTC:long",
+                leg_index=1,
+                purpose="entry",
+                order_kind="market",
+                order_id="old-position",
+                pos_id="old-position",
+                venue="deepcoin",
+                status="active",
+                attribution_status="attribution_conflict",
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                id=420,
+                chat_id=96,
+                message_id=96,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 1),
+                entered_at=datetime(2026, 7, 1),
+                execution_binding_id=96,
+            )
+        )
+        session.add(
+            BoundPositionCloseReservation(
+                pos_id="old-position",
+                execution_binding_id=96,
+                status="completed",
+                created_at=datetime(2026, 7, 2),
+                updated_at=datetime(2026, 7, 2),
+            )
+        )
+        session.commit()
+    client = _HistoricalCleanupClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+
+    assert [action.action for action in plan.historical_actions] == [
+        "terminalize_historical_entry_leg",
+        "close_historical_binding",
+        "exit_historical_lifecycle",
+    ]
+    apply_position_attribution_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
+    )
+
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, 188)
+        binding = session.get(ExecutionBinding, 96)
+        lifecycle = session.get(StrategyLifecycle, 420)
+    assert leg.status == "manually_closed"
+    assert leg.terminal_reason == "historical_close_reservation"
+    assert binding.status == "closed"
+    assert binding.pos_id is None
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "manual"
+    assert lifecycle.exited_at == datetime(2026, 7, 15, 4, 0)
+
+
+def test_unique_index_failure_rolls_back_cleanup_and_audits(tmp_path, monkeypatch):
+    session_factory = _seed_historical_duplicate_fixture(tmp_path)
+    client = _HistoricalCleanupClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+    before = _historical_fixture_state(session_factory)
+
+    def fail_index(_connection):
+        raise RuntimeError("index failure")
+
+    monkeypatch.setattr(
+        repair_module,
+        "ensure_position_ownership_unique_index",
+        fail_index,
+        raising=False,
+    )
+    with pytest.raises(PositionAttributionRepairError, match="repair transaction failed"):
+        apply_position_attribution_repair_plan(
+            session_factory,
+            plan,
+            deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
+        )
+
+    assert _historical_fixture_state(session_factory) == before
+    with session_factory() as session:
+        assert (
+            session.query(PositionAttributionAudit)
+            .filter_by(event_type="historical_cleanup")
+            .count()
+            == 0
+        )
 
 
 def test_repair_plan_preserves_explicit_legacy_manual_bind(tmp_path):
