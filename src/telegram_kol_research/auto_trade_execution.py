@@ -405,6 +405,7 @@ def _auto_process_management_signal(
         planned_at=processed_at,
         candidate_id=candidate_id,
         shadow_only=settings.management_execution_mode == "shadow",
+        execution_mode=settings.management_execution_mode,
     )
     if result.status != "ready" or result.batch is None:
         return {

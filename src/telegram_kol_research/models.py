@@ -504,6 +504,9 @@ class StrategyManagementBatch(Base):
     )
     intent: Mapped[str] = mapped_column(String(64), nullable=False)
     effective_action: Mapped[str] = mapped_column(String(64), nullable=False)
+    execution_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="disabled"
+    )
     requested_fraction: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     effective_fraction: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     partial_round_before: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -581,6 +584,8 @@ class StrategyManagementNotification(Base):
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     delivery_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)

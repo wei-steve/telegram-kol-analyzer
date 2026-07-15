@@ -450,6 +450,12 @@ def test_database_bootstrap_creates_management_batch_and_management_leg_schema(t
         row[1]
         for row in conn.execute("PRAGMA table_info(strategy_management_legs)").fetchall()
     }
+    notification_columns = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(strategy_management_notifications)"
+        ).fetchall()
+    }
     batch_indexes = {
         row[1]
         for row in conn.execute("PRAGMA index_list(strategy_management_batches)").fetchall()
@@ -470,6 +476,7 @@ def test_database_bootstrap_creates_management_batch_and_management_leg_schema(t
         "execution_binding_id",
         "intent",
         "effective_action",
+        "execution_mode",
         "requested_fraction",
         "effective_fraction",
         "partial_round_before",
@@ -507,6 +514,7 @@ def test_database_bootstrap_creates_management_batch_and_management_leg_schema(t
         "created_at",
         "updated_at",
     } <= leg_columns
+    assert {"claimed_at", "lease_expires_at"} <= notification_columns
     assert "uq_strategy_management_batches_idempotency" in batch_indexes
     assert "uq_strategy_management_batches_active_strategy" in batch_indexes
     assert "uq_strategy_management_legs_batch_pos" in leg_indexes
@@ -546,6 +554,10 @@ def test_database_bootstrap_adds_management_batch_and_management_leg_indexes_to_
         row[1]
         for row in conn.execute("PRAGMA index_list(strategy_management_batches)").fetchall()
     }
+    batch_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(strategy_management_batches)").fetchall()
+    }
     leg_indexes = {
         row[1]
         for row in conn.execute("PRAGMA index_list(strategy_management_legs)").fetchall()
@@ -553,6 +565,7 @@ def test_database_bootstrap_adds_management_batch_and_management_leg_indexes_to_
     conn.close()
 
     assert "uq_strategy_management_batches_idempotency" in batch_indexes
+    assert "execution_mode" in batch_columns
     assert "uq_strategy_management_batches_active_strategy" in batch_indexes
     assert "uq_strategy_management_legs_batch_pos" in leg_indexes
 

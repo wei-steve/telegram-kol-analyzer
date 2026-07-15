@@ -111,10 +111,15 @@ def plan_strategy_management_batch(
     planned_at: datetime | None = None,
     candidate_id: int | None = None,
     shadow_only: bool = False,
+    execution_mode: str | None = None,
 ) -> ManagementPlanningResult:
     """Reconcile, reload, validate, and persist one immutable exact target."""
 
     now = planned_at or datetime.now(UTC)
+    resolved_execution_mode = (
+        execution_mode if execution_mode in {"disabled", "shadow", "live"}
+        else ("shadow" if shadow_only else "live")
+    )
     with position_authority_lock():
         try:
             reconciliation_snapshot = (
@@ -139,7 +144,7 @@ def plan_strategy_management_batch(
             reconciliation_snapshot=reconciliation_snapshot,
             contract_spec_provider=contract_spec_provider,
             planned_at=now,
-            shadow_only=shadow_only,
+            execution_mode=resolved_execution_mode,
         )
 
 
@@ -151,7 +156,7 @@ def _plan_strategy_management_batch_locked(
     reconciliation_snapshot,
     contract_spec_provider,
     planned_at: datetime,
-    shadow_only: bool = False,
+    execution_mode: str = "live",
 ) -> ManagementPlanningResult:
     now = planned_at
 
@@ -175,6 +180,7 @@ def _plan_strategy_management_batch_locked(
             intent=intent or "unknown",
             reason_code="management_intent_not_supported",
             planned_at=now,
+            execution_mode=execution_mode,
         )
     try:
         requested_fraction = normalize_requested_management_fraction(
@@ -223,6 +229,7 @@ def _plan_strategy_management_batch_locked(
             intent=intent,
             reason_code=unsafe_reason,
             planned_at=now,
+            execution_mode=execution_mode,
         )
 
     instrument_id = f"{str(lifecycle.symbol).upper()}-USDT-SWAP"
@@ -285,6 +292,7 @@ def _plan_strategy_management_batch_locked(
             intent=intent,
             reason_code=_planning_reason_from_attribution(str(exc)),
             planned_at=now,
+            execution_mode=execution_mode,
         )
     except Exception:
         return _persist_blocked(
@@ -294,6 +302,7 @@ def _plan_strategy_management_batch_locked(
             intent=intent,
             reason_code="target_position_snapshot_unavailable",
             planned_at=now,
+            execution_mode=execution_mode,
         )
 
     partial_round_before = partial_policy_state.round_before
@@ -327,6 +336,7 @@ def _plan_strategy_management_batch_locked(
                 intent=intent,
                 reason_code="target_protection_evidence_unavailable",
                 planned_at=now,
+                execution_mode=execution_mode,
             )
         matches = match_position_protection(
             live_positions, tpsl_orders, evidence_available=True
@@ -347,6 +357,7 @@ def _plan_strategy_management_batch_locked(
                     intent=intent,
                     reason_code="target_protection_not_verified",
                     planned_at=now,
+                    execution_mode=execution_mode,
                 )
             protection_row_ids = [
                 _exact_protection_order_id(row) for row in protection.rows
@@ -374,6 +385,7 @@ def _plan_strategy_management_batch_locked(
                     intent=intent,
                     reason_code="target_protection_order_identity_unavailable",
                     planned_at=now,
+                    execution_mode=execution_mode,
                 )
             seen_protection_order_ids.update(
                 str(order_id) for order_id in protection_row_ids
@@ -407,8 +419,10 @@ def _plan_strategy_management_batch_locked(
                 intent=intent,
                 reason_code="management_close_size_unsafe",
                 planned_at=now,
+                execution_mode=execution_mode,
             )
     target_snapshot = {
+        "execution_mode": execution_mode,
         "identity": {
             "target_lifecycle_id": lifecycle.id,
             "execution_binding_id": binding.id,
@@ -468,8 +482,13 @@ def _plan_strategy_management_batch_locked(
                 target_snapshot=target_snapshot,
                 planned_at=now,
                 legs=batch_legs,
-                status="blocked" if shadow_only else "ready",
-                reason_code=("management_shadow_plan_only" if shadow_only else None),
+                execution_mode=execution_mode,
+                status="blocked" if execution_mode != "live" else "ready",
+                reason_code=(
+                    "management_shadow_plan_only"
+                    if execution_mode == "shadow"
+                    else ("management_disabled_plan_only" if execution_mode == "disabled" else None)
+                ),
                 validate_current_state=lambda current_session: (
                     _require_frozen_identity_and_policy_current(
                         current_session,
@@ -874,6 +893,7 @@ def _persist_blocked(
     intent: str,
     reason_code: str,
     planned_at: datetime,
+    execution_mode: str = "live",
 ) -> ManagementPlanningResult:
     candidate = identity.candidate
     binding = identity.binding
@@ -905,6 +925,7 @@ def _persist_blocked(
         elif intent == "full_exit":
             effective_fraction = 1.0
         target_snapshot = {
+            "execution_mode": execution_mode,
             "identity": {
                 "target_lifecycle_id": lifecycle.id,
                 "execution_binding_id": binding.id,
@@ -924,6 +945,7 @@ def _persist_blocked(
             execution_binding_id=binding.id,
             intent=intent,
             effective_action=effective_action_name,
+            execution_mode=execution_mode,
             requested_fraction=candidate.management_fraction,
             effective_fraction=effective_fraction,
             partial_round_before=partial_round_before,

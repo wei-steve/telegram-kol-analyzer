@@ -16,8 +16,15 @@ def test_management_batch_assets_only_load_read_only_api(tmp_path):
     js = client.get("/static/app.js").text
     css = client.get("/static/app.css").text
     assert "loadManagementBatches" in js
-    assert "'/api/management-batches'" in js or '"/api/management-batches"' in js
-    assert "method: 'POST'" not in js[js.find("loadManagementBatches"):js.find("loadManagementBatches") + 1800]
+    assert "/api/management-batches?" in js
+    management_slice = js[js.find("loadManagementBatches"):js.find("loadManagementBatches") + 2200]
+    assert "chat_id" in management_slice
+    assert "getSelectedChatId" in management_slice
+    assert "view === 'management-batches'" in js
+    assert "group-context-success" in js
+    assert "ensureWorkbenchViewLoaded('management-batches', { force: true })" in js
+    assert "view === 'strategies' || view === 'messages' || view === 'management-batches'" in js
+    assert "method: 'POST'" not in management_slice
     assert "management-batch-card" in css
     for forbidden in ("retryManagementBatch", "closeManagementBatch", "cancelManagementBatch"):
         assert forbidden not in js

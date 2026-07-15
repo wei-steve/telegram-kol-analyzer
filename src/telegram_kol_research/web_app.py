@@ -127,6 +127,7 @@ from telegram_kol_research.strategy_alerts import (
 )
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
+    canonical_management_error_summary,
     deliver_pending_position_attribution_incidents,
     load_system_operator_bot_config,
     send_ai_recognition_conflict_review,
@@ -230,12 +231,9 @@ def _safe_protection_rows(value: Any) -> list[dict[str, Any]]:
 
 
 def _management_batch_mode(batch: StrategyManagementBatch, snapshot: dict[str, Any]) -> str:
-    explicit = snapshot.get("mode") or snapshot.get("execution_mode")
-    if explicit == "live":
-        return "live"
-    if explicit in {"shadow", "disabled"} or batch.reason_code == "management_shadow_plan_only":
-        return "shadow"
-    return "live"
+    del snapshot
+    mode = str(batch.execution_mode or "disabled")
+    return mode if mode in {"disabled", "shadow", "live"} else "disabled"
 
 
 def _management_batch_api_rows(
@@ -279,8 +277,8 @@ def _management_batch_api_rows(
                         "exchange_order_id": _bounded_management_text(leg.exchange_order_id, limit=120),
                         "old_protection": _safe_protection_rows(leg.old_tpsl_json),
                         "planned_protection": _safe_protection_rows(leg.planned_tpsl_json),
-                        "last_error": _bounded_management_text(
-                            _json_value(leg.last_error, leg.last_error), limit=240
+                        "error_summary": canonical_management_error_summary(
+                            leg.last_error
                         ),
                     }
                 )
@@ -300,7 +298,9 @@ def _management_batch_api_rows(
                 {
                     "batch_id": batch.id,
                     "mode": mode,
-                    "mode_label": "未调用交易 API" if mode == "shadow" else "实盘执行",
+                    "mode_label": (
+                        "实盘执行" if mode == "live" else "未调用交易 API"
+                    ),
                     "intent": batch.intent,
                     "effective_action": batch.effective_action,
                     "requested_fraction": batch.requested_fraction,
@@ -2471,7 +2471,7 @@ def create_web_app(
         )
 
     @app.get("/api/management-batches")
-    def api_management_batches(chat_id: int | None = None, limit: int = 50):
+    def api_management_batches(chat_id: int, limit: int = 50):
         if not 1 <= limit <= 100:
             raise HTTPException(status_code=422, detail="invalid management batch limit")
         return {

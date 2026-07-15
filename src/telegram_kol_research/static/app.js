@@ -1201,7 +1201,7 @@ function bindGroupPromptEditor() {
 }
 
 function workbenchLoadKey(view) {
-  if (view === 'strategies' || view === 'messages') {
+  if (view === 'strategies' || view === 'messages' || view === 'management-batches') {
     return String(getSelectedChatId() || 0);
   }
   return 'global';
@@ -1298,7 +1298,13 @@ function renderManagementBatchCard(batch) {
 async function loadManagementBatches() {
   const container = document.querySelector('[data-lazy-workbench="management-batches"]');
   if (!container) return;
-  const response = await fetch('/api/management-batches', { cache: 'no-store' });
+  const chatId = getSelectedChatId();
+  if (!chatId) {
+    container.innerHTML = '<p class="empty-state">请先选择群组</p>';
+    return;
+  }
+  const params = new URLSearchParams({ chat_id: String(chatId) });
+  const response = await fetch(`/api/management-batches?${params}`, { cache: 'no-store' });
   if (!response.ok) throw new Error(`请求失败 (${response.status})`);
   const payload = await response.json();
   container.innerHTML = '';
@@ -1385,16 +1391,24 @@ function bindWorkbenchNavigation() {
   const dashboard = document.querySelector('[data-trader-dashboard]');
   const buttons = document.querySelectorAll('[data-workbench-view]');
   const panels = document.querySelectorAll('[data-workbench-panel]');
+  if (dashboard && dashboard.dataset.managementGroupRefreshBound !== 'true') {
+    dashboard.dataset.managementGroupRefreshBound = 'true';
+    document.addEventListener('group-context-success', () => {
+      if (dashboard.dataset.activeWorkbenchView === 'management-batches') {
+        ensureWorkbenchViewLoaded('management-batches', { force: true });
+      }
+    });
+  }
   if (!dashboard || !buttons.length || !panels.length) {
     return;
   }
 
-  const views = ['home', 'positions', 'strategies', 'messages', 'more'];
+  const views = ['home', 'positions', 'strategies', 'messages', 'management-batches', 'more'];
   const setWorkbenchView = (requestedView) => {
     const view = views.includes(requestedView) ? requestedView : 'home';
     const legacyView = view === 'home' ? 'overview' : view;
     dashboard.dataset.activeWorkbenchView = view;
-    dashboard.classList.remove(...['overview', 'positions', 'strategies', 'messages', 'more'].map((item) => `mobile-view-${item}`));
+    dashboard.classList.remove(...['overview', 'positions', 'strategies', 'messages', 'management-batches', 'more'].map((item) => `mobile-view-${item}`));
     dashboard.classList.add(`mobile-view-${legacyView}`);
     buttons.forEach((button) => {
       const isActive = button.dataset.workbenchView === view;

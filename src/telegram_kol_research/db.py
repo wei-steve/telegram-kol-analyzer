@@ -119,6 +119,20 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
             "ALTER TABLE position_attribution_audits ADD COLUMN notified_at DATETIME"
         ),
     },
+    "strategy_management_batches": {
+        "execution_mode": (
+            "ALTER TABLE strategy_management_batches "
+            "ADD COLUMN execution_mode VARCHAR(16) NOT NULL DEFAULT 'disabled'"
+        ),
+    },
+    "strategy_management_notifications": {
+        "claimed_at": (
+            "ALTER TABLE strategy_management_notifications ADD COLUMN claimed_at DATETIME"
+        ),
+        "lease_expires_at": (
+            "ALTER TABLE strategy_management_notifications ADD COLUMN lease_expires_at DATETIME"
+        ),
+    },
     "recovery_decisions": {
         "reason_codes_json": "ALTER TABLE recovery_decisions ADD COLUMN reason_codes_json TEXT NOT NULL DEFAULT '[]'",
         "entry_range_text": "ALTER TABLE recovery_decisions ADD COLUMN entry_range_text VARCHAR(255)",

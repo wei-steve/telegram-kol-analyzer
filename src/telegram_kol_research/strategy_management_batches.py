@@ -86,6 +86,7 @@ class ManagementBatchRecord:
     execution_binding_id: int
     intent: str
     effective_action: str
+    execution_mode: str
     requested_fraction: float | None
     effective_fraction: float | None
     partial_round_before: int
@@ -116,6 +117,7 @@ def create_management_batch(
     execution_binding_id: int,
     intent: str,
     effective_action: str,
+    execution_mode: str = "disabled",
     requested_fraction: float | None,
     effective_fraction: float | None,
     partial_round_before: int,
@@ -142,6 +144,7 @@ def create_management_batch(
             execution_binding_id=execution_binding_id,
             intent=intent,
             effective_action=effective_action,
+            execution_mode=execution_mode,
             requested_fraction=requested_fraction,
             effective_fraction=effective_fraction,
             partial_round_before=partial_round_before,
@@ -169,6 +172,7 @@ def create_management_batch_in_session(
     execution_binding_id: int,
     intent: str,
     effective_action: str,
+    execution_mode: str = "disabled",
     requested_fraction: float | None,
     effective_fraction: float | None,
     partial_round_before: int,
@@ -196,6 +200,7 @@ def create_management_batch_in_session(
         execution_binding_id=execution_binding_id,
         intent=intent,
         effective_action=effective_action,
+        execution_mode=execution_mode,
         requested_fraction=requested_fraction,
         effective_fraction=effective_fraction,
         partial_round_before=partial_round_before,
@@ -496,6 +501,7 @@ def _batch_to_record(session, batch: StrategyManagementBatch) -> ManagementBatch
         execution_binding_id=batch.execution_binding_id,
         intent=batch.intent,
         effective_action=batch.effective_action,
+        execution_mode=batch.execution_mode,
         requested_fraction=batch.requested_fraction,
         effective_fraction=batch.effective_fraction,
         partial_round_before=batch.partial_round_before,

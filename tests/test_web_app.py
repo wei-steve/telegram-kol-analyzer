@@ -60,10 +60,11 @@ def test_management_batch_api_is_bounded_redacted_read_only_and_group_isolated(t
                 execution_binding_id=index, intent="partial_take_profit",
                 effective_action="partial_close", effective_fraction=0.5,
                 partial_round_before=0, status="blocked" if index == 1 else "recovery_required",
+                execution_mode="shadow" if index == 1 else "live",
                 reason_code="unsafe headers DC-ACCESS-SIGN should not leak",
                 target_fingerprint=("a" if index == 1 else "b") * 64,
                 target_snapshot_json=json.dumps({
-                    "mode": "shadow", "targets": [{"pos_id": f"pos-{index}", "size": "0.02"}],
+                    "mode": "live", "targets": [{"pos_id": f"pos-{index}", "size": "0.02"}],
                     "headers": {"DC-ACCESS-KEY": "never-return"}, "raw_response": "never-return",
                 }), planned_at=now, created_at=now, updated_at=now,
             )
@@ -74,12 +75,18 @@ def test_management_batch_api_is_bounded_redacted_read_only_and_group_isolated(t
                 preflight_size="0.02", planned_close_size="0.01",
                 old_tpsl_json='[{"purpose":"stop_loss","order_id":"sl-1","secret":"no"}]',
                 planned_tpsl_json='[{"purpose":"stop_loss","price":"65000","api_key":"no"}]',
-                request_json='{"DC-ACCESS-KEY":"never-return"}',
+                last_error=json.dumps({
+                    "stage": "replace_protection", "reason_code": "restore_failed",
+                    "type": "DeepcoinError", "message": "https://private.invalid/raw-body-content",
+                    "token": "top-secret-token", "cookie": "session-cookie",
+                    "headers": {"Authorization": "Bearer-never"},
+                }), request_json='{"DC-ACCESS-KEY":"never-return"}',
                 response_json='{"raw":"never-return"}',
             ))
         session.commit()
 
     client = TestClient(create_web_app(database_path=database_path))
+    assert client.get("/api/management-batches").status_code == 422
     response = client.get("/api/management-batches", params={"chat_id": -1001, "limit": 500})
     assert response.status_code == 422
     response = client.get("/api/management-batches", params={"chat_id": -1001, "limit": 20})
@@ -96,9 +103,25 @@ def test_management_batch_api_is_bounded_redacted_read_only_and_group_isolated(t
     assert row["mode_label"] == "未调用交易 API"
     assert row["legs"][0]["pos_id"] == "pos-1"
     encoded = json.dumps(payload, ensure_ascii=False)
-    for forbidden in ("DC-ACCESS", "never-return", "raw_payload", "request_json", "response_json"):
+    for forbidden in (
+        "DC-ACCESS", "never-return", "raw_payload", "request_json", "response_json",
+        "private.invalid", "top-secret-token", "session-cookie", "bearer-never",
+        "raw-body-content", '"message"', '"headers"',
+    ):
         assert forbidden not in encoded
+    assert row["legs"][0]["error_summary"] == {
+        "type": "DeepcoinError", "stage": "replace_protection",
+        "reason_code": "restore_failed",
+    }
     assert client.post("/api/management-batches/1/retry").status_code == 404
+    group_b = client.get(
+        "/api/management-batches", params={"chat_id": -1002, "limit": 20}
+    ).json()["batches"]
+    assert len(group_b) == 1
+    assert group_b[0]["source"]["chat_id"] == -1002
+    assert group_b[0]["strategy_instance_id"] == "deepcoin:-1002:7:BTC:short"
+    assert group_b[0]["legs"][0]["pos_id"] == "pos-2"
+    assert "pos-1" not in json.dumps(group_b)
 
 
 def test_management_batch_api_marks_recovery_as_no_auto_retry(tmp_path):
@@ -113,6 +136,7 @@ def test_management_batch_api_marks_recovery_as_no_auto_retry(tmp_path):
             recognition_decision_id=1, recognition_generation="g", target_lifecycle_id=2,
             strategy_instance_id="deepcoin:-2002:8:ETH:long", execution_binding_id=3,
             intent="adjust_stop_loss", effective_action="replace_stop_loss",
+            execution_mode="shadow",
             partial_round_before=1, status="recovery_required", reason_code="restore_failed",
             target_fingerprint="e" * 64, target_snapshot_json='{"mode":"live"}',
             planned_at=now, created_at=now, updated_at=now,
@@ -122,6 +146,8 @@ def test_management_batch_api_marks_recovery_as_no_auto_retry(tmp_path):
         "/api/management-batches", params={"chat_id": -2002}
     ).json()["batches"][0]
     assert row["safety_label"] == "禁止自动重试"
+    assert row["mode"] == "shadow"
+    assert row["mode_label"] == "未调用交易 API"
 
 
 def test_incomplete_equivalent_assignment_does_not_render_reviewed_provenance():

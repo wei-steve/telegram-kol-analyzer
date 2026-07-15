@@ -392,11 +392,13 @@ def test_unsafe_entry_leg_blocks_whole_batch(
         deepcoin_client=_ReadOnlyDeepcoin([_position()]),
         contract_spec_provider=_ContractSpecs(),
         planned_at=PLANNED_AT,
+        shadow_only=True,
     )
 
     assert result.status == "blocked"
     assert result.reason_code == reason
     assert result.batch.status == "blocked"
+    assert result.batch.execution_mode == "shadow"
     assert result.batch.legs == ()
 
 
@@ -524,11 +526,13 @@ def test_protection_ambiguity_blocks_every_target(monkeypatch, tmp_path):
         deepcoin_client=client,
         contract_spec_provider=_ContractSpecs(),
         planned_at=PLANNED_AT,
+        shadow_only=True,
     )
 
     assert result.status == "blocked"
     assert result.reason_code == "target_protection_not_verified"
     assert result.batch.status == "blocked"
+    assert result.batch.execution_mode == "shadow"
     assert result.batch.legs == ()
 
 

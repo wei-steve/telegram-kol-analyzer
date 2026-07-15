@@ -6,14 +6,15 @@ import os
 import json
 import asyncio
 import hashlib
+import re
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import update
+from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.llm_chat import _load_env_file_values
@@ -227,6 +228,7 @@ def format_strategy_management_notification(payload: dict[str, Any]) -> str:
     mode = str(payload.get("mode") or "shadow")
     lines = [
         "【策略管理批次异常】",
+        f"通知ID: {payload.get('notification_id') or '-'}",
         f"batch #{payload.get('batch_id') or '-'} / 状态: {state}",
         (
             f"来源: {payload.get('source_chat_title') or '-'} / "
@@ -241,7 +243,7 @@ def format_strategy_management_notification(payload: dict[str, Any]) -> str:
         ),
         f"动作: {payload.get('intent') or '-'} -> {payload.get('effective_action') or '-'}",
         f"原因: {_safe_management_text(payload.get('reason'))}",
-        f"模式: {mode}" + (" / 未调用交易 API" if mode == "shadow" else ""),
+        f"模式: {mode}" + (" / 未调用交易 API" if mode != "live" else ""),
     ]
     if state == "recovery_required":
         lines.append("安全限制: 禁止自动重试")
@@ -256,7 +258,7 @@ def format_strategy_management_notification(payload: dict[str, Any]) -> str:
             f"pos={leg.get('pos_id') or '-'} index={leg.get('leg_index')} "
             f"status={leg.get('status') or '-'} planned={leg.get('planned_close_size') or '-'} "
             f"clOrdId={leg.get('client_order_id') or '-'} ordId={leg.get('exchange_order_id') or '-'} "
-            f"error={_safe_management_text(leg.get('last_error'))}"
+            f"error={json.dumps(leg.get('error_summary') or {}, ensure_ascii=False, sort_keys=True)}"
         )
     if not legs:
         lines.append("- -")
@@ -286,20 +288,38 @@ def _decode_value(value: Any) -> Any:
         return None
 
 
+def canonical_management_error_summary(value: Any) -> dict[str, str]:
+    """Select machine identifiers only; never copy exception prose or transport data."""
+
+    decoded = _decode_value(value)
+    if not isinstance(decoded, dict):
+        return {}
+    summary: dict[str, str] = {}
+    error_type = decoded.get("type")
+    if isinstance(error_type, str) and re.fullmatch(
+        r"[A-Z][A-Za-z0-9]{0,70}(?:Error|Exception)", error_type
+    ):
+        summary["type"] = error_type
+    for key in ("stage", "reason_code", "reason"):
+        item = decoded.get(key)
+        if isinstance(item, str) and re.fullmatch(r"[a-z][a-z0-9_]{2,79}", item):
+            summary[key] = item
+    status = decoded.get("status")
+    if status in {
+        "planned", "reserved", "submitted", "submit_unknown", "failed",
+        "confirmed", "partial", "inconsistent", "restored", "recovery_required",
+    }:
+        summary["status"] = status
+    return summary
+
+
 def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[str, Any]:
     from telegram_kol_research.models import RawMessage, StrategyManagementLeg
 
     raw = session.get(RawMessage, batch.raw_message_id)
     # The raw row is the source-of-truth isolation boundary. Never infer a chat
     # from a strategy string or join another group's similarly numbered message.
-    snapshot = _decode_mapping(batch.target_snapshot_json)
-    explicit_mode = snapshot.get("mode") or snapshot.get("execution_mode")
-    mode = (
-        "shadow"
-        if explicit_mode in {"shadow", "disabled"}
-        or batch.reason_code == "management_shadow_plan_only"
-        else "live"
-    )
+    mode = str(batch.execution_mode or "disabled")
     labels = group_labels or {}
     legs = []
     for leg in (
@@ -319,13 +339,13 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
                 "planned_close_size": _safe_management_text(leg.planned_close_size, limit=64),
                 "client_order_id": _safe_management_text(leg.client_order_id, limit=120),
                 "exchange_order_id": _safe_management_text(leg.exchange_order_id, limit=120),
-                "last_error": _safe_management_text(_decode_value(leg.last_error), limit=240),
+                "error_summary": canonical_management_error_summary(leg.last_error),
             }
         )
     return {
         "batch_id": batch.id,
         "state": batch.status,
-        "mode": "live" if mode == "live" else "shadow",
+        "mode": mode if mode in {"disabled", "shadow", "live"} else "disabled",
         "source_chat_id": raw.chat_id if raw is not None else None,
         "source_chat_title": (
             _safe_management_text(labels.get(raw.chat_id), limit=120)
@@ -410,29 +430,45 @@ def enqueue_strategy_management_notifications(session_factory, *, group_labels=N
     return created
 
 
-def claim_next_strategy_management_notification(session_factory):
+def claim_next_strategy_management_notification(
+    session_factory, *, claimed_at: datetime | None = None, lease_seconds: float = 120.0
+):
     """CAS one pending/failed delivery; concurrent notifiers have one winner."""
 
     from telegram_kol_research.models import StrategyManagementNotification
 
+    now = claimed_at or datetime.now(UTC)
+    lease_expiry = now + timedelta(seconds=max(5.0, float(lease_seconds)))
+    claimable = or_(
+        StrategyManagementNotification.status.in_(("pending", "failed")),
+        (
+            (StrategyManagementNotification.status == "delivering")
+            & or_(
+                StrategyManagementNotification.lease_expires_at.is_(None),
+                StrategyManagementNotification.lease_expires_at <= now,
+            )
+        ),
+    )
     with session_factory() as session:
         row_id = (
             session.query(StrategyManagementNotification.id)
-            .filter(StrategyManagementNotification.status.in_(("pending", "failed")))
+            .filter(claimable)
             .order_by(StrategyManagementNotification.id.asc()).limit(1).scalar()
         )
     if row_id is None:
         return None
     token = uuid.uuid4().hex
-    now = datetime.now(UTC)
     with session_factory() as session:
         result = session.execute(
             update(StrategyManagementNotification)
             .where(
                 StrategyManagementNotification.id == row_id,
-                StrategyManagementNotification.status.in_(("pending", "failed")),
+                claimable,
             )
-            .values(status="delivering", claim_token=token, delivery_error=None, updated_at=now)
+            .values(
+                status="delivering", claim_token=token, delivery_error=None,
+                claimed_at=now, lease_expires_at=lease_expiry, updated_at=now,
+            )
         )
         session.commit()
         if result.rowcount != 1:
@@ -445,17 +481,28 @@ def claim_next_strategy_management_notification(session_factory):
 
 
 async def deliver_strategy_management_notifications(
-    session_factory, *, config: SystemOperatorBotConfig, group_labels=None, limit: int = 20
+    session_factory, *, config: SystemOperatorBotConfig, group_labels=None, limit: int = 20,
+    claimed_at: datetime | None = None, lease_seconds: float = 120.0,
 ) -> int:
+    """Deliver with a durable lease and at-least-once crash semantics.
+
+    Telegram ``sendMessage`` has no idempotency key. A process death after
+    Telegram accepts a message but before ``delivered`` commits can therefore
+    cause one repeat after lease expiry. The stable notification ID embedded in
+    the text is the dedup marker; committed successes are never reclaimed.
+    """
     from telegram_kol_research.models import StrategyManagementNotification
 
     enqueue_strategy_management_notifications(session_factory, group_labels=group_labels)
     delivered = 0
     for _ in range(max(1, min(int(limit), 100))):
-        claim = claim_next_strategy_management_notification(session_factory)
+        claim = claim_next_strategy_management_notification(
+            session_factory, claimed_at=claimed_at, lease_seconds=lease_seconds
+        )
         if claim is None:
             break
         payload = dict(claim["payload"])
+        payload["notification_id"] = claim["id"]
         if group_labels and payload.get("source_chat_id") is not None:
             payload["source_chat_title"] = _safe_management_text(
                 group_labels.get(payload["source_chat_id"]), limit=120
@@ -476,6 +523,7 @@ async def deliver_strategy_management_notifications(
                     )
                     .values(
                         status="failed", claim_token=None,
+                        lease_expires_at=None,
                         delivery_error=type(exc).__name__,
                         updated_at=datetime.now(UTC),
                     )
@@ -494,6 +542,7 @@ async def deliver_strategy_management_notifications(
                 )
                 .values(
                     status="delivered", claim_token=None, delivery_error=None,
+                    lease_expires_at=None,
                     notified_at=datetime.now(UTC), updated_at=datetime.now(UTC),
                 )
             )

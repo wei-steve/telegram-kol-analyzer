@@ -1,4 +1,6 @@
 import asyncio
+import json
+from datetime import UTC, datetime
 import pytest
 
 import telegram_kol_research.system_operator_bot as operator_bot_module
@@ -14,6 +16,8 @@ from telegram_kol_research.system_operator_bot import (
     send_semantic_disagreement_notification,
     system_operator_bot_enabled,
 )
+
+NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
 
 
 def test_management_notification_formatter_has_exact_identity_and_safety_labels():
@@ -32,6 +36,7 @@ def test_management_notification_formatter_has_exact_identity_and_safety_labels(
             "intent": "adjust_stop_loss",
             "effective_action": "replace_stop_loss",
             "reason": "restore_failed",
+            "notification_id": 701,
             "legs": [
                 {
                     "leg_id": 3,
@@ -40,7 +45,7 @@ def test_management_notification_formatter_has_exact_identity_and_safety_labels(
                     "leg_index": 0,
                     "status": "recovery_required",
                     "planned_close_size": None,
-                    "last_error": "restore_failed",
+                    "error_summary": {"stage": "restore", "reason_code": "restore_failed"},
                 }
             ],
         }
@@ -50,6 +55,7 @@ def test_management_notification_formatter_has_exact_identity_and_safety_labels(
         "batch #88", "-10088", "#901", "raw=71", "lifecycle=11",
         "deepcoin:-10088:811:BTC:short", "binding=12", "adjust_stop_loss",
         "replace_stop_loss", "pos-1", "未调用交易 API", "禁止自动重试",
+        "通知ID: 701",
     ):
         assert expected in message
 
@@ -120,7 +126,12 @@ def test_management_notification_dedup_retry_and_concurrent_claim(tmp_path, monk
         session.add(StrategyManagementLeg(
             management_batch_id=batch.id, execution_order_leg_id=entry.id,
             pos_id="pos-1", leg_index=0, status="recovery_required",
-            planned_close_size="0.01", last_error='"restore_failed"',
+            planned_close_size="0.01", last_error=json.dumps({
+                "stage": "replace_protection", "reason_code": "restore_failed",
+                "type": "DeepcoinError", "message": "https://private.invalid/raw-body-content",
+                "token": "top-secret-token", "cookie": "session-cookie",
+                "headers": {"Authorization": "Bearer-never"},
+            }),
         ))
         session.commit(); batch_id = batch.id
 
@@ -146,6 +157,14 @@ def test_management_notification_dedup_retry_and_concurrent_claim(tmp_path, monk
         rows = session.query(StrategyManagementNotification).all()
         assert len(rows) == 1
         assert rows[0].status == "delivered"
+        assert rows[0].claimed_at is not None
+        assert rows[0].lease_expires_at is None
+        payload_text = rows[0].payload_json.lower()
+        for forbidden in (
+            "private.invalid", "top-secret-token", "session-cookie",
+            "bearer-never", "raw-body-content", '"message"', '"headers"',
+        ):
+            assert forbidden not in payload_text
         batch = session.get(StrategyManagementBatch, batch_id)
         batch.reason_code = "restore_failed_after_cancel"
         session.commit()
@@ -168,6 +187,62 @@ def test_management_notification_dedup_retry_and_concurrent_claim(tmp_path, monk
     operator_bot_module.enqueue_strategy_management_notifications(sf)
     with sf() as session:
         assert session.query(StrategyManagementNotification).count() == 3
+
+
+def test_management_notification_claim_lease_recovers_expired_delivery(tmp_path):
+    from datetime import timedelta
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import StrategyManagementNotification
+
+    sf = create_session_factory(tmp_path / "lease.db")
+    with sf() as session:
+        session.add(StrategyManagementNotification(
+            management_batch_id=1, state="blocked", payload_fingerprint="a" * 64,
+            payload_json='{"batch_id":1,"state":"blocked"}', status="pending",
+        ))
+        session.commit()
+    first = operator_bot_module.claim_next_strategy_management_notification(
+        sf, claimed_at=NOW, lease_seconds=30
+    )
+    assert first is not None
+    assert operator_bot_module.claim_next_strategy_management_notification(
+        sf, claimed_at=NOW + timedelta(seconds=29), lease_seconds=30
+    ) is None
+    reclaimed = operator_bot_module.claim_next_strategy_management_notification(
+        sf, claimed_at=NOW + timedelta(seconds=31), lease_seconds=30
+    )
+    assert reclaimed is not None
+    assert reclaimed["claim_token"] != first["claim_token"]
+
+
+def test_cancelled_management_delivery_is_reclaimable_only_after_lease(
+    tmp_path, monkeypatch
+):
+    from datetime import timedelta
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import StrategyManagementNotification
+
+    sf = create_session_factory(tmp_path / "cancelled-lease.db")
+    with sf() as session:
+        session.add(StrategyManagementNotification(
+            management_batch_id=1, state="submit_unknown", payload_fingerprint="b" * 64,
+            payload_json='{"batch_id":1,"state":"submit_unknown"}', status="pending",
+        ))
+        session.commit()
+    async def cancelled(**_kwargs):
+        raise asyncio.CancelledError
+    monkeypatch.setattr(operator_bot_module, "send_system_operator_bot_message", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(operator_bot_module.deliver_strategy_management_notifications(
+            sf, config=SystemOperatorBotConfig("token", "chat"),
+            claimed_at=NOW, lease_seconds=30,
+        ))
+    assert operator_bot_module.claim_next_strategy_management_notification(
+        sf, claimed_at=NOW + timedelta(seconds=29), lease_seconds=30
+    ) is None
+    assert operator_bot_module.claim_next_strategy_management_notification(
+        sf, claimed_at=NOW + timedelta(seconds=31), lease_seconds=30
+    ) is not None
 
 
 def test_management_submit_unknown_outbox_survives_disabled_bot_and_later_success(
