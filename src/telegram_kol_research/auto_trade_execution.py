@@ -14,7 +14,6 @@ from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_dr
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
-from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -40,6 +39,11 @@ from telegram_kol_research.recovery_scan import _resolve_signal_max_loss_usdt
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import apply_trading_settings_to_group_config
 from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.strategy_management_batches import load_management_batch
+from telegram_kol_research.strategy_management_batches import transition_batch
+from telegram_kol_research.strategy_management_planner import (
+    plan_strategy_management_batch,
+)
 
 
 def auto_process_message_trade_signal(
@@ -55,19 +59,21 @@ def auto_process_message_trade_signal(
 
     now = processed_at or datetime.now(UTC)
     settings = load_trading_settings(session_factory)
-    if not settings.auto_trade_enabled:
-        return {"status": "skipped", "reason": "auto_trade_disabled"}
-
     loaded = _load_best_entry_candidate(session_factory, raw_message_id=raw_message_id)
     if loaded is None:
+        if not settings.management_planning_enabled:
+            return {"status": "skipped", "reason": "management_execution_disabled"}
         return _auto_process_management_signal(
             session_factory,
             raw_message_id=raw_message_id,
             group_config=group_config,
             deepcoin_client=deepcoin_client,
+            contract_spec_provider=contract_spec_provider,
             settings=settings,
             processed_at=now,
         )
+    if not settings.auto_trade_enabled:
+        return {"status": "skipped", "reason": "auto_trade_disabled"}
     raw_message, candidate, source, has_media = loaded
     if candidate.parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
         return _record_entry_auto_trade_skip(
@@ -354,14 +360,19 @@ def _auto_process_management_signal(
     raw_message_id: int,
     group_config: GroupConfig,
     deepcoin_client: DeepcoinTradingClientProtocol,
+    contract_spec_provider: DeepcoinContractSpecProvider | None,
     settings,
     processed_at: datetime,
 ) -> dict[str, Any]:
-    loaded = _load_best_management_candidate(session_factory, raw_message_id=raw_message_id)
+    loaded = _load_best_management_candidate(
+        session_factory, raw_message_id=raw_message_id
+    )
     if loaded is None:
-        return {"status": "skipped", "reason": "no_entry_signal_candidate"}
+        return {"status": "skipped", "reason": "no_management_signal_candidate"}
     raw_message, candidate, source, has_media = loaded
-    runtime_group_config = apply_trading_settings_to_group_config(group_config, settings)
+    runtime_group_config = apply_trading_settings_to_group_config(
+        group_config, settings
+    )
     runtime_config = _resolve_runtime_config(
         runtime_group_config,
         raw_message=raw_message,
@@ -371,8 +382,7 @@ def _auto_process_management_signal(
         return {"status": "skipped", "reason": "group_not_configured_for_auto_trade"}
     if runtime_config["trading_mode"] != "auto_trade":
         return {"status": "skipped", "reason": "kol_or_group_auto_trade_disabled"}
-    symbol = (candidate.symbol or "").upper()
-    side = (candidate.side or "").lower()
+    symbol = str(candidate.symbol or "").upper()
     if not symbol or symbol not in {item.upper() for item in settings.allowed_symbols}:
         return {"status": "skipped", "reason": "symbol_not_allowed", "symbol": symbol}
     if candidate.confidence < settings.min_ai_confidence:
@@ -380,115 +390,43 @@ def _auto_process_management_signal(
     if has_media and not settings.allow_vision_auto_trade:
         return {"status": "skipped", "reason": "vision_auto_trade_disabled"}
 
-    if hasattr(deepcoin_client, "list_open_orders"):
-        reconcile_deepcoin_execution_bindings(
-            session_factory,
-            client=deepcoin_client,
-            recovered_at=processed_at,
-        )
-    partial_close_fraction = _extract_partial_close_fraction(raw_message.text)
-    if (
-        candidate.event_type == "position_update"
-        and partial_close_fraction is not None
-        and _requests_breakeven_protection(raw_message.text)
-    ):
-        bindings = _load_active_execution_bindings(
-            session_factory,
-            chat_id=raw_message.chat_id,
-            kol_id=str(runtime_config["kol_id"]),
-            symbol=symbol,
-            side=side,
-        )
-        if not bindings:
-            return {"status": "skipped", "reason": "no_execution_binding"}
-        action = "partial_close_and_move_stop_to_entry"
-        action_payload: dict[str, Any] = {
-            "targets": [
-                {"binding_id": binding.id, "fraction": partial_close_fraction}
-                for binding in bindings
-            ]
-        }
-        strategy_instance_id = None
-    else:
-        binding = _load_active_execution_binding(
-            session_factory,
-            chat_id=raw_message.chat_id,
-            kol_id=str(runtime_config["kol_id"]),
-            symbol=symbol,
-            side=side,
-        )
-        if binding is None:
-            return {"status": "skipped", "reason": "no_execution_binding"}
-
-        action_payload = {"binding_id": binding.id}
-        strategy_instance_id = binding.strategy_instance_id
-        if candidate.event_type == "close_signal":
-            action = "close_position" if binding.pos_id else "cancel_entry"
-        else:
-            if partial_close_fraction is not None:
-                action = "close_position"
-                action_payload["fraction"] = partial_close_fraction
-                action_payload["partial_close_reason"] = "partial_take_profit"
-            else:
-                reference_price = _safe_ticker_price(
-                    deepcoin_client,
-                    inst_id=_to_deepcoin_swap_instrument(symbol),
-                )
-                stop_loss = _first_price(
-                    candidate.stop_loss_text,
-                    symbol=symbol,
-                    reference_price=reference_price,
-                )
-                take_profit = _first_price(
-                    candidate.take_profit_text,
-                    symbol=symbol,
-                    reference_price=reference_price,
-                )
-                if stop_loss is not None:
-                    action_payload["stop_loss"] = stop_loss
-                if take_profit is not None:
-                    action_payload["take_profit"] = take_profit
-                if stop_loss is not None and take_profit is not None:
-                    action = "adjust_position_tpsl"
-                elif stop_loss is not None:
-                    action = "adjust_stop_loss"
-                elif take_profit is not None:
-                    action = "adjust_take_profit"
-                else:
-                    return {"status": "skipped", "reason": "no_tpsl_update"}
-
-    trade_signal = enqueue_trade_signal(
+    result = plan_strategy_management_batch(
         session_factory,
-        venue="deepcoin",
-        source_type="kol_management",
-        kol_id=str(runtime_config["kol_id"]),
-        chat_id=raw_message.chat_id,
-        message_id=raw_message.message_id,
-        symbol=symbol,
-        side=side,
-        action=action,
-        payload={
-            "source": {
-                "chat_id": raw_message.chat_id,
-                "message_id": raw_message.message_id,
-                "candidate_id": candidate.id,
-                "event_type": candidate.event_type,
-            },
-            **action_payload,
-        },
-        strategy_instance_id=strategy_instance_id,
-        enqueued_at=processed_at,
-    )
-    submit_result = process_trade_signal_live(
-        session_factory,
-        signal_id=trade_signal.id,
+        raw_message_id=raw_message_id,
         deepcoin_client=deepcoin_client,
-        processed_at=processed_at,
+        contract_spec_provider=contract_spec_provider,
+        planned_at=processed_at,
     )
+    if result.status != "ready" or result.batch is None:
+        return {
+            "status": "blocked" if result.status == "blocked" else result.status,
+            "reason": result.reason_code,
+            "batch_id": result.batch_id,
+        }
+    if settings.management_execution_mode == "shadow":
+        return {
+            "status": "shadow_planned",
+            "management_action": result.batch.effective_action,
+            "batch_id": result.batch.id,
+        }
+
+    # Task 6 replaces this temporary fail-closed transition with the batch-ID
+    # executor. Never leave a ready live-mode batch for a future worker to pick up.
+    transitioned = transition_batch(
+        session_factory,
+        result.batch.id,
+        expected_statuses={"ready", "executing", "reconciling"},
+        new_status="blocked",
+        transitioned_at=processed_at,
+        reason_code="management_executor_unavailable",
+    )
+    blocked_batch = load_management_batch(session_factory, result.batch.id)
+    if not transitioned or blocked_batch.status != "blocked":
+        raise RuntimeError("management executor unavailable batch was not blocked")
     return {
-        "status": "submitted",
-        "management_action": action,
-        "result": submit_result,
+        "status": "blocked",
+        "reason": "management_executor_unavailable",
+        "batch_id": result.batch.id,
     }
 
 

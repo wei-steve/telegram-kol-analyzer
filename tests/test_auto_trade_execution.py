@@ -1,5 +1,7 @@
 ﻿from datetime import UTC, datetime
 
+import pytest
+
 from telegram_kol_research.auto_trade_execution import _load_active_execution_binding
 from telegram_kol_research.auto_trade_execution import _load_active_execution_bindings
 from telegram_kol_research.auto_trade_execution import _extract_partial_close_fraction
@@ -258,6 +260,245 @@ def _group_config():
             )
         ]
     )
+
+
+@pytest.mark.parametrize(
+    ("mode", "auto_trade_enabled", "expected_status", "expected_reason"),
+    [
+        ("shadow", False, "shadow_planned", None),
+        ("live", True, "blocked", "management_executor_unavailable"),
+    ],
+)
+def test_management_planning_never_writes_before_batch_executor_exists(
+    tmp_path,
+    monkeypatch,
+    mode,
+    auto_trade_enabled,
+    expected_status,
+    expected_reason,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        entry = RawMessage(
+            chat_id=100,
+            message_id=54,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 7, 15, 7, 55, tzinfo=UTC),
+            text="BTC short",
+            archived_target_group=True,
+        )
+        management = RawMessage(
+            chat_id=100,
+            message_id=55,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 7, 15, 8, 0, tzinfo=UTC),
+            text="BTC short exit",
+            archived_target_group=True,
+        )
+        session.add_all([entry, management])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=54,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=entry.posted_at,
+        )
+        session.add(lifecycle)
+        session.flush()
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:54:BTC:short",
+            kol_id="group:100",
+            chat_id=100,
+            message_id=54,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            pos_id="pos-shadow",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        session.add(
+            SignalCandidate(
+                raw_message_id=management.id,
+                symbol="BTC",
+                side="short",
+                event_type="close_signal",
+                target_lifecycle_id=lifecycle.id,
+                management_action="full_exit",
+                recognition_generation="shadow-generation",
+                parse_source="mimo_authoritative",
+                confidence=0.99,
+            )
+        )
+        from telegram_kol_research.models import ExecutionOrderLeg, RecognitionDecision
+
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=0,
+                purpose="entry",
+                order_kind="market",
+                order_id="pos-shadow",
+                pos_id="pos-shadow",
+                venue="deepcoin",
+                attribution_status="verified",
+                attribution_evidence_json='{"policy_version": 2}',
+                status="active",
+            )
+        )
+        session.add(
+            RecognitionDecision(
+                raw_message_id=management.id,
+                input_kind="text",
+                authoritative_model="mimo",
+                authoritative_status="success",
+                authoritative_payload_json="{}",
+                agreement_status="authoritative_only",
+                differences_json="[]",
+            )
+        )
+        session.commit()
+        raw_message_id = management.id
+
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": auto_trade_enabled,
+            "management_execution_mode": mode,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.positions = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-shadow",
+            "posSide": "short",
+            "pos": "10",
+            "avgPx": "62000",
+            "mgnMode": "cross",
+            "posMode": "split",
+        }
+    ]
+    import telegram_kol_research.strategy_management_planner as planner
+
+    monkeypatch.setattr(
+        planner, "reconcile_deepcoin_execution_bindings", lambda *args, **kwargs: None
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 15, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == expected_status
+    if expected_reason is None:
+        assert result["management_action"] == "full_exit"
+    else:
+        assert result["reason"] == expected_reason
+        from telegram_kol_research.models import StrategyManagementBatch
+
+        with session_factory() as session:
+            batch = session.get(StrategyManagementBatch, result["batch_id"])
+            assert batch.status == "blocked"
+            assert batch.reason_code == "management_executor_unavailable"
+    assert isinstance(result["batch_id"], int)
+    assert fake_client.orders == []
+    assert fake_client.trigger_orders == []
+    assert fake_client.protections == []
+    assert fake_client.cancel_orders == []
+    assert fake_client.cancel_trigger_orders == []
+
+
+@pytest.mark.parametrize(
+    ("group_config", "allowed_symbols", "expected_reason"),
+    [
+        (
+            GroupConfig(
+                groups=[
+                    TargetGroupConfig(
+                        chat_title="Disabled",
+                        chat_id=100,
+                        enabled=True,
+                        trading_mode="notify_only",
+                    )
+                ]
+            ),
+            ["BTC", "ETH"],
+            "kol_or_group_auto_trade_disabled",
+        ),
+        (_group_config(), ["ETH"], "symbol_not_allowed"),
+    ],
+)
+def test_management_planning_preserves_runtime_risk_gates(
+    tmp_path, monkeypatch, group_config, allowed_symbols, expected_reason
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=99,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 7, 15, 8, 0, tzinfo=UTC),
+            text="BTC exit",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="short",
+                event_type="close_signal",
+                management_action="full_exit",
+                recognition_generation="risk-gate-generation",
+                parse_source="mimo_authoritative",
+                confidence=0.99,
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": False,
+            "management_execution_mode": "shadow",
+            "allowed_symbols": allowed_symbols,
+        },
+    )
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    monkeypatch.setattr(
+        auto_module,
+        "plan_strategy_management_batch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("planner must not run after a failed runtime gate")
+        ),
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_id,
+        group_config=group_config,
+        deepcoin_client=_FakeDeepcoinClient(),
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == expected_reason
 
 
 def test_auto_process_message_trade_signal_submits_live_order_with_protection(tmp_path):
@@ -765,10 +1006,11 @@ def test_auto_process_message_trade_signal_closes_position_from_close_signal(tmp
         processed_at=datetime(2026, 6, 12, 8, 6, tzinfo=UTC),
     )
 
-    assert result["status"] == "submitted"
-    assert result["management_action"] == "close_position"
-    assert fake_client.orders[0]["closePosId"] == "pos-1"
-    assert fake_client.orders[0]["side"] == "sell"
+    assert result == {
+        "status": "skipped",
+        "reason": "management_execution_disabled",
+    }
+    assert fake_client.orders == []
 
 
 def test_auto_process_close_signal_does_not_steal_live_position_from_other_chat(tmp_path):
@@ -874,7 +1116,7 @@ def test_auto_process_close_signal_does_not_steal_live_position_from_other_chat(
     )
 
     assert result["status"] == "skipped"
-    assert result["reason"] == "no_execution_binding"
+    assert result["reason"] == "management_execution_disabled"
     assert fake_client.orders == []
     with session_factory() as session:
         lifecycle = session.query(StrategyLifecycle).filter_by(chat_id=100, message_id=55).one()
@@ -885,7 +1127,7 @@ def test_auto_process_close_signal_does_not_steal_live_position_from_other_chat(
 
     assert lifecycle.execution_binding_id is None
     assert stale_binding.status == "stale"
-    assert stale_binding.last_exchange_status == "position_ownership_unassigned"
+    assert stale_binding.last_exchange_status == "expired_pending_entry_not_attributed"
     assert other_lifecycle.lifecycle_status == "expired"
     assert other_lifecycle.execution_binding_id is None
 
@@ -966,7 +1208,10 @@ def test_auto_process_close_signal_does_not_recover_ambiguous_positions(tmp_path
         processed_at=datetime(2026, 7, 2, 13, 8, tzinfo=UTC),
     )
 
-    assert result == {"status": "skipped", "reason": "no_execution_binding"}
+    assert result == {
+        "status": "skipped",
+        "reason": "management_execution_disabled",
+    }
     assert fake_client.orders == []
 
 
@@ -1037,13 +1282,16 @@ def test_auto_process_message_trade_signal_does_not_guess_filled_binding_before_
         processed_at=datetime(2026, 6, 12, 8, 6, tzinfo=UTC),
     )
 
-    assert result == {"status": "skipped", "reason": "no_execution_binding"}
+    assert result == {
+        "status": "skipped",
+        "reason": "management_execution_disabled",
+    }
     assert fake_client.orders == []
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
     assert binding.pos_id is None
-    assert binding.status == "stale"
-    assert binding.last_exchange_status == "position_ownership_unassigned"
+    assert binding.status == "open"
+    assert binding.last_exchange_status is None
 
 
 def test_auto_process_message_trade_signal_partially_closes_profit_percent(tmp_path):
@@ -1115,21 +1363,11 @@ def test_auto_process_message_trade_signal_partially_closes_profit_percent(tmp_p
         processed_at=datetime(2026, 6, 30, 20, 58, tzinfo=UTC),
     )
 
-    assert result["status"] == "submitted"
-    assert result["management_action"] == "close_position"
-    assert fake_client.orders == [
-        {
-            "instId": "BTC-USDT-SWAP",
-            "tdMode": "cross",
-            "side": "buy",
-            "posSide": "short",
-            "ordType": "market",
-            "sz": "4.9",
-            "mrgPosition": "split",
-            "closePosId": "pos-1",
-        }
-    ]
-    assert result["result"]["full_close"] is False
+    assert result == {
+        "status": "skipped",
+        "reason": "management_execution_disabled",
+    }
+    assert fake_client.orders == []
 
 
 def test_auto_process_message_trade_signal_adjusts_stop_loss_from_position_update(tmp_path):
@@ -1223,8 +1461,9 @@ def test_auto_process_message_trade_signal_adjusts_stop_loss_from_position_updat
         processed_at=datetime(2026, 6, 12, 8, 11, tzinfo=UTC),
     )
 
-    assert result["status"] == "submitted"
-    assert result["management_action"] == "adjust_stop_loss"
-    assert [item["ordId"] for item in fake_client.cancel_trigger_orders] == ["tp-old", "sl-old"]
-    assert fake_client.protections[0]["tpTriggerPx"] == "69000.0"
-    assert fake_client.protections[0]["slTriggerPx"] == "68050.0"
+    assert result == {
+        "status": "skipped",
+        "reason": "management_execution_disabled",
+    }
+    assert fake_client.cancel_trigger_orders == []
+    assert fake_client.protections == []

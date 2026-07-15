@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 import json
 from math import inf, isclose, isfinite
 import re
@@ -118,6 +119,84 @@ class EquivalentAttributionComponent:
 
 class PositionAttributionError(RuntimeError):
     """Raised when a live mutation lacks unique persisted position ownership."""
+
+
+def canonical_live_position_economics(
+    live_positions: Iterable[Mapping[str, object]],
+    *,
+    target_pos_ids: Iterable[str],
+    instrument_id: str,
+    side: str,
+) -> tuple[dict[str, str], ...]:
+    """Freeze exact exchange economics for a preselected position-ID set.
+
+    This helper deliberately cannot discover targets. It only validates and
+    canonicalizes the exact IDs selected through persisted ownership.
+    """
+
+    rows_by_pos_id: dict[str, list[Mapping[str, object]]] = {
+        str(pos_id): [] for pos_id in target_pos_ids if str(pos_id)
+    }
+    if not rows_by_pos_id:
+        raise PositionAttributionError("target_position_set_empty")
+    for row in live_positions:
+        pos_id = str(row.get("posId") or row.get("pos_id") or row.get("id") or "")
+        if pos_id in rows_by_pos_id:
+            rows_by_pos_id[pos_id].append(row)
+
+    result: list[dict[str, str]] = []
+    for pos_id in sorted(rows_by_pos_id):
+        matches = rows_by_pos_id[pos_id]
+        if len(matches) != 1:
+            raise PositionAttributionError("target_live_position_not_unique")
+        row = matches[0]
+        observed_instrument = str(
+            row.get("instId") or row.get("instrument_id") or row.get("symbol") or ""
+        ).upper()
+        if observed_instrument != str(instrument_id).upper():
+            raise PositionAttributionError("target_live_position_instrument_mismatch")
+        observed_side = str(row.get("posSide") or row.get("side") or "").lower()
+        if observed_side != str(side).lower():
+            raise PositionAttributionError("target_live_position_side_mismatch")
+        size = _canonical_positive_decimal(
+            row.get("pos") or row.get("size") or row.get("sz"),
+            reason="target_live_position_size_invalid",
+        )
+        avg_entry_price = _canonical_positive_decimal(
+            row.get("avgPx") or row.get("avg_entry_price") or row.get("entryPrice"),
+            reason="target_live_position_entry_price_invalid",
+        )
+        margin_mode = str(
+            row.get("mgnMode") or row.get("marginMode") or row.get("margin_mode") or ""
+        ).lower()
+        position_mode = str(
+            row.get("posMode") or row.get("positionMode") or row.get("position_mode") or ""
+        ).lower()
+        if not margin_mode or not position_mode:
+            raise PositionAttributionError("target_live_position_mode_unavailable")
+        result.append(
+            {
+                "pos_id": pos_id,
+                "instrument_id": observed_instrument,
+                "side": observed_side,
+                "size": size,
+                "avg_entry_price": avg_entry_price,
+                "margin_mode": margin_mode,
+                "position_mode": position_mode,
+            }
+        )
+    return tuple(result)
+
+
+def _canonical_positive_decimal(value: object, *, reason: str) -> str:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        raise PositionAttributionError(reason) from None
+    if not number.is_finite() or number <= 0:
+        raise PositionAttributionError(reason)
+    normalized = format(number.normalize(), "f")
+    return "0" if normalized == "-0" else normalized
 
 
 def require_verified_position_ownership(session, *, venue: str, pos_id: str):

@@ -1,0 +1,645 @@
+"""Fail-closed planning for exact-strategy Deepcoin management batches."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
+
+from sqlalchemy.orm import sessionmaker
+
+from telegram_kol_research.execution_bindings import (
+    build_strategy_instance_id,
+    reconcile_deepcoin_execution_bindings,
+)
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    RecognitionDecision,
+    SignalCandidate,
+    StrategyLifecycle,
+    StrategyManagementBatch,
+)
+from telegram_kol_research.position_attribution import (
+    TERMINAL_ENTRY_LEG_STATES,
+    PositionAttributionError,
+    canonical_live_position_economics,
+    require_equivalent_live_position_economics,
+    require_verified_position_ownership,
+)
+from telegram_kol_research.protection_attribution import match_position_protection
+from telegram_kol_research.position_authority_lock import position_authority_lock
+from telegram_kol_research.strategy_management_batches import (
+    ManagementBatchRecord,
+    ManagementLegCreate,
+    create_management_batch,
+    load_management_batch,
+)
+
+
+PROTECTION_INTENTS = frozenset({"adjust_stop_loss", "move_stop_to_break_even"})
+SUPPORTED_INTENTS = frozenset(
+    {"partial_take_profit", "full_exit", *PROTECTION_INTENTS}
+)
+
+
+class ManagementTargetChangedError(RuntimeError):
+    """Raised when a frozen batch target no longer matches fresh preflight."""
+
+
+@dataclass(frozen=True, slots=True)
+class ManagementPlanningResult:
+    status: str
+    reason_code: str | None = None
+    batch: ManagementBatchRecord | None = None
+    target_lifecycle_id: int | None = None
+
+    @property
+    def batch_id(self) -> int | None:
+        return self.batch.id if self.batch is not None else None
+
+
+@dataclass(frozen=True, slots=True)
+class _PlanningIdentity:
+    candidate: SignalCandidate
+    recognition_decision_id: int
+    lifecycle: StrategyLifecycle
+    binding: ExecutionBinding
+    entry_legs: tuple[ExecutionOrderLeg, ...]
+
+
+def plan_strategy_management_batch(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    deepcoin_client,
+    contract_spec_provider,
+    planned_at: datetime | None = None,
+) -> ManagementPlanningResult:
+    """Reconcile, reload, validate, and persist one immutable exact target."""
+
+    now = planned_at or datetime.now(UTC)
+    try:
+        reconcile_deepcoin_execution_bindings(
+            session_factory,
+            client=deepcoin_client,
+            recovered_at=now,
+        )
+    except Exception:
+        return ManagementPlanningResult(
+            status="blocked", reason_code="management_reconciliation_failed"
+        )
+
+    with position_authority_lock():
+        return _plan_strategy_management_batch_locked(
+            session_factory,
+            raw_message_id=raw_message_id,
+            deepcoin_client=deepcoin_client,
+            contract_spec_provider=contract_spec_provider,
+            planned_at=now,
+        )
+
+
+def _plan_strategy_management_batch_locked(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    deepcoin_client,
+    contract_spec_provider,
+    planned_at: datetime,
+) -> ManagementPlanningResult:
+    now = planned_at
+
+    identity_or_result = _load_exact_identity(
+        session_factory, raw_message_id=raw_message_id
+    )
+    if isinstance(identity_or_result, ManagementPlanningResult):
+        return identity_or_result
+    identity = identity_or_result
+    candidate = identity.candidate
+    lifecycle = identity.lifecycle
+    binding = identity.binding
+    intent = str(candidate.management_action or "").strip().lower()
+    if intent not in SUPPORTED_INTENTS:
+        return _persist_blocked(
+            session_factory,
+            identity=identity,
+            raw_message_id=raw_message_id,
+            intent=intent or "unknown",
+            reason_code="management_intent_not_supported",
+            planned_at=now,
+        )
+    idempotency_fingerprint = _idempotency_fingerprint(
+        raw_message_id=raw_message_id,
+        recognition_generation=str(candidate.recognition_generation),
+        lifecycle_id=lifecycle.id,
+        intent=intent,
+    )
+    existing = _load_existing_by_idempotency(
+        session_factory, idempotency_fingerprint=idempotency_fingerprint
+    )
+    if existing is not None:
+        return ManagementPlanningResult(
+            status=existing.status,
+            reason_code=existing.reason_code,
+            batch=existing,
+            target_lifecycle_id=lifecycle.id,
+        )
+
+    unsafe_reason = _unsafe_entry_leg_reason(identity.entry_legs, binding=binding)
+    if unsafe_reason is not None:
+        return _persist_blocked(
+            session_factory,
+            identity=identity,
+            raw_message_id=raw_message_id,
+            intent=intent,
+            reason_code=unsafe_reason,
+            planned_at=now,
+        )
+
+    instrument_id = f"{str(lifecycle.symbol).upper()}-USDT-SWAP"
+    try:
+        live_positions = _read_positions_once(
+            deepcoin_client, instrument_id=instrument_id
+        )
+        economics = canonical_live_position_economics(
+            live_positions,
+            target_pos_ids=[str(leg.pos_id) for leg in identity.entry_legs],
+            instrument_id=instrument_id,
+            side=str(lifecycle.side),
+        )
+        with session_factory() as session:
+            current_lifecycle = session.get(StrategyLifecycle, lifecycle.id)
+            current_binding = session.get(ExecutionBinding, binding.id)
+            if (
+                current_lifecycle is None
+                or current_binding is None
+                or current_lifecycle.execution_binding_id != current_binding.id
+                or not _binding_matches_lifecycle(current_binding, current_lifecycle)
+            ):
+                raise PositionAttributionError(
+                    "target_identity_changed_during_planning"
+                )
+            for detached_leg in identity.entry_legs:
+                current_leg = session.get(ExecutionOrderLeg, detached_leg.id)
+                if (
+                    current_leg is None
+                    or current_leg.execution_binding_id
+                    != detached_leg.execution_binding_id
+                    or current_leg.strategy_instance_id
+                    != detached_leg.strategy_instance_id
+                    or current_leg.pos_id != detached_leg.pos_id
+                    or current_leg.status != detached_leg.status
+                    or current_leg.attribution_status
+                    != detached_leg.attribution_status
+                ):
+                    raise PositionAttributionError(
+                        "target_identity_changed_during_planning"
+                    )
+                owner = require_verified_position_ownership(
+                    session, venue="deepcoin", pos_id=str(current_leg.pos_id)
+                )
+                if owner.id != current_leg.id:
+                    raise PositionAttributionError("position_ownership_not_unique")
+                require_equivalent_live_position_economics(
+                    owner, live_positions=live_positions, session=session
+                )
+        contract_spec = (
+            contract_spec_provider.get_contract_spec(instrument_id)
+            if contract_spec_provider is not None
+            else None
+        )
+        if contract_spec is None:
+            raise PositionAttributionError("target_contract_spec_unavailable")
+    except PositionAttributionError as exc:
+        return _persist_blocked(
+            session_factory,
+            identity=identity,
+            raw_message_id=raw_message_id,
+            intent=intent,
+            reason_code=_planning_reason_from_attribution(str(exc)),
+            planned_at=now,
+        )
+    except Exception:
+        return _persist_blocked(
+            session_factory,
+            identity=identity,
+            raw_message_id=raw_message_id,
+            intent=intent,
+            reason_code="target_position_snapshot_unavailable",
+            planned_at=now,
+        )
+
+    protection_by_pos_id: dict[str, dict[str, Any]] = {}
+    if intent in PROTECTION_INTENTS:
+        try:
+            tpsl_orders = _read_tpsl_once(
+                deepcoin_client, instrument_id=instrument_id
+            )
+        except Exception:
+            return _persist_blocked(
+                session_factory,
+                identity=identity,
+                raw_message_id=raw_message_id,
+                intent=intent,
+                reason_code="target_protection_evidence_unavailable",
+                planned_at=now,
+            )
+        matches = match_position_protection(
+            live_positions, tpsl_orders, evidence_available=True
+        )
+        for position in economics:
+            protection = matches.by_pos_id.get(position["pos_id"])
+            if protection is None or protection.status != "verified":
+                return _persist_blocked(
+                    session_factory,
+                    identity=identity,
+                    raw_message_id=raw_message_id,
+                    intent=intent,
+                    reason_code="target_protection_not_verified",
+                    planned_at=now,
+                )
+            if not protection.order_ids:
+                return _persist_blocked(
+                    session_factory,
+                    identity=identity,
+                    raw_message_id=raw_message_id,
+                    intent=intent,
+                    reason_code="target_protection_order_identity_unavailable",
+                    planned_at=now,
+                )
+            protection_by_pos_id[position["pos_id"]] = {
+                "status": protection.status,
+                "stop_loss": protection.stop_loss,
+                "take_profits": list(protection.take_profits),
+                "order_ids": list(protection.order_ids),
+                "evidence": protection.evidence,
+            }
+
+    effective_fraction = _effective_fraction(intent, candidate.management_fraction)
+    target_snapshot = {
+        "identity": {
+            "target_lifecycle_id": lifecycle.id,
+            "execution_binding_id": binding.id,
+            "strategy_instance_id": binding.strategy_instance_id,
+        },
+        "positions": [
+            {
+                **position,
+                "execution_order_leg_id": _leg_by_pos_id(identity.entry_legs)[
+                    position["pos_id"]
+                ].id,
+            }
+            for position in economics
+        ],
+        "contract_spec": contract_spec.to_dict(),
+        "protection": protection_by_pos_id,
+    }
+    target_fingerprint = management_target_fingerprint(target_snapshot)
+    legs_by_pos_id = _leg_by_pos_id(identity.entry_legs)
+    batch = create_management_batch(
+        session_factory,
+        idempotency_fingerprint=idempotency_fingerprint,
+        raw_message_id=raw_message_id,
+        recognition_decision_id=identity.recognition_decision_id,
+        recognition_generation=str(candidate.recognition_generation),
+        target_lifecycle_id=lifecycle.id,
+        strategy_instance_id=str(binding.strategy_instance_id),
+        execution_binding_id=binding.id,
+        intent=intent,
+        effective_action=intent,
+        requested_fraction=candidate.management_fraction,
+        effective_fraction=effective_fraction,
+        partial_round_before=0,
+        target_fingerprint=target_fingerprint,
+        target_snapshot=target_snapshot,
+        planned_at=now,
+        legs=[
+            ManagementLegCreate(
+                execution_order_leg_id=legs_by_pos_id[position["pos_id"]].id,
+                pos_id=position["pos_id"],
+                leg_index=index,
+                preflight_size=position["size"],
+                planned_close_size=_planned_close_size(
+                    position["size"], effective_fraction=effective_fraction
+                ),
+                avg_entry_price=position["avg_entry_price"],
+                quantity_step=str(contract_spec.quantity_step),
+                old_tpsl=protection_by_pos_id.get(position["pos_id"]),
+                planned_tpsl=(
+                    {
+                        "intent": intent,
+                        "stop_loss_text": candidate.stop_loss_text,
+                    }
+                    if intent in PROTECTION_INTENTS
+                    else None
+                ),
+                last_exchange_snapshot=position,
+            )
+            for index, position in enumerate(economics)
+        ],
+    )
+    return ManagementPlanningResult(
+        status="ready", batch=batch, target_lifecycle_id=lifecycle.id
+    )
+
+
+def management_target_fingerprint(target_snapshot: Any) -> str:
+    encoded = json.dumps(
+        target_snapshot,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def require_unchanged_target_fingerprint(
+    expected_fingerprint: str, target_snapshot: Any
+) -> None:
+    if management_target_fingerprint(target_snapshot) != str(expected_fingerprint):
+        raise ManagementTargetChangedError("management_target_changed")
+
+
+def _load_exact_identity(
+    session_factory: sessionmaker, *, raw_message_id: int
+) -> _PlanningIdentity | ManagementPlanningResult:
+    with session_factory() as session:
+        decision = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == raw_message_id)
+            .one_or_none()
+        )
+        candidate = (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == raw_message_id)
+            .filter(SignalCandidate.parse_source == "mimo_authoritative")
+            .order_by(SignalCandidate.confidence.desc(), SignalCandidate.id.asc())
+            .first()
+        )
+        lifecycle_id = candidate.target_lifecycle_id if candidate is not None else None
+        if decision is None or candidate is None or not candidate.recognition_generation:
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="authoritative_management_candidate_not_found",
+                target_lifecycle_id=lifecycle_id,
+            )
+        if lifecycle_id is None:
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="target_lifecycle_not_found",
+            )
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        if lifecycle is None:
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="target_lifecycle_not_found",
+                target_lifecycle_id=lifecycle_id,
+            )
+        if lifecycle.execution_binding_id is None:
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="target_strategy_binding_not_found",
+                target_lifecycle_id=lifecycle.id,
+            )
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        if (
+            binding is None
+            or str(binding.venue or "").lower() != "deepcoin"
+            or str(binding.status or "").lower() not in {"open", "active"}
+            or not binding.strategy_instance_id
+            or not _binding_matches_lifecycle(binding, lifecycle)
+        ):
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="target_strategy_binding_not_found",
+                target_lifecycle_id=lifecycle.id,
+            )
+        bindings = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .filter(ExecutionBinding.strategy_instance_id == binding.strategy_instance_id)
+            .filter(ExecutionBinding.status.in_(["open", "active"]))
+            .all()
+        )
+        if len(bindings) != 1 or bindings[0].id != binding.id:
+            session.expunge(candidate)
+            session.expunge(lifecycle)
+            session.expunge(binding)
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="target_strategy_binding_not_unique",
+                target_lifecycle_id=lifecycle.id,
+            )
+        entry_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == binding.id)
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .order_by(ExecutionOrderLeg.leg_index.asc(), ExecutionOrderLeg.id.asc())
+            .all()
+        )
+        session.expunge(candidate)
+        session.expunge(lifecycle)
+        session.expunge(binding)
+        for leg in entry_legs:
+            session.expunge(leg)
+        return _PlanningIdentity(
+            candidate=candidate,
+            recognition_decision_id=decision.id,
+            lifecycle=lifecycle,
+            binding=binding,
+            entry_legs=tuple(entry_legs),
+        )
+
+
+def _unsafe_entry_leg_reason(
+    entry_legs: tuple[ExecutionOrderLeg, ...], *, binding: ExecutionBinding
+) -> str | None:
+    if not entry_legs:
+        return "target_position_ownership_not_found"
+    position_ids: list[str] = []
+    for leg in entry_legs:
+        if leg.execution_binding_id != binding.id or (
+            leg.strategy_instance_id != binding.strategy_instance_id
+        ):
+            return "target_strategy_identity_mismatch"
+        if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+            return "target_position_ownership_terminal"
+        state = str(leg.attribution_status or "unassigned")
+        if state == "attribution_conflict":
+            return "target_position_ownership_conflict"
+        if state == "evidence_unavailable":
+            return "target_position_evidence_unavailable"
+        if state != "verified" or not leg.pos_id:
+            return "target_position_ownership_not_verified"
+        position_ids.append(str(leg.pos_id))
+    if len(position_ids) != len(set(position_ids)):
+        return "target_position_ownership_not_unique"
+    if binding.pos_id and str(binding.pos_id) not in set(position_ids):
+        return "target_binding_position_mismatch"
+    return None
+
+
+def _binding_matches_lifecycle(
+    binding: ExecutionBinding, lifecycle: StrategyLifecycle
+) -> bool:
+    expected_strategy_instance_id = build_strategy_instance_id(
+        venue="deepcoin",
+        chat_id=lifecycle.chat_id,
+        message_id=lifecycle.message_id,
+        symbol=lifecycle.symbol,
+        side=lifecycle.side,
+    )
+    return bool(
+        binding.chat_id == lifecycle.chat_id
+        and binding.message_id == lifecycle.message_id
+        and str(binding.symbol or "").upper() == str(lifecycle.symbol or "").upper()
+        and str(binding.side or "").lower() == str(lifecycle.side or "").lower()
+        and binding.strategy_instance_id == expected_strategy_instance_id
+    )
+
+
+def _persist_blocked(
+    session_factory: sessionmaker,
+    *,
+    identity: _PlanningIdentity,
+    raw_message_id: int,
+    intent: str,
+    reason_code: str,
+    planned_at: datetime,
+) -> ManagementPlanningResult:
+    candidate = identity.candidate
+    binding = identity.binding
+    lifecycle = identity.lifecycle
+    idempotency_fingerprint = _idempotency_fingerprint(
+        raw_message_id=raw_message_id,
+        recognition_generation=str(candidate.recognition_generation),
+        lifecycle_id=lifecycle.id,
+        intent=intent,
+    )
+    existing = _load_existing_by_idempotency(
+        session_factory, idempotency_fingerprint=idempotency_fingerprint
+    )
+    if existing is None:
+        target_snapshot = {
+            "identity": {
+                "target_lifecycle_id": lifecycle.id,
+                "execution_binding_id": binding.id,
+                "strategy_instance_id": binding.strategy_instance_id,
+            },
+            "positions": [],
+            "blocked_reason": reason_code,
+        }
+        existing = create_management_batch(
+            session_factory,
+            idempotency_fingerprint=idempotency_fingerprint,
+            raw_message_id=raw_message_id,
+            recognition_decision_id=identity.recognition_decision_id,
+            recognition_generation=str(candidate.recognition_generation),
+            target_lifecycle_id=lifecycle.id,
+            strategy_instance_id=str(binding.strategy_instance_id),
+            execution_binding_id=binding.id,
+            intent=intent,
+            effective_action=intent,
+            requested_fraction=candidate.management_fraction,
+            effective_fraction=_effective_fraction(intent, candidate.management_fraction),
+            partial_round_before=0,
+            status="blocked",
+            reason_code=reason_code,
+            target_fingerprint=management_target_fingerprint(target_snapshot),
+            target_snapshot=target_snapshot,
+            planned_at=planned_at,
+            legs=[],
+        )
+    return ManagementPlanningResult(
+        status="blocked",
+        reason_code=reason_code,
+        batch=existing,
+        target_lifecycle_id=lifecycle.id,
+    )
+
+
+def _read_positions_once(client, *, instrument_id: str) -> list[dict[str, Any]]:
+    method = getattr(client, "list_positions", None)
+    if method is None:
+        raise RuntimeError("positions method unavailable")
+    try:
+        rows = method(inst_id=instrument_id)
+    except TypeError:
+        rows = method()
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise RuntimeError("invalid positions response")
+    return rows
+
+
+def _read_tpsl_once(client, *, instrument_id: str) -> list[dict[str, Any]]:
+    method = getattr(client, "list_trigger_orders_pending", None)
+    if method is None:
+        raise RuntimeError("TPSL method unavailable")
+    rows = method(inst_id=instrument_id)
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise RuntimeError("invalid TPSL response")
+    return rows
+
+
+def _effective_fraction(intent: str, requested_fraction: float | None) -> float | None:
+    if intent == "full_exit":
+        return 1.0
+    if intent == "partial_take_profit":
+        return float(requested_fraction) if requested_fraction is not None else 0.5
+    return None
+
+
+def _planned_close_size(size: str, *, effective_fraction: float | None) -> str | None:
+    if effective_fraction is None:
+        return None
+    return format((Decimal(size) * Decimal(str(effective_fraction))).normalize(), "f")
+
+
+def _leg_by_pos_id(
+    entry_legs: tuple[ExecutionOrderLeg, ...],
+) -> dict[str, ExecutionOrderLeg]:
+    return {str(leg.pos_id): leg for leg in entry_legs}
+
+
+def _idempotency_fingerprint(
+    *, raw_message_id: int, recognition_generation: str, lifecycle_id: int, intent: str
+) -> str:
+    return management_target_fingerprint(
+        {
+            "raw_message_id": raw_message_id,
+            "recognition_generation": recognition_generation,
+            "target_lifecycle_id": lifecycle_id,
+            "intent": intent,
+        }
+    )
+
+
+def _load_existing_by_idempotency(
+    session_factory: sessionmaker, *, idempotency_fingerprint: str
+) -> ManagementBatchRecord | None:
+    with session_factory() as session:
+        row = (
+            session.query(StrategyManagementBatch.id)
+            .filter(
+                StrategyManagementBatch.idempotency_fingerprint
+                == idempotency_fingerprint
+            )
+            .one_or_none()
+        )
+    return load_management_batch(session_factory, row[0]) if row is not None else None
+
+
+def _planning_reason_from_attribution(reason: str) -> str:
+    if reason.startswith("position_ownership_not_verified:attribution_conflict"):
+        return "target_position_ownership_conflict"
+    if reason.startswith("position_ownership_not_verified:evidence_unavailable"):
+        return "target_position_evidence_unavailable"
+    if reason.startswith("position_ownership_not_verified"):
+        return "target_position_ownership_not_verified"
+    if reason == "position_ownership_terminal":
+        return "target_position_ownership_terminal"
+    return reason
