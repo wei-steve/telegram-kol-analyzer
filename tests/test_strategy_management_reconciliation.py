@@ -555,3 +555,79 @@ def test_overclose_or_position_growth_is_inconsistent_and_never_succeeds(tmp_pat
     stored = load_management_batch(sf, batch.id)
     assert stored.status == "recovery_required"
     assert stored.legs[0].status == "inconsistent"
+
+
+def test_composite_protection_unknown_is_never_reprocessed_as_close_phase(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action="partial_then_break_even")
+    assert transition_batch(
+        sf,
+        batch.id,
+        expected_statuses={"reconciling"},
+        new_status="recovery_required",
+        reason_code="protection_recovery_required",
+    )
+    assert transition_leg(
+        sf,
+        batch.legs[0].id,
+        expected_statuses={"submitted"},
+        new_status="recovery_required",
+        last_error={"stage": "replace_protection_outcome_unknown"},
+    )
+
+    _reconcile_management(sf, positions=[_position("pos-1", "1")])
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "protection_recovery_required"
+    assert [leg.status for leg in stored.legs] == ["recovery_required"]
+    assert stored.legs[0].last_error == {
+        "stage": "replace_protection_outcome_unknown"
+    }
+
+
+def test_composite_restored_partial_failure_is_never_reprocessed_as_close_phase(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(
+        sf,
+        action="partial_then_break_even",
+        sizes=("1", "2"),
+        preflight=("2", "4"),
+    )
+    assert transition_batch(
+        sf,
+        batch.id,
+        expected_statuses={"reconciling"},
+        new_status="partial_failed",
+        reason_code="protection_replacement_failed_and_restored",
+    )
+    assert transition_leg(
+        sf,
+        batch.legs[0].id,
+        expected_statuses={"submitted"},
+        new_status="succeeded",
+    )
+    assert transition_leg(
+        sf,
+        batch.legs[1].id,
+        expected_statuses={"submitted"},
+        new_status="restored",
+        last_error={"stage": "replace_protection"},
+    )
+
+    _reconcile_management(
+        sf,
+        positions=[_position("pos-1", "1"), _position("pos-2", "2")],
+        orders=[
+            {"ordId": "close-1", "clOrdId": "TMCLIENT1"},
+            {"ordId": "close-2", "clOrdId": "TMCLIENT2"},
+        ],
+    )
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "partial_failed"
+    assert stored.reason_code == "protection_replacement_failed_and_restored"
+    assert [leg.status for leg in stored.legs] == ["succeeded", "restored"]
+    assert stored.legs[1].last_error == {"stage": "replace_protection"}

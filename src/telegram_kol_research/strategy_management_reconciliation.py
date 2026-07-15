@@ -35,6 +35,9 @@ _CLOSE_ACTIONS = frozenset(
 )
 _ORDER_ID_KEYS = ("ordId", "orderId", "order_id", "id")
 _CLIENT_ORDER_ID_KEYS = ("clOrdId", "clientOrderId", "client_order_id")
+_PROTECTION_PHASE_LEG_STATES = frozenset(
+    {"succeeded", "restored", "recovery_required"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,13 +75,15 @@ def reconcile_strategy_management_batches(
         for batch in batches:
             if batch.effective_action not in _CLOSE_ACTIONS:
                 continue
-            counts["checked"] += 1
             legs = (
                 session.query(StrategyManagementLeg)
                 .filter(StrategyManagementLeg.management_batch_id == batch.id)
                 .order_by(StrategyManagementLeg.leg_index.asc(), StrategyManagementLeg.id.asc())
                 .all()
             )
+            if _composite_protection_phase_started(batch, legs):
+                continue
+            counts["checked"] += 1
             if not legs or not _identity_is_exact(session, batch, legs):
                 _freeze_batch(
                     batch,
@@ -150,6 +155,20 @@ def reconcile_strategy_management_batches(
         session.commit()
 
     return ManagementReconciliationResult(**counts)
+
+
+def _composite_protection_phase_started(batch, legs) -> bool:
+    """Keep close reconciliation permanently out after phase hand-off."""
+
+    if batch.effective_action != "partial_then_break_even":
+        return False
+    reason = str(batch.reason_code or "")
+    return bool(
+        batch.status == "protection_ready"
+        or reason.startswith("protection_")
+        or reason.startswith("all_position_protection_")
+        or any(str(leg.status or "") in _PROTECTION_PHASE_LEG_STATES for leg in legs)
+    )
 
 
 def _reconcile_leg(
