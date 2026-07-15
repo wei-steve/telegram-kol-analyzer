@@ -440,6 +440,20 @@ def _apply_reconcile_snapshot(
             .all()
         )
         bindings_by_id = {int(binding.id): binding for binding in bindings}
+        manual_terminal_binding_ids = _manual_terminal_binding_ids(
+            session, bindings=bindings
+        )
+        for leg in legs:
+            if int(leg.execution_binding_id) not in manual_terminal_binding_ids:
+                continue
+            if (
+                str(leg.status or "").lower() == "manually_closed"
+                and leg.terminal_reason
+            ):
+                continue
+            leg.status = "manually_closed"
+            leg.terminal_reason = "manual_lifecycle_terminal"
+            leg.updated_at = recovered_at
         reserved_pos_ids = {
             str(pos_id)
             for (pos_id,) in (
@@ -451,6 +465,8 @@ def _apply_reconcile_snapshot(
 
         if snapshot.errors:
             for leg in legs:
+                if int(leg.execution_binding_id) in manual_terminal_binding_ids:
+                    continue
                 if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
                     continue
                 if leg.pos_id and str(leg.pos_id) in reserved_pos_ids:
@@ -465,6 +481,9 @@ def _apply_reconcile_snapshot(
                     recovered_at=recovered_at,
                 )
             for binding in bindings:
+                if int(binding.id) in manual_terminal_binding_ids:
+                    _count_reconcile_binding(result, binding)
+                    continue
                 binding.last_exchange_status = "position_attribution_evidence_unavailable"
                 binding.recovered_at = recovered_at
                 binding.updated_at = recovered_at
@@ -474,7 +493,11 @@ def _apply_reconcile_snapshot(
             return result
 
         _refresh_exact_entry_leg_states(
-            legs,
+            [
+                leg
+                for leg in legs
+                if int(leg.execution_binding_id) not in manual_terminal_binding_ids
+            ],
             snapshot=snapshot,
             recovered_at=recovered_at,
         )
@@ -505,6 +528,7 @@ def _apply_reconcile_snapshot(
             )
             for leg in legs
             if not (leg.pos_id and str(leg.pos_id) in reserved_pos_ids)
+            and int(leg.execution_binding_id) not in manual_terminal_binding_ids
         ]
         attribution = match_entry_legs_to_positions(leg_rows, position_rows, fill_rows)
         legs_by_id = {int(leg.id): leg for leg in legs}
@@ -524,9 +548,6 @@ def _apply_reconcile_snapshot(
             for leg_id in evidence["candidate_leg_ids"]:
                 conflict_evidence_by_leg[int(leg_id)] = evidence
         assignments = dict(attribution.assignments)
-        manual_terminal_binding_ids = _manual_terminal_binding_ids(
-            session, bindings=bindings
-        )
         existing_owner_by_position = {
             str(leg.pos_id): int(leg.id)
             for leg in legs
@@ -574,6 +595,8 @@ def _apply_reconcile_snapshot(
 
         for leg in legs:
             leg_id = int(leg.id)
+            if int(leg.execution_binding_id) in manual_terminal_binding_ids:
+                continue
             if leg.pos_id and str(leg.pos_id) in reserved_pos_ids:
                 continue
             if leg_id in assignments:
@@ -615,6 +638,9 @@ def _apply_reconcile_snapshot(
                 symbol=binding.symbol,
                 side=binding.side,
             )
+            if int(binding.id) in manual_terminal_binding_ids:
+                _count_reconcile_binding(result, binding)
+                continue
             binding_legs = [
                 leg for leg in legs if int(leg.execution_binding_id) == int(binding.id)
             ]

@@ -2220,15 +2220,79 @@ def test_reconcile_does_not_reopen_manually_exited_strategy_when_old_leg_fills(t
         lifecycle = session.query(StrategyLifecycle).one()
 
     legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
-    assert binding.status == "unknown"
-    assert binding.pos_id is None
+    assert binding.status == "closed"
+    assert binding.pos_id == "old-pos"
     assert lifecycle.lifecycle_status == "exited"
     assert lifecycle.exit_reason == "manual"
     assert [(leg.order_id, leg.pos_id) for leg in legs] == [
         ("filled-trigger", None),
         ("pending-trigger", None),
     ]
-    assert legs[1].attribution_status == "attribution_conflict"
+    assert [leg.status for leg in legs] == ["manually_closed", "manually_closed"]
+    assert [leg.terminal_reason for leg in legs] == [
+        "manual_lifecycle_terminal",
+        "manual_lifecycle_terminal",
+    ]
+    assert [leg.attribution_status for leg in legs] == ["unassigned", "unassigned"]
+
+
+def test_reconcile_manual_lifecycle_terminalizes_legacy_backfilled_closed_leg(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            symbol="ETH",
+            side="short",
+            order_id="legacy-order",
+            client_order_id="legacy-client",
+            status="closed",
+            last_exchange_status="manual_closed_by_user",
+        ),
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="ETH",
+                side="short",
+                lifecycle_status="exited",
+                exit_reason="manual",
+                signal_at=datetime(2026, 7, 8, 3, 44),
+                exited_at=datetime(2026, 7, 8, 7, 6),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class EmptySnapshotClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=EmptySnapshotClient(),
+        recovered_at=datetime(2026, 7, 15, 10, 30),
+    )
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.query(ExecutionOrderLeg).filter_by(execution_binding_id=binding_id).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+        assert (binding.status, binding.last_exchange_status) == (
+            "closed",
+            "manual_closed_by_user",
+        )
+        assert (lifecycle.lifecycle_status, lifecycle.exit_reason) == ("exited", "manual")
+        assert (leg.status, leg.terminal_reason) == (
+            "manually_closed",
+            "manual_lifecycle_terminal",
+        )
+        assert leg.pos_id is None
+        assert leg.attribution_status == "unassigned"
 
 
 def test_reconcile_recovers_second_leg_when_first_leg_is_no_longer_active(tmp_path):

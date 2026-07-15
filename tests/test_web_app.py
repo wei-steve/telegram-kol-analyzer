@@ -26,6 +26,7 @@ from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.web_app import _persisted_position_attribution
 from telegram_kol_research.group_config import load_group_config
+from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
@@ -1053,6 +1054,175 @@ def test_manual_close_api_marks_lifecycle_and_binding_closed(tmp_path):
         assert lifecycle.exit_price_actual == 59500
         assert binding.status == "closed"
         assert binding.last_exchange_status.startswith("manual_closed_by_user")
+
+
+def test_manual_close_terminalizes_entry_legs_and_reconcile_cannot_revive_them(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=10,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 15, 9, 0),
+            entered_at=datetime(2026, 7, 15, 9, 1),
+        )
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=10,
+            symbol="ETH",
+            side="short",
+            status="open",
+            order_id="old-trigger,new-position",
+            client_order_id="old-client,new-client",
+            last_exchange_status="entry_order_pending",
+        )
+        session.add_all([lifecycle, binding])
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id="old-trigger",
+                    client_order_id="old-client",
+                    venue="deepcoin",
+                    status="open",
+                    attribution_status="unassigned",
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    leg_index=2,
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id="new-position",
+                    client_order_id="new-client",
+                    venue="deepcoin",
+                    status="open",
+                    attribution_status="unassigned",
+                ),
+            ]
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+        binding_id = binding.id
+
+    client = TestClient(app)
+    first = client.post(
+        f"/api/strategy-lifecycles/{lifecycle_id}/manual-close",
+        json={"note": "exchange position closed by operator"},
+    )
+
+    assert first.status_code == 200
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, binding_id)
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, purpose="entry")
+            .order_by(ExecutionOrderLeg.leg_index)
+            .all()
+        )
+        assert (lifecycle.lifecycle_status, lifecycle.exit_reason) == ("exited", "manual")
+        assert (binding.status, binding.last_exchange_status) == (
+            "closed",
+            "manual_closed_by_user: exchange position closed by operator",
+        )
+        assert [leg.status for leg in legs] == ["manually_closed", "manually_closed"]
+        assert [leg.terminal_reason for leg in legs] == [
+            "manual_closed_by_user",
+            "manual_closed_by_user",
+        ]
+        assert [leg.pos_id for leg in legs] == [None, None]
+        assert [leg.attribution_status for leg in legs] == ["unassigned", "unassigned"]
+
+    class FakeSnapshotClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "new-position",
+                    "posSide": "short",
+                    "pos": "2",
+                    "avgPx": "3000",
+                    "cTime": "1784077320000",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "old-trigger",
+                    "clOrdId": "old-client",
+                    "state": "filled",
+                    "posSide": "short",
+                    "side": "sell",
+                    "sz": "2",
+                    "px": "3000",
+                    "triggerTime": "1784070000000",
+                    "errorCode": "0",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "new-position",
+                    "clOrdId": "new-client",
+                    "state": "filled",
+                    "posSide": "short",
+                    "side": "sell",
+                    "sz": "2",
+                    "px": "3000",
+                    "triggerTime": "1784077320000",
+                    "errorCode": "0",
+                },
+            ]
+
+    reconcile_deepcoin_execution_bindings(
+        app.state.session_factory,
+        client=FakeSnapshotClient(),
+        recovered_at=datetime(2026, 7, 15, 10, 30),
+    )
+    second = client.post(f"/api/strategy-lifecycles/{lifecycle_id}/manual-close", json={})
+
+    assert second.status_code == 409
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, binding_id)
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, purpose="entry")
+            .order_by(ExecutionOrderLeg.leg_index)
+            .all()
+        )
+        assert (lifecycle.lifecycle_status, lifecycle.exit_reason) == ("exited", "manual")
+        assert (binding.status, binding.last_exchange_status) == (
+            "closed",
+            "manual_closed_by_user: exchange position closed by operator",
+        )
+        assert [leg.status for leg in legs] == ["manually_closed", "manually_closed"]
+        assert [leg.terminal_reason for leg in legs] == [
+            "manual_closed_by_user",
+            "manual_closed_by_user",
+        ]
+        assert [leg.pos_id for leg in legs] == [None, None]
+        assert [leg.attribution_status for leg in legs] == ["unassigned", "unassigned"]
 
 
 def test_bound_position_close_api_rejects_unbound_or_ambiguous_position_before_order_submission(tmp_path):

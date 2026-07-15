@@ -285,3 +285,21 @@ older Miya repair output and fingerprints are void. After deployment:
 
 These are deployment-time audit requirements, not a claim that production has
 already been checked or repaired.
+
+## 12. Record External Manual Position Closure
+
+Closing a position directly in Deepcoin does not, by itself, authorize the
+service to guess which strategy ended. Exchange position absence is not
+position-attribution evidence.
+
+After an operator has independently verified the exact strategy affected by an
+external close, use that strategy's Web `manual-close` action (or another
+reviewed entry point that calls the same audited transition). The transition
+must atomically mark the lifecycle `exited/manual`, the binding
+`closed/manual_closed_by_user`, and every entry leg `manually_closed` with a
+manual terminal reason. Later reconciliation must preserve those terminal
+states and must not attach an old filled order to a same-symbol position.
+
+Do not use a missing-position snapshot to perform this transition
+automatically. If strategy identity is uncertain, keep the investigation
+read-only and route the case through the reviewed repair/fingerprint workflow.

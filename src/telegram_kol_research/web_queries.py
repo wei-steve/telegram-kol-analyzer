@@ -1804,6 +1804,7 @@ def mark_strategy_lifecycle_manual_close(
 
     from telegram_kol_research.models import (
         ExecutionBinding,
+        ExecutionOrderLeg,
         StrategyLifecycle,
         TradeIdea,
     )
@@ -1849,6 +1850,16 @@ def mark_strategy_lifecycle_manual_close(
                 else f"manual_closed_by_user: {note}"[:64]
             )
             binding.updated_at = now
+            entry_legs = (
+                session.query(ExecutionOrderLeg)
+                .filter(ExecutionOrderLeg.execution_binding_id == int(binding.id))
+                .filter(ExecutionOrderLeg.purpose == "entry")
+                .all()
+            )
+            for leg in entry_legs:
+                leg.status = "manually_closed"
+                leg.terminal_reason = "manual_closed_by_user"
+                leg.updated_at = now
 
         result = {
             "lifecycle_id": lifecycle.id,
