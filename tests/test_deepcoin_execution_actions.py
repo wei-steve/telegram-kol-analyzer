@@ -15,7 +15,13 @@ from telegram_kol_research.execution_bindings import list_execution_order_legs
 from telegram_kol_research.execution_bindings import upsert_execution_binding
 from telegram_kol_research.execution_bindings import upsert_execution_order_leg
 from telegram_kol_research.execution_events import list_execution_events
+from telegram_kol_research.execution_events import ExecutionEventRecord
+from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg, StrategyLifecycle
+from telegram_kol_research.position_attribution_repair import (
+    apply_position_attribution_repair_plan,
+    build_position_attribution_repair_plan,
+)
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import save_trading_settings
@@ -143,6 +149,24 @@ def _binding(session_factory, **overrides):
 def _persist_reviewed_equivalent_assignments(session_factory, *, mutate=None):
     with session_factory() as session:
         legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.leg_index).all()
+        binding = session.get(ExecutionBinding, legs[0].execution_binding_id)
+        binding.payload_json = json.dumps(
+            {
+                "draft": {
+                    "stop_loss": 1560.0,
+                    "take_profit_legs": [{"price": 1600.0}],
+                }
+            }
+        )
+        for leg in legs:
+            leg.request_json = json.dumps(
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posSide": "long",
+                    "sz": "0.1",
+                    "px": "1580",
+                }
+            )
         leg_ids = [leg.id for leg in legs]
         position_ids = [str(leg.pos_id) for leg in legs]
         evidence = {
@@ -339,7 +363,10 @@ def test_exact_bound_close_rejects_legacy_weak_verified_evidence(tmp_path):
 
     with pytest.raises(
         DeepcoinExecutionActionError,
-        match="position_ownership_evidence_not_authoritative",
+        match=(
+            "position_ownership_evidence_not_authoritative|"
+            "position_not_bound_to_exactly_one_active_binding"
+        ),
     ):
         close_bound_position_market(
             session_factory,
@@ -384,7 +411,27 @@ def test_reviewed_equivalent_assignments_authorize_close_and_tpsl_management(tmp
     )
     _persist_reviewed_equivalent_assignments(session_factory)
     client = _FakeDeepcoinClient()
+    client.positions = [
+        {
+            "posId": "pos-1",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.1",
+            "avgPx": "1580",
+            "slTriggerPx": "1560",
+            "tpTriggerPx": "1600",
+            "mgnMode": "cross",
+            "mrgPosition": "split",
+            "cTime": "1000",
+        }
+    ]
 
+    close = close_bound_position_market(
+        session_factory,
+        pos_id="pos-1",
+        deepcoin_client=client,
+    )
+    client.positions = [client.positions[0]]
     protection = adjust_position_tpsl(
         session_factory,
         trade_signal=_signal(
@@ -394,15 +441,364 @@ def test_reviewed_equivalent_assignments_authorize_close_and_tpsl_management(tmp
         ),
         deepcoin_client=client,
     )
+
+    assert protection["submitted"] is True
+    assert close["submitted"] is True
+    assert close["pos_id"] == "pos-1"
+
+
+def test_repair_produced_equivalent_evidence_authorizes_complete_live_management(
+    tmp_path
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.pos_id = None
+        binding.payload_json = json.dumps(
+            {
+                "draft": {
+                    "stop_loss": 1560.0,
+                    "take_profit_legs": [{"price": 1600.0}],
+                }
+            }
+        )
+        legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.id).all()
+        for leg in legs:
+            leg.pos_id = None
+            leg.status = "filled"
+            leg.attribution_status = "attribution_conflict"
+            leg.order_kind = "market"
+            leg.request_json = json.dumps(
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posSide": "long",
+                    "sz": "0.1",
+                    "px": "1580",
+                }
+            )
+        session.commit()
+    client = _FakeDeepcoinClient()
+    client.positions = [
+        {
+            "posId": pos_id,
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.1",
+            "avgPx": "1580",
+            "slTriggerPx": "1560",
+            "tpTriggerPx": "1600",
+            "mgnMode": "cross",
+            "mrgPosition": "split",
+            "cTime": "1000",
+        }
+        for pos_id in ("pos-1", "pos-2")
+    ]
+    client.list_order_history = lambda *, inst_id=None: []
+    client.list_trade_fills = lambda *, inst_id=None: []
+    client.list_trigger_order_history = lambda *, inst_id: [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "ordId": order_id,
+            "clOrdId": client_order_id,
+            "state": "filled",
+            "posSide": "long",
+            "sz": "0.1",
+            "px": "1580",
+            "triggerTime": "1000",
+            "errorCode": "0",
+        }
+        for order_id, client_order_id in (
+            ("entry-1", "client-1"),
+            ("entry-2", "client-2"),
+        )
+    ]
+
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client
+    )
+    assert len(plan.actions) == 2
+    apply_position_attribution_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
+    )
+
     close = close_bound_position_market(
         session_factory,
         pos_id="pos-1",
         deepcoin_client=client,
     )
+    client.positions = [client.positions[0]]
+    protection = adjust_position_tpsl(
+        session_factory,
+        trade_signal=_signal(
+            session_factory,
+            action="adjust_stop_loss",
+            payload={"binding_id": binding_id, "stop_loss": 1577.04},
+        ),
+        deepcoin_client=client,
+    )
 
-    assert protection["submitted"] is True
     assert close["submitted"] is True
-    assert close["pos_id"] == "pos-1"
+    assert protection["submitted"] is True
+
+
+@pytest.mark.parametrize(
+    ("case", "drift"),
+    [
+        (
+            "request_size",
+            lambda session, binding, legs: setattr(
+                legs[0],
+                "request_json",
+                json.dumps(
+                    {
+                        "instId": "ETH-USDT-SWAP",
+                        "posSide": "long",
+                        "sz": "0.2",
+                        "px": "1580",
+                    }
+                ),
+            ),
+        ),
+        (
+            "binding_draft_stop",
+            lambda session, binding, legs: setattr(
+                binding,
+                "payload_json",
+                json.dumps(
+                    {
+                        "draft": {
+                            "stop_loss": 1550.0,
+                            "take_profit_legs": [{"price": 1600.0}],
+                        }
+                    }
+                ),
+            ),
+        ),
+        (
+            "binding_mode",
+            lambda session, binding, legs: setattr(
+                binding, "position_mode", "merged"
+            ),
+        ),
+        (
+            "binding_strategy",
+            lambda session, binding, legs: setattr(
+                binding, "strategy_instance_id", "deepcoin:other:ETH:long"
+            ),
+        ),
+        (
+            "binding_venue",
+            lambda session, binding, legs: setattr(binding, "venue", "other"),
+        ),
+    ],
+)
+def test_reviewed_equivalent_assignment_rebuilds_current_database_economics(
+    tmp_path, case, drift
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    _persist_reviewed_equivalent_assignments(session_factory)
+    with session_factory() as session:
+        legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.id).all()
+        binding = session.get(ExecutionBinding, legs[0].execution_binding_id)
+        drift(session, binding, legs)
+        session.commit()
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match=(
+            "position_ownership_evidence_not_authoritative|"
+            "position_not_bound_to_exactly_one_active_binding"
+        ),
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+        )
+
+    assert client.order_payloads == []
+
+
+def test_reviewed_equivalent_assignment_rebuilds_response_economics(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    _persist_reviewed_equivalent_assignments(session_factory)
+    with session_factory() as session:
+        for leg in session.query(ExecutionOrderLeg).all():
+            leg.request_json = json.dumps(
+                {"instId": "ETH-USDT-SWAP", "posSide": "long"}
+            )
+            leg.response_json = json.dumps(
+                {"data": {"sz": "0.1", "avgPx": "1580"}}
+            )
+        session.commit()
+    client = _FakeDeepcoinClient()
+    client.positions[0].update(
+        {
+            "avgPx": "1580",
+            "slTriggerPx": "1560",
+            "tpTriggerPx": "1600",
+            "mgnMode": "cross",
+            "mrgPosition": "split",
+        }
+    )
+
+    result = close_bound_position_market(
+        session_factory,
+        pos_id="pos-1",
+        deepcoin_client=client,
+    )
+
+    assert result["submitted"] is True
+
+
+def test_reviewed_equivalent_assignment_rejects_response_economic_drift(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    _persist_reviewed_equivalent_assignments(session_factory)
+    with session_factory() as session:
+        legs = session.query(ExecutionOrderLeg).all()
+        for leg in legs:
+            leg.request_json = json.dumps(
+                {"instId": "ETH-USDT-SWAP", "posSide": "long"}
+            )
+            leg.response_json = json.dumps(
+                {"data": {"sz": "0.1", "avgPx": "1580"}}
+            )
+        legs[0].response_json = json.dumps(
+            {"data": {"sz": "0.2", "avgPx": "1580"}}
+        )
+        session.commit()
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="position_ownership_evidence_not_authoritative",
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+        )
+
+    assert client.order_payloads == []
+
+
+def test_reviewed_equivalent_assignment_rejects_protection_mutation_drift(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    _persist_reviewed_equivalent_assignments(session_factory)
+    record_execution_event(
+        session_factory,
+        ExecutionEventRecord(
+            execution_binding_id=binding_id,
+            action="adjust_position_tpsl",
+        ),
+    )
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="position_ownership_evidence_not_authoritative",
+    ):
+        adjust_position_tpsl(
+            session_factory,
+            trade_signal=_signal(
+                session_factory,
+                action="adjust_stop_loss",
+                payload={"binding_id": binding_id, "stop_loss": 1577.04},
+            ),
+            deepcoin_client=client,
+        )
+
+    assert client.cancel_trigger_payloads == []
+    assert client.protection_payloads == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pos", "0.2"),
+        ("avgPx", "1581"),
+        ("slTriggerPx", "1550"),
+        ("tpTriggerPx", "1610"),
+        ("mgnMode", "isolated"),
+        ("mrgPosition", "merge"),
+        ("instId", "BTC-USDT-SWAP"),
+        ("posSide", "short"),
+        ("avgPx", None),
+    ],
+)
+def test_reviewed_equivalent_assignment_rejects_live_position_economic_drift(
+    tmp_path, field, value
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    _persist_reviewed_equivalent_assignments(session_factory)
+    client = _FakeDeepcoinClient()
+    client.positions = [
+        {
+            "posId": "pos-1",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.1",
+            "avgPx": "1580",
+            "slTriggerPx": "1560",
+            "tpTriggerPx": "1600",
+            "mgnMode": "cross",
+            "mrgPosition": "split",
+            "cTime": "1000",
+            field: value,
+        }
+    ]
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="live_position_economics_changed|bound_position_not_found",
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+        )
+
+    assert client.order_payloads == []
 
 
 @pytest.mark.parametrize(

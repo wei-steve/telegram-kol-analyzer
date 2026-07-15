@@ -157,7 +157,8 @@ Historical repair is dry-run-first:
 
 ```bash
 telegram-kol-research repair-position-attribution --database-path data/research.db
-telegram-kol-research repair-position-attribution --database-path data/research.db --apply
+telegram-kol-research repair-position-attribution --database-path data/research.db \
+  --apply --expected-fingerprint <fingerprint-from-reviewed-dry-run>
 ```
 
 Back up the database and review the dry run before `--apply`. Apply is explicit,

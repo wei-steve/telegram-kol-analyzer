@@ -9,7 +9,12 @@ from telegram_kol_research.execution_bindings import (
     list_execution_order_legs,
     upsert_execution_order_leg,
 )
-from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg, PositionAttributionAudit
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    PositionAttributionAudit,
+    StrategyLifecycle,
+)
 from telegram_kol_research.position_attribution_repair import (
     PositionAttributionRepairError,
     apply_position_attribution_repair_plan,
@@ -406,15 +411,137 @@ def test_miya_repair_apply_rejects_exchange_position_drift(tmp_path):
 
     with pytest.raises(PositionAttributionRepairError, match="live positions changed"):
         apply_position_attribution_repair_plan(
-            session_factory, plan, deepcoin_client=client
+            session_factory,
+            plan,
+            deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
+        )
+
+
+def test_nonempty_repair_apply_requires_reviewed_fingerprint(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_miya_equivalent_component(session_factory)
+    client = _MiyaRepairClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client
+    )
+
+    with pytest.raises(PositionAttributionRepairError, match="reviewed fingerprint"):
+        apply_position_attribution_repair_plan(
+            session_factory,
+            plan,
+            deepcoin_client=client,
+        )
+
+
+def test_nonempty_repair_apply_rejects_mismatched_reviewed_fingerprint(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_miya_equivalent_component(session_factory)
+    client = _MiyaRepairClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client
+    )
+
+    with pytest.raises(PositionAttributionRepairError, match="reviewed fingerprint"):
+        apply_position_attribution_repair_plan(
+            session_factory,
+            plan,
+            deepcoin_client=client,
+            expected_fingerprint="0" * 64,
+        )
+
+
+def test_nonempty_repair_apply_without_deepcoin_client_is_rejected(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_miya_equivalent_component(session_factory)
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=_MiyaRepairClient()
+    )
+
+    with pytest.raises(PositionAttributionRepairError, match="Deepcoin client"):
+        apply_position_attribution_repair_plan(
+            session_factory,
+            plan,
+            expected_fingerprint=plan.fingerprint,
+        )
+
+
+def test_zero_action_repair_apply_preserves_no_client_behavior(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=_RepairClient()
+    )
+    assert plan.actions == ()
+
+    result = apply_position_attribution_repair_plan(session_factory, plan)
+
+    assert result.applied == 0
+    assert result.already_applied is False
+
+
+def test_zero_action_apply_cannot_bypass_supplied_reviewed_fingerprint(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=_RepairClient()
+    )
+    assert plan.actions == ()
+
+    with pytest.raises(PositionAttributionRepairError, match="reviewed fingerprint"):
+        apply_position_attribution_repair_plan(
+            session_factory,
+            plan,
+            expected_fingerprint="previous-reviewed-nonzero-plan",
+        )
+
+
+def test_repair_apply_accepts_matching_reviewed_fingerprint(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_miya_equivalent_component(session_factory)
+    client = _MiyaRepairClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client
+    )
+
+    result = apply_position_attribution_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
+    )
+
+    assert result.applied == 2
+
+
+def test_repair_apply_rejects_drift_to_different_coherent_plan(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_miya_equivalent_component(session_factory)
+    reviewed_client = _MiyaRepairClient()
+    reviewed_plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=reviewed_client
+    )
+    current_client = _MiyaRepairClient()
+    current_client.positions[1]["posId"] = "1001124099803511"
+    current_plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=current_client
+    )
+    assert current_plan.actions
+    assert current_plan.fingerprint != reviewed_plan.fingerprint
+
+    with pytest.raises(PositionAttributionRepairError, match="reviewed fingerprint"):
+        apply_position_attribution_repair_plan(
+            session_factory,
+            current_plan,
+            deepcoin_client=current_client,
+            expected_fingerprint=reviewed_plan.fingerprint,
         )
 
 
 def test_miya_repair_apply_rejects_database_fingerprint_drift(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_miya_equivalent_component(session_factory)
+    client = _MiyaRepairClient()
     plan = build_position_attribution_repair_plan(
-        session_factory, deepcoin_client=_MiyaRepairClient()
+        session_factory, deepcoin_client=client
     )
     with session_factory() as session:
         session.query(ExecutionOrderLeg).filter_by(id=244).one().request_json = (
@@ -423,7 +550,12 @@ def test_miya_repair_apply_rejects_database_fingerprint_drift(tmp_path):
         session.commit()
 
     with pytest.raises(PositionAttributionRepairError, match="database evidence changed"):
-        apply_position_attribution_repair_plan(session_factory, plan)
+        apply_position_attribution_repair_plan(
+            session_factory,
+            plan,
+            deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
+        )
 
 
 def test_miya_repair_apply_is_idempotent(tmp_path):
@@ -435,10 +567,16 @@ def test_miya_repair_apply_is_idempotent(tmp_path):
     )
 
     first = apply_position_attribution_repair_plan(
-        session_factory, plan, deepcoin_client=client
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
     )
     repeated = apply_position_attribution_repair_plan(
-        session_factory, plan, deepcoin_client=client
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
     )
 
     assert first.applied == 2
@@ -455,13 +593,19 @@ def test_repeated_miya_repair_rejects_exchange_drift(tmp_path):
         session_factory, deepcoin_client=client
     )
     apply_position_attribution_repair_plan(
-        session_factory, plan, deepcoin_client=client
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
     )
     client.positions.pop()
 
     with pytest.raises(PositionAttributionRepairError, match="live positions changed"):
         apply_position_attribution_repair_plan(
-            session_factory, plan, deepcoin_client=client
+            session_factory,
+            plan,
+            deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
         )
 
 
@@ -473,7 +617,10 @@ def test_repeated_miya_repair_rejects_api_error(tmp_path):
         session_factory, deepcoin_client=client
     )
     apply_position_attribution_repair_plan(
-        session_factory, plan, deepcoin_client=client
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
     )
 
     def fail_positions():
@@ -482,7 +629,10 @@ def test_repeated_miya_repair_rejects_api_error(tmp_path):
     client.list_positions = fail_positions
     with pytest.raises(PositionAttributionRepairError, match="evidence unavailable"):
         apply_position_attribution_repair_plan(
-            session_factory, plan, deepcoin_client=client
+            session_factory,
+            plan,
+            deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
         )
 
 
@@ -494,7 +644,10 @@ def test_repeated_miya_repair_rejects_database_drift(tmp_path):
         session_factory, deepcoin_client=client
     )
     apply_position_attribution_repair_plan(
-        session_factory, plan, deepcoin_client=client
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
     )
     with session_factory() as session:
         session.query(ExecutionOrderLeg).filter_by(id=244).one().request_json = (
@@ -504,7 +657,10 @@ def test_repeated_miya_repair_rejects_database_drift(tmp_path):
 
     with pytest.raises(PositionAttributionRepairError, match="database evidence changed"):
         apply_position_attribution_repair_plan(
-            session_factory, plan, deepcoin_client=client
+            session_factory,
+            plan,
+            deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
         )
 
 
@@ -516,7 +672,10 @@ def test_repeated_miya_repair_rejects_binding_evidence_drift(tmp_path):
         session_factory, deepcoin_client=client
     )
     apply_position_attribution_repair_plan(
-        session_factory, plan, deepcoin_client=client
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
     )
     with session_factory() as session:
         session.query(ExecutionBinding).filter_by(id=123).one().margin_mode = (
@@ -526,7 +685,10 @@ def test_repeated_miya_repair_rejects_binding_evidence_drift(tmp_path):
 
     with pytest.raises(PositionAttributionRepairError, match="database evidence changed"):
         apply_position_attribution_repair_plan(
-            session_factory, plan, deepcoin_client=client
+            session_factory,
+            plan,
+            deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
         )
 
 
@@ -674,6 +836,7 @@ def test_repair_apply_is_atomic_audited_and_idempotent(tmp_path):
         session_factory,
         plan,
         deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
     )
 
     assert result.applied == 3
@@ -696,9 +859,174 @@ def test_repair_apply_is_atomic_audited_and_idempotent(tmp_path):
         session_factory,
         plan,
         deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
     )
     assert repeated.applied == 0
     assert repeated.already_applied is True
+
+
+def test_unrelated_manually_closed_binding_is_not_resurrected_by_repair(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_miya_equivalent_component(session_factory)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            id=999,
+            strategy_instance_id="deepcoin:manual:ETH:long",
+            kol_id="manual",
+            chat_id=999,
+            message_id=999,
+            symbol="ETH",
+            side="long",
+            venue="deepcoin",
+            pos_id=None,
+            status="closed",
+            last_exchange_status="manual_closed_or_not_found_on_exchange",
+        )
+        session.add(binding)
+        session.add(
+            ExecutionOrderLeg(
+                id=999,
+                execution_binding_id=999,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=1,
+                purpose="entry",
+                order_kind="market",
+                order_id="stale-manual-pos",
+                pos_id="stale-manual-pos",
+                venue="deepcoin",
+                status="manually_closed",
+                terminal_reason="manual_position_missing",
+                attribution_status="verified",
+                attribution_evidence_json='{"policy_version":2}',
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                chat_id=999,
+                message_id=999,
+                symbol="ETH",
+                side="long",
+                lifecycle_status="exited",
+                exit_reason="manual",
+                signal_at=datetime(2026, 7, 1),
+                execution_binding_id=999,
+            )
+        )
+        session.commit()
+    client = _MiyaRepairClient()
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client
+    )
+
+    apply_position_attribution_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
+    )
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 999)
+        lifecycle = session.query(StrategyLifecycle).filter_by(chat_id=999).one()
+        assert (binding.status, binding.pos_id) == ("closed", None)
+        assert binding.last_exchange_status == "manual_closed_or_not_found_on_exchange"
+        assert (lifecycle.lifecycle_status, lifecycle.exit_reason) == (
+            "exited",
+            "manual",
+        )
+
+
+def test_absent_verified_pos_id_cannot_activate_affected_binding_or_lifecycle(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            id=130,
+            strategy_instance_id="deepcoin:absent:ETH:short",
+            kol_id="absent",
+            chat_id=130,
+            message_id=130,
+            symbol="ETH",
+            side="short",
+            venue="deepcoin",
+            pos_id=None,
+            status="closed",
+            last_exchange_status="manual_closed_or_not_found_on_exchange",
+        )
+        session.add(binding)
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=130,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="absent-pos",
+                    pos_id="absent-pos",
+                    venue="deepcoin",
+                    status="active",
+                    attribution_status="verified",
+                    attribution_evidence_json='{"policy_version":2}',
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=130,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=2,
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id="cancelled-entry",
+                    client_order_id="cancelled-client",
+                    venue="deepcoin",
+                    status="open",
+                    attribution_status="unassigned",
+                ),
+            ]
+        )
+        session.add(
+            StrategyLifecycle(
+                chat_id=130,
+                message_id=130,
+                symbol="ETH",
+                side="short",
+                lifecycle_status="exited",
+                exit_reason="manual",
+                signal_at=datetime(2026, 7, 1),
+                execution_binding_id=130,
+            )
+        )
+        session.commit()
+    client = _RepairClient()
+    client.positions = []
+    client.list_trigger_order_history = lambda *, inst_id: [
+        {
+            "instId": inst_id,
+            "ordId": "cancelled-entry",
+            "clOrdId": "cancelled-client",
+            "state": "cancelled",
+            "posSide": "short",
+        }
+    ]
+    plan = build_position_attribution_repair_plan(
+        session_factory, deepcoin_client=client
+    )
+    assert any(action.binding_id == 130 for action in plan.actions)
+
+    apply_position_attribution_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
+    )
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 130)
+        lifecycle = session.query(StrategyLifecycle).filter_by(chat_id=130).one()
+        assert binding.status != "active"
+        assert binding.pos_id is None
+        assert (lifecycle.lifecycle_status, lifecycle.exit_reason) == (
+            "exited",
+            "manual",
+        )
 
 
 def test_repair_apply_rejects_stale_database_without_partial_changes(tmp_path):
@@ -720,6 +1048,7 @@ def test_repair_apply_rejects_stale_database_without_partial_changes(tmp_path):
             session_factory,
             plan,
             deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
         )
 
     wrong = list_execution_order_legs(session_factory, execution_binding_id=112)[0]
@@ -747,6 +1076,7 @@ def test_repair_apply_rejects_changed_request_evidence(tmp_path):
             session_factory,
             plan,
             deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
         )
 
 
@@ -766,6 +1096,7 @@ def test_repair_apply_rejects_changed_live_position_ids(tmp_path):
             session_factory,
             plan,
             deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
         )
 
 
@@ -792,6 +1123,7 @@ def test_repair_apply_rejects_changed_exchange_fill_evidence(tmp_path):
             session_factory,
             plan,
             deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
         )
 
 

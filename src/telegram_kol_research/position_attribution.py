@@ -246,6 +246,7 @@ def _has_authoritative_equivalent_permutation_assignment(
         leg,
         evidence=evidence,
         population_legs=population_legs,
+        population_positions=population_positions,
         component_position_ids=component_position_ids,
         session=session,
     )
@@ -384,13 +385,18 @@ def _persisted_component_matches_current_database(
     *,
     evidence: Mapping[str, object],
     population_legs: list[LegEvidence],
+    population_positions: list[PositionEvidence],
     component_position_ids: list[str],
     session=None,
 ) -> bool:
     from sqlalchemy.orm import object_session
     from sqlalchemy.orm.exc import UnmappedInstanceError
 
-    from telegram_kol_research.models import ExecutionOrderLeg
+    from telegram_kol_research.execution_bindings import (
+        _post_entry_protection_mutated_binding_ids,
+        build_leg_economic_evidence,
+    )
+    from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg
 
     if session is None:
         try:
@@ -438,7 +444,107 @@ def _persisted_component_matches_current_database(
             key: row_evidence.get(key) for key in canonical_keys
         } != canonical_evidence:
             return False
-    return True
+    binding_ids = {int(row.execution_binding_id) for row in rows}
+    if len(binding_ids) != 1:
+        return False
+    binding = session.get(ExecutionBinding, next(iter(binding_ids)))
+    if binding is None:
+        return False
+    reviewed_leg = population_legs[0]
+    if (
+        binding.strategy_instance_id != reviewed_leg.strategy_instance_id
+        or str(binding.venue or "").lower() != reviewed_leg.venue.lower()
+    ):
+        return False
+    mutated_binding_ids = _post_entry_protection_mutated_binding_ids(
+        session, binding_ids=binding_ids
+    )
+    current_legs = [
+        build_leg_economic_evidence(
+            row,
+            binding=binding,
+            pos_id=str(row.pos_id or "") or None,
+            has_successful_entry_evidence=True,
+            protection_mutated=int(row.execution_binding_id) in mutated_binding_ids,
+        )
+        for row in rows
+    ]
+    return evidence.get("equivalence_signature") == _equivalence_signature(
+        current_legs, population_positions
+    )
+
+
+def require_equivalent_live_position_economics(
+    leg, *, live_position: Mapping[str, object], session=None
+) -> None:
+    """Fail closed when fresh live economics drift from reviewed equivalent evidence."""
+
+    try:
+        evidence = json.loads(getattr(leg, "attribution_evidence_json", None) or "{}")
+    except (TypeError, ValueError):
+        return
+    if not isinstance(evidence, dict) or evidence.get("evidence_type") != (
+        "equivalent_permutation_assignment"
+    ):
+        return
+    if not _has_authoritative_equivalent_permutation_assignment(
+        leg, evidence, session=session
+    ):
+        raise PositionAttributionError("position_ownership_evidence_not_authoritative")
+    populations = _validated_equivalent_assignment_populations(
+        evidence.get("equivalence_signature")
+    )
+    if populations is None:
+        raise PositionAttributionError("position_ownership_evidence_not_authoritative")
+    _, population_positions = populations
+    current_pos_id = str(getattr(leg, "pos_id", None) or "")
+    try:
+        index = [item.pos_id for item in population_positions].index(current_pos_id)
+    except ValueError as exc:
+        raise PositionAttributionError("live_position_economics_changed") from exc
+
+    from telegram_kol_research.execution_bindings import build_position_evidence
+
+    current_position = build_position_evidence(dict(live_position))
+    if (
+        current_position is None
+        or current_position.pos_id != current_pos_id
+        or not _reviewed_position_matches_live(
+            population_positions[index], current_position
+        )
+    ):
+        raise PositionAttributionError("live_position_economics_changed")
+
+
+def _reviewed_position_matches_live(
+    reviewed: PositionEvidence, current: PositionEvidence
+) -> bool:
+    required_values = (
+        reviewed.size,
+        reviewed.entry_price,
+        reviewed.stop_loss,
+        reviewed.margin_mode,
+        reviewed.position_mode,
+        current.size,
+        current.entry_price,
+        current.stop_loss,
+        current.margin_mode,
+        current.position_mode,
+    )
+    return bool(
+        not any(value is None for value in required_values)
+        and reviewed.take_profits
+        and current.take_profits
+        and _normalize_instrument(reviewed.symbol)
+        == _normalize_instrument(current.symbol)
+        and _normalize_side(reviewed.side) == _normalize_side(current.side)
+        and _numbers_equivalent(reviewed.size, current.size)
+        and _numbers_equivalent(reviewed.entry_price, current.entry_price)
+        and _numbers_equivalent(reviewed.stop_loss, current.stop_loss)
+        and _number_tuples_equivalent(reviewed.take_profits, current.take_profits)
+        and reviewed.margin_mode == current.margin_mode
+        and reviewed.position_mode == current.position_mode
+    )
 
 
 def _strict_int(value) -> int:

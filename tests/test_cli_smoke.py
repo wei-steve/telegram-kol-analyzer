@@ -1,4 +1,6 @@
 from typer.testing import CliRunner
+from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from telegram_kol_research.cli import app
 from telegram_kol_research.db import create_session_factory
@@ -57,6 +59,87 @@ def test_repair_position_attribution_cli_defaults_to_dry_run(tmp_path, monkeypat
     assert result.exit_code == 0
     assert "DRY RUN" in result.stdout
     assert '"actions": []' in result.stdout
+
+
+def test_repair_position_attribution_cli_apply_requires_expected_fingerprint(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.position_attribution_repair import (
+        PositionAttributionRepairAction,
+        PositionAttributionRepairPlan,
+    )
+
+    plan = PositionAttributionRepairPlan(
+        created_at=datetime(2026, 7, 15, tzinfo=UTC),
+        live_position_ids=("pos-1",),
+        exchange_evidence_fingerprint="exchange",
+        actions=(
+            PositionAttributionRepairAction(
+                action="assign_verified_position",
+                binding_id=1,
+                leg_id=1,
+                leg_index=1,
+                old_pos_id=None,
+                new_pos_id="pos-1",
+                old_status="filled",
+                new_status="active",
+                old_attribution_status="unassigned",
+                new_attribution_status="verified",
+            ),
+        ),
+        unresolved_conflicts=[],
+        database_fingerprint="database",
+        fingerprint="reviewed-fingerprint",
+    )
+    client = object()
+    monkeypatch.setattr(
+        cli_module, "build_deepcoin_client_from_env", lambda: client
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_position_attribution_repair_plan",
+        lambda *args, **kwargs: plan,
+    )
+    applied = []
+    monkeypatch.setattr(
+        cli_module,
+        "apply_position_attribution_repair_plan",
+        lambda *args, **kwargs: (
+            applied.append(kwargs) or SimpleNamespace(applied=1)
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "repair-position-attribution",
+            "--database-path",
+            str(tmp_path / "research.db"),
+            "--apply",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "expected-fingerprint" in result.stdout + result.stderr
+    assert applied == []
+
+    matching = CliRunner().invoke(
+        app,
+        [
+            "repair-position-attribution",
+            "--database-path",
+            str(tmp_path / "research.db"),
+            "--apply",
+            "--expected-fingerprint",
+            plan.fingerprint,
+        ],
+    )
+
+    assert matching.exit_code == 0
+    assert applied == [
+        {"deepcoin_client": client, "expected_fingerprint": plan.fingerprint}
+    ]
 
 
 def test_repair_execution_order_legs_cli_backfills_legacy_bindings(tmp_path):

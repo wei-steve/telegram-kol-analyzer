@@ -27,6 +27,7 @@ from telegram_kol_research.position_authority_lock import (
 )
 from telegram_kol_research.position_attribution import (
     PositionAttributionError,
+    require_equivalent_live_position_economics,
     require_verified_position_ownership,
 )
 from telegram_kol_research.protection_attribution import match_position_protection
@@ -193,6 +194,7 @@ def adjust_position_tpsl(
         binding=binding,
         inst_id=inst_id,
     )
+    _require_live_position_economics(session_factory, binding, [position])
     pending = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
     pos_id = _first_string(position, "posId", "pos_id", "id")
     protection = match_position_protection(live_positions, pending).by_pos_id.get(pos_id or "")
@@ -319,6 +321,7 @@ def close_position_market(
         inst_id=inst_id,
         requested_pos_ids=requested_pos_ids,
     )
+    _require_live_position_economics(session_factory, binding, positions)
     submitted_orders: list[dict[str, Any]] = []
     full_close = True
     for position in positions:
@@ -430,7 +433,37 @@ def close_bound_position_market(
         binding,
         requested_pos_ids={normalized_pos_id},
     )
-    _reserve_bound_position_close(session_factory, binding=binding, pos_id=normalized_pos_id, now=now)
+    inst_id = _to_deepcoin_swap_instrument(binding.symbol)
+    positions = _select_bound_positions(
+        deepcoin_client.list_positions(inst_id=inst_id),
+        binding=binding,
+        inst_id=inst_id,
+        requested_pos_ids={normalized_pos_id},
+    )
+    if len(positions) != 1:
+        raise DeepcoinExecutionActionError("ambiguous_exact_bound_live_position")
+    position = positions[0]
+    live_pos_id = _first_string(position, "posId", "pos_id", "id")
+    if live_pos_id != normalized_pos_id:
+        raise DeepcoinExecutionActionError("exact_bound_live_position_not_found")
+    _require_live_position_economics(session_factory, binding, [position])
+    close_size = _position_size(position)
+    if close_size <= 0:
+        raise DeepcoinExecutionActionError("non_positive_close_size")
+
+    payload = {
+        "instId": inst_id,
+        "tdMode": _deepcoin_margin_mode(binding.margin_mode),
+        "side": "sell" if binding.side.lower() == "long" else "buy",
+        "posSide": binding.side.lower(),
+        "ordType": "market",
+        "sz": f"{close_size:g}",
+        "mrgPosition": _deepcoin_position_mode(binding.position_mode),
+        "closePosId": normalized_pos_id,
+    }
+    _reserve_bound_position_close(
+        session_factory, binding=binding, pos_id=normalized_pos_id, now=now
+    )
     _record_bound_position_close_reservation_event(
         session_factory,
         binding=binding,
@@ -439,33 +472,6 @@ def close_bound_position_market(
         now=now,
     )
     try:
-        inst_id = _to_deepcoin_swap_instrument(binding.symbol)
-        positions = _select_bound_positions(
-            deepcoin_client.list_positions(inst_id=inst_id),
-            binding=binding,
-            inst_id=inst_id,
-            requested_pos_ids={normalized_pos_id},
-        )
-        if len(positions) != 1:
-            raise DeepcoinExecutionActionError("ambiguous_exact_bound_live_position")
-        position = positions[0]
-        live_pos_id = _first_string(position, "posId", "pos_id", "id")
-        if live_pos_id != normalized_pos_id:
-            raise DeepcoinExecutionActionError("exact_bound_live_position_not_found")
-        close_size = _position_size(position)
-        if close_size <= 0:
-            raise DeepcoinExecutionActionError("non_positive_close_size")
-
-        payload = {
-            "instId": inst_id,
-            "tdMode": _deepcoin_margin_mode(binding.margin_mode),
-            "side": "sell" if binding.side.lower() == "long" else "buy",
-            "posSide": binding.side.lower(),
-            "ordType": "market",
-            "sz": f"{close_size:g}",
-            "mrgPosition": _deepcoin_position_mode(binding.position_mode),
-            "closePosId": normalized_pos_id,
-        }
         response = deepcoin_client.place_order(payload)
     except Exception as exc:
         _mark_bound_position_close_reservation(
@@ -928,6 +934,33 @@ def _require_verified_binding_positions(
                     session,
                     venue=binding.venue,
                     pos_id=pos_id,
+                )
+    except PositionAttributionError as exc:
+        raise DeepcoinExecutionActionError(str(exc)) from exc
+
+
+def _require_live_position_economics(
+    session_factory: sessionmaker,
+    binding: _LoadedBinding,
+    positions: list[dict[str, Any]],
+) -> None:
+    """Revalidate reviewed equivalent evidence against fresh live rows."""
+
+    try:
+        with session_factory() as session:
+            for position in positions:
+                pos_id = _first_string(position, "posId", "pos_id", "id")
+                if not pos_id:
+                    raise PositionAttributionError("live_position_economics_changed")
+                leg = require_verified_position_ownership(
+                    session,
+                    venue=binding.venue,
+                    pos_id=pos_id,
+                )
+                require_equivalent_live_position_economics(
+                    leg,
+                    live_position=position,
+                    session=session,
                 )
     except PositionAttributionError as exc:
         raise DeepcoinExecutionActionError(str(exc)) from exc

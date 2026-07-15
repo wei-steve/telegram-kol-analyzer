@@ -631,6 +631,9 @@ def repair_execution_order_legs(
 def repair_position_attribution(
     database_path: Path = Path("data/research.db"),
     apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
 ) -> None:
     """Plan or explicitly apply audited position-attribution repairs."""
 
@@ -652,6 +655,12 @@ def repair_position_attribution(
     )
     if not apply:
         return
+    if plan.actions and not expected_fingerprint:
+        typer.echo(
+            "Refusing apply: --expected-fingerprint is required for a nonempty plan.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     if plan.unresolved_conflicts:
         typer.echo("Refusing apply: unresolved attribution conflicts remain.", err=True)
         raise typer.Exit(code=2)
@@ -659,6 +668,7 @@ def repair_position_attribution(
         session_factory,
         plan,
         deepcoin_client=client,
+        expected_fingerprint=expected_fingerprint,
     )
     typer.echo(f"Applied {result.applied} repair action(s).")
 

@@ -112,10 +112,12 @@ history, apply the exact freshly rebuilt plan:
 ```bash
 telegram-kol-research repair-position-attribution \
   --database-path data/research.db \
-  --apply
+  --apply \
+  --expected-fingerprint <fingerprint-from-reviewed-dry-run>
 systemctl restart telegram-kol.service
 ```
 
+Nonempty apply requires the exact fingerprint copied from the reviewed dry run.
 Apply refuses a stale database fingerprint, changed live position IDs, API
 evidence errors, or unresolved attribution conflicts. After restart, run the
 dry run again and repeat read-only reconciliation. Verify live positions,

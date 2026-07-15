@@ -479,7 +479,7 @@ def _apply_reconcile_snapshot(
             recovered_at=recovered_at,
         )
         position_rows = [
-            _position_evidence(row)
+            build_position_evidence(row)
             for row in active_positions
             if _first_string(row, "posId", "pos_id", "id") not in reserved_pos_ids
         ]
@@ -794,7 +794,7 @@ def _exchange_row_matches_leg(row: dict[str, Any], leg: ExecutionOrderLeg) -> bo
     )
 
 
-def _position_evidence(row: dict[str, Any]) -> PositionEvidence | None:
+def build_position_evidence(row: dict[str, Any]) -> PositionEvidence | None:
     pos_id = _first_string(row, "posId", "pos_id", "id")
     if not pos_id:
         return None
@@ -832,6 +832,25 @@ def _leg_evidence(
     response_pos_id = _position_id_from_response_json(leg.response_json)
     if response_pos_id:
         direct_pos_id = response_pos_id
+    return build_leg_economic_evidence(
+        leg,
+        binding=binding,
+        pos_id=direct_pos_id,
+        has_successful_entry_evidence=has_successful_entry_evidence,
+        protection_mutated=protection_mutated,
+    )
+
+
+def build_leg_economic_evidence(
+    leg: ExecutionOrderLeg,
+    *,
+    binding: ExecutionBinding,
+    pos_id: str | None = None,
+    has_successful_entry_evidence: bool = False,
+    protection_mutated: bool = False,
+) -> LegEvidence:
+    """Rebuild one leg's normalized current economic evidence."""
+
     signature = _leg_economic_signature(leg, binding=binding)
     return LegEvidence(
         leg_id=int(leg.id),
@@ -841,7 +860,7 @@ def _leg_evidence(
         side=str(binding.side or ""),
         order_id=leg.order_id,
         client_order_id=leg.client_order_id,
-        pos_id=direct_pos_id,
+        pos_id=pos_id,
         requested_size=signature["requested_size"],
         terminal=str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES,
         strategy_instance_id=(leg.strategy_instance_id or binding.strategy_instance_id),
@@ -982,6 +1001,7 @@ def _leg_economic_signature(
     leg: ExecutionOrderLeg, *, binding: ExecutionBinding
 ) -> dict[str, Any]:
     request = _safe_json_object(leg.request_json)
+    response = _safe_json_object(leg.response_json)
     binding_payload = _safe_json_object(binding.payload_json)
     draft = binding_payload.get("draft")
     if not isinstance(draft, dict):
@@ -1002,6 +1022,7 @@ def _leg_economic_signature(
         request.get("sz")
         or request.get("size")
         or request.get("quantity")
+        or _nested_payload_value(response, "sz", "size", "quantity", "fillSz")
         or draft_leg.get("quantity")
         or draft_leg.get("sz")
     )
@@ -1009,15 +1030,19 @@ def _leg_economic_signature(
         request.get("px")
         or request.get("price")
         or request.get("triggerPx")
+        or _nested_payload_value(response, "avgPx", "fillPx", "px", "price")
         or draft_leg.get("price")
     )
     stop_loss = _to_float(
         request.get("slTriggerPx")
         or request.get("stop_loss")
+        or _nested_payload_value(response, "slTriggerPx", "stop_loss")
         or draft.get("stop_loss")
     )
     take_profits = _direct_price_tuple(
-        request.get("tpTriggerPx") or request.get("take_profits")
+        request.get("tpTriggerPx")
+        or request.get("take_profits")
+        or _nested_payload_value(response, "tpTriggerPx", "take_profits")
     )
     if not take_profits:
         draft_take_profit_legs = draft.get("take_profit_legs")
@@ -1044,6 +1069,23 @@ def _safe_json_object(value: str | None) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _nested_payload_value(payload: Any, *keys: str) -> Any:
+    if isinstance(payload, dict):
+        for key in keys:
+            if payload.get(key) not in (None, ""):
+                return payload[key]
+        for value in payload.values():
+            found = _nested_payload_value(value, *keys)
+            if found not in (None, ""):
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _nested_payload_value(value, *keys)
+            if found not in (None, ""):
+                return found
+    return None
 
 
 def _plain_int(value: Any) -> int | None:

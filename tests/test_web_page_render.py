@@ -622,6 +622,16 @@ def test_reviewed_equivalent_positions_render_miya_and_deterministic_provenance(
             side="short",
             venue="deepcoin",
             pos_id="pos-miya-1,pos-miya-2",
+            margin_mode="cross",
+            position_mode="split",
+            payload_json=json.dumps(
+                {
+                    "draft": {
+                        "stop_loss": 1820.0,
+                        "take_profit_legs": [{"price": 1700.0}],
+                    }
+                }
+            ),
             status="active",
         )
         session.add(binding)
@@ -637,6 +647,14 @@ def test_reviewed_equivalent_positions_render_miya_and_deterministic_provenance(
                 venue="deepcoin",
                 attribution_status="verified",
                 status="active",
+                request_json=json.dumps(
+                    {
+                        "instId": "ETH-USDT-SWAP",
+                        "posSide": "short",
+                        "sz": "1.5",
+                        "px": "1770",
+                    }
+                ),
             )
             for index, pos_id in enumerate(("pos-miya-1", "pos-miya-2"), start=1)
         ]

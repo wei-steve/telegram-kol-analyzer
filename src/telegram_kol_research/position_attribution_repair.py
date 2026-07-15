@@ -16,7 +16,7 @@ from telegram_kol_research.execution_bindings import (
     _leg_evidence,
     _load_reconcile_snapshot,
     _post_entry_protection_mutated_binding_ids,
-    _position_evidence,
+    build_position_evidence,
     _snapshot_fill_evidence,
 )
 from telegram_kol_research.models import (
@@ -108,7 +108,11 @@ def build_position_attribution_repair_plan(
                 database_fingerprint=database_fingerprint,
             )
 
-        position_rows = [row for raw in snapshot.positions if (row := _position_evidence(raw))]
+        position_rows = [
+            row
+            for raw in snapshot.positions
+            if (row := build_position_evidence(raw))
+        ]
         fill_rows = _snapshot_fill_evidence(
             snapshot,
             legs=legs,
@@ -253,10 +257,23 @@ def apply_position_attribution_repair_plan(
     plan: PositionAttributionRepairPlan,
     *,
     deepcoin_client=None,
+    expected_fingerprint: str | None = None,
 ) -> PositionAttributionRepairResult:
     if plan.unresolved_conflicts:
         raise PositionAttributionRepairError(
             "repair plan contains unresolved attribution conflicts"
+        )
+    if expected_fingerprint is not None and expected_fingerprint != plan.fingerprint:
+        raise PositionAttributionRepairError(
+            "reviewed fingerprint does not match the repair plan"
+        )
+    if plan.actions and expected_fingerprint is None:
+        raise PositionAttributionRepairError(
+            "reviewed fingerprint is required for a nonempty repair plan"
+        )
+    if plan.actions and deepcoin_client is None:
+        raise PositionAttributionRepairError(
+            "Deepcoin client is required for a nonempty repair plan"
         )
     with session_factory() as session:
         applied_audits = {
@@ -359,7 +376,13 @@ def apply_position_attribution_repair_plan(
                     leg.last_verified_at = plan.created_at
                 if action.action == "terminal_cancelled_leg":
                     leg.terminal_reason = "historical_exchange_cancelled"
-            _derive_repaired_bindings(bindings, list(legs_by_id.values()), plan.created_at)
+            _derive_repaired_bindings(
+                bindings,
+                list(legs_by_id.values()),
+                plan.created_at,
+                affected_binding_ids={action.binding_id for action in plan.actions},
+                live_position_ids=set(plan.live_position_ids),
+            )
             applied_database_fingerprint = _database_fingerprint(bindings, legs)
             for action in plan.actions:
                 _insert_repair_audit(
@@ -576,17 +599,42 @@ def _repair_audit_fingerprint(plan, action) -> str:
     return _hash({"plan": plan.fingerprint, "action": asdict(action)})
 
 
-def _derive_repaired_bindings(bindings, legs, updated_at) -> None:
+def _derive_repaired_bindings(
+    bindings,
+    legs,
+    updated_at,
+    *,
+    affected_binding_ids: set[int],
+    live_position_ids: set[str],
+) -> None:
     for binding in bindings:
+        if int(binding.id) not in affected_binding_ids:
+            continue
         binding_legs = [
             leg for leg in legs if int(leg.execution_binding_id) == int(binding.id)
         ]
+        binding_is_terminal = str(binding.status or "").lower() in {
+            "closed",
+            "cancelled",
+            "expired",
+            "invalidated",
+        } or str(binding.last_exchange_status or "").lower().startswith(
+            "manual_closed"
+        )
         verified = [
             str(leg.pos_id)
             for leg in sorted(binding_legs, key=lambda row: row.leg_index)
-            if leg.pos_id and str(leg.attribution_status) == "verified"
+            if (
+                leg.pos_id
+                and str(leg.pos_id) in live_position_ids
+                and str(leg.attribution_status) == "verified"
+                and str(leg.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
+            )
         ]
-        if verified:
+        if binding_is_terminal:
+            binding.pos_id = None
+            binding.status = "closed"
+        elif verified:
             binding.pos_id = ",".join(dict.fromkeys(verified))
             binding.status = "active"
             binding.last_exchange_status = "position_ownership_verified_by_repair"

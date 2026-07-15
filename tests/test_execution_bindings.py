@@ -11,7 +11,7 @@ from telegram_kol_research.execution_bindings import (
     ExecutionOrderLegRecord,
     _leg_evidence,
     _leg_has_successful_fill_evidence,
-    _position_evidence,
+    build_position_evidence,
     _post_entry_protection_mutated_binding_ids,
     build_client_order_id,
     build_deepcoin_account_state,
@@ -114,7 +114,7 @@ def test_database_bootstrap_creates_execution_bindings_table(tmp_path):
 
 
 def test_position_evidence_uses_only_direct_normalized_position_fields():
-    evidence = _position_evidence(
+    evidence = build_position_evidence(
         {
             "posId": "pos-1",
             "instId": "ETH-USDT-SWAP",
