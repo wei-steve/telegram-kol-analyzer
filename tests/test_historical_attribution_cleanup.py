@@ -270,6 +270,49 @@ def test_conflicting_exact_position_history_rows_are_unresolved():
 
 
 @pytest.mark.parametrize(
+    "conflicting_row",
+    [
+        _position_history_row(closePos="3"),
+        _position_history_row(pos="malformed"),
+        _position_history_row(closeAvgPx="62800"),
+        _position_history_row(instId="ETH-USDT-SWAP"),
+        _position_history_row(posSide="short"),
+        _position_history_row(mrgPosition="merge"),
+    ],
+    ids=[
+        "partial",
+        "malformed",
+        "different_closed_row",
+        "instrument_mismatch",
+        "side_mismatch",
+        "position_mode_mismatch",
+    ],
+)
+def test_fully_closed_row_mixed_with_same_candidate_invalid_row_is_unresolved(
+    conflicting_row,
+):
+    decision = _decision(
+        bindings=[_binding(row_id=10)],
+        legs=[
+            _leg(
+                row_id=1,
+                binding_id=10,
+                pos_id="position-1",
+                order_id="position-1",
+                status="active",
+            )
+        ],
+        lifecycles=[_lifecycle(row_id=100, binding_id=10, status="entered")],
+        snapshot=_snapshot(
+            position_history=[_position_history_row(), conflicting_row]
+        ),
+    )
+
+    assert decision.actions == ()
+    assert decision.conflicts[0].reason == "historical_position_history_conflict"
+
+
+@pytest.mark.parametrize(
     ("snapshot_field", "row"),
     [
         ("positions", {"posId": "position-1", "pos": "4"}),
@@ -368,6 +411,127 @@ def test_stale_shared_position_uses_exact_fully_closed_evidence_per_leg():
     assert decision.conflicts == ()
 
 
+def test_redundant_competitor_requires_own_order_derived_closed_history():
+    reservation = BoundPositionCloseReservation(
+        id=1,
+        pos_id="actual-1",
+        execution_binding_id=11,
+        status="completed",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    event = ExecutionEvent(
+        id=1,
+        execution_binding_id=11,
+        strategy_instance_id="deepcoin:1:11:BTC:long",
+        venue="deepcoin",
+        action="close_position_market",
+        status="completed",
+        pos_id="actual-1",
+        created_at=NOW,
+    )
+    decision = _decision(
+        bindings=[_binding(row_id=9), _binding(row_id=11)],
+        legs=[
+            _leg(
+                row_id=10,
+                binding_id=9,
+                pos_id="shared",
+                order_id="shared",
+                status="active",
+            ),
+            _leg(
+                row_id=13,
+                binding_id=11,
+                pos_id="shared",
+                order_id="actual-1",
+                status="active",
+            ),
+        ],
+        lifecycles=[
+            _lifecycle(row_id=90, binding_id=9, status="entered"),
+            _lifecycle(
+                row_id=110,
+                binding_id=11,
+                status="exited",
+                exit_reason="manual",
+            ),
+        ],
+        events=[event],
+        reservations=[reservation],
+        snapshot=_snapshot(
+            position_history=[_position_history_row(posId="shared")]
+        ),
+    )
+
+    assert decision.actions == ()
+    assert decision.conflicts[0].reason == "historical_terminal_evidence_missing"
+
+
+@pytest.mark.parametrize(
+    ("snapshot_field", "row"),
+    [
+        ("positions", {"posId": "actual-1", "pos": "4"}),
+        ("open_orders", {"ordId": "actual-1", "state": "live"}),
+        (
+            "pending_trigger_orders",
+            {"ordId": "actual-2", "state": "live", "triggerOrderType": "NORMAL"},
+        ),
+        (
+            "pending_trigger_orders",
+            {"posId": "actual-2", "state": "live", "triggerOrderType": "TPSL"},
+        ),
+    ],
+)
+def test_shared_owner_component_blocks_live_or_pending_order_derived_identity(
+    snapshot_field, row
+):
+    decision = _decision(
+        bindings=[_binding(row_id=9), _binding(row_id=11)],
+        legs=[
+            _leg(
+                row_id=10,
+                binding_id=9,
+                pos_id="shared",
+                order_id="shared",
+                status="active",
+            ),
+            _leg(
+                row_id=13,
+                binding_id=11,
+                pos_id="shared",
+                order_id="actual-1",
+                status="active",
+            ),
+            _leg(
+                row_id=14,
+                binding_id=11,
+                pos_id="shared",
+                order_id="actual-2",
+                status="active",
+            ),
+        ],
+        lifecycles=[
+            _lifecycle(row_id=90, binding_id=9, status="entered"),
+            _lifecycle(row_id=110, binding_id=11, status="entered"),
+        ],
+        snapshot=_snapshot(
+            position_history=[
+                _position_history_row(posId="shared"),
+                _position_history_row(posId="actual-1"),
+                _position_history_row(posId="actual-2"),
+            ],
+            **{snapshot_field: [row]},
+        ),
+    )
+
+    assert decision.actions == ()
+    assert decision.conflicts[0].reason in {
+        "historical_position_still_exchange_active",
+        "historical_pending_order_active",
+    }
+
+
 def test_same_binding_duplicate_retains_only_exact_direct_owner():
     decision = _decision(
         bindings=[_binding(row_id=10)],
@@ -378,6 +542,12 @@ def test_same_binding_duplicate_retains_only_exact_direct_owner():
         lifecycles=[
             _lifecycle(row_id=100, binding_id=10, status="exited", exit_reason="manual")
         ],
+        snapshot=_snapshot(
+            position_history=[
+                _position_history_row(posId="p1"),
+                _position_history_row(posId="child-2"),
+            ]
+        ),
     )
 
     clear_actions = [

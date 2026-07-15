@@ -398,32 +398,34 @@ def terminal_evidence_for_leg(
     candidates = list(dict.fromkeys(value for value in candidates if value))
     if not candidates:
         return None
-    local_evidence = terminal_evidence_for_binding(
-        binding,
-        pos_id=candidates[0] if candidates else None,
-        lifecycles=lifecycles,
-        events=events,
-        reservations=reservations,
-        history_rows=history_rows,
-        entry_order_ids=_entry_order_ids([leg]),
-    )
-    if local_evidence is not None:
-        return local_evidence
+    if not persisted_position_is_redundant:
+        local_evidence = terminal_evidence_for_binding(
+            binding,
+            pos_id=candidates[0],
+            lifecycles=lifecycles,
+            events=events,
+            reservations=reservations,
+            history_rows=history_rows,
+            entry_order_ids=_entry_order_ids([leg]),
+        )
+        if local_evidence is not None:
+            return local_evidence
 
     expected_instrument = _binding_instrument(binding)
     expected_side = _string(getattr(binding, "side", None))
     if expected_instrument is None or expected_side is None:
         return None
     for candidate in candidates:
-        exact_evidence = {
-            json.dumps(
-                row,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-                default=str,
-            ): evidence
+        candidate_rows = [
+            row
             for row in position_history_rows
+            if _string(row.get("posId")) == candidate
+        ]
+        if not candidate_rows:
+            continue
+        fully_closed = [
+            evidence
+            for row in candidate_rows
             if (
                 evidence := _fully_closed_position_history_evidence(
                     row,
@@ -433,18 +435,29 @@ def terminal_evidence_for_leg(
                 )
             )
             is not None
+        ]
+        if not fully_closed:
+            continue
+        stable_rows = {
+            json.dumps(
+                row,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                default=str,
+            ): row
+            for row in candidate_rows
         }
-        if len(exact_evidence) > 1:
+        if len(fully_closed) != len(candidate_rows) or len(stable_rows) > 1:
             return {
                 "source": "exchange_position_history_conflict",
                 "pos_id": candidate,
                 "rows": [
-                    exact_evidence[key]
-                    for key in sorted(exact_evidence, key=repr)
+                    stable_rows[key]
+                    for key in sorted(stable_rows)
                 ],
             }
-        if exact_evidence:
-            return next(iter(exact_evidence.values()))
+        return fully_closed[0]
     return None
 
 

@@ -131,11 +131,25 @@ def _load_local_repair_evidence(session):
 
 
 def _historical_position_candidates(bindings_by_id, legs):
-    candidates: set[tuple[str, str]] = set()
+    persisted_position_owners: dict[tuple[str, str], set[int]] = {}
     for leg in legs:
         if str(leg.purpose or "").lower() != "entry":
             continue
-        if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+        venue = str(leg.venue or "").lower()
+        pos_id = str(leg.pos_id or "").strip()
+        binding = bindings_by_id.get(int(leg.execution_binding_id))
+        if (
+            venue != "deepcoin"
+            or not pos_id
+            or binding is None
+            or str(binding.venue or "").lower() != "deepcoin"
+        ):
+            continue
+        persisted_position_owners.setdefault((venue, pos_id), set()).add(int(leg.id))
+
+    candidates: set[tuple[str, str]] = set()
+    for leg in legs:
+        if str(leg.purpose or "").lower() != "entry":
             continue
         if str(leg.venue or "").lower() != "deepcoin":
             continue
@@ -146,7 +160,17 @@ def _historical_position_candidates(bindings_by_id, legs):
         if not symbol:
             continue
         instrument = f"{symbol}-USDT-SWAP"
-        for identifier in (leg.pos_id, leg.order_id):
+        terminal = str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+        if terminal:
+            persisted_pos_id = str(leg.pos_id or "").strip()
+            owners = persisted_position_owners.get(
+                (str(leg.venue or "").lower(), persisted_pos_id),
+                set(),
+            )
+            identifiers = (leg.order_id,) if len(owners) > 1 else ()
+        else:
+            identifiers = (leg.pos_id, leg.order_id)
+        for identifier in identifiers:
             identifier = str(identifier or "").strip()
             if identifier:
                 candidates.add((instrument, identifier))
@@ -169,6 +193,14 @@ def _load_historical_position_evidence(snapshot, deepcoin_client, candidates) ->
             isinstance(row, dict) for row in rows
         ):
             snapshot.errors[source] = "invalid list response schema"
+            continue
+        if any(
+            str(row.get("posId") or "").strip() != identifier for row in rows
+        ):
+            snapshot.errors[source] = (
+                "position history response posId mismatch: "
+                f"expected {identifier}"
+            )
             continue
         snapshot.position_history.extend(rows)
 
@@ -448,6 +480,13 @@ def apply_position_attribution_repair_plan(
         if (
             current_plan.exchange_evidence_fingerprint
             != plan.exchange_evidence_fingerprint
+            and not (
+                already_applied
+                and any(
+                    action.action == "clear_redundant_historical_position"
+                    for action in plan.historical_actions
+                )
+            )
         ):
             raise PositionAttributionRepairError(
                 "stale repair plan: exchange evidence changed"
@@ -860,16 +899,7 @@ def _apply_historical_cleanup_action(
         leg = legs_by_id.get(int(action.leg_id or 0))
         if leg is None:
             raise PositionAttributionRepairError("stale repair plan: leg missing")
-        was_cleared_by_plan = any(
-            planned.action == "clear_redundant_historical_position"
-            and planned.leg_id == action.leg_id
-            and planned.old_pos_id == action.old_pos_id
-            for planned in plan.historical_actions
-        )
-        valid_pos_ids = {action.old_pos_id}
-        if was_cleared_by_plan:
-            valid_pos_ids.add(None)
-        if leg.pos_id not in valid_pos_ids or str(leg.status) != action.old_state:
+        if leg.pos_id != action.old_pos_id or str(leg.status) != action.old_state:
             raise PositionAttributionRepairError(
                 "stale repair plan: historical leg changed"
             )

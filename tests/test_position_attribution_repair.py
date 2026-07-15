@@ -64,6 +64,33 @@ class _HistoricalCleanupClient:
         return self.position_history.get((inst_id, pos_id), [])
 
 
+def _closed_position_history_row(pos_id: str):
+    return {
+        "instId": "BTC-USDT-SWAP",
+        "posId": pos_id,
+        "posSide": "long",
+        "mrgPosition": "split",
+        "pos": "1",
+        "closePos": "1.0",
+        "avgPx": "62500",
+        "closeAvgPx": "62790.1",
+        "pnl": "0.2901",
+        "cTime": "1784073600000",
+        "uTime": "1784077200000",
+    }
+
+
+def _historical_duplicate_client(*, live_position_ids=()):
+    client = _HistoricalCleanupClient(live_position_ids=live_position_ids)
+    client.position_history = {
+        ("BTC-USDT-SWAP", identifier): [
+            _closed_position_history_row(identifier)
+        ]
+        for identifier in ("p1", "child-2")
+    }
+    return client
+
+
 def _seed_historical_duplicate_fixture(tmp_path):
     database_path = tmp_path / "historical-duplicates.db"
     conn = sqlite3.connect(database_path)
@@ -385,6 +412,30 @@ def test_repair_plan_loads_unique_exact_history_for_nonterminal_entry_ids(
     assert captured["snapshot"].position_history == expected_rows
 
 
+def test_repair_plan_loads_only_own_order_ids_for_terminal_duplicate_owners(
+    tmp_path,
+):
+    session_factory = _seed_historical_duplicate_fixture(tmp_path)
+    client = _historical_duplicate_client()
+
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+
+    assert client.position_history_calls == [
+        ("BTC-USDT-SWAP", "child-2"),
+        ("BTC-USDT-SWAP", "p1"),
+    ]
+    assert [action.action for action in plan.historical_actions] == [
+        "clear_redundant_historical_position",
+        "close_historical_binding",
+        "install_position_ownership_unique_index",
+    ]
+    assert plan.unresolved_conflicts == []
+
+
 def test_repair_plan_exact_history_failure_is_source_error_and_blocks_actions(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_exact_history_candidates(session_factory)
@@ -410,6 +461,43 @@ def test_repair_plan_exact_history_failure_is_source_error_and_blocks_actions(tm
         {
             "evidence_source_errors": {
                 "position_history:BTC-USDT-SWAP:stale-pos": "history unavailable"
+            }
+        }
+    ]
+
+
+def test_repair_plan_rejects_position_history_row_for_different_requested_id(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_history_candidates(session_factory)
+    client = _HistoricalCleanupClient()
+    client.position_history[("BTC-USDT-SWAP", "actual-order-pos")] = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "different-position",
+            "posSide": "long",
+            "mrgPosition": "split",
+            "pos": "4",
+            "closePos": "4",
+        }
+    ]
+
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 12, 0, tzinfo=UTC),
+    )
+
+    assert plan.actions == ()
+    assert plan.historical_actions == ()
+    assert plan.unresolved_conflicts == [
+        {
+            "evidence_source_errors": {
+                "position_history:BTC-USDT-SWAP:actual-order-pos": (
+                    "position history response posId mismatch: "
+                    "expected actual-order-pos"
+                )
             }
         }
     ]
@@ -1094,7 +1182,7 @@ def test_repair_plan_includes_historical_cleanup_without_mutating_database(tmp_p
 
     plan = build_position_attribution_repair_plan(
         session_factory,
-        deepcoin_client=_HistoricalCleanupClient(),
+        deepcoin_client=_historical_duplicate_client(),
         now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
     )
 
@@ -1108,7 +1196,7 @@ def test_repair_plan_excludes_current_live_position_from_historical_actions(tmp_
 
     plan = build_position_attribution_repair_plan(
         session_factory,
-        deepcoin_client=_HistoricalCleanupClient(live_position_ids=["p1"]),
+        deepcoin_client=_historical_duplicate_client(live_position_ids=["p1"]),
         now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
     )
 
@@ -1124,7 +1212,7 @@ def test_historical_repair_fingerprint_changes_when_terminal_evidence_changes(
     tmp_path, mutation
 ):
     session_factory = _seed_historical_duplicate_fixture(tmp_path)
-    client = _HistoricalCleanupClient()
+    client = _historical_duplicate_client()
     first = build_position_attribution_repair_plan(
         session_factory,
         deepcoin_client=client,
@@ -1169,7 +1257,7 @@ def test_historical_repair_fingerprint_changes_when_terminal_evidence_changes(
 
 def test_historical_cleanup_apply_is_atomic_audited_indexed_and_idempotent(tmp_path):
     session_factory = _seed_historical_duplicate_fixture(tmp_path)
-    client = _HistoricalCleanupClient()
+    client = _historical_duplicate_client()
     plan = build_position_attribution_repair_plan(
         session_factory,
         deepcoin_client=client,
@@ -1408,7 +1496,7 @@ def test_exact_exchange_position_history_persists_neutral_close_reasons(tmp_path
 
 def test_unique_index_failure_rolls_back_cleanup_and_audits(tmp_path, monkeypatch):
     session_factory = _seed_historical_duplicate_fixture(tmp_path)
-    client = _HistoricalCleanupClient()
+    client = _historical_duplicate_client()
     plan = build_position_attribution_repair_plan(
         session_factory,
         deepcoin_client=client,
