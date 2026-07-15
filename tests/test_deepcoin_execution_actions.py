@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import json
 from threading import Event, Thread
 
 import pytest
@@ -137,6 +138,76 @@ def _binding(session_factory, **overrides):
             ),
         )
     return binding_id
+
+
+def _persist_reviewed_equivalent_assignments(session_factory, *, mutate=None):
+    with session_factory() as session:
+        legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.leg_index).all()
+        leg_ids = [leg.id for leg in legs]
+        position_ids = [str(leg.pos_id) for leg in legs]
+        evidence = {
+            "policy_version": 2,
+            "evidence_type": "equivalent_permutation_assignment",
+            "component_leg_ids": leg_ids,
+            "component_position_ids": position_ids,
+            "mapping_basis": "stable_sorted_canonicalization",
+            "ownership_statement": (
+                "binding owner proven; parent-child mapping canonicalized"
+            ),
+            "equivalence_signature": {
+                "binding_id": legs[0].execution_binding_id,
+                "strategy_instance_id": legs[0].strategy_instance_id,
+                "venue": "deepcoin",
+                "symbol": "ETH-USDT-SWAP",
+                "side": "long",
+                "requested_size": 0.1,
+                "entry_price": 1580.0,
+                "stop_loss": 1560.0,
+                "take_profits": [1600.0],
+                "protection_mutated": False,
+                "margin_mode": "cross",
+                "position_mode": "split",
+                "order_kind": "market",
+                "leg_population": [
+                    {
+                        "leg_id": leg.id,
+                        "binding_id": leg.execution_binding_id,
+                        "strategy_instance_id": leg.strategy_instance_id,
+                        "venue": leg.venue,
+                        "symbol": "ETH-USDT-SWAP",
+                        "side": "long",
+                        "requested_size": 0.1,
+                        "entry_price": 1580.0,
+                        "stop_loss": 1560.0,
+                        "take_profits": [1600.0],
+                        "margin_mode": "cross",
+                        "position_mode": "split",
+                        "order_kind": leg.order_kind,
+                        "protection_mutated": False,
+                    }
+                    for leg in legs
+                ],
+                "position_population": [
+                    {
+                        "position_id": position_id,
+                        "symbol": "ETH-USDT-SWAP",
+                        "side": "long",
+                        "size": 0.1,
+                        "entry_price": 1580.0,
+                        "stop_loss": 1560.0,
+                        "take_profits": [1600.0],
+                        "margin_mode": "cross",
+                        "position_mode": "split",
+                    }
+                    for position_id in position_ids
+                ],
+            },
+        }
+        if mutate is not None:
+            mutate(evidence, legs)
+        for leg in legs:
+            leg.attribution_evidence_json = json.dumps(evidence)
+        session.commit()
 
 
 def _signal(session_factory, *, action, payload=None, message_id=88, kol_id="alice", symbol="ETH", side="long"):
@@ -301,6 +372,81 @@ def test_exact_bound_close_accepts_explicit_legacy_manual_bind(tmp_path):
 
     assert result["submitted"] is True
     assert len(client.order_payloads) == 1
+
+
+def test_reviewed_equivalent_assignments_authorize_close_and_tpsl_management(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    _persist_reviewed_equivalent_assignments(session_factory)
+    client = _FakeDeepcoinClient()
+
+    protection = adjust_position_tpsl(
+        session_factory,
+        trade_signal=_signal(
+            session_factory,
+            action="adjust_stop_loss",
+            payload={"binding_id": binding_id, "stop_loss": 1577.04},
+        ),
+        deepcoin_client=client,
+    )
+    close = close_bound_position_market(
+        session_factory,
+        pos_id="pos-1",
+        deepcoin_client=client,
+    )
+
+    assert protection["submitted"] is True
+    assert close["submitted"] is True
+    assert close["pos_id"] == "pos-1"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda evidence, legs: evidence.pop("policy_version"),
+        lambda evidence, legs: evidence.pop("component_leg_ids"),
+        lambda evidence, legs: evidence.pop("component_position_ids"),
+        lambda evidence, legs: evidence.pop("mapping_basis"),
+        lambda evidence, legs: evidence.pop("ownership_statement"),
+        lambda evidence, legs: evidence["component_position_ids"].reverse(),
+        lambda evidence, legs: evidence["equivalence_signature"].pop("symbol"),
+        lambda evidence, legs: evidence["equivalence_signature"].pop(
+            "leg_population"
+        ),
+        lambda evidence, legs: evidence["equivalence_signature"].pop(
+            "position_population"
+        ),
+    ],
+)
+def test_reviewed_equivalent_assignment_fails_closed_when_schema_is_incomplete_or_stale(
+    tmp_path, mutate
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    _persist_reviewed_equivalent_assignments(session_factory, mutate=mutate)
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="position_ownership_evidence_not_authoritative",
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+        )
+
+    assert client.order_payloads == []
 
 
 def test_adjust_stop_loss_cancels_existing_position_tpsl_before_resetting(tmp_path):

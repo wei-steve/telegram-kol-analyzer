@@ -24,7 +24,8 @@
       {% if attr.group_name %}<span>{{ attr.group_name }}</span>{% endif %}
       {% if attr.strategy_summary %}<span>{{ attr.strategy_summary }}</span>{% endif %}
       {% if attr.order_role %}<code>{{ attr.order_role }}</code>{% endif %}
-      {% if attr.evidence_type %}<code>{{ attr.evidence_type }}</code>{% endif %}
+      {% if attr.provenance_label %}<code>{{ attr.provenance_label }}</code>
+      {% elif attr.evidence_type %}<code>{{ attr.evidence_type }}</code>{% endif %}
       {% if attr.pos_id %}<code>pos {{ attr.pos_id }}</code>{% endif %}
       {% if attr.last_verified_at %}<small>{{ attr.last_verified_at }}</small>{% endif %}
       {% if attr.reasons %}<small>{{ attr.reasons | join('，') }}</small>{% endif %}

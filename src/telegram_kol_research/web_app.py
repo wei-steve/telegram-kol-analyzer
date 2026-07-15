@@ -791,11 +791,17 @@ def _persisted_position_attribution(
             )
             if item
         )
-        reasons = ["持久化 entry-leg 证据"]
+        if evidence.get("evidence_type") == "equivalent_permutation_assignment":
+            provenance_label = "等价腿确定性归属"
+            reasons = ["已审核等价腿组件，按稳定排序确定腿/仓位映射"]
+        else:
+            provenance_label = None
+            reasons = ["持久化 entry-leg 证据"]
     else:
         label = "归属待确认"
         rendered_state = "conflict"
         strategy_summary = "归属冲突 · 自动管理已冻结"
+        provenance_label = None
         reasons = [state]
     last_verified_at = leg.last_verified_at
     if last_verified_at is not None:
@@ -820,6 +826,7 @@ def _persisted_position_attribution(
         "order_role": f"entry leg #{leg.leg_index}",
         "evidence_type": evidence.get("evidence_type")
         or evidence.get("evidence_source"),
+        "provenance_label": provenance_label,
         "pos_id": leg.pos_id,
         "last_verified_at": last_verified_display,
         "ownership_state": state,

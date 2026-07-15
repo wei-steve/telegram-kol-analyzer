@@ -24,6 +24,7 @@ from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_signal
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import create_web_app
+from telegram_kol_research.web_app import _persisted_position_attribution
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import ExecutionBinding
@@ -36,6 +37,42 @@ from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_bot_commands import (
     _log_system_operator_callback_processed,
 )
+
+
+def test_reviewed_equivalent_assignment_maps_to_dedicated_web_provenance():
+    leg = SimpleNamespace(
+        attribution_evidence_json=json.dumps(
+            {
+                "evidence_type": "equivalent_permutation_assignment",
+                "mapping_basis": "stable_sorted_canonicalization",
+            }
+        ),
+        attribution_status="verified",
+        status="active",
+        strategy_instance_id="deepcoin:9527:56:ETH:short",
+        leg_index=1,
+        pos_id="pos-miya-1",
+        last_verified_at=None,
+    )
+    binding = SimpleNamespace(
+        chat_id=9527,
+        strategy_instance_id="deepcoin:9527:56:ETH:short",
+        symbol="ETH",
+        side="short",
+    )
+
+    attribution = _persisted_position_attribution(
+        leg=leg,
+        binding=binding,
+        group_label_by_chat_id={9527: "米娅 vip 会员群 11分组"},
+    )
+
+    assert attribution is not None
+    assert attribution["group_name"] == "米娅 vip 会员群 11分组"
+    assert attribution["provenance_label"] == "等价腿确定性归属"
+    assert attribution["reasons"] == [
+        "已审核等价腿组件，按稳定排序确定腿/仓位映射"
+    ]
 
 
 def test_semantic_review_worker_lifespan_starts_once_without_telegram_and_stops_first(

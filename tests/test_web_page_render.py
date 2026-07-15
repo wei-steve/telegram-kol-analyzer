@@ -609,6 +609,113 @@ def test_bound_position_close_renders_exact_context_for_bound_exchange_position(
     assert 'data-close-bound-position-status aria-live="polite"' in response.text
 
 
+def test_reviewed_equivalent_positions_render_miya_and_deterministic_provenance(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:9527:56:ETH:short",
+            kol_id="group:9527",
+            chat_id=9527,
+            message_id=56,
+            symbol="ETH",
+            side="short",
+            venue="deepcoin",
+            pos_id="pos-miya-1,pos-miya-2",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
+        legs = [
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=index,
+                purpose="entry",
+                order_kind="trigger_limit",
+                pos_id=pos_id,
+                venue="deepcoin",
+                attribution_status="verified",
+                status="active",
+            )
+            for index, pos_id in enumerate(("pos-miya-1", "pos-miya-2"), start=1)
+        ]
+        session.add_all(legs)
+        session.flush()
+        evidence = {
+            "policy_version": 2,
+            "evidence_type": "equivalent_permutation_assignment",
+            "component_leg_ids": [leg.id for leg in legs],
+            "component_position_ids": ["pos-miya-1", "pos-miya-2"],
+            "mapping_basis": "stable_sorted_canonicalization",
+            "ownership_statement": (
+                "binding owner proven; parent-child mapping canonicalized"
+            ),
+            "equivalence_signature": {
+                "leg_population": [
+                    {
+                        "leg_id": leg.id,
+                        "binding_id": binding.id,
+                        "strategy_instance_id": binding.strategy_instance_id,
+                        "venue": "deepcoin",
+                        "order_kind": "trigger_limit",
+                    }
+                    for leg in legs
+                ],
+                "position_population": [
+                    {"position_id": "pos-miya-1"},
+                    {"position_id": "pos-miya-2"},
+                ],
+            },
+        }
+        for leg in legs:
+            leg.attribution_evidence_json = json.dumps(evidence)
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": pos_id,
+                    "posSide": "short",
+                    "pos": "1.5",
+                    "avgPx": "1770",
+                }
+                for pos_id in ("pos-miya-1", "pos-miya-2")
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=database_path,
+            group_config=GroupConfig(
+                groups=[
+                    TargetGroupConfig(
+                        chat_title="米娅 vip 会员群 11分组",
+                        chat_id=9527,
+                        ai_strategy_enabled=True,
+                        trading_mode="auto_trade",
+                    )
+                ]
+            ),
+            deepcoin_client_factory=FakeDeepcoinClient,
+        )
+    ).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "米娅 vip 会员群 11分组" in response.text
+    assert "等价腿确定性归属" in response.text
+    assert "已审核等价腿组件，按稳定排序确定腿/仓位映射" in response.text
+    assert "Deepcoin 直接 ID 证明" not in response.text
+    assert "equivalent_permutation_assignment" not in response.text
+
+
 def test_conflicted_position_renders_frozen_persisted_attribution(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

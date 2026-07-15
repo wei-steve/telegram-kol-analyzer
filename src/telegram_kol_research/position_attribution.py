@@ -161,6 +161,11 @@ def has_authoritative_persisted_position(leg) -> bool:
     except (TypeError, ValueError):
         return False
     if (
+        isinstance(evidence, dict)
+        and evidence.get("evidence_type") == "equivalent_permutation_assignment"
+    ):
+        return _has_authoritative_equivalent_permutation_assignment(leg, evidence)
+    if (
         str(getattr(leg, "order_kind", None) or "") == "manual_bind"
         and isinstance(evidence, dict)
         and evidence.get("source") == "manual_operator_bind"
@@ -169,6 +174,146 @@ def has_authoritative_persisted_position(leg) -> bool:
     return bool(
         isinstance(evidence, dict)
         and evidence.get("policy_version") == ATTRIBUTION_POLICY_VERSION
+    )
+
+
+def _has_authoritative_equivalent_permutation_assignment(
+    leg, evidence: Mapping[str, object]
+) -> bool:
+    """Trust only the complete reviewed canonical evidence emitted by repair."""
+
+    if evidence.get("policy_version") != ATTRIBUTION_POLICY_VERSION:
+        return False
+    if evidence.get("mapping_basis") != "stable_sorted_canonicalization":
+        return False
+    if evidence.get("ownership_statement") != (
+        "binding owner proven; parent-child mapping canonicalized"
+    ):
+        return False
+
+    component_leg_ids = evidence.get("component_leg_ids")
+    component_position_ids = evidence.get("component_position_ids")
+    if not isinstance(component_leg_ids, list) or not isinstance(
+        component_position_ids, list
+    ):
+        return False
+    if len(component_leg_ids) < 2 or len(component_leg_ids) != len(
+        component_position_ids
+    ):
+        return False
+    if any(
+        isinstance(leg_id, bool) or not isinstance(leg_id, int)
+        for leg_id in component_leg_ids
+    ):
+        return False
+    if any(
+        not isinstance(position_id, str) or not position_id
+        for position_id in component_position_ids
+    ):
+        return False
+    if len(set(component_leg_ids)) != len(component_leg_ids) or len(
+        set(component_position_ids)
+    ) != len(component_position_ids):
+        return False
+    if component_leg_ids != sorted(component_leg_ids):
+        return False
+    if component_position_ids != sorted(
+        component_position_ids, key=_numeric_aware_identifier_key
+    ):
+        return False
+
+    current_leg_id = getattr(leg, "id", None)
+    current_pos_id = str(getattr(leg, "pos_id", None) or "")
+    if current_leg_id not in component_leg_ids:
+        return False
+    pair_index = component_leg_ids.index(current_leg_id)
+    if component_position_ids[pair_index] != current_pos_id:
+        return False
+
+    signature = evidence.get("equivalence_signature")
+    if not isinstance(signature, dict):
+        return False
+    signature_keys = {
+        "binding_id",
+        "strategy_instance_id",
+        "venue",
+        "symbol",
+        "side",
+        "requested_size",
+        "entry_price",
+        "stop_loss",
+        "take_profits",
+        "protection_mutated",
+        "margin_mode",
+        "position_mode",
+        "order_kind",
+        "leg_population",
+        "position_population",
+    }
+    if not signature_keys.issubset(signature):
+        return False
+    leg_population = signature.get("leg_population")
+    position_population = signature.get("position_population")
+    if not isinstance(leg_population, list) or not isinstance(
+        position_population, list
+    ):
+        return False
+    if len(leg_population) != len(component_leg_ids) or len(
+        position_population
+    ) != len(component_position_ids):
+        return False
+
+    leg_population_keys = {
+        "leg_id",
+        "binding_id",
+        "strategy_instance_id",
+        "venue",
+        "symbol",
+        "side",
+        "requested_size",
+        "entry_price",
+        "stop_loss",
+        "take_profits",
+        "margin_mode",
+        "position_mode",
+        "order_kind",
+        "protection_mutated",
+    }
+    position_population_keys = {
+        "position_id",
+        "symbol",
+        "side",
+        "size",
+        "entry_price",
+        "stop_loss",
+        "take_profits",
+        "margin_mode",
+        "position_mode",
+    }
+    if any(
+        not isinstance(row, dict) or not leg_population_keys.issubset(row)
+        for row in leg_population
+    ):
+        return False
+    if any(
+        not isinstance(row, dict) or not position_population_keys.issubset(row)
+        for row in position_population
+    ):
+        return False
+    if [row["leg_id"] for row in leg_population] != component_leg_ids:
+        return False
+    if [row["position_id"] for row in position_population] != component_position_ids:
+        return False
+
+    current_leg_row = leg_population[pair_index]
+    return bool(
+        current_leg_row["binding_id"]
+        == getattr(leg, "execution_binding_id", None)
+        and current_leg_row["strategy_instance_id"]
+        == getattr(leg, "strategy_instance_id", None)
+        and str(current_leg_row["venue"] or "").lower()
+        == str(getattr(leg, "venue", None) or "").lower()
+        and current_leg_row["order_kind"] == getattr(leg, "order_kind", None)
     )
 
 
