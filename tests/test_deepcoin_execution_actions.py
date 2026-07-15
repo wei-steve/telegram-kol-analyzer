@@ -9,6 +9,7 @@ from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionAc
 from telegram_kol_research.deepcoin_execution_actions import adjust_position_tpsl
 from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
 from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
+from telegram_kol_research.deepcoin_execution_actions import partial_close_and_move_stop_to_entry
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
 from telegram_kol_research.execution_bindings import list_execution_order_legs
@@ -1161,22 +1162,10 @@ def test_adjust_stop_loss_cancels_existing_position_tpsl_before_resetting(tmp_pa
     )
 
     assert [item["ordId"] for item in client.cancel_trigger_payloads] == ["tp-old", "sl-old"]
-    assert client.protection_payloads == [
-        {
-            "instType": "SWAP",
-            "instId": "ETH-USDT-SWAP",
-            "posSide": "long",
-            "mrgPosition": "split",
-            "tdMode": "cross",
-            "posId": "pos-1",
-            "tpTriggerPx": "1605.6",
-            "tpTriggerPxType": "last",
-            "tpOrdPx": "-1",
-            "slTriggerPx": "1577.04",
-            "slTriggerPxType": "last",
-            "slOrdPx": "-1",
-        }
-    ]
+    assert [
+        (item.get("tpTriggerPx"), item.get("slTriggerPx"), item["sz"])
+        for item in client.protection_payloads
+    ] == [("1605.6", None, "0.1"), (None, "1577.04", "0.1")]
     assert result["cancelled_tpsl_order_ids"] == ["tp-old", "sl-old"]
     assert result["before"] == {"take_profit": 1605.6, "stop_loss": 1567.52}
     assert result["after"] == {"take_profit": 1605.6, "stop_loss": 1577.04}
@@ -1188,6 +1177,56 @@ def test_adjust_stop_loss_cancels_existing_position_tpsl_before_resetting(tmp_pa
         "cancel_position_tpsl",
     ]
     assert events[0].related_order_id == "tp-old,sl-old"
+
+
+def test_adjust_position_tpsl_preserves_multiple_take_profit_rows(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    trade_signal = _signal(
+        session_factory,
+        action="adjust_stop_loss",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+    )
+    client = _FakeDeepcoinClient()
+    client.trigger_pending[0]["sz"] = "0.04"
+    client.trigger_pending.insert(
+        1,
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "tp-old-2",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "posId": "pos-1",
+            "tpTriggerPx": "1615.6",
+            "tpTriggerPxType": "mark",
+            "tpOrdPx": "1615",
+            "sz": "0.06",
+            "cTime": "1000",
+        },
+    )
+
+    adjust_position_tpsl(
+        session_factory,
+        trade_signal=trade_signal,
+        deepcoin_client=client,
+        executed_at=datetime(2026, 6, 30, 9, 0, tzinfo=UTC),
+    )
+
+    assert [item["ordId"] for item in client.cancel_trigger_payloads] == [
+        "tp-old",
+        "tp-old-2",
+        "sl-old",
+    ]
+    assert [
+        (item.get("tpTriggerPx"), item.get("slTriggerPx"), item["sz"])
+        for item in client.protection_payloads
+    ] == [
+        ("1605.6", None, "0.04"),
+        ("1615.6", None, "0.06"),
+        (None, "1577.04", "0.1"),
+    ]
+    assert client.protection_payloads[1]["tpTriggerPxType"] == "mark"
+    assert client.protection_payloads[1]["tpOrdPx"] == "1615"
 
 
 def test_adjust_position_tpsl_refuses_to_append_when_existing_tpsl_is_missing(tmp_path):
@@ -1395,6 +1434,31 @@ def test_legacy_composite_breakeven_management_requires_batch(tmp_path):
         )
 
     assert client.order_payloads == []
+    assert client.protection_payloads == []
+
+
+def test_composite_helper_never_moves_stop_before_close_exchange_confirmation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    signal = _signal(
+        session_factory,
+        action="partial_close_and_move_stop_to_entry",
+        payload={"targets": [{"binding_id": binding_id, "fraction": 0.5}]},
+    )
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="composite_management_requires_exchange_confirmed_batch_close",
+    ):
+        partial_close_and_move_stop_to_entry(
+            session_factory,
+            trade_signal=signal,
+            deepcoin_client=client,
+        )
+
+    assert client.order_payloads == []
+    assert client.cancel_trigger_payloads == []
     assert client.protection_payloads == []
 
 

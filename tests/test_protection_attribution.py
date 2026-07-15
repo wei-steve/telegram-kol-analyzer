@@ -1,4 +1,7 @@
-from telegram_kol_research.protection_attribution import match_position_protection
+from telegram_kol_research.protection_attribution import (
+    match_position_protection,
+    snapshot_protection_rows,
+)
 
 
 def _position(pos_id, *, size="1.5", created_at="1782788876000", **overrides):
@@ -80,6 +83,62 @@ def test_stop_and_partial_targets_created_at_nearby_times_form_one_evidence_grou
     assert protection.stop_loss == 1820
     assert protection.take_profits == [1900, 2000]
     assert protection.order_ids == ["sl", "tp-1", "tp-2"]
+
+
+def test_protection_snapshot_preserves_every_ordered_row_and_execution_semantics():
+    rows = [
+        _tpsl(
+            ordId="tp-1",
+            size="0.9",
+            tpTriggerPrice="1900",
+            tpTriggerPxType="mark",
+            tpOrdPx="1899",
+        ),
+        _tpsl(
+            ordId="tp-2",
+            size="0.6",
+            tpTriggerPrice="2000",
+            tpTriggerPxType="index",
+            tpOrdPx="-1",
+        ),
+        _tpsl(
+            ordId="sl-full",
+            size="0",
+            slTriggerPrice="1820",
+            slTriggerPxType="last",
+            slOrdPx="-1",
+        ),
+    ]
+
+    assert snapshot_protection_rows(rows) == [
+        {
+            "order_id": "tp-1",
+            "purpose": "take_profit",
+            "trigger_price": "1900",
+            "size": "0.9",
+            "full_position": False,
+            "trigger_type": "mark",
+            "order_price": "1899",
+        },
+        {
+            "order_id": "tp-2",
+            "purpose": "take_profit",
+            "trigger_price": "2000",
+            "size": "0.6",
+            "full_position": False,
+            "trigger_type": "index",
+            "order_price": "-1",
+        },
+        {
+            "order_id": "sl-full",
+            "purpose": "stop_loss",
+            "trigger_price": "1820",
+            "size": "0",
+            "full_position": True,
+            "trigger_type": "last",
+            "order_price": "-1",
+        },
+    ]
 
 
 def test_nearby_positions_keep_each_target_with_its_nearest_stop_group():

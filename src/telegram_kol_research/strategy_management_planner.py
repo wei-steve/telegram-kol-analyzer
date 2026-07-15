@@ -33,7 +33,10 @@ from telegram_kol_research.position_attribution import (
     require_equivalent_live_position_economics,
     require_verified_position_ownership,
 )
-from telegram_kol_research.protection_attribution import match_position_protection
+from telegram_kol_research.protection_attribution import (
+    match_position_protection,
+    snapshot_protection_rows,
+)
 from telegram_kol_research.position_authority_lock import position_authority_lock
 from telegram_kol_research.strategy_management_batches import (
     ManagementBatchRecord,
@@ -356,6 +359,7 @@ def _plan_strategy_management_batch_locked(
                 "take_profits": list(protection.take_profits),
                 "order_ids": list(protection.order_ids),
                 "rows": [dict(row) for row in protection.rows],
+                "row_snapshots": snapshot_protection_rows(protection.rows),
                 "evidence": protection.evidence,
             }
 

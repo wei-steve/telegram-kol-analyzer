@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -13,8 +14,10 @@ from telegram_kol_research.models import (
     RawMessage,
     RecognitionDecision,
     StrategyLifecycle,
+    StrategyManagementBatch,
     StrategyManagementLeg,
 )
+from telegram_kol_research.protection_attribution import snapshot_protection_rows
 from telegram_kol_research.strategy_management_batches import (
     ManagementLegCreate,
     create_management_batch,
@@ -121,6 +124,113 @@ def _persist_close_batch(session_factory, *, sizes=("1", "2"), symbol="BTC"):
     )
 
 
+def _persist_protection_batch(
+    session_factory,
+    *,
+    action="adjust_stop_loss",
+    stop_loss="65000",
+):
+    batch = _persist_close_batch(session_factory, sizes=("1", "2"), symbol="BTC")
+    rows_by_pos = {
+        "pos-1": [
+            {
+                "triggerOrderType": "TPSL",
+                "ordId": "tp-1a",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "posId": "pos-1",
+                "tpTriggerPx": "63000",
+                "tpTriggerPxType": "mark",
+                "tpOrdPx": "-1",
+                "sz": "1",
+                "cTime": "1000",
+            },
+            {
+                "triggerOrderType": "TPSL",
+                "ordId": "tp-1b",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "posId": "pos-1",
+                "tpTriggerPx": "62000",
+                "tpTriggerPxType": "last",
+                "tpOrdPx": "61990",
+                "sz": "1",
+                "cTime": "1000",
+            },
+            {
+                "triggerOrderType": "TPSL",
+                "ordId": "sl-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "posId": "pos-1",
+                "slTriggerPx": "65500",
+                "slTriggerPxType": "index",
+                "slOrdPx": "-1",
+                "sz": "0",
+                "cTime": "1000",
+            },
+        ],
+        "pos-2": [
+            {
+                "triggerOrderType": "TPSL",
+                "ordId": "tp-2",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "posId": "pos-2",
+                "tpTriggerPx": "62500",
+                "tpTriggerPxType": "last",
+                "tpOrdPx": "-1",
+                "sz": "4",
+                "cTime": "1001",
+            },
+            {
+                "triggerOrderType": "TPSL",
+                "ordId": "sl-2",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "posId": "pos-2",
+                "slTriggerPx": "65700",
+                "slTriggerPxType": "last",
+                "slOrdPx": "-1",
+                "sz": "0",
+                "cTime": "1001",
+            },
+        ],
+    }
+    with session_factory() as session:
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        stored_batch.intent = action
+        stored_batch.effective_action = action
+        stored_batch.effective_fraction = None
+        stored_batch.requested_fraction = None
+        legs = (
+            session.query(StrategyManagementLeg)
+            .filter(StrategyManagementLeg.management_batch_id == batch.id)
+            .order_by(StrategyManagementLeg.leg_index)
+            .all()
+        )
+        for leg, pos_id, size, avg_px in zip(
+            legs, ("pos-1", "pos-2"), ("2", "4"), ("64000", "64500")
+        ):
+            rows = rows_by_pos[pos_id]
+            leg.planned_close_size = None
+            leg.preflight_size = size
+            leg.avg_entry_price = avg_px
+            leg.old_tpsl_json = json.dumps(
+                {
+                    "status": "verified",
+                    "order_ids": [row["ordId"] for row in rows],
+                    "rows": rows,
+                    "row_snapshots": snapshot_protection_rows(rows),
+                }
+            )
+            leg.planned_tpsl_json = json.dumps(
+                {"intent": action, "stop_loss_text": stop_loss}
+            )
+        session.commit()
+    return load_management_batch(session_factory, batch.id), rows_by_pos
+
+
 class _FakeClient:
     def __init__(self, session_factory, outcomes=None):
         self.session_factory = session_factory
@@ -142,6 +252,67 @@ class _FakeClient:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+class _ProtectionClient:
+    def __init__(
+        self,
+        session_factory,
+        rows_by_pos,
+        *,
+        set_outcomes=None,
+        cancel_outcomes=None,
+    ):
+        self.session_factory = session_factory
+        self.positions = [
+            {
+                "posId": "pos-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "2",
+                "avgPx": "64000",
+                "cTime": "1000",
+            },
+            {
+                "posId": "pos-2",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "4",
+                "avgPx": "64500",
+                "cTime": "1001",
+            },
+        ]
+        self.pending = [dict(row) for rows in rows_by_pos.values() for row in rows]
+        self.set_outcomes = list(set_outcomes or [])
+        self.cancel_outcomes = list(cancel_outcomes or [])
+        self.cancel_calls = []
+        self.set_calls = []
+        self.pending_reads = 0
+
+    def list_positions(self, *, inst_id=None):
+        return [dict(row) for row in self.positions]
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        self.pending_reads += 1
+        return [dict(row) for row in self.pending]
+
+    def cancel_trigger_order(self, payload):
+        self.cancel_calls.append(dict(payload))
+        if self.cancel_outcomes:
+            outcome = self.cancel_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        return {"code": "0", "data": {"ordId": payload["ordId"]}}
+
+    def set_position_sltp(self, payload):
+        self.set_calls.append(dict(payload))
+        if self.set_outcomes:
+            outcome = self.set_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        return {"code": "0", "data": {"ordId": f"new-{len(self.set_calls)}"}}
 
 
 def _legacy_close_signal(session_factory, batch, **overrides):
@@ -429,6 +600,197 @@ def test_non_close_or_terminal_batch_is_explicitly_fail_closed(tmp_path):
             deepcoin_client=_FakeClient(session_factory),
             executed_at=NOW,
         )
+
+
+def test_explicit_stop_replaces_every_position_and_preserves_each_take_profit(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "succeeded"
+    assert [leg["status"] for leg in result["legs"]] == ["succeeded", "succeeded"]
+    assert [call["ordId"] for call in client.cancel_calls] == [
+        "tp-1a",
+        "tp-1b",
+        "sl-1",
+        "tp-2",
+        "sl-2",
+    ]
+    assert [
+        (call["posId"], call.get("tpTriggerPx"), call.get("slTriggerPx"))
+        for call in client.set_calls
+    ] == [
+        ("pos-1", "63000", None),
+        ("pos-1", "62000", None),
+        ("pos-1", None, "65000"),
+        ("pos-2", "62500", None),
+        ("pos-2", None, "65000"),
+    ]
+    assert client.set_calls[0]["tpTriggerPxType"] == "mark"
+    assert client.set_calls[1]["tpOrdPx"] == "61990"
+
+
+def test_break_even_uses_each_positions_own_average_entry(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory, action="move_stop_to_break_even", stop_loss=None
+    )
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    stops = [call for call in client.set_calls if "slTriggerPx" in call]
+    assert [(call["posId"], call["slTriggerPx"]) for call in stops] == [
+        ("pos-1", "64000"),
+        ("pos-2", "64500"),
+    ]
+
+
+def test_second_partial_promoted_to_full_exit_never_creates_new_stop(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+    with session_factory() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        stored.intent = "partial_take_profit"
+        stored.effective_action = "full_exit"
+        stored.partial_round_before = 1
+        for leg in (
+            session.query(StrategyManagementLeg)
+            .filter(StrategyManagementLeg.management_batch_id == batch.id)
+            .all()
+        ):
+            leg.planned_tpsl_json = json.dumps(
+                {"intent": "move_stop_to_break_even"}
+            )
+        session.commit()
+
+    class Client(_FakeClient):
+        def __init__(self, factory):
+            super().__init__(factory)
+            self.protection_payloads = []
+
+        def set_position_sltp(self, payload):
+            self.protection_payloads.append(dict(payload))
+            return {"code": "0", "data": {"ordId": "should-not-exist"}}
+
+    client = Client(session_factory)
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "reconciling"
+    assert client.protection_payloads == []
+
+
+@pytest.mark.parametrize("drift", ["price", "missing", "ambiguous"])
+def test_protection_preflight_drift_or_ambiguity_has_zero_cancels(drift, tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    if drift == "price":
+        client.pending[0]["tpTriggerPx"] = "63100"
+    elif drift == "missing":
+        client.pending.pop()
+    else:
+        ambiguous = dict(client.pending[-1])
+        ambiguous["ordId"] = "sl-extra"
+        ambiguous["slTriggerPx"] = "65800"
+        client.pending.append(ambiguous)
+
+    with pytest.raises(ManagementBatchExecutionError, match="protection_preflight"):
+        execute_management_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=client,
+            executed_at=NOW,
+        )
+
+    assert client.cancel_calls == []
+    assert client.set_calls == []
+
+
+def test_replacement_failure_restores_complete_position_and_stops_later_legs(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    client = _ProtectionClient(
+        session_factory,
+        rows_by_pos,
+        set_outcomes=[
+            {"code": "0", "data": {"ordId": "new-1a"}},
+            {"code": "0", "data": {"ordId": "new-1b"}},
+            {"code": "0", "data": {"ordId": "new-sl1"}},
+            DeepcoinDefiniteRejection("replacement rejected"),
+            {"code": "0", "data": {"ordId": "restore-tp2"}},
+            {"code": "0", "data": {"ordId": "restore-sl2"}},
+        ],
+    )
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "partial_failed"
+    assert [leg["status"] for leg in result["legs"]] == ["succeeded", "restored"]
+    assert [call["posId"] for call in client.set_calls] == [
+        "pos-1",
+        "pos-1",
+        "pos-1",
+        "pos-2",
+        "pos-2",
+        "pos-2",
+    ]
+    assert client.set_calls[-1]["slTriggerPx"] == "65700"
+
+
+def test_restore_failure_marks_recovery_required_and_stops_later_legs(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    client = _ProtectionClient(
+        session_factory,
+        rows_by_pos,
+        set_outcomes=[
+            DeepcoinDefiniteRejection("replacement rejected"),
+            DeepcoinDefiniteRejection("restore rejected"),
+        ],
+    )
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert [leg["status"] for leg in result["legs"]] == [
+        "recovery_required",
+        "planned",
+    ]
+    assert [call["ordId"] for call in client.cancel_calls] == [
+        "tp-1a",
+        "tp-1b",
+        "sl-1",
+    ]
 
 
 @pytest.mark.parametrize("mode", ["disabled", "shadow"])

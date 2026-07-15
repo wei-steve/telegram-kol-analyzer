@@ -29,6 +29,78 @@ class ProtectionMatchResult:
     by_pos_id: dict[str, PositionProtection]
 
 
+def snapshot_protection_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return stable, ordered TPSL rows suitable for mutation preflight.
+
+    The snapshot intentionally keeps each exchange row separate.  In
+    particular, multiple partial take-profit rows must never be collapsed into
+    the last observed trigger price.
+    """
+
+    snapshots: list[dict[str, Any]] = []
+    for row in rows:
+        order_id = _first_text(
+            row,
+            "ordId",
+            "orderId",
+            "order_id",
+            "algoId",
+            "triggerOrderId",
+            "id",
+        )
+        size = _first_text(row, "sz", "size") or "0"
+        tp_price = _first_text(
+            row, "tpTriggerPx", "tpTriggerPrice", "takeProfitPrice"
+        )
+        sl_price = _first_text(
+            row, "slTriggerPx", "slTriggerPrice", "stopLossPrice"
+        )
+        if tp_price is not None and sl_price is not None:
+            snapshots.append(
+                {
+                    "order_id": order_id,
+                    "purpose": "combined",
+                    "take_profit": {
+                        "trigger_price": tp_price,
+                        "trigger_type": _first_text(row, "tpTriggerPxType") or "last",
+                        "order_price": _first_text(row, "tpOrdPx") or "-1",
+                    },
+                    "stop_loss": {
+                        "trigger_price": sl_price,
+                        "trigger_type": _first_text(row, "slTriggerPxType") or "last",
+                        "order_price": _first_text(row, "slOrdPx") or "-1",
+                    },
+                    "size": size,
+                    "full_position": _float_or_none(size) == 0,
+                }
+            )
+            continue
+        if tp_price is not None:
+            purpose = "take_profit"
+            trigger_price = tp_price
+            trigger_type = _first_text(row, "tpTriggerPxType") or "last"
+            order_price = _first_text(row, "tpOrdPx") or "-1"
+        elif sl_price is not None:
+            purpose = "stop_loss"
+            trigger_price = sl_price
+            trigger_type = _first_text(row, "slTriggerPxType") or "last"
+            order_price = _first_text(row, "slOrdPx") or "-1"
+        else:
+            continue
+        snapshots.append(
+            {
+                "order_id": order_id,
+                "purpose": purpose,
+                "trigger_price": trigger_price,
+                "size": size,
+                "full_position": _float_or_none(size) == 0,
+                "trigger_type": trigger_type,
+                "order_price": order_price,
+            }
+        )
+    return snapshots
+
+
 @dataclass(frozen=True, slots=True)
 class _Position:
     pos_id: str

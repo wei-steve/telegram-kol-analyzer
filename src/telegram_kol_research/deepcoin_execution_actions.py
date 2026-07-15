@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -36,7 +36,10 @@ from telegram_kol_research.position_attribution import (
     require_equivalent_live_position_economics,
     require_verified_position_ownership,
 )
-from telegram_kol_research.protection_attribution import match_position_protection
+from telegram_kol_research.protection_attribution import (
+    match_position_protection,
+    snapshot_protection_rows,
+)
 from telegram_kol_research.trade_signals import TradeSignalRecord
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.strategy_management_batches import load_management_batch
@@ -121,63 +124,16 @@ def partial_close_and_move_stop_to_entry(
     deepcoin_client: DeepcoinTradingClientProtocol,
     executed_at: datetime | None = None,
 ) -> dict[str, Any]:
-    """Reduce each exact target, then set that position's stop to its own entry."""
+    """Reject the unsafe legacy composite path.
 
-    targets = trade_signal.payload.get("targets") if isinstance(trade_signal.payload, dict) else None
-    if not isinstance(targets, list) or not targets:
-        raise DeepcoinExecutionActionError("missing_breakeven_management_targets")
+    A close submission is not evidence of a fill.  The batch reconciler must
+    first confirm every close leg from exchange truth before a separate
+    protection phase can be authorized.
+    """
 
-    prepared: list[tuple[_LoadedBinding, float, float]] = []
-    for target in targets:
-        if not isinstance(target, dict):
-            raise DeepcoinExecutionActionError("invalid_breakeven_management_target")
-        binding_id = target.get("binding_id")
-        fraction = _positive_fraction(target.get("fraction"))
-        if binding_id in (None, "") or fraction is None:
-            raise DeepcoinExecutionActionError("invalid_breakeven_management_target")
-        binding = _load_binding_for_signal(session_factory, replace(trade_signal, payload={"binding_id": binding_id}))
-        if (
-            binding.kol_id != trade_signal.kol_id
-            or binding.chat_id != trade_signal.chat_id
-            or binding.symbol != trade_signal.symbol.upper()
-            or binding.side != trade_signal.side.lower()
-            or not binding.pos_id
-        ):
-            raise DeepcoinExecutionActionError("breakeven_management_target_not_exactly_bound")
-        _require_verified_binding_positions(session_factory, binding)
-        inst_id = _to_deepcoin_swap_instrument(binding.symbol)
-        position = _select_bound_position(deepcoin_client.list_positions(inst_id=inst_id), binding=binding, inst_id=inst_id)
-        average_entry = _position_average_entry(position)
-        if average_entry is None:
-            raise DeepcoinExecutionActionError("missing_position_average_entry")
-        prepared.append((binding, fraction, average_entry))
-
-    results: list[dict[str, Any]] = []
-    for binding, fraction, average_entry in prepared:
-        close_signal = replace(
-            trade_signal,
-            action="close_position",
-            strategy_instance_id=binding.strategy_instance_id,
-            payload={"binding_id": binding.id, "fraction": fraction},
-        )
-        try:
-            close_result = close_position_market(session_factory, trade_signal=close_signal, deepcoin_client=deepcoin_client, executed_at=executed_at)
-        except Exception as exc:
-            results.append({"binding_id": binding.id, "status": "failed", "stage": "partial_close", "error": str(exc)})
-            continue
-        protection_signal = replace(
-            trade_signal,
-            action="adjust_stop_loss",
-            strategy_instance_id=binding.strategy_instance_id,
-            payload={"binding_id": binding.id, "stop_loss": average_entry},
-        )
-        try:
-            protection_result = adjust_position_tpsl(session_factory, trade_signal=protection_signal, deepcoin_client=deepcoin_client, executed_at=executed_at)
-        except Exception as exc:
-            results.append({"binding_id": binding.id, "status": "failed", "stage": "move_stop", "close": close_result, "error": str(exc)})
-            continue
-        results.append({"binding_id": binding.id, "status": "submitted", "close": close_result, "protection": protection_result})
-    return {"submitted": any(item["status"] == "submitted" for item in results), "action": trade_signal.action, "targets": results}
+    raise DeepcoinExecutionActionError(
+        "composite_management_requires_exchange_confirmed_batch_close"
+    )
 
 
 @serialized_position_authority_mutation
@@ -234,6 +190,43 @@ def adjust_position_tpsl(
     if not after:
         raise DeepcoinExecutionActionError("missing_new_tpsl_price")
 
+    old_row_snapshots = snapshot_protection_rows(old_tpsl_rows)
+    if old_row_snapshots:
+        adjusted_row_snapshots = _adjust_protection_row_snapshots(
+            old_row_snapshots,
+            action=trade_signal.action,
+            payload=trade_signal.payload,
+        )
+    else:
+        adjusted_row_snapshots = _new_protection_row_snapshots(after)
+    common_payload = _build_position_tpsl_payload(
+        binding=binding, position=position, inst_id=inst_id, after={}
+    )
+    set_payloads = [
+        _build_position_tpsl_row_payload(common_payload, row)
+        for row in adjusted_row_snapshots
+    ]
+    if old_row_snapshots:
+        pending_recheck = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
+        rechecked = match_position_protection(
+            live_positions, pending_recheck
+        ).by_pos_id.get(pos_id or "")
+        rechecked_pending_rows = [
+            row
+            for row in pending_recheck
+            if _order_id_from_payload(row) in old_order_id_set
+        ]
+        if (
+            rechecked is None
+            or rechecked.status != "verified"
+            or rechecked.order_ids != old_order_ids
+            or snapshot_protection_rows(rechecked_pending_rows)
+            != old_row_snapshots
+        ):
+            raise DeepcoinExecutionActionError(
+                "pending_position_tpsl_changed_before_cancel"
+            )
+
     cancel_responses: list[dict[str, Any]] = []
     for order_id in old_order_ids:
         cancel_payload = {"instId": inst_id, "ordId": str(order_id)}
@@ -262,9 +255,42 @@ def adjust_position_tpsl(
             ),
         )
 
-    set_payload = _build_position_tpsl_payload(binding=binding, position=position, inst_id=inst_id, after=after)
-    set_response = deepcoin_client.set_position_sltp(set_payload)
-    new_order_id = _extract_order_id(set_response)
+    set_responses: list[dict[str, Any]] = []
+    new_order_ids: list[str] = []
+    try:
+        for set_payload in set_payloads:
+            set_response = deepcoin_client.set_position_sltp(set_payload)
+            new_order_id = _extract_order_id(set_response)
+            if not new_order_id:
+                raise DeepcoinExecutionActionError(
+                    "position_tpsl_replacement_missing_order_id"
+                )
+            set_responses.append(set_response)
+            new_order_ids.append(new_order_id)
+    except Exception as replacement_error:
+        try:
+            for new_order_id in new_order_ids:
+                deepcoin_client.cancel_trigger_order(
+                    {"instId": inst_id, "ordId": new_order_id}
+                )
+            for old_row in old_row_snapshots:
+                restore_response = deepcoin_client.set_position_sltp(
+                    _build_position_tpsl_row_payload(common_payload, old_row)
+                )
+                if not _extract_order_id(restore_response):
+                    raise DeepcoinExecutionActionError(
+                        "position_tpsl_restore_missing_order_id"
+                    )
+        except Exception as restore_error:
+            raise DeepcoinExecutionActionError(
+                f"position_tpsl_recovery_required:{restore_error}"
+            ) from replacement_error
+        raise DeepcoinExecutionActionError(
+            f"position_tpsl_replacement_failed_restored:{replacement_error}"
+        ) from replacement_error
+    set_payload = set_payloads[-1]
+    set_response = set_responses[-1]
+    new_order_id = new_order_ids[-1]
     record_execution_event(
         session_factory,
         ExecutionEventRecord(
@@ -278,14 +304,14 @@ def adjust_position_tpsl(
             symbol=binding.symbol,
             side=binding.side,
             action="adjust_position_tpsl" if require_existing else "set_position_tpsl",
-            order_id=new_order_id,
+            order_id=",".join(new_order_ids),
             related_order_id=",".join(old_order_ids) if old_order_ids else None,
             pos_id=_first_string(position, "posId", "pos_id", "id"),
             reason=trade_signal.action,
             before=before or None,
             after=after,
-            request=set_payload,
-            response=set_response,
+            request={"rows": set_payloads},
+            response={"rows": set_responses},
             created_at=now,
         ),
     )
@@ -308,6 +334,8 @@ def adjust_position_tpsl(
         "after": after,
         "request": set_payload,
         "response": set_response,
+        "requests": set_payloads,
+        "responses": set_responses,
         "cancel_responses": cancel_responses,
         "executed_at": now.isoformat(),
     }
@@ -1084,6 +1112,86 @@ def _build_position_tpsl_payload(
             }
         )
     return payload
+
+
+def _adjust_protection_row_snapshots(
+    rows: list[dict[str, Any]], *, action: str, payload: dict[str, Any]
+) -> list[dict[str, Any]]:
+    stop_loss = _first_payload_value(
+        payload, "stop_loss", "stop_loss_price", "sl", "slTriggerPx"
+    )
+    take_profit = _first_payload_value(
+        payload, "take_profit", "take_profit_price", "tp", "tpTriggerPx"
+    )
+    adjusted: list[dict[str, Any]] = []
+    for original in rows:
+        row = dict(original)
+        purpose = row.get("purpose")
+        if purpose == "stop_loss" and stop_loss is not None:
+            row["trigger_price"] = str(stop_loss)
+        elif purpose == "take_profit" and take_profit is not None:
+            row["trigger_price"] = str(take_profit)
+        elif purpose == "combined":
+            if stop_loss is not None:
+                row["stop_loss"] = {
+                    **dict(row["stop_loss"]),
+                    "trigger_price": str(stop_loss),
+                }
+            if take_profit is not None:
+                row["take_profit"] = {
+                    **dict(row["take_profit"]),
+                    "trigger_price": str(take_profit),
+                }
+        adjusted.append(row)
+    if action.lower() == "adjust_stop_loss" and not any(
+        row.get("purpose") in {"stop_loss", "combined"} for row in adjusted
+    ):
+        raise DeepcoinExecutionActionError("no_existing_stop_loss_to_adjust")
+    return adjusted
+
+
+def _new_protection_row_snapshots(after: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key, purpose in (("take_profit", "take_profit"), ("stop_loss", "stop_loss")):
+        if after.get(key) is None:
+            continue
+        rows.append(
+            {
+                "order_id": None,
+                "purpose": purpose,
+                "trigger_price": str(after[key]),
+                "size": "0",
+                "full_position": True,
+                "trigger_type": "last",
+                "order_price": "-1",
+            }
+        )
+    return rows
+
+
+def _build_position_tpsl_row_payload(
+    common: dict[str, Any], row: dict[str, Any]
+) -> dict[str, Any]:
+    result = dict(common)
+    if row.get("size") not in (None, ""):
+        result["sz"] = str(row["size"])
+    purpose = row.get("purpose")
+    if purpose in {"take_profit", "stop_loss"}:
+        prefix = "tp" if purpose == "take_profit" else "sl"
+        result[f"{prefix}TriggerPx"] = str(row["trigger_price"])
+        result[f"{prefix}TriggerPxType"] = str(row.get("trigger_type") or "last")
+        result[f"{prefix}OrdPx"] = str(row.get("order_price") or "-1")
+    elif purpose == "combined":
+        for key, prefix in (("take_profit", "tp"), ("stop_loss", "sl")):
+            item = row[key]
+            result[f"{prefix}TriggerPx"] = str(item["trigger_price"])
+            result[f"{prefix}TriggerPxType"] = str(
+                item.get("trigger_type") or "last"
+            )
+            result[f"{prefix}OrdPx"] = str(item.get("order_price") or "-1")
+    else:
+        raise DeepcoinExecutionActionError("unsupported_position_tpsl_row")
+    return result
 
 
 def _build_trigger_entry_payload_from_existing(
