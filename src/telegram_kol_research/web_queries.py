@@ -1814,8 +1814,43 @@ def mark_strategy_lifecycle_manual_close(
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         if lifecycle is None:
             raise LookupError("strategy lifecycle not found")
-        if lifecycle.lifecycle_status != "entered":
-            raise ValueError("only entered strategies can be marked manually closed")
+
+        binding = None
+        if lifecycle.execution_binding_id is not None:
+            candidate_binding = session.get(
+                ExecutionBinding, lifecycle.execution_binding_id
+            )
+            if candidate_binding is not None and (
+                str(candidate_binding.venue or "").lower() == "deepcoin"
+                and int(candidate_binding.chat_id) == int(lifecycle.chat_id)
+                and int(candidate_binding.message_id) == int(lifecycle.message_id)
+                and str(candidate_binding.symbol) == str(lifecycle.symbol)
+                and str(candidate_binding.side) == str(lifecycle.side)
+            ):
+                binding = candidate_binding
+        if binding is None:
+            matching_bindings = (
+                session.query(ExecutionBinding)
+                .filter(ExecutionBinding.venue == "deepcoin")
+                .filter(ExecutionBinding.chat_id == lifecycle.chat_id)
+                .filter(ExecutionBinding.message_id == lifecycle.message_id)
+                .filter(ExecutionBinding.symbol == lifecycle.symbol)
+                .filter(ExecutionBinding.side == lifecycle.side)
+                .order_by(ExecutionBinding.id.asc())
+                .limit(2)
+                .all()
+            )
+            binding = matching_bindings[0] if len(matching_bindings) == 1 else None
+        is_legacy_demoted_entry = bool(
+            lifecycle.lifecycle_status == "pending_entry"
+            and lifecycle.entered_at is not None
+            and binding is not None
+        )
+        if lifecycle.lifecycle_status != "entered" and not is_legacy_demoted_entry:
+            raise ValueError(
+                "manual close requires entered lifecycle, or legacy pending_entry "
+                "with entered_at and execution binding"
+            )
 
         lifecycle.lifecycle_status = "exited"
         lifecycle.exit_reason = "manual"
@@ -1829,19 +1864,6 @@ def mark_strategy_lifecycle_manual_close(
                 trade_idea.status = "closed"
                 trade_idea.closed_at = now
 
-        binding = None
-        if lifecycle.execution_binding_id is not None:
-            binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
-        if binding is None:
-            binding = (
-                session.query(ExecutionBinding)
-                .filter(ExecutionBinding.chat_id == lifecycle.chat_id)
-                .filter(ExecutionBinding.message_id == lifecycle.message_id)
-                .filter(ExecutionBinding.symbol == lifecycle.symbol)
-                .filter(ExecutionBinding.side == lifecycle.side)
-                .order_by(ExecutionBinding.id.desc())
-                .first()
-            )
         if binding is not None:
             binding.status = "closed"
             binding.last_exchange_status = (

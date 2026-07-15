@@ -300,6 +300,14 @@ must atomically mark the lifecycle `exited/manual`, the binding
 manual terminal reason. Later reconciliation must preserve those terminal
 states and must not attach an old filled order to a same-symbol position.
 
+The same action accepts a legacy lifecycle that reconciliation previously
+demoted from `entered` to `pending_entry` only when `entered_at` is still set
+and the lifecycle resolves to an execution binding. This is compatibility for
+an already-entered damaged record, not permission to close a never-entered
+pending strategy. A `pending_entry` row without `entered_at` or without a
+resolvable binding must be rejected without changing lifecycle, binding, or
+entry-leg state.
+
 Do not use a missing-position snapshot to perform this transition
 automatically. If strategy identity is uncertain, keep the investigation
 read-only and route the case through the reviewed repair/fingerprint workflow.

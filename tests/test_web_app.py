@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import sqlite3
 import threading
 import time
 from datetime import datetime
@@ -1056,7 +1057,7 @@ def test_manual_close_api_marks_lifecycle_and_binding_closed(tmp_path):
         assert binding.last_exchange_status.startswith("manual_closed_by_user")
 
 
-def test_manual_close_terminalizes_entry_legs_and_reconcile_cannot_revive_them(tmp_path):
+def test_manual_close_accepts_legacy_demoted_pending_and_reconcile_cannot_revive_it(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
     with app.state.session_factory() as session:
         lifecycle = StrategyLifecycle(
@@ -1064,7 +1065,7 @@ def test_manual_close_terminalizes_entry_legs_and_reconcile_cannot_revive_them(t
             message_id=10,
             symbol="ETH",
             side="short",
-            lifecycle_status="entered",
+            lifecycle_status="pending_entry",
             signal_at=datetime(2026, 7, 15, 9, 0),
             entered_at=datetime(2026, 7, 15, 9, 1),
         )
@@ -1223,6 +1224,211 @@ def test_manual_close_terminalizes_entry_legs_and_reconcile_cannot_revive_them(t
         ]
         assert [leg.pos_id for leg in legs] == [None, None]
         assert [leg.attribution_status for leg in legs] == ["unassigned", "unassigned"]
+
+
+def test_manual_close_rejects_never_entered_pending_without_writes(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=11,
+            symbol="ETH",
+            side="short",
+            status="open",
+            last_exchange_status="entry_order_pending",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=11,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 15, 11, 0),
+            entered_at=None,
+            execution_binding_id=binding.id,
+        )
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="pending-order",
+            venue="deepcoin",
+            status="pending",
+            attribution_status="unassigned",
+        )
+        session.add_all([lifecycle, leg])
+        session.commit()
+        lifecycle_id = lifecycle.id
+        binding_id = binding.id
+        leg_id = leg.id
+
+    response = TestClient(app).post(
+        f"/api/strategy-lifecycles/{lifecycle_id}/manual-close",
+        json={"note": "must not apply"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "manual close requires entered lifecycle, or legacy pending_entry "
+        "with entered_at and execution binding"
+    )
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        assert lifecycle.lifecycle_status == "pending_entry"
+        assert lifecycle.exit_reason is None
+        assert lifecycle.exited_at is None
+        assert binding.status == "open"
+        assert binding.last_exchange_status == "entry_order_pending"
+        assert leg.status == "pending"
+        assert leg.terminal_reason is None
+
+
+def test_manual_close_rejects_legacy_pending_without_matching_deepcoin_binding(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        wrong_binding = ExecutionBinding(
+            kol_id="group:999",
+            chat_id=999,
+            message_id=99,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="active",
+            last_exchange_status="position_active",
+        )
+        other_venue_binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=12,
+            symbol="ETH",
+            side="short",
+            venue="other-exchange",
+            status="active",
+            last_exchange_status="position_active",
+        )
+        session.add_all([wrong_binding, other_venue_binding])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=12,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 15, 12, 0),
+            entered_at=datetime(2026, 7, 15, 12, 1),
+            execution_binding_id=wrong_binding.id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+        wrong_binding_id = wrong_binding.id
+        other_venue_binding_id = other_venue_binding.id
+
+    response = TestClient(app).post(
+        f"/api/strategy-lifecycles/{lifecycle_id}/manual-close",
+        json={"note": "must not apply"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "manual close requires entered lifecycle, or legacy pending_entry "
+        "with entered_at and execution binding"
+    )
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        wrong_binding = session.get(ExecutionBinding, wrong_binding_id)
+        other_venue_binding = session.get(ExecutionBinding, other_venue_binding_id)
+        assert lifecycle.lifecycle_status == "pending_entry"
+        assert lifecycle.exit_reason is None
+        assert lifecycle.exited_at is None
+        assert (wrong_binding.status, wrong_binding.last_exchange_status) == (
+            "active",
+            "position_active",
+        )
+        assert (other_venue_binding.status, other_venue_binding.last_exchange_status) == (
+            "active",
+            "position_active",
+        )
+
+
+def test_manual_close_rejects_ambiguous_legacy_deepcoin_bindings_without_writes(tmp_path):
+    database_path = tmp_path / "research.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE execution_bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kol_id VARCHAR(255),
+            chat_id INTEGER,
+            message_id INTEGER,
+            symbol VARCHAR(64),
+            side VARCHAR(16),
+            venue VARCHAR(64),
+            order_id VARCHAR(255),
+            created_at DATETIME
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+    app = create_web_app(database_path=database_path)
+    with app.state.session_factory() as session:
+        bindings = [
+            ExecutionBinding(
+                kol_id=f"duplicate:{index}",
+                chat_id=88,
+                message_id=13,
+                symbol="ETH",
+                side="short",
+                venue="deepcoin",
+                status="active",
+                last_exchange_status="position_active",
+            )
+            for index in (1, 2)
+        ]
+        session.add_all(bindings)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=13,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 15, 13, 0),
+            entered_at=datetime(2026, 7, 15, 13, 1),
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+        binding_ids = [binding.id for binding in bindings]
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        f"/api/strategy-lifecycles/{lifecycle_id}/manual-close",
+        json={"note": "must not apply"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "manual close requires entered lifecycle, or legacy pending_entry "
+        "with entered_at and execution binding"
+    )
+    with app.state.session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        bindings = [session.get(ExecutionBinding, binding_id) for binding_id in binding_ids]
+        assert lifecycle.lifecycle_status == "pending_entry"
+        assert lifecycle.exit_reason is None
+        assert lifecycle.exited_at is None
+        assert [binding.status for binding in bindings] == ["active", "active"]
+        assert [binding.last_exchange_status for binding in bindings] == [
+            "position_active",
+            "position_active",
+        ]
 
 
 def test_bound_position_close_api_rejects_unbound_or_ambiguous_position_before_order_submission(tmp_path):
