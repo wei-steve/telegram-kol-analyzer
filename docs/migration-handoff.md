@@ -260,6 +260,10 @@ must pass `quick_check` and schema inspection. Components are streamed in fixed
 chunks and never retained as whole byte arrays. A rollback journal or any
 instability fails closed as `snapshot_unstable`. Historical JSON, IDs, and
 decimals have parser/output resource limits and only fixed malformed flags may
-escape. All identities in JSON and text output are hashed references. Counts
+escape. The same pre-parse character, UTF-8 byte, and nesting-depth validator
+covers legacy payloads, batch target snapshots, and leg errors. Temporary
+directory, private write/sync, and cleanup failures become fixed safe reasons
+without exception text. All identities in JSON and text output are hashed
+references. Counts
 are exact where labelled complete; any batch, leg, or returned-item truncation,
 or any false completeness flag, prohibits a "no residue" conclusion.

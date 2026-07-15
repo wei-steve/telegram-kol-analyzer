@@ -509,6 +509,143 @@ def test_audit_management_batches_resource_attack_values_are_malformed(tmp_path)
     assert "9" * 200 not in result.stdout
 
 
+def test_audit_management_batches_bounds_batch_and_leg_json_fields(tmp_path):
+    database_path = tmp_path / "bounded-json-fields.db"
+    create_session_factory(database_path)
+    oversized_marker = "oversized-secret-" + "x" * 70_000
+    deeply_nested = "[" * 100_000 + "0" + "]" * 100_000
+    depth_over_limit = "[" * 1000 + "0" + "]" * 1000
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, idempotency_fingerprint, raw_message_id, recognition_decision_id, "
+            "recognition_generation, target_lifecycle_id, strategy_instance_id, "
+            "execution_binding_id, intent, effective_action, execution_mode, "
+            "partial_round_before, status, target_fingerprint, target_snapshot_json, "
+            "planned_at, created_at, updated_at) "
+            "VALUES (1201, 'fp-1201', 1202, 1203, 'gen', 1204, 'strategy', 1205, "
+            "'partial_take_profit', 'partial_close', 'shadow', 0, 'ready', 'target', ?, "
+            "'2026-07-15 10:00:00', '2026-07-15 10:00:00', "
+            "'2026-07-15 10:00:00')",
+            (oversized_marker,),
+        )
+        connection.execute(
+            "INSERT INTO strategy_management_legs "
+            "(id, management_batch_id, execution_order_leg_id, pos_id, leg_index, "
+            "status, preflight_size, planned_close_size, last_error, created_at, updated_at) "
+            "VALUES (1210, 1201, 1211, 'pos-1210', 1, 'planned', '0.02', '0.01', ?, "
+            "'2026-07-15 10:00:00', '2026-07-15 10:00:00')",
+            (deeply_nested,),
+        )
+        connection.execute(
+            "INSERT INTO strategy_management_legs "
+            "(id, management_batch_id, execution_order_leg_id, pos_id, leg_index, "
+            "status, preflight_size, planned_close_size, last_error, created_at, updated_at) "
+            "VALUES (1212, 1201, 1213, 'pos-1212', 2, 'planned', '0.02', '0.01', ?, "
+            "'2026-07-15 10:00:00', '2026-07-15 10:00:00')",
+            (depth_over_limit,),
+        )
+        connection.commit()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    batch = payload["batches"][0]
+    assert batch["malformed_json_fields"] == ["target_snapshot_json"]
+    assert all(
+        leg["malformed_json_fields"] == ["last_error"] for leg in batch["legs"]
+    )
+    assert payload["malformed_row_count"] >= 3
+    assert payload["malformed_field_count"] >= 3
+    assert "oversized-secret" not in result.stdout
+    assert "[[[[[[[[[[" not in result.stdout
+
+
+def test_bounded_json_validator_catches_parser_memory_error(monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module.json,
+        "loads",
+        lambda value: (_ for _ in ()).throw(MemoryError("secret parser value")),
+    )
+
+    value, malformed = cli_module._bounded_json_value('{"safe": true}')
+
+    assert value is None
+    assert malformed is True
+
+
+def test_audit_management_batches_private_snapshot_oserrors_are_safe(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path = tmp_path / "snapshot-errors.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE harmless (id INTEGER PRIMARY KEY)")
+        connection.commit()
+
+    scenarios = (
+        ("temporary_directory", "private_snapshot_unavailable"),
+        ("source_copy", "source_copy_failed"),
+        ("fsync", "private_snapshot_unavailable"),
+    )
+    for name, expected_reason in scenarios:
+        with monkeypatch.context() as scoped:
+            # Each installer closes over the test's monkeypatch; rebind the
+            # target through this isolated context to avoid leaking scenarios.
+            if name == "temporary_directory":
+                scoped.setattr(
+                    cli_module.tempfile,
+                    "TemporaryDirectory",
+                    lambda *args, **kwargs: (_ for _ in ()).throw(
+                        OSError("secret temp failure")
+                    ),
+                )
+            elif name == "source_copy":
+                scoped.setattr(
+                    cli_module,
+                    "_stream_snapshot_component",
+                    lambda *args, **kwargs: (_ for _ in ()).throw(
+                        OSError("secret write failure")
+                    ),
+                )
+            else:
+                scoped.setattr(
+                    cli_module.os,
+                    "fsync",
+                    lambda *args, **kwargs: (_ for _ in ()).throw(
+                        OSError("secret fsync failure")
+                    ),
+                )
+            for output_format in ("json", "text"):
+                result = CliRunner().invoke(
+                    app,
+                    [
+                        "audit-management-batches",
+                        "--database-path",
+                        str(database_path),
+                        "--output-format",
+                        output_format,
+                    ],
+                )
+                assert result.exit_code == 1, (name, result.stdout)
+                assert expected_reason in result.stdout
+                assert "secret" not in result.stdout
+                assert "Traceback" not in result.stdout
+
+
 def test_audit_management_batches_handles_old_schema_without_migrating(tmp_path):
     database_path = tmp_path / "old.db"
     with sqlite3.connect(database_path) as connection:

@@ -221,11 +221,16 @@ malformed-field flags remain clear. Pending legacy management candidates are
 streamed completely for exact counts while only bounded redacted items are
 returned.
 
-Historical JSON and decimal text are resource-bounded before parsing or fixed
-formatting. Oversized/deep payloads, non-canonical or overlong batch IDs, huge
-decimal exponents, malformed old columns, and parser resource errors are
-reported only through fixed malformed counters/flags. Raw values, exception
-text, and tracebacks are never audit output.
+Legacy `payload_json`, batch `target_snapshot_json`, and leg `last_error` share
+one bounded validator: 65,536 characters, 262,144 UTF-8 bytes, and nesting
+depth 64 are checked before object construction. Historical JSON and decimal
+text are resource-bounded before parsing or fixed formatting. Oversized/deep
+payloads, non-canonical or overlong batch IDs, huge decimal exponents,
+malformed old columns, and parser resource errors are reported only through
+fixed malformed counters/flags. Raw values, exception text, and tracebacks are
+never audit output. Temporary-directory creation, private writes, sync, and
+cleanup failures similarly return a fixed `snapshot_unavailable` reason in
+both JSON and text mode.
 
 The audit includes abnormal counts for `blocked`, `submit_unknown`,
 `partial_failed`, and `recovery_required`. Never conclude that there is no

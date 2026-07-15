@@ -138,6 +138,7 @@ _MANAGEMENT_ALERT_STATES = (
 _SAFE_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _MAX_MANAGEMENT_PAYLOAD_CHARS = 65_536
 _MAX_MANAGEMENT_PAYLOAD_BYTES = 262_144
+_MAX_JSON_NESTING_DEPTH = 64
 _MAX_CANONICAL_ID_DIGITS = 20
 _MAX_CANONICAL_ID = 9_223_372_036_854_775_807
 _MAX_DECIMAL_INPUT_CHARS = 128
@@ -206,6 +207,12 @@ def _stream_linux_noatime_component(
             digest.update(chunk)
             size += len(chunk)
             _write_all(destination_fd, chunk)
+        try:
+            os.fsync(destination_fd)
+        except OSError as exc:
+            raise ManagementAuditSnapshotError(
+                "private_snapshot_unavailable", status="snapshot_unavailable"
+            ) from exc
         descriptor_stat = os.fstat(source_fd)
     except Exception:
         if destination.exists():
@@ -235,6 +242,19 @@ def _hash_private_component(path: Path) -> tuple[int, str]:
             digest.update(chunk)
             size += len(chunk)
     return size, digest.hexdigest()
+
+
+def _fsync_private_component(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise ManagementAuditSnapshotError(
+            "private_snapshot_unavailable", status="snapshot_unavailable"
+        ) from exc
 
 
 def _clone_darwin_component(source: Path, destination: Path) -> dict:
@@ -267,6 +287,7 @@ def _clone_darwin_component(source: Path, destination: Path) -> dict:
     if size != after.st_size:
         destination.unlink(missing_ok=True)
         raise ManagementAuditSnapshotError("private_clone_size_mismatch")
+    _fsync_private_component(destination)
     return {"stat": after_signature, "size": size, "sha256": digest}
 
 
@@ -413,7 +434,7 @@ def _safe_token_value(
 def _safe_decimal_value(
     value: object, malformed_fields: list[str], field: str
 ) -> str | None:
-    if value in {None, ""}:
+    if value is None or value == "":
         return None
     raw = str(value)
     if len(raw) > _MAX_DECIMAL_INPUT_CHARS:
@@ -476,7 +497,7 @@ def _safe_leg_index(
 def _safe_timestamp(
     value: object, malformed_fields: list[str], field: str
 ) -> str | None:
-    if value in {None, ""}:
+    if value is None or value == "":
         malformed_fields.append(field)
         return None
     normalized = str(value)
@@ -488,15 +509,60 @@ def _safe_timestamp(
     return _bounded_text(normalized, limit=40)
 
 
+def _json_structure_within_depth(value: str) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > _MAX_JSON_NESTING_DEPTH:
+                return False
+        elif character in "]}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not in_string and not escaped
+
+
+def _bounded_json_value(value: object) -> tuple[object | None, bool]:
+    if not isinstance(value, str) or len(value) > _MAX_MANAGEMENT_PAYLOAD_CHARS:
+        return None, True
+    try:
+        if len(value.encode("utf-8")) > _MAX_MANAGEMENT_PAYLOAD_BYTES:
+            return None, True
+        if not _json_structure_within_depth(value):
+            return None, True
+        return json.loads(value or "{}"), False
+    except (
+        json.JSONDecodeError,
+        TypeError,
+        RecursionError,
+        ValueError,
+        OverflowError,
+        MemoryError,
+    ):
+        return None, True
+
+
 def _malformed_json_fields(row: sqlite3.Row, fields: tuple[str, ...]) -> list[str]:
     malformed: list[str] = []
     keys = set(row.keys())
     for field in fields:
-        if field not in keys or row[field] in {None, ""}:
+        if field not in keys or row[field] is None or row[field] == "":
             continue
-        try:
-            json.loads(row[field])
-        except (json.JSONDecodeError, TypeError):
+        _, field_malformed = _bounded_json_value(row[field])
+        if field_malformed:
             malformed.append(field)
     return malformed
 
@@ -593,32 +659,10 @@ def _audit_pending_legacy_management_read_only(
             break
         for row in rows:
             scanned_count += 1
-            malformed = False
             raw_payload = row["payload_json"]
-            if (
-                not isinstance(raw_payload, str)
-                or len(raw_payload) > _MAX_MANAGEMENT_PAYLOAD_CHARS
-            ):
+            payload, malformed = _bounded_json_value(raw_payload)
+            if malformed:
                 payload = {}
-                malformed = True
-            else:
-                try:
-                    if (
-                        len(raw_payload.encode("utf-8"))
-                        > _MAX_MANAGEMENT_PAYLOAD_BYTES
-                    ):
-                        raise ValueError("payload byte limit")
-                    payload = json.loads(raw_payload or "{}")
-                except (
-                    json.JSONDecodeError,
-                    TypeError,
-                    RecursionError,
-                    ValueError,
-                    OverflowError,
-                    MemoryError,
-                ):
-                    payload = {}
-                    malformed = True
             canonical_batch_id = _canonical_positive_id(
                 payload, "management_batch_id"
             )
@@ -928,13 +972,20 @@ def _audit_management_snapshot(
 
 
 def _audit_management_batches_read_only(database_path: Path, *, limit: int) -> dict:
-    with tempfile.TemporaryDirectory(prefix="management-audit-") as temporary:
-        snapshot_path, snapshot_info = _build_stable_private_snapshots(
-            database_path, Path(temporary)
-        )
-        return _audit_management_snapshot(
-            snapshot_path, limit=limit, snapshot_info=snapshot_info
-        )
+    try:
+        with tempfile.TemporaryDirectory(prefix="management-audit-") as temporary:
+            snapshot_path, snapshot_info = _build_stable_private_snapshots(
+                database_path, Path(temporary)
+            )
+            return _audit_management_snapshot(
+                snapshot_path, limit=limit, snapshot_info=snapshot_info
+            )
+    except ManagementAuditSnapshotError:
+        raise
+    except OSError as exc:
+        raise ManagementAuditSnapshotError(
+            "private_snapshot_unavailable", status="snapshot_unavailable"
+        ) from exc
 
 
 def _record_within_window(record: NormalizedMessageRecord, *, start_at, end_at) -> bool:
