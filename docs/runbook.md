@@ -275,10 +275,13 @@ older Miya repair output and fingerprints are void. After deployment:
 4. Generate a fresh dry run from the same coherent snapshot. Any proposed
    terminal/manual transition or stale leg/binding/lifecycle cleanup must appear
    as an explicit planner action covered by that fingerprint.
-5. Review every nonzero action separately before `--apply`. Zero actions is a
-   valid result and authorizes no modification. If the planner cannot express a
-   needed state transition, stop and change/review the planner rather than
-   editing the database around it.
+5. Review every nonzero action separately before `--apply`. Copy the fingerprint
+   from that exact dry run and pass
+   `--expected-fingerprint <fingerprint-from-reviewed-dry-run>`; the rebuilt
+   current plan must match it exactly. Zero actions is a valid result and
+   authorizes no modification. If the planner cannot express a needed state
+   transition, stop and change/review the planner rather than editing the
+   database around it.
 
 These are deployment-time audit requirements, not a claim that production has
 already been checked or repaired.

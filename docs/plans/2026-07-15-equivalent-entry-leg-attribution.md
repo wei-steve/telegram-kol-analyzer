@@ -529,10 +529,21 @@ fresh evidence or was inherited from the invalid pre-close plan.
 
 **Step 7: Apply only an unchanged, newly reviewed plan**
 
-Run the CLI with `--apply`. The apply path must rebuild/fingerprint current
-exchange and database evidence and refuse any drift. Do not run `--apply` when
-the new dry run has zero actions. Any nonzero plan requires separate explicit
-review; approval of the obsolete two-assignment plan does not carry forward.
+For a nonzero plan, copy the fingerprint from that exact reviewed dry run and
+pass it explicitly:
+
+```bash
+.venv/bin/telegram-kol-research repair-position-attribution \
+  --database-path data/research.db \
+  --apply \
+  --expected-fingerprint <fingerprint-from-reviewed-dry-run>
+```
+
+The apply path must rebuild the current plan and require the supplied reviewed
+fingerprint to match exactly, then revalidate current exchange and database
+evidence and refuse any drift. Do not run `--apply` when the new dry run has
+zero actions. Any nonzero plan requires separate explicit review; approval of
+the obsolete two-assignment plan does not carry forward.
 
 **Step 8: Restart and verify production state**
 
