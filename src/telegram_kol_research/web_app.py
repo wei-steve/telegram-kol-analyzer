@@ -115,6 +115,9 @@ from telegram_kol_research.recovery_live_submit_gate import validate_recovery_li
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_runner import run_recovery_dry_run
 from telegram_kol_research.semantic_disagreement_review import run_semantic_review_loop
+from telegram_kol_research.strategy_management_worker import (
+    run_strategy_management_worker_loop,
+)
 from telegram_kol_research.strategy_alerts import (
     StrategyAlertConfig,
     load_strategy_alert_config,
@@ -1865,6 +1868,10 @@ def create_web_app(
     ai_recognition_config_path: str | Path | None = None,
     semantic_review_runner=None,
     semantic_review_restart_delay_seconds: float = 1.0,
+    strategy_management_worker_runner=None,
+    strategy_management_worker_interval_seconds: float = 5.0,
+    strategy_management_worker_startup_delay_seconds: float = 5.0,
+    strategy_management_worker_max_batches: int = 10,
 ) -> FastAPI:
     """Create the minimal FastAPI app used by the web command."""
 
@@ -1916,6 +1923,20 @@ def create_web_app(
                     now_provider=app.state.now_provider,
                     system_operator_bot_config=app.state.system_operator_bot_config,
                 )
+            )
+            app.state.strategy_management_worker_task = asyncio.create_task(
+                _run_reconcile_after_startup_delay(
+                    runner=app.state.strategy_management_worker_runner,
+                    startup_delay_seconds=app.state.strategy_management_worker_startup_delay_seconds,
+                    session_factory=app.state.session_factory,
+                    deepcoin_client_factory=app.state.deepcoin_client_factory,
+                    interval_seconds=app.state.strategy_management_worker_interval_seconds,
+                    max_batches=app.state.strategy_management_worker_max_batches,
+                    now_provider=app.state.now_provider,
+                )
+            )
+            app.state.strategy_management_worker_task.add_done_callback(
+                _log_background_task_result("strategy_management_worker_task")
             )
             if isinstance(app.state.strategy_alert_config, StrategyAlertConfig):
                 app.state.telegram_bot_command_task = asyncio.create_task(
@@ -1989,6 +2010,16 @@ def create_web_app(
             if lcm_http is not None:
                 await lcm_http.aclose()
             # ── live listener shutdown ──
+            management_worker_task = app.state.strategy_management_worker_task
+            if management_worker_task is not None:
+                management_worker_task.cancel()
+                try:
+                    await management_worker_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.strategy_management_worker_task = None
             deepcoin_reconcile_task = app.state.deepcoin_reconcile_task
             if deepcoin_reconcile_task is not None:
                 deepcoin_reconcile_task.cancel()
@@ -2103,6 +2134,19 @@ def create_web_app(
         min(float(semantic_review_restart_delay_seconds), 60.0),
     )
     app.state.semantic_review_task = None
+    app.state.strategy_management_worker_runner = (
+        strategy_management_worker_runner or run_strategy_management_worker_loop
+    )
+    app.state.strategy_management_worker_interval_seconds = max(
+        0.01, float(strategy_management_worker_interval_seconds)
+    )
+    app.state.strategy_management_worker_startup_delay_seconds = max(
+        0.0, float(strategy_management_worker_startup_delay_seconds)
+    )
+    app.state.strategy_management_worker_max_batches = max(
+        1, int(strategy_management_worker_max_batches)
+    )
+    app.state.strategy_management_worker_task = None
     app.state.authoritative_processor = lambda raw_message_id: _run_authoritative_processor(
         app,
         raw_message_id=raw_message_id,

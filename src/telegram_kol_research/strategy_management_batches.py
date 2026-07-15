@@ -20,7 +20,12 @@ from telegram_kol_research.models import StrategyManagementBatch
 from telegram_kol_research.models import StrategyManagementLeg
 
 
-RECOVERABLE_BATCH_STATUSES = frozenset({"executing", "reconciling"})
+RECOVERABLE_BATCH_STATUSES = frozenset(
+    {"executing", "reserved", "submitted", "submit_unknown", "reconciling"}
+)
+WORKER_BATCH_STATUSES = frozenset(
+    {"ready", "protection_ready", *RECOVERABLE_BATCH_STATUSES}
+)
 UNSET = object()
 
 
@@ -273,6 +278,39 @@ def claim_ready_batch(
     return load_management_batch(session_factory, batch_id)
 
 
+def claim_worker_batch(
+    session_factory: sessionmaker,
+    *,
+    batch_id: int,
+    expected_status: str,
+    claimed_at: datetime | None = None,
+) -> bool:
+    """CAS one newly executable batch so only the database winner may submit."""
+
+    if expected_status not in {"ready", "protection_ready"}:
+        return False
+    now = claimed_at or datetime.now(UTC)
+    values: dict[str, Any] = {
+        "status": "executing",
+        "started_at": now,
+        "updated_at": now,
+    }
+    if expected_status == "protection_ready":
+        values["reason_code"] = "protection_phase_executing"
+    with session_factory() as session:
+        _require_management_unique_indexes(session)
+        result = session.execute(
+            update(StrategyManagementBatch)
+            .where(
+                StrategyManagementBatch.id == int(batch_id),
+                StrategyManagementBatch.status == expected_status,
+            )
+            .values(**values)
+        )
+        session.commit()
+        return result.rowcount == 1
+
+
 def transition_batch(
     session_factory: sessionmaker,
     batch_id: int,
@@ -370,6 +408,27 @@ def list_recoverable_batches(
         batches = (
             session.query(StrategyManagementBatch)
             .filter(StrategyManagementBatch.status.in_(RECOVERABLE_BATCH_STATUSES))
+            .order_by(
+                StrategyManagementBatch.planned_at.asc(),
+                StrategyManagementBatch.id.asc(),
+            )
+            .limit(limit)
+            .all()
+        )
+        return [_batch_to_record(session, batch) for batch in batches]
+
+
+def list_worker_batches(
+    session_factory: sessionmaker, *, limit: int = 10
+) -> list[ManagementBatchRecord]:
+    """Return bounded automatic work; operator-paused states are never eligible."""
+
+    if limit <= 0:
+        return []
+    with session_factory() as session:
+        batches = (
+            session.query(StrategyManagementBatch)
+            .filter(StrategyManagementBatch.status.in_(WORKER_BATCH_STATUSES))
             .order_by(
                 StrategyManagementBatch.planned_at.asc(),
                 StrategyManagementBatch.id.asc(),

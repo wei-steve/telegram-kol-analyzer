@@ -406,7 +406,7 @@ def test_full_close_terminalizes_only_after_every_exact_position_disappears(tmp_
         lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
         entries = session.query(ExecutionOrderLeg).filter_by(purpose="entry").all()
 
-    assert interim.status == "recovery_required"
+    assert interim.status == "reconciling"
     assert final.status == "succeeded"
     assert [leg.status for leg in final.legs] == ["confirmed", "confirmed"]
     assert binding.status == "closed"
@@ -584,6 +584,26 @@ def test_composite_protection_unknown_is_never_reprocessed_as_close_phase(tmp_pa
     assert stored.legs[0].last_error == {
         "stage": "replace_protection_outcome_unknown"
     }
+
+
+def test_close_recovery_required_is_permanently_paused_from_auto_reconcile(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf)
+    assert transition_batch(
+        sf,
+        batch.id,
+        expected_statuses={"reconciling"},
+        new_status="recovery_required",
+        reason_code="operator_review_required",
+    )
+
+    result = _reconcile_management(sf, positions=[_position("pos-1", "1")])
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.checked == 0
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "operator_review_required"
+    assert stored.legs[0].status == "submitted"
 
 
 def test_composite_restored_partial_failure_is_never_reprocessed_as_close_phase(

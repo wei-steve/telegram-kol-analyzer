@@ -144,6 +144,40 @@ def test_semantic_review_worker_lifespan_starts_once_without_telegram_and_stops_
     assert shutdown_order == ["semantic_review_stopped", "resources_closed"]
 
 
+def test_management_worker_lifespan_starts_once_and_is_cancelled(tmp_path):
+    started = threading.Event()
+    stopped = threading.Event()
+    calls = []
+
+    async def fake_management_worker(**kwargs):
+        calls.append(kwargs)
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        strategy_management_worker_runner=fake_management_worker,
+        strategy_management_worker_startup_delay_seconds=0,
+        strategy_management_worker_interval_seconds=7,
+        strategy_management_worker_max_batches=3,
+    )
+
+    with TestClient(app):
+        assert started.wait(timeout=1)
+        assert len(calls) == 1
+        assert calls[0]["session_factory"] is app.state.session_factory
+        assert calls[0]["deepcoin_client_factory"] is app.state.deepcoin_client_factory
+        assert calls[0]["interval_seconds"] == 7
+        assert calls[0]["max_batches"] == 3
+        assert app.state.strategy_management_worker_task is not None
+
+    assert stopped.wait(timeout=1)
+    assert app.state.strategy_management_worker_task is None
+
+
 def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypatch):
     started = threading.Event()
     sent = []

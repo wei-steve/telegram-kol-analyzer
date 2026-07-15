@@ -28,7 +28,14 @@ from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 
 
 _ACTIVE_RECONCILIATION_STATUSES = frozenset(
-    {"executing", "reconciling", "partial_failed", "recovery_required"}
+    {
+        "executing",
+        "reserved",
+        "submitted",
+        "submit_unknown",
+        "reconciling",
+        "partial_failed",
+    }
 )
 _CLOSE_ACTIONS = frozenset(
     {"partial_close", "full_close", "full_exit", "partial_then_break_even"}
@@ -54,6 +61,7 @@ def reconcile_strategy_management_batches(
     *,
     snapshot: Any,
     reconciled_at: datetime | None = None,
+    batch_ids: set[int] | tuple[int, ...] | None = None,
 ) -> ManagementReconciliationResult:
     """Apply exchange truth without submitting or retrying any order."""
 
@@ -66,9 +74,16 @@ def reconcile_strategy_management_batches(
     counts = {"checked": 0, "succeeded": 0, "pending": 0, "frozen": 0}
 
     with session_factory() as session:
+        query = session.query(StrategyManagementBatch).filter(
+            StrategyManagementBatch.status.in_(_ACTIVE_RECONCILIATION_STATUSES)
+        )
+        if batch_ids is not None:
+            ids = tuple(int(batch_id) for batch_id in batch_ids)
+            if not ids:
+                return ManagementReconciliationResult()
+            query = query.filter(StrategyManagementBatch.id.in_(ids))
         batches = (
-            session.query(StrategyManagementBatch)
-            .filter(StrategyManagementBatch.status.in_(_ACTIVE_RECONCILIATION_STATUSES))
+            query
             .order_by(StrategyManagementBatch.planned_at.asc(), StrategyManagementBatch.id.asc())
             .all()
         )
@@ -140,13 +155,21 @@ def reconcile_strategy_management_batches(
                 _freeze_batch(batch, status="recovery_required", reason=reason, now=now)
                 counts["frozen"] += 1
             elif "confirmed" in statuses:
-                _freeze_batch(
-                    batch,
-                    status="recovery_required",
-                    reason="management_close_legs_partially_confirmed",
-                    now=now,
-                )
-                counts["frozen"] += 1
+                if batch.effective_action in {"full_close", "full_exit"}:
+                    # Exact full-exit legs may settle on different snapshots;
+                    # waiting is safe because no request is ever resubmitted.
+                    batch.status = "reconciling"
+                    batch.reason_code = "management_close_legs_partially_confirmed"
+                    batch.updated_at = now
+                    counts["pending"] += 1
+                else:
+                    _freeze_batch(
+                        batch,
+                        status="recovery_required",
+                        reason="management_close_legs_partially_confirmed",
+                        now=now,
+                    )
+                    counts["frozen"] += 1
             else:
                 batch.status = "reconciling"
                 batch.reason_code = "management_close_pending_exchange_confirmation"
