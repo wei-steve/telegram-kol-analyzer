@@ -10,6 +10,7 @@ from telegram_kol_research.execution_bindings import (
     ExecutionBindingRecord,
     ExecutionOrderLegRecord,
     _leg_evidence,
+    _leg_has_successful_fill_evidence,
     _position_evidence,
     _post_entry_protection_mutated_binding_ids,
     build_client_order_id,
@@ -31,6 +32,7 @@ from telegram_kol_research.models import (
     PositionAttributionAudit,
     StrategyLifecycle,
 )
+from telegram_kol_research.position_attribution import FillEvidence
 
 
 def _binding(**overrides):
@@ -191,6 +193,105 @@ def test_leg_evidence_normalizes_request_draft_binding_modes_and_fill_state():
     assert evidence.order_kind == "trigger_limit"
     assert evidence.has_successful_entry_evidence is True
     assert evidence.protection_mutated is False
+
+
+def test_successful_fill_does_not_cross_match_duplicate_client_id_when_order_differs():
+    leg = ExecutionOrderLeg(
+        id=2,
+        execution_binding_id=7,
+        leg_index=2,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="order-2",
+        client_order_id="duplicate-client",
+        venue="deepcoin",
+        status="open",
+    )
+    evidence = [
+        FillEvidence(
+            source="regular_order",
+            order_id="order-1",
+            client_order_id="duplicate-client",
+            pos_id=None,
+            symbol="ETH-USDT-SWAP",
+            side="short",
+            size=1.5,
+            price=1770.0,
+            created_at_ms=10_000,
+        )
+    ]
+
+    assert _leg_has_successful_fill_evidence(leg, evidence) is False
+
+
+def test_successful_fill_requires_at_least_one_shared_identifier():
+    leg = ExecutionOrderLeg(
+        id=2,
+        execution_binding_id=7,
+        leg_index=2,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id=None,
+        client_order_id=None,
+        venue="deepcoin",
+        status="open",
+    )
+    evidence = [
+        FillEvidence(
+            source="regular_order",
+            order_id="order-1",
+            client_order_id="client-1",
+            pos_id=None,
+            symbol="ETH-USDT-SWAP",
+            side="short",
+            size=1.5,
+            price=1770.0,
+            created_at_ms=10_000,
+        )
+    ]
+
+    assert _leg_has_successful_fill_evidence(leg, evidence) is False
+
+
+@pytest.mark.parametrize("invalid_list_value", [None, "not-a-list", {"bad": "shape"}])
+def test_leg_evidence_safely_ignores_null_or_nonlist_draft_legs(invalid_list_value):
+    binding = ExecutionBinding(
+        id=7,
+        strategy_instance_id="strategy-7",
+        kol_id="alice",
+        chat_id=100,
+        message_id=55,
+        symbol="ETH",
+        side="short",
+        venue="deepcoin",
+        margin_mode="cross",
+        position_mode="split",
+        payload_json=json.dumps(
+            {
+                "draft": {
+                    "order_legs": invalid_list_value,
+                    "take_profit_legs": invalid_list_value,
+                }
+            }
+        ),
+        status="open",
+    )
+    leg = ExecutionOrderLeg(
+        id=9,
+        execution_binding_id=7,
+        leg_index=2,
+        purpose="entry",
+        order_kind="trigger_limit",
+        venue="deepcoin",
+        status="open",
+        request_json="{}",
+    )
+
+    evidence = _leg_evidence(leg, binding=binding)
+
+    assert evidence.requested_size is None
+    assert evidence.entry_price is None
+    assert evidence.take_profits == ()
 
 
 def test_recorded_post_entry_protection_mutation_is_loaded_but_initial_setup_is_not(

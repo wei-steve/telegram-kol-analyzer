@@ -480,23 +480,41 @@ def _equivalent_economic_population(
     if not legs or not positions:
         return False
     first_leg = legs[0]
-    if any(not _leg_signatures_equivalent(first_leg, leg) for leg in legs[1:]):
+    ignore_protection = any(leg.protection_mutated for leg in legs)
+    if any(
+        not _leg_signatures_equivalent(
+            first_leg, leg, ignore_protection=ignore_protection
+        )
+        for leg in legs[1:]
+    ):
         return False
     return all(
-        _leg_position_signatures_equivalent(first_leg, position)
+        _leg_position_signatures_equivalent(
+            first_leg, position, ignore_protection=ignore_protection
+        )
         for position in positions
     )
 
 
-def _leg_signatures_equivalent(left: LegEvidence, right: LegEvidence) -> bool:
+def _leg_signatures_equivalent(
+    left: LegEvidence,
+    right: LegEvidence,
+    *,
+    ignore_protection: bool,
+) -> bool:
     return bool(
         left.venue.lower() == right.venue.lower()
         and _normalize_instrument(left.symbol) == _normalize_instrument(right.symbol)
         and _normalize_side(left.side) == _normalize_side(right.side)
         and _numbers_equivalent(left.requested_size, right.requested_size)
         and _numbers_equivalent(left.entry_price, right.entry_price)
-        and _numbers_equivalent(left.stop_loss, right.stop_loss)
-        and _number_tuples_equivalent(left.take_profits, right.take_profits)
+        and (
+            ignore_protection
+            or (
+                _numbers_equivalent(left.stop_loss, right.stop_loss)
+                and _number_tuples_equivalent(left.take_profits, right.take_profits)
+            )
+        )
         and left.margin_mode == right.margin_mode
         and left.position_mode == right.position_mode
         and left.order_kind == right.order_kind
@@ -504,15 +522,16 @@ def _leg_signatures_equivalent(left: LegEvidence, right: LegEvidence) -> bool:
 
 
 def _leg_position_signatures_equivalent(
-    leg: LegEvidence, position: PositionEvidence
+    leg: LegEvidence,
+    position: PositionEvidence,
+    *,
+    ignore_protection: bool,
 ) -> bool:
     required_values = (
         leg.requested_size,
         leg.entry_price,
-        leg.stop_loss,
         position.size,
         position.entry_price,
-        position.stop_loss,
         leg.margin_mode,
         leg.position_mode,
         position.margin_mode,
@@ -520,15 +539,27 @@ def _leg_position_signatures_equivalent(
     )
     if any(value is None for value in required_values):
         return False
-    if not leg.take_profits or not position.take_profits:
+    if not ignore_protection and (
+        leg.stop_loss is None
+        or position.stop_loss is None
+        or not leg.take_profits
+        or not position.take_profits
+    ):
         return False
     return bool(
         _normalize_instrument(leg.symbol) == _normalize_instrument(position.symbol)
         and _normalize_side(leg.side) == _normalize_side(position.side)
         and _numbers_equivalent(leg.requested_size, position.size)
         and _numbers_equivalent(leg.entry_price, position.entry_price)
-        and _numbers_equivalent(leg.stop_loss, position.stop_loss)
-        and _number_tuples_equivalent(leg.take_profits, position.take_profits)
+        and (
+            ignore_protection
+            or (
+                _numbers_equivalent(leg.stop_loss, position.stop_loss)
+                and _number_tuples_equivalent(
+                    leg.take_profits, position.take_profits
+                )
+            )
+        )
         and leg.margin_mode == position.margin_mode
         and leg.position_mode == position.position_mode
     )

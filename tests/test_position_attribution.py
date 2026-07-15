@@ -279,25 +279,26 @@ def test_post_entry_protection_mutation_disables_protection_identity():
         ),
         _equivalent_leg(
             2,
-            stop_loss=1830.0,
-            take_profits=(1690.0,),
+            stop_loss=1820.0,
+            take_profits=(1700.0,),
             protection_mutated=True,
         ),
     ]
     positions = [
-        _equivalent_position("pos-1", stop_loss=1820.0, take_profits=(1700.0,)),
-        _equivalent_position("pos-2", stop_loss=1830.0, take_profits=(1690.0,)),
+        _equivalent_position("pos-1", stop_loss=1830.0, take_profits=(1690.0,)),
+        _equivalent_position("pos-2", stop_loss=1840.0, take_profits=(1680.0,)),
     ]
 
     assert filter_candidate_edges_by_entry_protection(
         legs, positions, _closed_2x2_edges()
     ) == frozenset(_closed_2x2_edges())
-    assert (
-        classify_equivalent_attribution_components(
-            legs, positions, _closed_2x2_edges()
-        )
-        == ()
+    components = classify_equivalent_attribution_components(
+        legs, positions, _closed_2x2_edges()
     )
+
+    assert [(item.leg_ids, item.position_ids) for item in components] == [
+        ((1, 2), ("pos-1", "pos-2"))
+    ]
 
 
 def test_incident_assigns_both_smart_legs_and_excludes_cancelled_horse_leg():

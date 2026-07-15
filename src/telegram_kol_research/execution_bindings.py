@@ -916,19 +916,20 @@ def _snapshot_fill_evidence(
 def _leg_has_successful_fill_evidence(
     leg: ExecutionOrderLeg, evidence: list[FillEvidence]
 ) -> bool:
-    return any(
-        bool(
-            leg.order_id
-            and row.order_id
-            and str(leg.order_id) == str(row.order_id)
-        )
-        or bool(
-            leg.client_order_id
-            and row.client_order_id
-            and str(leg.client_order_id) == str(row.client_order_id)
-        )
-        for row in evidence
-    )
+    for row in evidence:
+        shared_identifiers = [
+            (str(leg_value), str(row_value))
+            for leg_value, row_value in (
+                (leg.order_id, row.order_id),
+                (leg.client_order_id, row.client_order_id),
+            )
+            if leg_value not in (None, "") and row_value not in (None, "")
+        ]
+        if shared_identifiers and all(
+            leg_value == row_value for leg_value, row_value in shared_identifiers
+        ):
+            return True
+    return False
 
 
 def _post_entry_protection_mutated_binding_ids(
@@ -970,10 +971,13 @@ def _leg_economic_signature(
     draft = binding_payload.get("draft")
     if not isinstance(draft, dict):
         draft = binding_payload
+    draft_order_legs = draft.get("order_legs")
+    if not isinstance(draft_order_legs, list):
+        draft_order_legs = []
     draft_leg = next(
         (
             row
-            for row in draft.get("order_legs", [])
+            for row in draft_order_legs
             if isinstance(row, dict)
             and _plain_int(row.get("leg_index")) == int(leg.leg_index)
         ),
@@ -1001,9 +1005,12 @@ def _leg_economic_signature(
         request.get("tpTriggerPx") or request.get("take_profits")
     )
     if not take_profits:
+        draft_take_profit_legs = draft.get("take_profit_legs")
+        if not isinstance(draft_take_profit_legs, list):
+            draft_take_profit_legs = []
         take_profits = tuple(
             price
-            for row in draft.get("take_profit_legs", [])
+            for row in draft_take_profit_legs
             if isinstance(row, dict)
             for price in [_to_float(row.get("price"))]
             if price is not None
