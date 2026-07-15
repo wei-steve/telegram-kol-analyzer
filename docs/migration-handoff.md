@@ -167,5 +167,32 @@ If a legacy database already contains duplicate `(venue,pos_id)` owners,
 bootstrap leaves the unique index pending so this read-only/dry-run repair path
 can start; runtime ownership gates still reject the duplicate. After repair,
 restart once more to create the unique index.
+
+Entry construction and historical attribution follow an additional economic
+identity invariant. A strategy with one normalized entry price produces one
+100% entry leg. If distinct draft range prices collapse to the same exchange
+price after tick normalization, equivalent legs are coalesced before live
+submission; a queued legacy draft is coalesced again at the submission boundary.
+TP/SL values may filter incompatible attribution candidates only when direct,
+current, and unmutated. They are auxiliary evidence, never standalone ownership
+proof. When historical legs and positions are strictly equivalent and the
+binding owner is otherwise proven, the repair planner uses a stable sorted
+canonical mapping rather than a random or input-order-dependent choice. Only a
+reviewed repair may persist this versioned
+`equivalent_permutation_assignment` evidence. Ordinary reconciliation must not
+originate it and therefore leaves a new equivalent permutation unresolved.
+
+On 2026-07-15, before this code was pushed or deployed, the operator manually
+closed the two then-unattributed live positions suspected to belong to Miya.
+That exchange-side state change invalidates every earlier repair plan and
+fingerprint, including any plan that expected two Miya assignment actions.
+After deployment, fetch a fresh coherent Deepcoin snapshot of positions, open
+TPSL orders, pending triggers, and relevant entry-order history before building
+a new mandatory dry run. A `posId` absent from the fresh live snapshot must
+never receive verified ownership and must never be sent a close request. Audit
+remaining protection/trigger orders and stale legs, then move stale bindings
+and lifecycles to the appropriate terminal/manual state. Apply nothing unless
+the fresh dry run reports a specific action that receives separate review.
+
 Production remains fail closed until real positions, entry legs, pending orders,
 TPSL, audit incidents, service health, and server tests all agree.

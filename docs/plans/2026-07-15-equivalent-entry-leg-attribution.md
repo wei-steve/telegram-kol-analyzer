@@ -488,18 +488,29 @@ Expected: server fast-forwards, reinstalls editable package, and restarts
 `telegram-kol.service`. Account for the known graceful-stop timeout and verify a
 new active PID rather than assuming the first status line is final.
 
-**Step 4: Verify no automatic canonical write occurred**
+**Step 4: Discard the pre-close repair plan and fetch current exchange truth**
 
-Before repair, query legs 244/245 and positions 3507/3509. They must remain
-conflicted/unassigned because ordinary reconcile does not enable equivalent
-canonicalization.
+The operator manually closed the two unattributed positions suspected to belong
+to Miya before this code was pushed or deployed. Treat every earlier repair plan
+and fingerprint as invalid. Fetch a fresh coherent Deepcoin snapshot containing
+current positions, open TPSL orders, pending triggers, and relevant regular and
+trigger entry-order history. Confirm ordinary reconcile did not originate new
+`equivalent_permutation_assignment` evidence. Do not assume the previously
+observed position IDs still exist or still require assignment.
 
 **Step 5: Create a fresh online database backup**
 
 Create a timestamped copy of `data/research.db`, record byte size and SHA-256,
 and keep the service/global auto-trade state unchanged.
 
-**Step 6: Run repair dry-run only**
+**Step 6: Audit stale state and run a fresh repair dry-run only**
+
+Before running the planner, audit residual protection/trigger orders and the
+affected execution legs, binding, and lifecycle terminal state. A position
+absent from the current Deepcoin snapshot must not receive verified ownership
+and must not be targeted by a close request. Any stale records or residual
+exchange orders require explicit evidence and separate review; do not infer
+ownership from TP/SL alone.
 
 ```bash
 cd /opt/telegram-kol-analyzer
@@ -507,21 +518,18 @@ cd /opt/telegram-kol-analyzer
   --database-path data/research.db
 ```
 
-Expected reviewed plan:
+Expected result is determined only by the new snapshot. Zero actions is valid
+when the manually closed positions no longer exist and no stale database state
+requires repair. Review every proposed action and unresolved conflict, and
+confirm there are no unrelated changes. Stop without apply if any action lacks
+fresh evidence or was inherited from the invalid pre-close plan.
 
-- exactly two `assign_verified_position` actions;
-- leg 244 maps to position `1001124099803507`;
-- leg 245 maps to position `1001124099803509`;
-- both actions use `equivalent_permutation_assignment`;
-- no unrelated clear/terminal action; and
-- no unresolved conflict.
-
-Stop without apply if any expectation differs.
-
-**Step 7: Apply only the unchanged reviewed plan**
+**Step 7: Apply only an unchanged, newly reviewed plan**
 
 Run the CLI with `--apply`. The apply path must rebuild/fingerprint current
-exchange and database evidence and refuse any drift.
+exchange and database evidence and refuse any drift. Do not run `--apply` when
+the new dry run has zero actions. Any nonzero plan requires separate explicit
+review; approval of the obsolete two-assignment plan does not carry forward.
 
 **Step 8: Restart and verify production state**
 
@@ -529,11 +537,17 @@ Restart `telegram-kol.service`, then verify:
 
 - service active and HTTP endpoints healthy;
 - global auto trade still false;
-- repair dry-run now has zero actions/conflicts;
-- both BTC long cards display the Miya group and their real `62500` stop;
-- provenance says deterministic equivalent assignment;
-- exact close/TPSL authority resolves one reviewed owner per position; and
+- a repeated fresh repair dry-run has zero remaining actions and reports any
+  unresolved conflict without mutation;
+- manually closed position IDs are not displayed, assigned, or sent a close;
+- residual protection/trigger orders and affected leg/binding/lifecycle terminal
+  states match the current exchange snapshot;
+- any surviving live position card and authority result is supported by its own
+  current reviewed evidence; and
 - no unrelated binding or leg changed.
+
+Do not report the old two-position Miya outcome as production-verified. Record
+the actual post-deployment snapshot and audit result instead.
 
 **Step 9: Run server-focused tests**
 
@@ -544,4 +558,3 @@ separately if the full server suite still encounters it.
 **Step 10: Keep automatic trading disabled**
 
 Re-enabling automatic trading requires a separate explicit user confirmation.
-

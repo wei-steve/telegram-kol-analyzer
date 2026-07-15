@@ -227,3 +227,53 @@ SQL
 ```
 
 Interpret a growing pending age, repeated `failed` rows, or critical `scheduled`/`failed` delivery as an operational investigation signal. Keep investigation read-only until service logs, provider health, and the exact ownership/notification state are understood. Production rollout and controlled latency/notification verification must follow `docs/server-deployment.md` and the semantic-review plan; do not use live trading as a test fixture.
+
+## 11. Operate Equivalent Entry-Leg Attribution Repair
+
+Entry submission must preserve economic identity:
+
+- One normalized entry price creates one entry leg with the full allocation.
+- If two range legs collapse to the same exchange-normalized price and otherwise
+  have the same execution identity, coalesce them before submission. The live
+  submission boundary repeats this check for queued legacy drafts.
+- TP/SL is auxiliary candidate-filtering evidence only. Equal, missing, stale,
+  ambiguous, or post-entry-mutated protection cannot prove ownership.
+- A strictly equivalent historical permutation may be mapped only by the repair
+  planner's versioned, stable sorted canonicalization. Never choose randomly or
+  depend on API/database input order.
+- Ordinary reconciliation cannot create
+  `equivalent_permutation_assignment`; without previously reviewed evidence it
+  must leave the component unresolved and fail closed.
+
+Every repair begins with a new dry run. Back up the production database, fetch
+one fresh coherent exchange snapshot, and run without `--apply`:
+
+```bash
+cd /opt/telegram-kol-analyzer
+.venv/bin/telegram-kol-research repair-position-attribution \
+  --database-path data/research.db
+```
+
+Review the snapshot fingerprint, every proposed action, every conflict, and the
+absence of unrelated clears before separately authorizing `--apply`. Rebuild and
+fingerprint the live/database evidence at apply time; drift must refuse the
+operation. Never reuse a saved plan after a manual exchange action.
+
+The operator manually closed the two unattributed positions suspected to belong
+to Miya on 2026-07-15, before this change was pushed or deployed. Therefore all
+older Miya repair output and fingerprints are void. After deployment:
+
+1. Pull current Deepcoin positions, open TPSL orders, pending triggers, and
+   relevant regular/trigger entry-order history.
+2. Confirm the manually closed `posId` values are absent. An absent position
+   must not receive verified ownership and must not be closed again.
+3. Audit whether residual TP/SL or trigger orders still need an explicitly
+   reviewed cancellation, without inferring ownership from those orders.
+4. Audit the associated execution legs, binding, and lifecycle. Mark stale
+   records terminal/manual where the fresh evidence proves the exchange-side
+   close/cancel; do not let ordinary reconcile revive them.
+5. Generate a new dry run from that snapshot. Zero actions is valid. If it
+   proposes any new action, stop and obtain separate review before apply.
+
+These are deployment-time audit requirements, not a claim that production has
+already been checked or repaired.
