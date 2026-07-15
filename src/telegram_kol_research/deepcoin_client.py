@@ -7,6 +7,8 @@ import hashlib
 import hmac
 import json
 import os
+import time
+from collections.abc import Callable
 from urllib.parse import urlencode
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -150,10 +152,20 @@ class DeepcoinRestClient:
         *,
         http_client: httpx.Client | None = None,
         timestamp_factory=None,
+        monotonic_factory: Callable[[], float] | None = None,
+        sleep_fn: Callable[[float], None] | None = None,
+        position_history_min_interval_seconds: float = 1.05,
     ) -> None:
         self._credentials = credentials
         self._http_client = http_client
         self._timestamp_factory = timestamp_factory or _utc_timestamp_ms
+        self._monotonic_factory = monotonic_factory or time.monotonic
+        self._sleep_fn = sleep_fn or time.sleep
+        self._position_history_min_interval_seconds = max(
+            0.0,
+            float(position_history_min_interval_seconds),
+        )
+        self._last_position_history_request_started_at: float | None = None
 
     def place_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_PLACE_ORDER_PATH, order_payload)
@@ -189,6 +201,7 @@ class DeepcoinRestClient:
         inst_id: str,
         pos_id: str,
     ) -> list[dict[str, Any]]:
+        self._pace_position_history_request()
         payload = self._request(
             "GET",
             _path_with_query(
@@ -206,6 +219,16 @@ class DeepcoinRestClient:
             payload,
             endpoint=DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH,
         )
+
+    def _pace_position_history_request(self) -> None:
+        now = self._monotonic_factory()
+        previous = self._last_position_history_request_started_at
+        if previous is not None:
+            remaining = self._position_history_min_interval_seconds - (now - previous)
+            if remaining > 0:
+                self._sleep_fn(remaining)
+                now = self._monotonic_factory()
+        self._last_position_history_request_started_at = now
 
     def list_open_orders(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         payload = self._request(

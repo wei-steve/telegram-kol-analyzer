@@ -40,6 +40,22 @@ class _CapturingHttpClient:
         return _FakeResponse(self.payload)
 
 
+class _FakeMonotonicClock:
+    def __init__(self, current: float = 100.0):
+        self.current = current
+        self.sleeps = []
+
+    def __call__(self):
+        return self.current
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.current += seconds
+
+    def advance(self, seconds):
+        self.current += seconds
+
+
 def test_build_deepcoin_auth_headers_signs_timestamp_method_path_and_body():
     credentials = DeepcoinCredentials(
         api_key="key",
@@ -161,6 +177,7 @@ def test_list_position_history_queries_exact_split_position():
         credentials,
         http_client=http_client,
         timestamp_factory=lambda: timestamp,
+        position_history_min_interval_seconds=0.0,
     )
 
     rows = client.list_position_history(
@@ -197,6 +214,79 @@ def test_list_position_history_queries_exact_split_position():
             inst_id="BTC-USDT-SWAP",
             pos_id="position-1",
         )
+
+
+def test_list_position_history_waits_only_for_remaining_endpoint_interval():
+    clock = _FakeMonotonicClock()
+    http_client = _CapturingHttpClient(
+        {"code": "0", "data": [{"posId": "position-1"}]}
+    )
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
+        position_history_min_interval_seconds=1.05,
+    )
+
+    client.list_position_history(
+        inst_id="BTC-USDT-SWAP",
+        pos_id="position-1",
+    )
+    assert clock.sleeps == []
+
+    clock.advance(0.25)
+    http_client.payload = {"code": "0", "data": [{"posId": "position-2"}]}
+    client.list_position_history(
+        inst_id="BTC-USDT-SWAP",
+        pos_id="position-2",
+    )
+
+    assert clock.sleeps == pytest.approx([0.80])
+    assert len(http_client.requests) == 2
+
+
+def test_list_position_history_does_not_sleep_after_full_interval_elapsed():
+    clock = _FakeMonotonicClock()
+    http_client = _CapturingHttpClient(
+        {"code": "0", "data": [{"posId": "position-1"}]}
+    )
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
+        position_history_min_interval_seconds=1.05,
+    )
+
+    client.list_position_history(
+        inst_id="BTC-USDT-SWAP",
+        pos_id="position-1",
+    )
+    clock.advance(1.10)
+    client.list_position_history(
+        inst_id="BTC-USDT-SWAP",
+        pos_id="position-1",
+    )
+
+    assert clock.sleeps == []
+
+
+def test_position_history_pacing_does_not_delay_other_endpoints():
+    clock = _FakeMonotonicClock()
+    http_client = _CapturingHttpClient({"code": "0", "data": []})
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
+        position_history_min_interval_seconds=1.05,
+    )
+
+    client.list_positions()
+    client.list_positions()
+
+    assert clock.sleeps == []
 
 
 def test_deepcoin_list_endpoint_rejects_non_list_data():
