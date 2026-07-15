@@ -1814,6 +1814,10 @@ def mark_strategy_lifecycle_manual_close(
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         if lifecycle is None:
             raise LookupError("strategy lifecycle not found")
+        manual_close_error = (
+            "manual close requires unique execution binding and either entered "
+            "lifecycle or legacy pending_entry with entered_at"
+        )
 
         matching_bindings = (
             session.query(ExecutionBinding)
@@ -1845,10 +1849,7 @@ def mark_strategy_lifecycle_manual_close(
                 and int(matching_bindings[0].id) == int(candidate_binding.id)
             )
             if not explicit_binding_is_unique:
-                raise ValueError(
-                    "manual close requires entered lifecycle, or legacy pending_entry "
-                    "with entered_at and execution binding"
-                )
+                raise ValueError(manual_close_error)
             binding = candidate_binding
         else:
             binding = matching_bindings[0] if len(matching_bindings) == 1 else None
@@ -1857,11 +1858,10 @@ def mark_strategy_lifecycle_manual_close(
             and lifecycle.entered_at is not None
             and binding is not None
         )
-        if lifecycle.lifecycle_status != "entered" and not is_legacy_demoted_entry:
-            raise ValueError(
-                "manual close requires entered lifecycle, or legacy pending_entry "
-                "with entered_at and execution binding"
-            )
+        if binding is None or (
+            lifecycle.lifecycle_status != "entered" and not is_legacy_demoted_entry
+        ):
+            raise ValueError(manual_close_error)
 
         lifecycle.lifecycle_status = "exited"
         lifecycle.exit_reason = "manual"

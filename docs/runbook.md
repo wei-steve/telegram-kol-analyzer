@@ -300,6 +300,11 @@ must atomically mark the lifecycle `exited/manual`, the binding
 manual terminal reason. Later reconciliation must preserve those terminal
 states and must not attach an old filled order to a same-symbol position.
 
+Every accepted manual close requires exactly one Deepcoin execution binding
+for the lifecycle's chat, message, symbol, and side. This requirement also
+applies to a lifecycle currently marked `entered`; never exit the lifecycle by
+itself when the binding is absent or ambiguous.
+
 The same action accepts a legacy lifecycle that reconciliation previously
 demoted from `entered` to `pending_entry` only when `entered_at` is still set
 and the lifecycle resolves to an execution binding. This is compatibility for
