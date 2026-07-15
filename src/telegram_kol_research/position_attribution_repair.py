@@ -531,6 +531,11 @@ def apply_position_attribution_repair_plan(
         legs_by_id = {int(row.id): row for row in legs}
         bindings_by_id = {int(row.id): row for row in bindings}
         lifecycles_by_id = {int(row.id): row for row in lifecycles}
+        planned_clears_by_leg = {
+            action.leg_id: action
+            for action in plan.historical_actions
+            if action.action == "clear_redundant_historical_position"
+        }
         try:
             for action in plan.actions:
                 leg = legs_by_id.get(action.leg_id)
@@ -568,6 +573,7 @@ def apply_position_attribution_repair_plan(
                     legs_by_id=legs_by_id,
                     bindings_by_id=bindings_by_id,
                     lifecycles_by_id=lifecycles_by_id,
+                    planned_clears_by_leg=planned_clears_by_leg,
                 )
             session.flush()
             applied_database_fingerprint = _database_fingerprint(
@@ -867,6 +873,7 @@ def _apply_historical_cleanup_action(
     legs_by_id,
     bindings_by_id,
     lifecycles_by_id,
+    planned_clears_by_leg,
 ) -> None:
     updated_at = _naive_utc(plan.created_at)
     if action.action == "clear_redundant_historical_position":
@@ -899,7 +906,18 @@ def _apply_historical_cleanup_action(
         leg = legs_by_id.get(int(action.leg_id or 0))
         if leg is None:
             raise PositionAttributionRepairError("stale repair plan: leg missing")
-        if leg.pos_id != action.old_pos_id or str(leg.status) != action.old_state:
+        planned_clear = planned_clears_by_leg.get(action.leg_id)
+        follows_matching_clear = (
+            planned_clear is not None
+            and plan.historical_actions.index(planned_clear)
+            < plan.historical_actions.index(action)
+            and planned_clear.old_pos_id == action.old_pos_id
+            and leg.pos_id == planned_clear.new_pos_id
+        )
+        if (
+            leg.pos_id != action.old_pos_id
+            and not follows_matching_clear
+        ) or str(leg.status) != action.old_state:
             raise PositionAttributionRepairError(
                 "stale repair plan: historical leg changed"
             )

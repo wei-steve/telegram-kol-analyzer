@@ -1323,6 +1323,126 @@ def test_historical_cleanup_apply_is_atomic_audited_indexed_and_idempotent(tmp_p
             session.commit()
 
 
+def test_historical_cleanup_apply_commits_clear_then_terminalize_chain(tmp_path):
+    session_factory = _seed_historical_duplicate_fixture(tmp_path)
+    with session_factory() as session:
+        redundant_leg = session.get(ExecutionOrderLeg, 2)
+        redundant_leg.status = "active"
+        session.commit()
+    client = _historical_duplicate_client()
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+
+    leg_actions = [
+        action
+        for action in plan.historical_actions
+        if action.leg_id == 2
+    ]
+    assert [action.action for action in leg_actions] == [
+        "clear_redundant_historical_position",
+        "terminalize_historical_entry_leg",
+    ]
+
+    result = apply_position_attribution_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        expected_fingerprint=plan.fingerprint,
+    )
+
+    assert result.applied == len(plan.historical_actions)
+    with session_factory() as session:
+        redundant_leg = session.get(ExecutionOrderLeg, 2)
+        audits = (
+            session.query(PositionAttributionAudit)
+            .filter_by(
+                event_type="historical_cleanup",
+                execution_order_leg_id=2,
+            )
+            .order_by(PositionAttributionAudit.id)
+            .all()
+        )
+    assert redundant_leg.pos_id is None
+    assert redundant_leg.status == "closed"
+    assert [audit.prior_state for audit in audits] == [
+        "attribution_conflict",
+        "active",
+    ]
+    assert [audit.new_state for audit in audits] == ["unassigned", "closed"]
+
+
+def test_historical_cleanup_apply_rejects_unplanned_terminalize_pos_drift(tmp_path):
+    session_factory = create_session_factory(tmp_path / "terminalize-pos-drift.db")
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                id=97,
+                strategy_instance_id="deepcoin:97:97:BTC:long",
+                kol_id="historical",
+                chat_id=97,
+                message_id=97,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                pos_id="position-1",
+                status="unknown",
+            )
+        )
+        session.add(
+            ExecutionOrderLeg(
+                id=189,
+                execution_binding_id=97,
+                strategy_instance_id="deepcoin:97:97:BTC:long",
+                leg_index=1,
+                purpose="entry",
+                order_kind="market",
+                order_id="position-1",
+                pos_id="position-1",
+                venue="deepcoin",
+                status="active",
+                attribution_status="attribution_conflict",
+            )
+        )
+        session.commit()
+    client = _HistoricalCleanupClient()
+    client.position_history[("BTC-USDT-SWAP", "position-1")] = [
+        _closed_position_history_row("position-1")
+    ]
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+    assert [
+        action.action
+        for action in plan.historical_actions
+        if action.leg_id == 189
+    ] == ["terminalize_historical_entry_leg"]
+
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, 189)
+        leg.pos_id = None
+        session.commit()
+
+    with pytest.raises(PositionAttributionRepairError, match="stale repair plan"):
+        apply_position_attribution_repair_plan(
+            session_factory,
+            plan,
+            deepcoin_client=client,
+            expected_fingerprint=plan.fingerprint,
+        )
+
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, 189)
+        audit_count = session.query(PositionAttributionAudit).count()
+    assert leg.pos_id is None
+    assert leg.status == "active"
+    assert audit_count == 0
+
+
 def test_historical_cleanup_updates_exact_execution_lifecycle(tmp_path):
     session_factory = create_session_factory(tmp_path / "lifecycle-cleanup.db")
     with session_factory() as session:
