@@ -43,6 +43,7 @@ from telegram_kol_research.protection_attribution import (
     match_position_protection,
     snapshot_protection_rows,
 )
+from telegram_kol_research.trade_signals import MANAGEMENT_TRADE_SIGNAL_ACTIONS
 from telegram_kol_research.trade_signals import TradeSignalRecord
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.strategy_management_batches import load_management_batch
@@ -86,6 +87,16 @@ def execute_deepcoin_management_signal(
     """Execute one non-entry Deepcoin trade signal from the durable queue."""
 
     action = trade_signal.action.lower()
+    if (
+        action in MANAGEMENT_TRADE_SIGNAL_ACTIONS
+        and trade_signal.source_type not in _MANUAL_MANAGEMENT_SOURCE_TYPES
+    ):
+        return close_position_market(
+            session_factory,
+            trade_signal=trade_signal,
+            deepcoin_client=deepcoin_client,
+            executed_at=executed_at,
+        )
     if action in {
         "close_position",
         "exit_position",
@@ -93,15 +104,6 @@ def execute_deepcoin_management_signal(
         "temporary_close",
         "partial_close_and_move_stop_to_entry",
     }:
-        return close_position_market(
-            session_factory,
-            trade_signal=trade_signal,
-            deepcoin_client=deepcoin_client,
-            executed_at=executed_at,
-        )
-    if action in {"adjust_position_tpsl", "adjust_stop_loss"} and (
-        trade_signal.source_type not in _MANUAL_MANAGEMENT_SOURCE_TYPES
-    ):
         return close_position_market(
             session_factory,
             trade_signal=trade_signal,
@@ -381,15 +383,23 @@ def close_position_market(
     """Delegate legacy close requests through a durable management batch."""
 
     payload = trade_signal.payload if isinstance(trade_signal.payload, dict) else {}
-    batch_id = payload.get("management_batch_id") or payload.get("batch_id")
-    if batch_id in (None, ""):
+    batch_id = payload.get("management_batch_id")
+    if isinstance(batch_id, bool):
         raise DeepcoinExecutionActionError("legacy_management_signal_requires_batch")
-    try:
+    if isinstance(batch_id, int):
+        normalized_batch_id = batch_id
+    elif (
+        isinstance(batch_id, str)
+        and batch_id.isdigit()
+        and not batch_id.startswith("0")
+    ):
         normalized_batch_id = int(batch_id)
-    except (TypeError, ValueError) as exc:
+    else:
         raise DeepcoinExecutionActionError(
             "legacy_management_signal_requires_batch"
-        ) from exc
+        )
+    if normalized_batch_id <= 0:
+        raise DeepcoinExecutionActionError("legacy_management_signal_requires_batch")
     settings = load_trading_settings(session_factory)
     if not settings.live_management_execution_enabled:
         raise DeepcoinExecutionActionError("management_live_execution_disabled")

@@ -1,6 +1,8 @@
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
@@ -16,12 +18,14 @@ from telegram_kol_research.recovery_live_submit import build_deepcoin_position_s
 from telegram_kol_research.recovery_live_submit import build_deepcoin_trigger_order_payload
 from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_signal
 from telegram_kol_research.recovery_live_submit import process_next_trade_signal_live
+from telegram_kol_research.recovery_live_submit import process_trade_signal_live
 from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.trading_settings import save_trading_settings
+from telegram_kol_research.trade_signals import enqueue_trade_signal
 
 
 class _StaticContractSpecProvider:
@@ -611,6 +615,121 @@ def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):
     with session_factory() as session:
         assert session.query(ExecutionBinding).count() == 1
         assert session.query(TradeSignal).filter_by(id=signal.id).one().status == "submitted"
+
+
+def test_legacy_management_audit_is_bounded_redacted_and_read_only(tmp_path):
+    from telegram_kol_research.trade_signals import audit_pending_legacy_management_signals
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    legacy = enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="kol_management",
+        kol_id="group:100",
+        chat_id=100,
+        message_id=700,
+        symbol="BTC",
+        side="short",
+        action="adjust_stop_loss",
+        payload={"binding_id": 12, "api_secret": "must-not-leak", "stop_loss": 62000},
+    )
+    enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="kol_management",
+        kol_id="group:200",
+        chat_id=200,
+        message_id=701,
+        symbol="ETH",
+        side="long",
+        action="close_position",
+        payload={"binding_id": 13, "management_batch_id": 55},
+    )
+    enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="recovery",
+        kol_id="group:100",
+        chat_id=100,
+        message_id=702,
+        symbol="BTC",
+        side="long",
+        action="open_position",
+        payload={"api_secret": "entry-secret"},
+    )
+
+    before = [(row.id, row.status, row.payload_json) for row in _all_trade_signals(session_factory)]
+    report = audit_pending_legacy_management_signals(session_factory, limit=10)
+    after = [(row.id, row.status, row.payload_json) for row in _all_trade_signals(session_factory)]
+
+    assert report == {
+        "total": 1,
+        "returned": 1,
+        "truncated": False,
+        "scan_truncated": False,
+        "by_action": {"adjust_stop_loss": 1},
+        "by_status": {"pending": 1},
+        "items": [
+            {
+                "id": legacy.id,
+                "action": "adjust_stop_loss",
+                "status": "pending",
+                "source_type": "kol_management",
+                "chat_id": 100,
+                "message_id": 700,
+            }
+        ],
+    }
+    assert "secret" not in json.dumps(report).lower()
+    assert before == after
+
+
+def test_recovery_dispatch_rejects_automatic_legacy_management_before_generic_action(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    signal = enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="kol_management",
+        kol_id="group:100",
+        chat_id=100,
+        message_id=703,
+        symbol="BTC",
+        side="short",
+        action="close_position",
+        payload={"binding_id": 12},
+    )
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    import telegram_kol_research.recovery_live_submit as live_submit
+
+    monkeypatch.setattr(
+        live_submit,
+        "execute_deepcoin_management_signal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy management must not reach generic dispatcher")
+        ),
+    )
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="legacy_management_signal_requires_batch",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=_FakeDeepcoinClient(),
+        )
+
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        assert row.status == "failed"
+        assert row.attempts == 1
+
+
+def _all_trade_signals(session_factory):
+    with session_factory() as session:
+        return session.query(TradeSignal).order_by(TradeSignal.id).all()
 
 
 def test_process_live_coalesces_equivalent_legacy_trigger_legs_before_submission(tmp_path):

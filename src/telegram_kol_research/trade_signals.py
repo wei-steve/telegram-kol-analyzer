@@ -15,6 +15,20 @@ from telegram_kol_research.models import TradeIdea
 from telegram_kol_research.models import TradeSignal
 
 
+MANAGEMENT_TRADE_SIGNAL_ACTIONS = frozenset(
+    {
+        "close_position",
+        "exit_position",
+        "temporary_exit",
+        "temporary_close",
+        "partial_close_and_move_stop_to_entry",
+        "adjust_position_tpsl",
+        "adjust_stop_loss",
+        "adjust_take_profit",
+    }
+)
+
+
 @dataclass(slots=True)
 class TradeSignalRecord:
     id: int
@@ -151,6 +165,78 @@ def list_pending_trade_signals(
             .all()
         )
         return [_row_to_record(row) for row in rows]
+
+
+def audit_pending_legacy_management_signals(
+    session_factory: sessionmaker,
+    *,
+    venue: str = "deepcoin",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """List redacted pending management rows which have no exact batch ID.
+
+    This is deliberately read-only.  It does not claim, refresh, convert, or
+    execute any signal, and it never returns the arbitrary stored payload.
+    ``scan_truncated`` makes the fixed scan cap explicit when ``total`` is only
+    the count within the bounded scan.
+    """
+
+    bounded_limit = max(1, min(int(limit), 500))
+    scan_limit = 5_000
+    with session_factory() as session:
+        rows = (
+            session.query(TradeSignal)
+            .filter(TradeSignal.venue == venue.lower())
+            .filter(TradeSignal.status == "pending")
+            .filter(TradeSignal.action.in_(sorted(MANAGEMENT_TRADE_SIGNAL_ACTIONS)))
+            .order_by(TradeSignal.created_at.asc(), TradeSignal.id.asc())
+            .limit(scan_limit + 1)
+            .all()
+        )
+        scan_truncated = len(rows) > scan_limit
+        rows = rows[:scan_limit]
+        legacy_rows = [row for row in rows if not _has_exact_management_batch_id(row)]
+        selected = legacy_rows[:bounded_limit]
+        by_action: dict[str, int] = {}
+        by_status: dict[str, int] = {}
+        for row in legacy_rows:
+            by_action[row.action] = by_action.get(row.action, 0) + 1
+            by_status[row.status] = by_status.get(row.status, 0) + 1
+        return {
+            "total": len(legacy_rows),
+            "returned": len(selected),
+            "truncated": scan_truncated or len(selected) < len(legacy_rows),
+            "scan_truncated": scan_truncated,
+            "by_action": dict(sorted(by_action.items())),
+            "by_status": dict(sorted(by_status.items())),
+            "items": [
+                {
+                    "id": row.id,
+                    "action": row.action,
+                    "status": row.status,
+                    "source_type": row.source_type,
+                    "chat_id": row.chat_id,
+                    "message_id": row.message_id,
+                }
+                for row in selected
+            ],
+        }
+
+
+def _has_exact_management_batch_id(row: TradeSignal) -> bool:
+    try:
+        payload = json.loads(row.payload_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    batch_id = payload.get("management_batch_id")
+    if isinstance(batch_id, bool):
+        return False
+    try:
+        return int(batch_id) > 0 and str(batch_id).strip() == str(int(batch_id))
+    except (TypeError, ValueError):
+        return False
 
 
 def mark_trade_signal_submitted(

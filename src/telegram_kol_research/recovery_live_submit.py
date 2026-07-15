@@ -23,6 +23,7 @@ from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.trade_signals import TradeSignalRecord
+from telegram_kol_research.trade_signals import MANAGEMENT_TRADE_SIGNAL_ACTIONS
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trade_signals import list_pending_trade_signals
 from telegram_kol_research.trade_signals import load_trade_signal
@@ -154,6 +155,14 @@ def process_trade_signal_live(
                 max_order_legs=max_order_legs,
             )
         else:
+            if (
+                trade_signal.action.lower() in MANAGEMENT_TRADE_SIGNAL_ACTIONS
+                and trade_signal.source_type == "kol_management"
+                and not _has_exact_management_batch_reference(trade_signal.payload)
+            ):
+                raise RecoveryLiveSubmitError(
+                    "legacy_management_signal_requires_batch"
+                )
             result = execute_deepcoin_management_signal(
                 session_factory,
                 trade_signal=trade_signal,
@@ -175,6 +184,19 @@ def process_trade_signal_live(
         processed_at=processed_at,
     )
     return result
+
+
+def _has_exact_management_batch_reference(payload: dict[str, Any]) -> bool:
+    batch_id = payload.get("management_batch_id")
+    if isinstance(batch_id, bool):
+        return False
+    if isinstance(batch_id, int):
+        return batch_id > 0
+    return bool(
+        isinstance(batch_id, str)
+        and batch_id.isdigit()
+        and not batch_id.startswith("0")
+    )
 
 
 def process_next_trade_signal_live(

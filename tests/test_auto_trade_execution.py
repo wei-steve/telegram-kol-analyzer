@@ -11,7 +11,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, MediaAsset, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, MediaAsset, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, TradeSignal
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
@@ -262,6 +262,76 @@ def _group_config():
     )
 
 
+def test_management_disabled_records_safe_skip_before_planning_or_exchange_access(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=901,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 7, 15, 8, 0, tzinfo=UTC),
+            text="BTC all exit",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="short",
+                event_type="close_signal",
+                management_action="full_exit",
+                recognition_generation="disabled-generation",
+                parse_source="mimo_authoritative",
+                confidence=0.99,
+            )
+        )
+        session.commit()
+        raw_message_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "disabled",
+            "allowed_symbols": ["BTC"],
+        },
+    )
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    monkeypatch.setattr(
+        auto_module,
+        "plan_strategy_management_batch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled management must not plan")
+        ),
+    )
+    client = _FakeDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=client,
+    )
+
+    assert result == {"status": "skipped", "reason": "management_execution_disabled"}
+    with session_factory() as session:
+        event = session.query(ExecutionEvent).one()
+        assert event.action == "management_auto_trade_skipped"
+        assert event.status == "skipped"
+        assert event.chat_id == 100
+        assert event.message_id == 901
+        assert event.reason == "management_execution_disabled"
+        assert session.query(TradeSignal).count() == 0
+    assert client.orders == []
+    assert client.trigger_orders == []
+    assert client.protections == []
+
+
 @pytest.mark.parametrize(
     ("mode", "auto_trade_enabled", "expected_status", "expected_reason"),
     [
@@ -462,6 +532,8 @@ def test_management_planning_shadows_or_executes_only_the_durable_batch(
     assert fake_client.protections == []
     assert fake_client.cancel_orders == []
     assert fake_client.cancel_trigger_orders == []
+    with session_factory() as session:
+        assert session.query(TradeSignal).count() == 0
 
 
 @pytest.mark.parametrize(
