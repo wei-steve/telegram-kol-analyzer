@@ -190,9 +190,11 @@ After deployment, fetch a fresh coherent Deepcoin snapshot of positions, open
 TPSL orders, pending triggers, and relevant entry-order history before building
 a new mandatory dry run. A `posId` absent from the fresh live snapshot must
 never receive verified ownership and must never be sent a close request. Audit
-remaining protection/trigger orders and stale legs, then move stale bindings
-and lifecycles to the appropriate terminal/manual state. Apply nothing unless
-the fresh dry run reports a specific action that receives separate review.
+remaining protection/trigger orders, stale legs, bindings, and lifecycles in
+read-only mode, then generate the fresh dry run. Any terminal/manual transition
+or stale-record cleanup must be an explicit fingerprinted planner action and
+receive separate review before `--apply`. Zero actions authorizes no change.
+Never bypass the planner/fingerprint by editing the production database directly.
 
 Production remains fail closed until real positions, entry legs, pending orders,
 TPSL, audit incidents, service health, and server tests all agree.

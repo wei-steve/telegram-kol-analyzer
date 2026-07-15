@@ -510,7 +510,10 @@ affected execution legs, binding, and lifecycle terminal state. A position
 absent from the current Deepcoin snapshot must not receive verified ownership
 and must not be targeted by a close request. Any stale records or residual
 exchange orders require explicit evidence and separate review; do not infer
-ownership from TP/SL alone.
+ownership from TP/SL alone. Keep this audit read-only. Any terminal/manual
+transition or stale leg/binding/lifecycle cleanup must appear as an explicit
+fingerprinted dry-run action and receive separate review before `--apply`;
+never edit the database directly or bypass the planner.
 
 ```bash
 cd /opt/telegram-kol-analyzer

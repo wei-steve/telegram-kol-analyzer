@@ -94,17 +94,27 @@ gate and resume normal binding-level close and TPSL management. Any later
 evidence that breaks equivalence invalidates this authority and returns the
 component to conflict.
 
-## Existing Miya Incident
+## Historical Miya Snapshot
 
-Binding 126 has two successful BTC long trigger legs and two live BTC long
-positions. Both sides have identical normalized price, quantity, trigger time,
-TP, SL, and strategy identity, with no outside candidates. It is eligible for
-equivalent-permutation recovery after the implementation is deployed and the
-production dry-run reproduces those facts.
+Before deployment, one observed snapshot showed Binding 126 with two successful
+BTC long trigger legs and two then-live BTC long positions. In that historical
+snapshot, both sides had identical normalized price, quantity, trigger time,
+TP, SL, and strategy identity, with no outside candidates. It was the
+production-shaped fixture for equivalent-permutation recovery; it is not a
+statement of current exchange state or a production verification result.
 
-The repair remains dry-run first. Applying the repair requires a fresh database
-backup, unchanged live-position set, zero unrelated unresolved conflicts, and a
-reviewed action list limited to the two Miya legs and positions.
+On 2026-07-15 the operator manually closed the two unattributed positions
+suspected to belong to Miya before this code was pushed or deployed. That action
+invalidated the old repair plan, its fingerprint, and the expectation of exactly
+two Miya assignment/apply actions. After deployment, fetch a fresh coherent
+snapshot of positions, open TPSL orders, pending triggers, and relevant entry
+history, then keep the audit read-only through a new repair dry run. A `posId`
+absent from the new snapshot must never receive verified ownership or be sent a
+close request. Zero actions is valid and authorizes no modification. Every
+nonzero action, including terminal/manual transitions or stale
+leg/binding/lifecycle cleanup, must be explicit in the fingerprinted plan and
+separately reviewed before `--apply`; never bypass the planner by editing the
+database directly.
 
 ## Failure Handling
 
@@ -130,6 +140,8 @@ reviewed action list limited to the two Miya legs and positions.
   conflicts cannot.
 - Repair tests covering dry-run, audited apply, idempotency, stale-plan refusal,
   and the production-shaped Miya incident.
-- Local full suite followed by GitHub push, server deployment, production
-  dry-run, reviewed repair apply, service restart, and Web card verification.
-
+- Local full suite followed by GitHub push and server deployment. Then capture a
+  fresh production snapshot and dry run. Apply only separately reviewed nonzero
+  actions without fingerprint drift; zero actions requires no apply. Restart
+  and Web verification are conditional on the actual reviewed result, and this
+  design does not claim that production has already been verified.

@@ -257,7 +257,9 @@ cd /opt/telegram-kol-analyzer
 Review the snapshot fingerprint, every proposed action, every conflict, and the
 absence of unrelated clears before separately authorizing `--apply`. Rebuild and
 fingerprint the live/database evidence at apply time; drift must refuse the
-operation. Never reuse a saved plan after a manual exchange action.
+operation. Never reuse a saved plan after a manual exchange action. Never edit
+the production database directly or bypass the planner/fingerprint checks to
+force an attribution, terminal state, manual state, or stale-record cleanup.
 
 The operator manually closed the two unattributed positions suspected to belong
 to Miya on 2026-07-15, before this change was pushed or deployed. Therefore all
@@ -267,13 +269,16 @@ older Miya repair output and fingerprints are void. After deployment:
    relevant regular/trigger entry-order history.
 2. Confirm the manually closed `posId` values are absent. An absent position
    must not receive verified ownership and must not be closed again.
-3. Audit whether residual TP/SL or trigger orders still need an explicitly
-   reviewed cancellation, without inferring ownership from those orders.
-4. Audit the associated execution legs, binding, and lifecycle. Mark stale
-   records terminal/manual where the fresh evidence proves the exchange-side
-   close/cancel; do not let ordinary reconcile revive them.
-5. Generate a new dry run from that snapshot. Zero actions is valid. If it
-   proposes any new action, stop and obtain separate review before apply.
+3. Keeping the process read-only, audit residual TP/SL and trigger orders plus
+   the associated execution legs, binding, and lifecycle. Do not infer
+   ownership from protection, and do not mutate exchange or database state.
+4. Generate a fresh dry run from the same coherent snapshot. Any proposed
+   terminal/manual transition or stale leg/binding/lifecycle cleanup must appear
+   as an explicit planner action covered by that fingerprint.
+5. Review every nonzero action separately before `--apply`. Zero actions is a
+   valid result and authorizes no modification. If the planner cannot express a
+   needed state transition, stop and change/review the planner rather than
+   editing the database around it.
 
 These are deployment-time audit requirements, not a claim that production has
 already been checked or repaired.
