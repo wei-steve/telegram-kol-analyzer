@@ -19,10 +19,17 @@ from telegram_kol_research.execution_bindings import (
     build_position_evidence,
     _snapshot_fill_evidence,
 )
+from telegram_kol_research.historical_attribution_cleanup import (
+    HistoricalCleanupAction,
+    plan_historical_attribution_cleanup,
+)
 from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
     ExecutionBinding,
+    ExecutionEvent,
     ExecutionOrderLeg,
     PositionAttributionAudit,
+    StrategyLifecycle,
 )
 from telegram_kol_research.position_attribution import (
     TERMINAL_ENTRY_LEG_STATES,
@@ -60,12 +67,63 @@ class PositionAttributionRepairPlan:
     unresolved_conflicts: list[dict[str, object]]
     database_fingerprint: str
     fingerprint: str
+    historical_actions: tuple[HistoricalCleanupAction, ...] = ()
+
+    @property
+    def has_actions(self) -> bool:
+        return bool(self.actions or self.historical_actions)
 
 
 @dataclass(frozen=True, slots=True)
 class PositionAttributionRepairResult:
     applied: int
     already_applied: bool = False
+
+
+_HISTORICAL_TERMINAL_EVENT_ACTIONS = (
+    "close_position_market",
+    "close_bound_position",
+    "close_bound_position_market",
+    "manual_close_position",
+)
+
+
+def _load_local_repair_evidence(session):
+    bindings = (
+        session.query(ExecutionBinding)
+        .filter(ExecutionBinding.venue == "deepcoin")
+        .order_by(ExecutionBinding.id)
+        .all()
+    )
+    legs = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.venue == "deepcoin")
+        .order_by(ExecutionOrderLeg.id)
+        .all()
+    )
+    binding_ids = [int(row.id) for row in bindings]
+    if not binding_ids:
+        return bindings, legs, [], [], []
+    lifecycles = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.execution_binding_id.in_(binding_ids))
+        .order_by(StrategyLifecycle.id)
+        .all()
+    )
+    terminal_events = (
+        session.query(ExecutionEvent)
+        .filter(ExecutionEvent.execution_binding_id.in_(binding_ids))
+        .filter(ExecutionEvent.action.in_(_HISTORICAL_TERMINAL_EVENT_ACTIONS))
+        .order_by(ExecutionEvent.id)
+        .all()
+    )
+    close_reservations = (
+        session.query(BoundPositionCloseReservation)
+        .filter(BoundPositionCloseReservation.execution_binding_id.in_(binding_ids))
+        .order_by(BoundPositionCloseReservation.id)
+        .all()
+    )
+    return bindings, legs, lifecycles, terminal_events, close_reservations
 
 
 def build_position_attribution_repair_plan(
@@ -76,19 +134,16 @@ def build_position_attribution_repair_plan(
 ) -> PositionAttributionRepairPlan:
     created_at = now or datetime.now(UTC)
     with session_factory() as session:
-        bindings = (
-            session.query(ExecutionBinding)
-            .filter(ExecutionBinding.venue == "deepcoin")
-            .order_by(ExecutionBinding.id)
-            .all()
+        bindings, legs, lifecycles, terminal_events, close_reservations = (
+            _load_local_repair_evidence(session)
         )
-        legs = (
-            session.query(ExecutionOrderLeg)
-            .filter(ExecutionOrderLeg.venue == "deepcoin")
-            .order_by(ExecutionOrderLeg.id)
-            .all()
+        database_fingerprint = _database_fingerprint(
+            bindings,
+            legs,
+            lifecycles=lifecycles,
+            terminal_events=terminal_events,
+            close_reservations=close_reservations,
         )
-        database_fingerprint = _database_fingerprint(bindings, legs)
         bindings_by_id = {int(row.id): row for row in bindings}
         instruments = {
             f"{str(binding.symbol).upper()}-USDT-SWAP" for binding in bindings
@@ -104,6 +159,7 @@ def build_position_attribution_repair_plan(
                 live_position_ids=_live_position_ids(snapshot.positions),
                 exchange_evidence_fingerprint=_exchange_evidence_fingerprint(snapshot),
                 actions=(),
+                historical_actions=(),
                 unresolved_conflicts=unresolved,
                 database_fingerprint=database_fingerprint,
             )
@@ -242,12 +298,29 @@ def build_position_attribution_repair_plan(
             action for action in assign_actions if action.leg_id not in terminal_leg_ids
         ]
         actions = _dedupe_actions([*clear_actions, *terminal_actions, *assign_actions])
+        historical = plan_historical_attribution_cleanup(
+            bindings=bindings,
+            legs=legs,
+            lifecycles=lifecycles,
+            events=terminal_events,
+            reservations=close_reservations,
+            snapshot=snapshot,
+        )
         return _build_plan(
             created_at=created_at,
             live_position_ids=_live_position_ids(snapshot.positions),
             exchange_evidence_fingerprint=_exchange_evidence_fingerprint(snapshot),
             actions=tuple(actions),
-            unresolved_conflicts=list(attribution.conflicts),
+            historical_actions=historical.actions,
+            unresolved_conflicts=[
+                *list(attribution.conflicts),
+                *(
+                    asdict(conflict)
+                    for conflict in historical.conflicts
+                    if conflict.reason
+                    != "historical_position_still_exchange_active"
+                ),
+            ],
             database_fingerprint=database_fingerprint,
         )
 
@@ -319,19 +392,16 @@ def apply_position_attribution_repair_plan(
             )
 
     with session_factory() as session:
-        bindings = (
-            session.query(ExecutionBinding)
-            .filter(ExecutionBinding.venue == "deepcoin")
-            .order_by(ExecutionBinding.id)
-            .all()
+        bindings, legs, lifecycles, terminal_events, close_reservations = (
+            _load_local_repair_evidence(session)
         )
-        legs = (
-            session.query(ExecutionOrderLeg)
-            .filter(ExecutionOrderLeg.venue == "deepcoin")
-            .order_by(ExecutionOrderLeg.id)
-            .all()
+        current_database_fingerprint = _database_fingerprint(
+            bindings,
+            legs,
+            lifecycles=lifecycles,
+            terminal_events=terminal_events,
+            close_reservations=close_reservations,
         )
-        current_database_fingerprint = _database_fingerprint(bindings, legs)
         if already_applied:
             applied_state_fingerprints = {
                 _repair_audit_applied_database_fingerprint(
@@ -383,7 +453,13 @@ def apply_position_attribution_repair_plan(
                 affected_binding_ids={action.binding_id for action in plan.actions},
                 live_position_ids=set(plan.live_position_ids),
             )
-            applied_database_fingerprint = _database_fingerprint(bindings, legs)
+            applied_database_fingerprint = _database_fingerprint(
+                bindings,
+                legs,
+                lifecycles=lifecycles,
+                terminal_events=terminal_events,
+                close_reservations=close_reservations,
+            )
             for action in plan.actions:
                 _insert_repair_audit(
                     session,
@@ -445,6 +521,7 @@ def _build_plan(
     live_position_ids: tuple[str, ...],
     exchange_evidence_fingerprint: str,
     actions: tuple[PositionAttributionRepairAction, ...],
+    historical_actions: tuple[HistoricalCleanupAction, ...],
     unresolved_conflicts: list[dict[str, object]],
     database_fingerprint: str,
 ) -> PositionAttributionRepairPlan:
@@ -452,6 +529,7 @@ def _build_plan(
         "live_position_ids": live_position_ids,
         "exchange_evidence_fingerprint": exchange_evidence_fingerprint,
         "actions": [asdict(action) for action in actions],
+        "historical_actions": [asdict(action) for action in historical_actions],
         "unresolved_conflicts": unresolved_conflicts,
         "database_fingerprint": database_fingerprint,
     }
@@ -460,13 +538,21 @@ def _build_plan(
         live_position_ids=live_position_ids,
         exchange_evidence_fingerprint=exchange_evidence_fingerprint,
         actions=actions,
+        historical_actions=historical_actions,
         unresolved_conflicts=unresolved_conflicts,
         database_fingerprint=database_fingerprint,
         fingerprint=_hash(payload),
     )
 
 
-def _database_fingerprint(bindings, legs) -> str:
+def _database_fingerprint(
+    bindings,
+    legs,
+    *,
+    lifecycles=(),
+    terminal_events=(),
+    close_reservations=(),
+) -> str:
     return _hash(
         {
             "bindings": [
@@ -507,6 +593,52 @@ def _database_fingerprint(bindings, legs) -> str:
                     "last_verified_at": _fingerprint_datetime(row.last_verified_at),
                 }
                 for row in legs
+            ],
+            "lifecycles": [
+                {
+                    "id": int(row.id),
+                    "execution_binding_id": (
+                        int(row.execution_binding_id)
+                        if row.execution_binding_id is not None
+                        else None
+                    ),
+                    "lifecycle_status": row.lifecycle_status,
+                    "exit_reason": row.exit_reason,
+                    "entered_at": _fingerprint_datetime(row.entered_at),
+                    "exited_at": _fingerprint_datetime(row.exited_at),
+                    "updated_at": _fingerprint_datetime(row.updated_at),
+                }
+                for row in lifecycles
+            ],
+            "terminal_events": [
+                {
+                    "id": int(row.id),
+                    "execution_binding_id": (
+                        int(row.execution_binding_id)
+                        if row.execution_binding_id is not None
+                        else None
+                    ),
+                    "action": row.action,
+                    "status": row.status,
+                    "pos_id": row.pos_id,
+                    "related_order_id": row.related_order_id,
+                    "exchange_event_time": _fingerprint_datetime(
+                        row.exchange_event_time
+                    ),
+                    "created_at": _fingerprint_datetime(row.created_at),
+                }
+                for row in terminal_events
+            ],
+            "close_reservations": [
+                {
+                    "id": int(row.id),
+                    "pos_id": row.pos_id,
+                    "execution_binding_id": int(row.execution_binding_id),
+                    "status": row.status,
+                    "created_at": _fingerprint_datetime(row.created_at),
+                    "updated_at": _fingerprint_datetime(row.updated_at),
+                }
+                for row in close_reservations
             ],
         }
     )

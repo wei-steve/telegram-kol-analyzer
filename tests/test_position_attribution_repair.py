@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import UTC, datetime
+import sqlite3
 
 import pytest
 
@@ -10,7 +11,9 @@ from telegram_kol_research.execution_bindings import (
     upsert_execution_order_leg,
 )
 from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
     ExecutionBinding,
+    ExecutionEvent,
     ExecutionOrderLeg,
     PositionAttributionAudit,
     StrategyLifecycle,
@@ -20,6 +23,117 @@ from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
 )
+
+
+class _HistoricalCleanupClient:
+    def __init__(self, *, live_position_ids=()):
+        self.positions = [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": pos_id,
+                "posSide": "long",
+                "pos": "1",
+            }
+            for pos_id in live_position_ids
+        ]
+
+    def list_positions(self):
+        return self.positions
+
+    def list_open_orders(self, *, inst_id=None):
+        return []
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        return []
+
+    def list_order_history(self, *, inst_id=None):
+        return []
+
+    def list_trade_fills(self, *, inst_id=None):
+        return []
+
+    def list_trigger_order_history(self, *, inst_id):
+        return []
+
+
+def _seed_historical_duplicate_fixture(tmp_path):
+    database_path = tmp_path / "historical-duplicates.db"
+    conn = sqlite3.connect(database_path)
+    conn.executescript(
+        """
+        CREATE TABLE execution_order_legs (
+            id INTEGER PRIMARY KEY,
+            execution_binding_id INTEGER NOT NULL,
+            strategy_instance_id VARCHAR(255),
+            leg_index INTEGER NOT NULL,
+            purpose VARCHAR(64) NOT NULL,
+            order_kind VARCHAR(64) NOT NULL,
+            order_id VARCHAR(255),
+            client_order_id VARCHAR(255),
+            pos_id VARCHAR(255),
+            status VARCHAR(32) NOT NULL,
+            request_json TEXT,
+            response_json TEXT,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL
+        );
+        INSERT INTO execution_order_legs VALUES
+          (1, 10, 'deepcoin:10:10:BTC:long', 1, 'entry', 'market', 'p1', 'client-1', 'p1', 'manually_closed', NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+          (2, 10, 'deepcoin:10:10:BTC:long', 2, 'entry', 'market', 'child-2', 'client-2', 'p1', 'manually_closed', NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+        """
+    )
+    conn.commit()
+    conn.close()
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                id=10,
+                strategy_instance_id="deepcoin:10:10:BTC:long",
+                kol_id="historical",
+                chat_id=10,
+                message_id=10,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                status="unknown",
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                id=100,
+                chat_id=10,
+                message_id=10,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="exited",
+                exit_reason="manual",
+                signal_at=datetime(2026, 7, 1),
+                entered_at=datetime(2026, 7, 1),
+                exited_at=datetime(2026, 7, 2),
+                execution_binding_id=10,
+            )
+        )
+        for leg in session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.id):
+            leg.venue = "deepcoin"
+            leg.attribution_status = "attribution_conflict"
+            leg.terminal_reason = "manual_lifecycle_terminal"
+        session.commit()
+    return session_factory
+
+
+def _historical_fixture_state(session_factory):
+    with session_factory() as session:
+        return [
+            (
+                row.id,
+                row.pos_id,
+                row.status,
+                row.attribution_status,
+                row.terminal_reason,
+            )
+            for row in session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.id)
+        ]
 
 
 class _RepairClient:
@@ -768,6 +882,85 @@ def test_repair_plan_clears_legacy_weak_verified_position(tmp_path):
     ]
     assert plan.actions[0].new_pos_id is None
     assert plan.actions[0].new_attribution_status == "unassigned"
+
+
+def test_repair_plan_includes_historical_cleanup_without_mutating_database(tmp_path):
+    session_factory = _seed_historical_duplicate_fixture(tmp_path)
+    before = _historical_fixture_state(session_factory)
+
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=_HistoricalCleanupClient(),
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+
+    assert plan.historical_actions
+    assert plan.historical_actions[0].action == "clear_redundant_historical_position"
+    assert _historical_fixture_state(session_factory) == before
+
+
+def test_repair_plan_excludes_current_live_position_from_historical_actions(tmp_path):
+    session_factory = _seed_historical_duplicate_fixture(tmp_path)
+
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=_HistoricalCleanupClient(live_position_ids=["p1"]),
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+
+    assert all(action.old_pos_id != "p1" for action in plan.historical_actions)
+    assert all(
+        conflict.get("reason") != "historical_position_still_exchange_active"
+        for conflict in plan.unresolved_conflicts
+    )
+
+
+@pytest.mark.parametrize("mutation", ["lifecycle", "execution_event", "close_reservation"])
+def test_historical_repair_fingerprint_changes_when_terminal_evidence_changes(
+    tmp_path, mutation
+):
+    session_factory = _seed_historical_duplicate_fixture(tmp_path)
+    client = _HistoricalCleanupClient()
+    first = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+    with session_factory() as session:
+        if mutation == "lifecycle":
+            row = session.get(StrategyLifecycle, 100)
+            row.exit_reason = "stop_loss"
+        elif mutation == "execution_event":
+            session.add(
+                ExecutionEvent(
+                    execution_binding_id=10,
+                    strategy_instance_id="deepcoin:10:10:BTC:long",
+                    venue="deepcoin",
+                    action="close_position_market",
+                    status="completed",
+                    pos_id="p1",
+                    created_at=datetime(2026, 7, 15, 4, 1),
+                )
+            )
+        else:
+            session.add(
+                BoundPositionCloseReservation(
+                    pos_id="p1",
+                    execution_binding_id=10,
+                    status="completed",
+                    created_at=datetime(2026, 7, 15, 4, 1),
+                    updated_at=datetime(2026, 7, 15, 4, 1),
+                )
+            )
+        session.commit()
+    second = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 4, 0, tzinfo=UTC),
+    )
+
+    assert second.database_fingerprint != first.database_fingerprint
+    assert second.fingerprint != first.fingerprint
 
 
 def test_repair_plan_preserves_explicit_legacy_manual_bind(tmp_path):
