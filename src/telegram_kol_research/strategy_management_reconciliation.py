@@ -10,6 +10,9 @@ from typing import Any
 
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.deepcoin_normalization import (
+    normalize_deepcoin_swap_instrument,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -21,6 +24,7 @@ from telegram_kol_research.models import (
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
+from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 
 
 _ACTIVE_RECONCILIATION_STATUSES = frozenset(
@@ -84,7 +88,7 @@ def reconcile_strategy_management_batches(
                 continue
 
             binding = session.get(ExecutionBinding, batch.execution_binding_id)
-            expected_instrument = f"{str(binding.symbol).upper()}-USDT-SWAP"
+            expected_instrument = normalize_deepcoin_swap_instrument(binding.symbol)
 
             for leg in legs:
                 _reconcile_leg(
@@ -153,19 +157,32 @@ def _reconcile_leg(
         return
 
     matching_orders = _matching_orders(leg, order_rows)
+    matching_order, ambiguous = _resolve_matching_order(matching_orders)
+    identity_conflict = _order_identity_conflicts(leg, matching_orders)
+    if ambiguous or identity_conflict:
+        leg.status = "inconsistent"
+        leg.last_error = _json(
+            {
+                "reason": (
+                    "management_close_order_identity_conflict"
+                    if identity_conflict
+                    else "management_close_order_identity_ambiguous"
+                )
+            }
+        )
+        leg.last_exchange_snapshot_json = _leg_snapshot(
+            leg, position_rows, matching_orders
+        )
+        leg.updated_at = now
+        return
+
+    if leg.status == "inconsistent":
+        return
+
     if leg.status in {"reserved", "submit_unknown"}:
-        matching_order, ambiguous = _resolve_matching_order(matching_orders)
         if matching_order is None:
-            leg.status = "inconsistent" if ambiguous else "submit_unknown"
-            leg.last_error = _json(
-                {
-                    "reason": (
-                        "management_close_order_identity_ambiguous"
-                        if ambiguous
-                        else "management_close_order_not_found"
-                    )
-                }
-            )
+            leg.status = "submit_unknown"
+            leg.last_error = _json({"reason": "management_close_order_not_found"})
             leg.last_exchange_snapshot_json = _leg_snapshot(leg, position_rows, matching_orders)
             leg.updated_at = now
             return
@@ -179,6 +196,15 @@ def _reconcile_leg(
         leg.exchange_order_id = order_id or leg.exchange_order_id
         leg.status = "submitted"
         leg.last_error = None
+    elif leg.status in {"submitted", "partial"} and matching_order is None:
+        # Position movement without the exact regular-order identity could be a
+        # manual or unrelated close. Preserve the non-retryable pending state.
+        leg.last_error = _json({"reason": "management_close_order_not_found"})
+        leg.last_exchange_snapshot_json = _leg_snapshot(
+            leg, position_rows, matching_orders
+        )
+        leg.updated_at = now
+        return
 
     rows = position_rows.get(str(leg.pos_id), [])
     if len(rows) > 1:
@@ -235,6 +261,15 @@ def _identity_is_exact(session, batch, legs) -> bool:
         or lifecycle is None
         or binding.strategy_instance_id != batch.strategy_instance_id
         or lifecycle.execution_binding_id != batch.execution_binding_id
+        or lifecycle.lifecycle_status != "entered"
+        or lifecycle.exit_reason is not None
+        or lifecycle.exited_at is not None
+        or binding.status not in {"open", "active", "stale"}
+        or (
+            binding.status == "stale"
+            and binding.last_exchange_status
+            != "verified_position_missing_from_exchange"
+        )
     ):
         return False
     seen: set[str] = set()
@@ -250,6 +285,8 @@ def _identity_is_exact(session, batch, legs) -> bool:
             or entry.purpose != "entry"
             or entry.pos_id != leg.pos_id
             or entry.attribution_status != "verified"
+            or str(entry.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+            or entry.terminal_reason is not None
         ):
             return False
     exact_entry_rows = (
@@ -364,6 +401,38 @@ def _resolve_matching_order(
     }
     if len(order_ids) > 1 or len(client_ids) > 1:
         return None, True
+    connected = {0}
+    connected_order_ids = {
+        value
+        for value in (_first_string(rows[0], *_ORDER_ID_KEYS),)
+        if value
+    }
+    connected_client_ids = {
+        value
+        for value in (_first_string(rows[0], *_CLIENT_ORDER_ID_KEYS),)
+        if value
+    }
+    changed = True
+    while changed:
+        changed = False
+        for index, row in enumerate(rows):
+            if index in connected:
+                continue
+            order_id = _first_string(row, *_ORDER_ID_KEYS)
+            client_id = _first_string(row, *_CLIENT_ORDER_ID_KEYS)
+            if not (
+                (order_id and order_id in connected_order_ids)
+                or (client_id and client_id in connected_client_ids)
+            ):
+                continue
+            connected.add(index)
+            if order_id:
+                connected_order_ids.add(order_id)
+            if client_id:
+                connected_client_ids.add(client_id)
+            changed = True
+    if len(connected) != len(rows):
+        return None, True
     merged: dict[str, Any] = {}
     for row in rows:
         merged.update(row)
@@ -374,14 +443,30 @@ def _resolve_matching_order(
     return merged, False
 
 
+def _order_identity_conflicts(leg, rows: list[dict[str, Any]]) -> bool:
+    durable_order_id = str(leg.exchange_order_id) if leg.exchange_order_id else None
+    durable_client_id = str(leg.client_order_id) if leg.client_order_id else None
+    for row in rows:
+        order_id = _first_string(row, *_ORDER_ID_KEYS)
+        client_id = _first_string(row, *_CLIENT_ORDER_ID_KEYS)
+        if durable_order_id and order_id and order_id != durable_order_id:
+            return True
+        if durable_client_id and client_id and client_id != durable_client_id:
+            return True
+    return False
+
+
 def _position_size(row: dict[str, Any]) -> Decimal:
     for key in ("pos", "size", "sz", "positionSize", "position_size"):
         value = row.get(key)
         if value not in (None, ""):
             try:
-                return abs(Decimal(str(value)))
+                result = abs(Decimal(str(value)))
             except InvalidOperation as exc:
                 raise ValueError("invalid position size") from exc
+            if not result.is_finite():
+                raise ValueError("position size must be finite")
+            return result
     raise ValueError("position size missing")
 
 

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
@@ -20,6 +23,9 @@ from telegram_kol_research.strategy_management_batches import (
     transition_batch,
     transition_leg,
 )
+from telegram_kol_research.strategy_management_reconciliation import (
+    reconcile_strategy_management_batches,
+)
 
 
 NOW = datetime(2026, 7, 15, 10, 0, tzinfo=UTC)
@@ -32,7 +38,9 @@ def _persist_batch(
     sizes=("1",),
     preflight=("2",),
     initial_status="submitted",
+    symbol="BTC",
 ):
+    strategy_instance_id = f"deepcoin:100:10:{symbol}:short"
     with session_factory() as session:
         raw = RawMessage(chat_id=100, message_id=20, text="tp", posted_at=NOW)
         session.add(raw)
@@ -49,7 +57,7 @@ def _persist_batch(
         lifecycle = StrategyLifecycle(
             chat_id=100,
             message_id=10,
-            symbol="BTC",
+            symbol=symbol,
             side="short",
             lifecycle_status="entered",
             signal_at=NOW,
@@ -57,11 +65,11 @@ def _persist_batch(
         session.add_all([decision, lifecycle])
         session.flush()
         binding = ExecutionBinding(
-            strategy_instance_id="deepcoin:100:10:BTC:short",
+            strategy_instance_id=strategy_instance_id,
             kol_id="alice",
             chat_id=100,
             message_id=10,
-            symbol="BTC",
+            symbol=symbol,
             side="short",
             venue="deepcoin",
             pos_id=",".join(f"pos-{i + 1}" for i in range(len(sizes))),
@@ -99,7 +107,7 @@ def _persist_batch(
         recognition_decision_id=ids[1],
         recognition_generation="generation-1",
         target_lifecycle_id=ids[2],
-        strategy_instance_id="deepcoin:100:10:BTC:short",
+        strategy_instance_id=strategy_instance_id,
         execution_binding_id=ids[3],
         intent="partial_take_profit" if action == "partial_close" else "full_take_profit",
         effective_action=action,
@@ -130,9 +138,16 @@ def _persist_batch(
 
 
 class _Client:
-    def __init__(self, *, positions, orders=()):
+    def __init__(self, *, positions, orders=None):
         self.positions = list(positions)
-        self.orders = list(orders)
+        self.orders = list(
+            orders
+            if orders is not None
+            else [
+                {"ordId": "close-1", "clOrdId": "TMCLIENT1"},
+                {"ordId": "close-2", "clOrdId": "TMCLIENT2"},
+            ]
+        )
         self.calls = {"positions": 0, "open": 0, "history": 0, "fills": 0}
 
     def list_positions(self):
@@ -159,6 +174,24 @@ def _position(pos_id, size):
 def _reconcile(session_factory, client):
     return reconcile_deepcoin_execution_bindings(
         session_factory, client=client, recovered_at=NOW
+    )
+
+
+def _reconcile_management(session_factory, *, positions, orders=None):
+    return reconcile_strategy_management_batches(
+        session_factory,
+        snapshot=SimpleNamespace(
+            positions=list(positions),
+            open_orders=list(
+                orders
+                if orders is not None
+                else [{"ordId": "close-1", "clOrdId": "TMCLIENT1"}]
+            ),
+            order_history=[],
+            trade_fills=[],
+            errors={},
+        ),
+        reconciled_at=NOW,
     )
 
 
@@ -204,7 +237,7 @@ def test_planned_partial_fully_reflected_confirms_and_advances_once(tmp_path):
     sf = create_session_factory(tmp_path / "research.db")
     batch = _persist_batch(sf)
 
-    _reconcile(sf, _Client(positions=[_position("pos-1", "1")]))
+    _reconcile_management(sf, positions=[_position("pos-1", "1")])
     first = load_management_batch(sf, batch.id)
     _reconcile(sf, _Client(positions=[_position("pos-1", "1")]))
     repeated = load_management_batch(sf, batch.id)
@@ -249,12 +282,71 @@ def test_unknown_without_order_evidence_never_becomes_retryable(tmp_path):
     sf = create_session_factory(tmp_path / "research.db")
     batch = _persist_batch(sf, initial_status="submit_unknown")
 
-    _reconcile(sf, _Client(positions=[_position("pos-1", "2")]))
+    _reconcile(sf, _Client(positions=[_position("pos-1", "2")], orders=[]))
 
     stored = load_management_batch(sf, batch.id)
     assert stored.status == "recovery_required"
     assert stored.reason_code == "management_close_submission_unresolved"
     assert stored.legs[0].status == "submit_unknown"
+
+
+def test_submitted_leg_conflicting_order_and_client_rows_freezes(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf)
+
+    _reconcile(
+        sf,
+        _Client(
+            positions=[_position("pos-1", "1")],
+            orders=[
+                {"ordId": "close-1", "clOrdId": "OTHER"},
+                {"ordId": "other-order", "clOrdId": "TMCLIENT1"},
+            ],
+        ),
+    )
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "recovery_required"
+    assert stored.legs[0].status == "inconsistent"
+    assert stored.legs[0].last_error == {
+        "reason": "management_close_order_identity_conflict"
+    }
+
+
+def test_submitted_position_delta_without_exact_order_evidence_does_not_succeed(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf)
+
+    _reconcile(sf, _Client(positions=[_position("pos-1", "1")], orders=[]))
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "reconciling"
+    assert stored.legs[0].status == "submitted"
+    assert stored.legs[0].last_error == {
+        "reason": "management_close_order_not_found"
+    }
+
+
+def test_durable_order_and_client_ids_on_disconnected_rows_are_ambiguous(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf)
+
+    _reconcile(
+        sf,
+        _Client(
+            positions=[_position("pos-1", "1")],
+            orders=[{"ordId": "close-1"}, {"clOrdId": "TMCLIENT1"}],
+        ),
+    )
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "recovery_required"
+    assert stored.legs[0].status == "inconsistent"
+    assert stored.legs[0].last_error == {
+        "reason": "management_close_order_identity_ambiguous"
+    }
 
 
 def test_partially_confirmed_multi_position_partial_freezes_strategy(tmp_path):
@@ -324,6 +416,70 @@ def test_full_close_terminalizes_only_after_every_exact_position_disappears(tmp_
     assert lifecycle.exited_at.replace(tzinfo=UTC) == NOW
     assert all(entry.status == "closed" for entry in entries)
     assert all(entry.terminal_reason == "management_full_close_confirmed" for entry in entries)
+
+
+def test_manual_close_during_full_close_reconciliation_preserves_audit(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action="full_close", sizes=("2",), preflight=("2",))
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+        entry = session.get(ExecutionOrderLeg, batch.legs[0].execution_order_leg_id)
+        binding.status = "closed"
+        binding.last_exchange_status = "manual_closed_by_user"
+        lifecycle.lifecycle_status = "exited"
+        lifecycle.exit_reason = "manual"
+        lifecycle.exited_at = NOW
+        entry.status = "manually_closed"
+        entry.terminal_reason = "manual_position_missing"
+        session.commit()
+
+    _reconcile(sf, _Client(positions=[]))
+
+    stored = load_management_batch(sf, batch.id)
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+        entry = session.get(ExecutionOrderLeg, batch.legs[0].execution_order_leg_id)
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "management_reconciliation_identity_mismatch"
+    assert binding.status == "closed"
+    assert binding.last_exchange_status == "manual_closed_by_user"
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "manual"
+    assert entry.status == "manually_closed"
+    assert entry.terminal_reason == "manual_position_missing"
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    ["BTC", "BTCUSDT", "BTC_USDT", "BTC-USDT", "BTC-USDT-SWAP"],
+)
+def test_reconciliation_uses_canonical_deepcoin_instrument(symbol, tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, symbol=symbol)
+
+    _reconcile_management(sf, positions=[_position("pos-1", "1")])
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "succeeded"
+    assert stored.legs[0].status == "confirmed"
+
+
+@pytest.mark.parametrize("invalid_size", ["NaN", "Infinity", "-Infinity", None])
+def test_invalid_current_size_freezes_only_the_leg(invalid_size, tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf)
+    position = _position("pos-1", invalid_size)
+    if invalid_size is None:
+        position.pop("pos")
+
+    _reconcile(sf, _Client(positions=[position]))
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "recovery_required"
+    assert stored.legs[0].status == "inconsistent"
+    assert stored.legs[0].last_error == {"reason": "management_position_size_invalid"}
 
 
 def test_overclose_or_position_growth_is_inconsistent_and_never_succeeds(tmp_path):
