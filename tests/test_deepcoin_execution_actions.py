@@ -17,7 +17,12 @@ from telegram_kol_research.execution_bindings import upsert_execution_order_leg
 from telegram_kol_research.execution_events import list_execution_events
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
-from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg, StrategyLifecycle
+from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    StrategyLifecycle,
+)
 from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
@@ -234,6 +239,35 @@ def _persist_reviewed_equivalent_assignments(session_factory, *, mutate=None):
         session.commit()
 
 
+def _complete_equivalent_live_positions():
+    return [
+        {
+            "posId": pos_id,
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.1",
+            "avgPx": "1580",
+            "slTriggerPx": "1560",
+            "tpTriggerPx": "1600",
+            "mgnMode": "cross",
+            "mrgPosition": "split",
+            "cTime": "1000",
+        }
+        for pos_id in ("pos-1", "pos-2")
+    ]
+
+
+def _reviewed_equivalent_binding(session_factory):
+    binding_id = _binding(
+        session_factory,
+        pos_id="pos-1,pos-2",
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    _persist_reviewed_equivalent_assignments(session_factory)
+    return binding_id
+
+
 def _signal(session_factory, *, action, payload=None, message_id=88, kol_id="alice", symbol="ETH", side="long"):
     return enqueue_trade_signal(
         session_factory,
@@ -403,41 +437,25 @@ def test_exact_bound_close_accepts_explicit_legacy_manual_bind(tmp_path):
 
 def test_reviewed_equivalent_assignments_authorize_close_and_tpsl_management(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
-    binding_id = _binding(
-        session_factory,
-        pos_id="pos-1,pos-2",
-        order_id="entry-1,entry-2",
-        client_order_id="client-1,client-2",
-    )
-    _persist_reviewed_equivalent_assignments(session_factory)
+    binding_id = _reviewed_equivalent_binding(session_factory)
     client = _FakeDeepcoinClient()
-    client.positions = [
-        {
-            "posId": "pos-1",
-            "instId": "ETH-USDT-SWAP",
-            "posSide": "long",
-            "pos": "0.1",
-            "avgPx": "1580",
-            "slTriggerPx": "1560",
-            "tpTriggerPx": "1600",
-            "mgnMode": "cross",
-            "mrgPosition": "split",
-            "cTime": "1000",
-        }
-    ]
+    client.positions = _complete_equivalent_live_positions()
 
     close = close_bound_position_market(
         session_factory,
         pos_id="pos-1",
         deepcoin_client=client,
     )
-    client.positions = [client.positions[0]]
     protection = adjust_position_tpsl(
         session_factory,
         trade_signal=_signal(
             session_factory,
             action="adjust_stop_loss",
-            payload={"binding_id": binding_id, "stop_loss": 1577.04},
+            payload={
+                "binding_id": binding_id,
+                "pos_id": "pos-1",
+                "stop_loss": 1577.04,
+            },
         ),
         deepcoin_client=client,
     )
@@ -535,19 +553,158 @@ def test_repair_produced_equivalent_evidence_authorizes_complete_live_management
         pos_id="pos-1",
         deepcoin_client=client,
     )
-    client.positions = [client.positions[0]]
     protection = adjust_position_tpsl(
         session_factory,
         trade_signal=_signal(
             session_factory,
             action="adjust_stop_loss",
-            payload={"binding_id": binding_id, "stop_loss": 1577.04},
+            payload={
+                "binding_id": binding_id,
+                "pos_id": "pos-1",
+                "stop_loss": 1577.04,
+            },
         ),
         deepcoin_client=client,
     )
 
     assert close["submitted"] is True
     assert protection["submitted"] is True
+
+
+@pytest.mark.parametrize(
+    ("sibling_state", "field", "value"),
+    [
+        ("size_drift", "pos", "0.2"),
+        ("entry_drift", "avgPx", "1581"),
+        ("stop_drift", "slTriggerPx", "1550"),
+        ("take_profit_drift", "tpTriggerPx", "1610"),
+        ("margin_drift", "mgnMode", "isolated"),
+        ("position_mode_drift", "mrgPosition", "merge"),
+        ("symbol_drift", "instId", "BTC-USDT-SWAP"),
+        ("side_drift", "posSide", "short"),
+        ("absent", None, None),
+        ("duplicate", None, None),
+    ],
+)
+def test_exact_bound_close_freezes_when_equivalent_sibling_is_not_current(
+    tmp_path, sibling_state, field, value
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _reviewed_equivalent_binding(session_factory)
+    client = _FakeDeepcoinClient()
+    client.positions = _complete_equivalent_live_positions()
+    if field is not None:
+        client.positions[1][field] = value
+    elif sibling_state == "absent":
+        client.positions.pop()
+    else:
+        client.positions.append(dict(client.positions[1]))
+    calls = 0
+    original_list_positions = client.list_positions
+
+    def list_positions(*, inst_id=None):
+        nonlocal calls
+        calls += 1
+        return original_list_positions(inst_id=inst_id)
+
+    client.list_positions = list_positions
+
+    with pytest.raises(
+        DeepcoinExecutionActionError, match="live_position_economics_changed"
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+        )
+
+    assert calls == 1
+    assert client.order_payloads == []
+    with session_factory() as session:
+        assert session.query(BoundPositionCloseReservation).count() == 0
+
+
+@pytest.mark.parametrize("sibling_state", ["drift", "absent"])
+def test_requested_subset_close_freezes_when_equivalent_sibling_is_not_current(
+    tmp_path, sibling_state
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _reviewed_equivalent_binding(session_factory)
+    client = _FakeDeepcoinClient()
+    client.positions = _complete_equivalent_live_positions()
+    if sibling_state == "drift":
+        client.positions[1]["pos"] = "0.2"
+    else:
+        client.positions.pop()
+    calls = 0
+    original_list_positions = client.list_positions
+
+    def list_positions(*, inst_id=None):
+        nonlocal calls
+        calls += 1
+        return original_list_positions(inst_id=inst_id)
+
+    client.list_positions = list_positions
+
+    with pytest.raises(
+        DeepcoinExecutionActionError, match="live_position_economics_changed"
+    ):
+        execute_deepcoin_management_signal(
+            session_factory,
+            trade_signal=_signal(
+                session_factory,
+                action="close_position",
+                payload={"binding_id": binding_id, "pos_id": "pos-1"},
+            ),
+            deepcoin_client=client,
+        )
+
+    assert calls == 1
+    assert client.order_payloads == []
+
+
+@pytest.mark.parametrize("sibling_state", ["drift", "absent"])
+def test_tpsl_freezes_when_equivalent_sibling_is_not_current(
+    tmp_path, sibling_state
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _reviewed_equivalent_binding(session_factory)
+    client = _FakeDeepcoinClient()
+    client.positions = _complete_equivalent_live_positions()
+    if sibling_state == "drift":
+        client.positions[1]["mrgPosition"] = "merge"
+    else:
+        client.positions.pop()
+    calls = 0
+    original_list_positions = client.list_positions
+
+    def list_positions(*, inst_id=None):
+        nonlocal calls
+        calls += 1
+        return original_list_positions(inst_id=inst_id)
+
+    client.list_positions = list_positions
+
+    with pytest.raises(
+        DeepcoinExecutionActionError, match="live_position_economics_changed"
+    ):
+        adjust_position_tpsl(
+            session_factory,
+            trade_signal=_signal(
+                session_factory,
+                action="adjust_stop_loss",
+                payload={
+                    "binding_id": binding_id,
+                    "pos_id": "pos-1",
+                    "stop_loss": 1577.04,
+                },
+            ),
+            deepcoin_client=client,
+        )
+
+    assert calls == 1
+    assert client.cancel_trigger_payloads == []
+    assert client.protection_payloads == []
 
 
 @pytest.mark.parametrize(
@@ -654,15 +811,7 @@ def test_reviewed_equivalent_assignment_rebuilds_response_economics(tmp_path):
             )
         session.commit()
     client = _FakeDeepcoinClient()
-    client.positions[0].update(
-        {
-            "avgPx": "1580",
-            "slTriggerPx": "1560",
-            "tpTriggerPx": "1600",
-            "mgnMode": "cross",
-            "mrgPosition": "split",
-        }
-    )
+    client.positions = _complete_equivalent_live_positions()
 
     result = close_bound_position_market(
         session_factory,

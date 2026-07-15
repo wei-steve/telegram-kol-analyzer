@@ -475,9 +475,9 @@ def _persisted_component_matches_current_database(
 
 
 def require_equivalent_live_position_economics(
-    leg, *, live_position: Mapping[str, object], session=None
+    leg, *, live_positions: Iterable[Mapping[str, object]], session=None
 ) -> None:
-    """Fail closed when fresh live economics drift from reviewed equivalent evidence."""
+    """Revalidate the complete reviewed component from one fresh live snapshot."""
 
     try:
         evidence = json.loads(getattr(leg, "attribution_evidence_json", None) or "{}")
@@ -497,23 +497,43 @@ def require_equivalent_live_position_economics(
     if populations is None:
         raise PositionAttributionError("position_ownership_evidence_not_authoritative")
     _, population_positions = populations
-    current_pos_id = str(getattr(leg, "pos_id", None) or "")
-    try:
-        index = [item.pos_id for item in population_positions].index(current_pos_id)
-    except ValueError as exc:
-        raise PositionAttributionError("live_position_economics_changed") from exc
+    component_leg_ids = set(evidence["component_leg_ids"])
+    if session is None:
+        raise PositionAttributionError("position_ownership_evidence_not_authoritative")
+    for reviewed_position in population_positions:
+        owner = require_verified_position_ownership(
+            session,
+            venue=str(getattr(leg, "venue", None) or "deepcoin"),
+            pos_id=reviewed_position.pos_id,
+        )
+        if int(owner.id) not in component_leg_ids:
+            raise PositionAttributionError(
+                "position_ownership_evidence_not_authoritative"
+            )
 
     from telegram_kol_research.execution_bindings import build_position_evidence
 
-    current_position = build_position_evidence(dict(live_position))
-    if (
-        current_position is None
-        or current_position.pos_id != current_pos_id
-        or not _reviewed_position_matches_live(
-            population_positions[index], current_position
+    rows_by_position_id: dict[str, list[Mapping[str, object]]] = {
+        item.pos_id: [] for item in population_positions
+    }
+    for live_position in live_positions:
+        pos_id = str(
+            live_position.get("posId")
+            or live_position.get("pos_id")
+            or live_position.get("id")
+            or ""
         )
-    ):
-        raise PositionAttributionError("live_position_economics_changed")
+        if pos_id in rows_by_position_id:
+            rows_by_position_id[pos_id].append(live_position)
+    for reviewed_position in population_positions:
+        matching_rows = rows_by_position_id[reviewed_position.pos_id]
+        if len(matching_rows) != 1:
+            raise PositionAttributionError("live_position_economics_changed")
+        current_position = build_position_evidence(dict(matching_rows[0]))
+        if current_position is None or not _reviewed_position_matches_live(
+            reviewed_position, current_position
+        ):
+            raise PositionAttributionError("live_position_economics_changed")
 
 
 def _reviewed_position_matches_live(
