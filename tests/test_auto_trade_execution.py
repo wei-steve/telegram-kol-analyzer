@@ -415,6 +415,35 @@ def test_management_planning_shadows_or_executes_only_the_durable_batch(
     assert result["status"] == expected_status
     if expected_reason is None:
         assert result["management_action"] == "full_exit"
+        from telegram_kol_research.strategy_management_batches import (
+            load_management_batch,
+        )
+        from telegram_kol_research.strategy_management_worker import (
+            run_strategy_management_worker_tick,
+        )
+
+        shadow_batch = load_management_batch(session_factory, result["batch_id"])
+        assert shadow_batch.status == "blocked"
+        assert shadow_batch.reason_code == "management_shadow_plan_only"
+        assert shadow_batch.completed_at is not None
+
+        save_trading_settings(
+            session_factory,
+            {
+                "auto_trade_enabled": True,
+                "management_execution_mode": "live",
+                "allowed_symbols": ["BTC", "ETH"],
+            },
+        )
+        background_writes = []
+        tick = run_strategy_management_worker_tick(
+            session_factory,
+            deepcoin_client_factory=lambda: fake_client,
+            executor=lambda *_args, **_kwargs: background_writes.append("execute"),
+            processed_at=datetime(2026, 7, 15, 8, 2, tzinfo=UTC),
+        )
+        assert tick.discovered == 0
+        assert background_writes == []
     elif mode == "live":
         assert result["reason"] == expected_reason
         from telegram_kol_research.models import StrategyManagementBatch

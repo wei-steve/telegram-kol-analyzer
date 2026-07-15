@@ -15,9 +15,13 @@ from telegram_kol_research.strategy_management_batches import (
     ManagementBatchRecord,
     claim_worker_batch,
     list_worker_batches,
+    load_management_batch,
+    transition_batch,
 )
 from telegram_kol_research.strategy_management_executor import (
+    ManagementBatchExecutionError,
     execute_management_batch,
+    validate_management_restart_snapshot,
 )
 from telegram_kol_research.strategy_management_reconciliation import (
     reconcile_strategy_management_batches,
@@ -60,6 +64,7 @@ def run_strategy_management_worker_tick(
     snapshot_loader: Callable[..., Any] = load_deepcoin_execution_reconciliation_snapshot,
     reconciler: Callable[..., Any] = reconcile_strategy_management_batches,
     executor: Callable[..., Any] = execute_management_batch,
+    restart_validator: Callable[..., None] = validate_management_restart_snapshot,
 ) -> StrategyManagementWorkerResult:
     """Process a bounded amount of work, isolating every durable batch failure."""
 
@@ -150,6 +155,27 @@ def run_strategy_management_worker_tick(
             if not allow_execution:
                 counts["skipped"] += 1
                 continue
+            try:
+                restart_validator(
+                    session_factory,
+                    batch_id=batch.id,
+                    snapshot=current_snapshot,
+                )
+            except ManagementBatchExecutionError:
+                frozen = transition_batch(
+                    session_factory,
+                    batch.id,
+                    expected_statuses={"executing"},
+                    new_status="recovery_required",
+                    transitioned_at=now,
+                    reason_code="management_restart_snapshot_validation_failed",
+                )
+                if not frozen:
+                    raise RuntimeError(
+                        "management_restart_snapshot_freeze_conflict"
+                    )
+                counts["recovered"] += 1
+                continue
             executor(
                 session_factory,
                 batch_id=batch.id,
@@ -157,6 +183,12 @@ def run_strategy_management_worker_tick(
                 executed_at=now,
             )
             counts["recovered"] += 1
+        except ManagementBatchExecutionError:
+            counts["failed"] += 1
+            _persist_deterministic_pre_submit_failure(
+                session_factory, batch_id=batch.id, failed_at=now
+            )
+            logger.exception("strategy management batch %s failed", batch.id)
         except Exception:
             counts["failed"] += 1
             logger.exception("strategy management batch %s failed", batch.id)
@@ -211,4 +243,37 @@ def _is_composite_protection_phase(batch: ManagementBatchRecord) -> bool:
             str(leg.status or "") in _PROTECTION_PHASE_LEG_STATUSES
             for leg in batch.legs
         )
+    )
+
+
+def _persist_deterministic_pre_submit_failure(
+    session_factory, *, batch_id: int, failed_at: datetime
+) -> bool:
+    """Make deterministic pre-submit failures durable without guessing unknowns."""
+
+    try:
+        batch = load_management_batch(session_factory, int(batch_id))
+    except LookupError:
+        return False
+    if batch.status != "executing" or any(
+        leg.status
+        in {
+            "reserved",
+            "submitted",
+            "submit_unknown",
+            "partial",
+            "succeeded",
+            "restored",
+            "recovery_required",
+        }
+        for leg in batch.legs
+    ):
+        return False
+    return transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"executing"},
+        new_status="blocked",
+        transitioned_at=failed_at,
+        reason_code="management_pre_submit_validation_failed",
     )

@@ -110,6 +110,7 @@ def plan_strategy_management_batch(
     contract_spec_provider,
     planned_at: datetime | None = None,
     candidate_id: int | None = None,
+    shadow_only: bool = False,
 ) -> ManagementPlanningResult:
     """Reconcile, reload, validate, and persist one immutable exact target."""
 
@@ -138,6 +139,7 @@ def plan_strategy_management_batch(
             reconciliation_snapshot=reconciliation_snapshot,
             contract_spec_provider=contract_spec_provider,
             planned_at=now,
+            shadow_only=shadow_only,
         )
 
 
@@ -149,6 +151,7 @@ def _plan_strategy_management_batch_locked(
     reconciliation_snapshot,
     contract_spec_provider,
     planned_at: datetime,
+    shadow_only: bool = False,
 ) -> ManagementPlanningResult:
     now = planned_at
 
@@ -465,6 +468,8 @@ def _plan_strategy_management_batch_locked(
                 target_snapshot=target_snapshot,
                 planned_at=now,
                 legs=batch_legs,
+                status="blocked" if shadow_only else "ready",
+                reason_code=("management_shadow_plan_only" if shadow_only else None),
                 validate_current_state=lambda current_session: (
                     _require_frozen_identity_and_policy_current(
                         current_session,

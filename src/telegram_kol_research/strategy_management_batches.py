@@ -23,9 +23,6 @@ from telegram_kol_research.models import StrategyManagementLeg
 RECOVERABLE_BATCH_STATUSES = frozenset(
     {"executing", "reserved", "submitted", "submit_unknown", "reconciling"}
 )
-WORKER_BATCH_STATUSES = frozenset(
-    {"ready", "protection_ready", *RECOVERABLE_BATCH_STATUSES}
-)
 UNSET = object()
 
 
@@ -208,6 +205,9 @@ def create_management_batch_in_session(
         target_snapshot_json=_encode_json(target_snapshot) or "{}",
         planned_at=planned_at,
         notification_state=notification_state,
+        completed_at=(
+            planned_at if status in {"succeeded", "blocked", "resolved"} else None
+        ),
         created_at=planned_at,
         updated_at=planned_at,
     )
@@ -426,16 +426,30 @@ def list_worker_batches(
     if limit <= 0:
         return []
     with session_factory() as session:
-        batches = (
-            session.query(StrategyManagementBatch)
-            .filter(StrategyManagementBatch.status.in_(WORKER_BATCH_STATUSES))
-            .order_by(
-                StrategyManagementBatch.planned_at.asc(),
-                StrategyManagementBatch.id.asc(),
+        def load_lane(statuses):
+            return (
+                session.query(StrategyManagementBatch)
+                .filter(StrategyManagementBatch.status.in_(statuses))
+                .order_by(
+                    StrategyManagementBatch.planned_at.asc(),
+                    StrategyManagementBatch.id.asc(),
+                )
+                .limit(limit)
+                .all()
             )
-            .limit(limit)
-            .all()
-        )
+
+        executable = load_lane({"ready", "protection_ready"})
+        recovery = load_lane(RECOVERABLE_BATCH_STATUSES)
+        batches = []
+        # Independent lanes prevent an old reconciliation backlog from hiding
+        # fresh exact-strategy work behind one global SQL LIMIT.
+        while len(batches) < limit and (executable or recovery):
+            if executable:
+                batches.append(executable.pop(0))
+                if len(batches) >= limit:
+                    break
+            if recovery:
+                batches.append(recovery.pop(0))
         return [_batch_to_record(session, batch) for batch in batches]
 
 

@@ -8,6 +8,10 @@ import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import StrategyManagementBatch
+from telegram_kol_research.strategy_management_executor import (
+    ManagementBatchExecutionError,
+)
+from telegram_kol_research.strategy_management_batches import load_management_batch
 from telegram_kol_research.strategy_management_worker import (
     run_strategy_management_worker_tick,
 )
@@ -259,3 +263,105 @@ def test_composite_protection_leg_state_survives_missing_reason_after_restart():
     )
 
     assert events == ["read", "protection-executor"]
+
+
+def test_ready_claim_with_deterministic_pre_submit_failure_is_persistently_blocked(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "blocked.db")
+    row = StrategyManagementBatch(
+        idempotency_fingerprint="z" * 64,
+        raw_message_id=1,
+        recognition_decision_id=1,
+        recognition_generation="g1",
+        target_lifecycle_id=1,
+        strategy_instance_id="deepcoin:100:10:BTC:short",
+        execution_binding_id=1,
+        intent="full_take_profit",
+        effective_action="full_exit",
+        partial_round_before=0,
+        status="ready",
+        target_fingerprint="y" * 64,
+        target_snapshot_json="{}",
+        planned_at=NOW,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    with session_factory() as session:
+        session.add(row)
+        session.commit()
+        batch_id = row.id
+
+    result = run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        executor=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ManagementBatchExecutionError("batch_binding_not_active_or_exact")
+        ),
+        processed_at=NOW,
+    )
+
+    stored = load_management_batch(session_factory, batch_id)
+    assert result.failed == 1
+    assert stored.status == "blocked"
+    assert stored.reason_code == "management_pre_submit_validation_failed"
+
+
+def test_old_reconciling_backlog_does_not_starve_later_ready_strategy(tmp_path):
+    session_factory = create_session_factory(tmp_path / "fair.db")
+    with session_factory() as session:
+        for index in range(5):
+            session.add(
+                StrategyManagementBatch(
+                    idempotency_fingerprint=f"recovery-{index}",
+                    raw_message_id=index + 1,
+                    recognition_decision_id=index + 1,
+                    recognition_generation="g1",
+                    target_lifecycle_id=index + 1,
+                    strategy_instance_id=f"deepcoin:{index}:10:BTC:short",
+                    execution_binding_id=index + 1,
+                    intent="full_take_profit",
+                    effective_action="full_exit",
+                    partial_round_before=0,
+                    status="reconciling",
+                    target_fingerprint=f"target-{index}",
+                    target_snapshot_json="{}",
+                    planned_at=NOW,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        ready = StrategyManagementBatch(
+            idempotency_fingerprint="later-ready",
+            raw_message_id=99,
+            recognition_decision_id=99,
+            recognition_generation="g1",
+            target_lifecycle_id=99,
+            strategy_instance_id="deepcoin:999:10:BTC:short",
+            execution_binding_id=99,
+            intent="full_take_profit",
+            effective_action="full_exit",
+            partial_round_before=0,
+            status="ready",
+            target_fingerprint="later-target",
+            target_snapshot_json="{}",
+            planned_at=NOW,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(ready)
+        session.commit()
+        ready_id = ready.id
+    executed = []
+
+    run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        snapshot_loader=lambda *_args, **_kwargs: object(),
+        reconciler=lambda *_args, **_kwargs: None,
+        executor=lambda *_args, **kwargs: executed.append(kwargs["batch_id"]),
+        max_batches=2,
+        processed_at=NOW,
+    )
+
+    assert ready_id in executed

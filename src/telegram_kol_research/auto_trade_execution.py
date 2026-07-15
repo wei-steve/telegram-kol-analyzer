@@ -404,6 +404,7 @@ def _auto_process_management_signal(
         contract_spec_provider=contract_spec_provider,
         planned_at=processed_at,
         candidate_id=candidate_id,
+        shadow_only=settings.management_execution_mode == "shadow",
     )
     if result.status != "ready" or result.batch is None:
         return {

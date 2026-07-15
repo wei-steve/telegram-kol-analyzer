@@ -45,6 +45,9 @@ _CLOSE_ACTIONS = frozenset(
     {"partial_close", "full_close", "full_exit", "partial_then_break_even"}
 )
 _PROTECTION_ACTIONS = frozenset({"adjust_stop_loss", "move_stop_to_break_even"})
+_PROTECTION_PHASE_LEG_STATES = frozenset(
+    {"succeeded", "restored", "recovery_required"}
+)
 
 
 class ManagementBatchExecutionError(RuntimeError):
@@ -76,6 +79,9 @@ def execute_management_batch(
         and (
             batch.status == "protection_ready"
             or batch.reason_code == "protection_phase_executing"
+            or any(
+                leg.status in _PROTECTION_PHASE_LEG_STATES for leg in batch.legs
+            )
         )
     ):
         return _execute_protection_batch(
@@ -294,6 +300,55 @@ def _execute_protection_batch(
         batch = load_management_batch(session_factory, batch.id)
     if batch.status != "executing":
         raise ManagementBatchExecutionError(f"batch_not_executable:{batch.status}")
+    durable_statuses = {leg.status for leg in batch.legs}
+    if "recovery_required" in durable_statuses:
+        if not transition_batch(
+            session_factory,
+            batch.id,
+            expected_statuses={"executing"},
+            new_status="recovery_required",
+            transitioned_at=executed_at,
+            reason_code="protection_recovery_required",
+        ):
+            raise ManagementBatchExecutionError(
+                "management_protection_recovery_finalization_conflict"
+            )
+        return _result(
+            load_management_batch(session_factory, batch.id),
+            reason="protection_recovery_required",
+        )
+    if "restored" in durable_statuses:
+        if not transition_batch(
+            session_factory,
+            batch.id,
+            expected_statuses={"executing"},
+            new_status="partial_failed",
+            transitioned_at=executed_at,
+            reason_code="protection_replacement_failed_and_restored",
+        ):
+            raise ManagementBatchExecutionError(
+                "management_protection_restore_finalization_conflict"
+            )
+        return _result(
+            load_management_batch(session_factory, batch.id),
+            reason="protection_replacement_failed_and_restored",
+        )
+    if durable_statuses == {"succeeded"}:
+        if not transition_batch(
+            session_factory,
+            batch.id,
+            expected_statuses={"executing"},
+            new_status="succeeded",
+            transitioned_at=executed_at,
+            reason_code="all_position_protection_replaced",
+        ):
+            raise ManagementBatchExecutionError(
+                "management_protection_success_finalization_conflict"
+            )
+        return _result(
+            load_management_batch(session_factory, batch.id),
+            reason="all_position_protection_replaced",
+        )
     if any(leg.status == "reserved" for leg in batch.legs):
         for leg in batch.legs:
             if leg.status == "reserved":
@@ -378,6 +433,8 @@ def _execute_protection_batch(
 
     failed_status: str | None = None
     for leg, old_rows, new_rows, common in prepared_legs:
+        if leg.status == "succeeded":
+            continue
         expected_leg_statuses = (
             {"confirmed"}
             if batch.effective_action == "partial_then_break_even"
@@ -537,45 +594,13 @@ def _preflight_exact_protection_positions(
     live_positions: list[dict[str, Any]],
     inst_id: str,
 ) -> dict[str, dict[str, Any]]:
-    expected_pos_ids = {leg.pos_id for leg in batch.legs}
-    bound_pos_ids = {
-        value.strip()
-        for value in str(binding.pos_id or "").split(",")
-        if value.strip()
-    }
-    if bound_pos_ids != expected_pos_ids:
-        raise ManagementBatchExecutionError(
-            "protection_preflight_binding_position_set_drift"
-        )
-    relevant_live_ids = {
-        str(pos_id)
-        for row in live_positions
-        if _first_text(row, "instId", "inst_id") == inst_id
-        and (_first_text(row, "posSide", "pos_side", "side") or "").lower()
-        == binding.side.lower()
-        and (pos_id := _first_text(row, "posId", "pos_id", "id")) is not None
-    }
-    if relevant_live_ids != expected_pos_ids:
-        raise ManagementBatchExecutionError(
-            "protection_preflight_live_position_set_drift"
-        )
-    positions_by_id: dict[str, dict[str, Any]] = {}
-    for row in live_positions:
-        pos_id = _first_text(row, "posId", "pos_id", "id")
-        if pos_id not in expected_pos_ids:
-            continue
-        if (
-            _first_text(row, "instId", "inst_id") != inst_id
-            or (_first_text(row, "posSide", "pos_side", "side") or "").lower()
-            != binding.side.lower()
-            or pos_id in positions_by_id
-        ):
-            raise ManagementBatchExecutionError(
-                "protection_preflight_position_ambiguous"
-            )
-        positions_by_id[str(pos_id)] = row
-    if set(positions_by_id) != expected_pos_ids:
-        raise ManagementBatchExecutionError("protection_preflight_position_set_drift")
+    positions_by_id = _preflight_exact_position_identity(
+        batch=batch,
+        binding=binding,
+        live_positions=live_positions,
+        inst_id=inst_id,
+        error_prefix="protection_preflight",
+    )
     for leg in batch.legs:
         position = positions_by_id[leg.pos_id]
         expected_size = leg.preflight_size
@@ -599,6 +624,87 @@ def _preflight_exact_protection_positions(
                 "protection_preflight_position_economics_drift"
             )
     return positions_by_id
+
+
+def _preflight_exact_position_identity(
+    *,
+    batch: ManagementBatchRecord,
+    binding: ExecutionBinding,
+    live_positions: list[dict[str, Any]],
+    inst_id: str,
+    error_prefix: str,
+) -> dict[str, dict[str, Any]]:
+    expected_pos_ids = {leg.pos_id for leg in batch.legs}
+    bound_pos_ids = {
+        value.strip()
+        for value in str(binding.pos_id or "").split(",")
+        if value.strip()
+    }
+    if bound_pos_ids != expected_pos_ids:
+        raise ManagementBatchExecutionError(
+            f"{error_prefix}_binding_position_set_drift"
+        )
+    relevant_live_ids = {
+        str(pos_id)
+        for row in live_positions
+        if _first_text(row, "instId", "inst_id") == inst_id
+        and (_first_text(row, "posSide", "pos_side", "side") or "").lower()
+        == binding.side.lower()
+        and (pos_id := _first_text(row, "posId", "pos_id", "id")) is not None
+    }
+    if relevant_live_ids != expected_pos_ids:
+        raise ManagementBatchExecutionError(
+            f"{error_prefix}_live_position_set_drift"
+        )
+    positions_by_id: dict[str, dict[str, Any]] = {}
+    for row in live_positions:
+        pos_id = _first_text(row, "posId", "pos_id", "id")
+        if pos_id not in expected_pos_ids:
+            continue
+        if (
+            _first_text(row, "instId", "inst_id") != inst_id
+            or (_first_text(row, "posSide", "pos_side", "side") or "").lower()
+            != binding.side.lower()
+            or pos_id in positions_by_id
+        ):
+            raise ManagementBatchExecutionError(
+                f"{error_prefix}_position_ambiguous"
+            )
+        positions_by_id[str(pos_id)] = row
+    if set(positions_by_id) != expected_pos_ids:
+        raise ManagementBatchExecutionError(f"{error_prefix}_position_set_drift")
+    return positions_by_id
+
+
+def validate_management_restart_snapshot(
+    session_factory: sessionmaker,
+    *,
+    batch_id: int,
+    snapshot: Any,
+) -> None:
+    """Require exact frozen exchange identity before resuming an all-planned batch."""
+
+    if getattr(snapshot, "errors", {}):
+        raise ManagementBatchExecutionError("restart_snapshot_exchange_read_failed")
+    batch = load_management_batch(session_factory, int(batch_id))
+    binding = _load_exact_binding(session_factory, batch)
+    _require_exact_entry_legs(session_factory, batch)
+    inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
+    positions = _preflight_exact_position_identity(
+        batch=batch,
+        binding=binding,
+        live_positions=list(getattr(snapshot, "positions", [])),
+        inst_id=inst_id,
+        error_prefix="restart_snapshot",
+    )
+    for leg in batch.legs:
+        if not _decimal_equal(
+            _first_text(positions[leg.pos_id], "pos", "size", "sz"),
+            leg.preflight_size,
+        ):
+            raise ManagementBatchExecutionError(
+                "restart_snapshot_position_size_drift"
+            )
 
 
 def _preflight_exact_protection_rows(

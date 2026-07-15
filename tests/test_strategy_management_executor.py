@@ -790,6 +790,185 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
     ]
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["errors", "missing", "size_drift", "extra", "wrong_instrument", "wrong_side"],
+)
+def test_all_planned_restart_snapshot_must_match_exact_frozen_positions(
+    tmp_path, mutation
+):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        validate_management_restart_snapshot,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory, sizes=("1", "2"))
+    positions = [
+        {
+            "posId": "pos-1",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "pos": "2",
+        },
+        {
+            "posId": "pos-2",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "pos": "4",
+        },
+    ]
+    errors = {}
+    if mutation == "errors":
+        errors["order_history:BTC-USDT-SWAP"] = "timeout"
+    elif mutation == "missing":
+        positions.pop()
+    elif mutation == "size_drift":
+        positions[0]["pos"] = "1"
+    elif mutation == "extra":
+        positions.append(
+            {
+                "posId": "pos-extra",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "1",
+            }
+        )
+    elif mutation == "wrong_instrument":
+        positions[0]["instId"] = "ETH-USDT-SWAP"
+    elif mutation == "wrong_side":
+        positions[0]["posSide"] = "long"
+
+    with pytest.raises(ManagementBatchExecutionError, match="restart_snapshot"):
+        validate_management_restart_snapshot(
+            session_factory,
+            batch_id=batch.id,
+            snapshot=SimpleNamespace(positions=positions, errors=errors),
+        )
+
+
+def test_all_planned_restart_size_drift_freezes_batch_with_zero_exchange_write(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_worker import (
+        run_strategy_management_worker_tick,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory, sizes=("1", "2"))
+    assert transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    snapshot = SimpleNamespace(
+        positions=[
+            {
+                "posId": "pos-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "1",
+            },
+            {
+                "posId": "pos-2",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "4",
+            },
+        ],
+        errors={},
+    )
+    client = _FakeClient(session_factory)
+
+    result = run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: client,
+        snapshot_loader=lambda *_args, **_kwargs: snapshot,
+        processed_at=NOW,
+    )
+
+    stored = load_management_batch(session_factory, batch.id)
+    assert result.recovered == 1
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "management_restart_snapshot_validation_failed"
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("mutation", ["binding_closed", "entry_wrong_strategy"])
+def test_ready_claim_identity_drift_is_terminal_blocked_with_zero_exchange_write(
+    tmp_path, mutation
+):
+    from telegram_kol_research.strategy_management_worker import (
+        run_strategy_management_worker_tick,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory, sizes=("1", "2"))
+    with session_factory() as session:
+        if mutation == "binding_closed":
+            binding = session.get(ExecutionBinding, batch.execution_binding_id)
+            binding.status = "closed"
+        else:
+            entry = (
+                session.query(ExecutionOrderLeg)
+                .filter_by(execution_binding_id=batch.execution_binding_id, purpose="entry")
+                .order_by(ExecutionOrderLeg.id)
+                .first()
+            )
+            entry.strategy_instance_id = "deepcoin:other:10:BTC:short"
+        session.commit()
+    client = _FakeClient(session_factory)
+
+    result = run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: client,
+        processed_at=NOW,
+    )
+
+    stored = load_management_batch(session_factory, batch.id)
+    assert result.failed == 1
+    assert stored.status == "blocked"
+    assert stored.reason_code == "management_pre_submit_validation_failed"
+    assert client.calls == []
+
+
+def test_executor_uses_durable_protection_leg_evidence_when_reason_is_missing(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory,
+        action="partial_then_break_even",
+        stop_loss=None,
+        keep_close_plan=True,
+    )
+    with session_factory() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        stored.status = "executing"
+        stored.reason_code = None
+        legs = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch.id
+        )
+        for leg in legs:
+            leg.status = "succeeded"
+        session.commit()
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "succeeded"
+    assert client.close_calls == []
+    assert client.cancel_calls == []
+    assert client.set_calls == []
+
+
 @pytest.mark.parametrize("drift", ["price", "missing", "ambiguous"])
 def test_protection_preflight_drift_or_ambiguity_has_zero_cancels(drift, tmp_path):
     from telegram_kol_research.strategy_management_executor import (
