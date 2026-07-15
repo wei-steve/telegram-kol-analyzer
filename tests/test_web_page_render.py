@@ -93,6 +93,20 @@ def test_index_page_renders_explicit_operational_states(tmp_path):
     assert "data-last-success-at" in response.text
 
 
+def test_management_execution_mode_form_labels_shadow_and_live_risk(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'name="management_execution_mode"' in response.text
+    assert 'value="disabled"' in response.text
+    assert 'value="shadow"' in response.text
+    assert '影子：只生成计划，不写入交易所' in response.text
+    assert 'value="live"' in response.text
+    assert '实盘：高风险，可写入交易所' in response.text
+
+
 def test_index_page_is_a_lightweight_shell_without_deepcoin_or_message_timeline(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

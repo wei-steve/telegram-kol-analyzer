@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy.orm import sessionmaker
 
@@ -20,6 +20,7 @@ TRADING_SETTINGS_KEY = "global"
 @dataclass(slots=True)
 class TradingSettings:
     auto_trade_enabled: bool = False
+    management_execution_mode: Literal["disabled", "shadow", "live"] = "disabled"
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
     max_concurrent_positions: int = 3
@@ -41,6 +42,18 @@ class TradingSettings:
             default_max_loss_usdt=self.default_max_loss_usdt,
             symbol_max_loss_usdt=self.symbol_max_loss_usdt,
             symbol=symbol,
+        )
+
+    @property
+    def management_planning_enabled(self) -> bool:
+        return self.management_execution_mode == "shadow" or (
+            self.management_execution_mode == "live" and self.auto_trade_enabled
+        )
+
+    @property
+    def live_management_execution_enabled(self) -> bool:
+        return (
+            self.management_execution_mode == "live" and self.auto_trade_enabled
         )
 
 
@@ -127,8 +140,12 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
     style = str(raw.get("entry_range_order_style") or defaults.entry_range_order_style)
     if style not in {"conservative", "eager"}:
         style = defaults.entry_range_order_style
+    management_execution_mode = _management_execution_mode(
+        raw.get("management_execution_mode", defaults.management_execution_mode)
+    )
     return TradingSettings(
         auto_trade_enabled=bool(raw.get("auto_trade_enabled", defaults.auto_trade_enabled)),
+        management_execution_mode=management_execution_mode,
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
             defaults.default_max_loss_usdt,
@@ -167,6 +184,16 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             raw.get("allow_vision_auto_trade", defaults.allow_vision_auto_trade)
         ),
     )
+
+
+def _management_execution_mode(
+    value: Any,
+) -> Literal["disabled", "shadow", "live"]:
+    if value not in {"disabled", "shadow", "live"}:
+        raise ValueError(
+            "management_execution_mode must be disabled, shadow, or live"
+        )
+    return value
 
 
 def _positive_float(value: Any, fallback: float) -> float:

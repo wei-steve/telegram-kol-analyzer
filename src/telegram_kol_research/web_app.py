@@ -3084,11 +3084,14 @@ def create_web_app(
 
     @app.post("/api/trading-settings")
     def update_trading_settings(payload: dict[str, Any]):
-        return save_trading_settings(
-            app.state.session_factory,
-            payload,
-            updated_at=app.state.now_provider(),
-        ).to_dict()
+        try:
+            return save_trading_settings(
+                app.state.session_factory,
+                payload,
+                updated_at=app.state.now_provider(),
+            ).to_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/messages/{raw_message_id}/recognize")
     async def recognize_message(raw_message_id: int):

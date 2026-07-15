@@ -1723,6 +1723,7 @@ function bindTradingSettingsForm() {
     };
     const payload = {
       auto_trade_enabled: Boolean(form.querySelector('[name="auto_trade_enabled"]')?.checked),
+      management_execution_mode: String(formData.get('management_execution_mode') || 'disabled'),
       default_max_loss_usdt: numericValue('default_max_loss_usdt', 20),
       daily_max_loss_usdt: numericValue('daily_max_loss_usdt', 500),
       max_concurrent_positions: numericValue('max_concurrent_positions', 3),

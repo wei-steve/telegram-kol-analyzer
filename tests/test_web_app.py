@@ -444,6 +444,35 @@ def test_trading_settings_api_persists_runtime_risk_defaults(tmp_path):
     assert reloaded.json()["take_profit_allocations"] == [50.0, 30.0, 20.0]
 
 
+def test_management_execution_mode_api_persists_shadow_with_auto_trade_disabled(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "management_execution_mode": "shadow",
+            "auto_trade_enabled": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["management_execution_mode"] == "shadow"
+    assert response.json()["auto_trade_enabled"] is False
+    assert client.get("/api/trading-settings").json()["management_execution_mode"] == "shadow"
+
+
+def test_management_execution_mode_api_rejects_invalid_value(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={"management_execution_mode": "unsafe"},
+    )
+
+    assert response.status_code == 422
+    assert "management_execution_mode" in response.json()["detail"]
+
+
 def test_trading_settings_symbols_api_lists_deepcoin_symbols_with_selection(tmp_path):
     class FakeDeepcoinClient:
         def list_swap_symbols(self):

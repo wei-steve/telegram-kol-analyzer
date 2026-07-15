@@ -323,6 +323,14 @@
             <input type="checkbox" name="auto_trade_enabled" {% if trading_settings.auto_trade_enabled %}checked{% endif %} />
             <span>开启全局自动交易</span>
           </label>
+          <label>
+            策略管理执行模式
+            <select name="management_execution_mode">
+              <option value="disabled" {% if trading_settings.management_execution_mode == 'disabled' %}selected{% endif %}>禁用：不生成管理计划</option>
+              <option value="shadow" {% if trading_settings.management_execution_mode == 'shadow' %}selected{% endif %}>影子：只生成计划，不写入交易所</option>
+              <option value="live" {% if trading_settings.management_execution_mode == 'live' %}selected{% endif %}>实盘：高风险，可写入交易所</option>
+            </select>
+          </label>
           <label>默认单笔最大亏损 USDT<input name="default_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.default_max_loss_usdt }}" /></label>
           <label>每日最大亏损 USDT<input name="daily_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.daily_max_loss_usdt }}" /></label>
           <label>最大同时持仓数<input name="max_concurrent_positions" type="number" min="1" step="1" value="{{ trading_settings.max_concurrent_positions }}" /></label>

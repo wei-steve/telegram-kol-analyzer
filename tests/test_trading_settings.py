@@ -1,3 +1,5 @@
+import pytest
+
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.group_config import TrackedSenderConfig
@@ -6,6 +8,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.trading_settings import TradingSettings
+from telegram_kol_research.trading_settings import trading_settings_from_payload
 
 
 def test_load_trading_settings_returns_safe_defaults(tmp_path):
@@ -20,6 +23,53 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.nearby_entry_market_deviation_pct == 0.15
     assert settings.take_profit_allocations == [40.0, 30.0, 30.0]
     assert settings.allow_vision_auto_trade is True
+
+
+def test_management_execution_mode_defaults_disabled_and_fails_closed(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    settings = load_trading_settings(session_factory)
+
+    assert settings.management_execution_mode == "disabled"
+    assert settings.management_planning_enabled is False
+    assert settings.live_management_execution_enabled is False
+
+
+def test_management_execution_mode_shadow_plans_without_global_auto_trade():
+    settings = trading_settings_from_payload(
+        {
+            "management_execution_mode": "shadow",
+            "auto_trade_enabled": False,
+        }
+    )
+
+    assert settings.management_planning_enabled is True
+    assert settings.live_management_execution_enabled is False
+
+
+def test_management_execution_mode_live_requires_global_auto_trade():
+    gated = trading_settings_from_payload(
+        {
+            "management_execution_mode": "live",
+            "auto_trade_enabled": False,
+        }
+    )
+    enabled = trading_settings_from_payload(
+        {
+            "management_execution_mode": "live",
+            "auto_trade_enabled": True,
+        }
+    )
+
+    assert gated.management_planning_enabled is False
+    assert gated.live_management_execution_enabled is False
+    assert enabled.management_planning_enabled is True
+    assert enabled.live_management_execution_enabled is True
+
+
+def test_management_execution_mode_rejects_invalid_value():
+    with pytest.raises(ValueError, match="management_execution_mode"):
+        trading_settings_from_payload({"management_execution_mode": "unsafe"})
 
 
 def test_save_trading_settings_normalizes_user_input(tmp_path):
