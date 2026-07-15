@@ -12,6 +12,7 @@ from telegram_kol_research.deepcoin_execution_actions import adjust_position_tps
 from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
 from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
 from telegram_kol_research.deepcoin_execution_actions import partial_close_and_move_stop_to_entry
+from telegram_kol_research.deepcoin_execution_actions import _management_action_matches_batch
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
 from telegram_kol_research.execution_bindings import list_execution_order_legs
@@ -113,6 +114,41 @@ class _FakeDeepcoinClient:
     def trigger_order(self, order_payload):
         self.trigger_payloads.append(order_payload)
         return {"code": "0", "data": {"ordId": "trigger-new"}}
+
+
+@pytest.mark.parametrize(
+    ("signal_action", "intent", "effective_action", "expected"),
+    [
+        ("close_position", "full_exit", "full_exit", True),
+        ("close_position", "partial_take_profit", "partial_close", False),
+        ("adjust_stop_loss", "adjust_stop_loss", "adjust_stop_loss", True),
+        ("adjust_position_tpsl", "move_stop_to_break_even", "move_stop_to_break_even", True),
+        ("adjust_stop_loss", "full_exit", "full_exit", False),
+        (
+            "partial_close_and_move_stop_to_entry",
+            "partial_then_break_even",
+            "partial_then_break_even",
+            True,
+        ),
+        (
+            "partial_close_and_move_stop_to_entry",
+            "partial_take_profit",
+            "partial_close",
+            False,
+        ),
+    ],
+)
+def test_management_compatibility_action_mapping_is_bidirectional(
+    signal_action, intent, effective_action, expected
+):
+    assert (
+        _management_action_matches_batch(
+            signal_action=signal_action,
+            batch_intent=intent,
+            effective_action=effective_action,
+        )
+        is expected
+    )
 
 
 def _binding(session_factory, **overrides):
@@ -445,13 +481,26 @@ def test_management_compatibility_signal_delegates_only_exact_source_batch(
             archived_target_group=True,
         )
         session.add(raw)
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=55,
+            symbol="ETH",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 15, 7, 0, tzinfo=UTC),
+            execution_binding_id=binding_id,
+        )
+        session.add(lifecycle)
         session.commit()
         raw_id = raw.id
+        lifecycle_id = lifecycle.id
     batch = SimpleNamespace(
         id=77,
         raw_message_id=raw_id,
+        target_lifecycle_id=lifecycle_id,
         execution_binding_id=binding_id,
         strategy_instance_id="deepcoin:100:55:ETH:long",
+        intent="full_exit",
         effective_action="full_exit",
     )
     signal = _signal(
@@ -488,6 +537,55 @@ def test_management_compatibility_signal_delegates_only_exact_source_batch(
     assert result == {"status": "delegated", "batch_id": 77}
     assert delegated == [77]
     assert client.order_payloads == []
+
+    wrong_action_signal = _signal(
+        session_factory,
+        action="adjust_stop_loss",
+        source_type="kol_management",
+        payload={"binding_id": binding_id, "management_batch_id": 77},
+    )
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="management_signal_batch_identity_mismatch",
+    ):
+        execute_deepcoin_management_signal(
+            session_factory,
+            trade_signal=wrong_action_signal,
+            deepcoin_client=client,
+        )
+    assert delegated == [77]
+
+    batch.target_lifecycle_id = lifecycle_id + 999
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="management_signal_batch_identity_mismatch",
+    ):
+        execute_deepcoin_management_signal(
+            session_factory,
+            trade_signal=signal,
+            deepcoin_client=client,
+        )
+    batch.target_lifecycle_id = lifecycle_id
+    assert delegated == [77]
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.chat_id = 300
+        session.commit()
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="management_signal_batch_identity_mismatch",
+    ):
+        execute_deepcoin_management_signal(
+            session_factory,
+            trade_signal=signal,
+            deepcoin_client=client,
+        )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.chat_id = 100
+        session.commit()
+    assert delegated == [77]
 
     cross_chat_signal = enqueue_trade_signal(
         session_factory,

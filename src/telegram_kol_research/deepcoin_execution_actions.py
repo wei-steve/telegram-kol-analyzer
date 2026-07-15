@@ -43,19 +43,16 @@ from telegram_kol_research.protection_attribution import (
     match_position_protection,
     snapshot_protection_rows,
 )
+from telegram_kol_research.trade_signals import MANUAL_MANAGEMENT_SOURCE_TYPES
 from telegram_kol_research.trade_signals import MANAGEMENT_TRADE_SIGNAL_ACTIONS
 from telegram_kol_research.trade_signals import TradeSignalRecord
+from telegram_kol_research.trade_signals import canonical_management_batch_id
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.strategy_management_batches import load_management_batch
 
 
 class DeepcoinExecutionActionError(RuntimeError):
     """Raised when a management signal cannot be executed unambiguously."""
-
-
-_MANUAL_MANAGEMENT_SOURCE_TYPES = frozenset(
-    {"manual", "manual_operator", "operator_manual"}
-)
 
 
 @dataclass(slots=True)
@@ -89,7 +86,7 @@ def execute_deepcoin_management_signal(
     action = trade_signal.action.lower()
     if (
         action in MANAGEMENT_TRADE_SIGNAL_ACTIONS
-        and trade_signal.source_type not in _MANUAL_MANAGEMENT_SOURCE_TYPES
+        and trade_signal.source_type not in MANUAL_MANAGEMENT_SOURCE_TYPES
     ):
         return close_position_market(
             session_factory,
@@ -168,7 +165,7 @@ def adjust_position_tpsl(
 
     if (
         trade_signal.action.lower() in {"adjust_position_tpsl", "adjust_stop_loss"}
-        and trade_signal.source_type not in _MANUAL_MANAGEMENT_SOURCE_TYPES
+        and trade_signal.source_type not in MANUAL_MANAGEMENT_SOURCE_TYPES
     ):
         raise DeepcoinExecutionActionError(
             "automated_position_tpsl_requires_management_batch"
@@ -383,22 +380,8 @@ def close_position_market(
     """Delegate legacy close requests through a durable management batch."""
 
     payload = trade_signal.payload if isinstance(trade_signal.payload, dict) else {}
-    batch_id = payload.get("management_batch_id")
-    if isinstance(batch_id, bool):
-        raise DeepcoinExecutionActionError("legacy_management_signal_requires_batch")
-    if isinstance(batch_id, int):
-        normalized_batch_id = batch_id
-    elif (
-        isinstance(batch_id, str)
-        and batch_id.isdigit()
-        and not batch_id.startswith("0")
-    ):
-        normalized_batch_id = int(batch_id)
-    else:
-        raise DeepcoinExecutionActionError(
-            "legacy_management_signal_requires_batch"
-        )
-    if normalized_batch_id <= 0:
+    normalized_batch_id = canonical_management_batch_id(payload)
+    if normalized_batch_id is None:
         raise DeepcoinExecutionActionError("legacy_management_signal_requires_batch")
     settings = load_trading_settings(session_factory)
     if not settings.live_management_execution_enabled:
@@ -409,32 +392,39 @@ def close_position_market(
         raise DeepcoinExecutionActionError("management_signal_batch_not_found") from exc
     with session_factory() as session:
         source = session.get(RawMessage, batch.raw_message_id)
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
         binding = session.get(ExecutionBinding, batch.execution_binding_id)
-        try:
-            requested_binding_id = int(payload.get("binding_id"))
-        except (TypeError, ValueError) as exc:
-            raise DeepcoinExecutionActionError(
-                "management_signal_batch_identity_mismatch"
-            ) from exc
+        requested_binding_id = _canonical_positive_int(payload.get("binding_id"))
         identity_matches = (
             source is not None
+            and lifecycle is not None
             and binding is not None
+            and requested_binding_id is not None
             and trade_signal.source_type == "kol_management"
             and trade_signal.venue.lower() == "deepcoin"
             and trade_signal.chat_id == source.chat_id
             and trade_signal.message_id == source.message_id
             and trade_signal.strategy_instance_id == batch.strategy_instance_id
             and requested_binding_id == batch.execution_binding_id
+            and lifecycle.execution_binding_id == batch.execution_binding_id
+            and lifecycle.chat_id == source.chat_id
+            and lifecycle.chat_id == binding.chat_id
+            and lifecycle.message_id == binding.message_id
+            and lifecycle.symbol.upper() == binding.symbol.upper()
+            and lifecycle.symbol.upper() == trade_signal.symbol.upper()
+            and lifecycle.side.lower() == binding.side.lower()
+            and lifecycle.side.lower() == trade_signal.side.lower()
+            and binding.chat_id == source.chat_id
             and binding.strategy_instance_id == batch.strategy_instance_id
             and trade_signal.kol_id == binding.kol_id
             and trade_signal.symbol.upper() == binding.symbol.upper()
             and trade_signal.side.lower() == binding.side.lower()
+            and _management_action_matches_batch(
+                signal_action=trade_signal.action,
+                batch_intent=batch.intent,
+                effective_action=batch.effective_action,
+            )
         )
-        if batch.effective_action in {"adjust_stop_loss", "move_stop_to_break_even"}:
-            identity_matches = identity_matches and trade_signal.action.lower() in {
-                "adjust_stop_loss",
-                "adjust_position_tpsl",
-            }
     if not identity_matches:
         raise DeepcoinExecutionActionError(
             "management_signal_batch_identity_mismatch"
@@ -449,6 +439,39 @@ def close_position_market(
         deepcoin_client=deepcoin_client,
         executed_at=executed_at,
     )
+
+
+def _canonical_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isdigit() and not value.startswith("0"):
+        normalized = int(value)
+        return normalized if normalized > 0 else None
+    return None
+
+
+def _management_action_matches_batch(
+    *, signal_action: str, batch_intent: str, effective_action: str
+) -> bool:
+    action = signal_action.lower()
+    batch_pair = (batch_intent.lower(), effective_action.lower())
+    if action in {
+        "close_position",
+        "exit_position",
+        "temporary_exit",
+        "temporary_close",
+    }:
+        return batch_pair == ("full_exit", "full_exit")
+    if action in {"adjust_stop_loss", "adjust_position_tpsl"}:
+        return batch_pair in {
+            ("adjust_stop_loss", "adjust_stop_loss"),
+            ("move_stop_to_break_even", "move_stop_to_break_even"),
+        }
+    if action == "partial_close_and_move_stop_to_entry":
+        return batch_pair == ("partial_then_break_even", "partial_then_break_even")
+    return False
 
 
 @serialized_position_authority_mutation

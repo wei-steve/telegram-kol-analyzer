@@ -657,18 +657,43 @@ def test_legacy_management_audit_is_bounded_redacted_and_read_only(tmp_path):
         action="open_position",
         payload={"api_secret": "entry-secret"},
     )
+    for offset, invalid_reference in enumerate([" 1", "01", True, 1.0], start=1):
+        enqueue_trade_signal(
+            session_factory,
+            venue="deepcoin",
+            source_type="kol_management",
+            kol_id="group:100",
+            chat_id=100,
+            message_id=710 + offset,
+            symbol="BTC",
+            side="short",
+            action="close_position",
+            payload={"binding_id": 12, "management_batch_id": invalid_reference},
+        )
+    enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="kol_management",
+        kol_id="group:100",
+        chat_id=100,
+        message_id=720,
+        symbol="BTC",
+        side="short",
+        action="close_position",
+        payload={"binding_id": 12, "batch_id": 1},
+    )
 
     before = [(row.id, row.status, row.payload_json) for row in _all_trade_signals(session_factory)]
     report = audit_pending_legacy_management_signals(session_factory, limit=10)
     after = [(row.id, row.status, row.payload_json) for row in _all_trade_signals(session_factory)]
 
     assert report == {
-        "total": 1,
-        "returned": 1,
+        "total": 6,
+        "returned": 6,
         "truncated": False,
         "scan_truncated": False,
-        "by_action": {"adjust_stop_loss": 1},
-        "by_status": {"pending": 1},
+        "by_action": {"adjust_stop_loss": 1, "close_position": 5},
+        "by_status": {"pending": 6},
         "items": [
             {
                 "id": legacy.id,
@@ -677,7 +702,20 @@ def test_legacy_management_audit_is_bounded_redacted_and_read_only(tmp_path):
                 "source_type": "kol_management",
                 "chat_id": 100,
                 "message_id": 700,
-            }
+            },
+            *[
+                {
+                    "id": legacy_id,
+                    "action": "close_position",
+                    "status": "pending",
+                    "source_type": "kol_management",
+                    "chat_id": 100,
+                    "message_id": message_id,
+                }
+                for legacy_id, message_id in _legacy_signal_ids_and_messages(
+                    session_factory
+                )
+            ],
         ],
     }
     assert "secret" not in json.dumps(report).lower()
@@ -727,9 +765,80 @@ def test_recovery_dispatch_rejects_automatic_legacy_management_before_generic_ac
         assert row.attempts == 1
 
 
+def test_process_next_rejects_legacy_management_before_client_factory(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    signal = enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="kol_management",
+        kol_id="group:100",
+        chat_id=100,
+        message_id=704,
+        symbol="BTC",
+        side="short",
+        action="close_position",
+        payload={"binding_id": 12},
+    )
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    factory_calls = []
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="legacy_management_signal_requires_batch",
+    ):
+        process_next_trade_signal_live(
+            session_factory,
+            deepcoin_client_factory=lambda: factory_calls.append("called")
+            or (_ for _ in ()).throw(AssertionError("factory must not run")),
+        )
+
+    assert factory_calls == []
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        assert row.status == "failed"
+        assert row.attempts == 1
+
+
+def test_process_next_entry_creates_deferred_client(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    client = _FakeDeepcoinClient()
+    factory_calls = []
+
+    result = process_next_trade_signal_live(
+        session_factory,
+        deepcoin_client_factory=lambda: factory_calls.append("called") or client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert factory_calls == ["called"]
+    assert result["submitted"] is True
+
+
 def _all_trade_signals(session_factory):
     with session_factory() as session:
         return session.query(TradeSignal).order_by(TradeSignal.id).all()
+
+
+def _legacy_signal_ids_and_messages(session_factory):
+    with session_factory() as session:
+        rows = (
+            session.query(TradeSignal)
+            .filter(TradeSignal.message_id >= 711)
+            .filter(TradeSignal.message_id <= 720)
+            .order_by(TradeSignal.id)
+            .all()
+        )
+        return [(row.id, row.message_id) for row in rows]
 
 
 def test_process_live_coalesces_equivalent_legacy_trigger_legs_before_submission(tmp_path):

@@ -36,7 +36,14 @@ from telegram_kol_research.trading_settings import save_trading_settings
 NOW = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
 
 
-def _persist_close_batch(session_factory, *, sizes=("1", "2"), symbol="BTC"):
+def _persist_close_batch(
+    session_factory,
+    *,
+    sizes=("1", "2"),
+    symbol="BTC",
+    intent="partial_take_profit",
+    effective_action="partial_close",
+):
     with session_factory() as session:
         raw = RawMessage(chat_id=100, message_id=20, text="exit", posted_at=NOW)
         session.add(raw)
@@ -107,8 +114,8 @@ def _persist_close_batch(session_factory, *, sizes=("1", "2"), symbol="BTC"):
         target_lifecycle_id=ids[2],
         strategy_instance_id="deepcoin:100:10:BTC:short",
         execution_binding_id=ids[3],
-        intent="partial_take_profit",
-        effective_action="partial_close",
+        intent=intent,
+        effective_action=effective_action,
         requested_fraction=0.5,
         effective_fraction=0.5,
         partial_round_before=0,
@@ -119,7 +126,9 @@ def _persist_close_batch(session_factory, *, sizes=("1", "2"), symbol="BTC"):
                 execution_order_leg_id=entry_ids[index],
                 pos_id=pos_id,
                 leg_index=index,
-                preflight_size=str(int(size) * 2),
+                preflight_size=(
+                    size if effective_action == "full_exit" else str(int(size) * 2)
+                ),
                 planned_close_size=size,
             )
             for index, (pos_id, size) in enumerate(zip(("pos-1", "pos-2"), sizes))
@@ -1504,7 +1513,11 @@ def test_matching_legacy_signal_delegates_valid_live_batch(tmp_path):
     )
 
     session_factory = create_session_factory(tmp_path / "research.db")
-    batch = _persist_close_batch(session_factory)
+    batch = _persist_close_batch(
+        session_factory,
+        intent="full_exit",
+        effective_action="full_exit",
+    )
     signal = _legacy_close_signal(session_factory, batch)
     save_trading_settings(
         session_factory,

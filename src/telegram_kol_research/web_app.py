@@ -30,6 +30,7 @@ except (
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
+from telegram_kol_research.auto_trade_execution import disabled_management_message_needs_no_client
 from telegram_kol_research.authoritative_recognition import process_authoritative_message
 from telegram_kol_research.app_logging import (
     configure_application_logging,
@@ -1967,7 +1968,14 @@ def _group_ai_strategy_enabled(group_config: GroupConfig, chat_title: str) -> bo
 
 def _run_auto_trade_executor(app: FastAPI, *, raw_message_id: int) -> dict[str, Any]:
     try:
-        deepcoin_client = app.state.deepcoin_client_factory()
+        deepcoin_client = (
+            None
+            if disabled_management_message_needs_no_client(
+                app.state.session_factory,
+                raw_message_id=raw_message_id,
+            )
+            else app.state.deepcoin_client_factory()
+        )
         return auto_process_message_trade_signal(
             app.state.session_factory,
             raw_message_id=raw_message_id,
@@ -4201,10 +4209,9 @@ def create_web_app(
     @app.post("/api/trade-signals/process-next")
     def trade_signals_process_next():
         try:
-            deepcoin_client = app.state.deepcoin_client_factory()
             result = process_next_trade_signal_live(
                 app.state.session_factory,
-                deepcoin_client=deepcoin_client,
+                deepcoin_client_factory=app.state.deepcoin_client_factory,
                 contract_spec_provider=app.state.deepcoin_contract_spec_provider,
                 processed_at=app.state.now_provider(),
             )

@@ -23,8 +23,10 @@ from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_signal
+from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import create_web_app
+from telegram_kol_research.web_app import _run_auto_trade_executor
 from telegram_kol_research.web_app import _persisted_position_attribution
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
@@ -34,12 +36,98 @@ from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
+from telegram_kol_research.models import TradeSignal
 from telegram_kol_research.models import StrategyManagementBatch, StrategyManagementLeg
 from telegram_kol_research.message_recognition import MessageRecognitionResult
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_bot_commands import (
     _log_system_operator_callback_processed,
 )
+
+
+def test_web_auto_executor_disabled_management_skips_client_factory(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=9001,
+            text="BTC exit",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="short",
+                event_type="close_signal",
+                management_action="full_exit",
+                recognition_generation="web-disabled-generation",
+                parse_source="mimo_authoritative",
+                confidence=0.99,
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "disabled",
+        },
+    )
+    factory_calls = []
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            session_factory=session_factory,
+            group_config=GroupConfig(groups=[]),
+            deepcoin_client_factory=lambda: factory_calls.append("called")
+            or (_ for _ in ()).throw(AssertionError("factory must not run")),
+            deepcoin_contract_spec_provider=None,
+            now_provider=lambda: datetime(2026, 7, 15, 10, 0),
+        )
+    )
+
+    result = _run_auto_trade_executor(app, raw_message_id=raw_id)
+
+    assert result == {"status": "skipped", "reason": "management_execution_disabled"}
+    assert factory_calls == []
+    with session_factory() as session:
+        event = session.query(ExecutionEvent).one()
+        assert event.action == "management_auto_trade_skipped"
+
+
+def test_web_process_next_legacy_management_skips_client_factory(tmp_path):
+    factory_calls = []
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: factory_calls.append("called")
+        or (_ for _ in ()).throw(AssertionError("factory must not run")),
+    )
+    save_trading_settings(app.state.session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_trade_signal(
+        app.state.session_factory,
+        venue="deepcoin",
+        source_type="kol_management",
+        kol_id="group:100",
+        chat_id=100,
+        message_id=9002,
+        symbol="BTC",
+        side="short",
+        action="close_position",
+        payload={"binding_id": 12},
+    )
+
+    response = TestClient(app).post("/api/trade-signals/process-next")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "legacy_management_signal_requires_batch"
+    assert factory_calls == []
+    with app.state.session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        assert row.status == "failed"
+        assert row.attempts == 1
 
 
 def test_management_batch_api_is_bounded_redacted_read_only_and_group_isolated(tmp_path):

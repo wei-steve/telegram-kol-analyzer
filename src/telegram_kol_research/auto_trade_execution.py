@@ -87,6 +87,8 @@ def auto_process_message_trade_signal(
                 ),
             )
             return {"status": "skipped", "reason": reason}
+        if deepcoin_client is None:
+            return {"status": "blocked", "reason": "deepcoin_client_unavailable"}
         return _auto_process_management_signal(
             session_factory,
             raw_message_id=raw_message_id,
@@ -103,6 +105,8 @@ def auto_process_message_trade_signal(
         return {"status": "skipped", "reason": "no_entry_signal_candidate"}
     if not settings.auto_trade_enabled:
         return {"status": "skipped", "reason": "auto_trade_disabled"}
+    if deepcoin_client is None:
+        return {"status": "blocked", "reason": "deepcoin_client_unavailable"}
     raw_message, candidate, source, has_media = loaded
     if candidate.parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
         return _record_entry_auto_trade_skip(
@@ -381,6 +385,23 @@ def _record_entry_auto_trade_skip(
     if extra:
         result.update(extra)
     return result
+
+
+def disabled_management_message_needs_no_client(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+) -> bool:
+    """Return true only for a management candidate gated off before planning."""
+
+    settings = load_trading_settings(session_factory)
+    return (
+        _load_best_management_candidate(
+            session_factory, raw_message_id=raw_message_id
+        )
+        is not None
+        and not settings.management_planning_enabled
+    )
 
 
 def _auto_process_management_signal(

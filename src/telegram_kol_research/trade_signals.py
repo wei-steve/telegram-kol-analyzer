@@ -27,6 +27,9 @@ MANAGEMENT_TRADE_SIGNAL_ACTIONS = frozenset(
         "adjust_take_profit",
     }
 )
+MANUAL_MANAGEMENT_SOURCE_TYPES = frozenset(
+    {"manual", "manual_operator", "operator_manual"}
+)
 
 
 @dataclass(slots=True)
@@ -195,7 +198,11 @@ def audit_pending_legacy_management_signals(
         )
         scan_truncated = len(rows) > scan_limit
         rows = rows[:scan_limit]
-        legacy_rows = [row for row in rows if not _has_exact_management_batch_id(row)]
+        legacy_rows = [
+            row
+            for row in rows
+            if canonical_management_batch_id(_row_payload(row)) is None
+        ]
         selected = legacy_rows[:bounded_limit]
         by_action: dict[str, int] = {}
         by_status: dict[str, int] = {}
@@ -223,20 +230,26 @@ def audit_pending_legacy_management_signals(
         }
 
 
-def _has_exact_management_batch_id(row: TradeSignal) -> bool:
+def _row_payload(row: TradeSignal) -> dict[str, Any]:
     try:
         payload = json.loads(row.payload_json or "{}")
     except (json.JSONDecodeError, TypeError):
-        return False
-    if not isinstance(payload, dict):
-        return False
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def canonical_management_batch_id(payload: dict[str, Any]) -> int | None:
+    """Parse only canonical positive IDs shared by audit and dispatch."""
+
     batch_id = payload.get("management_batch_id")
     if isinstance(batch_id, bool):
-        return False
-    try:
-        return int(batch_id) > 0 and str(batch_id).strip() == str(int(batch_id))
-    except (TypeError, ValueError):
-        return False
+        return None
+    if isinstance(batch_id, int):
+        return batch_id if batch_id > 0 else None
+    if isinstance(batch_id, str) and batch_id.isdigit() and not batch_id.startswith("0"):
+        normalized = int(batch_id)
+        return normalized if normalized > 0 else None
+    return None
 
 
 def mark_trade_signal_submitted(
