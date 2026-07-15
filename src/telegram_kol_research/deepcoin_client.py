@@ -31,6 +31,7 @@ DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH = "/deepcoin/trade/trigger-orders-pending"
 DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH = "/deepcoin/trade/trigger-orders-history"
 DEEPCOIN_SET_POSITION_SLTP_PATH = "/deepcoin/trade/set-position-sltp"
 DEEPCOIN_ACCOUNT_POSITIONS_PATH = "/deepcoin/account/positions"
+DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH = "/deepcoin/account/positions-history"
 DEEPCOIN_MARKET_TICKERS_PATH = "/deepcoin/market/tickers"
 
 
@@ -77,6 +78,14 @@ class DeepcoinTradingClientProtocol(Protocol):
 
     def list_positions(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return account positions, optionally filtered by instrument."""
+
+    def list_position_history(
+        self,
+        *,
+        inst_id: str,
+        pos_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return historical records for one exact split position."""
 
     def list_open_orders(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return pending regular orders, optionally filtered by instrument."""
@@ -173,6 +182,30 @@ class DeepcoinRestClient:
             ),
         )
         return _require_list_data(payload, endpoint=DEEPCOIN_ACCOUNT_POSITIONS_PATH)
+
+    def list_position_history(
+        self,
+        *,
+        inst_id: str,
+        pos_id: str,
+    ) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            _path_with_query(
+                DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH,
+                {
+                    "instType": "SWAP",
+                    "instId": inst_id,
+                    "mrgPosition": "split",
+                    "posId": pos_id,
+                    "limit": 100,
+                },
+            ),
+        )
+        return _require_list_data(
+            payload,
+            endpoint=DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH,
+        )
 
     def list_open_orders(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         payload = self._request(

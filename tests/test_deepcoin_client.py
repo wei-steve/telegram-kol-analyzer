@@ -144,6 +144,61 @@ def test_deepcoin_client_lists_order_and_trigger_history_with_swap_query():
     ]
 
 
+def test_list_position_history_queries_exact_split_position():
+    http_client = _CapturingHttpClient(
+        {
+            "code": "0",
+            "data": [{"posId": "position-1"}],
+        }
+    )
+    credentials = DeepcoinCredentials(
+        api_key="key",
+        api_secret="secret",
+        passphrase="pass",
+    )
+    timestamp = "2026-06-30T00:00:00.000Z"
+    client = DeepcoinRestClient(
+        credentials,
+        http_client=http_client,
+        timestamp_factory=lambda: timestamp,
+    )
+
+    rows = client.list_position_history(
+        inst_id="BTC-USDT-SWAP",
+        pos_id="position-1",
+    )
+
+    request_path = (
+        "/deepcoin/account/positions-history?instType=SWAP"
+        "&instId=BTC-USDT-SWAP&mrgPosition=split&posId=position-1&limit=100"
+    )
+    assert rows == [{"posId": "position-1"}]
+    assert http_client.requests == [
+        {
+            "method": "GET",
+            "request_path": request_path,
+            "content": "",
+            "headers": {
+                **build_deepcoin_auth_headers(
+                    credentials=credentials,
+                    timestamp=timestamp,
+                    method="GET",
+                    request_path=request_path,
+                    body="",
+                ),
+                "Content-Type": "application/json",
+            },
+        }
+    ]
+
+    http_client.payload = {"code": "0", "data": {"posId": "position-1"}}
+    with pytest.raises(DeepcoinClientError, match="invalid list response schema"):
+        client.list_position_history(
+            inst_id="BTC-USDT-SWAP",
+            pos_id="position-1",
+        )
+
+
 def test_deepcoin_list_endpoint_rejects_non_list_data():
     http_client = _CapturingHttpClient({"code": "0", "data": {"unexpected": []}})
     client = DeepcoinRestClient(
