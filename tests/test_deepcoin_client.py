@@ -48,6 +48,19 @@ class _FailingHttpClient:
         raise httpx.ReadTimeout("lost response", request=request)
 
 
+class _HttpStatusClient:
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+    def request(self, method, request_path, content="", headers=None):
+        request = httpx.Request(method, f"https://api.deepcoin.test{request_path}")
+        return httpx.Response(
+            self.status_code,
+            request=request,
+            json={"code": str(self.status_code), "msg": "server error"},
+        )
+
+
 class _FakeMonotonicClock:
     def __init__(self, current: float = 100.0):
         self.current = current
@@ -143,6 +156,19 @@ def test_client_order_timeout_preserves_unknown_write_outcome():
                 "sz": "1",
             }
         )
+
+
+def test_client_order_http_500_preserves_unknown_write_outcome():
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(
+            api_key="key", api_secret="secret", passphrase="pass"
+        ),
+        http_client=_HttpStatusClient(500),
+        timestamp_factory=lambda: "2026-07-15T09:00:00.000Z",
+    )
+
+    with pytest.raises(DeepcoinRequestOutcomeUnknown, match="outcome unknown"):
+        client.place_order({"instId": "BTC-USDT-SWAP", "clOrdId": "TM123"})
 
 
 def test_deepcoin_business_error_checks_nested_scode():

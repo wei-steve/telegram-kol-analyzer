@@ -11,6 +11,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
+from telegram_kol_research.deepcoin_normalization import (
+    normalize_deepcoin_margin_mode as _deepcoin_margin_mode,
+    normalize_deepcoin_position_mode as _deepcoin_position_mode,
+    normalize_deepcoin_swap_instrument as _to_deepcoin_swap_instrument,
+)
 from telegram_kol_research.deepcoin_order_matching import (
     extract_pending_protection_orders,
 )
@@ -20,6 +25,7 @@ from telegram_kol_research.models import (
     BoundPositionCloseReservation,
     ExecutionBinding,
     ExecutionOrderLeg,
+    RawMessage,
     StrategyLifecycle,
 )
 from telegram_kol_research.position_authority_lock import (
@@ -32,6 +38,8 @@ from telegram_kol_research.position_attribution import (
 )
 from telegram_kol_research.protection_attribution import match_position_protection
 from telegram_kol_research.trade_signals import TradeSignalRecord
+from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.strategy_management_batches import load_management_batch
 
 
 class DeepcoinExecutionActionError(RuntimeError):
@@ -325,6 +333,40 @@ def close_position_market(
         raise DeepcoinExecutionActionError(
             "legacy_management_signal_requires_batch"
         ) from exc
+    settings = load_trading_settings(session_factory)
+    if not settings.live_management_execution_enabled:
+        raise DeepcoinExecutionActionError("management_live_execution_disabled")
+    try:
+        batch = load_management_batch(session_factory, normalized_batch_id)
+    except LookupError as exc:
+        raise DeepcoinExecutionActionError("management_signal_batch_not_found") from exc
+    with session_factory() as session:
+        source = session.get(RawMessage, batch.raw_message_id)
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        try:
+            requested_binding_id = int(payload.get("binding_id"))
+        except (TypeError, ValueError) as exc:
+            raise DeepcoinExecutionActionError(
+                "management_signal_batch_identity_mismatch"
+            ) from exc
+        identity_matches = (
+            source is not None
+            and binding is not None
+            and trade_signal.source_type == "kol_management"
+            and trade_signal.venue.lower() == "deepcoin"
+            and trade_signal.chat_id == source.chat_id
+            and trade_signal.message_id == source.message_id
+            and trade_signal.strategy_instance_id == batch.strategy_instance_id
+            and requested_binding_id == batch.execution_binding_id
+            and binding.strategy_instance_id == batch.strategy_instance_id
+            and trade_signal.kol_id == binding.kol_id
+            and trade_signal.symbol.upper() == binding.symbol.upper()
+            and trade_signal.side.lower() == binding.side.lower()
+        )
+    if not identity_matches:
+        raise DeepcoinExecutionActionError(
+            "management_signal_batch_identity_mismatch"
+        )
     from telegram_kol_research.strategy_management_executor import (
         execute_management_batch,
     )
@@ -1180,25 +1222,6 @@ def _normalize_side(value: str) -> str:
     if side == "sell":
         return "short"
     return side
-
-
-def _to_deepcoin_swap_instrument(symbol: str) -> str:
-    normalized = symbol.upper().replace("_", "-")
-    if normalized.endswith("-SWAP"):
-        return normalized
-    if normalized.endswith("-USDT"):
-        return f"{normalized}-SWAP"
-    if normalized.endswith("USDT"):
-        return f"{normalized[:-4]}-USDT-SWAP"
-    return f"{normalized}-USDT-SWAP"
-
-
-def _deepcoin_margin_mode(value: str) -> str:
-    return "cross" if value.lower() in {"cross", "crossed", "full"} else "isolated"
-
-
-def _deepcoin_position_mode(value: str) -> str:
-    return "split" if value.lower() in {"split", "hedge", "long_short"} else "merge"
 
 
 def _extract_order_id(response: dict[str, Any]) -> str | None:

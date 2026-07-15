@@ -9,8 +9,13 @@ from typing import Any
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_client import (
-    DeepcoinRequestOutcomeUnknown,
+    DeepcoinDefiniteRejection,
     DeepcoinTradingClientProtocol,
+)
+from telegram_kol_research.deepcoin_normalization import (
+    normalize_deepcoin_margin_mode,
+    normalize_deepcoin_position_mode,
+    normalize_deepcoin_swap_instrument,
 )
 from telegram_kol_research.execution_events import (
     ExecutionEventRecord,
@@ -119,31 +124,7 @@ def execute_management_batch(
             )
         try:
             response = deepcoin_client.place_order(request)
-        except (TimeoutError, DeepcoinRequestOutcomeUnknown) as exc:
-            transition_leg(
-                session_factory,
-                leg.id,
-                expected_statuses={"reserved"},
-                new_status="submit_unknown",
-                transitioned_at=now,
-                last_error={"type": type(exc).__name__, "message": str(exc)},
-            )
-            _record_leg_event(
-                session_factory,
-                batch=batch,
-                binding=binding,
-                leg_id=leg.id,
-                pos_id=leg.pos_id,
-                client_order_id=client_order_id,
-                request=request,
-                response=None,
-                order_id=None,
-                status="submit_unknown",
-                reason="submission_outcome_unknown",
-                created_at=now,
-            )
-            continue
-        except Exception as exc:
+        except DeepcoinDefiniteRejection as exc:
             transition_leg(
                 session_factory,
                 leg.id,
@@ -164,6 +145,30 @@ def execute_management_batch(
                 order_id=None,
                 status="failed",
                 reason="submission_rejected",
+                created_at=now,
+            )
+            continue
+        except Exception as exc:
+            transition_leg(
+                session_factory,
+                leg.id,
+                expected_statuses={"reserved"},
+                new_status="submit_unknown",
+                transitioned_at=now,
+                last_error={"type": type(exc).__name__, "message": str(exc)},
+            )
+            _record_leg_event(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                leg_id=leg.id,
+                pos_id=leg.pos_id,
+                client_order_id=client_order_id,
+                request=request,
+                response=None,
+                order_id=None,
+                status="submit_unknown",
+                reason="submission_outcome_unknown",
                 created_at=now,
             )
             continue
@@ -274,21 +279,14 @@ def _require_exact_entry_legs(
 def _close_payload(
     *, binding: ExecutionBinding, pos_id: str, close_size: str, client_order_id: str
 ) -> dict[str, str]:
-    symbol = binding.symbol.upper().replace("_", "-")
-    if not symbol.endswith("-SWAP"):
-        symbol = f"{symbol}-SWAP" if symbol.endswith("-USDT") else f"{symbol}-USDT-SWAP"
     return {
-        "instId": symbol,
-        "tdMode": "cross"
-        if binding.margin_mode.lower() in {"cross", "crossed", "full"}
-        else "isolated",
+        "instId": normalize_deepcoin_swap_instrument(binding.symbol),
+        "tdMode": normalize_deepcoin_margin_mode(binding.margin_mode),
         "side": "sell" if binding.side.lower() == "long" else "buy",
         "posSide": binding.side.lower(),
         "ordType": "market",
         "sz": close_size,
-        "mrgPosition": "split"
-        if binding.position_mode.lower() in {"split", "hedge", "long_short"}
-        else "merge",
+        "mrgPosition": normalize_deepcoin_position_mode(binding.position_mode),
         "closePosId": str(pos_id),
         "clOrdId": client_order_id,
     }

@@ -45,6 +45,10 @@ class DeepcoinRequestOutcomeUnknown(DeepcoinClientError):
     """Raised when a write may have reached Deepcoin but no result was received."""
 
 
+class DeepcoinDefiniteRejection(DeepcoinClientError):
+    """Raised only when Deepcoin explicitly rejects a validated request."""
+
+
 def _require_list_data(payload: dict[str, Any], *, endpoint: str) -> list[dict[str, Any]]:
     data = payload.get("data")
     if not isinstance(data, list):
@@ -385,6 +389,10 @@ class DeepcoinRestClient:
                 ) from exc
             raise DeepcoinClientError(f"Deepcoin request failed: {exc}") from exc
         except httpx.HTTPStatusError as exc:
+            if method.upper() == "POST":
+                raise DeepcoinRequestOutcomeUnknown(
+                    f"Deepcoin request outcome unknown after HTTP status: {exc}"
+                ) from exc
             raise DeepcoinClientError(f"Deepcoin request failed: {exc}") from exc
         except json.JSONDecodeError as exc:
             if method.upper() == "POST":
@@ -394,10 +402,19 @@ class DeepcoinRestClient:
             raise DeepcoinClientError("Deepcoin response was not JSON") from exc
         finally:
             if owns_client:
-                client.close()
+                try:
+                    client.close()
+                except Exception as exc:
+                    if method.upper() == "POST":
+                        raise DeepcoinRequestOutcomeUnknown(
+                            f"Deepcoin request outcome unknown during cleanup: {exc}"
+                        ) from exc
+                    raise DeepcoinClientError(
+                        f"Deepcoin client cleanup failed: {exc}"
+                    ) from exc
 
         if str(payload.get("code", "0")) not in {"0", ""}:
-            raise DeepcoinClientError(
+            raise DeepcoinDefiniteRejection(
                 f"Deepcoin API error {payload.get('code')}: {payload.get('msg')}"
             )
         _raise_for_deepcoin_business_error(payload)
@@ -435,7 +452,7 @@ def _raise_for_deepcoin_business_error(payload: dict[str, Any]) -> None:
     for item in _iter_deepcoin_payload_items(payload.get("data")):
         s_code = str(item.get("sCode", "0"))
         if s_code not in {"0", ""}:
-            raise DeepcoinClientError(
+            raise DeepcoinDefiniteRejection(
                 f"Deepcoin API error {s_code}: {item.get('sMsg') or item.get('msg')}"
             )
 

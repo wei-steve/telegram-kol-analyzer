@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.deepcoin_client import DeepcoinClientError
+from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.execution_events import list_execution_events
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -22,12 +22,14 @@ from telegram_kol_research.strategy_management_batches import (
     transition_batch,
     transition_leg,
 )
+from telegram_kol_research.trade_signals import enqueue_trade_signal
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
 
 
-def _persist_close_batch(session_factory, *, sizes=("1", "2")):
+def _persist_close_batch(session_factory, *, sizes=("1", "2"), symbol="BTC"):
     with session_factory() as session:
         raw = RawMessage(chat_id=100, message_id=20, text="exit", posted_at=NOW)
         session.add(raw)
@@ -44,7 +46,7 @@ def _persist_close_batch(session_factory, *, sizes=("1", "2")):
         lifecycle = StrategyLifecycle(
             chat_id=100,
             message_id=10,
-            symbol="BTC",
+            symbol=symbol,
             side="short",
             lifecycle_status="entered",
             signal_at=NOW,
@@ -142,6 +144,26 @@ class _FakeClient:
         return outcome
 
 
+def _legacy_close_signal(session_factory, batch, **overrides):
+    values = {
+        "venue": "deepcoin",
+        "source_type": "kol_management",
+        "kol_id": "alice",
+        "chat_id": 100,
+        "message_id": 20,
+        "symbol": "BTC",
+        "side": "short",
+        "action": "close_position",
+        "strategy_instance_id": batch.strategy_instance_id,
+        "payload": {
+            "management_batch_id": batch.id,
+            "binding_id": batch.execution_binding_id,
+        },
+    }
+    values.update(overrides)
+    return enqueue_trade_signal(session_factory, **values)
+
+
 def test_close_legs_are_committed_reserved_before_exact_market_submission(tmp_path):
     from telegram_kol_research.strategy_management_executor import (
         execute_management_batch,
@@ -194,7 +216,7 @@ def test_definite_failure_continues_later_leg_and_is_partial_failed(tmp_path):
     batch = _persist_close_batch(session_factory)
     client = _FakeClient(
         session_factory,
-        [DeepcoinClientError("exchange rejected"), {"code": "0", "data": {"ordId": "close-2"}}],
+        [DeepcoinDefiniteRejection("exchange rejected"), {"code": "0", "data": {"ordId": "close-2"}}],
     )
 
     result = execute_management_batch(
@@ -207,6 +229,47 @@ def test_definite_failure_continues_later_leg_and_is_partial_failed(tmp_path):
         "failed",
         "submitted",
     ]
+
+
+def test_unexpected_exception_after_request_is_unknown_and_continues(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+    client = _FakeClient(
+        session_factory,
+        [RuntimeError("client failed after send"), {"code": "0", "data": {"ordId": "close-2"}}],
+    )
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert len(client.calls) == 2
+    assert result["status"] == "reconciling"
+    stored = load_management_batch(session_factory, batch.id)
+    assert [leg.status for leg in stored.legs] == ["submit_unknown", "submitted"]
+    assert stored.legs[0].client_order_id == client.calls[0][0]["clOrdId"]
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    ["BTC", "BTC-USDT", "BTCUSDT", "BTC_USDT", "BTC-USDT-SWAP"],
+)
+def test_close_payload_uses_canonical_deepcoin_instrument(symbol, tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory, symbol=symbol)
+    client = _FakeClient(session_factory)
+
+    execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert {payload["instId"] for payload, _status in client.calls} == {
+        "BTC-USDT-SWAP"
+    }
 
 
 def test_timeout_is_submit_unknown_never_retried_and_later_leg_continues(tmp_path):
@@ -366,3 +429,93 @@ def test_non_close_or_terminal_batch_is_explicitly_fail_closed(tmp_path):
             deepcoin_client=_FakeClient(session_factory),
             executed_at=NOW,
         )
+
+
+@pytest.mark.parametrize("mode", ["disabled", "shadow"])
+def test_legacy_batch_delegation_requires_live_management_mode(mode, tmp_path):
+    from telegram_kol_research.deepcoin_execution_actions import (
+        DeepcoinExecutionActionError,
+        execute_deepcoin_management_signal,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+    signal = _legacy_close_signal(session_factory, batch)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True, "management_execution_mode": mode},
+    )
+    client = _FakeClient(session_factory)
+
+    with pytest.raises(
+        DeepcoinExecutionActionError, match="management_live_execution_disabled"
+    ):
+        execute_deepcoin_management_signal(
+            session_factory, trade_signal=signal, deepcoin_client=client
+        )
+
+    assert client.calls == []
+    assert load_management_batch(session_factory, batch.id).status == "ready"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"message_id": 21},
+        {"strategy_instance_id": "deepcoin:100:999:BTC:short"},
+        {"payload": {"management_batch_id": 1, "binding_id": 999}},
+    ],
+)
+def test_legacy_batch_delegation_rejects_signal_identity_mismatch(override, tmp_path):
+    from telegram_kol_research.deepcoin_execution_actions import (
+        DeepcoinExecutionActionError,
+        execute_deepcoin_management_signal,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+    if "payload" in override:
+        override = {
+            "payload": {
+                **override["payload"],
+                "management_batch_id": batch.id,
+            }
+        }
+    signal = _legacy_close_signal(session_factory, batch, **override)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True, "management_execution_mode": "live"},
+    )
+    client = _FakeClient(session_factory)
+
+    with pytest.raises(
+        DeepcoinExecutionActionError, match="management_signal_batch_identity_mismatch"
+    ):
+        execute_deepcoin_management_signal(
+            session_factory, trade_signal=signal, deepcoin_client=client
+        )
+
+    assert client.calls == []
+    assert load_management_batch(session_factory, batch.id).status == "ready"
+
+
+def test_matching_legacy_signal_delegates_valid_live_batch(tmp_path):
+    from telegram_kol_research.deepcoin_execution_actions import (
+        execute_deepcoin_management_signal,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+    signal = _legacy_close_signal(session_factory, batch)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True, "management_execution_mode": "live"},
+    )
+    client = _FakeClient(session_factory)
+
+    result = execute_deepcoin_management_signal(
+        session_factory, trade_signal=signal, deepcoin_client=client
+    )
+
+    assert result["status"] == "reconciling"
+    assert len(client.calls) == 2

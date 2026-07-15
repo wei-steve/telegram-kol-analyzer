@@ -271,7 +271,17 @@ def _reviewed_equivalent_binding(session_factory):
     return binding_id
 
 
-def _signal(session_factory, *, action, payload=None, message_id=88, kol_id="alice", symbol="ETH", side="long"):
+def _signal(
+    session_factory,
+    *,
+    action,
+    payload=None,
+    message_id=88,
+    kol_id="alice",
+    symbol="ETH",
+    side="long",
+    strategy_instance_id="deepcoin:100:55:ETH:long",
+):
     return enqueue_trade_signal(
         session_factory,
         venue="deepcoin",
@@ -283,7 +293,7 @@ def _signal(session_factory, *, action, payload=None, message_id=88, kol_id="ali
         side=side,
         action=action,
         payload=payload or {},
-        strategy_instance_id="deepcoin:100:55:ETH:long",
+        strategy_instance_id=strategy_instance_id,
     )
 
 
