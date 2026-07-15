@@ -502,3 +502,148 @@ def test_management_transitions_preserve_omitted_fields_and_clear_explicit_none(
     assert cleared.legs[0].response is None
     assert cleared.legs[0].last_error is None
     assert cleared.legs[0].last_exchange_snapshot is None
+
+
+def test_management_mutations_reject_malformed_active_strategy_predicate(tmp_path):
+    repository = _repository()
+    session_factory = create_session_factory(tmp_path / "malformed-predicate.db")
+    created = repository.create_management_batch(
+        session_factory,
+        idempotency_fingerprint="existing-fingerprint",
+        raw_message_id=101,
+        recognition_decision_id=201,
+        recognition_generation="generation-existing",
+        target_lifecycle_id=301,
+        strategy_instance_id="strategy-existing",
+        execution_binding_id=401,
+        intent="full_exit",
+        effective_action="full_exit",
+        requested_fraction=None,
+        effective_fraction=1.0,
+        partial_round_before=0,
+        target_fingerprint="target-existing",
+        target_snapshot={"positions": [{"pos_id": "position-1"}]},
+        legs=[
+            repository.ManagementLegCreate(
+                execution_order_leg_id=501,
+                pos_id="position-1",
+                leg_index=0,
+            )
+        ],
+    )
+    engine = session_factory.kw["bind"]
+    with engine.begin() as connection:
+        connection.execute(
+            text(f'DROP INDEX "{MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME}"')
+        )
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX "
+                f'"{MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME}" '
+                "ON strategy_management_batches (strategy_instance_id) "
+                "WHERE status NOT IN ('ready')"
+            )
+        )
+
+    def snapshot():
+        with session_factory() as session:
+            return (
+                session.execute(
+                    text(
+                        "SELECT id, status, reason_code "
+                        "FROM strategy_management_batches ORDER BY id"
+                    )
+                ).fetchall(),
+                session.execute(
+                    text(
+                        "SELECT id, status, last_error "
+                        "FROM strategy_management_legs ORDER BY id"
+                    )
+                ).fetchall(),
+            )
+
+    mutations = [
+        lambda: repository.create_management_batch(
+            session_factory,
+            idempotency_fingerprint="new-fingerprint",
+            raw_message_id=102,
+            recognition_decision_id=202,
+            recognition_generation="generation-new",
+            target_lifecycle_id=302,
+            strategy_instance_id="strategy-new",
+            execution_binding_id=402,
+            intent="full_exit",
+            effective_action="full_exit",
+            requested_fraction=None,
+            effective_fraction=1.0,
+            partial_round_before=0,
+            target_fingerprint="target-new",
+            target_snapshot={"positions": []},
+            legs=[],
+        ),
+        lambda: repository.claim_ready_batch(session_factory, created.id),
+        lambda: repository.transition_batch(
+            session_factory,
+            created.id,
+            expected_statuses={"ready"},
+            new_status="blocked",
+            reason_code="must-not-write",
+        ),
+        lambda: repository.transition_leg(
+            session_factory,
+            created.legs[0].id,
+            expected_statuses={"planned"},
+            new_status="failed",
+            last_error={"code": "must-not-write"},
+        ),
+    ]
+    before = snapshot()
+    for mutation in mutations:
+        with pytest.raises(
+            repository.ManagementSchemaSafetyError,
+            match=MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME,
+        ):
+            mutation()
+        assert snapshot() == before
+
+
+def test_management_mutations_accept_equivalent_active_strategy_predicate_formatting(
+    tmp_path,
+):
+    repository = _repository()
+    session_factory = create_session_factory(tmp_path / "formatted-predicate.db")
+    created = repository.create_management_batch(
+        session_factory,
+        idempotency_fingerprint="formatted-fingerprint",
+        raw_message_id=101,
+        recognition_decision_id=201,
+        recognition_generation="generation-formatted",
+        target_lifecycle_id=301,
+        strategy_instance_id="strategy-formatted",
+        execution_binding_id=401,
+        intent="full_exit",
+        effective_action="full_exit",
+        requested_fraction=None,
+        effective_fraction=1.0,
+        partial_round_before=0,
+        target_fingerprint="target-formatted",
+        target_snapshot={"positions": []},
+        legs=[],
+    )
+    engine = session_factory.kw["bind"]
+    with engine.begin() as connection:
+        connection.execute(
+            text(f'DROP INDEX "{MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME}"')
+        )
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX "
+                f'"{MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME}" '
+                "ON strategy_management_batches (strategy_instance_id) "
+                "WHERE  STATUS   not  in ( 'succeeded' , 'blocked' , 'resolved' )"
+            )
+        )
+
+    claimed = repository.claim_ready_batch(session_factory, created.id)
+    assert claimed is not None
+    assert claimed.status == "executing"

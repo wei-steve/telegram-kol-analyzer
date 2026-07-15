@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Iterable, Sequence
@@ -14,6 +15,7 @@ from telegram_kol_research.db import MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME
 from telegram_kol_research.db import REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES
+from telegram_kol_research.models import ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE
 from telegram_kol_research.models import StrategyManagementBatch
 from telegram_kol_research.models import StrategyManagementLeg
 
@@ -441,7 +443,11 @@ def _require_management_unique_indexes(session) -> None:
             continue
         if index_name == MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME:
             where = str(index.get("dialect_options", {}).get("sqlite_where", ""))
-            if session.get_bind().dialect.name == "sqlite" and "status NOT IN" not in where:
+            if (
+                session.get_bind().dialect.name == "sqlite"
+                and _normalize_sql_predicate(where)
+                != _normalize_sql_predicate(ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE)
+            ):
                 unsafe.append(index_name)
     if unsafe:
         session.rollback()
@@ -449,3 +455,15 @@ def _require_management_unique_indexes(session) -> None:
             "management database safety indexes are missing or invalid: "
             + ", ".join(unsafe)
         )
+
+
+def _normalize_sql_predicate(predicate: str) -> tuple[str, tuple[str, ...]]:
+    literals: list[str] = []
+
+    def replace_literal(match: re.Match[str]) -> str:
+        literals.append(match.group(1).replace("''", "'"))
+        return "?"
+
+    structure = re.sub(r"'((?:''|[^'])*)'", replace_literal, predicate)
+    structure = re.sub(r'[\s"`\[\]]+', "", structure).lower()
+    return structure, tuple(literals)
