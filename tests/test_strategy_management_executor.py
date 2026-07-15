@@ -959,43 +959,100 @@ def test_fresh_ready_claim_revalidates_exchange_before_first_write(tmp_path, mut
     assert client.calls == []
 
 
-def test_restart_validator_ignores_other_exact_strategy_same_instrument_and_side(
-    tmp_path,
+@pytest.mark.parametrize(
+    "owner_case",
+    [
+        "valid",
+        "binding_other_venue",
+        "entry_other_venue",
+        "same_strategy",
+        "null_strategy",
+        "binding_open",
+        "unverified_entry",
+        "entry_strategy_mismatch",
+        "pos_not_bound",
+        "multiple_owners",
+    ],
+)
+def test_restart_validator_only_ignores_strict_other_strategy_owner(
+    tmp_path, owner_case
 ):
     from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
         validate_management_restart_snapshot,
     )
 
     session_factory = create_session_factory(tmp_path / "research.db")
     batch = _persist_close_batch(session_factory, sizes=("1", "2"))
     with session_factory() as session:
+        other_strategy = (
+            batch.strategy_instance_id
+            if owner_case == "same_strategy"
+            else None
+            if owner_case == "null_strategy"
+            else "deepcoin:200:20:BTC:short"
+        )
         other = ExecutionBinding(
-            strategy_instance_id="deepcoin:200:20:BTC:short",
+            strategy_instance_id=other_strategy,
             kol_id="bob",
             chat_id=200,
             message_id=20,
             symbol="BTC",
             side="short",
-            venue="deepcoin",
-            pos_id="pos-other",
-            status="active",
+            venue="gate" if owner_case == "binding_other_venue" else "deepcoin",
+            pos_id="different-pos" if owner_case == "pos_not_bound" else "pos-other",
+            status="open" if owner_case == "binding_open" else "active",
         )
         session.add(other)
         session.flush()
         session.add(
             ExecutionOrderLeg(
                 execution_binding_id=other.id,
-                strategy_instance_id=other.strategy_instance_id,
+                strategy_instance_id=(
+                    "deepcoin:mismatch:BTC:short"
+                    if owner_case == "entry_strategy_mismatch"
+                    else other.strategy_instance_id
+                ),
                 leg_index=0,
                 purpose="entry",
                 order_kind="market",
                 order_id="entry-other",
                 pos_id="pos-other",
-                venue="deepcoin",
-                attribution_status="verified",
+                venue="gate" if owner_case == "entry_other_venue" else "deepcoin",
+                attribution_status=(
+                    "unassigned" if owner_case == "unverified_entry" else "verified"
+                ),
                 status="active",
             )
         )
+        if owner_case == "multiple_owners":
+            duplicate = ExecutionBinding(
+                strategy_instance_id="gate:300:30:BTC:short",
+                kol_id="carol",
+                chat_id=300,
+                message_id=30,
+                symbol="BTC",
+                side="short",
+                venue="gate",
+                pos_id="pos-other",
+                status="active",
+            )
+            session.add(duplicate)
+            session.flush()
+            session.add(
+                ExecutionOrderLeg(
+                    execution_binding_id=duplicate.id,
+                    strategy_instance_id=duplicate.strategy_instance_id,
+                    leg_index=0,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="entry-other-gate",
+                    pos_id="pos-other",
+                    venue="gate",
+                    attribution_status="verified",
+                    status="active",
+                )
+            )
         session.commit()
     snapshot = SimpleNamespace(
         positions=[
@@ -1021,9 +1078,15 @@ def test_restart_validator_ignores_other_exact_strategy_same_instrument_and_side
         errors={},
     )
 
-    validate_management_restart_snapshot(
-        session_factory, batch_id=batch.id, snapshot=snapshot
-    )
+    if owner_case == "valid":
+        validate_management_restart_snapshot(
+            session_factory, batch_id=batch.id, snapshot=snapshot
+        )
+    else:
+        with pytest.raises(ManagementBatchExecutionError, match="restart_snapshot"):
+            validate_management_restart_snapshot(
+                session_factory, batch_id=batch.id, snapshot=snapshot
+            )
 
     from telegram_kol_research.strategy_management_worker import (
         run_strategy_management_worker_tick,
@@ -1037,18 +1100,23 @@ def test_restart_validator_ignores_other_exact_strategy_same_instrument_and_side
         processed_at=NOW,
     )
 
-    assert result.executed == 1
-    assert [payload["closePosId"] for payload, _status in client.calls] == [
-        "pos-1",
-        "pos-2",
-    ]
-    with session_factory() as session:
-        other_binding = session.query(ExecutionBinding).filter_by(chat_id=200).one()
-        other_leg = session.query(ExecutionOrderLeg).filter_by(
-            execution_binding_id=other_binding.id
-        ).one()
-        assert other_binding.status == "active"
-        assert other_leg.status == "active"
+    if owner_case == "valid":
+        assert result.executed == 1
+        assert [payload["closePosId"] for payload, _status in client.calls] == [
+            "pos-1",
+            "pos-2",
+        ]
+        with session_factory() as session:
+            other_binding = session.query(ExecutionBinding).filter_by(chat_id=200).one()
+            other_leg = session.query(ExecutionOrderLeg).filter_by(
+                execution_binding_id=other_binding.id
+            ).one()
+            assert other_binding.status == "active"
+            assert other_leg.status == "active"
+    else:
+        assert result.recovered == 1
+        assert load_management_batch(session_factory, batch.id).status == "recovery_required"
+        assert client.calls == []
 
 
 def test_ready_snapshot_loader_exception_freezes_with_zero_exchange_write(tmp_path):

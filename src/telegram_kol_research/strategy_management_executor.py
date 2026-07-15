@@ -768,10 +768,14 @@ def _other_exact_strategy_position_ids(
             }
             if (
                 other is not None
-                and other.status in {"active", "open", "partial"}
+                and other.status == "active"
+                and other.venue == binding.venue
+                and row.venue == binding.venue
                 and row.attribution_status == "verified"
                 and str(row.status or "").lower()
                 in {"active", "open", "filled", "partial_closed"}
+                and bool(other.strategy_instance_id)
+                and other.strategy_instance_id != batch.strategy_instance_id
                 and row.strategy_instance_id == other.strategy_instance_id
                 and other.symbol.upper() == binding.symbol.upper()
                 and other.side.lower() == binding.side.lower()
