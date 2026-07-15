@@ -106,6 +106,69 @@ def test_normalize_management_intent_leaves_unqualified_management_fraction_unse
     assert fraction is None
 
 
+@pytest.mark.parametrize(
+    ("text", "model_action", "expected_action", "expected_fraction"),
+    [
+        ("现在先分批止盈", None, "partial_take_profit", None),
+        (
+            "提前止盈一半并移动止损至成本价",
+            "partial_take_profit, move_stop_to_protect",
+            "partial_then_break_even",
+            0.5,
+        ),
+    ],
+)
+def test_applied_management_intent_persists_canonical_action(
+    tmp_path,
+    text,
+    model_action,
+    expected_action,
+    expected_fraction,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=2124,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 19, 3, 6, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 19, 3, 7, tzinfo=UTC),
+            entry_price_actual=1705,
+            stop_loss=1740,
+        )
+        raw_message = RawMessage(chat_id=88, message_id=2131, text=text)
+        session.add_all([lifecycle, raw_message])
+        session.flush()
+
+        applied = _apply_lifecycle_event_decision(
+            session,
+            raw_message,
+            {
+                "event_type": "position_update",
+                "target_lifecycle_id": lifecycle.id,
+                "symbol": "ETH",
+                "side": "short",
+                "management_action": model_action,
+                "confidence": 0.93,
+                "reason": text,
+            },
+            parse_source="mimo_authoritative",
+            authoritative_generation="generation-canonical",
+        )
+        session.flush()
+        candidate = session.query(SignalCandidate).one()
+
+        assert applied is True
+        assert lifecycle.management_action == expected_action
+        assert candidate.management_action == expected_action
+        if expected_fraction is None:
+            assert candidate.management_fraction is None
+        else:
+            assert candidate.management_fraction == pytest.approx(expected_fraction)
+
+
 def test_authoritative_position_update_persists_target_lifecycle_and_generation(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
@@ -1741,7 +1804,7 @@ def test_ai_lifecycle_event_records_partial_take_profit_update(tmp_path, monkeyp
 
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.management_signal_message_id == 1400
-    assert lifecycle.management_action == "partial_take_profit"
+    assert lifecycle.management_action == "partial_then_break_even"
     assert lifecycle.stop_loss == 63794.4
     assert "提前止盈一半" in lifecycle.management_note
     assert "止损已调整到成本保护价 63794.4" in lifecycle.management_note
@@ -1815,7 +1878,7 @@ def test_ai_lifecycle_event_explicit_stop_overrides_protection_price(tmp_path, m
 
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.management_signal_message_id == 2182
-    assert lifecycle.management_action == "risk_update"
+    assert lifecycle.management_action == "adjust_stop_loss"
     assert lifecycle.stop_loss == 1725
     assert lifecycle.take_profit == "1845"
     assert "止损已按 KOL 明确指令调整为 1725" in lifecycle.management_note
@@ -1894,7 +1957,7 @@ def test_ai_lifecycle_event_ignores_implausible_stop_and_uses_protection_price(
 
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.management_signal_message_id == 1073
-    assert lifecycle.management_action == "move_stop_to_protect"
+    assert lifecycle.management_action == "partial_then_break_even"
     assert lifecycle.stop_loss == 61563
     assert lifecycle.take_profit == "60950"
     assert candidate.event_type == "position_update"
@@ -1976,7 +2039,7 @@ def test_ai_lifecycle_event_downgrades_first_take_profit_exit_to_management_upda
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.exit_signal_message_id is None
     assert lifecycle.management_signal_message_id == 1073
-    assert lifecycle.management_action == "move_stop_to_protect"
+    assert lifecycle.management_action == "partial_then_break_even"
     assert lifecycle.stop_loss == 61563
     assert lifecycle.take_profit == "60950"
     assert candidate.event_type == "position_update"
@@ -2049,7 +2112,7 @@ def test_ai_lifecycle_event_extracts_explicit_stop_from_management_text(tmp_path
 
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.management_signal_message_id == 9123
-    assert lifecycle.management_action == "risk_update"
+    assert lifecycle.management_action == "adjust_stop_loss"
     assert lifecycle.stop_loss == 62000
     assert candidate.event_type == "position_update"
     assert candidate.stop_loss_text == "62000"

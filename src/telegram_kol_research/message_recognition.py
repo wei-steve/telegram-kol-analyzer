@@ -1011,7 +1011,7 @@ def _apply_lifecycle_event_decision(
             decision["take_profit"] = decision.get("exit_price")
         decision["exit_price"] = None
 
-    management_action, management_fraction = normalize_management_intent(
+    normalized_management_action, management_fraction = normalize_management_intent(
         decision,
         raw_message.text or "",
     )
@@ -1076,7 +1076,7 @@ def _apply_lifecycle_event_decision(
                 raw_message=raw_message,
                 lifecycle=target,
                 parse_source=parse_source,
-                management_action=management_action,
+                management_action=normalized_management_action,
                 management_fraction=management_fraction,
                 recognition_generation=authoritative_generation,
             )
@@ -1094,14 +1094,16 @@ def _apply_lifecycle_event_decision(
             raw_message=raw_message,
             lifecycle=target,
             parse_source=parse_source,
-            management_action=management_action,
+            management_action=normalized_management_action,
             management_fraction=management_fraction,
             recognition_generation=authoritative_generation,
         )
         return True
 
     if event_type == "position_update" and target.lifecycle_status == "entered":
-        management_action = str(decision.get("management_action") or "").strip() or "position_update"
+        raw_management_action = (
+            str(decision.get("management_action") or "").strip() or "position_update"
+        )
         management_note = str(decision.get("reason") or "").strip() or None
         explicit_stop_loss = _number_or_none(decision.get("stop_loss"))
         if explicit_stop_loss is None:
@@ -1122,7 +1124,7 @@ def _apply_lifecycle_event_decision(
             if _should_move_stop_to_protect(
                 current_text=raw_message.text,
                 decision=decision,
-                management_action=management_action,
+                management_action=raw_management_action,
             )
             else None
         )
@@ -1137,7 +1139,7 @@ def _apply_lifecycle_event_decision(
         if explicit_take_profit:
             target.take_profit = explicit_take_profit
         target.management_signal_message_id = raw_message.message_id
-        target.management_action = management_action
+        target.management_action = normalized_management_action
         target.management_note = management_note
         target.updated_at = utc_now()
         _upsert_management_signal_candidate(
@@ -1145,7 +1147,7 @@ def _apply_lifecycle_event_decision(
             raw_message=raw_message,
             lifecycle=target,
             parse_source=parse_source,
-            management_action=management_action,
+            management_action=normalized_management_action,
             management_fraction=management_fraction,
             recognition_generation=authoritative_generation,
         )
@@ -1169,6 +1171,8 @@ def normalize_management_intent(
 
     if event_type in {"exit_position", "exit_full", "full_exit", "close_position"}:
         return "full_exit", None
+    if raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}:
+        return "adjust_stop_loss", None
 
     has_partial = (
         "partial_take_profit" in raw_action
@@ -1193,10 +1197,7 @@ def normalize_management_intent(
         return "partial_take_profit", fraction
     if has_break_even:
         return "move_stop_to_break_even", None
-    if (
-        decision.get("stop_loss") not in (None, "")
-        or raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}
-    ):
+    if decision.get("stop_loss") not in (None, ""):
         return "adjust_stop_loss", None
     return raw_action or "position_update", None
 
