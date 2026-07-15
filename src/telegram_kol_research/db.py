@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.models import ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE
 from telegram_kol_research.models import Base
 
 
@@ -16,6 +17,21 @@ POSITION_OWNERSHIP_UNIQUE_INDEX_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_order_legs_venue_pos "
     "ON execution_order_legs (venue, pos_id) "
     "WHERE pos_id IS NOT NULL AND pos_id != ''"
+)
+MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME = (
+    "uq_strategy_management_batches_idempotency"
+)
+MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME = (
+    "uq_strategy_management_batches_active_strategy"
+)
+MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS "
+    "uq_strategy_management_batches_active_strategy "
+    "ON strategy_management_batches (strategy_instance_id) "
+    f"WHERE {ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE}"
+)
+MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME = (
+    "uq_strategy_management_legs_batch_pos"
 )
 
 
@@ -233,6 +249,19 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
         "ON execution_order_legs (pos_id)"
     ),
     POSITION_OWNERSHIP_UNIQUE_INDEX_NAME: POSITION_OWNERSHIP_UNIQUE_INDEX_SQL,
+    MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME: (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_strategy_management_batches_idempotency "
+        "ON strategy_management_batches (idempotency_fingerprint)"
+    ),
+    MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME: (
+        MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_SQL
+    ),
+    MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME: (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_strategy_management_legs_batch_pos "
+        "ON strategy_management_legs (management_batch_id, pos_id)"
+    ),
     "ix_execution_events_strategy_created": (
         "CREATE INDEX IF NOT EXISTS ix_execution_events_strategy_created "
         "ON execution_events (strategy_instance_id, created_at)"
@@ -334,7 +363,32 @@ def _backfill_sqlite_indexes(engine: Engine) -> None:
                     # Keep the database readable so the audited repair command can
                     # resolve legacy duplicates. Runtime ownership gates fail closed.
                     continue
+                if _management_unique_index_has_duplicates(connection, index_name):
+                    # A partially deployed legacy schema must remain readable. The
+                    # unsafe duplicate rows continue to fail closed until an audited
+                    # repair can make the matching unique index installable.
+                    continue
                 connection.execute(text(create_index_sql))
+
+
+def _management_unique_index_has_duplicates(connection, index_name: str) -> bool:
+    duplicate_queries = {
+        MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME: (
+            "SELECT 1 FROM strategy_management_batches "
+            "GROUP BY idempotency_fingerprint HAVING COUNT(*) > 1 LIMIT 1"
+        ),
+        MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME: (
+            "SELECT 1 FROM strategy_management_batches "
+            f"WHERE {ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE} "
+            "GROUP BY strategy_instance_id HAVING COUNT(*) > 1 LIMIT 1"
+        ),
+        MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME: (
+            "SELECT 1 FROM strategy_management_legs "
+            "GROUP BY management_batch_id, pos_id HAVING COUNT(*) > 1 LIMIT 1"
+        ),
+    }
+    query = duplicate_queries.get(index_name)
+    return query is not None and connection.execute(text(query)).first() is not None
 
 
 def ensure_position_ownership_unique_index(connection) -> None:

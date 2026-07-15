@@ -437,6 +437,167 @@ def test_database_bootstrap_creates_execution_order_legs_table(tmp_path):
     assert "uq_execution_order_legs_venue_pos" in indexes
 
 
+def test_database_bootstrap_creates_management_batch_and_management_leg_schema(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    batch_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(strategy_management_batches)").fetchall()
+    }
+    leg_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(strategy_management_legs)").fetchall()
+    }
+    batch_indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(strategy_management_batches)").fetchall()
+    }
+    leg_indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(strategy_management_legs)").fetchall()
+    }
+    conn.close()
+
+    assert {
+        "idempotency_fingerprint",
+        "raw_message_id",
+        "recognition_decision_id",
+        "recognition_generation",
+        "target_lifecycle_id",
+        "strategy_instance_id",
+        "execution_binding_id",
+        "intent",
+        "effective_action",
+        "requested_fraction",
+        "effective_fraction",
+        "partial_round_before",
+        "status",
+        "reason_code",
+        "target_fingerprint",
+        "target_snapshot_json",
+        "planned_at",
+        "started_at",
+        "reconciled_at",
+        "completed_at",
+        "notification_state",
+        "notification_fingerprint",
+        "created_at",
+        "updated_at",
+    } <= batch_columns
+    assert {
+        "management_batch_id",
+        "execution_order_leg_id",
+        "pos_id",
+        "leg_index",
+        "status",
+        "preflight_size",
+        "planned_close_size",
+        "avg_entry_price",
+        "quantity_step",
+        "old_tpsl_json",
+        "planned_tpsl_json",
+        "client_order_id",
+        "exchange_order_id",
+        "request_json",
+        "response_json",
+        "last_error",
+        "last_exchange_snapshot_json",
+        "created_at",
+        "updated_at",
+    } <= leg_columns
+    assert "uq_strategy_management_batches_idempotency" in batch_indexes
+    assert "uq_strategy_management_batches_active_strategy" in batch_indexes
+    assert "uq_strategy_management_legs_batch_pos" in leg_indexes
+
+
+def test_database_bootstrap_adds_management_batch_and_management_leg_indexes_to_legacy_tables(
+    tmp_path,
+):
+    database_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(database_path)
+    conn.execute(
+        """
+        CREATE TABLE strategy_management_batches (
+            id INTEGER PRIMARY KEY,
+            idempotency_fingerprint VARCHAR(64) NOT NULL,
+            strategy_instance_id VARCHAR(255) NOT NULL,
+            status VARCHAR(32) NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE strategy_management_legs (
+            id INTEGER PRIMARY KEY,
+            management_batch_id INTEGER NOT NULL,
+            pos_id VARCHAR(255) NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    batch_indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(strategy_management_batches)").fetchall()
+    }
+    leg_indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(strategy_management_legs)").fetchall()
+    }
+    conn.close()
+
+    assert "uq_strategy_management_batches_idempotency" in batch_indexes
+    assert "uq_strategy_management_batches_active_strategy" in batch_indexes
+    assert "uq_strategy_management_legs_batch_pos" in leg_indexes
+
+
+def test_database_bootstrap_skips_management_batch_lock_index_for_legacy_duplicates(
+    tmp_path,
+):
+    database_path = tmp_path / "legacy-duplicates.db"
+    conn = sqlite3.connect(database_path)
+    conn.execute(
+        """
+        CREATE TABLE strategy_management_batches (
+            id INTEGER PRIMARY KEY,
+            idempotency_fingerprint VARCHAR(64) NOT NULL,
+            strategy_instance_id VARCHAR(255) NOT NULL,
+            status VARCHAR(32) NOT NULL
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO strategy_management_batches VALUES (?, ?, ?, ?)",
+        [
+            (1, "one", "strategy-1", "ready"),
+            (2, "two", "strategy-1", "recovery_required"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(strategy_management_batches)").fetchall()
+    }
+    rows = conn.execute(
+        "SELECT id, status FROM strategy_management_batches ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    assert "uq_strategy_management_batches_active_strategy" not in indexes
+    assert rows == [(1, "ready"), (2, "recovery_required")]
+
+
 def test_database_bootstrap_backfills_position_attribution_schema(tmp_path):
     database_path = tmp_path / "legacy.db"
     conn = sqlite3.connect(database_path)

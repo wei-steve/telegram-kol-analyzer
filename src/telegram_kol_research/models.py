@@ -461,6 +461,105 @@ class ExecutionOrderLeg(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+SAFE_TERMINAL_MANAGEMENT_BATCH_STATUSES = frozenset(
+    {"succeeded", "blocked", "resolved"}
+)
+ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE = (
+    "status NOT IN ('succeeded', 'blocked', 'resolved')"
+)
+
+
+class StrategyManagementBatch(Base):
+    __tablename__ = "strategy_management_batches"
+    __table_args__ = (
+        Index(
+            "uq_strategy_management_batches_idempotency",
+            "idempotency_fingerprint",
+            unique=True,
+        ),
+        Index(
+            "uq_strategy_management_batches_active_strategy",
+            "strategy_instance_id",
+            unique=True,
+            sqlite_where=text(ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE),
+        ),
+        Index("ix_strategy_management_batches_status_planned", "status", "planned_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    idempotency_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    recognition_decision_id: Mapped[int] = mapped_column(
+        ForeignKey("recognition_decisions.id"), nullable=False, index=True
+    )
+    recognition_generation: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_lifecycle_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_lifecycles.id"), nullable=False, index=True
+    )
+    strategy_instance_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    intent: Mapped[str] = mapped_column(String(64), nullable=False)
+    effective_action: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_fraction: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    effective_fraction: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    partial_round_before: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ready")
+    reason_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    target_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_snapshot_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    planned_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    reconciled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    notification_state: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    notification_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class StrategyManagementLeg(Base):
+    __tablename__ = "strategy_management_legs"
+    __table_args__ = (
+        Index(
+            "uq_strategy_management_legs_batch_pos",
+            "management_batch_id",
+            "pos_id",
+            unique=True,
+        ),
+        Index("ix_strategy_management_legs_batch_status", "management_batch_id", "status"),
+        Index("ix_strategy_management_legs_execution_leg", "execution_order_leg_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    management_batch_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_management_batches.id"), nullable=False
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False
+    )
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    leg_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="planned")
+    preflight_size: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    planned_close_size: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    avg_entry_price: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    quantity_step: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    old_tpsl_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    planned_tpsl_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    client_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    exchange_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    request_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_exchange_snapshot_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class PositionAttributionAudit(Base):
     __tablename__ = "position_attribution_audits"
     __table_args__ = (
