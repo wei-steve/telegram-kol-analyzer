@@ -275,10 +275,28 @@ def reconcile_deepcoin_execution_bindings(
     *,
     client: DeepcoinReadOnlyClient,
     recovered_at: datetime | None = None,
+    snapshot: _ReconcileSnapshot | None = None,
 ) -> ExecutionReconciliationResult:
     """Reconcile one coherent exchange snapshot through global leg attribution."""
 
     now = recovered_at or datetime.now(UTC)
+    with position_authority_lock():
+        if snapshot is None:
+            snapshot = load_deepcoin_execution_reconciliation_snapshot(
+                session_factory, client=client
+            )
+        return _apply_reconcile_snapshot(
+            session_factory, snapshot=snapshot, recovered_at=now
+        )
+
+
+def load_deepcoin_execution_reconciliation_snapshot(
+    session_factory: sessionmaker,
+    *,
+    client: DeepcoinReadOnlyClient,
+) -> _ReconcileSnapshot:
+    """Read one coherent account snapshot reusable by reconciliation and planning."""
+
     with session_factory() as session:
         instruments = {
             f"{str(symbol or '').upper()}-USDT-SWAP"
@@ -287,11 +305,7 @@ def reconcile_deepcoin_execution_bindings(
             .all()
             if str(symbol or "").strip()
         }
-    with position_authority_lock():
-        snapshot = _load_reconcile_snapshot(client, instruments=instruments)
-        return _apply_reconcile_snapshot(
-            session_factory, snapshot=snapshot, recovered_at=now
-        )
+    return _load_reconcile_snapshot(client, instruments=instruments)
 
 
 def _load_reconcile_snapshot(

@@ -6,10 +6,10 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from sqlalchemy import inspect, update
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from telegram_kol_research.db import MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME
@@ -129,8 +129,8 @@ def create_management_batch(
 
     now = planned_at or datetime.now(UTC)
     with session_factory() as session:
-        _require_management_unique_indexes(session)
-        batch = StrategyManagementBatch(
+        batch_id = create_management_batch_in_session(
+            session,
             idempotency_fingerprint=idempotency_fingerprint,
             raw_message_id=raw_message_id,
             recognition_decision_id=recognition_decision_id,
@@ -143,46 +143,99 @@ def create_management_batch(
             requested_fraction=requested_fraction,
             effective_fraction=effective_fraction,
             partial_round_before=partial_round_before,
+            target_fingerprint=target_fingerprint,
+            target_snapshot=target_snapshot,
+            legs=legs,
+            planned_at=now,
             status=status,
             reason_code=reason_code,
-            target_fingerprint=target_fingerprint,
-            target_snapshot_json=_encode_json(target_snapshot) or "{}",
-            planned_at=now,
             notification_state=notification_state,
-            created_at=now,
-            updated_at=now,
         )
-        session.add(batch)
-        session.flush()
-        for leg in legs:
-            session.add(
-                StrategyManagementLeg(
-                    management_batch_id=batch.id,
-                    execution_order_leg_id=leg.execution_order_leg_id,
-                    pos_id=leg.pos_id,
-                    leg_index=leg.leg_index,
-                    status=leg.status,
-                    preflight_size=leg.preflight_size,
-                    planned_close_size=leg.planned_close_size,
-                    avg_entry_price=leg.avg_entry_price,
-                    quantity_step=leg.quantity_step,
-                    old_tpsl_json=_encode_json(leg.old_tpsl),
-                    planned_tpsl_json=_encode_json(leg.planned_tpsl),
-                    client_order_id=leg.client_order_id,
-                    exchange_order_id=leg.exchange_order_id,
-                    request_json=_encode_json(leg.request),
-                    response_json=_encode_json(leg.response),
-                    last_error=_encode_json(leg.last_error),
-                    last_exchange_snapshot_json=_encode_json(
-                        leg.last_exchange_snapshot
-                    ),
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
         session.commit()
-        batch_id = batch.id
     return load_management_batch(session_factory, batch_id)
+
+
+def create_management_batch_in_session(
+    session: Session,
+    *,
+    idempotency_fingerprint: str,
+    raw_message_id: int,
+    recognition_decision_id: int,
+    recognition_generation: str,
+    target_lifecycle_id: int,
+    strategy_instance_id: str,
+    execution_binding_id: int,
+    intent: str,
+    effective_action: str,
+    requested_fraction: float | None,
+    effective_fraction: float | None,
+    partial_round_before: int,
+    target_fingerprint: str,
+    target_snapshot: Any,
+    legs: Sequence[ManagementLegCreate],
+    planned_at: datetime,
+    status: str = "ready",
+    reason_code: str | None = None,
+    notification_state: str | None = "pending",
+    validate_current_state: Callable[[Session], None] | None = None,
+) -> int:
+    """Insert a batch in the caller transaction after an immediate state gate."""
+
+    _require_management_unique_indexes(session)
+    if validate_current_state is not None:
+        validate_current_state(session)
+    batch = StrategyManagementBatch(
+        idempotency_fingerprint=idempotency_fingerprint,
+        raw_message_id=raw_message_id,
+        recognition_decision_id=recognition_decision_id,
+        recognition_generation=recognition_generation,
+        target_lifecycle_id=target_lifecycle_id,
+        strategy_instance_id=strategy_instance_id,
+        execution_binding_id=execution_binding_id,
+        intent=intent,
+        effective_action=effective_action,
+        requested_fraction=requested_fraction,
+        effective_fraction=effective_fraction,
+        partial_round_before=partial_round_before,
+        status=status,
+        reason_code=reason_code,
+        target_fingerprint=target_fingerprint,
+        target_snapshot_json=_encode_json(target_snapshot) or "{}",
+        planned_at=planned_at,
+        notification_state=notification_state,
+        created_at=planned_at,
+        updated_at=planned_at,
+    )
+    session.add(batch)
+    session.flush()
+    for leg in legs:
+        session.add(
+            StrategyManagementLeg(
+                management_batch_id=batch.id,
+                execution_order_leg_id=leg.execution_order_leg_id,
+                pos_id=leg.pos_id,
+                leg_index=leg.leg_index,
+                status=leg.status,
+                preflight_size=leg.preflight_size,
+                planned_close_size=leg.planned_close_size,
+                avg_entry_price=leg.avg_entry_price,
+                quantity_step=leg.quantity_step,
+                old_tpsl_json=_encode_json(leg.old_tpsl),
+                planned_tpsl_json=_encode_json(leg.planned_tpsl),
+                client_order_id=leg.client_order_id,
+                exchange_order_id=leg.exchange_order_id,
+                request_json=_encode_json(leg.request),
+                response_json=_encode_json(leg.response),
+                last_error=_encode_json(leg.last_error),
+                last_exchange_snapshot_json=_encode_json(
+                    leg.last_exchange_snapshot
+                ),
+                created_at=planned_at,
+                updated_at=planned_at,
+            )
+        )
+    session.flush()
+    return batch.id
 
 
 def load_management_batch(

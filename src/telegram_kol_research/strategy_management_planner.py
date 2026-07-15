@@ -7,12 +7,14 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from math import isfinite
 from typing import Any
 
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.execution_bindings import (
     build_strategy_instance_id,
+    load_deepcoin_execution_reconciliation_snapshot,
     reconcile_deepcoin_execution_bindings,
 )
 from telegram_kol_research.models import (
@@ -36,6 +38,7 @@ from telegram_kol_research.strategy_management_batches import (
     ManagementBatchRecord,
     ManagementLegCreate,
     create_management_batch,
+    create_management_batch_in_session,
     load_management_batch,
 )
 
@@ -48,6 +51,14 @@ SUPPORTED_INTENTS = frozenset(
 
 class ManagementTargetChangedError(RuntimeError):
     """Raised when a frozen batch target no longer matches fresh preflight."""
+
+
+class ManagementFractionError(ValueError):
+    """Raised when a persisted partial-close fraction is unsafe."""
+
+
+class ManagementPlanningStateChanged(RuntimeError):
+    """Raised when local identity changes before the atomic batch insert."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +77,7 @@ class ManagementPlanningResult:
 class _PlanningIdentity:
     candidate: SignalCandidate
     recognition_decision_id: int
+    recognition_decision_state: tuple[Any, ...]
     lifecycle: StrategyLifecycle
     binding: ExecutionBinding
     entry_legs: tuple[ExecutionOrderLeg, ...]
@@ -78,26 +90,33 @@ def plan_strategy_management_batch(
     deepcoin_client,
     contract_spec_provider,
     planned_at: datetime | None = None,
+    candidate_id: int | None = None,
 ) -> ManagementPlanningResult:
     """Reconcile, reload, validate, and persist one immutable exact target."""
 
     now = planned_at or datetime.now(UTC)
-    try:
-        reconcile_deepcoin_execution_bindings(
-            session_factory,
-            client=deepcoin_client,
-            recovered_at=now,
-        )
-    except Exception:
-        return ManagementPlanningResult(
-            status="blocked", reason_code="management_reconciliation_failed"
-        )
-
     with position_authority_lock():
+        try:
+            reconciliation_snapshot = (
+                load_deepcoin_execution_reconciliation_snapshot(
+                    session_factory, client=deepcoin_client
+                )
+            )
+            reconcile_deepcoin_execution_bindings(
+                session_factory,
+                client=deepcoin_client,
+                recovered_at=now,
+                snapshot=reconciliation_snapshot,
+            )
+        except Exception:
+            return ManagementPlanningResult(
+                status="blocked", reason_code="management_reconciliation_failed"
+            )
         return _plan_strategy_management_batch_locked(
             session_factory,
             raw_message_id=raw_message_id,
-            deepcoin_client=deepcoin_client,
+            candidate_id=candidate_id,
+            reconciliation_snapshot=reconciliation_snapshot,
             contract_spec_provider=contract_spec_provider,
             planned_at=now,
         )
@@ -107,14 +126,17 @@ def _plan_strategy_management_batch_locked(
     session_factory: sessionmaker,
     *,
     raw_message_id: int,
-    deepcoin_client,
+    candidate_id: int | None,
+    reconciliation_snapshot,
     contract_spec_provider,
     planned_at: datetime,
 ) -> ManagementPlanningResult:
     now = planned_at
 
     identity_or_result = _load_exact_identity(
-        session_factory, raw_message_id=raw_message_id
+        session_factory,
+        raw_message_id=raw_message_id,
+        candidate_id=candidate_id,
     )
     if isinstance(identity_or_result, ManagementPlanningResult):
         return identity_or_result
@@ -131,6 +153,16 @@ def _plan_strategy_management_batch_locked(
             intent=intent or "unknown",
             reason_code="management_intent_not_supported",
             planned_at=now,
+        )
+    try:
+        requested_fraction = normalize_requested_management_fraction(
+            intent, candidate.management_fraction
+        )
+    except ManagementFractionError:
+        return ManagementPlanningResult(
+            status="blocked",
+            reason_code="management_fraction_invalid",
+            target_lifecycle_id=lifecycle.id,
         )
     idempotency_fingerprint = _idempotency_fingerprint(
         raw_message_id=raw_message_id,
@@ -162,9 +194,7 @@ def _plan_strategy_management_batch_locked(
 
     instrument_id = f"{str(lifecycle.symbol).upper()}-USDT-SWAP"
     try:
-        live_positions = _read_positions_once(
-            deepcoin_client, instrument_id=instrument_id
-        )
+        live_positions = list(reconciliation_snapshot.positions)
         economics = canonical_live_position_economics(
             live_positions,
             target_pos_ids=[str(leg.pos_id) for leg in identity.entry_legs],
@@ -236,9 +266,7 @@ def _plan_strategy_management_batch_locked(
     protection_by_pos_id: dict[str, dict[str, Any]] = {}
     if intent in PROTECTION_INTENTS:
         try:
-            tpsl_orders = _read_tpsl_once(
-                deepcoin_client, instrument_id=instrument_id
-            )
+            tpsl_orders = list(reconciliation_snapshot.pending_trigger_orders)
         except Exception:
             return _persist_blocked(
                 session_factory,
@@ -251,6 +279,7 @@ def _plan_strategy_management_batch_locked(
         matches = match_position_protection(
             live_positions, tpsl_orders, evidence_available=True
         )
+        seen_protection_order_ids: set[str] = set()
         for position in economics:
             protection = matches.by_pos_id.get(position["pos_id"])
             if protection is None or protection.status != "verified":
@@ -262,7 +291,21 @@ def _plan_strategy_management_batch_locked(
                     reason_code="target_protection_not_verified",
                     planned_at=now,
                 )
-            if not protection.order_ids:
+            protection_row_ids = [
+                _exact_protection_order_id(row) for row in protection.rows
+            ]
+            if (
+                not protection.rows
+                or any(order_id is None for order_id in protection_row_ids)
+                or len(set(protection_row_ids)) != len(protection_row_ids)
+                or protection.order_ids
+                != [str(order_id) for order_id in protection_row_ids]
+                or bool(
+                    seen_protection_order_ids.intersection(
+                        str(order_id) for order_id in protection_row_ids
+                    )
+                )
+            ):
                 return _persist_blocked(
                     session_factory,
                     identity=identity,
@@ -271,15 +314,19 @@ def _plan_strategy_management_batch_locked(
                     reason_code="target_protection_order_identity_unavailable",
                     planned_at=now,
                 )
+            seen_protection_order_ids.update(
+                str(order_id) for order_id in protection_row_ids
+            )
             protection_by_pos_id[position["pos_id"]] = {
                 "status": protection.status,
                 "stop_loss": protection.stop_loss,
                 "take_profits": list(protection.take_profits),
                 "order_ids": list(protection.order_ids),
+                "rows": [dict(row) for row in protection.rows],
                 "evidence": protection.evidence,
             }
 
-    effective_fraction = _effective_fraction(intent, candidate.management_fraction)
+    effective_fraction = _effective_fraction(intent, requested_fraction)
     target_snapshot = {
         "identity": {
             "target_lifecycle_id": lifecycle.id,
@@ -300,48 +347,59 @@ def _plan_strategy_management_batch_locked(
     }
     target_fingerprint = management_target_fingerprint(target_snapshot)
     legs_by_pos_id = _leg_by_pos_id(identity.entry_legs)
-    batch = create_management_batch(
-        session_factory,
-        idempotency_fingerprint=idempotency_fingerprint,
-        raw_message_id=raw_message_id,
-        recognition_decision_id=identity.recognition_decision_id,
-        recognition_generation=str(candidate.recognition_generation),
-        target_lifecycle_id=lifecycle.id,
-        strategy_instance_id=str(binding.strategy_instance_id),
-        execution_binding_id=binding.id,
-        intent=intent,
-        effective_action=intent,
-        requested_fraction=candidate.management_fraction,
-        effective_fraction=effective_fraction,
-        partial_round_before=0,
-        target_fingerprint=target_fingerprint,
-        target_snapshot=target_snapshot,
-        planned_at=now,
-        legs=[
-            ManagementLegCreate(
-                execution_order_leg_id=legs_by_pos_id[position["pos_id"]].id,
-                pos_id=position["pos_id"],
-                leg_index=index,
-                preflight_size=position["size"],
-                planned_close_size=_planned_close_size(
-                    position["size"], effective_fraction=effective_fraction
+    batch_legs = [
+        ManagementLegCreate(
+            execution_order_leg_id=legs_by_pos_id[position["pos_id"]].id,
+            pos_id=position["pos_id"],
+            leg_index=index,
+            preflight_size=position["size"],
+            planned_close_size=_planned_close_size(
+                position["size"], effective_fraction=effective_fraction
+            ),
+            avg_entry_price=position["avg_entry_price"],
+            quantity_step=str(contract_spec.quantity_step),
+            old_tpsl=protection_by_pos_id.get(position["pos_id"]),
+            planned_tpsl=(
+                {"intent": intent, "stop_loss_text": candidate.stop_loss_text}
+                if intent in PROTECTION_INTENTS
+                else None
+            ),
+            last_exchange_snapshot=position,
+        )
+        for index, position in enumerate(economics)
+    ]
+    try:
+        with session_factory() as session:
+            batch_id = create_management_batch_in_session(
+                session,
+                idempotency_fingerprint=idempotency_fingerprint,
+                raw_message_id=raw_message_id,
+                recognition_decision_id=identity.recognition_decision_id,
+                recognition_generation=str(candidate.recognition_generation),
+                target_lifecycle_id=lifecycle.id,
+                strategy_instance_id=str(binding.strategy_instance_id),
+                execution_binding_id=binding.id,
+                intent=intent,
+                effective_action=intent,
+                requested_fraction=requested_fraction,
+                effective_fraction=effective_fraction,
+                partial_round_before=0,
+                target_fingerprint=target_fingerprint,
+                target_snapshot=target_snapshot,
+                planned_at=now,
+                legs=batch_legs,
+                validate_current_state=lambda current_session: (
+                    _require_frozen_identity_current(current_session, identity)
                 ),
-                avg_entry_price=position["avg_entry_price"],
-                quantity_step=str(contract_spec.quantity_step),
-                old_tpsl=protection_by_pos_id.get(position["pos_id"]),
-                planned_tpsl=(
-                    {
-                        "intent": intent,
-                        "stop_loss_text": candidate.stop_loss_text,
-                    }
-                    if intent in PROTECTION_INTENTS
-                    else None
-                ),
-                last_exchange_snapshot=position,
             )
-            for index, position in enumerate(economics)
-        ],
-    )
+            session.commit()
+    except ManagementPlanningStateChanged:
+        return ManagementPlanningResult(
+            status="blocked",
+            reason_code="target_identity_changed_during_planning",
+            target_lifecycle_id=lifecycle.id,
+        )
+    batch = load_management_batch(session_factory, batch_id)
     return ManagementPlanningResult(
         status="ready", batch=batch, target_lifecycle_id=lifecycle.id
     )
@@ -365,7 +423,10 @@ def require_unchanged_target_fingerprint(
 
 
 def _load_exact_identity(
-    session_factory: sessionmaker, *, raw_message_id: int
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    candidate_id: int | None = None,
 ) -> _PlanningIdentity | ManagementPlanningResult:
     with session_factory() as session:
         decision = (
@@ -373,13 +434,21 @@ def _load_exact_identity(
             .filter(RecognitionDecision.raw_message_id == raw_message_id)
             .one_or_none()
         )
-        candidate = (
+        candidate_query = (
             session.query(SignalCandidate)
             .filter(SignalCandidate.raw_message_id == raw_message_id)
             .filter(SignalCandidate.parse_source == "mimo_authoritative")
-            .order_by(SignalCandidate.confidence.desc(), SignalCandidate.id.asc())
-            .first()
+            .filter(
+                SignalCandidate.event_type.in_(["close_signal", "position_update"])
+            )
         )
+        if candidate_id is not None:
+            candidate_query = candidate_query.filter(
+                SignalCandidate.id == candidate_id
+            )
+        candidate = candidate_query.order_by(
+            SignalCandidate.confidence.desc(), SignalCandidate.id.asc()
+        ).first()
         lifecycle_id = candidate.target_lifecycle_id if candidate is not None else None
         if decision is None or candidate is None or not candidate.recognition_generation:
             return ManagementPlanningResult(
@@ -449,6 +518,7 @@ def _load_exact_identity(
         return _PlanningIdentity(
             candidate=candidate,
             recognition_decision_id=decision.id,
+            recognition_decision_state=_recognition_decision_state(decision),
             lifecycle=lifecycle,
             binding=binding,
             entry_legs=tuple(entry_legs),
@@ -499,6 +569,135 @@ def _binding_matches_lifecycle(
         and str(binding.symbol or "").upper() == str(lifecycle.symbol or "").upper()
         and str(binding.side or "").lower() == str(lifecycle.side or "").lower()
         and binding.strategy_instance_id == expected_strategy_instance_id
+    )
+
+
+def _require_frozen_identity_current(session, identity: _PlanningIdentity) -> None:
+    expected_candidate = identity.candidate
+    current_candidate = session.get(SignalCandidate, expected_candidate.id)
+    decision = session.get(RecognitionDecision, identity.recognition_decision_id)
+    current_lifecycle = session.get(StrategyLifecycle, identity.lifecycle.id)
+    current_binding = session.get(ExecutionBinding, identity.binding.id)
+    current_legs = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.execution_binding_id == identity.binding.id)
+        .filter(ExecutionOrderLeg.purpose == "entry")
+        .order_by(ExecutionOrderLeg.leg_index.asc(), ExecutionOrderLeg.id.asc())
+        .all()
+    )
+    active_strategy_binding_ids = [
+        binding_id
+        for (binding_id,) in session.query(ExecutionBinding.id)
+        .filter(ExecutionBinding.venue == "deepcoin")
+        .filter(
+            ExecutionBinding.strategy_instance_id
+            == identity.binding.strategy_instance_id
+        )
+        .filter(ExecutionBinding.status.in_(["open", "active"]))
+        .all()
+    ]
+    if (
+        current_candidate is None
+        or decision is None
+        or current_lifecycle is None
+        or current_binding is None
+        or _candidate_state(current_candidate) != _candidate_state(expected_candidate)
+        or _recognition_decision_state(decision)
+        != identity.recognition_decision_state
+        or _lifecycle_state(current_lifecycle) != _lifecycle_state(identity.lifecycle)
+        or _binding_state(current_binding) != _binding_state(identity.binding)
+        or not _binding_matches_lifecycle(current_binding, current_lifecycle)
+        or [_leg_state(leg) for leg in current_legs]
+        != [_leg_state(leg) for leg in identity.entry_legs]
+        or active_strategy_binding_ids != [identity.binding.id]
+    ):
+        raise ManagementPlanningStateChanged(
+            "target_identity_changed_during_planning"
+        )
+    if _unsafe_entry_leg_reason(tuple(current_legs), binding=current_binding) is not None:
+        raise ManagementPlanningStateChanged(
+            "target_identity_changed_during_planning"
+        )
+    for leg in current_legs:
+        owner = require_verified_position_ownership(
+            session, venue="deepcoin", pos_id=str(leg.pos_id)
+        )
+        if owner.id != leg.id:
+            raise ManagementPlanningStateChanged(
+                "target_identity_changed_during_planning"
+            )
+
+
+def _candidate_state(candidate: SignalCandidate) -> tuple[Any, ...]:
+    return (
+        candidate.id,
+        candidate.raw_message_id,
+        candidate.event_type,
+        candidate.target_lifecycle_id,
+        candidate.management_action,
+        candidate.management_fraction,
+        candidate.recognition_generation,
+        candidate.parse_source,
+        candidate.symbol,
+        candidate.side,
+    )
+
+
+def _recognition_decision_state(decision: RecognitionDecision) -> tuple[Any, ...]:
+    return (
+        decision.id,
+        decision.raw_message_id,
+        decision.authoritative_model,
+        decision.authoritative_status,
+        decision.authoritative_payload_json,
+    )
+
+
+def _lifecycle_state(lifecycle: StrategyLifecycle) -> tuple[Any, ...]:
+    return (
+        lifecycle.id,
+        lifecycle.execution_binding_id,
+        lifecycle.lifecycle_status,
+        lifecycle.chat_id,
+        lifecycle.message_id,
+        lifecycle.symbol,
+        lifecycle.side,
+    )
+
+
+def _binding_state(binding: ExecutionBinding) -> tuple[Any, ...]:
+    return (
+        binding.id,
+        binding.venue,
+        binding.status,
+        binding.strategy_instance_id,
+        binding.chat_id,
+        binding.message_id,
+        binding.symbol,
+        binding.side,
+        binding.pos_id,
+        binding.margin_mode,
+        binding.position_mode,
+    )
+
+
+def _leg_state(leg: ExecutionOrderLeg) -> tuple[Any, ...]:
+    return (
+        leg.id,
+        leg.execution_binding_id,
+        leg.strategy_instance_id,
+        leg.leg_index,
+        leg.purpose,
+        leg.order_kind,
+        leg.order_id,
+        leg.client_order_id,
+        leg.pos_id,
+        leg.venue,
+        leg.attribution_status,
+        leg.attribution_evidence_json,
+        leg.terminal_reason,
+        leg.last_verified_at,
+        leg.status,
     )
 
 
@@ -562,34 +761,34 @@ def _persist_blocked(
     )
 
 
-def _read_positions_once(client, *, instrument_id: str) -> list[dict[str, Any]]:
-    method = getattr(client, "list_positions", None)
-    if method is None:
-        raise RuntimeError("positions method unavailable")
-    try:
-        rows = method(inst_id=instrument_id)
-    except TypeError:
-        rows = method()
-    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-        raise RuntimeError("invalid positions response")
-    return rows
-
-
-def _read_tpsl_once(client, *, instrument_id: str) -> list[dict[str, Any]]:
-    method = getattr(client, "list_trigger_orders_pending", None)
-    if method is None:
-        raise RuntimeError("TPSL method unavailable")
-    rows = method(inst_id=instrument_id)
-    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-        raise RuntimeError("invalid TPSL response")
-    return rows
-
-
 def _effective_fraction(intent: str, requested_fraction: float | None) -> float | None:
     if intent == "full_exit":
         return 1.0
     if intent == "partial_take_profit":
         return float(requested_fraction) if requested_fraction is not None else 0.5
+    return None
+
+
+def normalize_requested_management_fraction(
+    intent: str, value: object
+) -> float | None:
+    if intent != "partial_take_profit":
+        return None
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ManagementFractionError("management_fraction_invalid")
+    fraction = float(value)
+    if not isfinite(fraction) or not 0 < fraction < 1:
+        raise ManagementFractionError("management_fraction_invalid")
+    return fraction
+
+
+def _exact_protection_order_id(row: dict[str, Any]) -> str | None:
+    for key in ("ordId", "orderId", "order_id"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
     return None
 
 

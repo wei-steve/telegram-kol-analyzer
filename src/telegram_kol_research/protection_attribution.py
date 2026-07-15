@@ -16,6 +16,7 @@ class PositionProtection:
     stop_loss: float | None = None
     take_profits: list[float] = field(default_factory=list)
     order_ids: list[str] = field(default_factory=list)
+    rows: list[dict[str, Any]] = field(default_factory=list)
     evidence: dict[str, object] = field(default_factory=dict)
 
     @property
@@ -263,6 +264,7 @@ def _verified_protection(
         stop_loss=stop_losses[-1] if stop_losses else None,
         take_profits=_unique_floats(take_profits),
         order_ids=_order_ids(rows),
+        rows=[dict(row) for row in rows],
         evidence=evidence,
     )
 

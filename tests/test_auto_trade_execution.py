@@ -336,6 +336,16 @@ def test_management_planning_never_writes_before_batch_executor_exists(
                 confidence=0.99,
             )
         )
+        session.add(
+            SignalCandidate(
+                raw_message_id=management.id,
+                symbol="ETH",
+                side="long",
+                event_type="entry_signal",
+                parse_source="mimo_authoritative",
+                confidence=1.0,
+            )
+        )
         from telegram_kol_research.models import ExecutionOrderLeg, RecognitionDecision
 
         session.add(

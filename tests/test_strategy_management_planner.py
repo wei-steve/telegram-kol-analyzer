@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import text
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
@@ -209,7 +210,7 @@ def _persist_exact_management_target(
                 raw_message_id=management.id,
                 input_kind="text",
                 authoritative_model="mimo",
-                authoritative_status="success",
+                authoritative_status="非策略",
                 authoritative_payload_json="{}",
                 agreement_status="authoritative_only",
                 differences_json="[]",
@@ -313,7 +314,25 @@ def test_exact_identity_chain_creates_all_verified_targets(monkeypatch, tmp_path
     assert result.batch.execution_binding_id == binding_id
     assert result.batch.strategy_instance_id == "deepcoin:100:20:BTC:short"
     assert [leg.pos_id for leg in result.batch.legs] == ["pos-b-1", "pos-b-2"]
-    assert client.position_reads == ["BTC-USDT-SWAP"]
+    assert client.position_reads == [None]
+
+
+def test_real_reconciliation_and_planner_share_one_position_snapshot(tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(session_factory)
+    client = _ReadOnlyDeepcoin([_position()])
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert client.position_reads == [None]
 
 
 def test_two_active_bindings_for_strategy_blocks_whole_batch(monkeypatch, tmp_path):
@@ -535,3 +554,142 @@ def test_inline_protection_without_exact_order_id_blocks_plan(monkeypatch, tmp_p
 
     assert result.status == "blocked"
     assert result.reason_code == "target_protection_order_identity_unavailable"
+
+
+def test_any_protection_row_without_exact_unique_id_blocks_plan(monkeypatch, tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory, intent="adjust_stop_loss"
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    common = {
+        "instId": "BTC-USDT-SWAP",
+        "posId": "pos-b",
+        "posSide": "short",
+        "triggerOrderType": "TPSL",
+        "sz": "0",
+        "cTime": "1721000000000",
+    }
+    client = _ReadOnlyDeepcoin(
+        [_position()],
+        tpsl_orders=[
+            {**common, "ordId": "exact-sl", "slTriggerPx": "63000"},
+            {**common, "tpTriggerPx": "60000"},
+        ],
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "target_protection_order_identity_unavailable"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        False,
+        True,
+        0,
+        -0.1,
+        1,
+        1.1,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "0.5",
+    ],
+)
+def test_partial_fraction_boundary_rejects_invalid_or_corrupt_values(value):
+    planner = _planner()
+
+    with pytest.raises(planner.ManagementFractionError):
+        planner.normalize_requested_management_fraction(
+            "partial_take_profit", value
+        )
+
+
+def test_unqualified_partial_fraction_remains_unset_for_task5():
+    planner = _planner()
+
+    assert (
+        planner.normalize_requested_management_fraction(
+            "partial_take_profit", None
+        )
+        is None
+    )
+
+
+def test_corrupt_persisted_partial_fraction_blocks_without_batch(monkeypatch, tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory, intent="partial_take_profit"
+    )
+    with session_factory() as session:
+        session.execute(
+            text(
+                "UPDATE signal_candidates SET management_fraction = 'corrupt' "
+                "WHERE raw_message_id = :raw_id"
+            ),
+            {"raw_id": raw_id},
+        )
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "management_fraction_invalid"
+    assert result.batch is None
+
+
+def test_final_revalidation_runs_inside_insert_transaction(monkeypatch, tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(session_factory)
+    _disable_reconciliation(monkeypatch, planner)
+    original = planner.create_management_batch_in_session
+
+    def mutate_then_create(session, *args, **kwargs):
+        with session_factory() as other_session:
+            candidate = (
+                other_session.query(SignalCandidate)
+                .filter(SignalCandidate.raw_message_id == raw_id)
+                .one()
+            )
+            candidate.management_action = "partial_take_profit"
+            other_session.commit()
+        return original(session, *args, **kwargs)
+
+    monkeypatch.setattr(
+        planner, "create_management_batch_in_session", mutate_then_create
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "target_identity_changed_during_planning"
+    assert result.batch is None
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementBatch
+
+        assert session.query(StrategyManagementBatch).count() == 0

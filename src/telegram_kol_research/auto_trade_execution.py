@@ -59,19 +59,26 @@ def auto_process_message_trade_signal(
 
     now = processed_at or datetime.now(UTC)
     settings = load_trading_settings(session_factory)
-    loaded = _load_best_entry_candidate(session_factory, raw_message_id=raw_message_id)
-    if loaded is None:
+    management_loaded = _load_best_management_candidate(
+        session_factory, raw_message_id=raw_message_id
+    )
+    if management_loaded is not None:
         if not settings.management_planning_enabled:
             return {"status": "skipped", "reason": "management_execution_disabled"}
         return _auto_process_management_signal(
             session_factory,
             raw_message_id=raw_message_id,
+            candidate_id=management_loaded[1].id,
+            loaded=management_loaded,
             group_config=group_config,
             deepcoin_client=deepcoin_client,
             contract_spec_provider=contract_spec_provider,
             settings=settings,
             processed_at=now,
         )
+    loaded = _load_best_entry_candidate(session_factory, raw_message_id=raw_message_id)
+    if loaded is None:
+        return {"status": "skipped", "reason": "no_entry_signal_candidate"}
     if not settings.auto_trade_enabled:
         return {"status": "skipped", "reason": "auto_trade_disabled"}
     raw_message, candidate, source, has_media = loaded
@@ -358,18 +365,17 @@ def _auto_process_management_signal(
     session_factory: sessionmaker,
     *,
     raw_message_id: int,
+    candidate_id: int,
+    loaded: tuple[RawMessage, SignalCandidate, Source | None, bool],
     group_config: GroupConfig,
     deepcoin_client: DeepcoinTradingClientProtocol,
     contract_spec_provider: DeepcoinContractSpecProvider | None,
     settings,
     processed_at: datetime,
 ) -> dict[str, Any]:
-    loaded = _load_best_management_candidate(
-        session_factory, raw_message_id=raw_message_id
-    )
-    if loaded is None:
-        return {"status": "skipped", "reason": "no_management_signal_candidate"}
     raw_message, candidate, source, has_media = loaded
+    if candidate.id != candidate_id:
+        return {"status": "blocked", "reason": "management_candidate_changed"}
     runtime_group_config = apply_trading_settings_to_group_config(
         group_config, settings
     )
@@ -396,6 +402,7 @@ def _auto_process_management_signal(
         deepcoin_client=deepcoin_client,
         contract_spec_provider=contract_spec_provider,
         planned_at=processed_at,
+        candidate_id=candidate_id,
     )
     if result.status != "ready" or result.batch is None:
         return {
