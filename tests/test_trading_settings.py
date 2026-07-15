@@ -72,6 +72,41 @@ def test_management_execution_mode_rejects_invalid_value():
         trading_settings_from_payload({"management_execution_mode": "unsafe"})
 
 
+@pytest.mark.parametrize("value", ["false", "0", 0, 1])
+def test_auto_trade_enabled_rejects_non_boolean_values(value):
+    with pytest.raises(ValueError, match="auto_trade_enabled"):
+        trading_settings_from_payload(
+            {
+                "management_execution_mode": "live",
+                "auto_trade_enabled": value,
+            }
+        )
+
+
+@pytest.mark.parametrize("field", [
+    "move_stop_to_breakeven_after_tp1",
+    "allow_vision_auto_trade",
+])
+def test_trading_settings_boolean_fields_use_strict_validation(field):
+    with pytest.raises(ValueError, match=field):
+        trading_settings_from_payload({field: "false"})
+
+
+@pytest.mark.parametrize("value", [[], {}, 1, None])
+def test_management_execution_mode_rejects_non_string_values(value):
+    with pytest.raises(ValueError, match="management_execution_mode"):
+        trading_settings_from_payload({"management_execution_mode": value})
+
+
+def test_management_execution_mode_normalizes_allowed_string():
+    settings = trading_settings_from_payload(
+        {"management_execution_mode": " LIVE ", "auto_trade_enabled": True}
+    )
+
+    assert settings.management_execution_mode == "live"
+    assert settings.live_management_execution_enabled is True
+
+
 def test_save_trading_settings_normalizes_user_input(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
 

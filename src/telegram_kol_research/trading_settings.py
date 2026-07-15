@@ -144,7 +144,11 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         raw.get("management_execution_mode", defaults.management_execution_mode)
     )
     return TradingSettings(
-        auto_trade_enabled=bool(raw.get("auto_trade_enabled", defaults.auto_trade_enabled)),
+        auto_trade_enabled=_boolean_setting(
+            raw,
+            "auto_trade_enabled",
+            defaults.auto_trade_enabled,
+        ),
         management_execution_mode=management_execution_mode,
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
@@ -174,14 +178,15 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         symbol_max_loss_usdt=symbol_max_loss_usdt,
         entry_range_order_style=style,
         take_profit_allocations=take_profit_allocations,
-        move_stop_to_breakeven_after_tp1=bool(
-            raw.get(
-                "move_stop_to_breakeven_after_tp1",
-                defaults.move_stop_to_breakeven_after_tp1,
-            )
+        move_stop_to_breakeven_after_tp1=_boolean_setting(
+            raw,
+            "move_stop_to_breakeven_after_tp1",
+            defaults.move_stop_to_breakeven_after_tp1,
         ),
-        allow_vision_auto_trade=bool(
-            raw.get("allow_vision_auto_trade", defaults.allow_vision_auto_trade)
+        allow_vision_auto_trade=_boolean_setting(
+            raw,
+            "allow_vision_auto_trade",
+            defaults.allow_vision_auto_trade,
         ),
     )
 
@@ -189,10 +194,28 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
 def _management_execution_mode(
     value: Any,
 ) -> Literal["disabled", "shadow", "live"]:
-    if value not in {"disabled", "shadow", "live"}:
+    if not isinstance(value, str):
         raise ValueError(
             "management_execution_mode must be disabled, shadow, or live"
         )
+    normalized = value.strip().lower()
+    if normalized not in {"disabled", "shadow", "live"}:
+        raise ValueError(
+            "management_execution_mode must be disabled, shadow, or live"
+        )
+    return normalized
+
+
+def _boolean_setting(
+    payload: dict[str, Any],
+    field_name: str,
+    default: bool,
+) -> bool:
+    if field_name not in payload:
+        return default
+    value = payload[field_name]
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
     return value
 
 

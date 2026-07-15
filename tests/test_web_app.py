@@ -473,6 +473,35 @@ def test_management_execution_mode_api_rejects_invalid_value(tmp_path):
     assert "management_execution_mode" in response.json()["detail"]
 
 
+@pytest.mark.parametrize("value", ["false", "0", 0, 1])
+def test_trading_settings_api_rejects_non_boolean_auto_trade_enabled(tmp_path, value):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "management_execution_mode": "live",
+            "auto_trade_enabled": value,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "auto_trade_enabled" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("value", [[], {}, 1, None])
+def test_management_execution_mode_api_rejects_non_string_values(tmp_path, value):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={"management_execution_mode": value},
+    )
+
+    assert response.status_code == 422
+    assert "management_execution_mode" in response.json()["detail"]
+
+
 def test_trading_settings_symbols_api_lists_deepcoin_symbols_with_selection(tmp_path):
     class FakeDeepcoinClient:
         def list_swap_symbols(self):
