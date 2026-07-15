@@ -1,7 +1,9 @@
 """CLI entrypoints for the Telegram KOL research app."""
 
 import asyncio
+import hashlib
 import json
+import sqlite3
 import shutil
 from dataclasses import asdict
 from enum import Enum
@@ -107,6 +109,299 @@ class ExperimentInputKind(str, Enum):
     all = "all"
     text = "text"
     image = "image"
+
+
+_MANAGEMENT_SIGNAL_ACTIONS = frozenset(
+    {
+        "adjust_position_tpsl",
+        "adjust_stop_loss",
+        "adjust_take_profit",
+        "close_position",
+        "exit_position",
+        "partial_close_and_move_stop_to_entry",
+        "temporary_close",
+        "temporary_exit",
+    }
+)
+_MANAGEMENT_ALERT_STATES = (
+    "blocked",
+    "submit_unknown",
+    "partial_failed",
+    "recovery_required",
+)
+
+
+def _redacted_ref(kind: str, value: object) -> str | None:
+    if value is None or str(value) == "":
+        return None
+    digest = hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:10]
+    return f"{kind}:{digest}"
+
+
+def _bounded_text(value: object, *, limit: int = 64) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).replace("\r", " ").replace("\n", " ")
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit] + "..."
+
+
+def _malformed_json_fields(row: sqlite3.Row, fields: tuple[str, ...]) -> list[str]:
+    malformed: list[str] = []
+    keys = set(row.keys())
+    for field in fields:
+        if field not in keys or row[field] in {None, ""}:
+            continue
+        try:
+            json.loads(row[field])
+        except (json.JSONDecodeError, TypeError):
+            malformed.append(field)
+    return malformed
+
+
+def _sqlite_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')}
+
+
+def _has_columns(
+    connection: sqlite3.Connection, table: str, required: set[str]
+) -> bool:
+    return required.issubset(_sqlite_columns(connection, table))
+
+
+def _canonical_positive_id(payload: object, key: str) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isdigit() and not value.startswith("0"):
+        normalized = int(value)
+        return normalized if normalized > 0 else None
+    return None
+
+
+def _audit_pending_legacy_management_read_only(
+    connection: sqlite3.Connection, *, limit: int
+) -> dict:
+    required = {
+        "id",
+        "source_type",
+        "venue",
+        "chat_id",
+        "message_id",
+        "action",
+        "status",
+        "payload_json",
+        "created_at",
+    }
+    if not _has_columns(connection, "trade_signals", required):
+        return {
+            "status": "schema_unavailable",
+            "total": 0,
+            "returned": 0,
+            "truncated": False,
+            "malformed_payload_count": 0,
+            "by_action": {},
+            "items": [],
+        }
+    placeholders = ",".join("?" for _ in _MANAGEMENT_SIGNAL_ACTIONS)
+    rows = connection.execute(
+        "SELECT id, source_type, chat_id, message_id, action, status, payload_json "
+        "FROM trade_signals WHERE venue = 'deepcoin' AND status = 'pending' "
+        f"AND action IN ({placeholders}) ORDER BY created_at ASC, id ASC LIMIT 5001",
+        tuple(sorted(_MANAGEMENT_SIGNAL_ACTIONS)),
+    ).fetchall()
+    scan_truncated = len(rows) > 5000
+    legacy: list[tuple[sqlite3.Row, bool]] = []
+    for row in rows[:5000]:
+        malformed = False
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+            malformed = True
+        if _canonical_positive_id(payload, "management_batch_id") is None:
+            legacy.append((row, malformed))
+    selected = legacy[:limit]
+    by_action: dict[str, int] = {}
+    for row, _ in legacy:
+        action = str(row["action"] or "unknown")
+        by_action[action] = by_action.get(action, 0) + 1
+    return {
+        "status": "available",
+        "total": len(legacy),
+        "returned": len(selected),
+        "truncated": scan_truncated or len(selected) < len(legacy),
+        "scan_truncated": scan_truncated,
+        "malformed_payload_count": sum(1 for _, malformed in legacy if malformed),
+        "by_action": dict(sorted(by_action.items())),
+        "items": [
+            {
+                "signal_id": int(row["id"]),
+                "action": _bounded_text(row["action"]),
+                "status": _bounded_text(row["status"]),
+                "source_type": _bounded_text(row["source_type"]),
+                "chat_ref": _redacted_ref("chat", row["chat_id"]),
+                "message_id": row["message_id"],
+                "payload_status": "malformed" if malformed else "missing_batch_id",
+            }
+            for row, malformed in selected
+        ],
+    }
+
+
+def _audit_management_batches_read_only(database_path: Path, *, limit: int) -> dict:
+    uri = database_path.resolve().as_uri() + "?mode=ro"
+    with sqlite3.connect(uri, uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        batch_required = {
+            "id",
+            "raw_message_id",
+            "target_lifecycle_id",
+            "strategy_instance_id",
+            "execution_binding_id",
+            "intent",
+            "effective_action",
+            "execution_mode",
+            "status",
+            "target_snapshot_json",
+            "planned_at",
+        }
+        leg_required = {
+            "id",
+            "management_batch_id",
+            "pos_id",
+            "leg_index",
+            "status",
+            "preflight_size",
+            "planned_close_size",
+            "last_error",
+        }
+        schema_available = _has_columns(
+            connection, "strategy_management_batches", batch_required
+        ) and _has_columns(connection, "strategy_management_legs", leg_required)
+        result = {
+            "schema_status": (
+                "available" if schema_available else "management_schema_missing"
+            ),
+            "limit": limit,
+            "counts": {
+                "batches_total": 0,
+                **{state: 0 for state in _MANAGEMENT_ALERT_STATES},
+            },
+            "batches_returned": 0,
+            "batches_truncated": False,
+            "batches": [],
+        }
+        if schema_available:
+            result["counts"]["batches_total"] = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM strategy_management_batches"
+                ).fetchone()[0]
+            )
+            for state in _MANAGEMENT_ALERT_STATES:
+                result["counts"][state] = int(
+                    connection.execute(
+                        "SELECT COUNT(DISTINCT b.id) "
+                        "FROM strategy_management_batches b "
+                        "LEFT JOIN strategy_management_legs l "
+                        "ON l.management_batch_id = b.id "
+                        "WHERE b.status = ? OR l.status = ?",
+                        (state, state),
+                    ).fetchone()[0]
+                )
+            has_raw_source = _has_columns(
+                connection, "raw_messages", {"id", "chat_id", "message_id"}
+            )
+            source_select = (
+                ", r.chat_id AS source_chat_id, r.message_id AS source_message_id "
+                if has_raw_source
+                else ", NULL AS source_chat_id, NULL AS source_message_id "
+            )
+            source_join = (
+                "LEFT JOIN raw_messages r ON r.id = b.raw_message_id "
+                if has_raw_source
+                else ""
+            )
+            batches = connection.execute(
+                "SELECT b.id, b.raw_message_id, b.target_lifecycle_id, "
+                "b.strategy_instance_id, b.execution_binding_id, b.intent, "
+                "b.effective_action, b.execution_mode, b.status, "
+                "b.target_snapshot_json, b.planned_at "
+                + source_select
+                + "FROM strategy_management_batches b "
+                + source_join
+                + "ORDER BY b.planned_at DESC, b.id DESC LIMIT ?",
+                (limit + 1,),
+            ).fetchall()
+            result["batches_truncated"] = len(batches) > limit
+            for batch in batches[:limit]:
+                legs = connection.execute(
+                    "SELECT id, pos_id, leg_index, status, preflight_size, "
+                    "planned_close_size, last_error FROM strategy_management_legs "
+                    "WHERE management_batch_id = ? ORDER BY leg_index ASC, id ASC "
+                    "LIMIT 101",
+                    (batch["id"],),
+                ).fetchall()
+                legs_truncated = len(legs) > 100
+                legs = legs[:100]
+                result["batches"].append(
+                    {
+                        "batch_id": int(batch["id"]),
+                        "status": _bounded_text(batch["status"]),
+                        "intent": _bounded_text(batch["intent"]),
+                        "effective_action": _bounded_text(batch["effective_action"]),
+                        "execution_mode": _bounded_text(batch["execution_mode"]),
+                        "planned_at": _bounded_text(batch["planned_at"]),
+                        "source": {
+                            "raw_message_id": int(batch["raw_message_id"]),
+                            "chat_ref": _redacted_ref(
+                                "chat", batch["source_chat_id"]
+                            ),
+                            "message_id": batch["source_message_id"],
+                        },
+                        "target": {
+                            "lifecycle_id": int(batch["target_lifecycle_id"]),
+                            "strategy_ref": _redacted_ref(
+                                "strategy", batch["strategy_instance_id"]
+                            ),
+                            "binding_id": int(batch["execution_binding_id"]),
+                        },
+                        "malformed_json_fields": _malformed_json_fields(
+                            batch, ("target_snapshot_json",)
+                        ),
+                        "legs_returned": len(legs),
+                        "legs_truncated": legs_truncated,
+                        "legs": [
+                            {
+                                "leg_id": int(leg["id"]),
+                                "leg_index": int(leg["leg_index"]),
+                                "status": _bounded_text(leg["status"]),
+                                "pos_ref": _redacted_ref("pos", leg["pos_id"]),
+                                "preflight_size": _bounded_text(
+                                    leg["preflight_size"]
+                                ),
+                                "planned_close_size": _bounded_text(
+                                    leg["planned_close_size"]
+                                ),
+                                "malformed_json_fields": _malformed_json_fields(
+                                    leg, ("last_error",)
+                                ),
+                            }
+                            for leg in legs
+                        ],
+                    }
+                )
+            result["batches_returned"] = len(result["batches"])
+        result["legacy_pending_management"] = (
+            _audit_pending_legacy_management_read_only(connection, limit=limit)
+        )
+        return result
 
 
 def _record_within_window(record: NormalizedMessageRecord, *, start_at, end_at) -> bool:
@@ -625,6 +920,59 @@ def repair_execution_order_legs(
     session_factory = create_session_factory(database_path)
     repaired = repair_execution_order_legs_from_binding_payloads(session_factory)
     typer.echo(f"Repaired {repaired} execution order leg(s) in {database_path}")
+
+
+@app.command("audit-management-batches")
+def audit_management_batches(
+    database_path: Path = Path("data/research.db"),
+    limit: int = typer.Option(20, min=1, max=100),
+    output_format: str = typer.Option("text", "--output-format"),
+) -> None:
+    """Read a bounded, redacted management batch and legacy queue summary."""
+
+    normalized_format = output_format.strip().lower()
+    if normalized_format not in {"json", "text"}:
+        raise typer.BadParameter("output-format must be one of: text, json")
+    try:
+        audit = _audit_management_batches_read_only(database_path, limit=limit)
+    except sqlite3.OperationalError as exc:
+        typer.echo(f"Read-only audit unavailable: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if normalized_format == "json":
+        typer.echo(json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    counts = audit["counts"]
+    typer.echo(f"Management schema: {audit['schema_status']}")
+    typer.echo(
+        "Batch counts: "
+        + ", ".join(
+            f"{key}={counts[key]}"
+            for key in ("batches_total", *_MANAGEMENT_ALERT_STATES)
+        )
+    )
+    typer.echo(
+        f"Recent batches: {audit['batches_returned']}"
+        f" (truncated={str(audit['batches_truncated']).lower()})"
+    )
+    for batch in audit["batches"]:
+        source = batch["source"]
+        typer.echo(
+            f"- batch={batch['batch_id']} state={batch['status']} "
+            f"action={batch['effective_action']} mode={batch['execution_mode']} "
+            f"source={source['chat_ref']}/{source['message_id']} "
+            f"legs={len(batch['legs'])}"
+        )
+        for leg in batch["legs"]:
+            typer.echo(
+                f"  leg={leg['leg_id']} pos={leg['pos_ref']} state={leg['status']} "
+                f"size={leg['preflight_size']} close={leg['planned_close_size']}"
+            )
+    legacy = audit["legacy_pending_management"]
+    typer.echo(
+        f"Legacy pending management: status={legacy['status']} "
+        f"total={legacy['total']} returned={legacy['returned']} "
+        f"truncated={str(legacy['truncated']).lower()}"
+    )
 
 
 @app.command("repair-position-attribution")

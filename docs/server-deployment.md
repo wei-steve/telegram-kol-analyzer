@@ -170,6 +170,86 @@ nonzero historical plan as part of deployment review; deployment stops after a
 fresh dry run until the operator separately approves the exact actions and
 fingerprint.
 
+### Deploy strategy-management batches with execution disabled
+
+This section is preparation only. Do not push, deploy, enable shadow, or call a
+real Deepcoin endpoint until the final reviewed commit receives a new explicit
+deployment approval. Deepcoin triggered-limit lineage is a separate task and
+branch; its attribution migration must not be included here.
+
+Before an approved deployment, record the reviewed new and rollback commit
+SHAs. Confirm local focused/full tests passed and that a temporary writable
+database can be initialized twice with an identical schema. The safe defaults
+must remain:
+
+```text
+auto_trade_enabled=false
+management_execution_mode=disabled
+```
+
+After approval, use the normal GitHub/server helper. Do not change either gate
+before or during the update. On the server, verify the reviewed SHA and service
+state first:
+
+```bash
+cd /opt/telegram-kol-analyzer
+git rev-parse HEAD
+systemctl is-active telegram-kol.service
+systemctl --no-pager --full status telegram-kol.service
+```
+
+Use read-only SQLite checks to verify the schema and persisted gates. A missing
+`global` settings row means runtime safe defaults; a present row must explicitly
+show automatic trading false and management mode disabled before proceeding.
+
+```bash
+sqlite3 -readonly data/research.db <<'SQL'
+.headers on
+.mode column
+SELECT name FROM sqlite_master
+WHERE type='table'
+  AND name IN ('strategy_management_batches',
+               'strategy_management_legs',
+               'strategy_management_notifications')
+ORDER BY name;
+SELECT name FROM sqlite_master
+WHERE type='index'
+  AND name IN ('uq_strategy_management_batches_idempotency',
+               'uq_strategy_management_batches_active_strategy',
+               'uq_strategy_management_legs_batch_pos')
+ORDER BY name;
+SELECT key, value_json FROM trading_settings WHERE key='global';
+SQL
+```
+
+Then capture bounded, redacted, read-only evidence:
+
+```bash
+telegram-kol-research audit-management-batches \
+  --database-path data/research.db --limit 20 --output-format json
+```
+
+Review batch/leg counts, legacy pending management signals, malformed fields,
+and every `blocked`, `submit_unknown`, `partial_failed`, or
+`recovery_required` count. The audit never performs compatibility migration or
+legacy conversion. Stop deployment review if the service is inactive, the SHA
+differs, a table/index is missing, either gate is unsafe, schema is old, output
+is malformed, or ownership evidence is stale/ambiguous. Do not fix those
+conditions by enabling execution, editing production rows, retrying an unknown
+request, or placing a test order.
+
+This rollout ends with both gates off. Shadow observation and especially live
+management are later changes requiring explicit approval. Live additionally
+requires reviewed shadow evidence that source group/message, lifecycle,
+strategy, binding, verified entry legs, immutable batch legs, and exact
+`posId`s remain one-to-one.
+
+For rollback, keep both gates off, revert the reviewed deployment commit on the
+deployment branch, review and push that revert, then run the normal server
+update helper again. Recheck `git rev-parse HEAD`, service health, settings, and
+the read-only audit. Schema tables may safely remain; do not drop tables or
+delete batch/outbox history during rollback.
+
 ## Data And Secrets
 
 Do not commit runtime data or secrets to GitHub. Keep these on the server:

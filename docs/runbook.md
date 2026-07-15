@@ -162,6 +162,70 @@ Recommended browser flow:
 7. If needed, ask for a different bounded range in natural language, for example `总结最近 200 条消息`.
 8. Adjust the group-specific default prompt at the top of the AI panel when you want a different standing analysis style for that group.
 
+## Audit strategy-management batches
+
+Keep both production gates off for this rollout:
+
+```text
+auto_trade_enabled=false
+management_execution_mode=disabled
+```
+
+`disabled` neither plans nor executes position management. `shadow` may save a
+plan for review but cannot send it to Deepcoin. `live` can execute only when
+the global automatic-trading gate is also true. Do not enable shadow or live as
+part of this rollout. Live requires a new explicit approval after reviewed
+shadow evidence.
+
+Run the bounded read-only audit from the server checkout:
+
+```bash
+telegram-kol-research audit-management-batches \
+  --database-path data/research.db \
+  --limit 20 \
+  --output-format text
+
+telegram-kol-research audit-management-batches \
+  --database-path data/research.db \
+  --limit 20 \
+  --output-format json
+```
+
+The command opens SQLite in read-only mode. It does not initialize or migrate
+the schema, claim or convert legacy signals, build a Deepcoin client, make a
+network call, retry work, or change database state. Output is capped at 100
+batches, hashes chat/strategy/position identifiers, and contains only safe
+database IDs, actions, states, modes, sizes, counts, and malformed-JSON flags.
+It includes abnormal counts for `blocked`, `submit_unknown`, `partial_failed`,
+and `recovery_required`, plus bounded pending legacy management signals which
+have no canonical `management_batch_id`. `management_schema_missing` or
+`schema_unavailable` is an audit result, not permission to run a compatibility
+migration.
+
+Interpret and handle abnormal states as follows:
+
+- `blocked`: correct the identity/evidence/configuration defect, then allow a
+  new source message to form a new batch. Do not edit the blocked row.
+- `submit_unknown`: freeze. Compare the exact client/order identity against a
+  fresh coherent exchange snapshot. Never automatically retry an unknown
+  request, because the first request may have succeeded.
+- `partial_failed`: retain and report earlier confirmed leg successes. Review
+  each failed leg and its exchange evidence independently; do not repeat the
+  entire strategy action.
+- `recovery_required`: keep both gates off, preserve the batch/outbox, and
+  collect exact position, order, fill, and TPSL evidence. Resume only through a
+  separately reviewed recovery procedure.
+- Manual close/cancel: verify the exact `posId` or order is absent/terminal,
+  reconcile the verified entry leg and lifecycle, then audit again. Never bind
+  a new same-symbol position by proximity.
+- Stale or conflicting ownership: leave it unassigned/conflicted, audit the
+  candidate/lifecycle/binding/entry legs separately, and use the fingerprinted
+  attribution-repair dry run if appropriate. Never auto-repair ambiguity.
+
+Pending legacy management signals are audit-only. Do not claim, execute, or
+convert them during deployment. Deepcoin triggered-limit lineage is a separate
+branch and must not be repaired or migrated by this rollout.
+
 ## 9. Test the Project
 
 Run the current automated test suite:

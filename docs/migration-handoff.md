@@ -199,3 +199,53 @@ Never bypass the planner/fingerprint by editing the production database directly
 
 Production remains fail closed until real positions, entry legs, pending orders,
 TPSL, audit incidents, service health, and server tests all agree.
+
+## Durable strategy-management batches
+
+Telegram position management now uses one exact, group-isolated identity chain:
+source chat/message -> candidate -> lifecycle -> strategy instance -> execution
+binding -> verified entry legs -> immutable management batch legs -> Deepcoin
+`posId`s. A lifecycle, symbol, side, price, or lone remaining position is never
+enough to cross a missing link. Any ambiguity, stale ownership, missing leg, or
+exchange-evidence failure blocks the whole preflight before an exchange write.
+
+An unqualified first partial take-profit closes 50% of the total verified
+strategy position, allocated proportionally over every split position. An
+explicit fraction overrides that default. The second distinct partial request
+closes all remaining size, so repeated partial messages cannot leave an
+indefinite tail. Full exit also covers every split position. An explicit stop
+price is applied to every position; breakeven uses each position's own average
+entry price. Existing TP/SL protection is preserved or compensated per
+position, and a composite partial-then-breakeven action waits for exchange
+confirmation of the close phase before replacing protection.
+
+The batch and leg rows are the durable execution journal. `ready` is planned
+but unclaimed, `executing` is the compare-and-set owner, `reserved` is durable
+pre-submit intent, `submitted` awaits exchange truth, and `reconciling` checks
+one coherent exchange snapshot. `protection_ready` means a confirmed composite
+close may enter its protection phase. `succeeded`, `blocked`, and `resolved`
+are safe terminal states. `partial_failed` means some legs succeeded while a
+known failure remains; `submit_unknown` means an exchange outcome is unknown
+and must never be automatically retried; `recovery_required` freezes the batch
+for operator investigation. `restored` means failed protection replacement was
+compensated with the complete prior protection for that position. Earlier
+confirmed successes are never rolled back or hidden.
+
+Abnormal transitions persist an immutable notification/outbox identity in the
+same database transaction. Sending is separately claimed and bounded; a bot
+failure cannot alter the batch or authorize a retry. Exchange reconciliation,
+not an HTTP success response, confirms close completion. Manual close/cancel is
+a first-class terminal fact: refresh exact exchange evidence and reconcile the
+bound legs rather than attaching a new same-symbol position or editing rows.
+
+The settings have three meanings: `disabled` creates no management plan and
+performs no management exchange write; `shadow` may persist reviewed plans but
+does not execute them; `live` is effective only together with
+`auto_trade_enabled=true`. This rollout must remain
+`auto_trade_enabled=false` and `management_execution_mode=disabled`. Enabling
+shadow or live requires a later, explicit approval; live additionally requires
+reviewed shadow evidence.
+
+Deepcoin triggered-limit lineage (trigger -> generated regular order -> fill ->
+position) is deliberately a separate task and branch. Do not mix its historical
+attribution migration or compatibility repair into this batch rollout.

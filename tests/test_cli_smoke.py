@@ -1,5 +1,7 @@
 from typer.testing import CliRunner
 from datetime import UTC, datetime
+import json
+import sqlite3
 from types import SimpleNamespace
 
 from telegram_kol_research.cli import app
@@ -9,6 +11,7 @@ from telegram_kol_research.execution_bindings import (
     list_execution_order_legs,
     upsert_execution_binding,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 def test_cli_help_renders():
@@ -18,6 +21,168 @@ def test_cli_help_renders():
     assert "report" in result.stdout
     assert "recovery-dry-run" in result.stdout
     assert "repair-position-attribution" in result.stdout
+    assert "audit-management-batches" in result.stdout
+
+
+def test_audit_management_batches_is_bounded_redacted_and_read_only(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO raw_messages "
+            "(id, chat_id, message_id, archived_target_group, created_at) "
+            "VALUES (11, -1001234567890, 8427, 1, '2026-07-15 10:00:00')"
+        )
+        for batch_id, status in ((21, "recovery_required"), (22, "blocked")):
+            connection.execute(
+                "INSERT INTO strategy_management_batches "
+                "(id, idempotency_fingerprint, raw_message_id, recognition_decision_id, "
+                "recognition_generation, target_lifecycle_id, strategy_instance_id, "
+                "execution_binding_id, intent, effective_action, execution_mode, "
+                "partial_round_before, status, target_fingerprint, target_snapshot_json, "
+                "planned_at, created_at, updated_at) "
+                "VALUES (?, ?, 11, 31, 'generation-secret', 41, ?, 51, "
+                "'partial_take_profit', 'partial_close', 'shadow', 0, ?, ?, ?, "
+                "'2026-07-15 10:00:00', '2026-07-15 10:00:00', '2026-07-15 10:00:00')",
+                (
+                    batch_id,
+                    f"fingerprint-{batch_id}",
+                    f"strategy-secret-{batch_id}",
+                    status,
+                    f"target-secret-{batch_id}",
+                    "{malformed" if batch_id == 21 else "{}",
+                ),
+            )
+        connection.execute(
+            "UPDATE strategy_management_batches "
+            "SET planned_at = '2026-07-15 11:00:00' WHERE id = 21"
+        )
+        connection.execute(
+            "INSERT INTO strategy_management_legs "
+            "(id, management_batch_id, execution_order_leg_id, pos_id, leg_index, "
+            "status, preflight_size, planned_close_size, last_error, created_at, updated_at) "
+            "VALUES (61, 21, 71, 'pos-secret-abcdef', 1, 'submit_unknown', '0.02', "
+            "'0.01', '{broken', '2026-07-15 10:00:00', '2026-07-15 10:00:00')"
+        )
+        connection.execute(
+            "INSERT INTO trade_signals "
+            "(id, signal_uid, source_type, venue, kol_id, chat_id, message_id, symbol, "
+            "side, action, status, payload_json, attempts, created_at, updated_at) "
+            "VALUES (81, 'signal-secret', 'automatic', 'deepcoin', 'kol-secret', "
+            "-1001234567890, 8427, 'BTC', 'short', 'close_position', 'pending', "
+            "'{bad-json', 0, '2026-07-15 10:00:00', '2026-07-15 10:00:00')"
+        )
+        connection.commit()
+
+    before = database_path.read_bytes()
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: (_ for _ in ()).throw(AssertionError("exchange client called")),
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--limit",
+            "1",
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["schema_status"] == "available"
+    assert payload["counts"]["batches_total"] == 2
+    assert payload["counts"]["blocked"] == 1
+    assert payload["counts"]["submit_unknown"] == 1
+    assert payload["counts"]["recovery_required"] == 1
+    assert payload["legacy_pending_management"]["total"] == 1
+    assert payload["batches_returned"] == 1
+    assert payload["batches_truncated"] is True
+    assert payload["batches"][0]["source"]["chat_ref"].startswith("chat:")
+    assert payload["batches"][0]["legs"][0]["pos_ref"].startswith("pos:")
+    assert payload["batches"][0]["malformed_json_fields"] == ["target_snapshot_json"]
+    assert payload["batches"][0]["legs"][0]["malformed_json_fields"] == [
+        "last_error"
+    ]
+    assert "pos-secret" not in result.stdout
+    assert "strategy-secret" not in result.stdout
+    assert "kol-secret" not in result.stdout
+    text_result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--limit",
+            "1",
+            "--output-format",
+            "text",
+        ],
+    )
+    assert text_result.exit_code == 0, text_result.stdout
+    assert "Batch counts:" in text_result.stdout
+    assert "Legacy pending management:" in text_result.stdout
+    assert "pos-secret" not in text_result.stdout
+    assert "strategy-secret" not in text_result.stdout
+    assert database_path.read_bytes() == before
+
+
+def test_audit_management_batches_handles_old_schema_without_migrating(tmp_path):
+    database_path = tmp_path / "old.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE trade_signals (id INTEGER PRIMARY KEY)")
+        connection.commit()
+    before = database_path.read_bytes()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["schema_status"] == "management_schema_missing"
+    assert payload["counts"]["batches_total"] == 0
+    assert payload["legacy_pending_management"]["status"] == "schema_unavailable"
+    assert database_path.read_bytes() == before
+
+
+def test_database_initialization_twice_is_idempotent_and_management_defaults_disabled(
+    tmp_path,
+):
+    database_path = tmp_path / "initialized-twice.db"
+    first_factory = create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        first_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ).fetchall()
+
+    second_factory = create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        second_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ).fetchall()
+
+    assert second_schema == first_schema
+    assert load_trading_settings(first_factory).auto_trade_enabled is False
+    assert load_trading_settings(second_factory).management_execution_mode == "disabled"
 
 
 def test_repair_position_attribution_cli_defaults_to_dry_run(tmp_path, monkeypatch):
