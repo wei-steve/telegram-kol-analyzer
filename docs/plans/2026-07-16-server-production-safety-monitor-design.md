@@ -128,10 +128,12 @@ state directory.
 
 The installation helper copies reviewed unit files, captures the current
 checkout HEAD into the root-only environment file, creates the state directory
-with restrictive ownership/mode, reloads systemd, and enables the timer. It
-does not start a trading service, edit trading settings, or modify database
-files. Re-running it is idempotent and intentionally advances the monitored SHA
-only when the operator reruns it from the reviewed server checkout.
+with restrictive ownership/mode, and reloads systemd. It does not enable or
+start the timer by default. An explicit `--enable` option enables the timer only
+after the dry health run and labelled notification test have passed. It never
+starts the trading service, edits trading settings, or modifies database files.
+Re-running it is idempotent and intentionally advances the monitored SHA only
+when the operator reruns it from the reviewed server checkout.
 
 ## Testing
 
