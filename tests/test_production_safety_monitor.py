@@ -5,13 +5,18 @@ import pytest
 
 from telegram_kol_research.production_safety_monitor import MAX_ALERT_LENGTH
 from telegram_kol_research.production_safety_monitor import MonitorExpectations
+from telegram_kol_research.production_safety_monitor import MonitorResult
 from telegram_kol_research.production_safety_monitor import MonitorSnapshot
 from telegram_kol_research.production_safety_monitor import evaluate_monitor_snapshot
 from telegram_kol_research.production_safety_monitor import format_monitor_alert
 
 
+REVIEWED_HEAD = "3ec22ca77a1362167ce9d2cf702cfc50b1491967"
+OTHER_HEAD = "a94c7b4cbb41331858be886bf341e79bd6bc2f4a"
+
+
 EXPECTATIONS = MonitorExpectations(
-    head="reviewed-sha",
+    head=REVIEWED_HEAD,
     auto_trade_enabled=True,
     management_execution_mode="live",
     max_concurrent_positions=4,
@@ -21,7 +26,7 @@ EXPECTATIONS = MonitorExpectations(
 def _snapshot(**overrides):
     values = {
         "service_state": "active",
-        "head": "reviewed-sha",
+        "head": REVIEWED_HEAD,
         "settings": {
             "auto_trade_enabled": True,
             "management_execution_mode": "live",
@@ -81,7 +86,7 @@ def test_monitor_inputs_and_result_are_frozen():
     ("snapshot", "expected_reasons"),
     [
         (_snapshot(service_state="inactive"), ("service_inactive",)),
-        (_snapshot(head="unreviewed-sha"), ("head_drift",)),
+        (_snapshot(head=OTHER_HEAD), ("head_drift",)),
         (
             _snapshot(
                 settings={
@@ -147,6 +152,47 @@ def test_normal_submitted_trade_events_do_not_alert(event):
 
     assert result.healthy is True
     assert result.reason_codes == ()
+
+
+def test_real_manual_close_reservation_and_submission_do_not_alert():
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            abnormal_events=(
+                {
+                    "action": "close_bound_position_reservation",
+                    "status": "reserved",
+                    "pos_id": "1001124101591781",
+                },
+                {
+                    "action": "close_bound_position_reservation",
+                    "status": "submitted",
+                    "pos_id": "1001124101591781",
+                },
+                {
+                    "action": "close_bound_position_market",
+                    "status": "submitted",
+                    "pos_id": "1001124101591781",
+                },
+            )
+        ),
+        EXPECTATIONS,
+    )
+
+    assert result.healthy is True
+    assert result.reason_codes == ()
+
+
+def test_reserved_is_not_globally_normal_for_other_actions():
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            abnormal_events=(
+                {"action": "submit_entry_order", "status": "reserved", "pos_id": "p-1"},
+            )
+        ),
+        EXPECTATIONS,
+    )
+
+    assert result.reason_codes == ("event_unknown_status",)
 
 
 def test_only_duplicate_exact_manual_close_for_same_pos_id_alerts():
@@ -230,7 +276,7 @@ def test_malformed_inputs_use_fixed_reason_without_raw_values(field, value):
 
 def test_formatter_uses_fixed_chinese_labels_and_sorted_reason_codes():
     result = evaluate_monitor_snapshot(
-        _snapshot(service_state="inactive", head="wrong", journal_error_count=2),
+        _snapshot(service_state="inactive", head=OTHER_HEAD, journal_error_count=2),
         EXPECTATIONS,
     )
 
@@ -243,7 +289,7 @@ def test_formatter_uses_fixed_chinese_labels_and_sorted_reason_codes():
     assert "检查时间：2026-07-16T09:30:00+00:00" in text
     assert "异常代码：head_drift,journal_errors,service_inactive" in text
     assert "服务状态：inactive" in text
-    assert "当前版本：wrong" in text
+    assert f"当前版本：{OTHER_HEAD[:12]}" in text
     assert "日志错误数：2" in text
 
 
@@ -286,3 +332,72 @@ def test_formatter_is_bounded_and_never_emits_sensitive_or_raw_fields():
 
     assert len(text) <= MAX_ALERT_LENGTH
     assert all(secret not in text for secret in secrets)
+
+
+def test_realistic_short_bot_token_is_rejected_from_every_string_detail():
+    bot_token = "1234567890:AAEabcDEF_ghIJK-lmnOPQrstUVWxyz12345"
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            service_state=bot_token,
+            head=bot_token,
+            settings={
+                "auto_trade_enabled": False,
+                "management_execution_mode": bot_token,
+                "max_concurrent_positions": 8,
+            },
+            adapter_failures=(bot_token,),
+        ),
+        MonitorExpectations(
+            head=bot_token,
+            auto_trade_enabled=True,
+            management_execution_mode=bot_token,
+            max_concurrent_positions=4,
+        ),
+    )
+
+    text = format_monitor_alert(result, checked_at=bot_token)
+
+    assert "malformed_snapshot" in result.reason_codes
+    assert bot_token not in repr(result)
+    assert bot_token not in text
+
+
+def test_formatter_revalidates_each_string_detail_field():
+    bot_token = "1234567890:AAEabcDEF_ghIJK-lmnOPQrstUVWxyz12345"
+    result = MonitorResult(
+        healthy=False,
+        reason_codes=("malformed_snapshot",),
+        details={
+            "service_state": bot_token,
+            "head": bot_token,
+            "expected_head": bot_token,
+            "management_execution_mode": bot_token,
+            "expected_management_execution_mode": bot_token,
+            "adapter_failures": (bot_token,),
+        },
+    )
+
+    text = format_monitor_alert(result, checked_at=bot_token)
+
+    assert bot_token not in text
+
+
+def test_oversized_integer_is_malformed_and_formatter_never_crashes():
+    oversized = 10**5000
+    result = evaluate_monitor_snapshot(
+        _snapshot(journal_error_count=oversized),
+        EXPECTATIONS,
+    )
+
+    assert result.reason_codes == ("malformed_snapshot",)
+    assert oversized not in result.details.values()
+
+    injected = MonitorResult(
+        healthy=False,
+        reason_codes=("malformed_snapshot",),
+        details={"journal_error_count": oversized},
+    )
+    text = format_monitor_alert(injected, checked_at="2026-07-16T09:30:00+00:00")
+
+    assert "日志错误数：invalid" in text
+    assert len(text) <= MAX_ALERT_LENGTH

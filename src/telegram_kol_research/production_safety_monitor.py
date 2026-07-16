@@ -11,10 +11,25 @@ from typing import Any
 
 
 MAX_ALERT_LENGTH = 1200
+MAX_SAFE_COUNT = 1_000_000_000
 
-_SAFE_TOKEN = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
+_SAFE_EVENT_VALUE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
+_GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_TIMESTAMP = re.compile(r"[0-9T:+.-]{1,40}\Z")
 _ADAPTER_NAMES = frozenset({"service", "head", "settings", "journal", "events", "audit"})
+_MANAGEMENT_MODES = frozenset({"disabled", "shadow", "live"})
+_SERVICE_STATES = frozenset(
+    {
+        "active",
+        "activating",
+        "deactivating",
+        "failed",
+        "inactive",
+        "maintenance",
+        "reloading",
+        "unknown",
+    }
+)
 _AUDIT_ALERT_STATES = (
     "blocked",
     "partial_failed",
@@ -79,7 +94,7 @@ def evaluate_monitor_snapshot(
     reasons: set[str] = set()
     details: dict[str, Any] = {}
 
-    service_state = _safe_token_value(snapshot.service_state)
+    service_state = _safe_service_state(snapshot.service_state)
     if service_state is None:
         reasons.add("malformed_snapshot")
         service_state = "invalid"
@@ -87,8 +102,8 @@ def evaluate_monitor_snapshot(
         reasons.add("service_inactive")
         details["service_state"] = service_state
 
-    observed_head = _safe_token_value(snapshot.head)
-    expected_head = _safe_token_value(expectations.head)
+    observed_head = _safe_git_head(snapshot.head)
+    expected_head = _safe_git_head(expectations.head)
     if observed_head is None or expected_head is None:
         reasons.add("malformed_snapshot")
     if observed_head != expected_head:
@@ -142,8 +157,8 @@ def _evaluate_settings(
         details["auto_trade_enabled"] = auto_trade_enabled
         details["expected_auto_trade_enabled"] = expectations.auto_trade_enabled
 
-    management_mode = _safe_token_value(settings.get("management_execution_mode"))
-    expected_mode = _safe_token_value(expectations.management_execution_mode)
+    management_mode = _safe_management_mode(settings.get("management_execution_mode"))
+    expected_mode = _safe_management_mode(expectations.management_execution_mode)
     if management_mode is None or expected_mode is None:
         reasons.add("malformed_snapshot")
     elif management_mode != expected_mode:
@@ -177,18 +192,20 @@ def _evaluate_events(
         if not isinstance(event, Mapping):
             reasons.add("malformed_snapshot")
             continue
-        action = _safe_token_value(event.get("action"))
-        status = _safe_token_value(event.get("status"))
+        action = _safe_event_value(event.get("action"))
+        status = _safe_event_value(event.get("status"))
         if action is None or status is None:
             reasons.add("malformed_snapshot")
             continue
         if status in _RECOVERY_EVENT_STATUSES:
             recovery_count += 1
-        elif status not in _NORMAL_EVENT_STATUSES:
+        elif status not in _NORMAL_EVENT_STATUSES and not (
+            action == "close_bound_position_reservation" and status == "reserved"
+        ):
             unknown_count += 1
 
         if action == "close_bound_position_market":
-            pos_id = _safe_token_value(event.get("pos_id"))
+            pos_id = _safe_event_value(event.get("pos_id"))
             if pos_id is None:
                 reasons.add("malformed_snapshot")
             else:
@@ -337,22 +354,46 @@ def _safe_detail_value(key: str, value: object) -> str | None:
     if key == "adapter_failures":
         failures = _safe_adapter_failures(value)
         return ",".join(failures) if failures else None
+    if key == "service_state":
+        return _safe_service_state(value) or "invalid"
+    if key in {"head", "expected_head"}:
+        head = _safe_git_head(value)
+        return head[:12] if head is not None else "invalid"
+    if key in {"management_execution_mode", "expected_management_execution_mode"}:
+        return _safe_management_mode(value) or "invalid"
     if type(value) is bool:
         return "true" if value else "false"
     if _safe_count(value) is not None:
         return str(value)
-    token = _safe_token_value(value)
-    return token or "invalid"
+    return "invalid"
 
 
-def _safe_token_value(value: object) -> str | None:
-    if not isinstance(value, str) or not _SAFE_TOKEN.fullmatch(value):
+def _safe_event_value(value: object) -> str | None:
+    if not isinstance(value, str) or not _SAFE_EVENT_VALUE.fullmatch(value):
+        return None
+    return value
+
+
+def _safe_git_head(value: object) -> str | None:
+    if not isinstance(value, str) or not _GIT_HEAD.fullmatch(value):
+        return None
+    return value
+
+
+def _safe_management_mode(value: object) -> str | None:
+    if not isinstance(value, str) or value not in _MANAGEMENT_MODES:
+        return None
+    return value
+
+
+def _safe_service_state(value: object) -> str | None:
+    if not isinstance(value, str) or value not in _SERVICE_STATES:
         return None
     return value
 
 
 def _safe_count(value: object) -> int | None:
-    if type(value) is not int or value < 0:
+    if type(value) is not int or not 0 <= value <= MAX_SAFE_COUNT:
         return None
     return value
 
