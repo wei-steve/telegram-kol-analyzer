@@ -120,7 +120,14 @@ def _persist_close_batch(
         effective_fraction=0.5,
         partial_round_before=0,
         target_fingerprint="b" * 64,
-        target_snapshot={"identity": {"execution_binding_id": ids[3]}},
+        target_snapshot={
+            "identity": {"execution_binding_id": ids[3]},
+            "contract_spec": {
+                "instrument_id": "BTC-USDT-SWAP",
+                "quantity_step": 1,
+                "min_quantity": 1,
+            },
+        },
         legs=[
             ManagementLegCreate(
                 execution_order_leg_id=entry_ids[index],
@@ -130,6 +137,7 @@ def _persist_close_batch(
                     size if effective_action == "full_exit" else str(int(size) * 2)
                 ),
                 planned_close_size=size,
+                quantity_step="1",
             )
             for index, (pos_id, size) in enumerate(zip(("pos-1", "pos-2"), sizes))
         ],
@@ -452,6 +460,43 @@ def test_sync_live_final_close_preflight_freezes_before_place_order(
     )
 
     assert result["status"] == "recovery_required"
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("planned_size", "quantity_step", "min_quantity"),
+    [("2.4", "1", 1), ("0.5", "0.1", 1)],
+)
+def test_final_close_preflight_rejects_invalid_contract_quantity_before_post(
+    planned_size, quantity_step, min_quantity, tmp_path
+):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+    with session_factory() as session:
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored_batch.target_snapshot_json)
+        snapshot["contract_spec"]["quantity_step"] = float(quantity_step)
+        snapshot["contract_spec"]["min_quantity"] = min_quantity
+        stored_batch.target_snapshot_json = json.dumps(snapshot)
+        first_leg = (
+            session.query(StrategyManagementLeg)
+            .filter(StrategyManagementLeg.management_batch_id == batch.id)
+            .order_by(StrategyManagementLeg.leg_index)
+            .first()
+        )
+        first_leg.planned_close_size = planned_size
+        first_leg.quantity_step = quantity_step
+        session.commit()
+
+    client = _FakeClient(session_factory)
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert result["reason"] == "close_final_preflight_failed"
     assert client.calls == []
 
 

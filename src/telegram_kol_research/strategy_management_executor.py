@@ -679,7 +679,52 @@ def _require_fresh_close_write_boundary(
             session_factory, batch=batch, binding=binding
         ),
     )
+    contract_spec = (
+        batch.target_snapshot.get("contract_spec")
+        if isinstance(batch.target_snapshot, dict)
+        else None
+    )
+    if not isinstance(contract_spec, dict):
+        raise ManagementBatchExecutionError(
+            "close_final_preflight_contract_spec_missing"
+        )
+    try:
+        contract_step = Decimal(str(contract_spec["quantity_step"]))
+        min_quantity = Decimal(str(contract_spec["min_quantity"]))
+    except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
+        raise ManagementBatchExecutionError(
+            "close_final_preflight_contract_spec_invalid"
+        ) from exc
+    if (
+        not contract_step.is_finite()
+        or contract_step <= 0
+        or not min_quantity.is_finite()
+        or min_quantity <= 0
+    ):
+        raise ManagementBatchExecutionError(
+            "close_final_preflight_contract_spec_invalid"
+        )
     for leg in batch.legs:
+        try:
+            planned_size = Decimal(str(leg.planned_close_size))
+            persisted_step = Decimal(str(leg.quantity_step))
+            preflight_size = Decimal(str(leg.preflight_size))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ManagementBatchExecutionError(
+                "close_final_preflight_quantity_invalid"
+            ) from exc
+        if (
+            not planned_size.is_finite()
+            or not preflight_size.is_finite()
+            or preflight_size <= 0
+            or planned_size < min_quantity
+            or planned_size > preflight_size
+            or persisted_step != contract_step
+            or planned_size % contract_step != 0
+        ):
+            raise ManagementBatchExecutionError(
+                "close_final_preflight_quantity_invalid"
+            )
         if not _decimal_equal(
             _first_text(positions[leg.pos_id], "pos", "size", "sz"),
             leg.preflight_size,

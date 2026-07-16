@@ -49,6 +49,19 @@ def test_allocate_close_sizes_uses_aggregate_target_and_stable_remainders(
     ) == expected
 
 
+def test_allocate_close_sizes_for_chen_retain_40_percent_case_is_step_aligned():
+    planned = _sizing().allocate_close_sizes(
+        ("6", "5"),
+        fraction=Decimal("0.6"),
+        quantity_step="1",
+        min_quantity="1",
+    )
+
+    assert planned == ("3", "3")
+    assert all(Decimal(size) % Decimal("1") == 0 for size in planned)
+    assert sum(map(Decimal, planned)) == Decimal("6")
+
+
 def test_allocate_close_sizes_rejects_target_below_every_leg_minimum():
     sizing = _sizing()
 
