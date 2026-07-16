@@ -76,6 +76,49 @@ The equivalent server-side command is:
 BRANCH=codex/deepcoin-auto-trading-v1 /usr/local/bin/telegram-kol-update
 ```
 
+## Install the production safety monitor
+
+The independent `telegram-kol-monitor.service` observes production every 30
+minutes and sends deduplicated system-abnormality alerts. Normal trade
+notifications are not duplicated. The monitor does not restart or stop
+`telegram-kol.service`, alter trading gates, write `data/research.db`, or send a
+Deepcoin request.
+
+Only after the reviewed commit has been deployed and the focused server tests
+pass, install the reviewed units in their default disabled state:
+
+```bash
+cd /opt/telegram-kol-analyzer
+sudo ./scripts/install_server_monitor.sh
+systemctl is-enabled telegram-kol-monitor.timer || true
+```
+
+The installer captures the current deployed HEAD into the root-only
+`/etc/telegram-kol-monitor.env`. Before enabling the timer, follow the complete
+commands in `docs/runbook.md` to run one no-notify `--force-full-audit` health
+check and exactly one `--notify --test-notification` delivery check. After both
+pass, enable only the timer:
+
+```bash
+sudo ./scripts/install_server_monitor.sh --enable
+systemctl is-active telegram-kol-monitor.timer
+systemctl list-timers telegram-kol-monitor.timer --no-pager
+journalctl -u telegram-kol-monitor.service -n 50 --no-pager
+```
+
+Verify the main service remains active and the expected HEAD and live gates
+remain unchanged. A later reviewed deployment must rerun the installer to
+advance the frozen HEAD. To roll back the monitor without touching trading:
+
+```bash
+sudo systemctl disable --now telegram-kol-monitor.timer
+sudo rm -f /etc/systemd/system/telegram-kol-monitor.timer
+sudo rm -f /etc/systemd/system/telegram-kol-monitor.service
+sudo rm -f /etc/telegram-kol-monitor.env
+sudo rm -rf /var/lib/telegram-kol-monitor
+sudo systemctl daemon-reload
+```
+
 After deploying the Deepcoin order-leg tracking update, run the one-time
 history repair on the server so legacy `execution_bindings.payload_json`
 submitted orders are copied into `execution_order_legs`:

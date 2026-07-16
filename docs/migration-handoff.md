@@ -29,6 +29,22 @@ Use GitHub as the code-transfer channel. After a reviewed commit is pushed to `c
 - Store only non-secret decisions and operational notes in repository documentation.
 - If a credential is discovered in Git history, revoke or rotate it; deleting a working-tree file is insufficient.
 
+## Server production safety monitor
+
+Production safety monitoring runs independently through
+`telegram-kol-monitor.service` and a persistent 30-minute
+`telegram-kol-monitor.timer`. The root-only expected-HEAD environment and state
+live outside the trading database. Normal trade notifications are not
+duplicated; the monitor alerts only on actionable system abnormalities and has
+no authority to restart `telegram-kol.service`, change settings, write the
+production database, or mutate Deepcoin state.
+
+On each reviewed server deployment, run `./scripts/install_server_monitor.sh`
+first. Its default is install-only and leaves the timer disabled. Complete the
+runbook's no-notify full audit and one labelled notification test before running
+`./scripts/install_server_monitor.sh --enable`. Status and monitor-only rollback
+commands are maintained in `docs/runbook.md` and `docs/server-deployment.md`.
+
 ## Mobile-first web workbench
 
 The main web console now follows one shared mobile-first information architecture rather than adapting the old three-column desktop shell independently. Its five primary destinations are `首页`, `持仓`, `策略`, `消息`, and `更多`.

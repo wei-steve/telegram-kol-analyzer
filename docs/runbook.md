@@ -179,6 +179,81 @@ limit and briefly exceed it. This small concurrent-entry race is an accepted
 operational boundary; reconciliation and later management still use exact
 verified `posId` ownership.
 
+## Operate the server production safety monitor
+
+The production safety monitor is a separate read-only oneshot service. It
+checks the deployed commit, `telegram-kol.service` state, the approved live
+gates, bounded journal errors, bounded abnormal execution summaries, and the
+daily management audit. It writes only its root-owned state file under
+`/var/lib/telegram-kol-monitor`; it does not change trading settings, write the
+production database, call a Deepcoin mutation, or restart the trading service.
+Normal trade notifications are not duplicated: only actionable system
+abnormalities are eligible for monitor alerts.
+
+After deploying and reviewing the server checkout, install the files without
+enabling or starting the timer:
+
+```bash
+cd /opt/telegram-kol-analyzer
+sudo ./scripts/install_server_monitor.sh
+systemctl is-enabled telegram-kol-monitor.timer || true
+```
+
+The installer freezes the checkout's current `git rev-parse HEAD` in the
+root-only `/etc/telegram-kol-monitor.env`. Rerun the installer after each later
+reviewed deployment to advance that expected-commit baseline. Before enabling,
+run one full health check with notification delivery omitted:
+
+```bash
+sudo .venv/bin/telegram-kol-research monitor-production-safety \
+  --expected-head "$(git rev-parse HEAD)" \
+  --expected-auto-trade-enabled \
+  --expected-management-mode live \
+  --expected-max-concurrent-positions 4 \
+  --database-path data/research.db \
+  --state-path /var/lib/telegram-kol-monitor/state.json \
+  --lookback-minutes 35 \
+  --force-full-audit
+```
+
+Confirm the compact result is healthy. Then send exactly one clearly labelled
+notification-chain test; this mode does not call the settings, database, audit,
+or exchange adapters:
+
+```bash
+sudo .venv/bin/telegram-kol-research monitor-production-safety \
+  --expected-head "$(git rev-parse HEAD)" \
+  --expected-auto-trade-enabled \
+  --expected-management-mode live \
+  --expected-max-concurrent-positions 4 \
+  --notify \
+  --test-notification
+```
+
+Confirm exactly one message beginning `【监控测试】` arrived, then enable only
+the monitor timer and inspect its schedule and latest result:
+
+```bash
+sudo ./scripts/install_server_monitor.sh --enable
+systemctl is-active telegram-kol-monitor.timer
+systemctl list-timers telegram-kol-monitor.timer --no-pager
+journalctl -u telegram-kol-monitor.service -n 50 --no-pager
+systemctl is-active telegram-kol.service
+```
+
+Rollback removes only the monitor timer, service, expected-commit file, and
+optional independent state. It must leave `telegram-kol.service`, trading
+settings, the production database, and exchange state untouched:
+
+```bash
+sudo systemctl disable --now telegram-kol-monitor.timer
+sudo rm -f /etc/systemd/system/telegram-kol-monitor.timer
+sudo rm -f /etc/systemd/system/telegram-kol-monitor.service
+sudo rm -f /etc/telegram-kol-monitor.env
+sudo rm -rf /var/lib/telegram-kol-monitor
+sudo systemctl daemon-reload
+```
+
 ## Audit strategy-management batches
 
 Keep both production gates off for this rollout:

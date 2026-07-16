@@ -1,0 +1,32 @@
+[Unit]
+Description=Telegram KOL production safety monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/opt/telegram-kol-analyzer
+EnvironmentFile=/etc/telegram-kol-monitor.env
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research monitor-production-safety --expected-head ${TELEGRAM_KOL_MONITOR_EXPECTED_HEAD} --expected-auto-trade-enabled --expected-management-mode live --expected-max-concurrent-positions 4 --database-path /opt/telegram-kol-analyzer/data/research.db --state-path /var/lib/telegram-kol-monitor/state.json --lookback-minutes 35 --notify
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadOnlyPaths=/opt/telegram-kol-analyzer
+ReadWritePaths=/var/lib/telegram-kol-monitor
