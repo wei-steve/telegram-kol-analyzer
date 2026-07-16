@@ -339,6 +339,79 @@ def test_app_js_binds_workbench_navigation_and_home_event_filters(tmp_path):
     assert "[data-group-picker-search]" in response.text
 
 
+def test_app_js_coordinates_workbench_and_settings_as_one_primary_surface(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    js = client.get("/static/app.js").text
+
+    assert "function setActiveDashboardPanel" in js
+    assert "function setWorkbenchView" in js
+    assert "function openDashboardPanel" in js
+    settings_start = js.index("function openDashboardPanel")
+    settings_end = js.index("\nfunction ", settings_start + 1)
+    settings_block = js[settings_start:settings_end]
+    assert "data-return-workbench-view" in settings_block
+    assert "[data-workbench-panel]" in settings_block
+    assert "classList.remove('is-active')" in settings_block
+    assert "if (WORKBENCH_VIEWS.includes(currentView))" in settings_block
+    assert "setAttribute('data-return-workbench-view', currentView)" in settings_block
+
+
+def test_app_js_does_not_cache_stale_group_destination_as_loaded(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    js = client.get("/static/app.js").text
+
+    visible_start = js.index("async function loadVisibleGroupDestination")
+    visible_end = js.index("\nasync function ", visible_start + 1)
+    visible_block = js[visible_start:visible_end]
+    selected_start = js.index("async function loadSelectedGroupDestination")
+    selected_end = js.index("\nasync function ", selected_start + 1)
+    selected_block = js[selected_start:selected_end]
+    ensure_start = js.index("async function ensureWorkbenchViewLoaded")
+    ensure_end = js.index("\nfunction ", ensure_start + 1)
+    ensure_block = js[ensure_start:ensure_end]
+
+    assert visible_block.count("return false") >= 2
+    assert visible_block.count("return true") >= 2
+    assert "const committed = await loadVisibleGroupDestination" in selected_block
+    assert "if (!committed) return false" in selected_block
+    assert "loaded = await loadSelectedGroupDestination(view)" in ensure_block
+    assert "if (!loaded)" in ensure_block
+
+
+def test_app_js_loads_guarded_desktop_message_companion_from_strategy_view(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    js = client.get("/static/app.js").text
+
+    assert "function loadDesktopStrategyCompanion" in js
+    companion_start = js.index("function loadDesktopStrategyCompanion")
+    companion_end = js.index("\nfunction ", companion_start + 1)
+    companion_block = js[companion_start:companion_end]
+    assert "matchMedia('(min-width: 761px)')" in companion_block
+    assert "requestId !== groupSwitchRequestId" in companion_block
+    assert "getSelectedChatId() !== chatId" in companion_block
+    assert "fetchDetailPanel(chatId)" in companion_block
+
+
+def test_mobile_assets_use_five_destinations_and_bottom_sheet_settings(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    css = client.get("/static/app.css").text
+
+    assert "grid-template-columns: repeat(5, minmax(0, 1fr));" in css
+    mobile_start = css.index("@media (max-width: 760px)")
+    mobile_css = css[mobile_start:]
+    assert ".settings-menu" in mobile_css
+    assert "position: fixed" in mobile_css
+    assert "bottom: calc(68px + env(safe-area-inset-bottom))" in mobile_css
+    sticky_start = mobile_css.index(".dashboard-tab-panel .prompt-actions")
+    sticky_end = mobile_css.index("\n  }", sticky_start)
+    sticky_block = mobile_css[sticky_start:sticky_end]
+    assert "bottom: calc(68px + env(safe-area-inset-bottom));" in sticky_block
+
+
 def test_app_assets_expose_persistent_mutation_states(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

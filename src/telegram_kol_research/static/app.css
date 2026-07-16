@@ -3185,7 +3185,7 @@ pre { white-space: pre-wrap; }
     bottom: 0;
     left: 0;
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
     border-top: 1px solid rgba(148, 163, 184, 0.24);
     background: #0f172a;
@@ -3213,12 +3213,54 @@ pre { white-space: pre-wrap; }
   .mobile-work-nav button:active {
     background: rgba(59, 130, 246, 0.42);
   }
+
+  .settings-menu {
+    position: fixed;
+    z-index: 40;
+    right: 10px;
+    bottom: calc(68px + env(safe-area-inset-bottom));
+    left: 10px;
+    top: auto;
+    min-width: 0;
+    max-height: min(70dvh, 520px);
+    overflow-y: auto;
+    padding: 8px;
+    border-radius: 16px;
+    box-shadow: 0 20px 60px rgba(2, 6, 23, 0.72);
+  }
+
+  .settings-menu-item {
+    min-height: 48px;
+    padding: 10px 14px;
+    font-size: 0.95rem;
+  }
+
+  .dashboard-tab-panel.is-active {
+    padding-bottom: calc(76px + env(safe-area-inset-bottom));
+  }
+
+  .dashboard-tab-panel .prompt-actions {
+    position: sticky;
+    z-index: 8;
+    bottom: calc(68px + env(safe-area-inset-bottom));
+    padding: 10px;
+    border-top: 1px solid var(--color-border);
+    background: rgba(17, 24, 39, 0.96);
+  }
+
+  .dashboard-tab-panel [data-dashboard-tab="main"] {
+    min-width: 48px;
+    white-space: nowrap;
+  }
 }
 
 @media (max-width: 600px) {
   .trader-kpi-strip { flex-wrap: wrap; justify-content: center; }
   .header-center { display: none; }
-  .trader-desk-header { flex-wrap: wrap; }
+  .trader-desk-header { flex-wrap: nowrap; gap: 8px; padding-inline: 4px; }
+  .trader-desk-header .header-link { display: none; }
+  .header-right { gap: 6px; }
+  .trader-desk-header h1 { font-size: 1.05rem; }
   .detail-tabs { overflow-x: auto; }
   .execution-summary { grid-template-columns: 1fr; }
   .execution-card-head { display: grid; }

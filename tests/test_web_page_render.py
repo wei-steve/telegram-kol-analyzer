@@ -393,6 +393,33 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "<summary>" in msgs_resp.text
 
 
+def test_mobile_navigation_keeps_batch_under_more_instead_of_bottom_bar(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    desktop_nav = re.search(
+        r'<nav class="desktop-workbench-nav".*?</nav>', response.text, re.S
+    )
+    mobile_nav = re.search(
+        r'<nav class="mobile-work-nav".*?</nav>', response.text, re.S
+    )
+    assert desktop_nav is not None
+    assert mobile_nav is not None
+    assert 'data-workbench-view="management-batches"' in desktop_nav.group(0)
+    assert 'data-workbench-view="management-batches"' not in mobile_nav.group(0)
+    assert mobile_nav.group(0).count("data-workbench-view=") == 5
+    assert 'data-workbench-view="more"' in mobile_nav.group(0)
+    more_panel = re.search(
+        r'<section class="workbench-panel more-workbench-panel".*?</section>',
+        response.text,
+        re.S,
+    )
+    assert more_panel is not None
+    assert 'data-workbench-view="management-batches"' in more_panel.group(0)
+
+
 def test_bound_position_close_is_not_rendered_for_unbound_exchange_position(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

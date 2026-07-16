@@ -1114,6 +1114,9 @@ function bindGroupLinks() {
         if (requestId !== groupSwitchRequestId) return;
         markWorkbenchLoaded(activeView, chatId);
         syncSelectedGroupState(chatId, { focus: true });
+        if (activeView === 'strategies') {
+          loadDesktopStrategyCompanion({ chatId, detailPanel, requestId }).catch(() => {});
+        }
         applyGroupPromptToEditor(String(chatId));
         renderConversationHistory();
         document.dispatchEvent(new CustomEvent('group-context-success', { detail: { chatId } }));
@@ -1131,21 +1134,33 @@ function bindGroupLinks() {
 async function loadVisibleGroupDestination({ activeView, chatId, filter, detailPanel, strategyPanel, requestId }) {
   if (activeView === 'messages') {
     const nextContent = await fetchDetailPanel(chatId);
-    if (requestId !== groupSwitchRequestId) return;
+    if (requestId !== groupSwitchRequestId) return false;
     if (!detailPanel) throw new Error('missing detail panel');
     detailPanel.innerHTML = '';
     detailPanel.appendChild(nextContent);
     bindDetailPanelControls();
     bindWorkflowFilters();
-    return;
+    return true;
   }
   const nextStrategyContent = await fetchStrategyMidPanel(chatId, filter);
-  if (requestId !== groupSwitchRequestId) return;
+  if (requestId !== groupSwitchRequestId) return false;
   if (!strategyPanel) throw new Error('missing strategy panel');
   strategyPanel.innerHTML = '';
   strategyPanel.appendChild(nextStrategyContent);
   bindStrategyFilterBadges();
   bindWorkflowFilters();
+  return true;
+}
+
+async function loadDesktopStrategyCompanion({ chatId, detailPanel, requestId }) {
+  if (!window.matchMedia('(min-width: 761px)').matches || !detailPanel) return;
+  const nextContent = await fetchDetailPanel(chatId);
+  if (requestId !== groupSwitchRequestId || getSelectedChatId() !== chatId) return;
+  detailPanel.innerHTML = '';
+  detailPanel.appendChild(nextContent);
+  bindDetailPanelControls();
+  bindWorkflowFilters();
+  markWorkbenchLoaded('messages', chatId);
 }
 
 function bindGroupAutomationToggles() {
@@ -1322,11 +1337,11 @@ async function loadManagementBatches() {
 
 async function loadSelectedGroupDestination(view) {
   const chatId = getSelectedChatId();
-  if (!chatId) return;
+  if (!chatId) return false;
   const requestId = ++groupSwitchRequestId;
   const filterInput = document.querySelector('[data-strategy-filter-input]');
   const filter = filterInput ? filterInput.value : 'holding';
-  await loadVisibleGroupDestination({
+  const committed = await loadVisibleGroupDestination({
     activeView: view,
     chatId,
     filter,
@@ -1334,6 +1349,15 @@ async function loadSelectedGroupDestination(view) {
     strategyPanel: document.querySelector('[data-strategy-panel]'),
     requestId,
   });
+  if (!committed) return false;
+  if (view === 'strategies') {
+    loadDesktopStrategyCompanion({
+      chatId,
+      detailPanel: document.querySelector('[data-detail-panel]'),
+      requestId,
+    }).catch(() => {});
+  }
+  return true;
 }
 
 async function ensureWorkbenchViewLoaded(view, options = {}) {
@@ -1345,6 +1369,7 @@ async function ensureWorkbenchViewLoaded(view, options = {}) {
   const container = document.querySelector(`[data-lazy-workbench="${view}"]`);
   if (container) container.setAttribute('aria-busy', 'true');
   state.promise = (async () => {
+    let loaded = true;
     if (view === 'home') {
       await loadHomeDashboard();
     } else if (view === 'positions') {
@@ -1352,7 +1377,11 @@ async function ensureWorkbenchViewLoaded(view, options = {}) {
     } else if (view === 'management-batches') {
       await loadManagementBatches();
     } else {
-      await loadSelectedGroupDestination(view);
+      loaded = await loadSelectedGroupDestination(view);
+    }
+    if (!loaded) {
+      if (container) container.setAttribute('aria-busy', 'false');
+      return;
     }
     state.key = key;
     if (container) container.setAttribute('aria-busy', 'false');
@@ -1364,24 +1393,92 @@ async function ensureWorkbenchViewLoaded(view, options = {}) {
   return state.promise;
 }
 
-function bindDashboardTabs() {
+function setActiveDashboardPanel(tab) {
   const buttons = document.querySelectorAll('[data-dashboard-tab]');
   const panels = document.querySelectorAll('[data-dashboard-panel]');
+  buttons.forEach((button) => {
+    button.classList.toggle('is-active', Boolean(tab) && button.dataset.dashboardTab === tab);
+  });
+  panels.forEach((panel) => {
+    panel.classList.toggle('is-active', Boolean(tab) && panel.dataset.dashboardPanel === tab);
+  });
+  if (tab === 'prompt') {
+    loadAiPromptCenter();
+  }
+}
+
+const WORKBENCH_VIEWS = ['home', 'positions', 'strategies', 'messages', 'management-batches', 'more'];
+
+function setWorkbenchView(requestedView) {
+  const dashboard = document.querySelector('[data-trader-dashboard]');
+  const buttons = document.querySelectorAll('[data-workbench-view]');
+  const panels = document.querySelectorAll('[data-workbench-panel]');
+  if (!dashboard || !buttons.length || !panels.length) return;
+  const view = WORKBENCH_VIEWS.includes(requestedView) ? requestedView : 'home';
+  const legacyView = view === 'home' ? 'overview' : view;
+  dashboard.dataset.activeWorkbenchView = view;
+  dashboard.classList.remove(...['overview', 'positions', 'strategies', 'messages', 'management-batches', 'more'].map((item) => `mobile-view-${item}`));
+  dashboard.classList.add(`mobile-view-${legacyView}`);
+  buttons.forEach((button) => {
+    const isActive = button.dataset.workbenchView === view;
+    button.classList.toggle('is-active', isActive);
+    if (isActive) {
+      button.setAttribute('aria-current', 'page');
+    } else {
+      button.removeAttribute('aria-current');
+    }
+  });
+  panels.forEach((panel) => {
+    const panelView = panel.dataset.workbenchPanel;
+    const isActive = panelView === view || (view === 'messages' && panelView === 'strategies');
+    panel.classList.toggle('is-active', isActive);
+  });
+  const dashboardPanel = view === 'positions'
+    ? 'exchange-positions'
+    : (view === 'strategies' || view === 'messages') ? 'main' : null;
+  setActiveDashboardPanel(dashboardPanel);
+  ensureWorkbenchViewLoaded(view);
+}
+
+function openDashboardPanel(tab) {
+  const dashboard = document.querySelector('[data-trader-dashboard]');
+  if (!dashboard) return;
+  if (tab === 'main') {
+    setWorkbenchView(dashboard.getAttribute('data-return-workbench-view') || 'home');
+    return;
+  }
+  if (tab === 'exchange-positions') {
+    setWorkbenchView('positions');
+    return;
+  }
+  const currentView = dashboard.dataset.activeWorkbenchView;
+  if (WORKBENCH_VIEWS.includes(currentView)) {
+    dashboard.setAttribute('data-return-workbench-view', currentView);
+  } else if (!dashboard.hasAttribute('data-return-workbench-view')) {
+    dashboard.setAttribute('data-return-workbench-view', 'home');
+  }
+  dashboard.dataset.activeWorkbenchView = 'settings';
+  document.querySelectorAll('[data-workbench-panel]').forEach((panel) => {
+    panel.classList.remove('is-active');
+  });
+  document.querySelectorAll('[data-workbench-view]').forEach((button) => {
+    button.classList.remove('is-active');
+    button.removeAttribute('aria-current');
+  });
+  setActiveDashboardPanel(tab);
+}
+
+function bindDashboardTabs() {
+  const buttons = document.querySelectorAll('[data-dashboard-tab]');
   buttons.forEach((button) => {
     if (button.dataset.dashboardTabBound === 'true') return;
     button.dataset.dashboardTabBound = 'true';
     button.addEventListener('click', () => {
       const tab = button.dataset.dashboardTab || 'main';
-      buttons.forEach((item) => item.classList.toggle('is-active', item === button));
-      panels.forEach((panel) => {
-        panel.classList.toggle('is-active', panel.dataset.dashboardPanel === tab);
-      });
+      openDashboardPanel(tab);
       const menu = button.closest('details');
       if (menu) {
         menu.open = false;
-      }
-      if (tab === 'prompt') {
-        loadAiPromptCenter();
       }
     });
   });
@@ -1403,34 +1500,9 @@ function bindWorkbenchNavigation() {
     return;
   }
 
-  const views = ['home', 'positions', 'strategies', 'messages', 'management-batches', 'more'];
-  const setWorkbenchView = (requestedView) => {
-    const view = views.includes(requestedView) ? requestedView : 'home';
-    const legacyView = view === 'home' ? 'overview' : view;
-    dashboard.dataset.activeWorkbenchView = view;
-    dashboard.classList.remove(...['overview', 'positions', 'strategies', 'messages', 'management-batches', 'more'].map((item) => `mobile-view-${item}`));
-    dashboard.classList.add(`mobile-view-${legacyView}`);
-    buttons.forEach((button) => {
-      const isActive = button.dataset.workbenchView === view;
-      button.classList.toggle('is-active', isActive);
-      if (isActive) {
-        button.setAttribute('aria-current', 'page');
-      } else {
-        button.removeAttribute('aria-current');
-      }
-    });
-    panels.forEach((panel) => {
-      const panelView = panel.dataset.workbenchPanel;
-      const isActive = panelView === view || (view === 'messages' && panelView === 'strategies');
-      panel.classList.toggle('is-active', isActive);
-    });
-    if (view === 'positions') {
-      document.querySelector('[data-dashboard-tab="exchange-positions"]')?.click();
-    }
-    ensureWorkbenchViewLoaded(view);
-  };
-
   buttons.forEach((button) => {
+    if (button.dataset.workbenchViewBound === 'true') return;
+    button.dataset.workbenchViewBound = 'true';
     button.addEventListener('click', () => {
       setWorkbenchView(button.dataset.workbenchView || 'home');
     });
