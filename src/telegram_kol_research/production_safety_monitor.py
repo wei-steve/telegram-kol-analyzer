@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
+import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 
@@ -16,6 +21,7 @@ MAX_SAFE_COUNT = 1_000_000_000
 _SAFE_EVENT_VALUE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 _GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_TIMESTAMP = re.compile(r"[0-9T:+.-]{1,40}\Z")
+_SHA256_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _ADAPTER_NAMES = frozenset({"service", "head", "settings", "journal", "events", "audit"})
 _MANAGEMENT_MODES = frozenset({"disabled", "shadow", "live"})
 _SERVICE_STATES = frozenset(
@@ -57,6 +63,34 @@ _FIXED_REASON_CODES = frozenset(
         "service_inactive",
     }
 )
+_STATE_FIELDS = frozenset(
+    {
+        "last_window_at",
+        "last_full_audit_date",
+        "anomaly_fingerprint",
+        "last_notification_at",
+    }
+)
+_FINGERPRINT_DETAIL_KEYS = (
+    "service_state",
+    "head",
+    "expected_head",
+    "auto_trade_enabled",
+    "expected_auto_trade_enabled",
+    "management_execution_mode",
+    "expected_management_execution_mode",
+    "max_concurrent_positions",
+    "expected_max_concurrent_positions",
+    "journal_error_count",
+    "unknown_event_count",
+    "recovery_event_count",
+    "duplicate_manual_close_count",
+    "audit_abnormal_count",
+    "audit_complete",
+    "audit_abnormal",
+    "adapter_failures",
+)
+_NOTIFICATION_SUPPRESSION = timedelta(hours=6)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +117,136 @@ class MonitorResult:
     healthy: bool
     reason_codes: tuple[str, ...]
     details: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorState:
+    last_window_at: str | None = None
+    last_full_audit_date: str | None = None
+    anomaly_fingerprint: str | None = None
+    last_notification_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorNotificationDecision:
+    should_notify: bool
+    next_state: MonitorState
+
+
+def load_monitor_state(path: str | Path) -> MonitorState:
+    """Load the exact monitor-state schema, rebuilding malformed state safely."""
+
+    try:
+        payload = json.loads(
+            Path(path).read_text(encoding="utf-8"),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        return _monitor_state_from_payload(payload)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return MonitorState()
+
+
+def save_monitor_state(path: str | Path, state: MonitorState) -> None:
+    """Atomically persist only the allowlisted monitor state with mode 0600."""
+
+    destination = Path(path)
+    payload = _monitor_state_payload(state)
+    rendered = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
+            temporary_file.write(rendered)
+            temporary_file.flush()
+            os.fchmod(temporary_file.fileno(), 0o600)
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_name, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def fingerprint_monitor_result(result: MonitorResult) -> str:
+    """Return a canonical SHA-256 for one bounded, secret-free result summary."""
+
+    reason_codes = sorted(
+        set(code for code in result.reason_codes if code in _FIXED_REASON_CODES)
+    )
+    if not reason_codes and not result.healthy:
+        reason_codes = ["malformed_snapshot"]
+    details: dict[str, str] = {}
+    for key in _FINGERPRINT_DETAIL_KEYS:
+        if key not in result.details:
+            continue
+        rendered = _safe_detail_value(key, result.details[key])
+        if rendered is not None:
+            details[key] = rendered
+    canonical = json.dumps(
+        {
+            "details": details,
+            "healthy": result.healthy is True,
+            "reason_codes": reason_codes,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def decide_monitor_notification(
+    result: MonitorResult,
+    state: MonitorState,
+    *,
+    now: datetime,
+) -> MonitorNotificationDecision:
+    """Apply fingerprint change and six-hour repeat-notification policy."""
+
+    _monitor_state_payload(state)
+    now_rendered = _canonical_aware_datetime(now)
+    if result.healthy:
+        return MonitorNotificationDecision(
+            should_notify=False,
+            next_state=MonitorState(
+                last_window_at=state.last_window_at,
+                last_full_audit_date=state.last_full_audit_date,
+                anomaly_fingerprint=None,
+                last_notification_at=state.last_notification_at,
+            ),
+        )
+
+    fingerprint = fingerprint_monitor_result(result)
+    should_notify = fingerprint != state.anomaly_fingerprint
+    if not should_notify:
+        if state.last_notification_at is None:
+            should_notify = True
+        else:
+            last_notification = datetime.fromisoformat(state.last_notification_at)
+            should_notify = now - last_notification >= _NOTIFICATION_SUPPRESSION
+    if not should_notify:
+        return MonitorNotificationDecision(should_notify=False, next_state=state)
+    return MonitorNotificationDecision(
+        should_notify=True,
+        next_state=MonitorState(
+            last_window_at=state.last_window_at,
+            last_full_audit_date=state.last_full_audit_date,
+            anomaly_fingerprint=fingerprint,
+            last_notification_at=now_rendered,
+        ),
+    )
 
 
 def evaluate_monitor_snapshot(
@@ -409,3 +573,74 @@ def _safe_adapter_failures(value: object) -> tuple[str, ...] | None:
     for item in value:
         failures.add(item if isinstance(item, str) and item in _ADAPTER_NAMES else "unknown")
     return tuple(sorted(failures))
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _monitor_state_from_payload(payload: object) -> MonitorState:
+    if not isinstance(payload, dict) or set(payload) != _STATE_FIELDS:
+        raise ValueError("invalid monitor state schema")
+    state = MonitorState(
+        last_window_at=payload["last_window_at"],
+        last_full_audit_date=payload["last_full_audit_date"],
+        anomaly_fingerprint=payload["anomaly_fingerprint"],
+        last_notification_at=payload["last_notification_at"],
+    )
+    _monitor_state_payload(state)
+    return state
+
+
+def _monitor_state_payload(state: MonitorState) -> dict[str, str | None]:
+    if not isinstance(state, MonitorState):
+        raise TypeError("state must be MonitorState")
+    if state.last_window_at is not None:
+        _validate_canonical_aware_datetime(state.last_window_at)
+    if state.last_full_audit_date is not None:
+        try:
+            parsed_date = date.fromisoformat(state.last_full_audit_date)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid full-audit date") from exc
+        if parsed_date.isoformat() != state.last_full_audit_date:
+            raise ValueError("non-canonical full-audit date")
+    if state.anomaly_fingerprint is not None and (
+        not isinstance(state.anomaly_fingerprint, str)
+        or not _SHA256_FINGERPRINT.fullmatch(state.anomaly_fingerprint)
+    ):
+        raise ValueError("invalid anomaly fingerprint")
+    if state.last_notification_at is not None:
+        _validate_canonical_aware_datetime(state.last_notification_at)
+    return {
+        "last_window_at": state.last_window_at,
+        "last_full_audit_date": state.last_full_audit_date,
+        "anomaly_fingerprint": state.anomaly_fingerprint,
+        "last_notification_at": state.last_notification_at,
+    }
+
+
+def _canonical_aware_datetime(value: datetime) -> str:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("datetime must be timezone-aware")
+    return value.isoformat()
+
+
+def _validate_canonical_aware_datetime(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be a string")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("invalid timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.isoformat() != value:
+        raise ValueError("timestamp must be canonical and timezone-aware")
+    return parsed

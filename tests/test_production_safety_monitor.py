@@ -1,14 +1,23 @@
+import json
+import os
+import stat
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from telegram_kol_research.production_safety_monitor import MAX_ALERT_LENGTH
 from telegram_kol_research.production_safety_monitor import MonitorExpectations
+from telegram_kol_research.production_safety_monitor import MonitorNotificationDecision
 from telegram_kol_research.production_safety_monitor import MonitorResult
 from telegram_kol_research.production_safety_monitor import MonitorSnapshot
+from telegram_kol_research.production_safety_monitor import MonitorState
+from telegram_kol_research.production_safety_monitor import decide_monitor_notification
 from telegram_kol_research.production_safety_monitor import evaluate_monitor_snapshot
+from telegram_kol_research.production_safety_monitor import fingerprint_monitor_result
 from telegram_kol_research.production_safety_monitor import format_monitor_alert
+from telegram_kol_research.production_safety_monitor import load_monitor_state
+from telegram_kol_research.production_safety_monitor import save_monitor_state
 
 
 REVIEWED_HEAD = "3ec22ca77a1362167ce9d2cf702cfc50b1491967"
@@ -418,3 +427,167 @@ def test_oversized_integer_is_malformed_and_formatter_never_crashes():
 
     assert "日志错误数：invalid" in text
     assert len(text) <= MAX_ALERT_LENGTH
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        None,
+        "not-json",
+        "[]",
+        "{}",
+        json.dumps(
+            {
+                "last_window_at": None,
+                "last_full_audit_date": None,
+                "anomaly_fingerprint": None,
+                "last_notification_at": None,
+                "unexpected": "field",
+            }
+        ),
+        json.dumps(
+            {
+                "last_window_at": "2026-07-16 09:00:00",
+                "last_full_audit_date": None,
+                "anomaly_fingerprint": None,
+                "last_notification_at": None,
+            }
+        ),
+        json.dumps(
+            {
+                "last_window_at": None,
+                "last_full_audit_date": None,
+                "anomaly_fingerprint": "not-a-sha256",
+                "last_notification_at": None,
+            }
+        ),
+    ],
+)
+def test_missing_or_malformed_monitor_state_defaults_safely(tmp_path, contents):
+    path = tmp_path / "state.json"
+    if contents is not None:
+        path.write_text(contents, encoding="utf-8")
+
+    assert load_monitor_state(path) == MonitorState()
+
+
+def test_monitor_state_is_persisted_atomically_with_exact_fields_and_mode(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.json"
+    state = MonitorState(
+        last_window_at="2026-07-16T09:00:00+00:00",
+        last_full_audit_date="2026-07-16",
+        anomaly_fingerprint="a" * 64,
+        last_notification_at="2026-07-16T09:01:00+00:00",
+    )
+    real_replace = os.replace
+    replacements = []
+
+    def record_replace(source, destination):
+        replacements.append((source, destination))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", record_replace)
+
+    save_monitor_state(path, state)
+
+    assert len(replacements) == 1
+    source, destination = replacements[0]
+    assert os.path.dirname(source) == str(tmp_path)
+    assert destination == path
+    assert set(json.loads(path.read_text(encoding="utf-8"))) == {
+        "last_window_at",
+        "last_full_audit_date",
+        "anomaly_fingerprint",
+        "last_notification_at",
+    }
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert load_monitor_state(path) == state
+
+
+def test_monitor_fingerprint_is_order_independent_and_canonical():
+    first = MonitorResult(
+        healthy=False,
+        reason_codes=("service_inactive", "journal_errors"),
+        details={"service_state": "inactive", "journal_error_count": 2},
+    )
+    reordered = MonitorResult(
+        healthy=False,
+        reason_codes=("journal_errors", "service_inactive"),
+        details={"journal_error_count": 2, "service_state": "inactive"},
+    )
+
+    fingerprint = fingerprint_monitor_result(first)
+
+    assert fingerprint == fingerprint_monitor_result(reordered)
+    assert len(fingerprint) == 64
+    assert all(character in "0123456789abcdef" for character in fingerprint)
+
+
+def test_changed_monitor_fingerprint_notifies_immediately():
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
+    state = MonitorState(
+        anomaly_fingerprint="a" * 64,
+        last_notification_at=(now - timedelta(minutes=1)).isoformat(),
+    )
+    result = MonitorResult(
+        healthy=False,
+        reason_codes=("service_inactive",),
+        details={"service_state": "inactive"},
+    )
+
+    decision = decide_monitor_notification(result, state, now=now)
+
+    assert isinstance(decision, MonitorNotificationDecision)
+    assert decision.should_notify is True
+    assert decision.next_state.anomaly_fingerprint == fingerprint_monitor_result(result)
+    assert decision.next_state.last_notification_at == now.isoformat()
+
+
+def test_same_monitor_notification_is_suppressed_for_six_hours():
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
+    result = MonitorResult(
+        healthy=False,
+        reason_codes=("service_inactive",),
+        details={"service_state": "inactive"},
+    )
+    fingerprint = fingerprint_monitor_result(result)
+    recent_state = MonitorState(
+        anomaly_fingerprint=fingerprint,
+        last_notification_at=(now - timedelta(hours=5, minutes=59)).isoformat(),
+    )
+    eligible_state = MonitorState(
+        anomaly_fingerprint=fingerprint,
+        last_notification_at=(now - timedelta(hours=6)).isoformat(),
+    )
+
+    suppressed = decide_monitor_notification(result, recent_state, now=now)
+    eligible = decide_monitor_notification(result, eligible_state, now=now)
+
+    assert suppressed.should_notify is False
+    assert suppressed.next_state == recent_state
+    assert eligible.should_notify is True
+    assert eligible.next_state.last_notification_at == now.isoformat()
+
+
+def test_healthy_monitor_result_silently_clears_active_fingerprint():
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
+    previous_notification = (now - timedelta(minutes=30)).isoformat()
+    state = MonitorState(
+        last_window_at="2026-07-16T09:30:00+00:00",
+        last_full_audit_date="2026-07-16",
+        anomaly_fingerprint="a" * 64,
+        last_notification_at=previous_notification,
+    )
+    result = MonitorResult(healthy=True, reason_codes=(), details={})
+
+    decision = decide_monitor_notification(result, state, now=now)
+
+    assert decision.should_notify is False
+    assert decision.next_state == MonitorState(
+        last_window_at=state.last_window_at,
+        last_full_audit_date=state.last_full_audit_date,
+        anomaly_fingerprint=None,
+        last_notification_at=previous_notification,
+    )
