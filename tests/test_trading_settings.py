@@ -18,6 +18,7 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
 
     assert settings.auto_trade_enabled is False
     assert settings.default_max_loss_usdt == 20.0
+    assert settings.max_concurrent_positions == 4
     assert settings.allowed_symbols == ["BTC", "ETH"]
     assert settings.entry_range_order_style == "eager"
     assert settings.nearby_entry_market_deviation_pct == 0.15

@@ -23,7 +23,7 @@ class TradingSettings:
     management_execution_mode: Literal["disabled", "shadow", "live"] = "disabled"
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
-    max_concurrent_positions: int = 3
+    max_concurrent_positions: int = 4
     max_market_entry_deviation_pct: float = 0.15
     nearby_entry_market_deviation_pct: float = 0.15
     min_ai_confidence: float = 0.75

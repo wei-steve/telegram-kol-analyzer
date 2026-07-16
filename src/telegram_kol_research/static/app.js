@@ -1795,7 +1795,7 @@ function bindTradingSettingsForm() {
       management_execution_mode: String(formData.get('management_execution_mode') || 'disabled'),
       default_max_loss_usdt: numericValue('default_max_loss_usdt', 20),
       daily_max_loss_usdt: numericValue('daily_max_loss_usdt', 500),
-      max_concurrent_positions: numericValue('max_concurrent_positions', 3),
+      max_concurrent_positions: numericValue('max_concurrent_positions', 4),
       max_market_entry_deviation_pct: numericValue('max_market_entry_deviation_pct', 0.15),
       nearby_entry_market_deviation_pct: numericValue('nearby_entry_market_deviation_pct', 0.15),
       min_ai_confidence: Number(formData.get('min_ai_confidence') || 0.75),

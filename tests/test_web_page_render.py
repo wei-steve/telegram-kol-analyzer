@@ -107,6 +107,17 @@ def test_management_execution_mode_form_labels_shadow_and_live_risk(tmp_path):
     assert '实盘：高风险，可写入交易所' in response.text
 
 
+def test_index_labels_position_limit_as_per_group(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "每群组最大有效持仓数" in response.text
+    assert 'name="max_concurrent_positions"' in response.text
+    assert 'value="4"' in response.text
+
+
 def test_index_page_is_a_lightweight_shell_without_deepcoin_or_message_timeline(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
