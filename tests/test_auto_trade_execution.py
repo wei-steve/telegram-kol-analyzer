@@ -1,4 +1,5 @@
-﻿from datetime import UTC, datetime
+﻿import json
+from datetime import UTC, datetime
 
 import pytest
 
@@ -91,6 +92,16 @@ class _FakeDeepcoinClient:
         return 68100.0
 
 
+class _TickerForbiddenDeepcoinClient(_FakeDeepcoinClient):
+    def __init__(self):
+        super().__init__()
+        self.ticker_calls = 0
+
+    def get_ticker_price(self, *, inst_id):
+        self.ticker_calls += 1
+        raise AssertionError("position limit must be checked before ticker access")
+
+
 def _verify_bound_position(session_factory, *, binding_id: int, pos_id: str) -> None:
     upsert_execution_order_leg(
         session_factory,
@@ -106,6 +117,26 @@ def _verify_bound_position(session_factory, *, binding_id: int, pos_id: str) -> 
             last_verified_at=datetime.now(UTC),
         ),
     )
+
+
+def _seed_verified_positions(session_factory, *, chat_id: int, count: int) -> None:
+    for index in range(1, count + 1):
+        binding_id = upsert_execution_binding(
+            session_factory,
+            ExecutionBindingRecord(
+                kol_id=f"group:{chat_id}",
+                chat_id=chat_id,
+                message_id=1000 + index,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+            ),
+        )
+        _verify_bound_position(
+            session_factory,
+            binding_id=binding_id,
+            pos_id=f"pos-{chat_id}-{index}",
+        )
 
 
 def test_count_group_effective_positions_uses_distinct_verified_active_entry_legs(tmp_path):
@@ -320,6 +351,76 @@ def _group_config():
             )
         ]
     )
+
+
+def test_group_position_limit_blocks_entry_before_exchange_access(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "max_concurrent_positions": 4,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    _seed_verified_positions(session_factory, chat_id=100, count=4)
+    fake_client = _TickerForbiddenDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 16, 8, 1, tzinfo=UTC),
+    )
+
+    assert result == {
+        "status": "skipped",
+        "reason": "group_position_limit_reached",
+        "current_position_count": 4,
+        "max_concurrent_positions": 4,
+    }
+    assert fake_client.ticker_calls == 0
+    assert fake_client.orders == []
+    assert fake_client.trigger_orders == []
+    with session_factory() as session:
+        event = session.query(ExecutionEvent).one()
+        assert event.reason == "group_position_limit_reached"
+        payload = json.loads(event.request_json)
+        assert payload["current_position_count"] == 4
+        assert payload["max_concurrent_positions"] == 4
+
+
+def test_group_position_limit_isolated_by_chat_below_boundary_reaches_submission(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "max_concurrent_positions": 4,
+            "allowed_symbols": ["BTC", "ETH"],
+            "max_market_entry_deviation_pct": 0.01,
+        },
+    )
+    _seed_verified_positions(session_factory, chat_id=100, count=3)
+    _seed_verified_positions(session_factory, chat_id=200, count=4)
+    fake_client = _FakeDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 16, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert fake_client.orders == []
+    assert len(fake_client.trigger_orders) == 2
 
 
 def test_management_disabled_records_safe_skip_before_planning_or_exchange_access(

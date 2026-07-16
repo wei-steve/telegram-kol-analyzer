@@ -174,6 +174,24 @@ def auto_process_message_trade_signal(
             processed_at=now,
         )
 
+    current_position_count = _count_group_effective_positions(
+        session_factory,
+        chat_id=raw_message.chat_id,
+    )
+    if current_position_count >= settings.max_concurrent_positions:
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason="group_position_limit_reached",
+            runtime_kol_id=str(runtime_config.get("kol_id") or ""),
+            processed_at=now,
+            extra={
+                "current_position_count": current_position_count,
+                "max_concurrent_positions": settings.max_concurrent_positions,
+            },
+        )
+
     instrument_id = _to_deepcoin_swap_instrument(symbol)
     reference_price = _safe_ticker_price(deepcoin_client, inst_id=instrument_id)
     entry_execution_type = _infer_entry_execution_type(
