@@ -40,9 +40,12 @@ The monitor verifies these exact production expectations:
 - `management_execution_mode=live`;
 - `max_concurrent_positions=4`.
 
-Expected values are explicit CLI arguments in the unit file rather than hidden
-fallbacks. A later deployment that intentionally changes a baseline must update
-the reviewed unit file in the same change.
+Expected gate values are explicit CLI arguments in the reviewed unit file rather
+than hidden fallbacks. The expected commit cannot be embedded in the commit that
+defines the unit without creating a circular SHA dependency. Instead, the
+installation helper captures the currently deployed, reviewed HEAD into a
+root-only `/etc/telegram-kol-monitor.env` file. A later reviewed deployment must
+rerun the installer to advance that frozen commit baseline.
 
 ## Lightweight Check
 
@@ -113,19 +116,22 @@ underlying trading state and is not retried inside the same invocation.
 ## systemd Operation
 
 `telegram-kol-monitor.service` is `Type=oneshot`, runs from
-`/opt/telegram-kol-analyzer`, and invokes the virtualenv CLI with fixed bounded
-arguments. It is separate from `telegram-kol.service` and has no restart or
-mutation relationship with it.
+`/opt/telegram-kol-analyzer`, reads only the root-owned expected-HEAD environment
+file, and invokes the virtualenv CLI with fixed bounded arguments. It is
+separate from `telegram-kol.service` and has no restart or mutation relationship
+with it.
 
 `telegram-kol-monitor.timer` uses an initial delay, a 30-minute interval,
 randomized delay to avoid synchronized load, and `Persistent=true` so a server
 reboot resumes monitoring. The unit writes only to journald and the independent
 state directory.
 
-The installation helper copies reviewed unit files, creates the state directory
+The installation helper copies reviewed unit files, captures the current
+checkout HEAD into the root-only environment file, creates the state directory
 with restrictive ownership/mode, reloads systemd, and enables the timer. It
 does not start a trading service, edit trading settings, or modify database
-files. Re-running it is idempotent.
+files. Re-running it is idempotent and intentionally advances the monitored SHA
+only when the operator reruns it from the reviewed server checkout.
 
 ## Testing
 
