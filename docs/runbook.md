@@ -194,6 +194,14 @@ production database, call a Deepcoin mutation, or restart the trading service.
 Normal trade notifications are not duplicated: only actionable system
 abnormalities are eligible for monitor alerts.
 
+If an existing state file is unreadable or malformed, the monitor repairs the
+four-field file but keeps a pending state-integrity notification as a fingerprint
+with no notification timestamp until one delivery succeeds. A `--notify` run
+retries that fixed `state_invalid` alert after missing configuration or delivery
+failure. A no-notify diagnostic run still advances successfully read window and
+audit progress, but it does not mark it delivered; the pending alert remains for
+a later notification-enabled invocation.
+
 Provision the monitor-only root credential file once. It may contain only the
 system-operator bot token, chat ID, and optional timeout; never put a Deepcoin,
 Telegram-session, database, or application credential in this file:

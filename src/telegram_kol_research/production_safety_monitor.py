@@ -479,6 +479,13 @@ def run_production_safety_monitor(
     checked_at = _require_aware_datetime(now)
     loaded_state = _load_monitor_state(state_path)
     state = loaded_state.state
+    state_integrity_alert_pending = (
+        loaded_state.invalid_existing_file
+        or (
+            state.anomaly_fingerprint is not None
+            and state.last_notification_at is None
+        )
+    )
     if state.last_window_at is None:
         since = checked_at - lookback
     else:
@@ -528,7 +535,7 @@ def run_production_safety_monitor(
             abnormal_events=abnormal_events,
             audit=audit,
             adapter_failures=tuple(failures),
-            state_invalid=loaded_state.invalid_existing_file,
+            state_invalid=state_integrity_alert_pending,
         ),
         expectations,
     )
@@ -543,7 +550,19 @@ def run_production_safety_monitor(
         last_notification_at=state.last_notification_at,
     )
     decision = decide_monitor_notification(result, base_state, now=checked_at)
-    next_state = decision.next_state if not decision.should_notify else base_state
+    if state_integrity_alert_pending and not result.healthy:
+        # A fingerprint without a delivery timestamp is the four-field schema's
+        # durable marker for a repaired state-integrity alert awaiting delivery.
+        # Keep operational progress while notify=False, config failure, or send
+        # failure prevents acknowledgement by the operator.
+        next_state = MonitorState(
+            last_window_at=base_state.last_window_at,
+            last_full_audit_date=base_state.last_full_audit_date,
+            anomaly_fingerprint=fingerprint_monitor_result(result),
+            last_notification_at=None,
+        )
+    else:
+        next_state = decision.next_state if not decision.should_notify else base_state
     notification_status = "not_needed" if result.healthy else "disabled"
     monitor_error = None
 

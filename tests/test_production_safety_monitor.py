@@ -849,6 +849,164 @@ def test_unreadable_existing_state_is_rebuilt_and_reported_without_raw_reason(
     assert "secret" not in json.dumps(outcome.result.details)
 
 
+def test_invalid_state_successful_delivery_sends_once_and_retains_repaired_progress(
+    tmp_path,
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{", encoding="utf-8")
+    deliveries = []
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+
+    first = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 1, 0, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+    delivered_state = load_monitor_state(state_path)
+    second = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 1, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+
+    assert first.notification_status == "sent"
+    assert first.result.reason_codes == ("state_invalid",)
+    assert len(deliveries) == 1
+    assert delivered_state.last_window_at == "2026-07-16T01:00:00+00:00"
+    assert delivered_state.last_full_audit_date == "2026-07-16"
+    assert delivered_state.anomaly_fingerprint is not None
+    assert delivered_state.last_notification_at == "2026-07-16T01:00:00+00:00"
+    assert second.exit_code == 0
+    assert second.notification_status == "not_needed"
+    assert len(deliveries) == 1
+
+
+def test_invalid_state_delivery_failure_persists_pending_alert_and_retries(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{", encoding="utf-8")
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+    attempts = 0
+
+    def fail_then_succeed(**payload):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("raw delivery secret")
+
+    first = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 1, 0, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=fail_then_succeed,
+    )
+    pending_state = load_monitor_state(state_path)
+    second = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 1, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=fail_then_succeed,
+    )
+
+    assert first.notification_status == "delivery_failed"
+    assert pending_state.last_window_at == "2026-07-16T01:00:00+00:00"
+    assert pending_state.last_full_audit_date == "2026-07-16"
+    assert pending_state.anomaly_fingerprint is not None
+    assert pending_state.last_notification_at is None
+    assert second.result.reason_codes == ("state_invalid",)
+    assert second.notification_status == "sent"
+    assert attempts == 2
+
+
+def test_invalid_state_missing_config_retries_when_config_becomes_available(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{", encoding="utf-8")
+    available_config = SimpleNamespace(bot_token="token", chat_id="chat")
+    config_calls = 0
+    deliveries = []
+
+    def load_config():
+        nonlocal config_calls
+        config_calls += 1
+        if config_calls == 1:
+            return SimpleNamespace(bot_token="", chat_id="")
+        return available_config
+
+    first = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 1, 0, tzinfo=UTC),
+        notify=True,
+        load_bot_config=load_config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+    pending_state = load_monitor_state(state_path)
+    second = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 1, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=load_config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+
+    assert first.notification_status == "config_missing"
+    assert pending_state.anomaly_fingerprint is not None
+    assert pending_state.last_notification_at is None
+    assert second.result.reason_codes == ("state_invalid",)
+    assert second.notification_status == "sent"
+    assert config_calls == 2
+    assert len(deliveries) == 1
+
+
+def test_invalid_state_no_notify_repairs_progress_but_keeps_delivery_pending(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{", encoding="utf-8")
+
+    first = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 1, 0, tzinfo=UTC),
+        notify=False,
+    )
+    pending_state = load_monitor_state(state_path)
+    second = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 1, 30, tzinfo=UTC),
+        notify=False,
+        load_bot_config=lambda: (_ for _ in ()).throw(
+            AssertionError("disabled diagnostic loaded bot config")
+        ),
+    )
+
+    assert first.notification_status == "disabled"
+    assert pending_state.last_window_at == "2026-07-16T01:00:00+00:00"
+    assert pending_state.last_full_audit_date == "2026-07-16"
+    assert pending_state.anomaly_fingerprint is not None
+    assert pending_state.last_notification_at is None
+    assert second.result.reason_codes == ("state_invalid",)
+    assert second.notification_status == "disabled"
+    assert load_monitor_state(state_path).last_window_at == "2026-07-16T01:30:00+00:00"
+
+
 @pytest.mark.parametrize(
     ("now", "last_date", "expected"),
     [

@@ -99,6 +99,15 @@ If the state file is absent or malformed, the monitor safely rebuilds it. That
 condition is logged and included in the current result, but state loss alone
 does not authorize any trading or database action.
 
+An absent file is a normal first run. For an existing unreadable or malformed
+file, the repaired four-field state uses a non-null anomaly fingerprint with a
+null notification timestamp as the pending state-integrity notification marker.
+Missing configuration, delivery failure, and explicit no-notify diagnostics
+retain that marker together with repaired cursor/audit progress. A later
+notification-enabled invocation retries the fixed `state_invalid` alert; only a
+successful delivery writes the notification timestamp, after which the next
+healthy run clears the fingerprint without another message.
+
 ## Notification Policy
 
 Reuse `load_system_operator_bot_config` in explicit environment-only mode and

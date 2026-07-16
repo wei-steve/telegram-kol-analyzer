@@ -315,3 +315,5 @@ def test_runbook_documents_monitor_identity_owned_runtime_state():
 
     assert "monitor-identity-owned" in runbook.lower()
     assert "root-owned state file" not in runbook.lower()
+    assert "pending state-integrity notification" in runbook.lower()
+    assert "does not mark it delivered" in runbook.lower()
