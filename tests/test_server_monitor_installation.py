@@ -1,4 +1,10 @@
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,12 +51,74 @@ def test_monitor_service_drops_all_capabilities_and_denies_system_bus():
     assert "CapabilityBoundingSet=" in directives
     assert "AmbientCapabilities=" in directives
     assert "NoNewPrivileges=true" in directives
-    assert "RestrictAddressFamilies=AF_INET AF_INET6" in directives
-    assert "AF_UNIX" not in service
+    assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in directives
     assert "InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private" in directives
     assert "SystemCallFilter=@system-service" in directives
     assert "SystemCallFilter=~@mount @privileged" in directives
     assert "RestrictNamespaces=true" in directives
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="systemd sandbox probe is Linux-only")
+def test_monitor_sandbox_allows_asyncio_socketpair_but_denies_control_sockets():
+    if os.geteuid() != 0:
+        pytest.skip("system systemd sandbox probe requires root")
+    if (
+        shutil.which("systemd-run") is None
+        or shutil.which("systemctl") is None
+        or not Path("/run/systemd/system").is_dir()
+    ):
+        pytest.skip("running systemd manager is unavailable")
+    manager = subprocess.run(
+        ["systemctl", "is-system-running"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if manager.stdout.strip() not in {"running", "degraded", "starting", "maintenance"}:
+        pytest.skip("running systemd manager is unavailable")
+
+    probe = """
+import asyncio
+import os
+import socket
+
+asyncio.run(asyncio.sleep(0))
+for path in ("/run/dbus/system_bus_socket", "/run/systemd/private"):
+    if os.path.exists(path):
+        raise SystemExit(f"control socket visible: {path}")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        try:
+            client.connect(path)
+        except OSError:
+            pass
+        else:
+            raise SystemExit(f"control socket connectable: {path}")
+    finally:
+        client.close()
+"""
+    completed = subprocess.run(
+        [
+            "systemd-run",
+            "--wait",
+            "--pipe",
+            "--collect",
+            "--quiet",
+            "--property=Type=oneshot",
+            "--property=RestrictAddressFamilies=AF_UNIX",
+            "--property=InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private",
+            sys.executable,
+            "-c",
+            probe,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_monitor_service_exposes_only_required_read_only_inputs_and_state():

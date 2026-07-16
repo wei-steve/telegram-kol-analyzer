@@ -118,8 +118,10 @@ underlying trading state and is not retried inside the same invocation.
 ## systemd Operation
 
 `telegram-kol-monitor.service` is `Type=oneshot` and runs as the dedicated
-unprivileged `telegram-kol-monitor` user/group with an empty capability set and
-no AF_UNIX/system-bus access. A read-only mount allowlist exposes only the
+unprivileged `telegram-kol-monitor` user/group with an empty capability set.
+AF_UNIX remains available for Python/asyncio runtime-local socket pairs, while
+`/run/dbus/system_bus_socket` and `/run/systemd/private` are explicitly
+inaccessible so no system-bus/service-control connection is possible. A read-only mount allowlist exposes only the
 virtualenv/source, Git metadata, database components, and journal; the general
 checkout `.env`, `config/`, and unrelated data remain hidden. It reads a
 root-owned environment file containing only the frozen expected HEAD and
