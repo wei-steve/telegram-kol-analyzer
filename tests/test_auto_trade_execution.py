@@ -2,6 +2,7 @@
 
 import pytest
 
+from telegram_kol_research.auto_trade_execution import _count_group_effective_positions
 from telegram_kol_research.auto_trade_execution import _load_active_execution_binding
 from telegram_kol_research.auto_trade_execution import _load_active_execution_bindings
 from telegram_kol_research.auto_trade_execution import _extract_partial_close_fraction
@@ -105,6 +106,65 @@ def _verify_bound_position(session_factory, *, binding_id: int, pos_id: str) -> 
             last_verified_at=datetime.now(UTC),
         ),
     )
+
+
+def test_count_group_effective_positions_uses_distinct_verified_active_entry_legs(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    def add_leg(
+        *,
+        chat_id: int,
+        message_id: int,
+        pos_id: str | None,
+        venue: str = "deepcoin",
+        purpose: str = "entry",
+        status: str = "active",
+        attribution_status: str = "verified",
+    ) -> None:
+        binding_id = upsert_execution_binding(
+            session_factory,
+            ExecutionBindingRecord(
+                kol_id=f"group:{chat_id}",
+                chat_id=chat_id,
+                message_id=message_id,
+                symbol="BTC",
+                side="long",
+                venue=venue,
+            ),
+        )
+        upsert_execution_order_leg(
+            session_factory,
+            ExecutionOrderLegRecord(
+                execution_binding_id=binding_id,
+                leg_index=1,
+                purpose=purpose,
+                order_kind="market",
+                pos_id=pos_id,
+                venue=venue,
+                status=status,
+                attribution_status=attribution_status,
+            ),
+        )
+
+    for message_id, pos_id in enumerate(
+        ["pos-100-1", "pos-100-2", "pos-100-3", "pos-100-4"], start=1
+    ):
+        add_leg(chat_id=100, message_id=message_id, pos_id=pos_id)
+
+    add_leg(
+        chat_id=100,
+        message_id=10,
+        pos_id="pos-unassigned",
+        attribution_status="unassigned",
+    )
+    add_leg(chat_id=100, message_id=11, pos_id="pos-terminal", status="closed")
+    add_leg(chat_id=100, message_id=12, pos_id="pos-protection", purpose="protection")
+    add_leg(chat_id=100, message_id=13, pos_id="")
+    add_leg(chat_id=100, message_id=14, pos_id="pos-other-venue", venue="other")
+    add_leg(chat_id=200, message_id=20, pos_id="pos-200-1")
+
+    assert _count_group_effective_positions(session_factory, chat_id=100) == 4
+    assert _count_group_effective_positions(session_factory, chat_id=200) == 1
 
 
 def test_load_active_execution_binding_uses_kol_id_to_disambiguate(tmp_path):

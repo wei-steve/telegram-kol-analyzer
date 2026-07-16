@@ -6,6 +6,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
@@ -17,6 +18,7 @@ from telegram_kol_research.execution_bindings import build_strategy_instance_id
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionOrderLeg,
     MediaAsset,
     RawMessage,
     RecognitionDecision,
@@ -699,6 +701,30 @@ def _load_active_execution_binding(
             return None
         session.expunge(rows[0])
         return rows[0]
+
+
+def _count_group_effective_positions(
+    session_factory: sessionmaker,
+    *,
+    chat_id: int,
+) -> int:
+    with session_factory() as session:
+        count = (
+            session.query(func.count(func.distinct(ExecutionOrderLeg.pos_id)))
+            .join(
+                ExecutionBinding,
+                ExecutionBinding.id == ExecutionOrderLeg.execution_binding_id,
+            )
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .filter(ExecutionBinding.chat_id == chat_id)
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .filter(ExecutionOrderLeg.status == "active")
+            .filter(ExecutionOrderLeg.attribution_status == "verified")
+            .filter(ExecutionOrderLeg.pos_id.is_not(None))
+            .filter(ExecutionOrderLeg.pos_id != "")
+            .scalar()
+        )
+    return int(count or 0)
 
 
 def _load_active_execution_bindings(
