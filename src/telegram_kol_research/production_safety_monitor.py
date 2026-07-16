@@ -150,12 +150,16 @@ def _evaluate_settings(
         return
 
     auto_trade_enabled = settings.get("auto_trade_enabled")
-    if type(auto_trade_enabled) is not bool:
+    expected_auto_trade_enabled = expectations.auto_trade_enabled
+    if (
+        type(auto_trade_enabled) is not bool
+        or type(expected_auto_trade_enabled) is not bool
+    ):
         reasons.add("malformed_snapshot")
-    elif auto_trade_enabled != expectations.auto_trade_enabled:
+    elif auto_trade_enabled != expected_auto_trade_enabled:
         reasons.add("auto_trade_enabled_drift")
         details["auto_trade_enabled"] = auto_trade_enabled
-        details["expected_auto_trade_enabled"] = expectations.auto_trade_enabled
+        details["expected_auto_trade_enabled"] = expected_auto_trade_enabled
 
     management_mode = _safe_management_mode(settings.get("management_execution_mode"))
     expected_mode = _safe_management_mode(expectations.management_execution_mode)

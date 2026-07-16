@@ -115,6 +115,23 @@ def test_system_drift_and_adapter_failure_alert(snapshot, expected_reasons):
     assert result.reason_codes == tuple(sorted(expected_reasons))
 
 
+@pytest.mark.parametrize("invalid_expected", [1, "true", None])
+def test_malformed_expected_auto_trade_value_is_never_compared_or_retained(
+    invalid_expected,
+):
+    expectations = MonitorExpectations(
+        head=REVIEWED_HEAD,
+        auto_trade_enabled=invalid_expected,
+        management_execution_mode="live",
+        max_concurrent_positions=4,
+    )
+
+    result = evaluate_monitor_snapshot(_snapshot(), expectations)
+
+    assert result.reason_codes == ("malformed_snapshot",)
+    assert result.details == {}
+
+
 @pytest.mark.parametrize(
     ("status", "reason"),
     [
