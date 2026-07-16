@@ -252,25 +252,17 @@ The installer refuses any path other than the validated
 `git rev-parse HEAD` with only the allowlisted operator-bot fields in the
 root-owned `0600` `/etc/telegram-kol-monitor.env`. Rerun the installer after each later
 reviewed deployment to advance that expected-commit baseline. Before enabling,
-run one full health check with notification delivery omitted:
+start the installed static diagnostic unit. It runs the full audit without
+notification delivery under the same dedicated identity, read-only mounts,
+credentials isolation, and sandbox as the scheduled monitor:
 
 ```bash
-expected_head="$(git rev-parse HEAD)"
-sudo runuser -u telegram-kol-monitor -g telegram-kol-monitor -G systemd-journal -- \
-  .venv/bin/telegram-kol-research monitor-production-safety \
-  --expected-head "$expected_head" \
-  --expected-auto-trade-enabled \
-  --expected-management-mode live \
-  --expected-max-concurrent-positions 4 \
-  --database-path data/research.db \
-  --state-path /var/lib/telegram-kol-monitor/state.json \
-  --lookback-minutes 35 \
-  --force-full-audit
+sudo systemctl start telegram-kol-monitor-diagnostic.service
+journalctl -u telegram-kol-monitor-diagnostic.service -n 20 --no-pager
 ```
 
-Running the diagnostic as the monitor identity keeps `state.json` owned and
-writable by that identity; do not invoke this state-writing command directly as
-root. Confirm the compact result is healthy. Then start the installed static oneshot
+The diagnostic unit is static and never enabled. Confirm its compact result is
+healthy. Then start the installed static oneshot
 unit to send exactly one clearly labelled notification-chain test. The unit
 loads `/etc/telegram-kol-monitor.env`, runs as the dedicated identity with the
 same sandbox as the scheduled monitor, is never enabled, and does not call the
@@ -297,10 +289,12 @@ settings, the production database, and exchange state untouched:
 
 ```bash
 sudo systemctl disable --now telegram-kol-monitor.timer
+sudo systemctl stop telegram-kol-monitor.service telegram-kol-monitor-diagnostic.service telegram-kol-monitor-test-notification.service
 sudo systemctl clean --what=state telegram-kol-monitor.timer
 sudo rm -f /etc/systemd/system/telegram-kol-monitor.timer
 sudo rm -f /etc/systemd/system/telegram-kol-monitor.service
 sudo rm -f /etc/systemd/system/telegram-kol-monitor-test-notification.service
+sudo rm -f /etc/systemd/system/telegram-kol-monitor-diagnostic.service
 sudo rm -f /etc/telegram-kol-monitor.env
 sudo rm -f /etc/telegram-kol-monitor.credentials
 sudo rm -rf /var/lib/telegram-kol-monitor

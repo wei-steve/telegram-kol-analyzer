@@ -48,11 +48,12 @@ On each reviewed server deployment, first run
 `systemctl is-active --quiet telegram-kol-monitor.timer` to be false. Run
 `./scripts/install_server_monitor.sh` only from `/opt/telegram-kol-analyzer`.
 Its default is install-only and fails closed if an old timer remains enabled or
-active. Complete the
-runbook's no-notify full audit and its single instruction for the installed,
-never-enabled static labelled-notification oneshot before running
+active. Complete the runbook's never-enabled static no-notify diagnostic unit
+and its single instruction for the installed, never-enabled static labelled-
+notification oneshot before running
 `./scripts/install_server_monitor.sh --enable`. Status and monitor-only rollback
-commands, including removal of the never-enabled test-notification unit and
+commands, including removal of the never-enabled diagnostic and test-
+notification units and
 persistent timer-state cleanup with
 `systemctl clean --what=state telegram-kol-monitor.timer`, are maintained in
 `docs/runbook.md` and `docs/server-deployment.md`. The initial root-only

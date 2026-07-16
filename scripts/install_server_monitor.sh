@@ -26,9 +26,11 @@ MONITOR_GROUP="telegram-kol-monitor"
 SERVICE_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor.service"
 TIMER_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor.timer"
 TEST_NOTIFICATION_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor-test-notification.service"
+DIAGNOSTIC_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor-diagnostic.service"
 SERVICE_DEST="/etc/systemd/system/telegram-kol-monitor.service"
 TIMER_DEST="/etc/systemd/system/telegram-kol-monitor.timer"
 TEST_NOTIFICATION_DEST="/etc/systemd/system/telegram-kol-monitor-test-notification.service"
+DIAGNOSTIC_DEST="/etc/systemd/system/telegram-kol-monitor-diagnostic.service"
 CREDENTIAL_FILE="/etc/telegram-kol-monitor.credentials"
 ENV_FILE="/etc/telegram-kol-monitor.env"
 STATE_DIRECTORY="/var/lib/telegram-kol-monitor"
@@ -62,6 +64,27 @@ case "$timer_active_status" in
     exit 1
     ;;
 esac
+
+for monitor_unit in \
+  telegram-kol-monitor.service \
+  telegram-kol-monitor-diagnostic.service \
+  telegram-kol-monitor-test-notification.service
+do
+  unit_active_status=0
+  systemctl is-active --quiet "$monitor_unit" || unit_active_status=$?
+  case "$unit_active_status" in
+    0)
+      echo "Stop $monitor_unit before installing or upgrading." >&2
+      exit 1
+      ;;
+    3|4)
+      ;;
+    *)
+      echo "Unable to prove $monitor_unit is inactive." >&2
+      exit 1
+      ;;
+  esac
+done
 
 timer_enabled_status=0
 systemctl is-enabled --quiet telegram-kol-monitor.timer || timer_enabled_status=$?
@@ -130,6 +153,7 @@ install -o root -g root -m 0600 "$env_source" "$ENV_FILE"
 install -o root -g root -m 0644 "$SERVICE_SOURCE" "$SERVICE_DEST"
 install -o root -g root -m 0644 "$TIMER_SOURCE" "$TIMER_DEST"
 install -o root -g root -m 0644 "$TEST_NOTIFICATION_SOURCE" "$TEST_NOTIFICATION_DEST"
+install -o root -g root -m 0644 "$DIAGNOSTIC_SOURCE" "$DIAGNOSTIC_DEST"
 systemctl daemon-reload
 
 if [[ "$enable_timer" == true ]]; then

@@ -126,11 +126,11 @@ fi
 
 The installer rejects another clone or worktree and captures only the validated
 production HEAD plus allowlisted bot fields into the root-owned `0600`
-`/etc/telegram-kol-monitor.env`. It also installs a static test-notification
-oneshot that is never enabled and uses the same dedicated identity, environment,
-and sandbox as the scheduled service. Before enabling the timer, follow the
-single operational test instruction in `docs/runbook.md` after its no-notify
-`--force-full-audit` health check. After both pass, enable only the timer:
+`/etc/telegram-kol-monitor.env`. It also installs static diagnostic and
+test-notification oneshots that are never enabled and use the same dedicated
+identity, environment, and sandbox as the scheduled service. Before enabling
+the timer, follow the diagnostic and single notification-test instructions in
+`docs/runbook.md`. After both pass, enable only the timer:
 
 ```bash
 sudo ./scripts/install_server_monitor.sh --enable
@@ -145,10 +145,12 @@ advance the frozen HEAD. To roll back the monitor without touching trading:
 
 ```bash
 sudo systemctl disable --now telegram-kol-monitor.timer
+sudo systemctl stop telegram-kol-monitor.service telegram-kol-monitor-diagnostic.service telegram-kol-monitor-test-notification.service
 sudo systemctl clean --what=state telegram-kol-monitor.timer
 sudo rm -f /etc/systemd/system/telegram-kol-monitor.timer
 sudo rm -f /etc/systemd/system/telegram-kol-monitor.service
 sudo rm -f /etc/systemd/system/telegram-kol-monitor-test-notification.service
+sudo rm -f /etc/systemd/system/telegram-kol-monitor-diagnostic.service
 sudo rm -f /etc/telegram-kol-monitor.env
 sudo rm -f /etc/telegram-kol-monitor.credentials
 sudo rm -rf /var/lib/telegram-kol-monitor

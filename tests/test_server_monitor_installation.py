@@ -13,6 +13,9 @@ TIMER_PATH = PROJECT_ROOT / "deploy" / "systemd" / "telegram-kol-monitor.timer"
 TEST_NOTIFICATION_PATH = (
     PROJECT_ROOT / "deploy" / "systemd" / "telegram-kol-monitor-test-notification.service"
 )
+DIAGNOSTIC_PATH = (
+    PROJECT_ROOT / "deploy" / "systemd" / "telegram-kol-monitor-diagnostic.service"
+)
 INSTALLER_PATH = PROJECT_ROOT / "scripts" / "install_server_monitor.sh"
 PRODUCTION_ROOT = "/opt/telegram-kol-analyzer"
 
@@ -86,6 +89,31 @@ def test_test_notification_unit_uses_same_identity_environment_and_sandbox_once(
         if line and not line.startswith(ignored_prefixes)
     }
     assert actual_sandbox == expected_sandbox
+
+
+def test_diagnostic_unit_forces_full_audit_without_notification_in_same_sandbox():
+    service = SERVICE_PATH.read_text(encoding="utf-8")
+    diagnostic = DIAGNOSTIC_PATH.read_text(encoding="utf-8")
+    service_directives = set(service.splitlines())
+    diagnostic_directives = set(diagnostic.splitlines())
+
+    assert "Type=oneshot" in diagnostic_directives
+    assert "User=telegram-kol-monitor" in diagnostic_directives
+    assert "EnvironmentFile=/etc/telegram-kol-monitor.env" in diagnostic_directives
+    assert "[Install]" not in diagnostic_directives
+    normalized = " ".join(diagnostic.split())
+    assert "--force-full-audit" in normalized
+    assert "--notify" not in normalized
+    ignored_prefixes = ("Description=", "ExecStart=")
+    assert {
+        line
+        for line in diagnostic_directives
+        if line and not line.startswith(ignored_prefixes)
+    } == {
+        line
+        for line in service_directives
+        if line and not line.startswith(ignored_prefixes)
+    }
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="systemd sandbox probe is Linux-only")
@@ -196,6 +224,13 @@ def test_installer_fails_closed_on_running_or_enabled_install_only_before_change
     preflight = installer[:preflight_end]
 
     assert "systemctl is-active --quiet telegram-kol-monitor.timer" in preflight
+    for unit in (
+        "telegram-kol-monitor.service",
+        "telegram-kol-monitor-diagnostic.service",
+        "telegram-kol-monitor-test-notification.service",
+    ):
+        assert unit in preflight
+    assert 'systemctl is-active --quiet "$monitor_unit"' in preflight
     assert "systemctl is-enabled --quiet telegram-kol-monitor.timer" in preflight
     assert 'if [[ "$enable_timer" == false && "$timer_enabled_status" -eq 0 ]]; then' in preflight
     assert "useradd " not in preflight
@@ -236,6 +271,11 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
         'install -o root -g root -m 0644 "$TEST_NOTIFICATION_SOURCE" '
         '"$TEST_NOTIFICATION_DEST"'
     ) in installer
+    assert "telegram-kol-monitor-diagnostic.service" in installer
+    assert (
+        'install -o root -g root -m 0644 "$DIAGNOSTIC_SOURCE" '
+        '"$DIAGNOSTIC_DEST"'
+    ) in installer
 
 
 def test_installer_orders_enable_after_install_and_reload_and_targets_timer_only():
@@ -256,7 +296,13 @@ def test_installer_orders_enable_after_install_and_reload_and_targets_timer_only
 def test_units_and_installer_never_mutate_trading_or_exchange_state():
     combined = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (SERVICE_PATH, TIMER_PATH, TEST_NOTIFICATION_PATH, INSTALLER_PATH)
+        for path in (
+            SERVICE_PATH,
+            TIMER_PATH,
+            TEST_NOTIFICATION_PATH,
+            DIAGNOSTIC_PATH,
+            INSTALLER_PATH,
+        )
     ).lower()
 
     for forbidden in (
@@ -284,6 +330,15 @@ def test_operations_docs_require_disabled_upgrade_and_clean_persistent_timer_sta
     assert "systemctl is-enabled --quiet telegram-kol-monitor.timer" in combined
     assert "systemctl is-active --quiet telegram-kol-monitor.timer" in combined
     assert "systemctl clean --what=state telegram-kol-monitor.timer" in combined
+    stop_oneshots = (
+        "systemctl stop telegram-kol-monitor.service "
+        "telegram-kol-monitor-diagnostic.service "
+        "telegram-kol-monitor-test-notification.service"
+    )
+    assert combined.count(stop_oneshots) == 2
+    assert combined.index(stop_oneshots) < combined.index(
+        "systemctl clean --what=state telegram-kol-monitor.timer"
+    )
     assert combined.index("systemctl clean --what=state telegram-kol-monitor.timer") < combined.index(
         "rm -f /etc/systemd/system/telegram-kol-monitor.timer"
     )
@@ -291,6 +346,7 @@ def test_operations_docs_require_disabled_upgrade_and_clean_persistent_timer_sta
         "rm -f /etc/systemd/system/telegram-kol-monitor-test-notification.service"
         in combined
     )
+    assert "rm -f /etc/systemd/system/telegram-kol-monitor-diagnostic.service" in combined
     assert "/etc/telegram-kol-monitor.credentials" in combined
     assert "dedicated unprivileged" in combined.lower()
     assert "normal trade notifications" in combined.lower()
@@ -310,9 +366,9 @@ def test_operations_docs_have_exactly_one_safe_test_notification_instruction():
 
     assert combined.count(instruction) == 1
     assert combined.count(
-        "sudo runuser -u telegram-kol-monitor -g telegram-kol-monitor "
-        "-G systemd-journal --"
+        "sudo systemctl start telegram-kol-monitor-diagnostic.service"
     ) == 1
+    assert "sudo runuser -u telegram-kol-monitor" not in combined
     assert "sudo .venv/bin/telegram-kol-research monitor-production-safety" not in combined
     assert "dedicated identity" in combined.lower()
     assert "never enabled" in combined.lower()
