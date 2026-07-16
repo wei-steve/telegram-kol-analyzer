@@ -726,6 +726,112 @@ def _audit_pending_legacy_management_read_only(
     }
 
 
+def _management_batch_malformed_fields(batch: sqlite3.Row) -> set[str]:
+    batch_fields = _malformed_json_fields(batch, ("target_snapshot_json",))
+    source_fields: list[str] = []
+    target_fields: list[str] = []
+    _identity_ref("batch", batch["id"], batch_fields, "batch_id")
+    _safe_token_value(batch["status"], batch_fields, "status")
+    _safe_token_value(batch["intent"], batch_fields, "intent")
+    _safe_token_value(
+        batch["effective_action"], batch_fields, "effective_action"
+    )
+    _safe_token_value(batch["execution_mode"], batch_fields, "execution_mode")
+    _safe_timestamp(batch["planned_at"], batch_fields, "planned_at")
+    _identity_ref(
+        "raw_message",
+        batch["raw_message_id"],
+        source_fields,
+        "raw_message_id",
+    )
+    _identity_ref("chat", batch["source_chat_id"], source_fields, "source_chat_id")
+    _identity_ref(
+        "message",
+        batch["source_message_id"],
+        source_fields,
+        "source_message_id",
+    )
+    _identity_ref(
+        "lifecycle",
+        batch["target_lifecycle_id"],
+        target_fields,
+        "target_lifecycle_id",
+    )
+    _identity_ref(
+        "strategy",
+        batch["strategy_instance_id"],
+        target_fields,
+        "strategy_instance_id",
+    )
+    _identity_ref(
+        "binding",
+        batch["execution_binding_id"],
+        target_fields,
+        "execution_binding_id",
+    )
+    return set(batch_fields + source_fields + target_fields)
+
+
+def _management_leg_malformed_fields(leg: sqlite3.Row) -> set[str]:
+    fields = _malformed_json_fields(leg, ("last_error",))
+    _identity_ref("leg", leg["id"], fields, "leg_id")
+    _safe_leg_index(leg["leg_index"], fields)
+    _safe_token_value(leg["status"], fields, "status")
+    _identity_ref("pos", leg["pos_id"], fields, "pos_id")
+    _safe_decimal_value(leg["preflight_size"], fields, "preflight_size")
+    _safe_decimal_value(
+        leg["planned_close_size"], fields, "planned_close_size"
+    )
+    return set(fields)
+
+
+def _audit_all_management_evidence(
+    connection: sqlite3.Connection,
+    *,
+    source_select: str,
+    source_join: str,
+) -> tuple[int, int, bool]:
+    malformed_row_count = 0
+    malformed_field_count = 0
+    batches = connection.execute(
+        "SELECT b.id, b.raw_message_id, b.target_lifecycle_id, "
+        "b.strategy_instance_id, b.execution_binding_id, b.intent, "
+        "b.effective_action, b.execution_mode, b.status, "
+        "b.target_snapshot_json, b.planned_at "
+        + source_select
+        + "FROM strategy_management_batches b "
+        + source_join
+    )
+    for batch in batches:
+        fields = _management_batch_malformed_fields(batch)
+        if fields:
+            malformed_row_count += 1
+            malformed_field_count += len(fields)
+
+    legs = connection.execute(
+        "SELECT id, pos_id, leg_index, status, preflight_size, "
+        "planned_close_size, last_error FROM strategy_management_legs"
+    )
+    for leg in legs:
+        fields = _management_leg_malformed_fields(leg)
+        if fields:
+            malformed_row_count += 1
+            malformed_field_count += len(fields)
+
+    oversized_leg_group_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM ("
+            "SELECT management_batch_id FROM strategy_management_legs "
+            "GROUP BY management_batch_id HAVING COUNT(*) > 100)"
+        ).fetchone()[0]
+    )
+    return (
+        malformed_row_count,
+        malformed_field_count,
+        oversized_leg_group_count == 0,
+    )
+
+
 def _audit_management_snapshot(
     snapshot_path: Path, *, limit: int, snapshot_info: dict
 ) -> dict:
@@ -770,6 +876,7 @@ def _audit_management_snapshot(
             },
             "batches_returned": 0,
             "batches_truncated": False,
+            "all_history_legs_complete": False,
             "malformed_row_count": 0,
             "malformed_field_count": 0,
             "output_complete": False,
@@ -804,6 +911,15 @@ def _audit_management_snapshot(
                 "LEFT JOIN raw_messages r ON r.id = b.raw_message_id "
                 if has_raw_source
                 else ""
+            )
+            (
+                result["malformed_row_count"],
+                result["malformed_field_count"],
+                result["all_history_legs_complete"],
+            ) = _audit_all_management_evidence(
+                connection,
+                source_select=source_select,
+                source_join=source_join,
             )
             batches = connection.execute(
                 "SELECT b.id, b.raw_message_id, b.target_lifecycle_id, "
@@ -892,9 +1008,6 @@ def _audit_management_snapshot(
                             ),
                         }
                     )
-                    if leg_fields:
-                        result["malformed_row_count"] += 1
-                        result["malformed_field_count"] += len(set(leg_fields))
                 source = {
                     "raw_message_ref": _identity_ref(
                         "raw_message",
@@ -940,9 +1053,6 @@ def _audit_management_snapshot(
                 all_batch_fields = sorted(
                     set(batch_fields + source_fields + target_fields)
                 )
-                if all_batch_fields:
-                    result["malformed_row_count"] += 1
-                    result["malformed_field_count"] += len(all_batch_fields)
                 result["batches"].append(
                     {
                         "batch_ref": batch_ref,
@@ -970,6 +1080,7 @@ def _audit_management_snapshot(
         result["malformed_field_count"] += legacy["malformed_field_count"]
         result["output_complete"] = (
             not result["batches_truncated"]
+            and result["all_history_legs_complete"]
             and all(not batch["legs_truncated"] for batch in result["batches"])
             and legacy["complete"]
             and not legacy["truncated"]
@@ -1664,6 +1775,7 @@ def audit_management_batches(
             },
             "batches_returned": 0,
             "batches_truncated": False,
+            "all_history_legs_complete": False,
             "malformed_row_count": 0,
             "malformed_field_count": 0,
             "output_complete": False,

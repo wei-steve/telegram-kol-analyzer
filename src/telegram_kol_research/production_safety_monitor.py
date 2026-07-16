@@ -887,6 +887,42 @@ def _evaluate_events(
         details["duplicate_manual_close_count"] = duplicate_count
 
 
+def _audit_safety_evidence_is_complete(audit: Mapping[str, Any]) -> bool:
+    if (
+        audit.get("output_complete") is True
+        and audit.get("batches_truncated") is False
+    ):
+        return True
+    if (
+        audit.get("output_complete") is not False
+        or audit.get("batches_truncated") is not True
+    ):
+        return False
+
+    limit = _safe_count(audit.get("limit"))
+    returned = _safe_count(audit.get("batches_returned"))
+    counts = audit.get("counts")
+    batches = audit.get("batches")
+    if (
+        limit is None
+        or limit < 1
+        or returned != limit
+        or not isinstance(counts, Mapping)
+        or not isinstance(batches, Sequence)
+        or isinstance(batches, (str, bytes, bytearray))
+        or len(batches) != returned
+        or audit.get("all_history_legs_complete") is not True
+    ):
+        return False
+    total = _safe_count(counts.get("batches_total"))
+    if total is None or total <= returned:
+        return False
+    return all(
+        isinstance(batch, Mapping) and batch.get("legs_truncated") is False
+        for batch in batches
+    )
+
+
 def _evaluate_audit(
     audit: object,
     reasons: set[str],
@@ -903,9 +939,7 @@ def _evaluate_audit(
         incomplete = True
     if audit.get("snapshot_validation") != "ok":
         incomplete = True
-    if audit.get("output_complete") is not True:
-        incomplete = True
-    if audit.get("batches_truncated") is not False:
+    if not _audit_safety_evidence_is_complete(audit):
         incomplete = True
     if audit.get("schema_status") != "available":
         abnormal = True

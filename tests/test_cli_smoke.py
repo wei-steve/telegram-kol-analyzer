@@ -13,6 +13,11 @@ from telegram_kol_research.execution_bindings import (
     list_execution_order_legs,
     upsert_execution_binding,
 )
+from telegram_kol_research.production_safety_monitor import (
+    MonitorExpectations,
+    MonitorSnapshot,
+    evaluate_monitor_snapshot,
+)
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -298,6 +303,172 @@ def test_audit_management_batches_is_bounded_redacted_and_read_only(
     assert "pos-secret" not in text_result.stdout
     assert "strategy-secret" not in text_result.stdout
     assert database_path.read_bytes() == before
+
+
+def _audit_payload_with_management_history(
+    tmp_path,
+    *,
+    oldest_status: str = "succeeded",
+    oldest_target_snapshot_json: str = "{}",
+    oldest_leg_count: int = 0,
+) -> dict:
+    database_path = tmp_path / "management-history.db"
+    create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        for index in range(21):
+            status = oldest_status if index == 0 else "succeeded"
+            connection.execute(
+                "INSERT INTO raw_messages "
+                "(id, chat_id, message_id, archived_target_group, created_at) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (
+                    2000 + index,
+                    -1000000 - index,
+                    7000 + index,
+                    f"2026-07-{index + 1:02d} 10:00:00",
+                ),
+            )
+            connection.execute(
+                "INSERT INTO strategy_management_batches "
+                "(id, idempotency_fingerprint, raw_message_id, recognition_decision_id, "
+                "recognition_generation, target_lifecycle_id, strategy_instance_id, "
+                "execution_binding_id, intent, effective_action, execution_mode, "
+                "partial_round_before, status, target_fingerprint, target_snapshot_json, "
+                "planned_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'partial_take_profit', "
+                "'partial_close', 'shadow', 0, ?, ?, ?, ?, ?, ?)",
+                (
+                    1000 + index,
+                    f"fingerprint-{index}",
+                    2000 + index,
+                    3000 + index,
+                    f"generation-{index}",
+                    4000 + index,
+                    5000 + index,
+                    6000 + index,
+                    status,
+                    f"target-{index}",
+                    oldest_target_snapshot_json if index == 0 else "{}",
+                    f"2026-07-{index + 1:02d} 10:00:00",
+                    f"2026-07-{index + 1:02d} 10:00:00",
+                    f"2026-07-{index + 1:02d} 10:00:00",
+                ),
+            )
+        for leg_index in range(oldest_leg_count):
+            connection.execute(
+                "INSERT INTO strategy_management_legs "
+                "(id, management_batch_id, execution_order_leg_id, pos_id, leg_index, "
+                "status, preflight_size, planned_close_size, last_error, created_at, updated_at) "
+                "VALUES (?, 1000, ?, ?, ?, 'succeeded', '1', '1', NULL, "
+                "'2026-07-01 10:00:00', '2026-07-01 10:00:00')",
+                (
+                    8000 + leg_index,
+                    9000 + leg_index,
+                    f"pos-{leg_index}",
+                    leg_index + 1,
+                ),
+            )
+        connection.commit()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--limit",
+            "20",
+            "--output-format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    return json.loads(result.stdout)
+
+
+def _evaluate_real_audit_payload(payload: dict):
+    head = "a" * 40
+    return evaluate_monitor_snapshot(
+        MonitorSnapshot(
+            service_state="active",
+            head=head,
+            settings={
+                "auto_trade_enabled": False,
+                "management_execution_mode": "disabled",
+                "max_concurrent_positions": 4,
+            },
+            journal_error_count=0,
+            abnormal_events=(),
+            audit=payload,
+        ),
+        MonitorExpectations(
+            head=head,
+            auto_trade_enabled=False,
+            management_execution_mode="disabled",
+            max_concurrent_positions=4,
+        ),
+    )
+
+
+def test_monitor_accepts_benign_truncation_of_normal_batch_display_rows(tmp_path):
+    payload = _audit_payload_with_management_history(tmp_path)
+
+    assert payload["counts"]["batches_total"] == 21
+    assert payload["batches_returned"] == 20
+    assert payload["batches_truncated"] is True
+    assert payload["output_complete"] is False
+
+    monitor_result = _evaluate_real_audit_payload(payload)
+
+    assert monitor_result.healthy is True
+    assert monitor_result.reason_codes == ()
+
+
+def test_monitor_catches_abnormal_batch_outside_returned_display_window(tmp_path):
+    payload = _audit_payload_with_management_history(
+        tmp_path,
+        oldest_status="recovery_required",
+    )
+
+    assert payload["counts"]["recovery_required"] == 1
+    assert all(batch["status"] == "succeeded" for batch in payload["batches"])
+
+    monitor_result = _evaluate_real_audit_payload(payload)
+
+    assert monitor_result.healthy is False
+    assert monitor_result.reason_codes == ("audit_abnormal",)
+    assert monitor_result.details["audit_abnormal_count"] == 1
+
+
+def test_monitor_catches_malformed_batch_outside_returned_display_window(tmp_path):
+    payload = _audit_payload_with_management_history(
+        tmp_path,
+        oldest_target_snapshot_json="{malformed",
+    )
+
+    assert all(batch["status"] == "succeeded" for batch in payload["batches"])
+    assert payload["malformed_row_count"] == 1
+    assert payload["malformed_field_count"] == 1
+
+    monitor_result = _evaluate_real_audit_payload(payload)
+
+    assert monitor_result.healthy is False
+    assert monitor_result.reason_codes == ("audit_abnormal",)
+
+
+def test_monitor_rejects_leg_truncation_outside_returned_display_window(tmp_path):
+    payload = _audit_payload_with_management_history(
+        tmp_path,
+        oldest_leg_count=101,
+    )
+
+    assert all(batch["status"] == "succeeded" for batch in payload["batches"])
+    assert payload.get("all_history_legs_complete") is False
+
+    monitor_result = _evaluate_real_audit_payload(payload)
+
+    assert monitor_result.healthy is False
+    assert monitor_result.reason_codes == ("audit_incomplete",)
 
 
 def test_audit_management_batches_source_snapshot_creates_no_sidecars(tmp_path):
