@@ -119,6 +119,12 @@ MONITOR_TEST_NOTIFICATION_TEXT = (
 )
 
 
+def _load_monitor_bot_config():
+    """Load only the service environment, never checkout configuration files."""
+
+    return load_system_operator_bot_config(env_file_paths=[])
+
+
 @dataclass(frozen=True, slots=True)
 class MonitorExpectations:
     head: str
@@ -186,13 +192,10 @@ class ProductionSafetyAdapters:
     )
 
     def read_service_state(self) -> str:
-        completed = _run_bounded_command(
-            ("systemctl", "is-active", self.service_name), timeout_seconds=5
-        )
-        state = completed.output.strip()
-        if completed.returncode not in {0, 3}:
-            raise RuntimeError("service_state_unavailable")
-        return state
+        # A successful response from the service-owned loopback endpoint proves
+        # the app is serving without granting this monitor system-bus access.
+        read_loopback_settings(self.settings_url)
+        return "active"
 
     def read_git_head(self) -> str:
         completed = _run_bounded_command(
@@ -441,7 +444,7 @@ def run_production_safety_monitor(
     force_full_audit: bool = False,
     abnormal_event_limit: int = 100,
     lookback: timedelta = _DEFAULT_LOOKBACK,
-    load_bot_config=load_system_operator_bot_config,
+    load_bot_config=_load_monitor_bot_config,
     send_bot_message=send_system_operator_bot_message,
 ) -> MonitorRunOutcome:
     """Collect, evaluate, deduplicate, optionally notify, and persist state."""
@@ -555,7 +558,7 @@ def run_production_safety_monitor(
 
 def send_monitor_test_notification(
     *,
-    load_bot_config=load_system_operator_bot_config,
+    load_bot_config=_load_monitor_bot_config,
     send_bot_message=send_system_operator_bot_message,
 ) -> str:
     """Send only the fixed, clearly labelled monitor delivery test."""

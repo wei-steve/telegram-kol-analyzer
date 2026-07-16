@@ -19,26 +19,111 @@ case "$#:$*" in
     ;;
 esac
 
+PRODUCTION_ROOT="/opt/telegram-kol-analyzer"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-SERVICE_SOURCE="$PROJECT_ROOT/deploy/systemd/telegram-kol-monitor.service"
-TIMER_SOURCE="$PROJECT_ROOT/deploy/systemd/telegram-kol-monitor.timer"
+MONITOR_USER="telegram-kol-monitor"
+MONITOR_GROUP="telegram-kol-monitor"
+SERVICE_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor.service"
+TIMER_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor.timer"
 SERVICE_DEST="/etc/systemd/system/telegram-kol-monitor.service"
 TIMER_DEST="/etc/systemd/system/telegram-kol-monitor.timer"
+CREDENTIAL_FILE="/etc/telegram-kol-monitor.credentials"
 ENV_FILE="/etc/telegram-kol-monitor.env"
 STATE_DIRECTORY="/var/lib/telegram-kol-monitor"
 
-expected_head="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+if [[ "$PROJECT_ROOT" != "$PRODUCTION_ROOT" ]]; then
+  echo "Run this installer only from the fixed production checkout $PRODUCTION_ROOT." >&2
+  exit 1
+fi
+git_root="$(git -C "$PRODUCTION_ROOT" rev-parse --show-toplevel)"
+if [[ "$(cd "$git_root" && pwd -P)" != "$PRODUCTION_ROOT" ]]; then
+  echo "The production path is not the validated Git checkout root." >&2
+  exit 1
+fi
+expected_head="$(git -C "$PRODUCTION_ROOT" rev-parse --verify HEAD)"
 if [[ ! "$expected_head" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Unable to capture a valid reviewed Git HEAD." >&2
+  exit 1
+fi
+
+timer_active_status=0
+systemctl is-active --quiet telegram-kol-monitor.timer || timer_active_status=$?
+case "$timer_active_status" in
+  0)
+    echo "Stop telegram-kol-monitor.timer before installing or upgrading." >&2
+    exit 1
+    ;;
+  3|4)
+    ;;
+  *)
+    echo "Unable to prove telegram-kol-monitor.timer is inactive." >&2
+    exit 1
+    ;;
+esac
+
+timer_enabled_status=0
+systemctl is-enabled --quiet telegram-kol-monitor.timer || timer_enabled_status=$?
+case "$timer_enabled_status" in
+  0|1|3)
+    ;;
+  *)
+    echo "Unable to prove telegram-kol-monitor.timer enablement state." >&2
+    exit 1
+    ;;
+esac
+if [[ "$enable_timer" == false && "$timer_enabled_status" -eq 0 ]]; then
+  echo "Disable telegram-kol-monitor.timer before an install-only upgrade." >&2
+  exit 1
+fi
+
+if [[ ! -f "$CREDENTIAL_FILE" ]]; then
+  echo "Missing root-owned monitor credential file $CREDENTIAL_FILE." >&2
+  exit 1
+fi
+if [[ "$(stat -c %u "$CREDENTIAL_FILE")" != "0" || "$(stat -c %a "$CREDENTIAL_FILE")" != "600" ]]; then
+  echo "Monitor credential file must be owned by root with mode 0600." >&2
+  exit 1
+fi
+if grep -Ev '^(#.*|[[:space:]]*|TELEGRAM_KOL_SYSTEM_BOT_TOKEN=[A-Za-z0-9:_.-]+|TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID=-?[0-9]+|TELEGRAM_KOL_SYSTEM_BOT_TIMEOUT_SECONDS=[0-9]+([.][0-9]+)?)$' "$CREDENTIAL_FILE" >/dev/null; then
+  echo "Monitor credential file contains a non-allowlisted key or value." >&2
+  exit 1
+fi
+if [[ "$(grep -c '^TELEGRAM_KOL_SYSTEM_BOT_TOKEN=' "$CREDENTIAL_FILE")" -ne 1 || "$(grep -c '^TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID=' "$CREDENTIAL_FILE")" -ne 1 ]]; then
+  echo "Monitor credential file must contain exactly one bot token and chat ID." >&2
+  exit 1
+fi
+
+# Preflight complete; mutations may begin.
+if ! getent group "$MONITOR_GROUP" >/dev/null; then
+  groupadd --system "$MONITOR_GROUP"
+fi
+if ! id "$MONITOR_USER" >/dev/null 2>&1; then
+  useradd --system \
+    --gid "$MONITOR_GROUP" \
+    --home-dir "$STATE_DIRECTORY" \
+    --shell /usr/sbin/nologin \
+    "$MONITOR_USER"
+fi
+if [[ "$(id -u "$MONITOR_USER")" -eq 0 || "$(id -gn "$MONITOR_USER")" != "$MONITOR_GROUP" ]]; then
+  echo "Existing monitor identity is not the dedicated unprivileged account." >&2
+  exit 1
+fi
+if ! runuser -u "$MONITOR_USER" -- test -x "$PRODUCTION_ROOT/.venv/bin/telegram-kol-research"; then
+  echo "Monitor identity cannot execute the production virtualenv CLI." >&2
+  exit 1
+fi
+if ! runuser -u "$MONITOR_USER" -- test -r "$PRODUCTION_ROOT/data/research.db"; then
+  echo "Monitor identity cannot read the production database." >&2
   exit 1
 fi
 
 env_source="$(mktemp)"
 trap 'rm -f "$env_source"' EXIT
 chmod 0600 "$env_source"
-printf 'TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=%s\n' "$expected_head" > "$env_source"
+grep '^TELEGRAM_KOL_SYSTEM_BOT_' "$CREDENTIAL_FILE" > "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=%s\n' "$expected_head" >> "$env_source"
 
-install -d -o root -g root -m 0700 "$STATE_DIRECTORY"
+install -d -o "$MONITOR_USER" -g "$MONITOR_GROUP" -m 0700 "$STATE_DIRECTORY"
 install -o root -g root -m 0600 "$env_source" "$ENV_FILE"
 install -o root -g root -m 0644 "$SERVICE_SOURCE" "$SERVICE_DEST"
 install -o root -g root -m 0644 "$TIMER_SOURCE" "$TIMER_DEST"
@@ -50,5 +135,5 @@ fi
 
 echo "Installed telegram-kol-monitor for expected HEAD $expected_head."
 if [[ "$enable_timer" == false ]]; then
-  echo "Timer remains disabled; run the staged health and notification checks before --enable."
+  echo "Timer is disabled and inactive; complete the staged checks before --enable."
 fi

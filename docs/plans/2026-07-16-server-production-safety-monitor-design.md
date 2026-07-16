@@ -51,7 +51,9 @@ rerun the installer to advance that frozen commit baseline.
 
 Every 30 minutes the monitor performs bounded checks:
 
-1. Read service state with `systemctl is-active`.
+1. Prove the application is serving through its literal-loopback settings
+   endpoint. The monitor has no system-bus socket access, so it cannot use
+   systemd's control API.
 2. Read the checkout HEAD with `git rev-parse HEAD`.
 3. Read trading settings from the loopback HTTP API.
 4. Count priority-error journal entries since the prior scheduled window.
@@ -99,7 +101,7 @@ does not authorize any trading or database action.
 
 ## Notification Policy
 
-Reuse `load_system_operator_bot_config` and
+Reuse `load_system_operator_bot_config` in explicit environment-only mode and
 `send_system_operator_bot_message`. Messages contain only bounded fields:
 
 - check time;
@@ -115,21 +117,28 @@ underlying trading state and is not retried inside the same invocation.
 
 ## systemd Operation
 
-`telegram-kol-monitor.service` is `Type=oneshot`, runs from
-`/opt/telegram-kol-analyzer`, reads only the root-owned expected-HEAD environment
-file, and invokes the virtualenv CLI with fixed bounded arguments. It is
+`telegram-kol-monitor.service` is `Type=oneshot` and runs as the dedicated
+unprivileged `telegram-kol-monitor` user/group with an empty capability set and
+no AF_UNIX/system-bus access. A read-only mount allowlist exposes only the
+virtualenv/source, Git metadata, database components, and journal; the general
+checkout `.env`, `config/`, and unrelated data remain hidden. It reads a
+root-owned environment file containing only the frozen expected HEAD and
+system-operator bot fields, and invokes the virtualenv CLI with fixed bounded
+arguments. It is
 separate from `telegram-kol.service` and has no restart or mutation relationship
 with it.
 
-`telegram-kol-monitor.timer` uses an initial delay, a 30-minute interval,
-randomized delay to avoid synchronized load, and `Persistent=true` so a server
-reboot resumes monitoring. The unit writes only to journald and the independent
-state directory.
+`telegram-kol-monitor.timer` uses a true 30-minute `OnCalendar=` schedule,
+randomized delay to avoid synchronized load, and `Persistent=true` so systemd
+records and catches up a missed calendar run. The unit writes only to journald
+and the independent state directory.
 
-The installation helper copies reviewed unit files, captures the current
-checkout HEAD into the root-only environment file, creates the state directory
-with restrictive ownership/mode, and reloads systemd. It does not enable or
-start the timer by default. An explicit `--enable` option enables the timer only
+The installation helper accepts only the fixed validated
+`/opt/telegram-kol-analyzer` production Git root, copies reviewed unit files,
+captures that checkout HEAD into the root-only allowlisted environment file,
+creates the dedicated identity and its state directory with restrictive
+ownership/mode, and reloads systemd. Install-only fails before changes when an
+existing timer is active or enabled. An explicit `--enable` option enables the timer only
 after the dry health run and labelled notification test have passed. It never
 starts the trading service, edits trading settings, or modifies database files.
 Re-running it is idempotent and intentionally advances the monitored SHA only
@@ -149,6 +158,9 @@ Use test-driven development for:
 - bounded/redacted Telegram formatting;
 - CLI exit codes and no-notification healthy behavior;
 - static unit-file and installer safety assertions.
+- dedicated identity, empty capabilities, system-bus denial, checkout-secret
+  isolation, persistent calendar scheduling, disabled-upgrade ordering, fixed
+  checkout validation, and rollback timer-state cleanup.
 
 Adapters are injected or subprocess boundaries are faked in unit tests. No test
 uses production credentials, sends Telegram messages, touches the production
@@ -170,7 +182,8 @@ service state, code SHA, trading gates, and management audit.
 Only after the server timer is proven active and the test notification is
 confirmed should the temporary Codex automation be deleted.
 
-Rollback disables and removes only `telegram-kol-monitor.timer` and
+Rollback disables the timer, cleans its persistent systemd timer state while
+the unit is loaded, and removes only `telegram-kol-monitor.timer` and
 `telegram-kol-monitor.service`, reloads systemd, and leaves
 `telegram-kol.service`, trading settings, database, and exchange state
 untouched.

@@ -187,16 +187,29 @@ def _write_all(descriptor: int, chunk: bytes) -> None:
 def _stream_linux_noatime_component(
     source: Path, destination: Path, *, noatime_flag: int
 ) -> dict:
-    """Stream one Linux source fd only when O_NOATIME was accepted."""
+    """Stream without atime writes via O_NOATIME or a verified read-only mount."""
 
     before = source.stat(follow_symlinks=False)
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
         source_fd = os.open(source, flags | noatime_flag)
     except OSError as exc:
-        raise ManagementAuditSnapshotError(
-            "noatime_open_failed", status="snapshot_unavailable"
-        ) from exc
+        try:
+            mount_flags = os.statvfs(source).f_flag
+            read_only_flag = os.ST_RDONLY
+        except (AttributeError, OSError):
+            mount_flags = 0
+            read_only_flag = 1
+        if not mount_flags & read_only_flag:
+            raise ManagementAuditSnapshotError(
+                "noatime_open_failed", status="snapshot_unavailable"
+            ) from exc
+        try:
+            source_fd = os.open(source, flags)
+        except OSError as fallback_exc:
+            raise ManagementAuditSnapshotError(
+                "readonly_mount_open_failed", status="snapshot_unavailable"
+            ) from fallback_exc
     destination_fd = None
     try:
         destination_fd = os.open(
@@ -1643,6 +1656,10 @@ def monitor_production_safety(
         Path("data/research.db"),
         "--database-path",
     ),
+    checkout_path: Path = typer.Option(
+        Path("."),
+        "--checkout-path",
+    ),
     state_path: Path = typer.Option(
         Path("/var/lib/telegram-kol-monitor/state.json"),
         "--state-path",
@@ -1705,7 +1722,7 @@ def monitor_production_safety(
         state_path=state_path,
         adapters=ProductionSafetyAdapters(
             database_path=database_path,
-            checkout_path=Path.cwd(),
+            checkout_path=checkout_path,
             settings_url=settings_url,
         ),
         now=datetime.now(UTC),

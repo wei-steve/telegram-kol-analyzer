@@ -1037,7 +1037,6 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
         output = {
-            "systemctl": "active\n",
             "git": REVIEWED_HEAD + "\n",
             "journalctl": "first\nsecond\n",
             sys.executable: json.dumps(_healthy_audit()),
@@ -1050,6 +1049,11 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
         checkout_path=Path("/opt/telegram-kol-analyzer"),
     )
 
+    monkeypatch.setattr(
+        monitor_module,
+        "read_loopback_settings",
+        lambda url: _snapshot().settings,
+    )
     assert adapters.read_service_state() == "active"
     assert adapters.read_git_head() == REVIEWED_HEAD
     assert adapters.count_journal_errors(
@@ -1057,7 +1061,6 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
     ) == 2
     assert adapters.run_management_audit() == _healthy_audit()
     assert calls == [
-        (("systemctl", "is-active", "telegram-kol.service"), {"timeout_seconds": 5}),
         (
             ("git", "rev-parse", "HEAD"),
             {"timeout_seconds": 5, "cwd": Path("/opt/telegram-kol-analyzer")},

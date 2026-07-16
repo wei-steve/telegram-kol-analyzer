@@ -33,17 +33,28 @@ Use GitHub as the code-transfer channel. After a reviewed commit is pushed to `c
 
 Production safety monitoring runs independently through
 `telegram-kol-monitor.service` and a persistent 30-minute
-`telegram-kol-monitor.timer`. The root-only expected-HEAD environment and state
-live outside the trading database. Normal trade notifications are not
+`telegram-kol-monitor.timer`. The dedicated unprivileged monitor identity has
+no capabilities or system-bus access. Its root-owned monitor-only environment
+contains the frozen expected HEAD and system-operator bot fields only; it must
+never contain Deepcoin credentials or reuse the checkout's general environment.
+Its independent writable state lives outside the trading database. Normal trade notifications are not
 duplicated; the monitor alerts only on actionable system abnormalities and has
 no authority to restart `telegram-kol.service`, change settings, write the
 production database, or mutate Deepcoin state.
 
-On each reviewed server deployment, run `./scripts/install_server_monitor.sh`
-first. Its default is install-only and leaves the timer disabled. Complete the
+On each reviewed server deployment, first run
+`systemctl disable --now telegram-kol-monitor.timer`, then require both
+`systemctl is-enabled --quiet telegram-kol-monitor.timer` and
+`systemctl is-active --quiet telegram-kol-monitor.timer` to be false. Run
+`./scripts/install_server_monitor.sh` only from `/opt/telegram-kol-analyzer`.
+Its default is install-only and fails closed if an old timer remains enabled or
+active. Complete the
 runbook's no-notify full audit and one labelled notification test before running
 `./scripts/install_server_monitor.sh --enable`. Status and monitor-only rollback
-commands are maintained in `docs/runbook.md` and `docs/server-deployment.md`.
+commands, including persistent timer-state cleanup with
+`systemctl clean --what=state telegram-kol-monitor.timer`, are maintained in
+`docs/runbook.md` and `docs/server-deployment.md`. The initial root-only
+credential source is `/etc/telegram-kol-monitor.credentials`.
 
 ## Mobile-first web workbench
 

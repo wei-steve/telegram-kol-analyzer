@@ -370,6 +370,23 @@ def test_load_system_operator_bot_config_uses_dedicated_env_vars():
     assert system_operator_bot_enabled(config)
 
 
+def test_load_system_operator_bot_config_explicit_empty_paths_reads_no_checkout_env(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "TELEGRAM_KOL_SYSTEM_BOT_TOKEN=checkout-secret\n"
+        "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID=123\n"
+        "DEEPCOIN_API_SECRET=must-not-be-read\n",
+        encoding="utf-8",
+    )
+
+    config = load_system_operator_bot_config(environ={}, env_file_paths=[])
+
+    assert config.bot_token == ""
+    assert config.chat_id == ""
+
+
 def test_format_pending_entry_expiry_review_message_includes_operator_choices():
     message = format_pending_entry_expiry_review_message(
         {

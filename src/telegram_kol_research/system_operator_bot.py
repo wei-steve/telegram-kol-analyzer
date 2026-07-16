@@ -32,15 +32,17 @@ def load_system_operator_bot_config(
     environ: dict[str, str] | None = None,
     env_file_paths: list[str | os.PathLike[str]] | None = None,
 ) -> SystemOperatorBotConfig:
+    paths = (
+        [
+            ".env",
+            "config/telegram.env",
+            "config/system_operator_bot.env",
+        ]
+        if env_file_paths is None
+        else env_file_paths
+    )
     env = dict(
-        _load_env_file_values(
-            env_file_paths
-            or [
-                ".env",
-                "config/telegram.env",
-                "config/system_operator_bot.env",
-            ]
-        )
+        _load_env_file_values(paths) if paths else {}
     )
     env.update(environ or os.environ)
     return SystemOperatorBotConfig(

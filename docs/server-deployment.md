@@ -84,16 +84,48 @@ notifications are not duplicated. The monitor does not restart or stop
 `telegram-kol.service`, alter trading gates, write `data/research.db`, or send a
 Deepcoin request.
 
+It runs as the dedicated unprivileged `telegram-kol-monitor` user and group
+with no capabilities or system-bus access. A read-only systemd mount allowlist
+exposes only its venv/source, Git metadata, SQLite database components, and
+journal access; the checkout `.env`, general `config/`, and unrelated runtime
+data stay hidden. Its outbound network access is needed for the literal
+loopback settings endpoint and Telegram notification. The generated monitor
+environment contains no Deepcoin credentials, so the process has neither the
+credentials nor host privilege needed to mutate exchange state.
+
+Before the first install, create `/etc/telegram-kol-monitor.credentials` as a
+root-owned `0600` file containing only
+`TELEGRAM_KOL_SYSTEM_BOT_TOKEN`, `TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID`, and an
+optional `TELEGRAM_KOL_SYSTEM_BOT_TIMEOUT_SECONDS`. Never copy the checkout's
+general environment into it.
+
+Before every install or upgrade, explicitly disable and stop the timer, then
+prove both states. Install-only intentionally fails closed before making any
+change if an old timer remains enabled or active:
+
+```bash
+sudo systemctl disable --now telegram-kol-monitor.timer
+if systemctl is-enabled --quiet telegram-kol-monitor.timer || \
+   systemctl is-active --quiet telegram-kol-monitor.timer; then
+  echo "monitor timer must be disabled and inactive" >&2
+  exit 1
+fi
+```
+
 Only after the reviewed commit has been deployed and the focused server tests
-pass, install the reviewed units in their default disabled state:
+pass, run the helper from the fixed production Git root:
 
 ```bash
 cd /opt/telegram-kol-analyzer
 sudo ./scripts/install_server_monitor.sh
-systemctl is-enabled telegram-kol-monitor.timer || true
+if systemctl is-enabled --quiet telegram-kol-monitor.timer || \
+   systemctl is-active --quiet telegram-kol-monitor.timer; then
+  exit 1
+fi
 ```
 
-The installer captures the current deployed HEAD into the root-only
+The installer rejects another clone or worktree and captures only the validated
+production HEAD plus allowlisted bot fields into the root-owned `0600`
 `/etc/telegram-kol-monitor.env`. Before enabling the timer, follow the complete
 commands in `docs/runbook.md` to run one no-notify `--force-full-audit` health
 check and exactly one `--notify --test-notification` delivery check. After both
@@ -112,9 +144,11 @@ advance the frozen HEAD. To roll back the monitor without touching trading:
 
 ```bash
 sudo systemctl disable --now telegram-kol-monitor.timer
+sudo systemctl clean --what=state telegram-kol-monitor.timer
 sudo rm -f /etc/systemd/system/telegram-kol-monitor.timer
 sudo rm -f /etc/systemd/system/telegram-kol-monitor.service
 sudo rm -f /etc/telegram-kol-monitor.env
+sudo rm -f /etc/telegram-kol-monitor.credentials
 sudo rm -rf /var/lib/telegram-kol-monitor
 sudo systemctl daemon-reload
 ```

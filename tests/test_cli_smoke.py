@@ -666,6 +666,42 @@ def test_linux_noatime_open_failure_refuses_before_source_read(tmp_path, monkeyp
     assert sorted(p.name for p in tmp_path.iterdir()) == before[2]
 
 
+def test_linux_noatime_permission_fallback_reads_only_verified_readonly_mount(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+
+    source = tmp_path / "source.db"
+    destination = tmp_path / "copy.db"
+    source.write_bytes(b"readonly snapshot")
+    source_stat = source.stat()
+    os.utime(
+        source,
+        ns=(source_stat.st_mtime_ns + 1_000_000_000, source_stat.st_mtime_ns),
+    )
+    real_open = os.open
+    noatime_flag = 0x40000
+
+    def guarded_open(path, flags, *args, **kwargs):
+        if os.fspath(path) == os.fspath(source) and flags & noatime_flag:
+            raise PermissionError("unprivileged O_NOATIME")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", guarded_open)
+    monkeypatch.setattr(
+        os,
+        "statvfs",
+        lambda path: SimpleNamespace(f_flag=os.ST_RDONLY),
+    )
+
+    evidence = cli_module._stream_linux_noatime_component(
+        source, destination, noatime_flag=noatime_flag
+    )
+
+    assert destination.read_bytes() == b"readonly snapshot"
+    assert evidence["size"] == len(b"readonly snapshot")
+
+
 def test_snapshot_capture_streams_to_files_and_returns_metadata_only(tmp_path):
     import telegram_kol_research.cli as cli_module
 

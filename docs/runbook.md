@@ -181,26 +181,62 @@ verified `posId` ownership.
 
 ## Operate the server production safety monitor
 
-The production safety monitor is a separate read-only oneshot service. It
+The production safety monitor is a separate read-only oneshot service under the
+dedicated unprivileged `telegram-kol-monitor` identity. It
 checks the deployed commit, `telegram-kol.service` state, the approved live
 gates, bounded journal errors, bounded abnormal execution summaries, and the
 daily management audit. It writes only its root-owned state file under
-`/var/lib/telegram-kol-monitor`; it does not change trading settings, write the
+`/var/lib/telegram-kol-monitor`; it has an empty capability set, no system-bus
+socket access, and no access to the checkout's `.env`, `config/`, or other
+`data/` content. It does not change trading settings, write the
 production database, call a Deepcoin mutation, or restart the trading service.
 Normal trade notifications are not duplicated: only actionable system
 abnormalities are eligible for monitor alerts.
 
-After deploying and reviewing the server checkout, install the files without
-enabling or starting the timer:
+Provision the monitor-only root credential file once. It may contain only the
+system-operator bot token, chat ID, and optional timeout; never put a Deepcoin,
+Telegram-session, database, or application credential in this file:
+
+```bash
+sudo install -o root -g root -m 0600 /dev/null /etc/telegram-kol-monitor.credentials
+sudoedit /etc/telegram-kol-monitor.credentials
+```
+
+```text
+TELEGRAM_KOL_SYSTEM_BOT_TOKEN=<operator-bot-token>
+TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID=<operator-chat-id>
+```
+
+For every install or upgrade, explicitly stop and disable the monitor first.
+The install-only helper fails before changing users, files, or systemd state if
+the timer is active or enabled:
+
+```bash
+sudo systemctl disable --now telegram-kol-monitor.timer
+if systemctl is-enabled --quiet telegram-kol-monitor.timer || \
+   systemctl is-active --quiet telegram-kol-monitor.timer; then
+  echo "monitor timer must be disabled and inactive" >&2
+  exit 1
+fi
+```
+
+After deploying and reviewing the fixed production checkout, install the files
+without enabling or starting the timer:
 
 ```bash
 cd /opt/telegram-kol-analyzer
 sudo ./scripts/install_server_monitor.sh
-systemctl is-enabled telegram-kol-monitor.timer || true
+if systemctl is-enabled --quiet telegram-kol-monitor.timer || \
+   systemctl is-active --quiet telegram-kol-monitor.timer; then
+  echo "unexpected enabled or active monitor timer" >&2
+  exit 1
+fi
 ```
 
-The installer freezes the checkout's current `git rev-parse HEAD` in the
-root-only `/etc/telegram-kol-monitor.env`. Rerun the installer after each later
+The installer refuses any path other than the validated
+`/opt/telegram-kol-analyzer` Git root. It freezes that checkout's current
+`git rev-parse HEAD` with only the allowlisted operator-bot fields in the
+root-owned `0600` `/etc/telegram-kol-monitor.env`. Rerun the installer after each later
 reviewed deployment to advance that expected-commit baseline. Before enabling,
 run one full health check with notification delivery omitted:
 
@@ -247,9 +283,11 @@ settings, the production database, and exchange state untouched:
 
 ```bash
 sudo systemctl disable --now telegram-kol-monitor.timer
+sudo systemctl clean --what=state telegram-kol-monitor.timer
 sudo rm -f /etc/systemd/system/telegram-kol-monitor.timer
 sudo rm -f /etc/systemd/system/telegram-kol-monitor.service
 sudo rm -f /etc/telegram-kol-monitor.env
+sudo rm -f /etc/telegram-kol-monitor.credentials
 sudo rm -rf /var/lib/telegram-kol-monitor
 sudo systemctl daemon-reload
 ```
