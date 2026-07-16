@@ -435,7 +435,7 @@ def read_abnormal_execution_events(
 def read_loopback_settings(
     url: str,
     *,
-    timeout_seconds: float = 5.0,
+    timeout_seconds: float = 30.0,
 ) -> Mapping[str, Any]:
     """Read the local settings endpoint while refusing any non-loopback URL."""
 

@@ -1392,7 +1392,7 @@ def test_loopback_settings_disable_environment_proxy_trust(monkeypatch):
     assert calls == [
         (
             ("GET", "http://127.0.0.1:8000/api/trading-settings"),
-            {"timeout": 5.0, "trust_env": False},
+            {"timeout": 30.0, "trust_env": False},
         )
     ]
 
