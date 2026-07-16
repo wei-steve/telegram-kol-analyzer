@@ -24,6 +24,129 @@ def test_cli_help_renders():
     assert "recovery-dry-run" in result.stdout
     assert "repair-position-attribution" in result.stdout
     assert "audit-management-batches" in result.stdout
+    assert "monitor-production-safety" in result.stdout
+
+
+def test_monitor_production_safety_help_has_required_flags():
+    result = CliRunner().invoke(
+        app,
+        ["monitor-production-safety", "--help"],
+        env={"COLUMNS": "240"},
+    )
+
+    assert result.exit_code == 0, result.stdout
+    for flag in (
+        "--expected-head",
+        "--expected-auto-trade-enabled",
+        "--expected-management-mode",
+        "--expected-max-concurrent-positions",
+        "--notify",
+        "--force-full-audit",
+        "--test-notification",
+    ):
+        assert flag in result.stdout
+
+
+def test_monitor_production_test_notification_requires_notify():
+    result = CliRunner().invoke(
+        app,
+        [
+            "monitor-production-safety",
+            "--expected-head",
+            "a" * 40,
+            "--expected-auto-trade-enabled",
+            "--expected-management-mode",
+            "live",
+            "--expected-max-concurrent-positions",
+            "4",
+            "--test-notification",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--notify" in result.stderr
+
+
+def test_monitor_production_test_notification_uses_fixed_text_only(monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "send_monitor_test_notification",
+        lambda: calls.append("test") or "sent",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_production_safety_monitor",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("monitor adapters called")),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "monitor-production-safety",
+            "--expected-head",
+            "a" * 40,
+            "--expected-auto-trade-enabled",
+            "--expected-management-mode",
+            "live",
+            "--expected-max-concurrent-positions",
+            "4",
+            "--notify",
+            "--test-notification",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert calls == ["test"]
+    assert json.loads(result.stdout) == {
+        "healthy": True,
+        "mode": "test_notification",
+        "notification_status": "sent",
+    }
+
+
+def test_monitor_production_prints_compact_fixed_summary_and_exits_nonzero(monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "run_production_safety_monitor",
+        lambda **kwargs: SimpleNamespace(
+            audit_ran=False,
+            exit_code=1,
+            monitor_error="notification_delivery_failed",
+            notification_status="delivery_failed",
+            result=SimpleNamespace(
+                healthy=False,
+                reason_codes=("service_inactive",),
+            ),
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "monitor-production-safety",
+            "--expected-head",
+            "a" * 40,
+            "--expected-auto-trade-enabled",
+            "--expected-management-mode",
+            "live",
+            "--expected-max-concurrent-positions",
+            "4",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {
+        "audit_ran": False,
+        "healthy": False,
+        "monitor_error": "notification_delivery_failed",
+        "notification_status": "delivery_failed",
+        "reason_codes": ["service_inactive"],
+    }
 
 
 def test_audit_management_batches_is_bounded_redacted_and_read_only(

@@ -13,7 +13,7 @@ import tempfile
 from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import typer
@@ -33,6 +33,12 @@ from telegram_kol_research.execution_bindings import (
 from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
+)
+from telegram_kol_research.production_safety_monitor import (
+    MonitorExpectations,
+    ProductionSafetyAdapters,
+    run_production_safety_monitor,
+    send_monitor_test_notification,
 )
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
@@ -1504,6 +1510,115 @@ def repair_execution_order_legs(
     session_factory = create_session_factory(database_path)
     repaired = repair_execution_order_legs_from_binding_payloads(session_factory)
     typer.echo(f"Repaired {repaired} execution order leg(s) in {database_path}")
+
+
+@app.command("monitor-production-safety")
+def monitor_production_safety(
+    expected_head: str = typer.Option(..., "--expected-head"),
+    expected_auto_trade_enabled: bool | None = typer.Option(
+        None,
+        "--expected-auto-trade-enabled/--no-expected-auto-trade-enabled",
+    ),
+    expected_management_mode: str = typer.Option(
+        ...,
+        "--expected-management-mode",
+    ),
+    expected_max_concurrent_positions: int = typer.Option(
+        ...,
+        "--expected-max-concurrent-positions",
+        min=0,
+    ),
+    database_path: Path = typer.Option(
+        Path("data/research.db"),
+        "--database-path",
+    ),
+    state_path: Path = typer.Option(
+        Path("/var/lib/telegram-kol-monitor/state.json"),
+        "--state-path",
+    ),
+    settings_url: str = typer.Option(
+        "http://127.0.0.1:8000/api/trading-settings",
+        "--settings-url",
+    ),
+    lookback_minutes: int = typer.Option(35, "--lookback-minutes", min=1, max=120),
+    notify: bool = typer.Option(False, "--notify"),
+    force_full_audit: bool = typer.Option(False, "--force-full-audit"),
+    test_notification: bool = typer.Option(False, "--test-notification"),
+) -> None:
+    """Run bounded read-only server safety checks and optional alerts."""
+
+    if expected_auto_trade_enabled is None:
+        raise typer.BadParameter(
+            "choose --expected-auto-trade-enabled or --no-expected-auto-trade-enabled"
+        )
+    if test_notification:
+        if not notify:
+            raise typer.BadParameter("--test-notification requires --notify")
+        try:
+            notification_status = send_monitor_test_notification()
+        except Exception:
+            typer.echo(
+                json.dumps(
+                    {
+                        "healthy": False,
+                        "mode": "test_notification",
+                        "notification_status": "failed",
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            raise typer.Exit(code=1)
+        typer.echo(
+            json.dumps(
+                {
+                    "healthy": True,
+                    "mode": "test_notification",
+                    "notification_status": notification_status,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return
+
+    outcome = run_production_safety_monitor(
+        expectations=MonitorExpectations(
+            head=expected_head,
+            auto_trade_enabled=expected_auto_trade_enabled,
+            management_execution_mode=expected_management_mode,
+            max_concurrent_positions=expected_max_concurrent_positions,
+        ),
+        state_path=state_path,
+        adapters=ProductionSafetyAdapters(
+            database_path=database_path,
+            checkout_path=Path.cwd(),
+            settings_url=settings_url,
+        ),
+        now=datetime.now(UTC),
+        notify=notify,
+        force_full_audit=force_full_audit,
+        lookback=timedelta(minutes=lookback_minutes),
+    )
+    summary = {
+        "audit_ran": outcome.audit_ran,
+        "healthy": outcome.result.healthy,
+        "monitor_error": outcome.monitor_error,
+        "notification_status": outcome.notification_status,
+        "reason_codes": list(outcome.result.reason_codes),
+    }
+    typer.echo(
+        json.dumps(
+            summary,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    if outcome.exit_code:
+        raise typer.Exit(code=outcome.exit_code)
 
 
 @app.command("audit-management-batches")

@@ -1,23 +1,35 @@
 import json
 import os
+import sqlite3
 import stat
+import sys
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from telegram_kol_research.production_safety_monitor import MAX_ALERT_LENGTH
+from telegram_kol_research.production_safety_monitor import MONITOR_TEST_NOTIFICATION_TEXT
 from telegram_kol_research.production_safety_monitor import MonitorExpectations
 from telegram_kol_research.production_safety_monitor import MonitorNotificationDecision
 from telegram_kol_research.production_safety_monitor import MonitorResult
 from telegram_kol_research.production_safety_monitor import MonitorSnapshot
 from telegram_kol_research.production_safety_monitor import MonitorState
+from telegram_kol_research.production_safety_monitor import ProductionSafetyAdapters
 from telegram_kol_research.production_safety_monitor import decide_monitor_notification
 from telegram_kol_research.production_safety_monitor import evaluate_monitor_snapshot
 from telegram_kol_research.production_safety_monitor import fingerprint_monitor_result
 from telegram_kol_research.production_safety_monitor import format_monitor_alert
 from telegram_kol_research.production_safety_monitor import load_monitor_state
+from telegram_kol_research.production_safety_monitor import read_abnormal_execution_events
+from telegram_kol_research.production_safety_monitor import read_loopback_settings
+from telegram_kol_research.production_safety_monitor import run_daily_management_audit
+from telegram_kol_research.production_safety_monitor import run_production_safety_monitor
 from telegram_kol_research.production_safety_monitor import save_monitor_state
+from telegram_kol_research.production_safety_monitor import send_monitor_test_notification
+from telegram_kol_research.production_safety_monitor import should_run_daily_audit
 
 
 REVIEWED_HEAD = "3ec22ca77a1362167ce9d2cf702cfc50b1491967"
@@ -591,3 +603,338 @@ def test_healthy_monitor_result_silently_clears_active_fingerprint():
         anomaly_fingerprint=None,
         last_notification_at=previous_notification,
     )
+
+
+class _RecordingAdapters:
+    def __init__(self, *, service_state="active", audit=None):
+        self.calls = []
+        self.service_state = service_state
+        self.audit = audit or _healthy_audit()
+
+    def read_service_state(self):
+        self.calls.append("service")
+        return self.service_state
+
+    def read_git_head(self):
+        self.calls.append("head")
+        return REVIEWED_HEAD
+
+    def read_settings(self):
+        self.calls.append("settings")
+        return _snapshot().settings
+
+    def count_journal_errors(self, *, since):
+        self.calls.append(("journal", since))
+        return 0
+
+    def read_abnormal_events(self, *, since, limit):
+        self.calls.append(("events", since, limit))
+        return ()
+
+    def run_management_audit(self):
+        self.calls.append("audit")
+        return self.audit
+
+
+def test_monitor_orchestration_reads_all_bounded_lightweight_sources(tmp_path):
+    adapters = _RecordingAdapters()
+    state_path = tmp_path / "state.json"
+    save_monitor_state(
+        state_path,
+        MonitorState(last_window_at="2026-07-16T00:00:00+00:00"),
+    )
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=adapters,
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        notify=False,
+        abnormal_event_limit=50,
+    )
+
+    assert outcome.exit_code == 0
+    assert adapters.calls == [
+        "service",
+        "head",
+        "settings",
+        ("journal", datetime(2026, 7, 16, 0, 0, tzinfo=UTC)),
+        ("events", datetime(2026, 7, 16, 0, 0, tzinfo=UTC), 50),
+    ]
+
+
+def test_execution_event_adapter_uses_sqlite_read_only_uri_and_select_only(tmp_path):
+    database_path = tmp_path / "research.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE execution_events (action TEXT, status TEXT, pos_id TEXT, created_at TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO execution_events VALUES "
+            "('close_bound_position_market', 'submitted', 'pos-1', '2026-07-16 00:10:00')"
+        )
+        connection.commit()
+    calls = []
+
+    def connect(path, *, uri=False, **kwargs):
+        calls.append((path, uri))
+        connection = sqlite3.connect(path, uri=uri, **kwargs)
+        connection.set_trace_callback(lambda statement: calls.append(statement))
+        return connection
+
+    events = read_abnormal_execution_events(
+        database_path,
+        since=datetime(2026, 7, 16, 0, 0, tzinfo=UTC),
+        limit=20,
+        connect=connect,
+    )
+
+    assert calls[0] == (f"file:{database_path}?mode=ro", True)
+    statements = [call for call in calls[1:] if isinstance(call, str)]
+    assert statements and all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    assert "request_json" not in " ".join(statements).lower()
+    assert events == ({"action": "close_bound_position_market", "status": "submitted", "pos_id": "pos-1"},)
+
+
+@pytest.mark.parametrize(
+    ("now", "last_date", "expected"),
+    [
+        (datetime(2026, 7, 16, 0, 59, tzinfo=UTC), None, False),
+        (datetime(2026, 7, 16, 1, 0, tzinfo=UTC), None, True),
+        (datetime(2026, 7, 16, 2, 0, tzinfo=UTC), "2026-07-16", False),
+        (datetime(2026, 7, 16, 2, 0, tzinfo=UTC), "2026-07-15", True),
+    ],
+)
+def test_daily_audit_starts_only_after_nine_asia_shanghai(now, last_date, expected):
+    assert should_run_daily_audit(now=now, last_successful_date=last_date) is expected
+
+
+def test_source_snapshots_differ_retries_exactly_once():
+    results = [
+        {"snapshot_status": "snapshot_unstable", "snapshot_reason": "source_snapshots_differ"},
+        _healthy_audit(),
+    ]
+    calls = []
+
+    audit = run_daily_management_audit(lambda: calls.append(1) or results.pop(0))
+
+    assert audit == _healthy_audit()
+    assert calls == [1, 1]
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        {"snapshot_status": "snapshot_unavailable", "snapshot_reason": "source_open_failed"},
+        {"snapshot_status": "snapshot_unstable", "snapshot_reason": "rollback_journal_present"},
+    ],
+)
+def test_other_audit_failures_are_not_retried(first):
+    calls = []
+
+    assert run_daily_management_audit(lambda: calls.append(1) or first) == first
+    assert calls == [1]
+
+
+def test_healthy_monitor_sends_nothing_even_when_notify_enabled(tmp_path):
+    adapters = _RecordingAdapters()
+    deliveries = []
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=adapters,
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: (_ for _ in ()).throw(AssertionError("bot config loaded")),
+        send_bot_message=lambda **kwargs: deliveries.append(kwargs),
+    )
+
+    assert outcome.exit_code == 0
+    assert deliveries == []
+
+
+def test_eligible_anomaly_sends_once_and_persists_delivery_dedupe(tmp_path):
+    state_path = tmp_path / "state.json"
+    adapters = _RecordingAdapters(service_state="inactive")
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+    deliveries = []
+    kwargs = dict(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=adapters,
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+
+    first = run_production_safety_monitor(**kwargs)
+    second = run_production_safety_monitor(**kwargs)
+
+    assert first.exit_code == 1
+    assert second.exit_code == 1
+    assert len(deliveries) == 1
+    assert deliveries[0]["config"] is config
+    assert deliveries[0]["text"].startswith("【生产安全监控异常】")
+
+
+@pytest.mark.parametrize("failure", ["missing", "delivery"])
+def test_notification_failure_is_nonzero_without_successful_delivery_state(tmp_path, failure):
+    state_path = tmp_path / "state.json"
+    config = SimpleNamespace(
+        bot_token="" if failure == "missing" else "token",
+        chat_id="" if failure == "missing" else "chat",
+    )
+
+    def send(**kwargs):
+        raise RuntimeError("raw delivery secret")
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(service_state="inactive"),
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=send,
+    )
+
+    state = load_monitor_state(state_path)
+    assert outcome.exit_code == 1
+    assert outcome.notification_status in {"config_missing", "delivery_failed"}
+    assert state.anomaly_fingerprint is None
+    assert state.last_notification_at is None
+
+
+def test_non_loopback_settings_url_is_rejected_before_http(monkeypatch):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    monkeypatch.setattr(
+        monitor_module.httpx,
+        "stream",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("HTTP called")),
+    )
+
+    with pytest.raises(ValueError, match="loopback"):
+        read_loopback_settings("http://example.com/api/trading-settings")
+    with pytest.raises(ValueError, match="loopback"):
+        read_loopback_settings("https://127.0.0.1/api/trading-settings")
+
+
+def test_successful_daily_audit_records_shanghai_date(tmp_path):
+    state_path = tmp_path / "state.json"
+    adapters = _RecordingAdapters()
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=adapters,
+        now=datetime(2026, 7, 16, 1, 0, tzinfo=UTC),
+        notify=False,
+    )
+
+    assert outcome.exit_code == 0
+    assert adapters.calls[-1] == "audit"
+    assert load_monitor_state(state_path).last_full_audit_date == "2026-07-16"
+
+
+def test_monitor_test_notification_has_fixed_prefix_and_no_dynamic_payload():
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+    deliveries = []
+
+    status = send_monitor_test_notification(
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+
+    assert status == "sent"
+    assert deliveries == [
+        {"config": config, "text": MONITOR_TEST_NOTIFICATION_TEXT}
+    ]
+    assert MONITOR_TEST_NOTIFICATION_TEXT.startswith(
+        "【监控测试】服务器安全监控通知链路验证"
+    )
+
+
+def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        output = {
+            "systemctl": "active\n",
+            "git": REVIEWED_HEAD + "\n",
+            "journalctl": "first\nsecond\n",
+            "telegram-kol-research": json.dumps(_healthy_audit()),
+        }[argv[0]]
+        return SimpleNamespace(returncode=0, output=output)
+
+    monkeypatch.setattr(monitor_module, "_run_bounded_command", run)
+    adapters = ProductionSafetyAdapters(
+        database_path=Path("data/research.db"),
+        checkout_path=Path("/opt/telegram-kol-analyzer"),
+    )
+
+    assert adapters.read_service_state() == "active"
+    assert adapters.read_git_head() == REVIEWED_HEAD
+    assert adapters.count_journal_errors(
+        since=datetime(2026, 7, 16, 0, 0, tzinfo=UTC)
+    ) == 2
+    assert adapters.run_management_audit() == _healthy_audit()
+    assert calls == [
+        (("systemctl", "is-active", "telegram-kol.service"), {"timeout_seconds": 5}),
+        (
+            ("git", "rev-parse", "HEAD"),
+            {"timeout_seconds": 5, "cwd": Path("/opt/telegram-kol-analyzer")},
+        ),
+        (
+            (
+                "journalctl",
+                "--unit",
+                "telegram-kol.service",
+                "--priority",
+                "err",
+                "--since",
+                "2026-07-16T00:00:00+00:00",
+                "--no-pager",
+                "--output",
+                "cat",
+            ),
+            {"timeout_seconds": 10, "max_output_bytes": 262_144},
+        ),
+        (
+            (
+                "telegram-kol-research",
+                "audit-management-batches",
+                "--database-path",
+                "data/research.db",
+                "--limit",
+                "20",
+                "--output-format",
+                "json",
+            ),
+            {"timeout_seconds": 180},
+        ),
+    ]
+
+
+def test_bounded_subprocess_reader_terminates_output_above_hard_cap():
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    with pytest.raises(RuntimeError, match="output_too_large"):
+        monitor_module._run_bounded_command(
+            (sys.executable, "-c", "import sys; sys.stdout.write('x' * 100000)"),
+            timeout_seconds=5,
+            max_output_bytes=32,
+        )
+
+    result = monitor_module._run_bounded_command(
+        (sys.executable, "-c", "print('bounded')"),
+        timeout_seconds=5,
+        max_output_bytes=32,
+    )
+    assert result.returncode == 0
+    assert result.output == "bounded\n"

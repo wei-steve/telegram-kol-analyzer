@@ -3,16 +3,31 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
+import selectors
+import sqlite3
+import subprocess
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
+
+import httpx
+
+from telegram_kol_research.system_operator_bot import (
+    load_system_operator_bot_config,
+    send_system_operator_bot_message,
+    system_operator_bot_enabled,
+)
 
 
 MAX_ALERT_LENGTH = 1200
@@ -91,6 +106,16 @@ _FINGERPRINT_DETAIL_KEYS = (
     "adapter_failures",
 )
 _NOTIFICATION_SUPPRESSION = timedelta(hours=6)
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_DEFAULT_LOOKBACK = timedelta(minutes=35)
+_MAX_COMMAND_OUTPUT_BYTES = 1_048_576
+_MAX_HTTP_OUTPUT_BYTES = 65_536
+_MAX_ABNORMAL_EVENTS = 200
+_MAX_JOURNAL_ERRORS = 10_000
+MONITOR_TEST_NOTIFICATION_TEXT = (
+    "【监控测试】服务器安全监控通知链路验证\n"
+    "本消息仅验证系统运维通知，不包含交易指令。"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +156,116 @@ class MonitorState:
 class MonitorNotificationDecision:
     should_notify: bool
     next_state: MonitorState
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorRunOutcome:
+    result: MonitorResult
+    notification_status: str
+    audit_ran: bool
+    monitor_error: str | None = None
+
+    @property
+    def exit_code(self) -> int:
+        return 0 if self.result.healthy and self.monitor_error is None else 1
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionSafetyAdapters:
+    """Bounded observation-only adapters used by the server monitor."""
+
+    database_path: Path
+    checkout_path: Path = Path(".")
+    settings_url: str = "http://127.0.0.1:8000/api/trading-settings"
+    service_name: str = "telegram-kol.service"
+    audit_command: str = "telegram-kol-research"
+
+    def read_service_state(self) -> str:
+        completed = _run_bounded_command(
+            ("systemctl", "is-active", self.service_name), timeout_seconds=5
+        )
+        state = completed.output.strip()
+        if completed.returncode not in {0, 3}:
+            raise RuntimeError("service_state_unavailable")
+        return state
+
+    def read_git_head(self) -> str:
+        completed = _run_bounded_command(
+            ("git", "rev-parse", "HEAD"),
+            timeout_seconds=5,
+            cwd=self.checkout_path,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("git_head_unavailable")
+        return completed.output.strip()
+
+    def read_settings(self) -> Mapping[str, Any]:
+        return read_loopback_settings(self.settings_url)
+
+    def count_journal_errors(self, *, since: datetime) -> int:
+        completed = _run_bounded_command(
+            (
+                "journalctl",
+                "--unit",
+                self.service_name,
+                "--priority",
+                "err",
+                "--since",
+                since.isoformat(),
+                "--no-pager",
+                "--output",
+                "cat",
+            ),
+            timeout_seconds=10,
+            max_output_bytes=262_144,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("journal_unavailable")
+        return min(
+            _MAX_JOURNAL_ERRORS,
+            sum(1 for line in completed.output.splitlines() if line.strip()),
+        )
+
+    def read_abnormal_events(
+        self, *, since: datetime, limit: int
+    ) -> tuple[Mapping[str, Any], ...]:
+        return read_abnormal_execution_events(
+            self.database_path,
+            since=since,
+            limit=limit,
+        )
+
+    def run_management_audit(self) -> Mapping[str, Any]:
+        completed = _run_bounded_command(
+            (
+                self.audit_command,
+                "audit-management-batches",
+                "--database-path",
+                str(self.database_path),
+                "--limit",
+                "20",
+                "--output-format",
+                "json",
+            ),
+            timeout_seconds=180,
+        )
+        try:
+            payload = json.loads(
+                completed.output,
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError("audit_output_invalid") from exc
+        if not isinstance(payload, Mapping):
+            raise RuntimeError("audit_output_invalid")
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class _CommandResult:
+    returncode: int
+    output: str
 
 
 def load_monitor_state(path: str | Path) -> MonitorState:
@@ -176,6 +311,343 @@ def save_monitor_state(path: str | Path, state: MonitorState) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def should_run_daily_audit(
+    *,
+    now: datetime,
+    last_successful_date: str | None,
+    force: bool = False,
+) -> bool:
+    """Schedule at most one successful audit day after 09:00 Shanghai time."""
+
+    localized = _require_aware_datetime(now).astimezone(_SHANGHAI)
+    if force:
+        return True
+    if localized.hour < 9:
+        return False
+    return last_successful_date != localized.date().isoformat()
+
+
+def run_daily_management_audit(run_once) -> Mapping[str, Any]:
+    """Retry only one transient source-snapshot mismatch, exactly once."""
+
+    first = run_once()
+    if not isinstance(first, Mapping):
+        raise TypeError("audit result must be a mapping")
+    if first.get("snapshot_reason") != "source_snapshots_differ":
+        return first
+    second = run_once()
+    if not isinstance(second, Mapping):
+        raise TypeError("audit result must be a mapping")
+    return second
+
+
+def read_abnormal_execution_events(
+    database_path: str | Path,
+    *,
+    since: datetime,
+    limit: int = 100,
+    connect=sqlite3.connect,
+) -> tuple[Mapping[str, Any], ...]:
+    """Read bounded identity/status fields from SQLite without write access."""
+
+    if type(limit) is not int or not 1 <= limit <= _MAX_ABNORMAL_EVENTS:
+        raise ValueError("invalid abnormal event limit")
+    since_utc = _require_aware_datetime(since).astimezone(UTC).replace(tzinfo=None)
+    uri = f"file:{database_path}?mode=ro"
+    query = """
+        SELECT action, status, pos_id
+        FROM execution_events
+        WHERE created_at >= ?
+          AND (
+            status NOT IN ('submitted', 'succeeded', 'confirmed', 'cancelled',
+                           'skipped', 'resolved', 'restored')
+            OR action = 'close_bound_position_market'
+          )
+        ORDER BY created_at DESC, action, status, pos_id
+        LIMIT ?
+    """
+    with connect(uri, uri=True) as connection:
+        rows = connection.execute(
+            query,
+            (since_utc.isoformat(sep=" "), limit),
+        ).fetchall()
+    return tuple(
+        {"action": row[0], "status": row[1], "pos_id": row[2]}
+        for row in rows
+    )
+
+
+def read_loopback_settings(
+    url: str,
+    *,
+    timeout_seconds: float = 5.0,
+) -> Mapping[str, Any]:
+    """Read the local settings endpoint while refusing any non-loopback URL."""
+
+    parsed = urlsplit(url)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1"}:
+        raise ValueError("settings URL must use loopback HTTP")
+    body = bytearray()
+    with httpx.stream("GET", url, timeout=timeout_seconds) as response:
+        response.raise_for_status()
+        for chunk in response.iter_bytes():
+            body.extend(chunk)
+            if len(body) > _MAX_HTTP_OUTPUT_BYTES:
+                raise ValueError("settings response too large")
+    payload = json.loads(
+        body,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
+    if not isinstance(payload, Mapping):
+        raise ValueError("settings response must be an object")
+    return {
+        "auto_trade_enabled": payload.get("auto_trade_enabled"),
+        "management_execution_mode": payload.get("management_execution_mode"),
+        "max_concurrent_positions": payload.get("max_concurrent_positions"),
+    }
+
+
+def run_production_safety_monitor(
+    *,
+    expectations: MonitorExpectations,
+    state_path: str | Path,
+    adapters,
+    now: datetime,
+    notify: bool,
+    force_full_audit: bool = False,
+    abnormal_event_limit: int = 100,
+    lookback: timedelta = _DEFAULT_LOOKBACK,
+    load_bot_config=load_system_operator_bot_config,
+    send_bot_message=send_system_operator_bot_message,
+) -> MonitorRunOutcome:
+    """Collect, evaluate, deduplicate, optionally notify, and persist state."""
+
+    checked_at = _require_aware_datetime(now)
+    state = load_monitor_state(state_path)
+    if state.last_window_at is None:
+        since = checked_at - lookback
+    else:
+        since = datetime.fromisoformat(state.last_window_at)
+
+    failures: list[str] = []
+    service_state = _read_adapter(adapters.read_service_state, "service", failures, "unknown")
+    head = _read_adapter(adapters.read_git_head, "head", failures, "0" * 40)
+    settings = _read_adapter(adapters.read_settings, "settings", failures, {})
+    journal_error_count = _read_adapter(
+        lambda: adapters.count_journal_errors(since=since),
+        "journal",
+        failures,
+        0,
+    )
+    abnormal_events = _read_adapter(
+        lambda: adapters.read_abnormal_events(
+            since=since,
+            limit=abnormal_event_limit,
+        ),
+        "events",
+        failures,
+        (),
+    )
+
+    audit = None
+    audit_ran = should_run_daily_audit(
+        now=checked_at,
+        last_successful_date=state.last_full_audit_date,
+        force=force_full_audit,
+    )
+    if audit_ran:
+        audit = _read_adapter(
+            lambda: run_daily_management_audit(adapters.run_management_audit),
+            "audit",
+            failures,
+            None,
+        )
+
+    result = evaluate_monitor_snapshot(
+        MonitorSnapshot(
+            service_state=service_state,
+            head=head,
+            settings=settings,
+            journal_error_count=journal_error_count,
+            abnormal_events=abnormal_events,
+            audit=audit,
+            adapter_failures=tuple(failures),
+        ),
+        expectations,
+    )
+
+    successful_audit_date = state.last_full_audit_date
+    if audit is not None and _audit_result_is_healthy(audit):
+        successful_audit_date = checked_at.astimezone(_SHANGHAI).date().isoformat()
+    base_state = MonitorState(
+        last_window_at=checked_at.isoformat(),
+        last_full_audit_date=successful_audit_date,
+        anomaly_fingerprint=state.anomaly_fingerprint,
+        last_notification_at=state.last_notification_at,
+    )
+    decision = decide_monitor_notification(result, base_state, now=checked_at)
+    next_state = decision.next_state if not decision.should_notify else base_state
+    notification_status = "not_needed" if result.healthy else "disabled"
+    monitor_error = None
+
+    if not result.healthy and decision.should_notify and notify:
+        try:
+            config = load_bot_config()
+        except Exception:
+            config = None
+        if not system_operator_bot_enabled(config):
+            notification_status = "config_missing"
+            monitor_error = "notification_config_missing"
+        else:
+            try:
+                _run_maybe_awaitable(
+                    send_bot_message(
+                        config=config,
+                        text=format_monitor_alert(result, checked_at=checked_at),
+                    )
+                )
+            except Exception:
+                notification_status = "delivery_failed"
+                monitor_error = "notification_delivery_failed"
+            else:
+                notification_status = "sent"
+                next_state = decision.next_state
+    elif not result.healthy and not decision.should_notify:
+        notification_status = "suppressed"
+        next_state = decision.next_state
+
+    try:
+        save_monitor_state(state_path, next_state)
+    except (OSError, TypeError, ValueError):
+        monitor_error = "state_write_failed"
+
+    return MonitorRunOutcome(
+        result=result,
+        notification_status=notification_status,
+        audit_ran=audit_ran,
+        monitor_error=monitor_error,
+    )
+
+
+def send_monitor_test_notification(
+    *,
+    load_bot_config=load_system_operator_bot_config,
+    send_bot_message=send_system_operator_bot_message,
+) -> str:
+    """Send only the fixed, clearly labelled monitor delivery test."""
+
+    config = load_bot_config()
+    if not system_operator_bot_enabled(config):
+        raise RuntimeError("notification_config_missing")
+    _run_maybe_awaitable(
+        send_bot_message(config=config, text=MONITOR_TEST_NOTIFICATION_TEXT)
+    )
+    return "sent"
+
+
+def _run_bounded_command(
+    argv: Sequence[str],
+    *,
+    timeout_seconds: float,
+    max_output_bytes: int = _MAX_COMMAND_OUTPUT_BYTES,
+    cwd: str | Path | None = None,
+) -> _CommandResult:
+    if (
+        not isinstance(argv, (tuple, list))
+        or not argv
+        or any(not isinstance(item, str) or not item for item in argv)
+    ):
+        raise ValueError("command argv must contain fixed nonempty strings")
+    if timeout_seconds <= 0 or max_output_bytes < 0:
+        raise ValueError("command bounds must be nonnegative")
+    process = subprocess.Popen(
+        tuple(argv),
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        shell=False,
+    )
+    if process.stdout is None:
+        process.kill()
+        process.wait()
+        raise RuntimeError("command_output_invalid")
+    output = bytearray()
+    deadline = time.monotonic() + timeout_seconds
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_and_wait(process)
+                raise subprocess.TimeoutExpired(tuple(argv), timeout_seconds)
+            events = selector.select(remaining)
+            if not events:
+                _kill_and_wait(process)
+                raise subprocess.TimeoutExpired(tuple(argv), timeout_seconds)
+            for key, _ in events:
+                chunk = os.read(
+                    key.fd,
+                    min(65_536, max_output_bytes - len(output) + 1),
+                )
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output.extend(chunk)
+                if len(output) > max_output_bytes:
+                    _kill_and_wait(process)
+                    raise RuntimeError("command_output_too_large")
+        remaining = max(0.0, deadline - time.monotonic())
+        returncode = process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        _kill_and_wait(process)
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+    return _CommandResult(
+        returncode=returncode,
+        output=bytes(output).decode("utf-8", errors="strict"),
+    )
+
+
+def _kill_and_wait(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.kill()
+    process.wait()
+
+
+def _read_adapter(reader, name: str, failures: list[str], fallback):
+    try:
+        return reader()
+    except Exception:
+        failures.append(name)
+        return fallback
+
+
+def _audit_result_is_healthy(audit: Mapping[str, Any]) -> bool:
+    reasons: set[str] = set()
+    details: dict[str, Any] = {}
+    _evaluate_audit(audit, reasons, details)
+    return not reasons
+
+
+def _run_maybe_awaitable(value: object) -> object:
+    if inspect.isawaitable(value):
+        import asyncio
+
+        return asyncio.run(value)
+    return value
+
+
+def _require_aware_datetime(value: datetime) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("datetime must be timezone-aware")
+    return value
 
 
 def fingerprint_monitor_result(result: MonitorResult) -> str:
