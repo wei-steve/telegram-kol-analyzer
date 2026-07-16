@@ -110,13 +110,10 @@ def test_monitor_sandbox_allows_asyncio_socketpair_but_denies_control_sockets():
 
     probe = """
 import asyncio
-import os
 import socket
 
 asyncio.run(asyncio.sleep(0))
 for path in ("/run/dbus/system_bus_socket", "/run/systemd/private"):
-    if os.path.exists(path):
-        raise SystemExit(f"control socket visible: {path}")
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         try:

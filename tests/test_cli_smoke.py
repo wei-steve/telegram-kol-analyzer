@@ -559,8 +559,8 @@ def test_audit_management_batches_active_wal_read_only_source_is_unchanged(tmp_p
         assert payload["snapshot_components"] == ["main", "shm", "wal"]
         assert sorted(path.name for path in tmp_path.iterdir()) == before_files
         for path in source_paths:
-            assert path.read_bytes() == before[path.name][0]
             assert path.stat() == before[path.name][1]
+            assert path.read_bytes() == before[path.name][0]
     finally:
         tmp_path.chmod(0o755)
         for suffix in ("", "-wal", "-shm"):
