@@ -204,6 +204,15 @@ def test_installer_fails_closed_on_running_or_enabled_install_only_before_change
     assert "systemctl daemon-reload" not in preflight
 
 
+def test_installer_accepts_systemd_not_found_as_a_fresh_disabled_install():
+    installer = INSTALLER_PATH.read_text(encoding="utf-8")
+    enablement_case = installer.split(
+        'case "$timer_enabled_status" in', 1
+    )[1].split("esac", 1)[0]
+
+    assert "0|1|3|4)" in enablement_case
+
+
 def test_installer_creates_identity_and_allowlisted_monitor_environment():
     installer = INSTALLER_PATH.read_text(encoding="utf-8")
 

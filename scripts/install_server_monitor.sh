@@ -66,7 +66,7 @@ esac
 timer_enabled_status=0
 systemctl is-enabled --quiet telegram-kol-monitor.timer || timer_enabled_status=$?
 case "$timer_enabled_status" in
-  0|1|3)
+  0|1|3|4)
     ;;
   *)
     echo "Unable to prove telegram-kol-monitor.timer enablement state." >&2
