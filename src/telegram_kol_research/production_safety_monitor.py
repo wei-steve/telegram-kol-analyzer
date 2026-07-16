@@ -588,6 +588,29 @@ def run_production_safety_monitor(
             else:
                 notification_status = "sent"
                 next_state = decision.next_state
+                continuing_reasons = tuple(
+                    reason
+                    for reason in result.reason_codes
+                    if reason != "state_invalid"
+                )
+                if state_integrity_alert_pending and continuing_reasons:
+                    # The delivered message included state_invalid, but that
+                    # synthetic one-shot reason is acknowledged now. Persist
+                    # only the continuing real anomaly so it keeps its normal
+                    # six-hour dedupe identity on the repaired next run.
+                    continuing_result = MonitorResult(
+                        healthy=False,
+                        reason_codes=continuing_reasons,
+                        details=result.details,
+                    )
+                    next_state = MonitorState(
+                        last_window_at=decision.next_state.last_window_at,
+                        last_full_audit_date=decision.next_state.last_full_audit_date,
+                        anomaly_fingerprint=fingerprint_monitor_result(
+                            continuing_result
+                        ),
+                        last_notification_at=decision.next_state.last_notification_at,
+                    )
     elif not result.healthy and not decision.should_notify:
         notification_status = "suppressed"
         next_state = decision.next_state

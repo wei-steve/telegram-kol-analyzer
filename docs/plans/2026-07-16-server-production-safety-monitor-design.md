@@ -108,6 +108,13 @@ notification-enabled invocation retries the fixed `state_invalid` alert; only a
 successful delivery writes the notification timestamp, after which the next
 healthy run clears the fingerprint without another message.
 
+When state corruption and a continuing operational anomaly are delivered in one
+message, the post-delivery fingerprint omits only the synthetic `state_invalid`
+reason and represents the continuing result. This preserves its ordinary six-hour
+suppression across the repaired-state boundary. Before successful delivery, the
+pending fingerprint still covers the complete current result so failures retry;
+after delivery, a changed continuing result remains immediately eligible.
+
 ## Notification Policy
 
 Reuse `load_system_operator_bot_config` in explicit environment-only mode and

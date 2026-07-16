@@ -200,7 +200,12 @@ with no notification timestamp until one delivery succeeds. A `--notify` run
 retries that fixed `state_invalid` alert after missing configuration or delivery
 failure. A no-notify diagnostic run still advances successfully read window and
 audit progress, but it does not mark it delivered; the pending alert remains for
-a later notification-enabled invocation.
+a later notification-enabled invocation. If `state_invalid` is delivered together
+with a continuing real anomaly, the message reports both, while the durable
+six-hour dedupe fingerprint excludes the acknowledged one-shot `state_invalid`
+reason. The continuing anomaly is therefore not sent again merely because the
+state file was repaired; a genuine change to that anomaly still notifies
+immediately.
 
 Provision the monitor-only root credential file once. It may contain only the
 system-operator bot token, chat ID, and optional timeout; never put a Deepcoin,

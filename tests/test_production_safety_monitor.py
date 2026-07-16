@@ -1007,6 +1007,130 @@ def test_invalid_state_no_notify_repairs_progress_but_keeps_delivery_pending(tmp
     assert load_monitor_state(state_path).last_window_at == "2026-07-16T01:30:00+00:00"
 
 
+def test_invalid_state_with_persistent_anomaly_sends_once_then_suppresses_for_six_hours(
+    tmp_path,
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{", encoding="utf-8")
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+    deliveries = []
+
+    def run(now):
+        return run_production_safety_monitor(
+            expectations=EXPECTATIONS,
+            state_path=state_path,
+            adapters=_RecordingAdapters(service_state="inactive"),
+            now=now,
+            notify=True,
+            load_bot_config=lambda: config,
+            send_bot_message=lambda **payload: deliveries.append(payload),
+        )
+
+    first = run(datetime(2026, 7, 16, 1, 0, tzinfo=UTC))
+    delivered_state = load_monitor_state(state_path)
+    second = run(datetime(2026, 7, 16, 1, 30, tzinfo=UTC))
+    third = run(datetime(2026, 7, 16, 6, 59, tzinfo=UTC))
+    persistent_result = evaluate_monitor_snapshot(
+        _snapshot(service_state="inactive"),
+        EXPECTATIONS,
+    )
+
+    assert first.result.reason_codes == ("service_inactive", "state_invalid")
+    assert first.notification_status == "sent"
+    assert delivered_state.anomaly_fingerprint == fingerprint_monitor_result(
+        persistent_result
+    )
+    assert second.result.reason_codes == ("service_inactive",)
+    assert second.notification_status == "suppressed"
+    assert third.notification_status == "suppressed"
+    assert len(deliveries) == 1
+
+
+@pytest.mark.parametrize("first_failure", ["delivery", "missing_config"])
+def test_invalid_state_with_persistent_anomaly_retries_unsuccessful_delivery(
+    tmp_path, first_failure
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{", encoding="utf-8")
+    available_config = SimpleNamespace(bot_token="token", chat_id="chat")
+    attempts = 0
+    config_calls = 0
+
+    def load_config():
+        nonlocal config_calls
+        config_calls += 1
+        if first_failure == "missing_config" and config_calls == 1:
+            return SimpleNamespace(bot_token="", chat_id="")
+        return available_config
+
+    def send(**payload):
+        nonlocal attempts
+        attempts += 1
+        if first_failure == "delivery" and attempts == 1:
+            raise RuntimeError("raw delivery secret")
+
+    first = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(service_state="inactive"),
+        now=datetime(2026, 7, 16, 1, 0, tzinfo=UTC),
+        notify=True,
+        load_bot_config=load_config,
+        send_bot_message=send,
+    )
+    pending_state = load_monitor_state(state_path)
+    second = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(service_state="inactive"),
+        now=datetime(2026, 7, 16, 1, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=load_config,
+        send_bot_message=send,
+    )
+
+    assert first.notification_status in {"config_missing", "delivery_failed"}
+    assert pending_state.anomaly_fingerprint is not None
+    assert pending_state.last_notification_at is None
+    assert second.result.reason_codes == ("service_inactive", "state_invalid")
+    assert second.notification_status == "sent"
+    assert attempts == (1 if first_failure == "missing_config" else 2)
+
+
+def test_changed_persistent_anomaly_after_combined_delivery_notifies_immediately(
+    tmp_path,
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{", encoding="utf-8")
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+    deliveries = []
+
+    first = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(service_state="inactive"),
+        now=datetime(2026, 7, 16, 1, 0, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+    changed = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(service_state="failed"),
+        now=datetime(2026, 7, 16, 1, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+
+    assert first.notification_status == "sent"
+    assert changed.result.reason_codes == ("service_inactive",)
+    assert changed.result.details["service_state"] == "failed"
+    assert changed.notification_status == "sent"
+    assert len(deliveries) == 2
+
+
 @pytest.mark.parametrize(
     ("now", "last_date", "expected"),
     [
