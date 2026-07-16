@@ -19,6 +19,7 @@ from telegram_kol_research.models import (
     RecognitionExperiment,
     SignalCandidate,
     StrategyLifecycle,
+    StrategyManagementBatch,
     utc_now,
 )
 from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
@@ -403,6 +404,19 @@ def _serialize_raw_messages(
         decision.raw_message_id: decision for decision in all_decisions
     }
 
+    all_management_batches = (
+        session.query(StrategyManagementBatch)
+        .filter(StrategyManagementBatch.raw_message_id.in_(raw_message_ids))
+        .order_by(
+            StrategyManagementBatch.raw_message_id.asc(),
+            StrategyManagementBatch.id.desc(),
+        )
+        .all()
+    )
+    management_batch_by_msg_id: dict[int, StrategyManagementBatch] = {}
+    for batch in all_management_batches:
+        management_batch_by_msg_id.setdefault(batch.raw_message_id, batch)
+
     all_experiments = (
         session.query(RecognitionExperiment)
         .filter(RecognitionExperiment.raw_message_id.in_(raw_message_ids))
@@ -448,6 +462,10 @@ def _serialize_raw_messages(
                 "semantic_review": _serialize_semantic_review(
                     decisions_by_msg_id.get(raw_message.id)
                 ),
+                "execution_outcome": _serialize_execution_outcome(
+                    decisions_by_msg_id.get(raw_message.id),
+                    management_batch_by_msg_id.get(raw_message.id),
+                ),
                 "recognition_comparison": _build_recognition_comparison(
                     recognition=rec_by_msg_id.get(raw_message.id),
                     media_assets=media_assets,
@@ -458,6 +476,87 @@ def _serialize_raw_messages(
         )
 
     return rows
+
+
+def _serialize_execution_outcome(
+    decision: RecognitionDecision | None,
+    batch: StrategyManagementBatch | None,
+) -> dict[str, str | None] | None:
+    if batch is not None:
+        status = str(batch.status or "")
+        detail = _execution_reason_label(batch.reason_code)
+        if status == "succeeded":
+            if batch.effective_action in {
+                "adjust_stop_loss",
+                "move_stop_to_break_even",
+                "partial_then_break_even",
+            }:
+                return {
+                    "state": "accepted",
+                    "label": "Deepcoin 已接受保护单更新",
+                    "detail": detail,
+                }
+            return {
+                "state": "confirmed",
+                "label": "交易所已确认执行",
+                "detail": detail,
+            }
+        if status in {"executing", "reconciling", "protection_ready"}:
+            return {
+                "state": "pending_confirmation",
+                "label": "已提交，等待交易所确认",
+                "detail": detail,
+            }
+        if status == "ready" and batch.execution_mode == "shadow":
+            return {
+                "state": "shadow",
+                "label": "仅模拟计划，未实盘执行",
+                "detail": detail,
+            }
+        if status == "ready":
+            return {"state": "waiting", "label": "待执行", "detail": detail}
+        if status in {"blocked", "partial_failed", "recovery_required"}:
+            return {
+                "state": "error",
+                "label": "执行异常，需人工处理",
+                "detail": detail,
+            }
+
+    if decision is None or decision.automation_status is None:
+        return None
+    status = str(decision.automation_status)
+    detail = _execution_reason_label(decision.automation_reason)
+    if status in {"submitted", "executed", "completed"}:
+        return {
+            "state": "pending_confirmation",
+            "label": "已提交，等待交易所确认",
+            "detail": detail,
+        }
+    if status in {"blocked", "failed", "error"}:
+        return {
+            "state": "error",
+            "label": "未执行成功",
+            "detail": detail,
+        }
+    if status == "shadow_planned":
+        return {
+            "state": "shadow",
+            "label": "仅模拟计划，未实盘执行",
+            "detail": detail,
+        }
+    return {"state": "not_executed", "label": "未执行", "detail": detail}
+
+
+def _execution_reason_label(reason: str | None) -> str | None:
+    return {
+        "close_submitted": "平仓请求已提交",
+        "management_close_exchange_confirmed": "已根据交易所仓位快照确认",
+        "all_position_protection_replaced": "所有持仓的保护单均已替换",
+        "management_execution_disabled": "自动持仓管理未启用",
+        "management_close_pending_exchange_confirmation": "等待交易所仓位快照确认",
+        "close_final_preflight_failed": "最终仓位或合约规格校验失败",
+        "management_close_result_requires_recovery": "平仓结果需要人工复核",
+    }.get(str(reason or ""))
 
 
 def _serialize_media_assets(media_assets: list[MediaAsset]) -> list[dict[str, object | None]]:
@@ -871,6 +970,10 @@ def _lifecycle_status_detail(status: str | None, exit_reason: str | None = None)
 
 
 def _management_action_label(action: str | None) -> str:
+    if action == "partial_close_confirmed":
+        return "部分平仓（交易所已确认）"
+    if action == "full_close_confirmed":
+        return "全部平仓（交易所已确认）"
     if action and "partial_take_profit" in action and "move_stop_to_protect" in action:
         return "部分止盈 + 保护止损"
     if action == "partial_take_profit":

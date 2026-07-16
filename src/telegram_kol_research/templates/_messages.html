@@ -83,6 +83,7 @@
       {% set detection = message.strategy_detection %}
       {% set comparison = message.recognition_comparison %}
       {% set semantic_review = message.semantic_review %}
+      {% set execution_outcome = message.execution_outcome %}
       {% set ai_panel_class = detection.status_class if detection else 'is-pending' %}
       {% set strategy_related = ai_panel_class == 'is-strategy' %}
       {% if comparison %}
@@ -210,6 +211,13 @@
                   </div>
                 {% endif %}
               </div>
+              {% if execution_outcome %}
+                <div class="message-execution-outcome is-{{ execution_outcome.state }}" role="status">
+                  <span>实盘执行结果：</span>
+                  <strong>{{ execution_outcome.label }}</strong>
+                  {% if execution_outcome.detail %}<small>{{ execution_outcome.detail }}</small>{% endif %}
+                </div>
+              {% endif %}
               {% if semantic_review %}
                 {% if semantic_review.severity in ['normal', 'critical'] %}
                   <details class="semantic-review semantic-review-{{ semantic_review.severity }}"

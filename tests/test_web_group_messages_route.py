@@ -9,6 +9,7 @@ from telegram_kol_research.models import (
     MediaAsset,
     MessageRecognition,
     RawMessage,
+    RecognitionDecision,
     RecognitionExperiment,
     SignalCandidate,
     StrategyLifecycle,
@@ -357,6 +358,43 @@ def test_group_messages_route_shows_ai_strategy_detection_results(tmp_path):
     assert 'data-message-list-collapse-all' in response.text
     assert response.text.count('data-message-default-expanded="true"') == 2
     assert response.text.count('data-message-default-expanded="false"') == 1
+
+
+def test_group_messages_route_labels_submitted_execution_as_unconfirmed(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        message = RawMessage(
+            chat_id=88,
+            message_id=9525,
+            sender_name="陈哥",
+            text="先出来，保留40%",
+        )
+        session.add(message)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="是策略",
+                authoritative_payload_json="{}",
+                agreement_status="authoritative_only",
+                differences_json="[]",
+                automation_status="executed",
+                automation_reason="close_submitted",
+            )
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/88/messages"
+    )
+
+    assert response.status_code == 200
+    assert "实盘执行结果：" in response.text
+    assert "已提交，等待交易所确认" in response.text
+    assert "交易所已确认执行" not in response.text
 
 
 def test_group_messages_route_labels_lifecycle_event_detection(tmp_path):

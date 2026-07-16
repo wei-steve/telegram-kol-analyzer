@@ -2569,6 +2569,34 @@ body {
 .message-strategy-content span { color: #86efac; font-size: 0.72rem; font-weight: 700; }
 .message-strategy-content strong { color: #f8fafc; font-weight: 700; }
 
+.message-execution-outcome {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+  border-left: 3px solid #f59e0b;
+  padding: 6px 8px;
+  background: rgba(120, 53, 15, 0.16);
+  color: #fde68a;
+  font-size: 0.78rem;
+}
+.message-execution-outcome.is-confirmed {
+  border-left-color: #22c55e;
+  background: rgba(20, 83, 45, 0.18);
+  color: #dcfce7;
+}
+.message-execution-outcome.is-accepted {
+  border-left-color: #38bdf8;
+  background: rgba(12, 74, 110, 0.2);
+  color: #e0f2fe;
+}
+.message-execution-outcome.is-error {
+  border-left-color: #ef4444;
+  background: rgba(127, 29, 29, 0.18);
+  color: #fecaca;
+}
+.message-execution-outcome small { color: inherit; opacity: 0.78; }
+
 .semantic-review {
   border: 1px solid rgba(148, 163, 184, 0.24);
   border-left-width: 4px;

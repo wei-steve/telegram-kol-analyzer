@@ -6,7 +6,12 @@ import pytest
 from sqlalchemy import event
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import MediaAsset, RawMessage, RecognitionDecision
+from telegram_kol_research.models import (
+    MediaAsset,
+    RawMessage,
+    RecognitionDecision,
+    StrategyManagementBatch,
+)
 from telegram_kol_research.web_queries import load_group_messages, load_messages_in_time_window
 
 
@@ -242,6 +247,66 @@ def test_load_group_messages_serializes_semantic_review_decisions_in_one_bulk_qu
         "reason": "止盈细节不同",
         "conflict_types": ["non_material_price_detail"],
         "model": "deepseek-v4-flash",
+    }
+
+
+def test_load_group_messages_distinguishes_submission_from_exchange_confirmation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        pending = RawMessage(chat_id=9, message_id=1, text="先出来，保留40%")
+        confirmed = RawMessage(chat_id=9, message_id=2, text="全部离场")
+        session.add_all([pending, confirmed])
+        session.flush()
+        session.add_all(
+            [
+                RecognitionDecision(
+                    raw_message_id=message.id,
+                    input_kind="text",
+                    authoritative_model="mimo-v2.5",
+                    authoritative_status="是策略",
+                    authoritative_payload_json="{}",
+                    agreement_status="authoritative_only",
+                    differences_json="[]",
+                    automation_status="executed",
+                    automation_reason="close_submitted",
+                )
+                for message in (pending, confirmed)
+            ]
+        )
+        session.flush()
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="a" * 64,
+                raw_message_id=confirmed.id,
+                recognition_decision_id=2,
+                recognition_generation="generation-1",
+                target_lifecycle_id=1,
+                strategy_instance_id="deepcoin:9:1:BTC:short",
+                execution_binding_id=1,
+                intent="full_exit",
+                effective_action="full_exit",
+                execution_mode="live",
+                partial_round_before=0,
+                status="succeeded",
+                reason_code="management_close_exchange_confirmed",
+                target_fingerprint="b" * 64,
+                target_snapshot_json="{}",
+            )
+        )
+        session.commit()
+
+    rows = load_group_messages(session_factory, chat_id=9, limit=10)
+    by_message_id = {row["message_id"]: row for row in rows}
+
+    assert by_message_id[1]["execution_outcome"] == {
+        "state": "pending_confirmation",
+        "label": "已提交，等待交易所确认",
+        "detail": "平仓请求已提交",
+    }
+    assert by_message_id[2]["execution_outcome"] == {
+        "state": "confirmed",
+        "label": "交易所已确认执行",
+        "detail": "已根据交易所仓位快照确认",
     }
 
 
