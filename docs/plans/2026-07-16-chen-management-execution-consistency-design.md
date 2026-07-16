@@ -127,4 +127,3 @@ updates the lifecycle and Web card exactly once.
    read-only management audit.
 6. Do not place a test order. Validate the next natural management message from
    its batch plan, Deepcoin response, reconciliation, and Web state.
-

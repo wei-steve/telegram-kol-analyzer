@@ -274,4 +274,3 @@ sqlite3 -readonly data/research.db "PRAGMA quick_check;"
 ```
 
 Expected: deployed SHA matches the reviewed commit, service is `active`, SQLite reports `ok`, and focused server tests have zero failures. Do not submit a live test order.
-
