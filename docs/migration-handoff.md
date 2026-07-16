@@ -242,7 +242,10 @@ exchange-evidence failure blocks the whole preflight before an exchange write.
 
 An unqualified first partial take-profit closes 50% of the total verified
 strategy position, allocated proportionally over every split position. An
-explicit fraction overrides that default. The second distinct partial request
+explicit close fraction overrides that default. Retained-position wording is
+the inverse: `保留 40%` / `剩余 40%` means close 60%. If independently
+explicit close and retain percentages disagree, recognition fails closed and
+does not create an executable management instruction. The second distinct partial request
 closes all remaining size, so repeated partial messages cannot leave an
 indefinite tail. Full exit also covers every split position. An explicit stop
 price is applied to every position; breakeven uses each position's own average
@@ -268,6 +271,27 @@ failure cannot alter the batch or authorize a retry. Exchange reconciliation,
 not an HTTP success response, confirms close completion. Manual close/cancel is
 a first-class terminal fact: refresh exact exchange evidence and reconcile the
 bound legs rather than attaching a new same-symbol position or editing rows.
+
+Every planned close quantity is derived from the verified Deepcoin contract
+`quantity_step` and `min_quantity`. The executor repeats those checks at the
+final live-position write boundary and rejects a missing/mismatched contract
+specification, an off-step quantity such as `2.4` BTC contracts when the step is
+`1`, a below-minimum quantity, or a quantity above the current position before
+calling `place_order`. Recognition stores requested management values on the
+candidate only. It must not overwrite the lifecycle's confirmed stop, take
+profit, management action, or entered/exited state. Partial-close lifecycle
+metadata is promoted only after every close leg is confirmed by a coherent
+exchange snapshot; full exit remains owned by full-close reconciliation.
+Protection metadata is promoted only after every replacement request has a
+durable successful Deepcoin response.
+
+Web message cards show AI recognition separately from real execution. The
+execution badge distinguishes not executed, shadow planned, waiting, submitted
+and awaiting exchange confirmation, operator recovery, Deepcoin-accepted
+protection replacement, and exchange-confirmed close. A recognition result or
+submission response alone must never render as an exchange-confirmed exit.
+Historical management messages must not be replayed after deployment; reconcile
+current exchange state and create actions only from new messages.
 
 The settings have three meanings: `disabled` creates no management plan and
 performs no management exchange write; `shadow` may persist reviewed plans but

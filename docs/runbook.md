@@ -194,6 +194,24 @@ the global automatic-trading gate is also true. Do not enable shadow or live as
 part of this rollout. Live requires a new explicit approval after reviewed
 shadow evidence.
 
+Percentage and contract-size rules for live management:
+
+- `止盈/减仓/平仓 60%` means close 60%; `保留/剩余 40%` also means
+  close 60%. Conflicting explicit close/retain values are blocked.
+- The planner apportions the aggregate target across every verified `posId`
+  using the instrument's `quantity_step` and `min_quantity`. The executor
+  validates the persisted step, minimum, current live size, and exact step
+  alignment again immediately before any Deepcoin close request.
+- An off-step or stale quantity is an operator-recovery event, not a reason to
+  round ad hoc or retry. Inspect the immutable batch, live positions, and the
+  verified contract specification; do not edit the quantity in SQLite.
+- AI recognition is intent only. Treat Web `已提交，等待交易所确认` as
+  still open until reconciliation reports `交易所已确认执行`. Protection
+  updates use the separate `Deepcoin 已接受保护单更新` label.
+- Never replay old Telegram management messages to repair a missed action.
+  Reconcile the current exchange snapshot first and wait for a new instruction
+  or an explicitly reviewed operator action.
+
 Run the bounded read-only audit from the server checkout:
 
 ```bash
