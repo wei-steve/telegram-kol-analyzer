@@ -127,4 +127,8 @@ def test_sync_command_persists_trade_ideas_from_related_candidates(
     assert {decision.authoritative_model for decision in decisions} == {"mimo-v2.5"}
     assert {candidate.parse_source for candidate in candidates} == {"mimo_authoritative"}
     assert lifecycle.lifecycle_status == "entered"
-    assert lifecycle.stop_loss == 68050
+    assert lifecycle.stop_loss == 67500
+    stop_update = next(
+        candidate for candidate in candidates if candidate.event_type == "position_update"
+    )
+    assert stop_update.stop_loss_text == "68050"
