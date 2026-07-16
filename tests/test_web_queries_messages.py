@@ -13,6 +13,7 @@ from telegram_kol_research.models import (
     StrategyManagementBatch,
 )
 from telegram_kol_research.web_queries import load_group_messages, load_messages_in_time_window
+from telegram_kol_research.web_queries import _serialize_execution_outcome
 
 
 def test_load_group_messages_includes_media_and_orders_newest_first_within_page(tmp_path):
@@ -308,6 +309,44 @@ def test_load_group_messages_distinguishes_submission_from_exchange_confirmation
         "label": "交易所已确认执行",
         "detail": "已根据交易所仓位快照确认",
     }
+
+
+@pytest.mark.parametrize("status", ["reconciling", "succeeded"])
+def test_execution_outcome_without_batch_never_promotes_to_confirmed(status):
+    decision = RecognitionDecision(
+        raw_message_id=1,
+        input_kind="text",
+        authoritative_model="mimo-v2.5",
+        authoritative_status="是策略",
+        authoritative_payload_json="{}",
+        agreement_status="authoritative_only",
+        differences_json="[]",
+        automation_status=status,
+    )
+
+    outcome = _serialize_execution_outcome(decision, None)
+
+    assert outcome["state"] == "pending_confirmation"
+    assert outcome["label"] == "已提交，等待交易所确认"
+
+
+@pytest.mark.parametrize("status", ["partial_failed", "recovery_required"])
+def test_execution_outcome_without_batch_marks_terminal_failures(status):
+    decision = RecognitionDecision(
+        raw_message_id=1,
+        input_kind="text",
+        authoritative_model="mimo-v2.5",
+        authoritative_status="是策略",
+        authoritative_payload_json="{}",
+        agreement_status="authoritative_only",
+        differences_json="[]",
+        automation_status=status,
+    )
+
+    outcome = _serialize_execution_outcome(decision, None)
+
+    assert outcome["state"] == "error"
+    assert outcome["label"] == "未执行成功"
 
 
 def test_load_group_messages_defensively_serializes_malformed_semantic_review_json(tmp_path):

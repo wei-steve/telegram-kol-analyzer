@@ -526,13 +526,26 @@ def _serialize_execution_outcome(
         return None
     status = str(decision.automation_status)
     detail = _execution_reason_label(decision.automation_reason)
-    if status in {"submitted", "executed", "completed"}:
+    if status in {
+        "submitted",
+        "executed",
+        "completed",
+        "executing",
+        "reconciling",
+        "succeeded",
+    }:
         return {
             "state": "pending_confirmation",
             "label": "已提交，等待交易所确认",
             "detail": detail,
         }
-    if status in {"blocked", "failed", "error"}:
+    if status in {
+        "blocked",
+        "failed",
+        "error",
+        "partial_failed",
+        "recovery_required",
+    }:
         return {
             "state": "error",
             "label": "未执行成功",
