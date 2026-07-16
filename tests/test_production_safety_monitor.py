@@ -722,6 +722,107 @@ def test_source_snapshots_differ_retries_exactly_once():
     assert calls == [1, 1]
 
 
+def test_source_snapshots_differ_nonzero_first_then_zero_retry_can_succeed(monkeypatch):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    results = [
+        SimpleNamespace(
+            returncode=1,
+            output=json.dumps(
+                {
+                    "snapshot_status": "snapshot_unstable",
+                    "snapshot_reason": "source_snapshots_differ",
+                }
+            ),
+        ),
+        SimpleNamespace(returncode=0, output=json.dumps(_healthy_audit())),
+    ]
+    monkeypatch.setattr(
+        monitor_module,
+        "_run_bounded_command",
+        lambda *args, **kwargs: results.pop(0),
+    )
+    adapters = ProductionSafetyAdapters(database_path=Path("data/research.db"))
+
+    audit = run_daily_management_audit(adapters.run_management_audit)
+
+    assert audit == _healthy_audit()
+    assert results == []
+
+
+@pytest.mark.parametrize("second_returncode", [1, 2])
+def test_source_snapshots_differ_retry_nonzero_final_result_fails(
+    monkeypatch, second_returncode
+):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    results = [
+        SimpleNamespace(
+            returncode=1,
+            output=json.dumps(
+                {
+                    "snapshot_status": "snapshot_unstable",
+                    "snapshot_reason": "source_snapshots_differ",
+                }
+            ),
+        ),
+        SimpleNamespace(
+            returncode=second_returncode,
+            output=json.dumps(_healthy_audit()),
+        ),
+    ]
+    monkeypatch.setattr(
+        monitor_module,
+        "_run_bounded_command",
+        lambda *args, **kwargs: results.pop(0),
+    )
+    adapters = ProductionSafetyAdapters(database_path=Path("data/research.db"))
+
+    with pytest.raises(RuntimeError, match="audit_command_failed"):
+        run_daily_management_audit(adapters.run_management_audit)
+
+    assert results == []
+
+
+def test_nonzero_snapshot_mismatch_payload_never_reaches_health_evaluation(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    misleading_payload = {
+        **_healthy_audit(),
+        "snapshot_reason": "source_snapshots_differ",
+    }
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append(1)
+        return SimpleNamespace(
+            returncode=1,
+            output=json.dumps(misleading_payload),
+        )
+
+    monkeypatch.setattr(monitor_module, "_run_bounded_command", run)
+    state_path = tmp_path / "state.json"
+    adapters = _RecordingAdapters()
+    adapters.run_management_audit = ProductionSafetyAdapters(
+        database_path=Path("data/research.db")
+    ).run_management_audit
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=adapters,
+        now=datetime(2026, 7, 16, 1, 0, tzinfo=UTC),
+        notify=False,
+    )
+
+    assert calls == [1, 1]
+    assert outcome.exit_code == 1
+    assert outcome.result.reason_codes == ("adapter_failure",)
+    assert load_monitor_state(state_path).last_full_audit_date is None
+
+
 @pytest.mark.parametrize(
     "first",
     [
@@ -822,6 +923,45 @@ def test_non_loopback_settings_url_is_rejected_before_http(monkeypatch):
         read_loopback_settings("https://127.0.0.1/api/trading-settings")
 
 
+def test_loopback_settings_disable_environment_proxy_trust(monkeypatch):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield json.dumps(_snapshot().settings).encode("utf-8")
+
+    def stream(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Response()
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.setattr(monitor_module.httpx, "stream", stream)
+
+    assert (
+        read_loopback_settings("http://127.0.0.1:8000/api/trading-settings")
+        == _snapshot().settings
+    )
+    assert calls == [
+        (
+            ("GET", "http://127.0.0.1:8000/api/trading-settings"),
+            {"timeout": 5.0, "trust_env": False},
+        )
+    ]
+
+
 def test_successful_daily_audit_records_shanghai_date(tmp_path):
     state_path = tmp_path / "state.json"
     adapters = _RecordingAdapters()
@@ -837,6 +977,38 @@ def test_successful_daily_audit_records_shanghai_date(tmp_path):
     assert outcome.exit_code == 0
     assert adapters.calls[-1] == "audit"
     assert load_monitor_state(state_path).last_full_audit_date == "2026-07-16"
+
+
+def test_nonzero_audit_with_healthy_json_is_unhealthy_and_not_recorded(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    monkeypatch.setattr(
+        monitor_module,
+        "_run_bounded_command",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            output=json.dumps(_healthy_audit()),
+        ),
+    )
+    state_path = tmp_path / "state.json"
+    adapters = _RecordingAdapters()
+    adapters.run_management_audit = ProductionSafetyAdapters(
+        database_path=Path("data/research.db")
+    ).run_management_audit
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=adapters,
+        now=datetime(2026, 7, 16, 1, 0, tzinfo=UTC),
+        notify=False,
+    )
+
+    assert outcome.exit_code == 1
+    assert outcome.result.reason_codes == ("adapter_failure",)
+    assert load_monitor_state(state_path).last_full_audit_date is None
 
 
 def test_monitor_test_notification_has_fixed_prefix_and_no_dynamic_payload():
@@ -868,7 +1040,7 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
             "systemctl": "active\n",
             "git": REVIEWED_HEAD + "\n",
             "journalctl": "first\nsecond\n",
-            "telegram-kol-research": json.dumps(_healthy_audit()),
+            sys.executable: json.dumps(_healthy_audit()),
         }[argv[0]]
         return SimpleNamespace(returncode=0, output=output)
 
@@ -907,7 +1079,9 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
         ),
         (
             (
-                "telegram-kol-research",
+                sys.executable,
+                "-m",
+                "telegram_kol_research.cli",
                 "audit-management-batches",
                 "--database-path",
                 "data/research.db",
@@ -919,6 +1093,32 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
             {"timeout_seconds": 180},
         ),
     ]
+
+
+def test_default_audit_invocation_is_bound_to_current_interpreter_with_stripped_path(
+    monkeypatch,
+):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0, output=json.dumps(_healthy_audit()))
+
+    monkeypatch.setenv("PATH", "/usr/sbin:/usr/bin")
+    monkeypatch.setattr(monitor_module, "_run_bounded_command", run)
+
+    audit = ProductionSafetyAdapters(
+        database_path=Path("data/research.db")
+    ).run_management_audit()
+
+    assert audit == _healthy_audit()
+    assert calls[0][0][:3] == (
+        sys.executable,
+        "-m",
+        "telegram_kol_research.cli",
+    )
 
 
 def test_bounded_subprocess_reader_terminates_output_above_hard_cap():

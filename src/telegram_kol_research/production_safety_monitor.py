@@ -10,6 +10,7 @@ import re
 import selectors
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 from collections import Counter
@@ -178,7 +179,11 @@ class ProductionSafetyAdapters:
     checkout_path: Path = Path(".")
     settings_url: str = "http://127.0.0.1:8000/api/trading-settings"
     service_name: str = "telegram-kol.service"
-    audit_command: str = "telegram-kol-research"
+    audit_command: tuple[str, ...] = (
+        sys.executable,
+        "-m",
+        "telegram_kol_research.cli",
+    )
 
     def read_service_state(self) -> str:
         completed = _run_bounded_command(
@@ -238,7 +243,7 @@ class ProductionSafetyAdapters:
     def run_management_audit(self) -> Mapping[str, Any]:
         completed = _run_bounded_command(
             (
-                self.audit_command,
+                *self.audit_command,
                 "audit-management-batches",
                 "--database-path",
                 str(self.database_path),
@@ -259,6 +264,10 @@ class ProductionSafetyAdapters:
             raise RuntimeError("audit_output_invalid") from exc
         if not isinstance(payload, Mapping):
             raise RuntimeError("audit_output_invalid")
+        if completed.returncode != 0:
+            if payload.get("snapshot_reason") == "source_snapshots_differ":
+                raise _SourceSnapshotsDiffer("audit_source_snapshots_differ")
+            raise RuntimeError("audit_command_failed")
         return payload
 
 
@@ -266,6 +275,10 @@ class ProductionSafetyAdapters:
 class _CommandResult:
     returncode: int
     output: str
+
+
+class _SourceSnapshotsDiffer(RuntimeError):
+    """Signal one retry without exposing a nonzero child result as audit data."""
 
 
 def load_monitor_state(path: str | Path) -> MonitorState:
@@ -332,7 +345,10 @@ def should_run_daily_audit(
 def run_daily_management_audit(run_once) -> Mapping[str, Any]:
     """Retry only one transient source-snapshot mismatch, exactly once."""
 
-    first = run_once()
+    try:
+        first = run_once()
+    except _SourceSnapshotsDiffer:
+        return run_once()
     if not isinstance(first, Mapping):
         raise TypeError("audit result must be a mapping")
     if first.get("snapshot_reason") != "source_snapshots_differ":
@@ -390,7 +406,12 @@ def read_loopback_settings(
     if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1"}:
         raise ValueError("settings URL must use loopback HTTP")
     body = bytearray()
-    with httpx.stream("GET", url, timeout=timeout_seconds) as response:
+    with httpx.stream(
+        "GET",
+        url,
+        timeout=timeout_seconds,
+        trust_env=False,
+    ) as response:
         response.raise_for_status()
         for chunk in response.iter_bytes():
             body.extend(chunk)
