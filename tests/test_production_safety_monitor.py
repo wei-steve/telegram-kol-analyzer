@@ -663,6 +663,91 @@ def test_monitor_orchestration_reads_all_bounded_lightweight_sources(tmp_path):
     ]
 
 
+def test_first_run_journal_failure_persists_original_window_for_recovery(tmp_path):
+    state_path = tmp_path / "state.json"
+    adapters = _RecordingAdapters()
+    original_count = adapters.count_journal_errors
+    journal_attempts = 0
+
+    def fail_once(*, since):
+        nonlocal journal_attempts
+        journal_attempts += 1
+        if journal_attempts == 1:
+            adapters.calls.append(("journal", since))
+            raise RuntimeError("raw journal failure")
+        return original_count(since=since)
+
+    adapters.count_journal_errors = fail_once
+    first_at = datetime(2026, 7, 16, 0, 30, tzinfo=UTC)
+    original_window_start = first_at - timedelta(minutes=35)
+
+    first = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=adapters,
+        now=first_at,
+        notify=False,
+    )
+    persisted_after_failure = load_monitor_state(state_path)
+    second = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=adapters,
+        now=first_at + timedelta(minutes=30),
+        notify=False,
+    )
+
+    assert first.result.reason_codes == ("adapter_failure",)
+    assert persisted_after_failure.last_window_at == original_window_start.isoformat()
+    assert second.exit_code == 0
+    assert adapters.calls.count(("journal", original_window_start)) == 2
+    assert adapters.calls.count(("events", original_window_start, 100)) == 2
+
+
+def test_execution_event_failure_preserves_existing_window_for_recovery(tmp_path):
+    state_path = tmp_path / "state.json"
+    original_window_start = datetime(2026, 7, 16, 0, 0, tzinfo=UTC)
+    save_monitor_state(
+        state_path,
+        MonitorState(last_window_at=original_window_start.isoformat()),
+    )
+    adapters = _RecordingAdapters()
+    original_reader = adapters.read_abnormal_events
+    event_attempts = 0
+
+    def fail_once(*, since, limit):
+        nonlocal event_attempts
+        event_attempts += 1
+        if event_attempts == 1:
+            adapters.calls.append(("events", since, limit))
+            raise RuntimeError("raw event failure")
+        return original_reader(since=since, limit=limit)
+
+    adapters.read_abnormal_events = fail_once
+
+    first = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=adapters,
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        notify=False,
+    )
+    persisted_after_failure = load_monitor_state(state_path)
+    second = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=adapters,
+        now=datetime(2026, 7, 16, 1, 0, tzinfo=UTC),
+        notify=False,
+    )
+
+    assert first.result.reason_codes == ("adapter_failure",)
+    assert persisted_after_failure.last_window_at == original_window_start.isoformat()
+    assert second.exit_code == 0
+    assert adapters.calls.count(("journal", original_window_start)) == 2
+    assert adapters.calls.count(("events", original_window_start, 100)) == 2
+
+
 def test_execution_event_adapter_uses_sqlite_read_only_uri_and_select_only(tmp_path):
     database_path = tmp_path / "research.db"
     with sqlite3.connect(database_path) as connection:
@@ -694,6 +779,74 @@ def test_execution_event_adapter_uses_sqlite_read_only_uri_and_select_only(tmp_p
     assert statements and all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
     assert "request_json" not in " ".join(statements).lower()
     assert events == ({"action": "close_bound_position_market", "status": "submitted", "pos_id": "pos-1"},)
+
+
+def test_execution_event_adapter_fails_closed_when_limit_hides_safety_row(tmp_path):
+    database_path = tmp_path / "research.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE execution_events (action TEXT, status TEXT, pos_id TEXT, created_at TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO execution_events VALUES (?, ?, ?, ?)",
+            [
+                ("open_market_position", "submit_unknown", "hidden", "2026-07-16 00:10:00"),
+                ("close_bound_position_market", "submitted", "new-1", "2026-07-16 00:20:00"),
+                ("close_bound_position_market", "submitted", "new-2", "2026-07-16 00:30:00"),
+            ],
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="events_incomplete"):
+        read_abnormal_execution_events(
+            database_path,
+            since=datetime(2026, 7, 16, 0, 0, tzinfo=UTC),
+            limit=2,
+        )
+
+
+def test_malformed_existing_state_is_rebuilt_and_reported_as_fixed_anomaly(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{", encoding="utf-8")
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        notify=False,
+    )
+
+    assert outcome.result.reason_codes == ("state_invalid",)
+    assert load_monitor_state(state_path).last_window_at == datetime(
+        2026, 7, 16, 0, 30, tzinfo=UTC
+    ).isoformat()
+
+
+def test_unreadable_existing_state_is_rebuilt_and_reported_without_raw_reason(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("existing", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == state_path:
+            raise PermissionError("raw secret path detail")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        notify=False,
+    )
+
+    assert outcome.result.reason_codes == ("state_invalid",)
+    assert "secret" not in json.dumps(outcome.result.details)
 
 
 @pytest.mark.parametrize(

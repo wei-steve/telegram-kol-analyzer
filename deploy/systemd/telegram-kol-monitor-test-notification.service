@@ -1,0 +1,51 @@
+[Unit]
+Description=Send one fixed Telegram KOL monitor test notification
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=telegram-kol-monitor
+Group=telegram-kol-monitor
+SupplementaryGroups=systemd-journal
+UMask=0077
+WorkingDirectory=/var/lib/telegram-kol-monitor
+EnvironmentFile=/etc/telegram-kol-monitor.env
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research monitor-production-safety --expected-head ${TELEGRAM_KOL_MONITOR_EXPECTED_HEAD} --expected-auto-trade-enabled --expected-management-mode live --expected-max-concurrent-positions 4 --checkout-path /opt/telegram-kol-analyzer --settings-url http://127.0.0.1:8000/api/trading-settings --database-path /opt/telegram-kol-analyzer/data/research.db --state-path /var/lib/telegram-kol-monitor/state.json --lookback-minutes 35 --notify --test-notification
+
+AmbientCapabilities=
+CapabilityBoundingSet=
+InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateMounts=true
+PrivateTmp=true
+ProcSubset=pid
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged
+TemporaryFileSystem=/opt/telegram-kol-analyzer:ro
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/.venv
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/src
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/.git
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/data/research.db
+BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/research.db-wal
+BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/research.db-shm
+BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/research.db-journal
+ReadWritePaths=/var/lib/telegram-kol-monitor

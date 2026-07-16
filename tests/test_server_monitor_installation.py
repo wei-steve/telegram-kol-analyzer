@@ -10,6 +10,9 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SERVICE_PATH = PROJECT_ROOT / "deploy" / "systemd" / "telegram-kol-monitor.service"
 TIMER_PATH = PROJECT_ROOT / "deploy" / "systemd" / "telegram-kol-monitor.timer"
+TEST_NOTIFICATION_PATH = (
+    PROJECT_ROOT / "deploy" / "systemd" / "telegram-kol-monitor-test-notification.service"
+)
 INSTALLER_PATH = PROJECT_ROOT / "scripts" / "install_server_monitor.sh"
 PRODUCTION_ROOT = "/opt/telegram-kol-analyzer"
 
@@ -56,6 +59,33 @@ def test_monitor_service_drops_all_capabilities_and_denies_system_bus():
     assert "SystemCallFilter=@system-service" in directives
     assert "SystemCallFilter=~@mount @privileged" in directives
     assert "RestrictNamespaces=true" in directives
+
+
+def test_test_notification_unit_uses_same_identity_environment_and_sandbox_once():
+    service = SERVICE_PATH.read_text(encoding="utf-8")
+    test_service = TEST_NOTIFICATION_PATH.read_text(encoding="utf-8")
+    service_directives = set(service.splitlines())
+    test_directives = set(test_service.splitlines())
+
+    assert "Type=oneshot" in test_directives
+    assert "User=telegram-kol-monitor" in test_directives
+    assert "Group=telegram-kol-monitor" in test_directives
+    assert "EnvironmentFile=/etc/telegram-kol-monitor.env" in test_directives
+    assert "[Install]" not in test_directives
+    assert "--notify --test-notification" in " ".join(test_service.split())
+    assert "TELEGRAM_KOL_SYSTEM_BOT_TOKEN" not in test_service
+    ignored_prefixes = ("Description=", "ExecStart=")
+    expected_sandbox = {
+        line
+        for line in service_directives
+        if line and not line.startswith(ignored_prefixes)
+    }
+    actual_sandbox = {
+        line
+        for line in test_directives
+        if line and not line.startswith(ignored_prefixes)
+    }
+    assert actual_sandbox == expected_sandbox
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="systemd sandbox probe is Linux-only")
@@ -195,6 +225,11 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert 'install -d -o "$MONITOR_USER" -g "$MONITOR_GROUP" -m 0700 "$STATE_DIRECTORY"' in installer
     assert 'runuser -u "$MONITOR_USER" -- test -x "$PRODUCTION_ROOT/.venv/bin/telegram-kol-research"' in installer
     assert 'runuser -u "$MONITOR_USER" -- test -r "$PRODUCTION_ROOT/data/research.db"' in installer
+    assert "telegram-kol-monitor-test-notification.service" in installer
+    assert (
+        'install -o root -g root -m 0644 "$TEST_NOTIFICATION_SOURCE" '
+        '"$TEST_NOTIFICATION_DEST"'
+    ) in installer
 
 
 def test_installer_orders_enable_after_install_and_reload_and_targets_timer_only():
@@ -215,7 +250,7 @@ def test_installer_orders_enable_after_install_and_reload_and_targets_timer_only
 def test_units_and_installer_never_mutate_trading_or_exchange_state():
     combined = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (SERVICE_PATH, TIMER_PATH, INSTALLER_PATH)
+        for path in (SERVICE_PATH, TIMER_PATH, TEST_NOTIFICATION_PATH, INSTALLER_PATH)
     ).lower()
 
     for forbidden in (
@@ -246,6 +281,37 @@ def test_operations_docs_require_disabled_upgrade_and_clean_persistent_timer_sta
     assert combined.index("systemctl clean --what=state telegram-kol-monitor.timer") < combined.index(
         "rm -f /etc/systemd/system/telegram-kol-monitor.timer"
     )
+    assert (
+        "rm -f /etc/systemd/system/telegram-kol-monitor-test-notification.service"
+        in combined
+    )
     assert "/etc/telegram-kol-monitor.credentials" in combined
     assert "dedicated unprivileged" in combined.lower()
     assert "normal trade notifications" in combined.lower()
+
+
+def test_operations_docs_have_exactly_one_safe_test_notification_instruction():
+    documents = [
+        PROJECT_ROOT / "docs" / "runbook.md",
+        PROJECT_ROOT / "docs" / "server-deployment.md",
+        PROJECT_ROOT / "docs" / "migration-handoff.md",
+    ]
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in documents)
+    instruction = (
+        "sudo systemctl start "
+        "telegram-kol-monitor-test-notification.service"
+    )
+
+    assert combined.count(instruction) == 1
+    assert combined.count(
+        "sudo .venv/bin/telegram-kol-research monitor-production-safety"
+    ) == 1
+    assert "dedicated identity" in combined.lower()
+    assert "never enabled" in combined.lower()
+
+
+def test_runbook_documents_monitor_identity_owned_runtime_state():
+    runbook = (PROJECT_ROOT / "docs" / "runbook.md").read_text(encoding="utf-8")
+
+    assert "monitor-identity-owned" in runbook.lower()
+    assert "root-owned state file" not in runbook.lower()

@@ -185,7 +185,8 @@ The production safety monitor is a separate read-only oneshot service under the
 dedicated unprivileged `telegram-kol-monitor` identity. It
 checks the deployed commit, `telegram-kol.service` state, the approved live
 gates, bounded journal errors, bounded abnormal execution summaries, and the
-daily management audit. It writes only its root-owned state file under
+daily management audit. It writes only its monitor-identity-owned mode-`0600`
+runtime state file under
 `/var/lib/telegram-kol-monitor`; it has an empty capability set, no system-bus
 socket access, and no access to the checkout's `.env`, `config/`, or other
 `data/` content. It does not change trading settings, write the
@@ -252,18 +253,14 @@ sudo .venv/bin/telegram-kol-research monitor-production-safety \
   --force-full-audit
 ```
 
-Confirm the compact result is healthy. Then send exactly one clearly labelled
-notification-chain test; this mode does not call the settings, database, audit,
-or exchange adapters:
+Confirm the compact result is healthy. Then start the installed static oneshot
+unit to send exactly one clearly labelled notification-chain test. The unit
+loads `/etc/telegram-kol-monitor.env`, runs as the dedicated identity with the
+same sandbox as the scheduled monitor, is never enabled, and does not call the
+settings, database, audit, or exchange adapters:
 
 ```bash
-sudo .venv/bin/telegram-kol-research monitor-production-safety \
-  --expected-head "$(git rev-parse HEAD)" \
-  --expected-auto-trade-enabled \
-  --expected-management-mode live \
-  --expected-max-concurrent-positions 4 \
-  --notify \
-  --test-notification
+sudo systemctl start telegram-kol-monitor-test-notification.service
 ```
 
 Confirm exactly one message beginning `【监控测试】` arrived, then enable only
@@ -286,6 +283,7 @@ sudo systemctl disable --now telegram-kol-monitor.timer
 sudo systemctl clean --what=state telegram-kol-monitor.timer
 sudo rm -f /etc/systemd/system/telegram-kol-monitor.timer
 sudo rm -f /etc/systemd/system/telegram-kol-monitor.service
+sudo rm -f /etc/systemd/system/telegram-kol-monitor-test-notification.service
 sudo rm -f /etc/telegram-kol-monitor.env
 sudo rm -f /etc/telegram-kol-monitor.credentials
 sudo rm -rf /var/lib/telegram-kol-monitor

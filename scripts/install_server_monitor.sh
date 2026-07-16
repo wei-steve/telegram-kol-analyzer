@@ -25,8 +25,10 @@ MONITOR_USER="telegram-kol-monitor"
 MONITOR_GROUP="telegram-kol-monitor"
 SERVICE_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor.service"
 TIMER_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor.timer"
+TEST_NOTIFICATION_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor-test-notification.service"
 SERVICE_DEST="/etc/systemd/system/telegram-kol-monitor.service"
 TIMER_DEST="/etc/systemd/system/telegram-kol-monitor.timer"
+TEST_NOTIFICATION_DEST="/etc/systemd/system/telegram-kol-monitor-test-notification.service"
 CREDENTIAL_FILE="/etc/telegram-kol-monitor.credentials"
 ENV_FILE="/etc/telegram-kol-monitor.env"
 STATE_DIRECTORY="/var/lib/telegram-kol-monitor"
@@ -127,6 +129,7 @@ install -d -o "$MONITOR_USER" -g "$MONITOR_GROUP" -m 0700 "$STATE_DIRECTORY"
 install -o root -g root -m 0600 "$env_source" "$ENV_FILE"
 install -o root -g root -m 0644 "$SERVICE_SOURCE" "$SERVICE_DEST"
 install -o root -g root -m 0644 "$TIMER_SOURCE" "$TIMER_DEST"
+install -o root -g root -m 0644 "$TEST_NOTIFICATION_SOURCE" "$TEST_NOTIFICATION_DEST"
 systemctl daemon-reload
 
 if [[ "$enable_timer" == true ]]; then

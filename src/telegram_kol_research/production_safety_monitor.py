@@ -77,6 +77,7 @@ _FIXED_REASON_CODES = frozenset(
         "management_execution_mode_drift",
         "max_concurrent_positions_drift",
         "service_inactive",
+        "state_invalid",
     }
 )
 _STATE_FIELDS = frozenset(
@@ -142,6 +143,7 @@ class MonitorSnapshot:
     abnormal_events: Sequence[Mapping[str, Any]]
     audit: Mapping[str, Any] | None
     adapter_failures: Sequence[str] = ()
+    state_invalid: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,8 +286,20 @@ class _SourceSnapshotsDiffer(RuntimeError):
     """Signal one retry without exposing a nonzero child result as audit data."""
 
 
+@dataclass(frozen=True, slots=True)
+class _LoadedMonitorState:
+    state: MonitorState
+    invalid_existing_file: bool
+
+
 def load_monitor_state(path: str | Path) -> MonitorState:
     """Load the exact monitor-state schema, rebuilding malformed state safely."""
+
+    return _load_monitor_state(path).state
+
+
+def _load_monitor_state(path: str | Path) -> _LoadedMonitorState:
+    """Distinguish a normal first run from an unsafe existing state file."""
 
     try:
         payload = json.loads(
@@ -293,9 +307,20 @@ def load_monitor_state(path: str | Path) -> MonitorState:
             object_pairs_hook=_strict_json_object,
             parse_constant=_reject_json_constant,
         )
-        return _monitor_state_from_payload(payload)
+        return _LoadedMonitorState(
+            state=_monitor_state_from_payload(payload),
+            invalid_existing_file=False,
+        )
+    except FileNotFoundError:
+        return _LoadedMonitorState(
+            state=MonitorState(),
+            invalid_existing_file=False,
+        )
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-        return MonitorState()
+        return _LoadedMonitorState(
+            state=MonitorState(),
+            invalid_existing_file=True,
+        )
 
 
 def save_monitor_state(path: str | Path, state: MonitorState) -> None:
@@ -390,8 +415,10 @@ def read_abnormal_execution_events(
     with connect(uri, uri=True) as connection:
         rows = connection.execute(
             query,
-            (since_utc.isoformat(sep=" "), limit),
+            (since_utc.isoformat(sep=" "), limit + 1),
         ).fetchall()
+    if len(rows) > limit:
+        raise RuntimeError("events_incomplete")
     return tuple(
         {"action": row[0], "status": row[1], "pos_id": row[2]}
         for row in rows
@@ -450,7 +477,8 @@ def run_production_safety_monitor(
     """Collect, evaluate, deduplicate, optionally notify, and persist state."""
 
     checked_at = _require_aware_datetime(now)
-    state = load_monitor_state(state_path)
+    loaded_state = _load_monitor_state(state_path)
+    state = loaded_state.state
     if state.last_window_at is None:
         since = checked_at - lookback
     else:
@@ -475,6 +503,7 @@ def run_production_safety_monitor(
         failures,
         (),
     )
+    window_sources_complete = not {"journal", "events"}.intersection(failures)
 
     audit = None
     audit_ran = should_run_daily_audit(
@@ -499,6 +528,7 @@ def run_production_safety_monitor(
             abnormal_events=abnormal_events,
             audit=audit,
             adapter_failures=tuple(failures),
+            state_invalid=loaded_state.invalid_existing_file,
         ),
         expectations,
     )
@@ -507,7 +537,7 @@ def run_production_safety_monitor(
     if audit is not None and _audit_result_is_healthy(audit):
         successful_audit_date = checked_at.astimezone(_SHANGHAI).date().isoformat()
     base_state = MonitorState(
-        last_window_at=checked_at.isoformat(),
+        last_window_at=(checked_at if window_sources_complete else since).isoformat(),
         last_full_audit_date=successful_audit_date,
         anomaly_fingerprint=state.anomaly_fingerprint,
         last_notification_at=state.last_notification_at,
@@ -786,6 +816,11 @@ def evaluate_monitor_snapshot(
     elif adapter_failures:
         reasons.add("adapter_failure")
         details["adapter_failures"] = adapter_failures
+
+    if type(snapshot.state_invalid) is not bool:
+        reasons.add("malformed_snapshot")
+    elif snapshot.state_invalid:
+        reasons.add("state_invalid")
 
     _evaluate_events(snapshot.abnormal_events, reasons, details)
     if snapshot.audit is not None:

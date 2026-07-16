@@ -49,9 +49,11 @@ On each reviewed server deployment, first run
 `./scripts/install_server_monitor.sh` only from `/opt/telegram-kol-analyzer`.
 Its default is install-only and fails closed if an old timer remains enabled or
 active. Complete the
-runbook's no-notify full audit and one labelled notification test before running
+runbook's no-notify full audit and its single instruction for the installed,
+never-enabled static labelled-notification oneshot before running
 `./scripts/install_server_monitor.sh --enable`. Status and monitor-only rollback
-commands, including persistent timer-state cleanup with
+commands, including removal of the never-enabled test-notification unit and
+persistent timer-state cleanup with
 `systemctl clean --what=state telegram-kol-monitor.timer`, are maintained in
 `docs/runbook.md` and `docs/server-deployment.md`. The initial root-only
 credential source is `/etc/telegram-kol-monitor.credentials`.
