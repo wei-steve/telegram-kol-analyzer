@@ -22,7 +22,12 @@ from telegram_kol_research.execution_events import (
     ExecutionEventRecord,
     record_execution_event,
 )
-from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    RawMessage,
+    StrategyLifecycle,
+)
 from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
@@ -372,8 +377,12 @@ def _execute_protection_batch(
             raise ManagementBatchExecutionError(
                 "management_protection_success_finalization_conflict"
             )
+        succeeded_batch = load_management_batch(session_factory, batch.id)
+        _confirm_protection_lifecycle(
+            session_factory, batch=succeeded_batch, confirmed_at=executed_at
+        )
         return _result(
-            load_management_batch(session_factory, batch.id),
+            succeeded_batch,
             reason="all_position_protection_replaced",
         )
     if any(leg.status == "reserved" for leg in batch.legs):
@@ -612,7 +621,53 @@ def _execute_protection_batch(
         reason_code=reason,
     ):
         raise ManagementBatchExecutionError("management_batch_finalization_conflict")
-    return _result(load_management_batch(session_factory, batch.id), reason=reason)
+    completed_batch = load_management_batch(session_factory, batch.id)
+    if final_status == "succeeded":
+        _confirm_protection_lifecycle(
+            session_factory, batch=completed_batch, confirmed_at=executed_at
+        )
+    return _result(completed_batch, reason=reason)
+
+
+def _confirm_protection_lifecycle(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+    confirmed_at: datetime,
+) -> None:
+    """Promote protection intent only after every replacement was accepted."""
+
+    requested_stops = {
+        str(leg.planned_tpsl.get("stop_loss_text")).strip()
+        for leg in batch.legs
+        if isinstance(leg.planned_tpsl, dict)
+        and leg.planned_tpsl.get("stop_loss_text") not in {None, ""}
+    }
+    confirmed_stop: float | None = None
+    if len(requested_stops) == 1:
+        try:
+            parsed = Decimal(next(iter(requested_stops)))
+        except InvalidOperation:
+            parsed = Decimal("NaN")
+        if parsed.is_finite() and parsed > 0:
+            confirmed_stop = float(parsed)
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+        raw = session.get(RawMessage, batch.raw_message_id)
+        if lifecycle is None or raw is None:
+            raise ManagementBatchExecutionError(
+                "management_protection_confirmation_identity_missing"
+            )
+        if confirmed_stop is not None:
+            lifecycle.stop_loss = confirmed_stop
+        lifecycle.management_signal_message_id = int(raw.message_id)
+        lifecycle.management_action = "protection_update_confirmed"
+        lifecycle.management_note = (
+            "Deepcoin accepted every planned position-protection replacement."
+        )
+        lifecycle.updated_at = confirmed_at
+        session.commit()
 
 
 def _preflight_exact_protection_positions(

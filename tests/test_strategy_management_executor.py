@@ -766,6 +766,10 @@ def test_explicit_stop_replaces_every_position_and_preserves_each_take_profit(tm
 
     session_factory = create_session_factory(tmp_path / "research.db")
     batch, rows_by_pos = _persist_protection_batch(session_factory)
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+        lifecycle.stop_loss = 65500
+        session.commit()
     client = _ProtectionClient(session_factory, rows_by_pos)
 
     result = execute_management_batch(
@@ -798,6 +802,11 @@ def test_explicit_stop_replaces_every_position_and_preserves_each_take_profit(tm
     assert client.set_calls[3]["sz"] == "4"
     assert "sz" not in client.set_calls[4]
     assert all(call["instType"] == "SWAP" for call in client.cancel_calls)
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+        assert lifecycle.stop_loss == 65000
+        assert lifecycle.management_signal_message_id == 20
+        assert lifecycle.management_action == "protection_update_confirmed"
 
 
 def test_break_even_uses_each_positions_own_average_entry(tmp_path):

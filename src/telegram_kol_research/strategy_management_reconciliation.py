@@ -139,6 +139,8 @@ def reconcile_strategy_management_batches(
                     counts["succeeded"] += 1
                 if batch.effective_action in {"full_close", "full_exit"}:
                     _terminalize_full_close(session, batch=batch, legs=legs, now=now)
+                else:
+                    _confirm_partial_close(session, batch=batch, now=now)
             elif "failed" in statuses:
                 _freeze_batch(
                     session,
@@ -394,6 +396,19 @@ def _terminalize_full_close(session, *, batch, legs, now: datetime) -> None:
         int(raw.message_id) if raw is not None else None
     )
     lifecycle.management_action = "full_close_confirmed"
+    lifecycle.updated_at = now
+
+
+def _confirm_partial_close(session, *, batch, now: datetime) -> None:
+    lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+    raw = session.get(RawMessage, batch.raw_message_id)
+    if lifecycle is None or raw is None:
+        raise RuntimeError("management_reconciliation_identity_disappeared")
+    lifecycle.management_signal_message_id = int(raw.message_id)
+    lifecycle.management_action = "partial_close_confirmed"
+    lifecycle.management_note = (
+        "Deepcoin exchange confirmed every planned close leg."
+    )
     lifecycle.updated_at = now
 
 

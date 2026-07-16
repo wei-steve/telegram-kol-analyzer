@@ -246,6 +246,12 @@ def test_planned_partial_fully_reflected_confirms_and_advances_once(tmp_path):
     assert first.legs[0].status == repeated.legs[0].status == "confirmed"
     assert first.reconciled_at == repeated.reconciled_at == NOW
     assert first.completed_at == repeated.completed_at == NOW
+    with sf() as session:
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+        assert lifecycle.lifecycle_status == "entered"
+        assert lifecycle.management_signal_message_id == 20
+        assert lifecycle.management_action == "partial_close_confirmed"
+        assert lifecycle.management_note == "Deepcoin exchange confirmed every planned close leg."
 
 
 def test_partially_filled_leg_requires_recovery_and_freezes_round(tmp_path):
