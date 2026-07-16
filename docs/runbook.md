@@ -162,6 +162,23 @@ Recommended browser flow:
 7. If needed, ask for a different bounded range in natural language, for example `总结最近 200 条消息`.
 8. Adjust the group-specific default prompt at the top of the AI panel when you want a different standing analysis style for that group.
 
+## Per-group automatic-entry position cap
+
+`max_concurrent_positions` is the cap for one exact Telegram `chat_id`, not an
+account-wide limit, and its code default is `4`. The effective-position count
+includes only distinct Deepcoin entry `posId`s whose entry legs are both
+`active` and `attribution_status=verified` through the exact group binding.
+Pending regular or trigger orders do not count.
+
+At or above the cap, a new automatic entry is skipped with
+`group_position_limit_reached`. The cap never blocks management actions,
+including partial take profit, full exit, stop changes, or temporary exit. The
+count and entry submission are intentionally not one transaction: two
+concurrent entry messages for the same group can both observe a count below the
+limit and briefly exceed it. This small concurrent-entry race is an accepted
+operational boundary; reconciliation and later management still use exact
+verified `posId` ownership.
+
 ## Audit strategy-management batches
 
 Keep both production gates off for this rollout:

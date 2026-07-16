@@ -99,6 +99,22 @@ The old YAML prompt fields are compatibility seed inputs only. Database versions
 
 Operational details, table names, rollback boundaries, and production checks are documented in `docs/context/ai-prompt-registry.md`.
 
+## Per-group automatic-entry position cap
+
+`max_concurrent_positions` is defined per exact Telegram `chat_id` and defaults
+to `4`; it is not an account-wide cap. A group's effective count is the number
+of distinct Deepcoin entry `posId`s on `active` entry legs with
+`attribution_status=verified` through that group's exact binding. Pending
+regular and trigger orders are intentionally excluded.
+
+Only new automatic entries are gated. At the limit they record
+`group_position_limit_reached`, while partial take profit, full exit, stop
+changes, temporary exit, and all other management actions remain available.
+The count and entry submission are intentionally non-transactional, so two
+concurrent entry messages for the same group can both observe spare capacity
+and briefly exceed the cap. This small race is accepted; it does not relax the
+exact verified-ownership requirements used for reconciliation or management.
+
 ## Deepcoin position-attribution authority
 
 `execution_order_legs` is the only persisted authority that may connect a live
