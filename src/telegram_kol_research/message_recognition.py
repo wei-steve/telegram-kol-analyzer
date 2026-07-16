@@ -1011,10 +1011,15 @@ def _apply_lifecycle_event_decision(
             decision["take_profit"] = decision.get("exit_price")
         decision["exit_price"] = None
 
-    normalized_management_action, management_fraction = normalize_management_intent(
-        decision,
-        raw_message.text or "",
-    )
+    try:
+        normalized_management_action, management_fraction = normalize_management_intent(
+            decision,
+            raw_message.text or "",
+        )
+    except ValueError as exc:
+        if str(exc) != "management_fraction_ambiguous":
+            raise
+        return False
 
     target = _resolve_lifecycle_event_target(session, raw_message, decision)
     if target is None:
@@ -1128,20 +1133,9 @@ def _apply_lifecycle_event_decision(
             )
             else None
         )
-        if explicit_stop_loss is not None:
-            target.stop_loss = explicit_stop_loss
-            stop_note = f"止损已按 KOL 明确指令调整为 {explicit_stop_loss:g}。"
-            management_note = f"{management_note} {stop_note}" if management_note else stop_note
-        elif protective_stop is not None:
-            target.stop_loss = protective_stop
-            protect_note = f"收到推保护价指令，止损已调整到成本保护价 {protective_stop:g}。"
-            management_note = f"{management_note} {protect_note}" if management_note else protect_note
-        if explicit_take_profit:
-            target.take_profit = explicit_take_profit
-        target.management_signal_message_id = raw_message.message_id
-        target.management_action = normalized_management_action
-        target.management_note = management_note
-        target.updated_at = utc_now()
+        requested_stop_loss = (
+            explicit_stop_loss if explicit_stop_loss is not None else protective_stop
+        )
         _upsert_management_signal_candidate(
             session,
             raw_message=raw_message,
@@ -1150,6 +1144,8 @@ def _apply_lifecycle_event_decision(
             management_action=normalized_management_action,
             management_fraction=management_fraction,
             recognition_generation=authoritative_generation,
+            requested_stop_loss=requested_stop_loss,
+            requested_take_profit=explicit_take_profit,
         )
         return True
 
@@ -1206,17 +1202,35 @@ def _explicit_management_fraction(
     decision: Mapping[str, Any],
     combined_text: str,
 ) -> float | None:
+    explicit_close_fractions: list[float] = []
     for key in ("management_fraction", "close_fraction", "fraction"):
         normalized = _fraction_value(decision.get(key))
         if normalized is not None:
-            return normalized
+            explicit_close_fractions.append(normalized)
 
-    contextual_percentages = re.findall(
-        r"(?:止盈|减仓|平仓|仓位)[^\d%\uff05]{0,12}(\d+(?:\.\d+)?)\s*[%\uff05]",
+    close_percentages = re.findall(
+        r"(?:止盈|减仓|平仓|平掉|出掉|出局)[^\d%\uff05]{0,12}(\d+(?:\.\d+)?)\s*[%\uff05]",
         combined_text,
     )
-    if contextual_percentages:
-        return _fraction_value(f"{contextual_percentages[-1]}%")
+    explicit_close_fractions.extend(
+        fraction
+        for value in close_percentages
+        if (fraction := _fraction_value(f"{value}%")) is not None
+    )
+    retained_percentages = re.findall(
+        r"(?:保留|剩余|留下|留)[^\d%\uff05]{0,12}(\d+(?:\.\d+)?)\s*[%\uff05]",
+        combined_text,
+    )
+    explicit_close_fractions.extend(
+        1.0 - retained
+        for value in retained_percentages
+        if (retained := _fraction_value(f"{value}%")) is not None
+    )
+    if explicit_close_fractions:
+        first = explicit_close_fractions[0]
+        if any(abs(value - first) > 1e-9 for value in explicit_close_fractions[1:]):
+            raise ValueError("management_fraction_ambiguous")
+        return first
     if any(term in combined_text for term in ("一半", "半仓", "half")):
         return 0.5
     return None
@@ -2801,6 +2815,8 @@ def _upsert_management_signal_candidate(
     management_action: str | None = None,
     management_fraction: float | None = None,
     recognition_generation: str | None = None,
+    requested_stop_loss: float | None = None,
+    requested_take_profit: str | None = None,
 ) -> SignalCandidate:
     candidate = (
         session.query(SignalCandidate)
@@ -2824,8 +2840,12 @@ def _upsert_management_signal_candidate(
     candidate.management_fraction = management_fraction
     candidate.recognition_generation = recognition_generation
     candidate.entry_text = None
-    candidate.stop_loss_text = _format_number(lifecycle.stop_loss)
-    candidate.take_profit_text = lifecycle.take_profit
+    candidate.stop_loss_text = (
+        _format_number(requested_stop_loss)
+        if requested_stop_loss is not None
+        else _format_number(lifecycle.stop_loss)
+    )
+    candidate.take_profit_text = requested_take_profit or lifecycle.take_profit
     candidate.confidence = max(candidate.confidence or 0.0, 0.85)
     candidate.parse_source = parse_source
     return candidate
