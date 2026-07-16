@@ -255,8 +255,10 @@ reviewed deployment to advance that expected-commit baseline. Before enabling,
 run one full health check with notification delivery omitted:
 
 ```bash
-sudo .venv/bin/telegram-kol-research monitor-production-safety \
-  --expected-head "$(git rev-parse HEAD)" \
+expected_head="$(git rev-parse HEAD)"
+sudo runuser -u telegram-kol-monitor -g telegram-kol-monitor -G systemd-journal -- \
+  .venv/bin/telegram-kol-research monitor-production-safety \
+  --expected-head "$expected_head" \
   --expected-auto-trade-enabled \
   --expected-management-mode live \
   --expected-max-concurrent-positions 4 \
@@ -266,7 +268,9 @@ sudo .venv/bin/telegram-kol-research monitor-production-safety \
   --force-full-audit
 ```
 
-Confirm the compact result is healthy. Then start the installed static oneshot
+Running the diagnostic as the monitor identity keeps `state.json` owned and
+writable by that identity; do not invoke this state-writing command directly as
+root. Confirm the compact result is healthy. Then start the installed static oneshot
 unit to send exactly one clearly labelled notification-chain test. The unit
 loads `/etc/telegram-kol-monitor.env`, runs as the dedicated identity with the
 same sandbox as the scheduled monitor, is never enabled, and does not call the

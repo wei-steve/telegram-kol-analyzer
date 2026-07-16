@@ -200,8 +200,15 @@ class ProductionSafetyAdapters:
         return "active"
 
     def read_git_head(self) -> str:
+        safe_checkout = self.checkout_path.resolve()
         completed = _run_bounded_command(
-            ("git", "rev-parse", "HEAD"),
+            (
+                "git",
+                "-c",
+                f"safe.directory={safe_checkout}",
+                "rev-parse",
+                "HEAD",
+            ),
             timeout_seconds=5,
             cwd=self.checkout_path,
         )

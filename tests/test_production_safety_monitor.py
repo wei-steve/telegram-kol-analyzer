@@ -1497,7 +1497,13 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
     assert adapters.run_management_audit() == _healthy_audit()
     assert calls == [
         (
-            ("git", "rev-parse", "HEAD"),
+            (
+                "git",
+                "-c",
+                "safe.directory=/opt/telegram-kol-analyzer",
+                "rev-parse",
+                "HEAD",
+            ),
             {"timeout_seconds": 5, "cwd": Path("/opt/telegram-kol-analyzer")},
         ),
         (

@@ -310,8 +310,10 @@ def test_operations_docs_have_exactly_one_safe_test_notification_instruction():
 
     assert combined.count(instruction) == 1
     assert combined.count(
-        "sudo .venv/bin/telegram-kol-research monitor-production-safety"
+        "sudo runuser -u telegram-kol-monitor -g telegram-kol-monitor "
+        "-G systemd-journal --"
     ) == 1
+    assert "sudo .venv/bin/telegram-kol-research monitor-production-safety" not in combined
     assert "dedicated identity" in combined.lower()
     assert "never enabled" in combined.lower()
 
