@@ -350,6 +350,14 @@ body {
   grid-template-columns: minmax(0, 1fr);
 }
 
+.strategy-record-pagination .secondary-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  box-sizing: border-box;
+}
+
 .strategy-record-card.home-event-card {
   grid-template-columns: minmax(0, 1fr);
   gap: 7px 10px;

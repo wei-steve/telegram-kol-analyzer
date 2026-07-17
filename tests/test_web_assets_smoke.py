@@ -269,6 +269,19 @@ def test_strategy_record_css_exposes_phone_first_accessibility_contract(tmp_path
     assert ":focus-visible" in css
 
 
+def test_strategy_record_pagination_keeps_a_44px_phone_touch_target(tmp_path):
+    css = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.css"
+    ).text
+
+    selector = ".strategy-record-pagination .secondary-button {"
+    assert selector in css
+    start = css.index(selector)
+    block = css[start : css.index("}", start)]
+
+    assert "min-height: 44px;" in block
+
+
 def test_strategy_record_css_resets_legacy_event_grid_and_wraps_detail_terms(tmp_path):
     css = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
         "/static/app.css"
