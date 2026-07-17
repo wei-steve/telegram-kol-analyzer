@@ -623,6 +623,47 @@ class PositionAttributionAudit(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class PositionProtectionLedger(Base):
+    __tablename__ = "position_protection_ledger"
+    __table_args__ = (
+        Index(
+            "uq_position_protection_ledger_venue_order",
+            "venue",
+            "order_id",
+            unique=True,
+        ),
+        Index("ix_position_protection_ledger_binding", "execution_binding_id"),
+        Index("ix_position_protection_ledger_leg", "execution_order_leg_id"),
+        Index("ix_position_protection_ledger_position", "venue", "pos_id"),
+        Index("ix_position_protection_ledger_status", "status", "last_seen_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    strategy_instance_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    instrument_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    order_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    purpose: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger_price: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    size_text: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="verified")
+    evidence_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    last_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class ExecutionEvent(Base):
     __tablename__ = "execution_events"
     __table_args__ = (
