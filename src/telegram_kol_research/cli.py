@@ -150,6 +150,7 @@ _MAX_CANONICAL_ID = 9_223_372_036_854_775_807
 _MAX_DECIMAL_INPUT_CHARS = 128
 _MAX_DECIMAL_DIGITS = 40
 _MAX_DECIMAL_FIXED_CHARS = 128
+_WEB_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 10
 
 
 class ManagementAuditSnapshotError(RuntimeError):
@@ -2228,7 +2229,12 @@ def web(
         deepcoin_contract_spec_provider=deepcoin_contract_spec_provider,
     )
     try:
-        uvicorn.run(app_instance, host=host, port=port)
+        uvicorn.run(
+            app_instance,
+            host=host,
+            port=port,
+            timeout_graceful_shutdown=_WEB_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+        )
     finally:
         if telegram_session_lock_entered and telegram_session_lock is not None:
             telegram_session_lock.__exit__(None, None, None)
