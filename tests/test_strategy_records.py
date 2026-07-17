@@ -919,6 +919,98 @@ def test_exchange_enrichment_flags_management_execution_drift_from_exact_stop():
     }
 
 
+def test_blocked_protection_management_batch_requires_attention(tmp_path):
+    session_factory = create_session_factory(tmp_path / "blocked-management.db")
+    with session_factory() as session:
+        entry_raw = RawMessage(chat_id=10, message_id=101, posted_at=NOW, text="BTC long")
+        management_raw = RawMessage(
+            chat_id=10,
+            message_id=102,
+            posted_at=NOW + timedelta(minutes=5),
+            text="止盈一半，止损上移",
+        )
+        session.add_all([entry_raw, management_raw])
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=entry_raw.id,
+            symbol="BTCUSDT",
+            side="long",
+            event_type="entry_signal",
+        )
+        session.add(candidate)
+        session.flush()
+        decision = _decision(entry_raw.id)
+        session.add(decision)
+        session.flush()
+        binding = _binding(
+            chat_id=10,
+            message_id=101,
+            symbol="BTCUSDT",
+            strategy_instance_id="blocked-protection-strategy",
+            status="active",
+        )
+        binding.pos_id = "pos-managed"
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=10,
+            message_id=101,
+            symbol="BTCUSDT",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            stop_loss=62000,
+            execution_binding_id=binding.id,
+            updated_at=NOW,
+        )
+        session.add(lifecycle)
+        session.flush()
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="blocked-protection",
+                raw_message_id=management_raw.id,
+                recognition_decision_id=decision.id,
+                recognition_generation="generation-1",
+                target_lifecycle_id=lifecycle.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                execution_binding_id=binding.id,
+                intent="partial_then_break_even",
+                effective_action="partial_then_break_even",
+                execution_mode="live",
+                requested_fraction=0.5,
+                effective_fraction=0.5,
+                partial_round_before=0,
+                status="blocked",
+                reason_code="protection_ambiguous_global_assignment",
+                target_fingerprint="blocked-protection-target",
+                target_snapshot_json="{}",
+                planned_at=NOW + timedelta(minutes=6),
+                created_at=NOW + timedelta(minutes=6),
+                updated_at=NOW + timedelta(minutes=6),
+            )
+        )
+        session.commit()
+
+    rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "测试群"},
+        filter_name="needs_attention",
+        now=NOW + timedelta(minutes=10),
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["attention"] == {
+        "severity": "warning",
+        "code": "management_blocked",
+        "label": "仓位管理已阻断待处理",
+    }
+    assert rows[0]["management_batch_statuses"] == ["blocked"]
+    assert "management_blocked" in {
+        reason["code"] for reason in rows[0]["attention_reasons"]
+    }
+
+
 def test_exchange_enrichment_does_not_infer_drift_without_management_message():
     record = _strategy_record(pos_id="pos-entry-only")
     record["expected_stop_loss"] = 63_575.875

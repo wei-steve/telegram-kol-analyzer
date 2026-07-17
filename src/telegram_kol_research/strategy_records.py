@@ -54,6 +54,7 @@ ATTENTION_LABELS = MappingProxyType(
         "attribution_ambiguous": ("warning", "交易所仓位归属不唯一"),
         "attribution_conflict": ("critical", "交易所仓位归属证据冲突"),
         "protection_mismatch": ("critical", "交易所保护证据与策略不一致"),
+        "management_blocked": ("warning", "仓位管理已阻断待处理"),
         "management_execution_drift": ("critical", "仓位管理与交易所结果漂移"),
         "position_missing": ("critical", "本地实盘绑定在交易所快照中缺失"),
         "binding_without_lifecycle": ("critical", "实盘绑定缺少策略生命周期"),
@@ -64,6 +65,17 @@ _FAILED_RECOGNITION_STATUSES = frozenset(
     {"failed", "failure", "error", "识别失败"}
 )
 _NORMAL_DISAGREEMENT_SEVERITIES = frozenset({"", "none", "normal"})
+ACTIONABLE_MANAGEMENT_BLOCK_REASONS = frozenset(
+    {
+        "protection_ambiguous_global_assignment",
+        "protection_missing_cancellable_order_id",
+        "protection_price_or_size_mismatch",
+        "protection_ledger_stale",
+        "protection_evidence_unavailable",
+        "target_protection_not_verified",
+        "target_protection_order_identity_unavailable",
+    }
+)
 _TIMELINE_KIND_RANK = MappingProxyType(
     {
         "message": 0,
@@ -2001,6 +2013,11 @@ def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
         StrategyManagementBatch.target_lifecycle_id == StrategyLifecycle.id,
         func.lower(StrategyManagementBatch.status).notin_(SAFE_MANAGEMENT_STATUSES),
     )
+    management_blocked = exists().where(
+        StrategyManagementBatch.target_lifecycle_id == StrategyLifecycle.id,
+        func.lower(StrategyManagementBatch.status) == "blocked",
+        StrategyManagementBatch.reason_code.in_(ACTIONABLE_MANAGEMENT_BLOCK_REASONS),
+    )
     critical = or_(
         recognition_evidence_missing,
         recognition_failed,
@@ -2010,7 +2027,7 @@ def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
     )
     severity_expression = case(
         (critical, 0),
-        (management_unconfirmed, 1),
+        (or_(management_unconfirmed, management_blocked), 1),
         (recognition_disagreement, 2),
         else_=3,
     )
@@ -2038,7 +2055,12 @@ def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
     )
     if only_attention:
         lifecycle_query = lifecycle_query.filter(
-            or_(critical, management_unconfirmed, recognition_disagreement)
+            or_(
+                critical,
+                management_unconfirmed,
+                management_blocked,
+                recognition_disagreement,
+            )
         )
     return lifecycle_query, severity_expression, latest_expression
 
@@ -2117,6 +2139,12 @@ def _attention_reasons(
         for batch in management_batches
     ):
         codes.append("management_unconfirmed")
+    if any(
+        str(batch.status or "").lower() == "blocked"
+        and str(batch.reason_code or "") in ACTIONABLE_MANAGEMENT_BLOCK_REASONS
+        for batch in management_batches
+    ):
+        codes.append("management_blocked")
 
     return [
         {"severity": ATTENTION_LABELS[code][0], "code": code, "label": ATTENTION_LABELS[code][1]}

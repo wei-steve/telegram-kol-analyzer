@@ -372,12 +372,17 @@ def _plan_strategy_management_batch_locked(
                     global_order_id_counts=global_protection_order_id_counts,
                 )
             if protection is None or protection.status != "verified":
+                reason_code = _unverified_protection_reason(
+                    protection=protection,
+                    ledger_rows=ledger_rows_by_pos_id.get(position["pos_id"], []),
+                    tpsl_orders=tpsl_orders,
+                )
                 return _persist_blocked(
                     session_factory,
                     identity=identity,
                     raw_message_id=raw_message_id,
                     intent=intent,
-                    reason_code="target_protection_not_verified",
+                    reason_code=reason_code,
                     planned_at=now,
                     execution_mode=execution_mode,
                 )
@@ -400,12 +405,18 @@ def _plan_strategy_management_batch_locked(
                     )
                 )
             ):
+                reason_code = _unusable_protection_order_reason(
+                    protection_rows=protection.rows,
+                    protection_row_ids=protection_row_ids,
+                    global_protection_order_id_counts=global_protection_order_id_counts,
+                    seen_protection_order_ids=seen_protection_order_ids,
+                )
                 return _persist_blocked(
                     session_factory,
                     identity=identity,
                     raw_message_id=raw_message_id,
                     intent=intent,
-                    reason_code="target_protection_order_identity_unavailable",
+                    reason_code=reason_code,
                     planned_at=now,
                     execution_mode=execution_mode,
                 )
@@ -1043,6 +1054,53 @@ def normalize_requested_management_fraction(
     if not isfinite(fraction) or not 0 < fraction < 1:
         raise ManagementFractionError("management_fraction_invalid")
     return fraction
+
+
+def _unverified_protection_reason(
+    *,
+    protection: PositionProtection | None,
+    ledger_rows: list[PositionProtectionLedger],
+    tpsl_orders: list[dict[str, Any]],
+) -> str:
+    if protection is not None and protection.status == "present_but_ambiguous":
+        return "protection_ambiguous_global_assignment"
+    current_order_ids = {
+        order_id
+        for row in tpsl_orders
+        if (order_id := _exact_protection_order_id(row)) is not None
+    }
+    if ledger_rows and not any(str(row.order_id) in current_order_ids for row in ledger_rows):
+        return "protection_missing_cancellable_order_id"
+    if ledger_rows:
+        return "protection_price_or_size_mismatch"
+    if current_order_ids:
+        return "protection_ambiguous_global_assignment"
+    return "target_protection_not_verified"
+
+
+def _unusable_protection_order_reason(
+    *,
+    protection_rows: list[dict[str, Any]],
+    protection_row_ids: list[str | None],
+    global_protection_order_id_counts: Counter,
+    seen_protection_order_ids: set[str],
+) -> str:
+    if not protection_rows or any(order_id is None for order_id in protection_row_ids):
+        return "protection_missing_cancellable_order_id"
+    if (
+        len(set(protection_row_ids)) != len(protection_row_ids)
+        or any(
+            global_protection_order_id_counts[str(order_id)] != 1
+            for order_id in protection_row_ids
+        )
+        or bool(
+            seen_protection_order_ids.intersection(
+                str(order_id) for order_id in protection_row_ids
+            )
+        )
+    ):
+        return "protection_ambiguous_global_assignment"
+    return "protection_missing_cancellable_order_id"
 
 
 def _ledger_confirmed_position_protection(

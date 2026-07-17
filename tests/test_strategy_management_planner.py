@@ -587,7 +587,7 @@ def test_protection_ambiguity_blocks_every_target(monkeypatch, tmp_path):
     )
 
     assert result.status == "blocked"
-    assert result.reason_code == "target_protection_not_verified"
+    assert result.reason_code == "protection_ambiguous_global_assignment"
     assert result.batch.status == "blocked"
     assert result.batch.execution_mode == "shadow"
     assert result.batch.legs == ()
@@ -737,7 +737,7 @@ def test_ledger_backed_protection_requires_current_order_id(monkeypatch, tmp_pat
     )
 
     assert result.status == "blocked"
-    assert result.reason_code == "target_protection_not_verified"
+    assert result.reason_code == "protection_missing_cancellable_order_id"
 
 
 def test_ledger_backed_protection_requires_matching_price(monkeypatch, tmp_path):
@@ -794,7 +794,7 @@ def test_ledger_backed_protection_requires_matching_price(monkeypatch, tmp_path)
     )
 
     assert result.status == "blocked"
-    assert result.reason_code == "target_protection_not_verified"
+    assert result.reason_code == "protection_price_or_size_mismatch"
 
 
 def test_inline_protection_without_exact_order_id_blocks_plan(monkeypatch, tmp_path):
@@ -828,7 +828,7 @@ def test_inline_protection_without_exact_order_id_blocks_plan(monkeypatch, tmp_p
     )
 
     assert result.status == "blocked"
-    assert result.reason_code == "target_protection_order_identity_unavailable"
+    assert result.reason_code == "protection_missing_cancellable_order_id"
 
 
 def test_any_protection_row_without_exact_unique_id_blocks_plan(monkeypatch, tmp_path):
@@ -863,7 +863,7 @@ def test_any_protection_row_without_exact_unique_id_blocks_plan(monkeypatch, tmp
     )
 
     assert result.status == "blocked"
-    assert result.reason_code == "target_protection_order_identity_unavailable"
+    assert result.reason_code == "protection_missing_cancellable_order_id"
 
 
 def test_selected_protection_order_id_must_be_unique_across_global_snapshot(
@@ -910,7 +910,7 @@ def test_selected_protection_order_id_must_be_unique_across_global_snapshot(
     )
 
     assert result.status == "blocked"
-    assert result.reason_code == "target_protection_order_identity_unavailable"
+    assert result.reason_code == "protection_ambiguous_global_assignment"
 
 
 @pytest.mark.parametrize(
