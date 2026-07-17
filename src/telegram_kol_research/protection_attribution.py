@@ -213,9 +213,11 @@ def match_position_protection(
         for position in parsed_positions:
             if position.instrument_id != group.instrument_id or position.side != group.side:
                 continue
-            plausible.append(position)
             time_distance = _time_distance(position.created_at_ms, group.created_at_ms)
-            if time_distance is None or time_distance > max(0, int(time_tolerance_ms)):
+            if time_distance is not None and time_distance > max(0, int(time_tolerance_ms)):
+                continue
+            plausible.append(position)
+            if time_distance is None:
                 continue
             size_penalty = _size_penalty(position.size, group.rows)
             if size_penalty != 0:

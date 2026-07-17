@@ -161,6 +161,28 @@ def test_nearby_positions_keep_each_target_with_its_nearest_stop_group():
     assert result.by_pos_id["pos-b"].stop_loss == 1700
 
 
+def test_many_same_side_positions_match_only_time_and_size_compatible_groups():
+    result = match_position_protection(
+        [
+            _position("pos-a", size="8", created_at="10000"),
+            _position("pos-b", size="19", created_at="15000"),
+            _position("pos-c", size="5", created_at="21000"),
+        ],
+        [
+            _tpsl(created_at="10000", ordId="a", size="8", slTriggerPrice="61500"),
+            _tpsl(created_at="15000", ordId="b", size="19", slTriggerPrice="62070"),
+            _tpsl(created_at="21000", ordId="c", size="5", slTriggerPrice="61000"),
+        ],
+    )
+
+    assert result.by_pos_id["pos-a"].status == "verified"
+    assert result.by_pos_id["pos-a"].order_ids == ["a"]
+    assert result.by_pos_id["pos-b"].status == "verified"
+    assert result.by_pos_id["pos-b"].order_ids == ["b"]
+    assert result.by_pos_id["pos-c"].status == "verified"
+    assert result.by_pos_id["pos-c"].order_ids == ["c"]
+
+
 def test_full_stop_does_not_hide_partial_target_size_mismatch():
     result = match_position_protection(
         [
@@ -257,7 +279,7 @@ def test_ambiguous_extra_order_blocks_mutation_even_with_one_exact_order():
     assert result.by_pos_id["pos-a"].can_mutate is False
 
 
-def test_inline_position_prices_remain_visible_when_pending_orders_are_ambiguous():
+def test_unrelated_pending_order_does_not_hide_exact_inline_position_prices():
     result = match_position_protection(
         [
             _position(
@@ -285,11 +307,11 @@ def test_inline_position_prices_remain_visible_when_pending_orders_are_ambiguous
     )
 
     protection = result.by_pos_id["pos-a"]
-    assert protection.status == "present_but_ambiguous"
+    assert protection.status == "verified"
     assert protection.stop_loss == 66500
     assert protection.take_profits == [63300]
-    assert protection.order_ids == []
-    assert protection.can_mutate is False
+    assert protection.order_ids == ["position-tpsl"]
+    assert protection.can_mutate is True
 
 
 def test_missing_tpsl_evidence_is_not_reported_as_absent():
