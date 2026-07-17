@@ -166,6 +166,12 @@ Strategy records are read-only views. The operational authority chain is:
 
 `message -> candidate -> lifecycle -> binding -> exchange state`
 
+For split positions, expand `binding` through active verified `entry` legs and
+check every exact `pos_id`; never query Deepcoin with the comma-joined binding
+compatibility value. For TPSL evidence, prefer `closePosId` and quarantine an
+exact ID that is absent from the current position snapshot. It must not enter
+the symbol/side/time fallback matcher.
+
 List/detail and cross-destination links must preserve unique IDs. Message links
 use the selected candidate ID and fail closed if it owns multiple lifecycles.
 Position links use a unique execution binding ID. Do not infer a strategy owner
@@ -185,6 +191,11 @@ current data. Check:
   binding, execution events, current position/TPSL, and management batches;
 - unassigned, ambiguous, conflicting, stale, and unavailable exchange evidence
   remains visibly unconfirmed;
+- a management message whose lifecycle stop differs from exact current
+  Deepcoin protection appears as `management_execution_drift` in both list and
+  detail unless a confirmed batch for that same message and stop explains it;
+- detail renders each verified live leg's position ID, size, protection state,
+  stop, and take-profit evidence separately;
 - Deepcoin failure does not render confirmed zero;
 - long evidence has no horizontal overflow, navigation does not cover content,
   phone touch targets are at least 44px, and desktop uses the same data model;

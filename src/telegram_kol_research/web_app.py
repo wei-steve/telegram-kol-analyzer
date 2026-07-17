@@ -128,6 +128,7 @@ from telegram_kol_research.strategy_records import (
     load_live_bindings_without_lifecycle,
     load_strategy_record_detail,
     load_strategy_record_summaries,
+    management_execution_drift_reason,
 )
 from telegram_kol_research.strategy_alerts import (
     StrategyAlertConfig,
@@ -633,7 +634,11 @@ def _strategy_record_matches_filter(
             "rejected",
         }
     if filter_name == "executing":
-        return lifecycle_state == "entered" or record.get("real_position") is not None
+        return (
+            lifecycle_state == "entered"
+            or record.get("real_position") is not None
+            or bool(record.get("real_positions"))
+        )
     return False
 
 
@@ -642,6 +647,7 @@ def _strategy_detail_position_ownership(
     detail: dict[str, object],
     binding: dict[str, object],
     position: dict[str, object],
+    expected_pos_id: object | None = None,
 ) -> tuple[str, str, list[str]]:
     """Fail closed unless exchange attribution proves the requested owner."""
 
@@ -724,7 +730,7 @@ def _strategy_detail_position_ownership(
     elif str(actual_strategy_id) != str(expected_strategy_id):
         mismatches.append("strategy_instance_id")
 
-    expected_pos_id = binding.get("pos_id")
+    expected_pos_id = expected_pos_id or binding.get("pos_id")
     actual_attribution_pos_id = attribution.get("pos_id")
     actual_position_pos_id = position.get("pos_id") or position.get("posId")
     if actual_attribution_pos_id in {None, ""}:
@@ -3187,11 +3193,23 @@ def create_web_app(
             binding.get("venue") if binding is not None else "deepcoin"
         ).strip().lower()
         pos_id = binding.get("pos_id") if binding is not None else None
+        exact_position_ids = detail["execution"].get("position_ids")
+        exact_position_ids = (
+            [str(value) for value in exact_position_ids]
+            if isinstance(exact_position_ids, list)
+            else []
+        )
+        position_ids_authoritative = (
+            detail["execution"].get("position_ids_authoritative") is True
+        )
+        if not exact_position_ids and not position_ids_authoritative and pos_id:
+            exact_position_ids = [str(pos_id)]
         if binding is not None and binding_venue != "deepcoin":
             exchange_evidence = {
                 "state": "not_applicable",
                 "message": f"非 Deepcoin 绑定（{binding_venue or '未知交易所'}），未读取或匹配 Deepcoin 仓位",
                 "position": None,
+                "positions": [],
                 "reasons": [],
             }
         else:
@@ -3204,46 +3222,139 @@ def create_web_app(
                     "state": "unknown",
                     "message": "Deepcoin 仓位快照暂不可用",
                     "position": None,
+                    "positions": [],
                     "reasons": [],
                 }
             else:
-                matched_positions = [
-                    row
-                    for row in exchange_snapshot.get("positions", [])
-                    if pos_id
-                    and str(row.get("pos_id") or row.get("posId") or "")
-                    == str(pos_id)
-                ]
-                if len(matched_positions) == 1 and binding is not None:
-                    position = matched_positions[0]
-                    state, message, reasons = _strategy_detail_position_ownership(
-                        detail=detail,
-                        binding=binding,
-                        position=position,
+                snapshot_positions = exchange_snapshot.get("positions", [])
+                snapshot_positions = (
+                    snapshot_positions if isinstance(snapshot_positions, list) else []
+                )
+                matched_positions: list[dict[str, object]] = []
+                match_errors: list[str] = []
+                ownership_results: list[tuple[str, str, list[str]]] = []
+                for expected_pos_id in exact_position_ids:
+                    matches = [
+                        row
+                        for row in snapshot_positions
+                        if isinstance(row, dict)
+                        and str(row.get("pos_id") or row.get("posId") or "")
+                        == expected_pos_id
+                    ]
+                    if len(matches) != 1:
+                        match_errors.append(
+                            f"pos_id {expected_pos_id} "
+                            + ("匹配到多条仓位" if len(matches) > 1 else "未找到仓位")
+                        )
+                        continue
+                    position = matches[0]
+                    matched_positions.append(position)
+                    if binding is not None:
+                        ownership_results.append(
+                            _strategy_detail_position_ownership(
+                                detail=detail,
+                                binding=binding,
+                                position=position,
+                                expected_pos_id=expected_pos_id,
+                            )
+                        )
+
+                if match_errors or not exact_position_ids:
+                    exchange_evidence = {
+                        "state": "conflict" if match_errors else "not_found",
+                        "message": (
+                            "；".join(match_errors)
+                            if match_errors
+                            else "该策略未绑定实时仓位"
+                        ),
+                        "position": None,
+                        "positions": matched_positions,
+                        "reasons": [],
+                    }
+                else:
+                    state_rank = {"confirmed": 0, "unconfirmed": 1, "conflict": 2}
+                    state = max(
+                        (result[0] for result in ownership_results),
+                        key=lambda value: state_rank.get(value, 2),
+                        default="unconfirmed",
                     )
+                    reasons = [
+                        reason
+                        for _row_state, _message, row_reasons in ownership_results
+                        for reason in row_reasons
+                    ]
+                    if state == "confirmed":
+                        message = (
+                            "Deepcoin 实时仓位及策略归属已确认"
+                            if len(matched_positions) == 1
+                            else f"{len(matched_positions)} 个 Deepcoin 实时仓位及策略归属已确认"
+                        )
+                    else:
+                        message = next(
+                            (
+                                row_message
+                                for row_state, row_message, _row_reasons in ownership_results
+                                if row_state == state
+                            ),
+                            "Deepcoin 仓位归属尚未确认",
+                        )
                     exchange_evidence = {
                         "state": state,
                         "message": message,
-                        "position": position,
+                        "position": (
+                            matched_positions[0]
+                            if len(matched_positions) == 1
+                            else None
+                        ),
+                        "positions": matched_positions,
                         "reasons": reasons,
                     }
-                else:
-                    exchange_evidence = {
-                        "state": (
-                            "conflict" if len(matched_positions) > 1 else "not_found"
-                        ),
-                        "message": (
-                            "同一 pos_id 匹配到多条 Deepcoin 仓位，无法安全确认"
-                            if len(matched_positions) > 1
-                            else (
-                                "该策略未绑定实时仓位"
-                                if not pos_id
-                                else "当前 Deepcoin 快照中未找到已绑定仓位"
-                            )
-                        ),
-                        "position": None,
-                        "reasons": [],
-                    }
+        exchange_evidence["management_drift"] = None
+        evidence_positions = exchange_evidence.get("positions")
+        if (
+            exchange_evidence.get("state") == "confirmed"
+            and isinstance(evidence_positions, list)
+        ):
+            drift_reason = management_execution_drift_reason(
+                {
+                    "expected_stop_loss": detail["overview"].get("stop_loss"),
+                    "expected_take_profit": detail["overview"].get("take_profit"),
+                    "expected_management_action": detail["overview"].get(
+                        "management_action"
+                    ),
+                    "management_signal_message_id": detail["overview"].get(
+                        "management_signal_message_id"
+                    ),
+                    "management_confirmations": detail["execution"].get(
+                        "management_confirmations"
+                    ),
+                },
+                [row for row in evidence_positions if isinstance(row, dict)],
+            )
+            if drift_reason is not None:
+                exchange_evidence["state"] = "attention"
+                exchange_evidence["message"] = "仓位管理与 Deepcoin 实际保护不一致"
+                exchange_evidence["reasons"] = [
+                    *exchange_evidence.get("reasons", []),
+                    drift_reason,
+                ]
+                exchange_evidence["management_drift"] = {
+                    "code": "management_execution_drift",
+                    "expected_stop_loss": detail["overview"].get("stop_loss"),
+                    "actual_stop_loss": [
+                        row.get("stop_loss_text")
+                        for row in evidence_positions
+                        if isinstance(row, dict)
+                    ],
+                    "expected_take_profit": detail["overview"].get("take_profit"),
+                    "actual_take_profit": [
+                        row.get("take_profit_text")
+                        for row in evidence_positions
+                        if isinstance(row, dict)
+                    ],
+                    "reason": drift_reason,
+                    "confirmation_state": "unexplained",
+                }
         detail["execution"]["exchange_evidence"] = exchange_evidence
         return templates.TemplateResponse(
             request,

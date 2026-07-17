@@ -587,6 +587,32 @@ def test_exchange_enrichment_confirms_one_uniquely_bound_position():
     assert enriched[0]["attention"] is None
 
 
+def test_exchange_enrichment_confirms_every_verified_position_leg():
+    record = _strategy_record(pos_id="pos-a,pos-b")
+    record["pos_ids"] = ["pos-a", "pos-b"]
+
+    enriched = enrich_strategy_records_with_exchange(
+        [record],
+        exchange_snapshot={
+            "positions": [
+                _exchange_position(pos_id="pos-a", attribution_state="bound"),
+                _exchange_position(pos_id="pos-b", attribution_state="bound"),
+            ],
+            "error": None,
+        },
+    )
+
+    assert len(enriched) == 1
+    assert enriched[0]["exchange_state"] == "confirmed"
+    assert enriched[0]["attribution_state"] == "bound"
+    assert enriched[0]["real_position"] is None
+    assert [row["pos_id"] for row in enriched[0]["real_positions"]] == [
+        "pos-a",
+        "pos-b",
+    ]
+    assert enriched[0]["attention"] is None
+
+
 def test_exchange_enrichment_marks_unattributed_position_for_attention():
     enriched = enrich_strategy_records_with_exchange(
         [_strategy_record()],
@@ -638,6 +664,51 @@ def test_exchange_enrichment_fails_closed_for_ambiguous_or_conflicting_evidence(
     assert conflict["attribution_state"] == "conflict"
     assert conflict["attention"]["code"] == "attribution_conflict"
     assert "证据冲突" in conflict["attention"]["reason"]
+
+
+def test_exchange_enrichment_does_not_duplicate_one_expected_conflicting_pos_id():
+    enriched = enrich_strategy_records_with_exchange(
+        [_strategy_record(pos_id="pos-duplicate")],
+        exchange_snapshot={
+            "positions": [
+                _exchange_position(
+                    pos_id="pos-duplicate", attribution_state="bound"
+                ),
+                _exchange_position(
+                    pos_id="pos-duplicate", attribution_state="bound"
+                ),
+            ],
+            "error": None,
+        },
+    )
+
+    assert len(enriched) == 1
+    assert enriched[0]["attention"]["code"] == "attribution_conflict"
+
+
+def test_exchange_enrichment_respects_authoritative_empty_entry_leg_set():
+    record = _strategy_record(pos_id="pos-a,pos-b")
+    record["pos_ids"] = []
+    record["position_ids_authoritative"] = True
+
+    enriched = enrich_strategy_records_with_exchange(
+        [record],
+        exchange_snapshot={
+            "positions": [
+                _exchange_position(pos_id="pos-a", attribution_state="unassigned"),
+                _exchange_position(pos_id="pos-b", attribution_state="unassigned"),
+            ],
+            "error": None,
+        },
+    )
+
+    lifecycle_record = next(row for row in enriched if row["lifecycle_id"] == 1)
+    assert lifecycle_record["exchange_state"] == "confirmed"
+    assert lifecycle_record["real_positions"] == []
+    assert all(
+        reason["code"] != "position_missing"
+        for reason in lifecycle_record["attention_reasons"]
+    )
 
 
 def test_exchange_enrichment_never_renders_unavailable_exchange_as_zero():
@@ -815,6 +886,263 @@ def test_exchange_enrichment_requires_concrete_protection_mismatch_evidence():
     assert plain["attention"] is None
     assert mismatch["attention"]["code"] == "protection_mismatch"
     assert "止损价" in mismatch["attention"]["reason"]
+
+
+def test_exchange_enrichment_flags_management_execution_drift_from_exact_stop():
+    record = _strategy_record(pos_id="pos-managed")
+    record.update(
+        {
+            "pos_ids": ["pos-managed"],
+            "expected_stop_loss": 63_575.875,
+            "management_signal_message_id": 1451,
+            "management_batch_statuses": [],
+        }
+    )
+    position = _exchange_position(
+        pos_id="pos-managed",
+        attribution_state="bound",
+        protection_status="protected",
+    )
+    position["stop_loss_text"] = "60500"
+
+    enriched = enrich_strategy_records_with_exchange(
+        [record],
+        exchange_snapshot={"positions": [position], "error": None},
+    )
+
+    assert enriched[0]["exchange_state"] == "attention"
+    assert enriched[0]["attention"] == {
+        "severity": "critical",
+        "code": "management_execution_drift",
+        "label": "仓位管理与交易所结果漂移",
+        "reason": "消息 #1451 后策略止损 63575.875，但 Deepcoin 精确仓位证据为 60500",
+    }
+
+
+def test_exchange_enrichment_does_not_infer_drift_without_management_message():
+    record = _strategy_record(pos_id="pos-entry-only")
+    record["expected_stop_loss"] = 63_575.875
+    position = _exchange_position(
+        pos_id="pos-entry-only",
+        attribution_state="bound",
+        protection_status="protected",
+    )
+    position["stop_loss_text"] = "60500"
+
+    enriched = enrich_strategy_records_with_exchange(
+        [record],
+        exchange_snapshot={"positions": [position], "error": None},
+    )
+
+    assert enriched[0]["exchange_state"] == "confirmed"
+    assert enriched[0]["attention"] is None
+
+
+def test_exchange_enrichment_keeps_absent_protection_separate_from_numeric_drift():
+    record = _strategy_record(pos_id="pos-unprotected")
+    record.update(
+        {
+            "expected_stop_loss": 63_575.875,
+            "management_signal_message_id": 1451,
+            "management_batch_statuses": [],
+        }
+    )
+    position = _exchange_position(
+        pos_id="pos-unprotected",
+        attribution_state="bound",
+        protection_status="unprotected",
+    )
+
+    enriched = enrich_strategy_records_with_exchange(
+        [record],
+        exchange_snapshot={"positions": [position], "error": None},
+    )
+
+    assert all(
+        reason["code"] != "management_execution_drift"
+        for reason in enriched[0]["attention_reasons"]
+    )
+
+
+def test_exchange_enrichment_accepts_only_confirmed_matching_management_evidence():
+    record = _strategy_record(pos_id="pos-confirmed-management")
+    record.update(
+        {
+            "expected_stop_loss": 63_575.875,
+            "management_signal_message_id": 1451,
+            "management_batch_statuses": ["succeeded"],
+            "management_confirmations": [
+                {
+                    "message_id": 1451,
+                    "status": "succeeded",
+                    "effective_action": "move_stop",
+                    "planned_stops": [60_500],
+                }
+            ],
+        }
+    )
+    position = _exchange_position(
+        pos_id="pos-confirmed-management",
+        attribution_state="bound",
+        protection_status="protected",
+    )
+    position["stop_loss_text"] = "60500"
+
+    enriched = enrich_strategy_records_with_exchange(
+        [record],
+        exchange_snapshot={"positions": [position], "error": None},
+    )
+
+    assert enriched[0]["attention"] is None
+
+
+def test_exchange_enrichment_compares_expected_take_profit_evidence():
+    record = _strategy_record(pos_id="pos-tp-drift")
+    record.update(
+        {
+            "expected_stop_loss": 63_575.875,
+            "expected_take_profit": [64_800, 66_500],
+            "management_signal_message_id": 1451,
+            "management_confirmations": [],
+        }
+    )
+    position = _exchange_position(
+        pos_id="pos-tp-drift",
+        attribution_state="bound",
+        protection_status="protected",
+    )
+    position.update(
+        {"stop_loss_text": "63575.875", "take_profit_text": "65000/66500"}
+    )
+
+    enriched = enrich_strategy_records_with_exchange(
+        [record],
+        exchange_snapshot={"positions": [position], "error": None},
+    )
+
+    assert enriched[0]["attention"]["code"] == "management_execution_drift"
+    assert "策略止盈 64800/66500" in enriched[0]["attention"]["reason"]
+
+
+def test_exchange_enrichment_flags_unconfirmed_partial_take_profit_action():
+    record = _strategy_record(pos_id="pos-partial-drift")
+    record.update(
+        {
+            "expected_stop_loss": 63_575.875,
+            "expected_management_action": "partial_take_profit, move_stop_to_protect",
+            "management_signal_message_id": 1451,
+            "management_confirmations": [],
+        }
+    )
+    position = _exchange_position(
+        pos_id="pos-partial-drift",
+        attribution_state="bound",
+        protection_status="protected",
+    )
+    position["stop_loss_text"] = "63575.875"
+
+    enriched = enrich_strategy_records_with_exchange(
+        [record],
+        exchange_snapshot={"positions": [position], "error": None},
+    )
+
+    assert enriched[0]["attention"]["code"] == "management_execution_drift"
+    assert "要求部分止盈" in enriched[0]["attention"]["reason"]
+
+
+def test_succeeded_partial_close_confirms_partial_take_profit_action():
+    record = _strategy_record(pos_id="pos-partial-confirmed")
+    record.update(
+        {
+            "expected_stop_loss": 63_575.875,
+            "expected_management_action": "partial_take_profit",
+            "management_signal_message_id": 1451,
+            "management_confirmations": [
+                {
+                    "message_id": 1451,
+                    "status": "succeeded",
+                    "intent": "partial_take_profit",
+                    "effective_action": "partial_close",
+                    "planned_stops": [],
+                }
+            ],
+        }
+    )
+    position = _exchange_position(
+        pos_id="pos-partial-confirmed",
+        attribution_state="bound",
+        protection_status="protected",
+    )
+    position["stop_loss_text"] = "63575.875"
+
+    enriched = enrich_strategy_records_with_exchange(
+        [record],
+        exchange_snapshot={"positions": [position], "error": None},
+    )
+
+    assert enriched[0]["attention"] is None
+
+
+def test_multi_leg_identical_take_profits_are_compared_as_one_set():
+    record = _strategy_record(pos_id="pos-a,pos-b")
+    record.update(
+        {
+            "pos_ids": ["pos-a", "pos-b"],
+            "expected_stop_loss": 63_575.875,
+            "expected_take_profit": [64_800, 66_500],
+            "management_signal_message_id": 1451,
+            "management_confirmations": [],
+        }
+    )
+    positions = []
+    for pos_id in ("pos-a", "pos-b"):
+        position = _exchange_position(
+            pos_id=pos_id,
+            attribution_state="bound",
+            protection_status="protected",
+        )
+        position.update(
+            {"stop_loss_text": "63575.875", "take_profit_text": "64800/66500"}
+        )
+        positions.append(position)
+
+    enriched = enrich_strategy_records_with_exchange(
+        [record],
+        exchange_snapshot={"positions": positions, "error": None},
+    )
+
+    assert enriched[0]["attention"] is None
+
+
+def test_resolved_batch_is_not_exchange_confirmation_for_drift_suppression():
+    record = _strategy_record(pos_id="pos-resolved")
+    record.update(
+        {
+            "expected_stop_loss": 63_575.875,
+            "management_signal_message_id": 1451,
+            "management_confirmations": [
+                {
+                    "message_id": 1451,
+                    "status": "resolved",
+                    "effective_action": "move_stop",
+                    "planned_stops": [60_500],
+                }
+            ],
+        }
+    )
+    position = _exchange_position(
+        pos_id="pos-resolved",
+        attribution_state="bound",
+        protection_status="protected",
+    )
+    position["stop_loss_text"] = "60500"
+
+    enriched = enrich_strategy_records_with_exchange(
+        [record],
+        exchange_snapshot={"positions": [position], "error": None},
+    )
+
+    assert enriched[0]["attention"]["code"] == "management_execution_drift"
 
 
 def _decision(raw_message_id: int, *, severity: str = "normal") -> RecognitionDecision:
@@ -995,6 +1323,78 @@ def test_load_strategy_record_summaries_orders_attention_and_exposes_stable_shap
         "recognition_disagreement",
         "execution_failed",
     }
+
+
+def test_strategy_summary_uses_verified_active_entry_leg_position_ids(tmp_path):
+    session_factory = create_session_factory(tmp_path / "multi-leg-summary.db")
+    with session_factory() as session:
+        binding = _binding(
+            chat_id=10,
+            message_id=501,
+            symbol="BTCUSDT",
+            strategy_instance_id="multi-leg-summary",
+            status="active",
+        )
+        binding.pos_id = "pos-a,pos-b"
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            execution_binding_id=binding.id,
+            chat_id=10,
+            message_id=501,
+            symbol="BTCUSDT",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            entered_at=NOW,
+            stop_loss=60_000,
+            updated_at=NOW,
+        )
+        session.add(lifecycle)
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id="multi-leg-summary",
+                    leg_index=index,
+                    purpose="entry",
+                    order_kind="market",
+                    pos_id=pos_id,
+                    venue="deepcoin",
+                    attribution_status="verified",
+                    status="active",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+                for index, pos_id in enumerate(("pos-a", "pos-b"))
+            ]
+        )
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id="multi-leg-summary",
+                leg_index=2,
+                purpose="entry",
+                order_kind="market",
+                pos_id="pos-manually-closed",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="manually_closed",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "大漂亮"},
+        filter_name="all",
+        now=NOW,
+    )
+
+    assert rows[0]["pos_id"] == "pos-a,pos-b"
+    assert rows[0]["pos_ids"] == ["pos-a", "pos-b"]
 
 
 def test_load_strategy_record_summaries_all_includes_normal_and_filters_group(
@@ -1506,4 +1906,4 @@ def test_loader_query_count_does_not_scale_with_strategy_count(tmp_path):
     finally:
         event.remove(engine, "before_cursor_execute", count_selects)
 
-    assert baseline_count == expanded_count == 8
+    assert baseline_count == expanded_count == 9

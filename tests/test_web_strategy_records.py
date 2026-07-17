@@ -389,6 +389,109 @@ def test_strategy_record_detail_rejects_reused_pos_id_owned_by_other_strategy(tm
     assert "已确认" not in response.text
 
 
+def test_strategy_record_detail_confirms_and_renders_every_verified_entry_leg(tmp_path):
+    class MultiLegPositionClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": pos_id,
+                    "posSide": "long",
+                    "pos": "1",
+                    "avgPx": avg_px,
+                }
+                for pos_id, avg_px in (("pos-leg-a", "67000"), ("pos-leg-b", "66500"))
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self):
+            return []
+
+    client, lifecycle_id = _client(tmp_path, client_factory=MultiLegPositionClient)
+    with client.app.state.session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        binding.pos_id = "pos-leg-a,pos-leg-b"
+        first_leg = session.query(ExecutionOrderLeg).one()
+        first_leg.pos_id = "pos-leg-a"
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id="strategy-web-record",
+                leg_index=1,
+                purpose="entry",
+                order_kind="limit",
+                order_id="exchange-order-web-2",
+                client_order_id="client-order-web-2",
+                pos_id="pos-leg-b",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="active",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    response = client.get(f"/strategy-records/{lifecycle_id}")
+
+    assert response.status_code == 200
+    assert 'data-exchange-state="confirmed"' in response.text
+    assert "2 个 Deepcoin 实时仓位及策略归属已确认" in response.text
+    assert 'data-exchange-position-id="pos-leg-a"' in response.text
+    assert 'data-exchange-position-id="pos-leg-b"' in response.text
+
+
+def test_strategy_record_detail_surfaces_management_execution_drift(tmp_path):
+    class DriftPositionClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-web-record",
+                    "posSide": "long",
+                    "pos": "1",
+                    "avgPx": "67000",
+                }
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            assert inst_id == "BTC-USDT-SWAP"
+            return [
+                {
+                    "instId": inst_id,
+                    "closePosId": "pos-web-record",
+                    "posSide": "long",
+                    "triggerOrderType": "TPSL",
+                    "ordId": "legacy-stop",
+                    "slTriggerPrice": "60500",
+                    "sz": "0",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self):
+            return []
+
+    client, lifecycle_id = _client(tmp_path, client_factory=DriftPositionClient)
+    with client.app.state.session_factory() as session:
+        lifecycle = session.query(StrategyLifecycle).one()
+        lifecycle.stop_loss = 63_575.875
+        lifecycle.management_signal_message_id = 1451
+        session.commit()
+
+    response = client.get(f"/strategy-records/{lifecycle_id}")
+
+    assert response.status_code == 200
+    assert 'data-exchange-state="attention"' in response.text
+    assert 'data-management-execution-drift="management_execution_drift"' in response.text
+    assert "策略止损 63575.875" in response.text
+    assert "Deepcoin 精确仓位证据为 60500" in response.text
+
+
 def test_strategy_record_detail_never_confirms_closed_binding_with_exact_identity(tmp_path):
     class MatchingPositionClient:
         def list_positions(self):

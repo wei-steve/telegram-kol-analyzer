@@ -371,6 +371,28 @@ submission response alone must never render as an exchange-confirmed exit.
 Historical management messages must not be replayed after deployment; reconcile
 current exchange state and create actions only from new messages.
 
+Deepcoin TPSL attribution must first use the position identity carried by the
+order itself. In current API responses this is normally `closePosId`; legacy
+aliases (`posId`, `pos_id`, and `positionId`) remain accepted. An exact
+`closePosId` must never fall through to symbol/side/time heuristics or be
+borrowed by a nearby same-symbol position.
+
+For split-entry strategies, `execution_order_legs` is the position-identity
+authority. Strategy list and detail views derive the current `pos_ids` from
+non-terminal, `verified`, `entry` legs and compare every ID independently with
+one captured Deepcoin snapshot. The comma-joined compatibility value on
+`execution_bindings.pos_id` is not a Deepcoin position ID and must never be
+matched as one. A single-position compatibility fallback remains only for
+legacy bindings without verified entry legs.
+
+The read-only strategy record projection reports
+`management_execution_drift` as critical only when a persisted management
+message exists, exact bound exchange positions are current, and concrete
+Deepcoin protection evidence disagrees with the lifecycle's expected stop.
+Ambiguous or unavailable protection evidence remains unknown instead of being
+promoted to a mismatch. This alert is diagnostic only: it never replays an old
+message, changes a lifecycle, or writes to the exchange.
+
 The settings have three meanings: `disabled` creates no management plan and
 performs no management exchange write; `shadow` may persist reviewed plans but
 does not execute them; `live` is effective only together with

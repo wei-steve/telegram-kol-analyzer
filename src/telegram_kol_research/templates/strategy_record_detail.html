@@ -64,6 +64,19 @@
     <h2 id="strategy-execution-title">执行与真实持仓</h2>
     <p role="status">{{ exchange.message }}</p>
     {% if exchange.reasons %}<p>归属证据：{{ exchange.reasons | join('、') }}</p>{% endif %}
+    {% if exchange.management_drift %}
+      <aside data-management-execution-drift="{{ exchange.management_drift.code }}">
+        <strong>关键告警：仓位管理与交易所结果漂移</strong>
+        <p>{{ exchange.management_drift.reason }}</p>
+        <dl>
+          <dt>策略期望止损</dt><dd>{{ exchange.management_drift.expected_stop_loss }}</dd>
+          <dt>Deepcoin 实际止损</dt><dd>{{ exchange.management_drift.actual_stop_loss | join(' / ') }}</dd>
+          <dt>策略期望止盈</dt><dd>{{ exchange.management_drift.expected_take_profit or '-' }}</dd>
+          <dt>Deepcoin 实际止盈</dt><dd>{{ exchange.management_drift.actual_take_profit | join(' / ') }}</dd>
+          <dt>确认状态</dt><dd>{{ exchange.management_drift.confirmation_state }}</dd>
+        </dl>
+      </aside>
+    {% endif %}
     <dl>
       <dt>归属状态</dt><dd>{{ exchange.state }}</dd>
       <dt>pos_id</dt><dd><span class="strategy-identifier">{{ record.execution.binding.pos_id if record.execution.binding else '未绑定' }}</span></dd>
@@ -197,12 +210,25 @@
       {% endfor %}
     </div>
 
-    {% if exchange.position %}
-      <details>
-        <summary>查看 Deepcoin 实时证据</summary>
-        <pre>{{ exchange.position | tojson(indent=2) }}</pre>
+    {% for position in exchange.positions or [] %}
+      <details data-exchange-position-id="{{ position.pos_id or position.posId }}">
+        <summary>查看 Deepcoin 实时证据 · {{ position.pos_id or position.posId }}</summary>
+        <dl>
+          <dt>数量</dt><dd>{{ position.size or position.pos or '-' }}</dd>
+          <dt>保护状态</dt><dd>{{ position.protection_status or '未知' }}</dd>
+          <dt>实际止损</dt><dd>{{ position.stop_loss_text or '未确认' }}</dd>
+          <dt>实际止盈</dt><dd>{{ position.take_profit_text or '未确认' }}</dd>
+        </dl>
+        <pre>{{ position | tojson(indent=2) }}</pre>
       </details>
-    {% endif %}
+    {% else %}
+      {% if exchange.position %}
+        <details data-exchange-position-id="{{ exchange.position.pos_id or exchange.position.posId }}">
+          <summary>查看 Deepcoin 实时证据</summary>
+          <pre>{{ exchange.position | tojson(indent=2) }}</pre>
+        </details>
+      {% endif %}
+    {% endfor %}
   </section>
 
   <section class="panel" aria-labelledby="strategy-evidence-title" data-strategy-detail-section="evidence">

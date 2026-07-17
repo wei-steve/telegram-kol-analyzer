@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 import hashlib
 import json
+import re
 from types import MappingProxyType
 from typing import Iterable
 from urllib.parse import urlencode
@@ -13,6 +14,7 @@ from urllib.parse import urlencode
 from sqlalchemy import and_, case, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
+from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
@@ -52,6 +54,7 @@ ATTENTION_LABELS = MappingProxyType(
         "attribution_ambiguous": ("warning", "交易所仓位归属不唯一"),
         "attribution_conflict": ("critical", "交易所仓位归属证据冲突"),
         "protection_mismatch": ("critical", "交易所保护证据与策略不一致"),
+        "management_execution_drift": ("critical", "仓位管理与交易所结果漂移"),
         "position_missing": ("critical", "本地实盘绑定在交易所快照中缺失"),
         "binding_without_lifecycle": ("critical", "实盘绑定缺少策略生命周期"),
     }
@@ -557,16 +560,34 @@ def load_strategy_record_detail(
             "entry_range_high": lifecycle.entry_range_high,
             "stop_loss": lifecycle.stop_loss,
             "take_profit": _safe_json_value(lifecycle.take_profit),
+            "management_signal_message_id": lifecycle.management_signal_message_id,
+            "management_action": lifecycle.management_action,
         },
         "timeline": timeline,
         "execution": {
             "binding": _binding_detail(binding) if binding is not None else None,
             "order_legs": [_order_leg_detail(row) for row in order_legs],
+            "position_ids": _verified_active_entry_leg_position_ids(order_legs),
+            "position_ids_authoritative": any(
+                row.purpose == "entry" for row in order_legs
+            ),
             "events": [_execution_event_detail(row) for row in execution_events],
             "management_batches": [
                 _management_batch_detail(
                     row,
                     legs=legs_by_batch_id.get(int(row.id), []),
+                )
+                for row in management_batches
+            ],
+            "management_confirmations": [
+                _management_confirmation_summary(
+                    row,
+                    legs=legs_by_batch_id.get(int(row.id), []),
+                    message_id=(
+                        int(raw_messages_by_id[int(row.raw_message_id)].message_id)
+                        if int(row.raw_message_id) in raw_messages_by_id
+                        else None
+                    ),
                 )
                 for row in management_batches
             ],
@@ -860,6 +881,23 @@ def _order_leg_detail(row: ExecutionOrderLeg) -> dict[str, object]:
     }
 
 
+def _verified_active_entry_leg_position_ids(
+    rows: Iterable[ExecutionOrderLeg],
+) -> list[str]:
+    pos_ids: list[str] = []
+    for row in rows:
+        pos_id = str(row.pos_id or "").strip()
+        if (
+            row.purpose == "entry"
+            and row.attribution_status == "verified"
+            and str(row.status or "").strip().lower() not in TERMINAL_ENTRY_LEG_STATES
+            and pos_id
+            and pos_id not in pos_ids
+        ):
+            pos_ids.append(pos_id)
+    return pos_ids
+
+
 def _execution_event_detail(row: ExecutionEvent) -> dict[str, object]:
     return {
         "id": int(row.id),
@@ -929,6 +967,29 @@ def _management_leg_detail(row: StrategyManagementLeg) -> dict[str, object]:
     }
 
 
+def _management_confirmation_summary(
+    row: StrategyManagementBatch,
+    *,
+    legs: list[StrategyManagementLeg],
+    message_id: int | None,
+) -> dict[str, object]:
+    planned_stops: list[float] = []
+    for leg in legs:
+        planned_tpsl = _safe_json_value(leg.planned_tpsl_json)
+        if not isinstance(planned_tpsl, dict):
+            continue
+        planned_stop = _finite_float(planned_tpsl.get("stop_loss_text"))
+        if planned_stop is not None and planned_stop not in planned_stops:
+            planned_stops.append(planned_stop)
+    return {
+        "message_id": message_id,
+        "status": str(row.status),
+        "intent": str(row.intent),
+        "effective_action": str(row.effective_action),
+        "planned_stops": planned_stops,
+    }
+
+
 def load_strategy_record_summaries(
     session_factory,
     *,
@@ -977,7 +1038,19 @@ def load_strategy_record_summaries(
             if not normalized_pos_ids:
                 return []
             binding_scope_predicates.append(
-                ExecutionBinding.pos_id.in_(normalized_pos_ids)
+                or_(
+                    ExecutionBinding.pos_id.in_(normalized_pos_ids),
+                    exists().where(
+                        ExecutionOrderLeg.execution_binding_id
+                        == ExecutionBinding.id,
+                        ExecutionOrderLeg.purpose == "entry",
+                        ExecutionOrderLeg.attribution_status == "verified",
+                        ExecutionOrderLeg.pos_id.in_(normalized_pos_ids),
+                        func.lower(func.coalesce(ExecutionOrderLeg.status, "")).not_in(
+                            TERMINAL_ENTRY_LEG_STATES
+                        ),
+                    ),
+                )
             )
         if live_binding_only:
             binding_scope_predicates.extend(
@@ -1078,6 +1151,21 @@ def load_strategy_record_summaries(
             else []
         )
         bindings_by_id = {int(row.id): row for row in bindings}
+        entry_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.execution_binding_id.in_(binding_ids),
+                ExecutionOrderLeg.purpose == "entry",
+            )
+            .order_by(
+                ExecutionOrderLeg.execution_binding_id,
+                ExecutionOrderLeg.leg_index,
+                ExecutionOrderLeg.id,
+            )
+            .all()
+            if binding_ids
+            else []
+        )
         strategy_instance_ids = {
             str(row.strategy_instance_id)
             for row in bindings
@@ -1122,11 +1210,52 @@ def load_strategy_record_summaries(
             )
             .all()
         )
+        management_batch_ids = {int(batch.id) for batch in management_batches}
+        management_legs = (
+            session.query(StrategyManagementLeg)
+            .filter(StrategyManagementLeg.management_batch_id.in_(management_batch_ids))
+            .order_by(
+                StrategyManagementLeg.management_batch_id,
+                StrategyManagementLeg.leg_index,
+                StrategyManagementLeg.id,
+            )
+            .all()
+            if management_batch_ids
+            else []
+        )
+        management_raw_message_ids = {
+            int(batch.raw_message_id) for batch in management_batches
+        }
+        management_raw_messages = (
+            session.query(RawMessage)
+            .filter(RawMessage.id.in_(management_raw_message_ids))
+            .all()
+            if management_raw_message_ids
+            else []
+        )
 
     events_by_binding_id, events_by_strategy_instance_id = _index_events(events)
     batches_by_lifecycle_id: dict[int, list[StrategyManagementBatch]] = defaultdict(list)
     for batch in management_batches:
         batches_by_lifecycle_id[int(batch.target_lifecycle_id)].append(batch)
+    management_legs_by_batch_id: dict[int, list[StrategyManagementLeg]] = defaultdict(list)
+    for leg in management_legs:
+        management_legs_by_batch_id[int(leg.management_batch_id)].append(leg)
+    management_message_id_by_raw_id = {
+        int(row.id): int(row.message_id) for row in management_raw_messages
+    }
+    entry_leg_binding_ids = {int(leg.execution_binding_id) for leg in entry_legs}
+    pos_ids_by_binding_id: dict[int, list[str]] = defaultdict(list)
+    for leg in entry_legs:
+        pos_id = str(leg.pos_id or "").strip()
+        if (
+            leg.attribution_status != "verified"
+            or str(leg.status or "").strip().lower() in TERMINAL_ENTRY_LEG_STATES
+        ):
+            continue
+        binding_pos_ids = pos_ids_by_binding_id[int(leg.execution_binding_id)]
+        if pos_id and pos_id not in binding_pos_ids:
+            binding_pos_ids.append(pos_id)
 
     fallback_time = _as_utc(now) or datetime.now(UTC)
     rows: list[dict[str, object]] = []
@@ -1182,6 +1311,29 @@ def load_strategy_record_summaries(
                 "execution_state": _execution_state(binding, lifecycle_events),
                 "attribution_state": _attribution_state(binding),
                 "pos_id": str(binding.pos_id) if binding is not None and binding.pos_id else None,
+                "pos_ids": (
+                    pos_ids_by_binding_id.get(int(binding.id), [])
+                    if binding is not None
+                    else []
+                ),
+                "position_ids_authoritative": (
+                    binding is not None and int(binding.id) in entry_leg_binding_ids
+                ),
+                "expected_stop_loss": lifecycle.stop_loss,
+                "expected_take_profit": _safe_json_value(lifecycle.take_profit),
+                "expected_management_action": lifecycle.management_action,
+                "management_signal_message_id": lifecycle.management_signal_message_id,
+                "management_batch_statuses": [str(batch.status) for batch in batches],
+                "management_confirmations": [
+                    _management_confirmation_summary(
+                        batch,
+                        legs=management_legs_by_batch_id.get(int(batch.id), []),
+                        message_id=management_message_id_by_raw_id.get(
+                            int(batch.raw_message_id)
+                        ),
+                    )
+                    for batch in batches
+                ],
                 "venue": (
                     str(binding.venue or "").strip().lower()
                     if binding is not None
@@ -1296,6 +1448,7 @@ def enrich_strategy_records_with_exchange(
     for source_record in records:
         record = dict(source_record)
         record["real_position"] = None
+        record["real_positions"] = []
         venue = str(record.get("venue") or "deepcoin").strip().lower()
         if venue != "deepcoin":
             record["venue"] = venue
@@ -1312,10 +1465,33 @@ def enrich_strategy_records_with_exchange(
             enriched.append(record)
             continue
 
-        pos_id = record.get("pos_id")
-        matched_positions = positions_by_pos_id.get(str(pos_id), []) if pos_id else []
-        if not matched_positions:
-            if pos_id and str(record.get("attribution_state") or "").lower() in {
+        expected_pos_ids = _record_position_ids(record)
+        if not expected_pos_ids:
+            record["exchange_state"] = "confirmed"
+            enriched.append(record)
+            continue
+
+        matched_positions: list[dict[str, object]] = []
+        missing_pos_ids: list[str] = []
+        duplicate_pos_ids: list[str] = []
+        for pos_id in expected_pos_ids:
+            matches = positions_by_pos_id.get(pos_id, [])
+            if not matches:
+                missing_pos_ids.append(pos_id)
+                continue
+            if len(matches) != 1:
+                matched_exchange_pos_ids.add(pos_id)
+                duplicate_pos_ids.append(pos_id)
+                continue
+            matched_exchange_pos_ids.add(pos_id)
+            matched_positions.append(matches[0])
+
+        record["real_positions"] = matched_positions
+        if len(matched_positions) == 1 and len(expected_pos_ids) == 1:
+            record["real_position"] = matched_positions[0]
+
+        if missing_pos_ids:
+            if str(record.get("attribution_state") or "").lower() in {
                 "bound",
                 "live_bound",
             }:
@@ -1324,49 +1500,59 @@ def enrich_strategy_records_with_exchange(
                 _add_exchange_attention(
                     record,
                     code="position_missing",
-                    reason=f"本地实盘绑定 pos_id {pos_id} 未出现在当前 Deepcoin 仓位快照中",
+                    reason=(
+                        "本地已验证 entry leg 的 pos_id 未出现在当前 Deepcoin 仓位快照中："
+                        + "、".join(missing_pos_ids)
+                    ),
                 )
             else:
                 record["exchange_state"] = "confirmed"
             enriched.append(record)
             continue
-        matched_exchange_pos_ids.add(str(pos_id))
-        if len(matched_positions) != 1:
+        if duplicate_pos_ids:
             record["exchange_state"] = "attention"
             record["attribution_state"] = "conflict"
             _add_exchange_attention(
                 record,
                 code="attribution_conflict",
-                reason=f"pos_id {pos_id} 对应多个交易所仓位记录",
+                reason=(
+                    "以下 pos_id 各自对应多条交易所仓位记录："
+                    + "、".join(duplicate_pos_ids)
+                ),
             )
             enriched.append(record)
             continue
 
-        position = matched_positions[0]
-        record["real_position"] = position
-        attribution = position.get("attribution")
-        attribution = attribution if isinstance(attribution, dict) else {}
-        attribution_state = str(attribution.get("state") or "unassigned").lower()
-        reason = _exchange_attribution_reason(attribution)
+        attribution_rows = []
+        for position in matched_positions:
+            attribution = position.get("attribution")
+            attribution = attribution if isinstance(attribution, dict) else {}
+            attribution_rows.append(
+                (
+                    str(attribution.get("state") or "unassigned").lower(),
+                    _exchange_attribution_reason(attribution),
+                )
+            )
+        attribution_states = {state for state, _reason in attribution_rows}
 
-        if attribution_state == "bound":
+        if attribution_states == {"bound"}:
             record["exchange_state"] = "confirmed"
             record["attribution_state"] = "bound"
-        elif attribution_state in {"candidate", "ambiguous"}:
+        elif attribution_states & {"conflict"}:
+            record["exchange_state"] = "attention"
+            record["attribution_state"] = "conflict"
+            _add_exchange_attention(
+                record,
+                code="attribution_conflict",
+                reason="；".join(reason for _state, reason in attribution_rows),
+            )
+        elif attribution_states & {"candidate", "ambiguous"}:
             record["exchange_state"] = "unconfirmed"
             record["attribution_state"] = "ambiguous"
             _add_exchange_attention(
                 record,
                 code="attribution_ambiguous",
-                reason=reason,
-            )
-        elif attribution_state == "conflict":
-            record["exchange_state"] = "attention"
-            record["attribution_state"] = "conflict"
-            _add_exchange_attention(
-                record,
-                code="attribution_conflict",
-                reason=reason,
+                reason="；".join(reason for _state, reason in attribution_rows),
             )
         else:
             record["exchange_state"] = "attention"
@@ -1374,17 +1560,29 @@ def enrich_strategy_records_with_exchange(
             _add_exchange_attention(
                 record,
                 code="unattributed_position",
-                reason=reason,
+                reason="；".join(reason for _state, reason in attribution_rows),
             )
 
-        if _has_concrete_protection_mismatch(position):
+        for position in matched_positions:
+            if _has_concrete_protection_mismatch(position):
+                _add_exchange_attention(
+                    record,
+                    code="protection_mismatch",
+                    reason=str(
+                        position.get("protection_mismatch_reason")
+                        or "交易所保护证据标记为不一致"
+                    ),
+                )
+        management_drift_reason = management_execution_drift_reason(
+            record,
+            matched_positions,
+        )
+        if management_drift_reason is not None:
+            record["exchange_state"] = "attention"
             _add_exchange_attention(
                 record,
-                code="protection_mismatch",
-                reason=str(
-                    position.get("protection_mismatch_reason")
-                    or "交易所保护证据标记为不一致"
-                ),
+                code="management_execution_drift",
+                reason=management_drift_reason,
             )
         enriched.append(record)
 
@@ -1399,6 +1597,18 @@ def enrich_strategy_records_with_exchange(
                 )
             )
     return enriched
+
+
+def _record_position_ids(record: dict[str, object]) -> list[str]:
+    values = record.get("pos_ids")
+    if isinstance(values, (list, tuple, set)):
+        normalized = [str(value).strip() for value in values if str(value).strip()]
+        if normalized:
+            return list(dict.fromkeys(normalized))
+        if record.get("position_ids_authoritative") is True:
+            return []
+    pos_id = str(record.get("pos_id") or "").strip()
+    return [pos_id] if pos_id else []
 
 
 def load_live_bindings_without_lifecycle(
@@ -1536,6 +1746,161 @@ def _has_concrete_protection_mismatch(position: dict[str, object]) -> bool:
     return position.get("protection_mismatch") is True or str(
         position.get("protection_status") or ""
     ).lower() in {"mismatch", "protection_mismatch"}
+
+
+def management_execution_drift_reason(
+    record: dict[str, object],
+    positions: list[dict[str, object]],
+) -> str | None:
+    message_id = record.get("management_signal_message_id")
+    expected_stop = _finite_float(record.get("expected_stop_loss"))
+    if message_id in {None, ""} or not positions:
+        return None
+
+    expected_action = str(record.get("expected_management_action") or "").lower()
+    if "partial_take_profit" in expected_action and not _has_confirmed_management_action(
+        record,
+        message_id=message_id,
+        action="partial_take_profit",
+    ):
+        return f"消息 #{message_id} 要求部分止盈，但没有同消息的交易所确认管理批次"
+
+    actual_take_profits: list[float] = []
+    for position in positions:
+        protection_status = str(position.get("protection_status") or "").lower()
+        if protection_status != "protected":
+            return None
+        actual_take_profits.extend(_price_values(position.get("take_profit_text")))
+        if expected_stop is not None:
+            actual_stop = _finite_float(
+                position.get("stop_loss_text") or position.get("stop_loss")
+            )
+            if actual_stop is None:
+                return None
+            if abs(actual_stop - expected_stop) > max(
+                1e-8, abs(expected_stop) * 1e-8
+            ) and not _confirmed_management_explains_stop(
+                record,
+                message_id=message_id,
+                actual_stop=actual_stop,
+            ):
+                actual_text = f"{actual_stop:.15g}"
+                return (
+                    f"消息 #{message_id} 后策略止损 {expected_stop:.15g}，"
+                    f"但 Deepcoin 精确仓位证据为 {actual_text}"
+                )
+
+    actual_take_profits = list(dict.fromkeys(actual_take_profits))
+    expected_take_profits = _price_values(record.get("expected_take_profit"))
+    if expected_take_profits and actual_take_profits and not _same_price_set(
+        expected_take_profits,
+        actual_take_profits,
+    ):
+        return (
+            f"消息 #{message_id} 后策略止盈 {_format_prices(expected_take_profits)}，"
+            f"但 Deepcoin 精确仓位证据为 {_format_prices(actual_take_profits)}"
+        )
+    return None
+
+
+def _has_confirmed_management_action(
+    record: dict[str, object],
+    *,
+    message_id: object,
+    action: str,
+) -> bool:
+    confirmations = record.get("management_confirmations")
+    if not isinstance(confirmations, list):
+        return False
+    for confirmation in confirmations:
+        if not isinstance(confirmation, dict):
+            continue
+        if str(confirmation.get("status") or "").strip().lower() != "succeeded":
+            continue
+        if str(confirmation.get("message_id") or "") != str(message_id):
+            continue
+        intent = str(confirmation.get("intent") or "").lower()
+        effective_action = str(confirmation.get("effective_action") or "").lower()
+        if action == "partial_take_profit" and (
+            intent == "partial_take_profit"
+            or effective_action in {"partial_close", "partial_then_break_even"}
+        ):
+            return True
+        if action in {intent, effective_action}:
+            return True
+    return False
+
+
+def _confirmed_management_explains_stop(
+    record: dict[str, object],
+    *,
+    message_id: object,
+    actual_stop: float,
+) -> bool:
+    confirmations = record.get("management_confirmations")
+    if not isinstance(confirmations, list):
+        return False
+    for confirmation in confirmations:
+        if not isinstance(confirmation, dict):
+            continue
+        if str(confirmation.get("status") or "").strip().lower() != "succeeded":
+            continue
+        if str(confirmation.get("message_id") or "") != str(message_id):
+            continue
+        planned_stops = confirmation.get("planned_stops")
+        if not isinstance(planned_stops, list):
+            continue
+        if any(
+            (planned := _finite_float(value)) is not None
+            and abs(planned - actual_stop) <= max(1e-8, abs(actual_stop) * 1e-8)
+            for value in planned_stops
+        ):
+            return True
+    return False
+
+
+def _price_values(value: object) -> list[float]:
+    if isinstance(value, dict):
+        values = [item for nested in value.values() for item in _price_values(nested)]
+    elif isinstance(value, (list, tuple, set)):
+        values = [item for nested in value for item in _price_values(nested)]
+    else:
+        values = [
+            float(match)
+            for match in re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?", str(value or ""))
+        ]
+    return list(dict.fromkeys(values))
+
+
+def _same_price_set(first: list[float], second: list[float]) -> bool:
+    if len(first) != len(second):
+        return False
+    unmatched = list(second)
+    for expected in first:
+        match_index = next(
+            (
+                index
+                for index, actual in enumerate(unmatched)
+                if abs(expected - actual) <= max(1e-8, abs(expected) * 1e-8)
+            ),
+            None,
+        )
+        if match_index is None:
+            return False
+        unmatched.pop(match_index)
+    return True
+
+
+def _format_prices(values: list[float]) -> str:
+    return "/".join(f"{value:.15g}" for value in values)
+
+
+def _finite_float(value: object) -> float | None:
+    try:
+        result = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return result if result == result and abs(result) != float("inf") else None
 
 
 def _add_exchange_attention(
