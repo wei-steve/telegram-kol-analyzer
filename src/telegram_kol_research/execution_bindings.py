@@ -540,6 +540,11 @@ def _apply_reconcile_snapshot(
         mutated_binding_ids = _post_entry_protection_mutated_binding_ids(
             session, binding_ids=set(bindings_by_id)
         )
+        prior_authoritative_leg_ids = {
+            int(leg.id)
+            for leg in legs
+            if _has_prior_authoritative_position_audit(session, leg=leg)
+        }
         leg_rows = [
             _leg_evidence(
                 leg,
@@ -550,6 +555,7 @@ def _apply_reconcile_snapshot(
                 protection_mutated=(
                     int(leg.execution_binding_id) in mutated_binding_ids
                 ),
+                force_direct_pos_id=int(leg.id) in prior_authoritative_leg_ids,
             )
             for leg in legs
             if not (leg.pos_id and str(leg.pos_id) in reserved_pos_ids)
@@ -873,11 +879,18 @@ def _leg_evidence(
     binding: ExecutionBinding,
     has_successful_entry_evidence: bool = False,
     protection_mutated: bool = False,
+    force_direct_pos_id: bool = False,
 ) -> LegEvidence:
     direct_pos_id = None
     if (
-        str(leg.attribution_status or "") == "verified"
-        and has_authoritative_persisted_position(leg)
+        leg.pos_id
+        and (
+            force_direct_pos_id
+            or (
+                str(leg.attribution_status or "") == "verified"
+                and has_authoritative_persisted_position(leg)
+            )
+        )
     ):
         direct_pos_id = leg.pos_id
     response_pos_id = _position_id_from_response_json(leg.response_json)
@@ -890,6 +903,33 @@ def _leg_evidence(
         has_successful_entry_evidence=has_successful_entry_evidence,
         protection_mutated=protection_mutated,
     )
+
+
+def _has_prior_authoritative_position_audit(
+    session, *, leg: ExecutionOrderLeg
+) -> bool:
+    if not leg.pos_id:
+        return False
+    rows = (
+        session.query(PositionAttributionAudit.evidence_json)
+        .filter(PositionAttributionAudit.execution_order_leg_id == int(leg.id))
+        .filter(PositionAttributionAudit.venue == str(leg.venue or "deepcoin"))
+        .filter(PositionAttributionAudit.pos_id == str(leg.pos_id))
+        .filter(PositionAttributionAudit.event_type == "ownership_verified")
+        .filter(PositionAttributionAudit.new_state == "verified")
+        .all()
+    )
+    for (evidence_json,) in rows:
+        try:
+            evidence = json.loads(evidence_json or "{}")
+        except (TypeError, ValueError):
+            continue
+        if (
+            isinstance(evidence, dict)
+            and evidence.get("policy_version") == ATTRIBUTION_POLICY_VERSION
+        ):
+            return True
+    return False
 
 
 def build_leg_economic_evidence(

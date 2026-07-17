@@ -14,6 +14,8 @@ The reconciliation matcher should preserve direct authoritative identity before 
 
 This rule does not create new ownership. It only preserves an already authoritative exact `posId` owner. Weak legacy verified rows that lack authoritative evidence remain unsafe and must still become `attribution_conflict`. A different `posId`, symbol, or side remains a conflict.
 
+If an earlier buggy reconcile has already demoted a leg to `attribution_conflict`, a later reconcile may recover it only when the append-only `position_attribution_audits` table contains a prior `ownership_verified -> verified` audit for the same `execution_order_leg_id` and exact `posId` under the current attribution policy. This recovery path is still exact-position only and remains subject to the global one-owner check.
+
 ## Out Of Scope
 
 This change does not loosen TPSL mutation safety. Deepcoin pending TPSL rows that lack `closePosId` or exact `posId` remain fail-closed when the planner cannot uniquely prove which position's protection would be cancelled or replaced. It also does not submit compensation trades or directly edit production SQLite.
@@ -23,6 +25,7 @@ This change does not loosen TPSL mutation safety. Deepcoin pending TPSL rows tha
 Add tests proving:
 
 - A previously authoritative verified leg stays verified when the same live `posId` has a reduced size after partial close.
+- A previously authoritative leg that was already demoted to conflict can recover only from matching prior verified audit evidence.
 - A weak legacy verified leg with the same `posId` and changed size is not grandfathered.
 - Existing exact-position and conflict tests still pass.
 

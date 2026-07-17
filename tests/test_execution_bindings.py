@@ -1640,6 +1640,87 @@ def test_reconcile_preserves_verified_position_after_partial_close_size_drift(tm
     assert leg.attribution_status == "verified"
 
 
+def test_reconcile_recovers_prior_verified_position_after_old_conflict(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            order_id="trigger-partial",
+            client_order_id="client-partial",
+            pos_id=None,
+            status="unknown",
+        ),
+    )
+    leg_id = _add_entry_leg(
+        session_factory,
+        binding_id,
+        order_id="trigger-partial",
+        client_order_id="client-partial",
+        pos_id="pos-partial",
+        status="active",
+        attribution_status="attribution_conflict",
+        request={
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "sz": "9",
+            "px": "63050",
+        },
+    )
+    with session_factory() as session:
+        session.add(
+            PositionAttributionAudit(
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg_id,
+                venue="deepcoin",
+                pos_id="pos-partial",
+                event_type="ownership_verified",
+                prior_state="unassigned",
+                new_state="verified",
+                fingerprint="prior-verified-" + "a" * 49,
+                evidence_json=json.dumps(
+                    {"policy_version": 2, "evidence_type": "unique_trigger_fill"}
+                ),
+                created_at=datetime(2026, 7, 17, 5, 40),
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-partial",
+                    "posSide": "long",
+                    "pos": "5",
+                    "avgPx": "63050",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                    "cTime": "1784266812000",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 7, 17, 11, 30),
+    )
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.get(ExecutionOrderLeg, leg_id)
+
+    assert binding.status == "active"
+    assert binding.pos_id == "pos-partial"
+    assert binding.last_exchange_status == "position_ownership_verified"
+    assert leg.status == "active"
+    assert leg.pos_id == "pos-partial"
+    assert leg.attribution_status == "verified"
+
+
 def test_reconcile_maps_multiple_current_policy_positions_back_to_matching_order_legs(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(

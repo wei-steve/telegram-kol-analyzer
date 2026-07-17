@@ -78,7 +78,41 @@ python -m pytest tests/test_execution_bindings.py::test_reconcile_does_not_grand
 
 Expected: PASS.
 
-### Task 3: Focused Verification And Deployment
+### Task 3: Recover Already-Demoted Authoritative Legs
+
+**Files:**
+- Modify: `tests/test_execution_bindings.py`
+- Modify: `src/telegram_kol_research/execution_bindings.py`
+
+**Step 1: Write the failing recovery test**
+
+Create a leg with `attribution_status="attribution_conflict"` and a live exact `posId`, plus a prior `position_attribution_audits` row proving `ownership_verified -> verified` for the same leg and `posId`. Assert reconciliation restores the leg and binding to verified ownership.
+
+**Step 2: Run test to verify it fails**
+
+Run:
+
+```bash
+python -m pytest tests/test_execution_bindings.py::test_reconcile_recovers_prior_verified_position_after_old_conflict -v
+```
+
+Expected before implementation: FAIL with binding still `unknown`.
+
+**Step 3: Implement the minimal recovery gate**
+
+When building reconcile leg evidence, pass through the direct persisted `posId` for already-demoted legs only if `position_attribution_audits` contains a prior verified ownership audit for the exact same leg and `posId` with the current attribution policy.
+
+**Step 4: Run focused recovery and safety tests**
+
+Run:
+
+```bash
+python -m pytest tests/test_execution_bindings.py::test_reconcile_recovers_prior_verified_position_after_old_conflict tests/test_execution_bindings.py::test_reconcile_does_not_grandfather_legacy_weak_verified_position -q
+```
+
+Expected: PASS.
+
+### Task 4: Focused Verification And Deployment
 
 **Files:**
 - Modify only if needed: `docs/migration-handoff.md`
