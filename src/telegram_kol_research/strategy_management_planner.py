@@ -20,6 +20,7 @@ from telegram_kol_research.execution_bindings import (
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionProtectionLedger,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -35,8 +36,12 @@ from telegram_kol_research.position_attribution import (
     require_verified_position_ownership,
 )
 from telegram_kol_research.protection_attribution import (
+    PositionProtection,
     match_position_protection,
     snapshot_protection_rows,
+)
+from telegram_kol_research.protection_ledger import (
+    list_verified_ledger_rows_for_positions,
 )
 from telegram_kol_research.position_authority_lock import position_authority_lock
 from telegram_kol_research.strategy_management_batches import (
@@ -343,6 +348,12 @@ def _plan_strategy_management_batch_locked(
         matches = match_position_protection(
             live_positions, tpsl_orders, evidence_available=True
         )
+        ledger_rows_by_pos_id: dict[str, list[PositionProtectionLedger]] = {}
+        with session_factory() as session:
+            for row in list_verified_ledger_rows_for_positions(
+                session, [str(position["pos_id"]) for position in economics]
+            ):
+                ledger_rows_by_pos_id.setdefault(str(row.pos_id), []).append(row)
         global_protection_order_id_counts = Counter(
             order_id
             for row in tpsl_orders
@@ -351,6 +362,15 @@ def _plan_strategy_management_batch_locked(
         seen_protection_order_ids: set[str] = set()
         for position in economics:
             protection = matches.by_pos_id.get(position["pos_id"])
+            if protection is None or protection.status != "verified":
+                protection = _ledger_confirmed_position_protection(
+                    position=position,
+                    entry_leg=_leg_by_pos_id(identity.entry_legs)[position["pos_id"]],
+                    binding=binding,
+                    tpsl_orders=tpsl_orders,
+                    ledger_rows=ledger_rows_by_pos_id.get(position["pos_id"], []),
+                    global_order_id_counts=global_protection_order_id_counts,
+                )
             if protection is None or protection.status != "verified":
                 return _persist_blocked(
                     session_factory,
@@ -1023,6 +1043,134 @@ def normalize_requested_management_fraction(
     if not isfinite(fraction) or not 0 < fraction < 1:
         raise ManagementFractionError("management_fraction_invalid")
     return fraction
+
+
+def _ledger_confirmed_position_protection(
+    *,
+    position: dict[str, Any],
+    entry_leg: ExecutionOrderLeg,
+    binding: ExecutionBinding,
+    tpsl_orders: list[dict[str, Any]],
+    ledger_rows: list[PositionProtectionLedger],
+    global_order_id_counts: Counter,
+) -> PositionProtection | None:
+    if not ledger_rows:
+        return None
+    rows_by_order_id = {
+        order_id: row
+        for row in tpsl_orders
+        if (order_id := _exact_protection_order_id(row)) is not None
+    }
+    confirmed_rows: list[dict[str, Any]] = []
+    order_ids: list[str] = []
+    position_id = str(position.get("pos_id") or position.get("posId") or "")
+    for ledger in ledger_rows:
+        order_id = str(ledger.order_id or "")
+        if (
+            not order_id
+            or global_order_id_counts[order_id] != 1
+            or int(ledger.execution_binding_id) != int(binding.id)
+            or int(ledger.execution_order_leg_id) != int(entry_leg.id)
+            or str(ledger.strategy_instance_id or "")
+            != str(binding.strategy_instance_id or "")
+            or str(ledger.pos_id or "") != position_id
+        ):
+            continue
+        row = rows_by_order_id.get(order_id)
+        if row is None or not _ledger_row_matches_current_protection(
+            ledger, row, position=position
+        ):
+            continue
+        confirmed_rows.append(dict(row))
+        order_ids.append(order_id)
+    if not confirmed_rows:
+        return None
+    stop_losses = [
+        value
+        for row in confirmed_rows
+        if (value := _protection_price(row, "sl")) is not None
+    ]
+    take_profits = [
+        value
+        for row in confirmed_rows
+        if (value := _protection_price(row, "tp")) is not None
+    ]
+    return PositionProtection(
+        status="verified",
+        stop_loss=stop_losses[-1] if stop_losses else None,
+        take_profits=_unique_float_values(take_profits),
+        order_ids=order_ids,
+        rows=confirmed_rows,
+        evidence={
+            "match": "ledger_confirmed_current_order",
+            "order_ids": list(order_ids),
+        },
+    )
+
+
+def _ledger_row_matches_current_protection(
+    ledger: PositionProtectionLedger,
+    row: dict[str, Any],
+    *,
+    position: dict[str, Any],
+) -> bool:
+    if str(row.get("triggerOrderType") or "TPSL").upper() != "TPSL":
+        return False
+    if _instrument_id(row) != str(ledger.instrument_id or "").upper():
+        return False
+    if _instrument_id(position) != str(ledger.instrument_id or "").upper():
+        return False
+    if _position_side(row) != str(ledger.side or "").lower():
+        return False
+    if _position_side(position) != str(ledger.side or "").lower():
+        return False
+    ledger_price = _to_float(ledger.trigger_price)
+    if ledger_price is not None:
+        current_price = _protection_price(row, str(ledger.purpose or ""))
+        if current_price is None or current_price != ledger_price:
+            return False
+    ledger_size = _to_float(ledger.size_text)
+    row_size = _to_float(row.get("sz") or row.get("size"))
+    if ledger_size is not None and row_size is not None and row_size != ledger_size:
+        return False
+    return True
+
+
+def _instrument_id(row: dict[str, Any]) -> str:
+    return str(row.get("instrument_id") or row.get("instId") or "").upper()
+
+
+def _position_side(row: dict[str, Any]) -> str:
+    value = str(row.get("posSide") or row.get("side") or "").lower()
+    return {"buy": "long", "sell": "short"}.get(value, value)
+
+
+def _protection_price(row: dict[str, Any], purpose: str) -> float | None:
+    keys = (
+        ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+        if purpose in {"stop_loss", "sl", "loss"}
+        else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
+    )
+    for key in keys:
+        value = _to_float(row.get(key))
+        if value is not None and value != 0:
+            return value
+    return None
+
+
+def _to_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _unique_float_values(values: list[float]) -> list[float]:
+    result: list[float] = []
+    for value in values:
+        if value not in result:
+            result.append(value)
+    return result
 
 
 def _exact_protection_order_id(row: dict[str, Any]) -> str | None:
