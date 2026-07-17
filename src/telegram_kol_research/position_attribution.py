@@ -170,7 +170,11 @@ def canonical_live_position_economics(
             row.get("mgnMode") or row.get("marginMode") or row.get("margin_mode") or ""
         ).lower()
         position_mode = str(
-            row.get("posMode") or row.get("positionMode") or row.get("position_mode") or ""
+            row.get("mrgPosition")
+            or row.get("posMode")
+            or row.get("positionMode")
+            or row.get("position_mode")
+            or ""
         ).lower()
         if not margin_mode or not position_mode:
             raise PositionAttributionError("target_live_position_mode_unavailable")

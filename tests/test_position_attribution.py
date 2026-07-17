@@ -4,6 +4,7 @@ from telegram_kol_research.position_attribution import (
     FillEvidence,
     LegEvidence,
     PositionEvidence,
+    canonical_live_position_economics,
     _numeric_aware_identifier_key,
     classify_leg_exchange_state,
     classify_equivalent_attribution_components,
@@ -120,6 +121,37 @@ def test_equivalent_closed_2x2_component_is_classified_without_assignments():
         ((1, 2), ("pos-1", "pos-2"))
     ]
     assert match_entry_legs_to_positions(legs, positions, []).assignments == {}
+
+
+def test_canonical_live_position_economics_accepts_deepcoin_mrg_position_key():
+    economics = canonical_live_position_economics(
+        [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "long",
+                "pos": "9",
+                "avgPx": "63050",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
+            }
+        ],
+        target_pos_ids=["pos-1"],
+        instrument_id="BTC-USDT-SWAP",
+        side="long",
+    )
+
+    assert economics == (
+        {
+            "pos_id": "pos-1",
+            "instrument_id": "BTC-USDT-SWAP",
+            "side": "long",
+            "size": "9",
+            "avg_entry_price": "63050",
+            "margin_mode": "cross",
+            "position_mode": "split",
+        },
+    )
 
 
 def test_equivalent_permutation_assignment_is_explicit_stable_and_evidenced():
