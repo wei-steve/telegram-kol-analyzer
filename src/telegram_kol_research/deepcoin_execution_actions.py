@@ -44,6 +44,7 @@ from telegram_kol_research.protection_attribution import (
     match_position_protection,
     snapshot_protection_rows,
 )
+from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.trade_signals import MANUAL_MANAGEMENT_SOURCE_TYPES
 from telegram_kol_research.trade_signals import MANAGEMENT_TRADE_SIGNAL_ACTIONS
 from telegram_kol_research.trade_signals import TradeSignalRecord
@@ -322,6 +323,16 @@ def adjust_position_tpsl(
     set_payload = set_payloads[-1]
     set_response = set_responses[-1]
     new_order_id = new_order_ids[-1]
+    _record_position_tpsl_ledger_rows(
+        session_factory,
+        binding=binding,
+        position=position,
+        inst_id=inst_id,
+        rows=adjusted_row_snapshots,
+        order_ids=new_order_ids,
+        evidence_source="tpsl_write_response",
+        seen_at=now,
+    )
     record_execution_event(
         session_factory,
         ExecutionEventRecord(
@@ -1237,6 +1248,64 @@ def _new_protection_row_snapshots(after: dict[str, Any]) -> list[dict[str, Any]]
             }
         )
     return rows
+
+
+def _record_position_tpsl_ledger_rows(
+    session_factory: sessionmaker,
+    *,
+    binding: _LoadedBinding,
+    position: dict[str, Any],
+    inst_id: str,
+    rows: list[dict[str, Any]],
+    order_ids: list[str],
+    evidence_source: str,
+    seen_at: datetime,
+) -> None:
+    pos_id = _first_string(position, "posId", "pos_id", "id")
+    if not pos_id:
+        return
+    with session_factory() as session:
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == int(binding.id))
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .filter(ExecutionOrderLeg.pos_id == str(pos_id))
+            .one_or_none()
+        )
+        if leg is None:
+            return
+        for row, order_id in zip(rows, order_ids, strict=False):
+            upsert_protection_ledger_row(
+                session,
+                venue=binding.venue,
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                pos_id=str(pos_id),
+                instrument_id=inst_id,
+                side=binding.side,
+                order_id=str(order_id),
+                purpose=str(row.get("purpose") or ""),
+                trigger_price=_ledger_trigger_price(row),
+                size_text=str(row.get("size")) if row.get("size") is not None else None,
+                status="verified",
+                evidence_source=evidence_source,
+                evidence={"match": "exchange_returned_order_id"},
+                seen_at=seen_at,
+            )
+        session.commit()
+
+
+def _ledger_trigger_price(row: dict[str, Any]) -> str | None:
+    purpose = row.get("purpose")
+    if purpose in {"take_profit", "stop_loss"}:
+        value = row.get("trigger_price")
+        return None if value is None else str(value)
+    if purpose == "combined":
+        stop = row.get("stop_loss")
+        if isinstance(stop, dict) and stop.get("trigger_price") is not None:
+            return str(stop["trigger_price"])
+    return None
 
 
 def _build_position_tpsl_row_payload(

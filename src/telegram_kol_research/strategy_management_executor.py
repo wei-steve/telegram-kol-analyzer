@@ -36,6 +36,7 @@ from telegram_kol_research.protection_attribution import (
     match_position_protection,
     snapshot_protection_rows,
 )
+from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.strategy_management_batches import (
     ManagementBatchRecord,
     claim_ready_batch,
@@ -528,6 +529,16 @@ def _execute_protection_batch(
                 replacement_error = exc
                 break
         if replacement_error is None:
+            _record_management_tpsl_ledger_rows(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                leg=leg,
+                inst_id=inst_id,
+                rows=new_rows,
+                order_ids=created_order_ids,
+                seen_at=executed_at,
+            )
             transition_leg(
                 session_factory,
                 leg.id,
@@ -1019,6 +1030,56 @@ def _protection_payload_common(
             raise ManagementBatchExecutionError("protection_preflight_pos_id_missing")
         payload["posId"] = pos_id
     return payload
+
+
+def _record_management_tpsl_ledger_rows(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+    binding: ExecutionBinding,
+    leg: Any,
+    inst_id: str,
+    rows: list[dict[str, Any]],
+    order_ids: list[str],
+    seen_at: datetime,
+) -> None:
+    with session_factory() as session:
+        for row, order_id in zip(rows, order_ids, strict=False):
+            upsert_protection_ledger_row(
+                session,
+                venue=binding.venue,
+                execution_binding_id=batch.execution_binding_id,
+                execution_order_leg_id=int(leg.execution_order_leg_id),
+                strategy_instance_id=batch.strategy_instance_id,
+                pos_id=str(leg.pos_id),
+                instrument_id=inst_id,
+                side=binding.side,
+                order_id=str(order_id),
+                purpose=str(row.get("purpose") or ""),
+                trigger_price=_ledger_trigger_price(row),
+                size_text=str(row.get("size")) if row.get("size") is not None else None,
+                status="verified",
+                evidence_source="management_tpsl_replacement",
+                evidence={
+                    "match": "exchange_returned_order_id",
+                    "management_batch_id": batch.id,
+                    "management_leg_id": leg.id,
+                },
+                seen_at=seen_at,
+            )
+        session.commit()
+
+
+def _ledger_trigger_price(row: dict[str, Any]) -> str | None:
+    purpose = row.get("purpose")
+    if purpose in {"take_profit", "stop_loss"}:
+        value = row.get("trigger_price")
+        return None if value is None else str(value)
+    if purpose == "combined":
+        stop = row.get("stop_loss")
+        if isinstance(stop, dict) and stop.get("trigger_price") is not None:
+            return str(stop["trigger_price"])
+    return None
 
 
 def _protection_row_payload(

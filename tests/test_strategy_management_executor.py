@@ -22,6 +22,9 @@ from telegram_kol_research.models import (
     StrategyManagementLeg,
 )
 from telegram_kol_research.protection_attribution import snapshot_protection_rows
+from telegram_kol_research.protection_ledger import (
+    list_verified_ledger_rows_for_positions,
+)
 from telegram_kol_research.strategy_management_batches import (
     ManagementLegCreate,
     create_management_batch,
@@ -807,6 +810,36 @@ def test_explicit_stop_replaces_every_position_and_preserves_each_take_profit(tm
         assert lifecycle.stop_loss == 65000
         assert lifecycle.management_signal_message_id == 20
         assert lifecycle.management_action == "protection_update_confirmed"
+
+
+def test_protection_batch_records_replacement_orders_in_ledger(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    with session_factory() as session:
+        rows = list_verified_ledger_rows_for_positions(session, ["pos-1", "pos-2"])
+
+    assert [
+        (row.pos_id, row.order_id, row.purpose, row.trigger_price, row.size_text)
+        for row in rows
+    ] == [
+        ("pos-1", "new-1", "take_profit", "63000", "1"),
+        ("pos-1", "new-2", "take_profit", "62000", "1"),
+        ("pos-1", "new-3", "stop_loss", "65000", "0"),
+        ("pos-2", "new-4", "take_profit", "62500", "4"),
+        ("pos-2", "new-5", "stop_loss", "65000", "0"),
+    ]
+    assert {row.execution_binding_id for row in rows} == {batch.execution_binding_id}
+    assert {row.evidence_source for row in rows} == {"management_tpsl_replacement"}
 
 
 def test_break_even_uses_each_positions_own_average_entry(tmp_path):

@@ -28,6 +28,9 @@ from telegram_kol_research.models import (
     RawMessage,
     StrategyLifecycle,
 )
+from telegram_kol_research.protection_ledger import (
+    list_verified_ledger_rows_for_positions,
+)
 from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
@@ -1448,6 +1451,39 @@ def test_adjust_stop_loss_cancels_existing_position_tpsl_before_resetting(tmp_pa
         "cancel_position_tpsl",
     ]
     assert events[0].related_order_id == "tp-old,sl-old"
+
+
+def test_adjust_stop_loss_records_new_tpsl_orders_in_protection_ledger(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    trade_signal = _signal(
+        session_factory,
+        action="adjust_stop_loss",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+    )
+    client = _FakeDeepcoinClient()
+    client.protection_outcomes = [
+        {"code": "0", "data": {"ordId": "tp-new-ledger"}},
+        {"code": "0", "data": {"ordId": "sl-new-ledger"}},
+    ]
+
+    adjust_position_tpsl(
+        session_factory,
+        trade_signal=trade_signal,
+        deepcoin_client=client,
+        executed_at=datetime(2026, 6, 30, 9, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        rows = list_verified_ledger_rows_for_positions(session, ["pos-1"])
+
+    assert [(row.order_id, row.purpose, row.trigger_price) for row in rows] == [
+        ("sl-new-ledger", "stop_loss", "1577.04"),
+        ("tp-new-ledger", "take_profit", "1605.6"),
+    ]
+    assert {row.execution_binding_id for row in rows} == {binding_id}
+    assert {row.pos_id for row in rows} == {"pos-1"}
+    assert {row.evidence_source for row in rows} == {"tpsl_write_response"}
 
 
 def test_adjust_position_tpsl_preserves_multiple_take_profit_rows(tmp_path):
