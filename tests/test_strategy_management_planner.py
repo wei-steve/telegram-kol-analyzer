@@ -771,6 +771,79 @@ def test_unqualified_first_partial_plan_defaults_to_half(
     assert [leg.planned_close_size for leg in result.batch.legs] == ["5"]
 
 
+def test_partial_plan_accepts_legacy_comma_separated_binding_pos_ids(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_take_profit",
+        management_fraction=None,
+        pos_ids=("pos-b", "pos-c"),
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.pos_id = "pos-b,pos-c"
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [
+                _position("pos-b", size="10", avg_px="62000"),
+                _position("pos-c", size="8", avg_px="62100"),
+            ]
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.effective_action == "partial_close"
+    assert result.batch.effective_fraction == 0.5
+    assert [leg.pos_id for leg in result.batch.legs] == ["pos-b", "pos-c"]
+    assert [leg.planned_close_size for leg in result.batch.legs] == ["5", "4"]
+
+
+def test_partial_plan_rejects_binding_summary_with_unknown_pos_id(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_take_profit",
+        management_fraction=None,
+        pos_ids=("pos-b", "pos-c"),
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.pos_id = "pos-b,pos-x"
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [
+                _position("pos-b", size="10", avg_px="62000"),
+                _position("pos-c", size="8", avg_px="62100"),
+            ]
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "target_binding_position_mismatch"
+    assert result.batch is not None
+    assert result.batch.legs == ()
+
+
 def test_partial_then_break_even_plans_durable_close_and_protection_phases(
     monkeypatch, tmp_path
 ):

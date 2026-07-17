@@ -650,6 +650,16 @@ def _load_exact_identity(
         )
 
 
+def _binding_position_id_set(binding_pos_id: str | None) -> set[str]:
+    if not binding_pos_id:
+        return set()
+    return {
+        item.strip()
+        for item in str(binding_pos_id).split(",")
+        if item.strip()
+    }
+
+
 def _unsafe_entry_leg_reason(
     entry_legs: tuple[ExecutionOrderLeg, ...], *, binding: ExecutionBinding
 ) -> str | None:
@@ -673,7 +683,8 @@ def _unsafe_entry_leg_reason(
         position_ids.append(str(leg.pos_id))
     if len(position_ids) != len(set(position_ids)):
         return "target_position_ownership_not_unique"
-    if binding.pos_id and str(binding.pos_id) not in set(position_ids):
+    binding_position_ids = _binding_position_id_set(binding.pos_id)
+    if binding_position_ids and not binding_position_ids.issubset(set(position_ids)):
         return "target_binding_position_mismatch"
     return None
 

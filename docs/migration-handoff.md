@@ -202,6 +202,13 @@ nonterminal entry leg uniquely owns that exact `posId` with
 symbol/side similarity, entry-price proximity, and the fact that only one
 position remains are not ownership proof.
 
+For legacy compatibility, `execution_bindings.pos_id` may be empty, a single
+posId, or a comma-separated summary of split-position posIds. Management
+planning must treat this field as a summary only. The authoritative ownership
+set remains the verified nonterminal `execution_order_legs` entry rows; a
+binding summary may only narrow that set, never expand it or prove ownership by
+itself.
+
 Reconciliation loads one coherent read-only exchange snapshot, refreshes exact
 entry-order states, runs global one-to-one matching, then derives binding and
 lifecycle state. The permitted ownership states are `verified`, `unassigned`,
