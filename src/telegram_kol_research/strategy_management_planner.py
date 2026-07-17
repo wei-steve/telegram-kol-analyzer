@@ -65,6 +65,14 @@ PROTECTION_INTENTS = frozenset(
 SUPPORTED_INTENTS = frozenset(
     {"partial_take_profit", "full_exit", *PROTECTION_INTENTS}
 )
+RETRYABLE_PREFLIGHT_BLOCK_REASONS = frozenset(
+    {
+        "target_contract_spec_unavailable",
+        "target_live_position_mode_unavailable",
+        "target_position_snapshot_unavailable",
+        "target_protection_evidence_unavailable",
+    }
+)
 
 
 class ManagementTargetChangedError(RuntimeError):
@@ -208,7 +216,10 @@ def _plan_strategy_management_batch_locked(
     existing = _load_existing_by_idempotency(
         session_factory, idempotency_fingerprint=idempotency_fingerprint
     )
-    if existing is not None:
+    retry_blocked_batch_id = (
+        existing.id if _retryable_preflight_blocked_batch(existing) else None
+    )
+    if existing is not None and retry_blocked_batch_id is None:
         return ManagementPlanningResult(
             status=existing.status,
             reason_code=existing.reason_code,
@@ -497,39 +508,74 @@ def _plan_strategy_management_batch_locked(
     ]
     try:
         with session_factory() as session:
-            batch_id = create_management_batch_in_session(
-                session,
-                idempotency_fingerprint=idempotency_fingerprint,
-                raw_message_id=raw_message_id,
-                recognition_decision_id=identity.recognition_decision_id,
-                recognition_generation=str(candidate.recognition_generation),
-                target_lifecycle_id=lifecycle.id,
-                strategy_instance_id=str(binding.strategy_instance_id),
-                execution_binding_id=binding.id,
-                intent=intent,
-                effective_action=effective_action_name,
-                requested_fraction=requested_fraction,
-                effective_fraction=effective_fraction,
-                partial_round_before=partial_round_before,
-                target_fingerprint=target_fingerprint,
-                target_snapshot=target_snapshot,
-                planned_at=now,
-                legs=batch_legs,
-                execution_mode=execution_mode,
-                status="blocked" if execution_mode != "live" else "ready",
-                reason_code=(
-                    "management_shadow_plan_only"
-                    if execution_mode == "shadow"
-                    else ("management_disabled_plan_only" if execution_mode == "disabled" else None)
-                ),
-                validate_current_state=lambda current_session: (
-                    _require_frozen_identity_and_policy_current(
-                        current_session,
-                        identity,
-                        partial_policy_state=partial_policy_state,
-                    )
-                ),
-            )
+            if retry_blocked_batch_id is None:
+                batch_id = create_management_batch_in_session(
+                    session,
+                    idempotency_fingerprint=idempotency_fingerprint,
+                    raw_message_id=raw_message_id,
+                    recognition_decision_id=identity.recognition_decision_id,
+                    recognition_generation=str(candidate.recognition_generation),
+                    target_lifecycle_id=lifecycle.id,
+                    strategy_instance_id=str(binding.strategy_instance_id),
+                    execution_binding_id=binding.id,
+                    intent=intent,
+                    effective_action=effective_action_name,
+                    requested_fraction=requested_fraction,
+                    effective_fraction=effective_fraction,
+                    partial_round_before=partial_round_before,
+                    target_fingerprint=target_fingerprint,
+                    target_snapshot=target_snapshot,
+                    planned_at=now,
+                    legs=batch_legs,
+                    execution_mode=execution_mode,
+                    status="blocked" if execution_mode != "live" else "ready",
+                    reason_code=(
+                        "management_shadow_plan_only"
+                        if execution_mode == "shadow"
+                        else (
+                            "management_disabled_plan_only"
+                            if execution_mode == "disabled"
+                            else None
+                        )
+                    ),
+                    validate_current_state=lambda current_session: (
+                        _require_frozen_identity_and_policy_current(
+                            current_session,
+                            identity,
+                            partial_policy_state=partial_policy_state,
+                        )
+                    ),
+                )
+            else:
+                batch_id = _replace_retryable_preflight_blocked_batch_in_session(
+                    session,
+                    batch_id=retry_blocked_batch_id,
+                    identity=identity,
+                    idempotency_fingerprint=idempotency_fingerprint,
+                    raw_message_id=raw_message_id,
+                    recognition_generation=str(candidate.recognition_generation),
+                    intent=intent,
+                    effective_action=effective_action_name,
+                    requested_fraction=requested_fraction,
+                    effective_fraction=effective_fraction,
+                    partial_round_before=partial_round_before,
+                    target_fingerprint=target_fingerprint,
+                    target_snapshot=target_snapshot,
+                    planned_at=now,
+                    legs=batch_legs,
+                    execution_mode=execution_mode,
+                    status="blocked" if execution_mode != "live" else "ready",
+                    reason_code=(
+                        "management_shadow_plan_only"
+                        if execution_mode == "shadow"
+                        else (
+                            "management_disabled_plan_only"
+                            if execution_mode == "disabled"
+                            else None
+                        )
+                    ),
+                    partial_policy_state=partial_policy_state,
+                )
             session.commit()
     except ManagementPlanningStateChanged:
         return ManagementPlanningResult(
@@ -1039,6 +1085,132 @@ def _persist_blocked(
         batch=existing,
         target_lifecycle_id=lifecycle.id,
     )
+
+
+def _retryable_preflight_blocked_batch(batch: ManagementBatchRecord | None) -> bool:
+    if batch is None:
+        return False
+    if batch.status != "blocked":
+        return False
+    if batch.reason_code not in RETRYABLE_PREFLIGHT_BLOCK_REASONS:
+        return False
+    if batch.legs:
+        return False
+    snapshot = batch.target_snapshot if isinstance(batch.target_snapshot, dict) else {}
+    if snapshot.get("blocked_reason") != batch.reason_code:
+        return False
+    positions = snapshot.get("positions")
+    return positions == [] or positions is None
+
+
+def _replace_retryable_preflight_blocked_batch_in_session(
+    session,
+    *,
+    batch_id: int,
+    identity: _PlanningIdentity,
+    idempotency_fingerprint: str,
+    raw_message_id: int,
+    recognition_generation: str,
+    intent: str,
+    effective_action: str,
+    requested_fraction: float | None,
+    effective_fraction: float | None,
+    partial_round_before: int,
+    target_fingerprint: str,
+    target_snapshot: dict[str, Any],
+    planned_at: datetime,
+    legs: list[ManagementLegCreate],
+    execution_mode: str,
+    status: str,
+    reason_code: str | None,
+    partial_policy_state: _PartialPolicyState,
+) -> int:
+    _require_frozen_identity_and_policy_current(
+        session, identity, partial_policy_state=partial_policy_state
+    )
+    batch = session.get(StrategyManagementBatch, int(batch_id))
+    if batch is None:
+        raise ManagementPlanningStateChanged("retryable_management_batch_missing")
+    current_legs = (
+        session.query(StrategyManagementLeg)
+        .filter(StrategyManagementLeg.management_batch_id == batch.id)
+        .all()
+    )
+    if current_legs:
+        raise ManagementPlanningStateChanged("retryable_management_batch_has_legs")
+    snapshot = json.loads(batch.target_snapshot_json or "{}")
+    if (
+        batch.idempotency_fingerprint != idempotency_fingerprint
+        or batch.raw_message_id != raw_message_id
+        or batch.recognition_generation != recognition_generation
+        or batch.target_lifecycle_id != identity.lifecycle.id
+        or batch.execution_binding_id != identity.binding.id
+        or batch.strategy_instance_id != str(identity.binding.strategy_instance_id)
+        or batch.intent != intent
+        or batch.status != "blocked"
+        or batch.reason_code not in RETRYABLE_PREFLIGHT_BLOCK_REASONS
+        or not isinstance(snapshot, dict)
+        or snapshot.get("blocked_reason") != batch.reason_code
+    ):
+        raise ManagementPlanningStateChanged("retryable_management_batch_changed")
+    batch.effective_action = effective_action
+    batch.execution_mode = execution_mode
+    batch.requested_fraction = requested_fraction
+    batch.effective_fraction = effective_fraction
+    batch.partial_round_before = partial_round_before
+    batch.status = status
+    batch.reason_code = reason_code
+    batch.target_fingerprint = target_fingerprint
+    batch.target_snapshot_json = json.dumps(
+        target_snapshot, ensure_ascii=False, sort_keys=True
+    )
+    batch.planned_at = planned_at
+    batch.started_at = None
+    batch.reconciled_at = None
+    batch.completed_at = planned_at if status in {"succeeded", "blocked", "resolved"} else None
+    batch.notification_state = "pending"
+    batch.notification_fingerprint = None
+    batch.updated_at = planned_at
+    for leg in legs:
+        session.add(
+            StrategyManagementLeg(
+                management_batch_id=batch.id,
+                execution_order_leg_id=leg.execution_order_leg_id,
+                pos_id=leg.pos_id,
+                leg_index=leg.leg_index,
+                status=leg.status,
+                preflight_size=leg.preflight_size,
+                planned_close_size=leg.planned_close_size,
+                avg_entry_price=leg.avg_entry_price,
+                quantity_step=leg.quantity_step,
+                old_tpsl_json=json.dumps(leg.old_tpsl, ensure_ascii=False)
+                if leg.old_tpsl is not None
+                else None,
+                planned_tpsl_json=json.dumps(leg.planned_tpsl, ensure_ascii=False)
+                if leg.planned_tpsl is not None
+                else None,
+                client_order_id=leg.client_order_id,
+                exchange_order_id=leg.exchange_order_id,
+                request_json=json.dumps(leg.request, ensure_ascii=False)
+                if leg.request is not None
+                else None,
+                response_json=json.dumps(leg.response, ensure_ascii=False)
+                if leg.response is not None
+                else None,
+                last_error=json.dumps(leg.last_error, ensure_ascii=False)
+                if leg.last_error is not None
+                else None,
+                last_exchange_snapshot_json=json.dumps(
+                    leg.last_exchange_snapshot, ensure_ascii=False
+                )
+                if leg.last_exchange_snapshot is not None
+                else None,
+                created_at=planned_at,
+                updated_at=planned_at,
+            )
+        )
+    session.flush()
+    return int(batch.id)
 
 
 def normalize_requested_management_fraction(

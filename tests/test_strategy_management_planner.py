@@ -1318,6 +1318,89 @@ def test_duplicate_partial_message_returns_same_batch_without_advancing_round(
         assert session.query(StrategyManagementBatch).count() == 1
 
 
+def test_retryable_preflight_blocked_batch_replans_when_snapshot_recovers(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(session_factory)
+    _disable_reconciliation(monkeypatch, planner)
+    missing_mode = dict(_position())
+    missing_mode.pop("posMode")
+
+    blocked = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([missing_mode]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+    recovered = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert blocked.status == "blocked"
+    assert blocked.reason_code == "target_live_position_mode_unavailable"
+    assert recovered.status == "ready"
+    assert recovered.batch.id == blocked.batch.id
+    assert recovered.reason_code is None
+    assert len(recovered.batch.legs) == 1
+    assert recovered.batch.legs[0].pos_id == "pos-b"
+    assert recovered.batch.target_snapshot["positions"][0]["position_mode"] == "split"
+    with session_factory() as session:
+        assert session.query(StrategyManagementBatch).count() == 1
+        assert session.query(StrategyManagementLeg).count() == 1
+
+
+def test_preflight_blocked_batch_with_existing_leg_is_not_replanned(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(session_factory)
+    _disable_reconciliation(monkeypatch, planner)
+    missing_mode = dict(_position())
+    missing_mode.pop("posMode")
+    blocked = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([missing_mode]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+    with session_factory() as session:
+        entry_leg = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-b").one()
+        session.add(
+            StrategyManagementLeg(
+                management_batch_id=blocked.batch.id,
+                execution_order_leg_id=entry_leg.id,
+                pos_id="pos-b",
+                leg_index=0,
+                status="planned",
+            )
+        )
+        session.commit()
+
+    repeated = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert repeated.status == "blocked"
+    assert repeated.reason_code == "target_live_position_mode_unavailable"
+    assert repeated.batch.id == blocked.batch.id
+    with session_factory() as session:
+        assert session.query(StrategyManagementBatch).count() == 1
+        assert session.query(StrategyManagementLeg).count() == 1
+
+
 def test_partial_round_history_is_revalidated_inside_insert_transaction(
     monkeypatch, tmp_path
 ):
