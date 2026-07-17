@@ -208,6 +208,17 @@ def test_exact_position_id_has_priority_over_indistinguishable_positions():
     assert result.by_pos_id["pos-b"].stop_loss == 1820
 
 
+def test_close_pos_id_is_exact_protection_identity():
+    result = match_position_protection(
+        [_position("pos-a"), _position("pos-b")],
+        [_tpsl(closePosId="pos-b", ordId="sl-b", slTriggerPrice="1820")],
+    )
+
+    assert result.by_pos_id["pos-a"].status == "absent"
+    assert result.by_pos_id["pos-b"].status == "verified"
+    assert result.by_pos_id["pos-b"].stop_loss == 1820
+
+
 def test_indistinguishable_positions_make_unscoped_protection_ambiguous():
     result = match_position_protection(
         [_position("pos-a"), _position("pos-b")],

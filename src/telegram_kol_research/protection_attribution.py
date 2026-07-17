@@ -147,7 +147,15 @@ def match_position_protection(
             continue
         if not _row_has_protection(order):
             continue
-        pos_id = _first_text(order, "posId", "pos_id", "positionId")
+        pos_id = _first_text(
+            order,
+            "closePosId",
+            "close_pos_id",
+            "closePositionId",
+            "posId",
+            "pos_id",
+            "positionId",
+        )
         if pos_id and pos_id in positions_by_id:
             exact_rows[pos_id].append(order)
             continue
