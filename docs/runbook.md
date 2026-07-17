@@ -239,6 +239,33 @@ production database, call a Deepcoin mutation, or restart the trading service.
 Normal trade notifications are not duplicated: only actionable system
 abnormalities are eligible for monitor alerts.
 
+The management audit reports informational keep-holding history separately as
+`counts.informational_noop`. Only exact historical zero-leg
+`hold_update`/`blocked` rows with reason
+`management_intent_not_supported` qualify; they do not contribute to the
+monitor's `audit_abnormal_count`. All other blocked or leg-bearing rows remain
+abnormal. New `hold_update` recognition is skipped before a Deepcoin client or
+management batch is created.
+
+After deploying a graceful-shutdown change, perform one controlled restart and
+inspect the old process rather than relying only on the new service's active
+state:
+
+```bash
+old_pid=$(systemctl show telegram-kol.service -p MainPID --value)
+systemctl restart telegram-kol.service
+systemctl is-active telegram-kol.service
+new_pid=$(systemctl show telegram-kol.service -p MainPID --value)
+test "$old_pid" -gt 0
+test "$new_pid" -gt 0
+test "$new_pid" != "$old_pid"
+echo "old_pid=$old_pid new_pid=$new_pid"
+journalctl -u telegram-kol.service --since '-2 minutes' --no-pager
+```
+
+The journal must not contain `stop-sigterm timed out`, `SIGKILL`, or a stop
+timeout for that restart, and the new `MainPID` must differ from `old_pid`.
+
 If an existing state file is unreadable or malformed, the monitor repairs the
 four-field file but keeps a pending state-integrity notification as a fingerprint
 with no notification timestamp until one delivery succeeds. A `--notify` run

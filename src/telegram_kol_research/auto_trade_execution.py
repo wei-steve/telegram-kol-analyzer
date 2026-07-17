@@ -66,6 +66,29 @@ def auto_process_message_trade_signal(
         session_factory, raw_message_id=raw_message_id
     )
     if management_loaded is not None:
+        if _is_informational_management_candidate(management_loaded[1]):
+            raw_message, candidate, _source, _has_media = management_loaded
+            reason = "management_intent_informational"
+            record_execution_event(
+                session_factory,
+                ExecutionEventRecord(
+                    action="management_auto_trade_skipped",
+                    status="skipped",
+                    kol_id=f"group:{raw_message.chat_id}",
+                    chat_id=raw_message.chat_id,
+                    message_id=raw_message.message_id,
+                    symbol=candidate.symbol,
+                    side=candidate.side,
+                    reason=reason,
+                    request={
+                        "raw_message_id": raw_message.id,
+                        "candidate_id": candidate.id,
+                        "management_action": candidate.management_action,
+                    },
+                    created_at=now,
+                ),
+            )
+            return {"status": "skipped", "reason": reason}
         if not settings.management_planning_enabled:
             raw_message, candidate, _source, _has_media = management_loaded
             reason = "management_execution_disabled"
@@ -415,13 +438,17 @@ def disabled_management_message_needs_no_client(
     """Return true only for a management candidate gated off before planning."""
 
     settings = load_trading_settings(session_factory)
-    return (
-        _load_best_management_candidate(
-            session_factory, raw_message_id=raw_message_id
-        )
-        is not None
-        and not settings.management_planning_enabled
+    loaded = _load_best_management_candidate(
+        session_factory, raw_message_id=raw_message_id
     )
+    return loaded is not None and (
+        _is_informational_management_candidate(loaded[1])
+        or not settings.management_planning_enabled
+    )
+
+
+def _is_informational_management_candidate(candidate: SignalCandidate) -> bool:
+    return str(candidate.management_action or "").strip().lower() == "hold_update"
 
 
 def _auto_process_management_signal(

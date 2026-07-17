@@ -885,6 +885,7 @@ def _audit_management_snapshot(
             "limit": limit,
             "counts": {
                 "batches_total": 0,
+                "informational_noop": 0,
                 **{state: 0 for state in _MANAGEMENT_ALERT_STATES},
             },
             "batches_returned": 0,
@@ -901,14 +902,37 @@ def _audit_management_snapshot(
                     "SELECT COUNT(*) FROM strategy_management_batches"
                 ).fetchone()[0]
             )
+            informational_predicate = None
+            if _has_columns(
+                connection, "strategy_management_batches", {"reason_code"}
+            ):
+                informational_predicate = (
+                    "b.intent = 'hold_update' "
+                    "AND b.status = 'blocked' "
+                    "AND COALESCE(b.reason_code, '') = "
+                    "'management_intent_not_supported' "
+                    "AND NOT EXISTS (SELECT 1 FROM strategy_management_legs noop_leg "
+                    "WHERE noop_leg.management_batch_id = b.id)"
+                )
+                result["counts"]["informational_noop"] = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM strategy_management_batches b WHERE "
+                        + informational_predicate
+                    ).fetchone()[0]
+                )
             for state in _MANAGEMENT_ALERT_STATES:
+                exclusion = (
+                    " AND NOT (" + informational_predicate + ")"
+                    if state == "blocked" and informational_predicate is not None
+                    else ""
+                )
                 result["counts"][state] = int(
                     connection.execute(
                         "SELECT COUNT(DISTINCT b.id) "
                         "FROM strategy_management_batches b "
                         "LEFT JOIN strategy_management_legs l "
                         "ON l.management_batch_id = b.id "
-                        "WHERE b.status = ? OR l.status = ?",
+                        "WHERE (b.status = ? OR l.status = ?)" + exclusion,
                         (state, state),
                     ).fetchone()[0]
                 )
@@ -1788,6 +1812,7 @@ def audit_management_batches(
             "limit": limit,
             "counts": {
                 "batches_total": 0,
+                "informational_noop": 0,
                 **{state: 0 for state in _MANAGEMENT_ALERT_STATES},
             },
             "batches_returned": 0,
@@ -1844,7 +1869,11 @@ def audit_management_batches(
         "Batch counts: "
         + ", ".join(
             f"{key}={counts[key]}"
-            for key in ("batches_total", *_MANAGEMENT_ALERT_STATES)
+            for key in (
+                "batches_total",
+                "informational_noop",
+                *_MANAGEMENT_ALERT_STATES,
+            )
         )
     )
     typer.echo(

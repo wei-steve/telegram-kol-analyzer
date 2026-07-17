@@ -422,3 +422,19 @@ without exception text. All identities in JSON and text output are hashed
 references. Counts
 are exact where labelled complete; any batch, leg, or returned-item truncation,
 or any false completeness flag, prohibits a "no residue" conclusion.
+
+`hold_update` is an informational MiMo result meaning that the KOL said to keep
+holding. It is not an exchange-management instruction. Automatic processing
+records it as `management_intent_informational`, does not construct a Deepcoin
+client, and does not create a management batch. Historical zero-leg rows whose
+exact tuple is `hold_update` + `blocked` +
+`management_intent_not_supported` remain immutable audit history but are
+counted as `informational_noop`, not as actionable `blocked` residue. Any row
+with a leg, a different intent, status, or reason remains alerting.
+
+Web shutdown explicitly disconnects the shared Telethon client before
+cancelling the live-listener task. Both disconnect and listener cleanup are
+bounded to five seconds so a shielded or failed Telegram cleanup cannot hold
+FastAPI lifespan open until systemd sends `SIGKILL`. Production verification
+still requires one controlled service restart and journal confirmation that
+the old PID exits before `TimeoutStopSec`.

@@ -193,6 +193,7 @@ from telegram_kol_research.telegram_session_lock import (
 REFRESH_TIMEOUT_SECONDS = 180
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
 logger = logging.getLogger(__name__)
+_TELEGRAM_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 _MANAGEMENT_SECRET_MARKERS = (
     "dc-access", "authorization", "api-key", "api_key", "passphrase",
@@ -398,6 +399,48 @@ async def _stop_semantic_review_task(app: FastAPI) -> None:
     except Exception:
         pass
     app.state.semantic_review_task = None
+
+
+async def _disconnect_shared_telegram_client(app: FastAPI) -> None:
+    client = app.state.telegram_client
+    disconnect = getattr(client, "disconnect", None)
+    if not callable(disconnect):
+        return
+    disconnect_task = asyncio.ensure_future(maybe_await(disconnect()))
+    done, _pending = await asyncio.wait(
+        {disconnect_task}, timeout=_TELEGRAM_SHUTDOWN_TIMEOUT_SECONDS
+    )
+    if disconnect_task not in done:
+        disconnect_task.cancel()
+        logger.warning("Telegram client disconnect exceeded shutdown timeout")
+        return
+    try:
+        disconnect_task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Telegram client disconnect failed during shutdown")
+
+
+async def _stop_live_listener_task(app: FastAPI) -> None:
+    task = app.state.live_listener_task
+    if task is None:
+        return
+    await _disconnect_shared_telegram_client(app)
+    task.cancel()
+    done, _pending = await asyncio.wait(
+        {task}, timeout=_TELEGRAM_SHUTDOWN_TIMEOUT_SECONDS
+    )
+    if task not in done:
+        logger.warning("Telegram live listener exceeded shutdown timeout")
+    else:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Telegram live listener failed during shutdown")
+    app.state.live_listener_task = None
 
 
 def _build_trader_dashboard_state(
@@ -2423,14 +2466,7 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.deepcoin_reconcile_task = None
-            task = app.state.live_listener_task
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                app.state.live_listener_task = None
+            await _stop_live_listener_task(app)
             bot_command_task = app.state.telegram_bot_command_task
             if bot_command_task is not None:
                 bot_command_task.cancel()

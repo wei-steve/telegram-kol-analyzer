@@ -375,6 +375,108 @@ def test_management_worker_lifespan_starts_once_and_is_cancelled(tmp_path):
     assert app.state.strategy_management_worker_task is None
 
 
+def test_lifespan_disconnects_shared_telegram_client_before_stopping_listener(tmp_path):
+    class ShieldedDisconnectClient:
+        def __init__(self):
+            self.disconnected = asyncio.Event()
+            self.cleanup_complete = asyncio.Event()
+            self.disconnect_calls = 0
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+            self.disconnected.set()
+            self.cleanup_complete.set()
+
+    async def shielded_listener(*, client, **kwargs):
+        try:
+            await client.disconnected.wait()
+        finally:
+            await asyncio.shield(client.cleanup_complete.wait())
+
+    async def exercise_lifespan():
+        client = ShieldedDisconnectClient()
+        app = create_web_app(
+            database_path=tmp_path / "research.db",
+            live_target_titles={"Demo Group"},
+            telegram_client=client,
+            live_listener_runner=shielded_listener,
+        )
+        app.state.strategy_alert_config = None
+        app.state.system_operator_bot_config = None
+
+        async def enter_and_exit():
+            async with app.router.lifespan_context(app):
+                await asyncio.sleep(0)
+
+        task = asyncio.create_task(enter_and_exit())
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+            timed_out = False
+        except TimeoutError:
+            timed_out = True
+            client.cleanup_complete.set()
+            await task
+        return timed_out, client.disconnect_calls
+
+    timed_out, disconnect_calls = asyncio.run(exercise_lifespan())
+
+    assert timed_out is False
+    assert disconnect_calls == 1
+
+
+def test_lifespan_bounds_listener_shutdown_when_telegram_disconnect_hangs(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.web_app as web_module
+
+    monkeypatch.setattr(
+        web_module,
+        "_TELEGRAM_SHUTDOWN_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+
+    class HangingDisconnectClient:
+        def __init__(self):
+            self.cleanup_complete = asyncio.Event()
+
+        async def disconnect(self):
+            await asyncio.Event().wait()
+
+    async def shielded_listener(*, client, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.shield(client.cleanup_complete.wait())
+
+    async def exercise_lifespan():
+        client = HangingDisconnectClient()
+        app = create_web_app(
+            database_path=tmp_path / "research.db",
+            live_target_titles={"Demo Group"},
+            telegram_client=client,
+            live_listener_runner=shielded_listener,
+        )
+        app.state.strategy_alert_config = None
+        app.state.system_operator_bot_config = None
+
+        async def enter_and_exit():
+            async with app.router.lifespan_context(app):
+                await asyncio.sleep(0)
+
+        task = asyncio.create_task(enter_and_exit())
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+            timed_out = False
+        except TimeoutError:
+            timed_out = True
+            client.cleanup_complete.set()
+            await task
+        return timed_out
+
+    assert asyncio.run(exercise_lifespan()) is False
+
+
 def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypatch):
     started = threading.Event()
     sent = []

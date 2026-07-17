@@ -8,12 +8,13 @@ from telegram_kol_research.auto_trade_execution import _load_active_execution_bi
 from telegram_kol_research.auto_trade_execution import _load_active_execution_bindings
 from telegram_kol_research.auto_trade_execution import _extract_partial_close_fraction
 from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
+from telegram_kol_research.auto_trade_execution import disabled_management_message_needs_no_client
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord, ExecutionOrderLegRecord, upsert_execution_binding, upsert_execution_order_leg
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, MediaAsset, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, TradeSignal
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, MediaAsset, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
@@ -100,6 +101,56 @@ class _TickerForbiddenDeepcoinClient(_FakeDeepcoinClient):
     def get_ticker_price(self, *, inst_id):
         self.ticker_calls += 1
         raise AssertionError("position limit must be checked before ticker access")
+
+
+def test_hold_update_is_informational_and_needs_no_deepcoin_client(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=902,
+            text="继续持有",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="short",
+                event_type="position_update",
+                management_action="hold_update",
+                recognition_generation="hold-generation",
+                parse_source="mimo_authoritative",
+                confidence=0.99,
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+        },
+    )
+
+    assert disabled_management_message_needs_no_client(
+        session_factory, raw_message_id=raw_id
+    ) is True
+    assert auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_id,
+        group_config=GroupConfig(groups=[]),
+        deepcoin_client=None,
+    ) == {"status": "skipped", "reason": "management_intent_informational"}
+
+    with session_factory() as session:
+        event = session.query(ExecutionEvent).one()
+        assert event.status == "skipped"
+        assert event.reason == "management_intent_informational"
+        assert session.query(StrategyManagementBatch).count() == 0
 
 
 def _verify_bound_position(session_factory, *, binding_id: int, pos_id: str) -> None:

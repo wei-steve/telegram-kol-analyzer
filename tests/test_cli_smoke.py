@@ -6,6 +6,8 @@ import sqlite3
 import tracemalloc
 from types import SimpleNamespace
 
+import pytest
+
 from telegram_kol_research.cli import app
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
@@ -303,6 +305,129 @@ def test_audit_management_batches_is_bounded_redacted_and_read_only(
     assert "pos-secret" not in text_result.stdout
     assert "strategy-secret" not in text_result.stdout
     assert database_path.read_bytes() == before
+
+
+def test_audit_management_batches_classifies_informational_hold_as_non_alerting(
+    tmp_path,
+):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO raw_messages "
+            "(id, chat_id, message_id, archived_target_group, created_at) "
+            "VALUES (101, 100, 201, 1, '2026-07-17 00:00:00')"
+        )
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, idempotency_fingerprint, raw_message_id, recognition_decision_id, "
+            "recognition_generation, target_lifecycle_id, strategy_instance_id, "
+            "execution_binding_id, intent, effective_action, execution_mode, "
+            "partial_round_before, status, reason_code, target_fingerprint, "
+            "target_snapshot_json, planned_at, created_at, updated_at) "
+            "VALUES (301, 'hold-fingerprint', 101, 401, 'hold-generation', 501, "
+            "'hold-strategy', 601, 'hold_update', 'hold_update', 'live', 0, "
+            "'blocked', 'management_intent_not_supported', 'hold-target', '{}', "
+            "'2026-07-17 00:00:00', '2026-07-17 00:00:00', '2026-07-17 00:00:00')"
+        )
+        connection.commit()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    counts = json.loads(result.stdout)["counts"]
+    assert counts["batches_total"] == 1
+    assert counts["informational_noop"] == 1
+    assert counts["blocked"] == 0
+
+    text_result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--output-format",
+            "text",
+        ],
+    )
+    assert text_result.exit_code == 0, text_result.stdout
+    assert "informational_noop=1" in text_result.stdout
+
+
+@pytest.mark.parametrize(
+    ("intent", "reason_code", "add_leg"),
+    [
+        ("risk_update", "management_intent_not_supported", False),
+        ("hold_update", "target_position_not_verified", False),
+        ("hold_update", None, False),
+        ("hold_update", "management_intent_not_supported", True),
+    ],
+)
+def test_audit_management_batches_keeps_near_match_holds_alerting(
+    tmp_path, intent, reason_code, add_leg
+):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO raw_messages "
+            "(id, chat_id, message_id, archived_target_group, created_at) "
+            "VALUES (102, 100, 202, 1, '2026-07-17 00:00:00')"
+        )
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, idempotency_fingerprint, raw_message_id, recognition_decision_id, "
+            "recognition_generation, target_lifecycle_id, strategy_instance_id, "
+            "execution_binding_id, intent, effective_action, execution_mode, "
+            "partial_round_before, status, reason_code, target_fingerprint, "
+            "target_snapshot_json, planned_at, created_at, updated_at) "
+            "VALUES (302, 'near-fingerprint', 102, 402, 'near-generation', 502, "
+            "'near-strategy', 602, ?, ?, 'live', 0, 'blocked', ?, "
+            "'near-target', '{}', '2026-07-17 00:00:00', "
+            "'2026-07-17 00:00:00', '2026-07-17 00:00:00')",
+            (intent, intent, reason_code),
+        )
+        if add_leg:
+            connection.execute(
+                "INSERT INTO strategy_management_legs "
+                "(id, management_batch_id, execution_order_leg_id, pos_id, leg_index, "
+                "status, created_at, updated_at) "
+                "VALUES (702, 302, 802, 'pos-near', 1, 'planned', "
+                "'2026-07-17 00:00:00', '2026-07-17 00:00:00')"
+            )
+        connection.commit()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    audit = json.loads(result.stdout)
+    assert audit["counts"]["informational_noop"] == 0
+    assert audit["counts"]["blocked"] == 1
+    reasons = set()
+    details = {}
+    monitor_module._evaluate_audit(audit, reasons, details)
+    assert "audit_abnormal" in reasons
+    assert details["audit_abnormal_count"] == 1
 
 
 def _audit_payload_with_management_history(
