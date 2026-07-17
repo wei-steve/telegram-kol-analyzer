@@ -156,8 +156,9 @@ def match_position_protection(
             "pos_id",
             "positionId",
         )
-        if pos_id and pos_id in positions_by_id:
-            exact_rows[pos_id].append(order)
+        if pos_id:
+            if pos_id in positions_by_id:
+                exact_rows[pos_id].append(order)
             continue
         instrument_id = _instrument_id(order)
         side = _side(order)

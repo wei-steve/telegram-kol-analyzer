@@ -219,6 +219,16 @@ def test_close_pos_id_is_exact_protection_identity():
     assert result.by_pos_id["pos-b"].stop_loss == 1820
 
 
+def test_unknown_close_pos_id_is_never_borrowed_by_a_live_position():
+    result = match_position_protection(
+        [_position("pos-live")],
+        [_tpsl(closePosId="pos-closed", ordId="sl-old", slTriggerPrice="1820")],
+    )
+
+    assert result.by_pos_id["pos-live"].status == "absent"
+    assert result.by_pos_id["pos-live"].order_ids == []
+
+
 def test_indistinguishable_positions_make_unscoped_protection_ambiguous():
     result = match_position_protection(
         [_position("pos-a"), _position("pos-b")],
