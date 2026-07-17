@@ -45,7 +45,7 @@ image_provider:
         ai_recognition_config_path=config_path,
     )
 
-    response = TestClient(app).get("/")
+    response = TestClient(app).get("/more-panel")
 
     assert response.status_code == 200
     assert "data-ai-prompt-center" in response.text
@@ -65,6 +65,59 @@ image_provider:
     assert "MiMo = A + B + C" in response.text
     assert "never-render-this-secret" not in response.text
     assert "never-render-this-image-secret" not in response.text
+
+
+def test_root_shell_skips_group_strategy_and_configuration_loaders(tmp_path, monkeypatch):
+    app = create_web_app(database_path=tmp_path / "research.db")
+
+    def fail_heavy_loader(*_args, **_kwargs):
+        raise AssertionError("root shell invoked a deferred loader")
+
+    for loader_name in (
+        "load_group_rows",
+        "list_pending_strategies",
+        "load_lifecycle_counts_by_chat_id",
+        "list_holding_strategies",
+        "load_trading_settings",
+        "load_ai_recognition_config",
+        "list_recognition_profiles",
+    ):
+        monkeypatch.setattr(
+            f"telegram_kol_research.web_app.{loader_name}",
+            fail_heavy_loader,
+        )
+
+    response = TestClient(app).get("/")
+
+    assert response.status_code == 200
+    assert 'data-lazy-workbench="groups"' in response.text
+    assert 'data-lazy-workbench="more"' in response.text
+    assert "data-group-link" not in response.text
+    assert "data-ai-recognition-config" not in response.text
+    assert "data-trading-settings-form" not in response.text
+    assert "data-ai-model-api-key" not in response.text
+
+
+def test_groups_and_more_partials_retain_deferred_controls(tmp_path):
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            group_config=GroupConfig(
+                groups=[TargetGroupConfig(chat_title="77", chat_id=77)]
+            ),
+        )
+    )
+
+    groups = client.get("/groups")
+    more = client.get("/more-panel")
+
+    assert groups.status_code == 200
+    assert "kol-strategy-list" in groups.text
+    assert "data-toggle-group-automation" in groups.text
+    assert more.status_code == 200
+    assert "data-ai-prompt-center" in more.text
+    assert "data-ai-recognition-config" in more.text
+    assert "data-trading-settings-form" in more.text
 from telegram_kol_research.web_app import _exchange_order_row
 
 
@@ -96,7 +149,7 @@ def test_index_page_renders_explicit_operational_states(tmp_path):
 def test_management_execution_mode_form_labels_shadow_and_live_risk(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
-    response = client.get("/")
+    response = client.get("/more-panel")
 
     assert response.status_code == 200
     assert 'name="management_execution_mode"' in response.text
@@ -107,10 +160,10 @@ def test_management_execution_mode_form_labels_shadow_and_live_risk(tmp_path):
     assert '实盘：高风险，可写入交易所' in response.text
 
 
-def test_index_labels_position_limit_as_per_group(tmp_path):
+def test_more_panel_labels_position_limit_as_per_group(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
-    response = client.get("/")
+    response = client.get("/more-panel")
 
     assert response.status_code == 200
     assert "每群组最大有效持仓数" in response.text
@@ -149,10 +202,12 @@ def test_index_page_is_a_lightweight_shell_without_deepcoin_or_message_timeline(
 
     assert response.status_code == 200
     assert deepcoin_factory_calls == []
-    assert 'data-lazy-workbench="home"' in response.text
-    assert 'data-lazy-workbench="positions"' in response.text
     assert 'data-lazy-workbench="strategies"' in response.text
-    assert 'data-lazy-workbench="messages"' in response.text
+    assert 'data-lazy-workbench="positions"' in response.text
+    assert 'data-lazy-workbench="activity"' in response.text
+    assert 'data-lazy-workbench="groups"' in response.text
+    assert 'data-lazy-workbench="home"' not in response.text
+    assert '/strategy-records?filter=needs_attention' in response.text
     assert "must be deferred until messages view opens" not in response.text
     assert "data-message-card" not in response.text
     assert "data-exchange-position-tabs" not in response.text
@@ -185,6 +240,418 @@ def test_deferred_home_and_positions_partials_render_independently(tmp_path):
     assert positions.status_code == 200
     assert "data-exchange-position-tabs" in positions.text
     assert 'data-exchange-position-tab="positions"' in positions.text
+
+
+def test_positions_panel_builds_one_annotated_exchange_snapshot_per_request(tmp_path):
+    factory_calls = []
+
+    class EmptyDeepcoinClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self):
+            return []
+
+    def tracking_factory():
+        factory_calls.append(True)
+        return EmptyDeepcoinClient()
+
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=tracking_factory,
+        )
+    )
+
+    response = client.get("/positions-panel")
+
+    assert response.status_code == 200
+    assert factory_calls == [True]
+
+
+def _seed_live_bound_strategy(database_path, *, pos_id: str = "pos-live") -> None:
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        candidate = SignalCandidate(
+            raw_message_id=70_001,
+            symbol="BTCUSDT",
+            side="long",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=candidate.raw_message_id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="accepted",
+                authoritative_payload_json="{}",
+                agreement_status="agreed",
+                differences_json="[]",
+                prompt_versions_json="{}",
+            )
+        )
+        binding = ExecutionBinding(
+            strategy_instance_id=f"strategy:{pos_id}",
+            kol_id="77",
+            chat_id=77,
+            message_id=701,
+            symbol="BTCUSDT",
+            side="long",
+            venue="deepcoin",
+            pos_id=pos_id,
+            status="open",
+        )
+        session.add(binding)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=77,
+                message_id=701,
+                symbol="BTCUSDT",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 16, tzinfo=UTC),
+                entered_at=datetime(2026, 7, 16, tzinfo=UTC),
+                stop_loss=60_000,
+                execution_binding_id=binding.id,
+            )
+        )
+        session.commit()
+
+
+def test_strategy_records_api_keeps_exchange_attention_and_builds_one_snapshot(tmp_path):
+    database_path = tmp_path / "research.db"
+    _seed_live_bound_strategy(database_path, pos_id="pos-missing")
+    factory_calls = []
+
+    class EmptyDeepcoinClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self):
+            return []
+
+    def tracking_factory():
+        factory_calls.append(True)
+        return EmptyDeepcoinClient()
+
+    response = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=tracking_factory,
+        )
+    ).get("/api/strategy-records")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["read_only"] is True
+    assert payload["filter"] == "needs_attention"
+    assert payload["scan_scope"]["recent_limit"] >= 200
+    assert payload["summary_counts"]["all"] == 1
+    assert payload["summary_counts"]["needs_attention"] == 1
+    assert factory_calls == [True]
+    assert len(payload["records"]) == 1
+    assert payload["records"][0]["attention"]["code"] == "position_missing"
+    assert payload["records"][0]["exchange_state"] == "attention"
+
+
+def test_strategy_records_api_never_crowds_out_old_missing_live_binding(tmp_path):
+    database_path = tmp_path / "research.db"
+    _seed_live_bound_strategy(database_path, pos_id="old-missing-pos")
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add_all(
+            [
+                StrategyLifecycle(
+                    chat_id=88,
+                    message_id=10_000 + index,
+                    symbol="ETHUSDT",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=datetime(2026, 7, 16, tzinfo=UTC),
+                    stop_loss=2_800,
+                    updated_at=datetime(2026, 7, 16, 12, 0, tzinfo=UTC),
+                )
+                for index in range(1_001)
+            ]
+        )
+        session.commit()
+
+    class EmptyDeepcoinClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=EmptyDeepcoinClient,
+        )
+    ).get("/api/strategy-records")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["scan_scope"]["current_live_binding_scope"] == "all"
+    old_record = next(
+        row for row in payload["records"] if row["pos_id"] == "old-missing-pos"
+    )
+    assert old_record["attention"]["code"] == "position_missing"
+    assert payload["summary_counts"]["all"] == 1_002
+    assert payload["summary_counts"]["needs_attention"] == 1_002
+
+
+def test_strategy_records_api_returns_exchange_orphan_evidence(tmp_path):
+    class OrphanDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "orphan-pos",
+                    "posSide": "long",
+                    "pos": "1.5",
+                    "avgPx": "3000",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=OrphanDeepcoinClient,
+        )
+    ).get("/api/strategy-records")
+
+    assert response.status_code == 200
+    record = response.json()["records"][0]
+    assert record["lifecycle_id"] is None
+    assert record["pos_id"] == "orphan-pos"
+    assert record["attention"]["code"] == "unattributed_position"
+    assert record["detail_href"] == "/?view=positions&pos_id=orphan-pos"
+    assert response.json()["summary_counts"]["all"] == 1
+    assert response.json()["summary_counts"]["needs_attention"] == 1
+
+
+def test_strategy_records_api_preserves_exchange_error_as_unknown(tmp_path):
+    database_path = tmp_path / "research.db"
+    _seed_live_bound_strategy(database_path)
+
+    class BrokenDeepcoinClient:
+        def list_positions(self):
+            raise RuntimeError("exchange unavailable")
+
+    response = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=BrokenDeepcoinClient,
+        )
+    ).get("/api/strategy-records")
+
+    assert response.status_code == 200
+    payload = response.json()
+    record = payload["records"][0]
+    assert record["exchange_state"] == "unknown"
+    assert record["real_position"] is None
+    assert record["attention"]["code"] == "exchange_unavailable"
+    assert payload["summary_counts"]["all"] == 1
+    assert payload["summary_counts"]["needs_attention"] == 1
+
+
+def test_strategy_records_api_exposes_safe_exchange_error_with_empty_database(tmp_path):
+    class BrokenDeepcoinClient:
+        def list_positions(self):
+            raise RuntimeError("secret-api-key=do-not-render")
+
+    response = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=BrokenDeepcoinClient,
+        )
+    ).get("/api/strategy-records")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["records"] == []
+    assert payload["exchange_state"] == "unknown"
+    assert payload["exchange_error"] is True
+    assert payload["exchange_message"] == "Deepcoin 仓位快照暂不可用"
+    assert "do-not-render" not in response.text
+
+
+def test_strategy_records_api_includes_orphan_live_binding_without_duplicate_exchange_orphan(
+    tmp_path,
+):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                strategy_instance_id="orphan-live-binding",
+                kol_id="77",
+                chat_id=77,
+                message_id=770,
+                symbol="ETHUSDT",
+                side="long",
+                venue="deepcoin",
+                pos_id="same-orphan-pos",
+                status="open",
+            )
+        )
+        session.commit()
+
+    class OrphanPositionClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "same-orphan-pos",
+                    "posSide": "long",
+                    "pos": "1",
+                    "avgPx": "3000",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=OrphanPositionClient,
+        )
+    ).get("/api/strategy-records")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["scan_scope"]["orphan_live_binding_scope"] == "all"
+    assert len(payload["records"]) == 1
+    record = payload["records"][0]
+    assert record["lifecycle_id"] is None
+    assert record["orphan_execution_binding"] is True
+    assert record["pos_id"] == "same-orphan-pos"
+    assert record["real_position"]["pos_id"] == "same-orphan-pos"
+    assert record["attention"]["code"] == "binding_without_lifecycle"
+
+
+def test_strategy_records_api_never_reconciles_other_venue_pos_id_with_deepcoin(
+    tmp_path,
+):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        lifecycle_binding = ExecutionBinding(
+            strategy_instance_id="gate-with-lifecycle",
+            kol_id="77",
+            chat_id=77,
+            message_id=771,
+            symbol="BTCUSDT",
+            side="long",
+            venue="gate",
+            pos_id="reused-lifecycle-pos",
+            status="open",
+        )
+        orphan_binding = ExecutionBinding(
+            strategy_instance_id="gate-without-lifecycle",
+            kol_id="88",
+            chat_id=88,
+            message_id=881,
+            symbol="SOLUSDT",
+            side="long",
+            venue="other-exchange",
+            pos_id="reused-orphan-pos",
+            status="active",
+        )
+        session.add_all([lifecycle_binding, orphan_binding])
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                chat_id=77,
+                message_id=771,
+                symbol="BTCUSDT",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 16, tzinfo=UTC),
+                entered_at=datetime(2026, 7, 16, tzinfo=UTC),
+                stop_loss=60_000,
+                execution_binding_id=lifecycle_binding.id,
+            )
+        )
+        session.commit()
+
+    class DeepcoinCollisionClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "reused-lifecycle-pos",
+                    "posSide": "long",
+                    "pos": "1",
+                    "avgPx": "62000",
+                },
+                {
+                    "instId": "SOL-USDT-SWAP",
+                    "posId": "reused-orphan-pos",
+                    "posSide": "long",
+                    "pos": "2",
+                    "avgPx": "150",
+                },
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=DeepcoinCollisionClient,
+        )
+    ).get("/api/strategy-records")
+
+    assert response.status_code == 200
+    records = response.json()["records"]
+    assert {row["pos_id"] for row in records} == {
+        "reused-lifecycle-pos",
+        "reused-orphan-pos",
+    }
+    gate_record = next(row for row in records if row["venue"] == "gate")
+    assert gate_record["exchange_state"] == "not_applicable"
+    assert gate_record["real_position"] is None
+    deepcoin_records = [row for row in records if row["venue"] == "deepcoin"]
+    assert {row["pos_id"] for row in deepcoin_records} == {
+        "reused-lifecycle-pos",
+        "reused-orphan-pos",
+    }
+    assert all(row["lifecycle_id"] is None for row in deepcoin_records)
+    assert all(not row.get("orphan_execution_binding") for row in deepcoin_records)
+    assert all(
+        row["attention"]["code"] == "unattributed_position"
+        for row in deepcoin_records
+    )
+    assert response.json()["summary_counts"]["all"] == 3
+    assert response.json()["summary_counts"]["needs_attention"] == 3
 
 
 def test_deferred_home_marks_deepcoin_error_without_blocking_the_shell(tmp_path):
@@ -220,16 +687,12 @@ def test_shared_group_context_renders_all_groups(tmp_path):
         session.commit()
 
     client = TestClient(create_web_app(database_path=database_path))
-    response = client.get("/")
+    response = client.get("/groups")
 
     assert response.status_code == 200
-    assert "data-group-context" in response.text
-    assert "data-group-context-trigger" in response.text
-    assert "data-group-picker" in response.text
-    assert "data-group-picker-search" in response.text
-    assert response.text.count("data-group-picker-option") == 2
-    assert 'value="77"' in response.text
-    assert 'value="88"' in response.text
+    assert response.text.count("data-group-link") == 2
+    assert 'data-chat-id="77"' in response.text
+    assert 'data-chat-id="88"' in response.text
     assert "data-message-group-select" not in response.text
 
 
@@ -270,6 +733,8 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
         text="\n".join(
             [
                 root_response.text,
+                client.get("/groups").text,
+                client.get("/more-panel").text,
                 client.get("/home-dashboard").text,
                 client.get("/positions-panel").text,
                 client.get("/groups/77/strategy-mid-panel?filter=holding").text,
@@ -280,19 +745,19 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
 
     assert response.status_code == 200
     assert "data-trader-dashboard" in response.text
-    assert 'data-workbench-view="home"' in response.text
+    assert 'data-workbench-view="strategies"' in response.text
     assert 'data-workbench-view="positions"' in response.text
     assert "data-home-risk-summary" in response.text
     assert "data-home-event-feed" in response.text
     assert 'data-home-event-filter="risk"' in response.text
     assert "data-desktop-workbench-nav" in response.text
     assert "data-mobile-work-nav" in response.text
-    assert 'data-mobile-work-view="overview"' in response.text
     assert 'data-mobile-work-view="strategies"' in response.text
-    assert 'data-mobile-work-view="messages"' in response.text
     assert 'data-mobile-work-view="positions"' in response.text
+    assert 'data-mobile-work-view="activity"' in response.text
+    assert 'data-mobile-work-view="groups"' in response.text
     assert 'data-mobile-work-view="more"' in response.text
-    assert 'data-mobile-work-region="overview"' in response.text
+    assert 'data-mobile-work-region="groups"' in response.text
     assert "data-dashboard-tab" in response.text
     assert "data-ai-prompt-center" in response.text
     assert "data-ai-recognition-config" in response.text
@@ -393,7 +858,7 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "<summary>" in msgs_resp.text
 
 
-def test_mobile_navigation_keeps_batch_under_more_instead_of_bottom_bar(tmp_path):
+def test_mobile_navigation_has_exactly_five_primary_destinations(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
     response = client.get("/")
@@ -407,17 +872,31 @@ def test_mobile_navigation_keeps_batch_under_more_instead_of_bottom_bar(tmp_path
     )
     assert desktop_nav is not None
     assert mobile_nav is not None
-    assert 'data-workbench-view="management-batches"' in desktop_nav.group(0)
-    assert 'data-workbench-view="management-batches"' not in mobile_nav.group(0)
+    for view, label in (
+        ("strategies", "策略"),
+        ("positions", "持仓"),
+        ("activity", "动态"),
+        ("groups", "群组"),
+        ("more", "更多"),
+    ):
+        assert f'data-workbench-view="{view}"' in mobile_nav.group(0)
+        assert label in mobile_nav.group(0)
     assert mobile_nav.group(0).count("data-workbench-view=") == 5
-    assert 'data-workbench-view="more"' in mobile_nav.group(0)
+    assert 'data-workbench-view="home"' not in mobile_nav.group(0)
+    assert 'data-workbench-view="messages"' not in mobile_nav.group(0)
+    assert 'data-workbench-view="management-batches"' not in mobile_nav.group(0)
+    assert re.search(
+        r'data-workbench-view="strategies"[^>]*aria-current="page"',
+        mobile_nav.group(0),
+    )
+    assert 'data-workbench-view="management-batches"' not in desktop_nav.group(0)
     more_panel = re.search(
         r'<section class="workbench-panel more-workbench-panel".*?</section>',
         response.text,
         re.S,
     )
     assert more_panel is not None
-    assert 'data-workbench-view="management-batches"' in more_panel.group(0)
+    assert 'data-legacy-workbench-view="management-batches"' in more_panel.group(0)
 
 
 def test_bound_position_close_is_not_rendered_for_unbound_exchange_position(tmp_path):
@@ -648,6 +1127,8 @@ def test_bound_position_close_renders_exact_context_for_bound_exchange_position(
     assert "2026-07-14 16:00:00" in response.text
     assert 'data-exchange-group-section' in response.text
     assert 'data-position-danger-zone' in response.text
+    assert 'href="/strategy-records/1"' in response.text
+    assert 'data-strategy-record-link="1"' in response.text
     close_buttons = re.findall(
         r'<button[^>]+data-close-bound-position[^>]*>', response.text,
     )
@@ -658,7 +1139,303 @@ def test_bound_position_close_renders_exact_context_for_bound_exchange_position(
         assert 'data-live-action-side="long"' in button
         assert 'data-live-action-size="0.01 contracts BTCUSDT"' in button
         assert 'data-live-action-label="市价全平"' in button
+        assert 'data-live-action-confirmation-note="这会向 DeepCoin 提交该指定仓位的市价全平订单。"' in button
     assert 'data-close-bound-position-status aria-live="polite"' in response.text
+
+
+def test_bound_position_does_not_link_lifecycle_owned_by_another_binding(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=57,
+            posted_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+            text="BTC long",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+        )
+        session.add(candidate)
+        session.flush()
+        position_binding = ExecutionBinding(
+            strategy_instance_id="position-owner",
+            kol_id="group:100",
+            chat_id=100,
+            message_id=57,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            pos_id="pos-owner-only",
+            status="active",
+        )
+        other_binding = ExecutionBinding(
+            strategy_instance_id="lifecycle-owner",
+            kol_id="group:999",
+            chat_id=999,
+            message_id=999,
+            symbol="ETH",
+            side="short",
+            venue="deepcoin",
+            status="active",
+        )
+        session.add_all([position_binding, other_binding])
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=position_binding.id,
+                strategy_instance_id=position_binding.strategy_instance_id,
+                leg_index=0,
+                purpose="entry",
+                order_kind="market",
+                pos_id="pos-owner-only",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="active",
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                execution_binding_id=other_binding.id,
+                chat_id=100,
+                message_id=57,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=raw_message.posted_at,
+            )
+        )
+        session.commit()
+        position_binding_id = position_binding.id
+
+    class MatchingPositionClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTCUSDT",
+                    "posId": "pos-owner-only",
+                    "posSide": "long",
+                    "pos": "0.01",
+                }
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=MatchingPositionClient,
+        )
+    ).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "已验证归属" in response.text
+    assert "data-strategy-record-link" not in response.text
+    assert 'href="/strategy-records/' not in response.text
+
+    with session_factory() as session:
+        existing_lifecycle = session.query(StrategyLifecycle).one()
+        existing_lifecycle.execution_binding_id = position_binding_id
+        second_message = RawMessage(
+            chat_id=101,
+            message_id=58,
+            posted_at=datetime(2026, 6, 12, 8, 1, tzinfo=UTC),
+            text="ETH short",
+        )
+        session.add(second_message)
+        session.flush()
+        second_candidate = SignalCandidate(
+            raw_message_id=second_message.id,
+            symbol="ETH",
+            side="short",
+            event_type="entry_signal",
+        )
+        session.add(second_candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=second_candidate.id,
+                execution_binding_id=position_binding_id,
+                chat_id=101,
+                message_id=58,
+                symbol="ETH",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=second_message.posted_at,
+            )
+        )
+        session.commit()
+
+    ambiguous_response = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=MatchingPositionClient,
+        )
+    ).get("/positions-panel")
+
+    assert ambiguous_response.status_code == 200
+    assert "data-strategy-record-link" not in ambiguous_response.text
+    assert 'href="/strategy-records/' not in ambiguous_response.text
+
+
+def test_recognized_message_links_to_its_single_authoritative_lifecycle(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=88,
+            posted_at=datetime(2026, 7, 17, 8, 0, tzinfo=UTC),
+            sender_name="alice",
+            text="BTC long Entry 62400 SL 60800 TP 63600",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            confidence=0.91,
+        )
+        session.add(candidate)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=100,
+            message_id=88,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=raw_message.posted_at,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/100/messages")
+
+    assert response.status_code == 200
+    assert f'href="/strategy-records/{lifecycle_id}"' in response.text
+    assert f'data-message-strategy-record="{lifecycle_id}"' in response.text
+
+
+def test_message_does_not_borrow_lifecycle_from_a_different_candidate(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=89,
+            posted_at=datetime(2026, 7, 17, 8, 1, tzinfo=UTC),
+            text="BTC long",
+        )
+        session.add(raw_message)
+        session.flush()
+        selected_candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            confidence=0.95,
+        )
+        lifecycle_candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            confidence=0.80,
+        )
+        session.add_all([selected_candidate, lifecycle_candidate])
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=lifecycle_candidate.id,
+                chat_id=100,
+                message_id=89,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="pending_entry",
+                signal_at=raw_message.posted_at,
+            )
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/100/messages"
+    )
+
+    assert response.status_code == 200
+    assert "data-message-strategy-record" not in response.text
+    assert 'href="/strategy-records/' not in response.text
+
+
+def test_message_fails_closed_when_selected_candidate_has_multiple_lifecycles(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=90,
+            posted_at=datetime(2026, 7, 17, 8, 2, tzinfo=UTC),
+            text="BTC long",
+        )
+        session.add(raw_message)
+        session.flush()
+        selected_candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            confidence=0.95,
+        )
+        session.add(selected_candidate)
+        session.flush()
+        # Malformed legacy rows can point the same selected candidate at
+        # multiple lifecycle identities while satisfying the database's
+        # (chat_id, message_id) uniqueness constraint. The UI must not choose.
+        session.add_all(
+            [
+                StrategyLifecycle(
+                    signal_candidate_id=selected_candidate.id,
+                    chat_id=100,
+                    message_id=90,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=raw_message.posted_at,
+                ),
+                StrategyLifecycle(
+                    signal_candidate_id=selected_candidate.id,
+                    chat_id=101,
+                    message_id=91,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="cancelled",
+                    signal_at=raw_message.posted_at,
+                ),
+            ]
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/100/messages"
+    )
+
+    assert response.status_code == 200
+    assert "data-message-strategy-record" not in response.text
+    assert 'href="/strategy-records/' not in response.text
 
 
 def test_reviewed_equivalent_positions_render_miya_and_deterministic_provenance(tmp_path):

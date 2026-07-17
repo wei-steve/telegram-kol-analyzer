@@ -438,10 +438,33 @@ def _serialize_raw_messages(
         if c.raw_message_id not in cand_by_msg_id:
             cand_by_msg_id[c.raw_message_id] = c
 
+    # Strategy-record links must follow the exact candidate relation.  Do not
+    # infer ownership from message symbol/side, and fail closed if legacy data
+    # contains more than one lifecycle for the selected candidate.
+    selected_candidate_ids = [candidate.id for candidate in cand_by_msg_id.values()]
+    lifecycle_ids_by_candidate_id: dict[int, list[int]] = {}
+    if selected_candidate_ids:
+        lifecycles = (
+            session.query(StrategyLifecycle)
+            .filter(StrategyLifecycle.signal_candidate_id.in_(selected_candidate_ids))
+            .order_by(StrategyLifecycle.signal_candidate_id.asc(), StrategyLifecycle.id.asc())
+            .all()
+        )
+        for lifecycle in lifecycles:
+            lifecycle_ids_by_candidate_id.setdefault(
+                lifecycle.signal_candidate_id, []
+            ).append(lifecycle.id)
+
     rows: list[dict[str, object | None]] = []
     for raw_message in raw_messages:
         media_assets = media_by_msg_id.get(raw_message.id, [])
         media_asset_rows = _serialize_media_assets(media_assets)
+        selected_candidate = cand_by_msg_id.get(raw_message.id)
+        lifecycle_ids = (
+            lifecycle_ids_by_candidate_id.get(selected_candidate.id, [])
+            if selected_candidate is not None
+            else []
+        )
         rows.append(
             {
                 "raw_message_id": raw_message.id,
@@ -454,9 +477,12 @@ def _serialize_raw_messages(
                 "text": raw_message.text,
                 "reply_to_message_id": raw_message.reply_to_message_id,
                 "media_assets": media_asset_rows,
+                "strategy_lifecycle_id": (
+                    lifecycle_ids[0] if len(lifecycle_ids) == 1 else None
+                ),
                 "strategy_detection": _build_strategy_detection(
                     recognition=rec_by_msg_id.get(raw_message.id),
-                    candidate=cand_by_msg_id.get(raw_message.id),
+                    candidate=selected_candidate,
                     media_assets=media_assets,
                 ),
                 "semantic_review": _serialize_semantic_review(

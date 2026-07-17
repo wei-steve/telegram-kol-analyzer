@@ -1,0 +1,1509 @@
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import event
+
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionEvent,
+    ExecutionOrderLeg,
+    MediaAsset,
+    RawMessage,
+    RecognitionDecision,
+    SignalCandidate,
+    StrategyLifecycle,
+    StrategyManagementBatch,
+    StrategyManagementLeg,
+)
+from telegram_kol_research.strategy_records import (
+    enrich_strategy_records_with_exchange,
+    load_live_bindings_without_lifecycle,
+    load_strategy_record_detail,
+    load_strategy_record_summaries,
+)
+
+
+NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+
+
+def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
+    session_factory = create_session_factory(tmp_path / "strategy-detail.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=10,
+            message_id=101,
+            posted_at=NOW - timedelta(hours=6),
+            text="BTC 现价做多",
+            raw_payload='{"message_id": 101}',
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            MediaAsset(
+                raw_message_id=raw_message.id,
+                telegram_file_id="telegram-file-1",
+                kind="photo",
+                mime_type="image/jpeg",
+                local_path="media/chart.jpg",
+                ocr_text="BTC LONG",
+                created_at=NOW - timedelta(hours=6),
+            )
+        )
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTCUSDT",
+            side="long",
+            event_type="entry_signal",
+            entry_text="market",
+            stop_loss_text="65000",
+            review_status="approved",
+            created_at=NOW - timedelta(hours=5, minutes=50),
+        )
+        decision = RecognitionDecision(
+            raw_message_id=raw_message.id,
+            input_kind="text+image",
+            authoritative_model="mimo-v2.5",
+            authoritative_status="是策略",
+            authoritative_payload_json='{"symbol":"BTCUSDT","api_key":"secret"}',
+            auxiliary_model="other-model",
+            auxiliary_status="是策略",
+            auxiliary_payload_json="{}",
+            agreement_status="agreed",
+            differences_json="[]",
+            prompt_versions_json='{"mimo":"v2"}',
+            created_at=NOW - timedelta(hours=5, minutes=45),
+            updated_at=NOW - timedelta(hours=5, minutes=45),
+        )
+        session.add_all([candidate, decision])
+        session.flush()
+        binding = _binding(
+            chat_id=10,
+            message_id=101,
+            symbol="BTCUSDT",
+            strategy_instance_id="strategy-detail-1",
+        )
+        binding.pos_id = "pos-1"
+        binding.order_id = "order-1"
+        binding.payload_json = '{"passphrase":"must-not-render"}'
+        binding.created_at = NOW - timedelta(hours=5, minutes=20)
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=10,
+            message_id=101,
+            symbol="BTCUSDT",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW - timedelta(hours=5, minutes=30),
+            entered_at=NOW - timedelta(hours=5),
+            stop_loss=65_000.0,
+            execution_binding_id=binding.id,
+            updated_at=NOW - timedelta(hours=5),
+        )
+        session.add(lifecycle)
+        session.flush()
+        order_leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="market",
+            order_id="order-1",
+            client_order_id="client-1",
+            pos_id="pos-1",
+            attribution_status="bound",
+            request_json='{"token":"must-not-render","size":"1"}',
+            response_json='{"code":"0"}',
+            status="filled",
+            created_at=NOW - timedelta(hours=5, minutes=15),
+            updated_at=NOW - timedelta(hours=5, minutes=10),
+        )
+        session.add(order_leg)
+        session.flush()
+        fill_event = ExecutionEvent(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            action="fill",
+            status="succeeded",
+            chat_id=10,
+            message_id=101,
+            source_message_id=101,
+            symbol="BTCUSDT",
+            side="long",
+            order_id="order-1",
+            pos_id="pos-1",
+            response_json='{"apiSecret":"must-not-render","fillPrice":"67000"}',
+            exchange_event_time=NOW - timedelta(hours=5),
+            created_at=NOW - timedelta(hours=5),
+        )
+        batch = StrategyManagementBatch(
+            idempotency_fingerprint="detail-management-batch",
+            raw_message_id=raw_message.id,
+            recognition_decision_id=decision.id,
+            recognition_generation="mimo_only_v2",
+            target_lifecycle_id=lifecycle.id,
+            strategy_instance_id=str(binding.strategy_instance_id),
+            execution_binding_id=binding.id,
+            intent="risk_update",
+            effective_action="move_stop",
+            execution_mode="live",
+            status="succeeded",
+            target_fingerprint="detail-target",
+            target_snapshot_json='{"stop":"breakeven"}',
+            planned_at=NOW - timedelta(hours=4),
+            completed_at=NOW - timedelta(hours=3, minutes=55),
+            created_at=NOW - timedelta(hours=4),
+            updated_at=NOW - timedelta(hours=3, minutes=55),
+        )
+        session.add_all([fill_event, batch])
+        session.flush()
+        session.add(
+            StrategyManagementLeg(
+                management_batch_id=batch.id,
+                execution_order_leg_id=order_leg.id,
+                pos_id="pos-1",
+                leg_index=0,
+                status="succeeded",
+                request_json='{"authorization":"must-not-render"}',
+                response_json='{"code":"0"}',
+                created_at=NOW - timedelta(hours=4),
+                updated_at=NOW - timedelta(hours=3, minutes=55),
+            )
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={10: "大镖客"},
+    )
+
+    assert detail is not None
+    assert detail["identity"]["lifecycle_id"] == lifecycle_id
+    assert detail["overview"]["authoritative_model"] == "mimo-v2.5"
+    assert [(item["kind"], item.get("role")) for item in detail["timeline"]] == [
+        ("message", "entry"),
+        ("message", "management"),
+        ("recognition", "entry"),
+        ("recognition", "management"),
+        ("strategy", None),
+        ("order", None),
+        ("fill", None),
+        ("management", "management"),
+    ]
+    assert all(item["source"] for item in detail["timeline"])
+    assert detail["execution"]["binding"]["pos_id"] == "pos-1"
+    assert detail["execution"]["management_batches"][0]["legs"][0]["pos_id"] == "pos-1"
+    assert detail["evidence"]["raw_message"]["text"] == "BTC 现价做多"
+    assert detail["evidence"]["media"][0]["kind"] == "photo"
+    assert detail["evidence"]["recognition_decision"]["authoritative_payload"]["api_key"] == "[REDACTED]"
+    assert [item["role"] for item in detail["evidence"]["recognition_decisions"]] == [
+        "entry",
+        "management",
+    ]
+    assert detail["execution"]["order_legs"][0]["request"]["token"] == "[REDACTED]"
+
+
+def test_load_strategy_record_detail_returns_none_for_unknown_lifecycle(tmp_path):
+    session_factory = create_session_factory(tmp_path / "missing-detail.db")
+
+    assert load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=999,
+        group_labels_by_chat_id={},
+    ) is None
+
+
+def test_load_strategy_record_detail_marks_missing_evidence_explicitly(tmp_path):
+    session_factory = create_session_factory(tmp_path / "partial-detail.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=20,
+            message_id=202,
+            symbol="ETHUSDT",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            entered_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={20: "峰哥"},
+    )
+
+    assert detail is not None
+    assert detail["execution"]["binding"] is None
+    assert detail["execution"]["exchange_evidence"] == {
+        "state": "missing",
+        "reason": "未提供交易所快照；详情加载器不会主动调用交易所",
+    }
+    assert detail["evidence"]["missing"] >= [
+        "signal_candidate",
+        "raw_message",
+        "recognition_decision",
+        "execution_binding",
+        "exchange_snapshot",
+    ]
+
+
+def test_strategy_detail_never_echoes_malformed_json_secrets(tmp_path):
+    session_factory = create_session_factory(tmp_path / "malformed-secret-detail.db")
+    malformed = '{"api_key":"super-secret-api-key","token":"super-secret-token"'
+    with session_factory() as session:
+        candidate = SignalCandidate(raw_message_id=7001, symbol="BTCUSDT", side="long")
+        session.add(candidate)
+        session.flush()
+        decision = _decision(candidate.raw_message_id)
+        decision.authoritative_payload_json = malformed
+        binding = _binding(
+            chat_id=10,
+            message_id=701,
+            symbol="BTCUSDT",
+            strategy_instance_id="malformed-detail",
+        )
+        binding.payload_json = malformed
+        session.add_all([decision, binding])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=10,
+            message_id=701,
+            symbol="BTCUSDT",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            entered_at=NOW,
+            execution_binding_id=binding.id,
+            updated_at=NOW,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={10: "大镖客"},
+    )
+
+    assert detail is not None
+    rendered = repr(detail)
+    assert "super-secret-api-key" not in rendered
+    assert "super-secret-token" not in rendered
+    parse_error = detail["evidence"]["recognition_decision"]["authoritative_payload"]
+    assert parse_error.keys() >= {"_parse_error", "error", "raw_length", "sha256"}
+    assert parse_error["_parse_error"] is True
+    assert parse_error["raw_length"] == len(malformed)
+    assert len(parse_error["sha256"]) == 64
+    assert "raw" not in parse_error
+
+
+def test_strategy_detail_redacts_nested_secrets_recursively(tmp_path):
+    session_factory = create_session_factory(tmp_path / "nested-secret-detail.db")
+    with session_factory() as session:
+        candidate = SignalCandidate(raw_message_id=7101, symbol="BTCUSDT", side="long")
+        session.add(candidate)
+        session.flush()
+        decision = _decision(candidate.raw_message_id)
+        decision.authoritative_payload_json = (
+            '{"outer":{"api_key":"nested-key","items":'
+            '[{"token":"nested-token"}]},"safe":"visible"}'
+        )
+        session.add(decision)
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=10,
+            message_id=711,
+            symbol="BTCUSDT",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={},
+    )
+
+    payload = detail["evidence"]["recognition_decision"]["authoritative_payload"]
+    assert payload == {
+        "outer": {
+            "api_key": "[REDACTED]",
+            "items": [{"token": "[REDACTED]"}],
+        },
+        "safe": "visible",
+    }
+
+
+def test_strategy_detail_preserves_role_specific_messages_and_decisions(tmp_path):
+    session_factory = create_session_factory(tmp_path / "role-detail.db")
+    with session_factory() as session:
+        # Deliberately insert out of role order and use tied timestamps.
+        exit_raw = RawMessage(chat_id=10, message_id=803, posted_at=NOW, text="平仓")
+        entry_raw = RawMessage(chat_id=10, message_id=801, posted_at=NOW, text="做多")
+        management_raw = RawMessage(chat_id=10, message_id=802, posted_at=NOW, text="移损")
+        session.add_all([exit_raw, entry_raw, management_raw])
+        session.flush()
+        entry_candidate = SignalCandidate(
+            raw_message_id=entry_raw.id,
+            symbol="BTCUSDT",
+            side="long",
+            event_type="entry_signal",
+        )
+        exit_candidate = SignalCandidate(
+            raw_message_id=exit_raw.id,
+            symbol="BTCUSDT",
+            side="long",
+            event_type="exit_signal",
+        )
+        entry_decision = _decision(entry_raw.id)
+        management_decision = _decision(management_raw.id)
+        exit_decision = _decision(exit_raw.id)
+        for decision in (entry_decision, management_decision, exit_decision):
+            decision.created_at = NOW
+            decision.updated_at = NOW
+        binding = _binding(
+            chat_id=10,
+            message_id=801,
+            symbol="BTCUSDT",
+            strategy_instance_id="role-detail",
+        )
+        session.add_all(
+            [
+                entry_candidate,
+                exit_candidate,
+                entry_decision,
+                management_decision,
+                exit_decision,
+                binding,
+            ]
+        )
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=entry_candidate.id,
+            exit_signal_candidate_id=exit_candidate.id,
+            chat_id=10,
+            message_id=801,
+            symbol="BTCUSDT",
+            side="long",
+            lifecycle_status="exited",
+            signal_at=NOW,
+            entered_at=NOW,
+            exited_at=NOW,
+            execution_binding_id=binding.id,
+            updated_at=NOW,
+        )
+        session.add(lifecycle)
+        session.flush()
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="role-detail-batch",
+                raw_message_id=management_raw.id,
+                recognition_decision_id=management_decision.id,
+                recognition_generation="mimo_only_v2",
+                target_lifecycle_id=lifecycle.id,
+                strategy_instance_id=str(binding.strategy_instance_id),
+                execution_binding_id=binding.id,
+                intent="risk_update",
+                effective_action="move_stop",
+                execution_mode="live",
+                status="succeeded",
+                target_fingerprint="role-detail-target",
+                planned_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+        entry_raw_id = entry_raw.id
+        management_raw_id = management_raw.id
+        exit_raw_id = exit_raw.id
+
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={},
+    )
+
+    role_events = [
+        (item["kind"], item["role"], item["source"]["raw_message_id"])
+        for item in detail["timeline"]
+        if item["kind"] in {"message", "recognition"}
+    ]
+    assert role_events == [
+        ("message", "entry", entry_raw_id),
+        ("message", "management", management_raw_id),
+        ("message", "exit", exit_raw_id),
+        ("recognition", "entry", entry_raw_id),
+        ("recognition", "management", management_raw_id),
+        ("recognition", "exit", exit_raw_id),
+    ]
+    assert len({item["event_id"] for item in detail["timeline"]}) == len(
+        detail["timeline"]
+    )
+    assert [item["role"] for item in detail["evidence"]["recognition_decisions"]] == [
+        "entry",
+        "management",
+        "exit",
+    ]
+
+
+def test_strategy_detail_entry_message_fallback_is_not_management_message(tmp_path):
+    session_factory = create_session_factory(tmp_path / "entry-fallback-detail.db")
+    with session_factory() as session:
+        entry_raw = RawMessage(
+            chat_id=20,
+            message_id=901,
+            posted_at=NOW - timedelta(hours=2),
+            text="入口原文",
+        )
+        management_raw = RawMessage(
+            chat_id=20,
+            message_id=902,
+            posted_at=NOW - timedelta(hours=1),
+            text="管理原文",
+        )
+        session.add_all([entry_raw, management_raw])
+        session.flush()
+        management_decision = _decision(management_raw.id)
+        binding = _binding(
+            chat_id=20,
+            message_id=901,
+            symbol="ETHUSDT",
+            strategy_instance_id="fallback-detail",
+        )
+        session.add_all([management_decision, binding])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=20,
+            message_id=901,
+            symbol="ETHUSDT",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW - timedelta(hours=2),
+            entered_at=NOW - timedelta(hours=2),
+            execution_binding_id=binding.id,
+            updated_at=NOW,
+        )
+        session.add(lifecycle)
+        session.flush()
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="fallback-detail-batch",
+                raw_message_id=management_raw.id,
+                recognition_decision_id=management_decision.id,
+                recognition_generation="mimo_only_v2",
+                target_lifecycle_id=lifecycle.id,
+                strategy_instance_id=str(binding.strategy_instance_id),
+                execution_binding_id=binding.id,
+                intent="risk_update",
+                effective_action="move_stop",
+                execution_mode="live",
+                status="succeeded",
+                target_fingerprint="fallback-detail-target",
+                planned_at=NOW - timedelta(hours=1),
+                created_at=NOW - timedelta(hours=1),
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+        entry_raw_id = entry_raw.id
+        management_raw_id = management_raw.id
+
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={},
+    )
+
+    assert detail["evidence"]["raw_message"]["id"] == entry_raw_id
+    assert detail["evidence"]["raw_message"]["text"] == "入口原文"
+    assert [
+        (item["role"], item["source"]["raw_message_id"])
+        for item in detail["timeline"]
+        if item["kind"] == "message"
+    ] == [("entry", entry_raw_id), ("management", management_raw_id)]
+
+
+def _strategy_record(
+    *, pos_id: str = "pos-1", venue: str = "deepcoin"
+) -> dict[str, object]:
+    return {
+        "lifecycle_id": 1,
+        "pos_id": pos_id,
+        "venue": venue,
+        "attribution_state": "live_bound",
+        "attention": None,
+        "attention_reasons": [],
+    }
+
+
+def _exchange_position(
+    *,
+    pos_id: str = "pos-1",
+    attribution_state: str,
+    reasons: list[str] | None = None,
+    protection_status: str = "protected",
+) -> dict[str, object]:
+    return {
+        "pos_id": pos_id,
+        "symbol": "BTCUSDT",
+        "side": "long",
+        "protection_status": protection_status,
+        "attribution": {
+            "state": attribution_state,
+            "reasons": reasons or [],
+        },
+    }
+
+
+def test_exchange_enrichment_confirms_one_uniquely_bound_position():
+    enriched = enrich_strategy_records_with_exchange(
+        [_strategy_record()],
+        exchange_snapshot={
+            "positions": [_exchange_position(attribution_state="bound")],
+            "error": None,
+        },
+    )
+
+    assert enriched[0]["exchange_state"] == "confirmed"
+    assert enriched[0]["attribution_state"] == "bound"
+    assert enriched[0]["real_position"]["pos_id"] == "pos-1"
+    assert enriched[0]["attention"] is None
+
+
+def test_exchange_enrichment_marks_unattributed_position_for_attention():
+    enriched = enrich_strategy_records_with_exchange(
+        [_strategy_record()],
+        exchange_snapshot={
+            "positions": [
+                _exchange_position(
+                    attribution_state="unassigned",
+                    reasons=["交易所仓位没有持久化策略归属"],
+                )
+            ],
+            "error": None,
+        },
+    )
+
+    assert enriched[0]["exchange_state"] == "attention"
+    assert enriched[0]["attribution_state"] == "unassigned"
+    assert enriched[0]["attention"]["code"] == "unattributed_position"
+    assert "没有持久化策略归属" in enriched[0]["attention"]["reason"]
+
+
+def test_exchange_enrichment_fails_closed_for_ambiguous_or_conflicting_evidence():
+    records = [_strategy_record(pos_id="pos-ambiguous"), _strategy_record(pos_id="pos-conflict")]
+    snapshot = {
+        "positions": [
+            _exchange_position(
+                pos_id="pos-ambiguous",
+                attribution_state="candidate",
+                reasons=["存在多个候选策略"],
+            ),
+            _exchange_position(
+                pos_id="pos-conflict",
+                attribution_state="conflict",
+                reasons=["entry leg 证据冲突"],
+            ),
+        ],
+        "error": None,
+    }
+
+    ambiguous, conflict = enrich_strategy_records_with_exchange(
+        records,
+        exchange_snapshot=snapshot,
+    )
+
+    assert ambiguous["exchange_state"] == "unconfirmed"
+    assert ambiguous["attribution_state"] == "ambiguous"
+    assert ambiguous["attention"]["code"] == "attribution_ambiguous"
+    assert "多个候选" in ambiguous["attention"]["reason"]
+    assert conflict["exchange_state"] == "attention"
+    assert conflict["attribution_state"] == "conflict"
+    assert conflict["attention"]["code"] == "attribution_conflict"
+    assert "证据冲突" in conflict["attention"]["reason"]
+
+
+def test_exchange_enrichment_never_renders_unavailable_exchange_as_zero():
+    enriched = enrich_strategy_records_with_exchange(
+        [_strategy_record()],
+        exchange_snapshot={"positions": [], "error": "exchange unavailable"},
+    )
+
+    assert enriched[0]["exchange_state"] == "unknown"
+    assert enriched[0]["real_position"] is None
+    assert enriched[0]["attention"]["code"] == "exchange_unavailable"
+
+
+def test_exchange_enrichment_fails_closed_when_live_bound_position_is_missing():
+    enriched = enrich_strategy_records_with_exchange(
+        [_strategy_record(pos_id="pos-missing")],
+        exchange_snapshot={"positions": [], "error": None},
+    )
+
+    assert enriched[0]["exchange_state"] == "attention"
+    assert enriched[0]["real_position"] is None
+    assert enriched[0]["attribution_state"] == "conflict"
+    assert enriched[0]["attention"]["code"] == "position_missing"
+    assert "pos-missing" in enriched[0]["attention"]["reason"]
+
+
+def test_exchange_enrichment_adds_safe_synthetic_row_for_exchange_orphan():
+    enriched = enrich_strategy_records_with_exchange(
+        [],
+        exchange_snapshot={
+            "positions": [
+                _exchange_position(
+                    pos_id="orphan/position 1",
+                    attribution_state="unassigned",
+                    reasons=["没有本地策略归属"],
+                )
+            ],
+            "error": None,
+        },
+    )
+
+    assert len(enriched) == 1
+    orphan = enriched[0]
+    assert orphan.keys() >= {
+        "lifecycle_id",
+        "chat_id",
+        "group_name",
+        "message_id",
+        "symbol",
+        "side",
+        "lifecycle_state",
+        "recognition_state",
+        "execution_state",
+        "attribution_state",
+        "attention",
+        "attention_reasons",
+        "latest_changed_at",
+        "detail_href",
+        "exchange_state",
+        "real_position",
+    }
+    assert orphan["lifecycle_id"] is None
+    assert orphan["lifecycle_state"] == "exchange_only"
+    assert orphan["attention"]["code"] == "unattributed_position"
+    assert orphan["detail_href"] == "/?view=positions&pos_id=orphan%2Fposition+1"
+    assert orphan["real_position"]["pos_id"] == "orphan/position 1"
+
+
+def test_exchange_enrichment_never_matches_other_venue_on_reused_pos_id():
+    enriched = enrich_strategy_records_with_exchange(
+        [_strategy_record(pos_id="reused-pos", venue="gate")],
+        exchange_snapshot={
+            "positions": [
+                _exchange_position(
+                    pos_id="reused-pos",
+                    attribution_state="unassigned",
+                )
+            ],
+            "error": None,
+        },
+    )
+
+    gate_record, deepcoin_orphan = enriched
+    assert gate_record["venue"] == "gate"
+    assert gate_record["exchange_state"] == "not_applicable"
+    assert gate_record["real_position"] is None
+    assert gate_record["attention"] is None
+    assert deepcoin_orphan["venue"] == "deepcoin"
+    assert deepcoin_orphan["lifecycle_id"] is None
+    assert deepcoin_orphan["pos_id"] == "reused-pos"
+    assert deepcoin_orphan["attention"]["code"] == "unattributed_position"
+
+
+def test_load_live_bindings_without_lifecycle_emits_fail_closed_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "orphan-binding.db")
+    with session_factory() as session:
+        orphan = _binding(
+            chat_id=77,
+            message_id=707,
+            symbol="SOLUSDT",
+            strategy_instance_id="orphan-binding",
+        )
+        orphan.pos_id = "orphan/binding 1"
+        orphan.venue = " DeepCoin "
+        other_venue = _binding(
+            chat_id=88,
+            message_id=808,
+            symbol="BTCUSDT",
+            strategy_instance_id="gate-orphan-binding",
+        )
+        other_venue.pos_id = "orphan/binding 1"
+        other_venue.venue = "gate"
+        session.add_all([orphan, other_venue])
+        session.commit()
+        binding_id = orphan.id
+
+    rows = load_live_bindings_without_lifecycle(
+        session_factory,
+        group_labels_by_chat_id={77: "孤立绑定群"},
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.keys() >= {
+        "lifecycle_id",
+        "binding_id",
+        "chat_id",
+        "group_name",
+        "message_id",
+        "symbol",
+        "side",
+        "lifecycle_state",
+        "recognition_state",
+        "execution_state",
+        "attribution_state",
+        "pos_id",
+        "attention",
+        "attention_reasons",
+        "latest_changed_at",
+        "detail_href",
+    }
+    assert row["lifecycle_id"] is None
+    assert row["binding_id"] == binding_id
+    assert row["venue"] == "deepcoin"
+    assert row["group_name"] == "孤立绑定群"
+    assert row["lifecycle_state"] == "binding_without_lifecycle"
+    assert row["attention"]["code"] == "binding_without_lifecycle"
+    assert row["detail_href"] == "/?view=positions&pos_id=orphan%2Fbinding+1"
+
+
+def test_exchange_enrichment_requires_concrete_protection_mismatch_evidence():
+    unprotected = _exchange_position(
+        pos_id="pos-unprotected",
+        attribution_state="bound",
+        protection_status="unprotected",
+    )
+    explicit_mismatch = _exchange_position(
+        pos_id="pos-mismatch",
+        attribution_state="bound",
+        protection_status="mismatch",
+    )
+    explicit_mismatch["protection_mismatch_reason"] = "止损价与交易所证据不一致"
+
+    plain, mismatch = enrich_strategy_records_with_exchange(
+        [
+            _strategy_record(pos_id="pos-unprotected"),
+            _strategy_record(pos_id="pos-mismatch"),
+        ],
+        exchange_snapshot={
+            "positions": [unprotected, explicit_mismatch],
+            "error": None,
+        },
+    )
+
+    assert plain["attention"] is None
+    assert mismatch["attention"]["code"] == "protection_mismatch"
+    assert "止损价" in mismatch["attention"]["reason"]
+
+
+def _decision(raw_message_id: int, *, severity: str = "normal") -> RecognitionDecision:
+    return RecognitionDecision(
+        raw_message_id=raw_message_id,
+        input_kind="text",
+        authoritative_model="mimo-v2.5",
+        authoritative_status="是策略",
+        authoritative_payload_json="{}",
+        agreement_status="agreed" if severity == "normal" else "disagreed",
+        differences_json="[]",
+        prompt_versions_json="{}",
+        disagreement_severity=severity,
+        updated_at=NOW - timedelta(minutes=30),
+    )
+
+
+def _binding(
+    *,
+    chat_id: int,
+    message_id: int,
+    symbol: str,
+    strategy_instance_id: str,
+    status: str = "open",
+) -> ExecutionBinding:
+    return ExecutionBinding(
+        strategy_instance_id=strategy_instance_id,
+        kol_id=str(chat_id),
+        chat_id=chat_id,
+        message_id=message_id,
+        symbol=symbol,
+        side="long",
+        status=status,
+        updated_at=NOW - timedelta(minutes=20),
+    )
+
+
+def _seed_strategy_records(session_factory) -> dict[str, int]:
+    with session_factory() as session:
+        candidates = []
+        lifecycles = []
+        for index, (chat_id, message_id, symbol, lifecycle_status, stop_loss) in enumerate(
+            [
+                (10, 101, "BTCUSDT", "pending_entry", 65_000.0),
+                (10, 102, "ETHUSDT", "entered", None),
+                (20, 201, "SOLUSDT", "entered", 130.0),
+                (20, 202, "XRPUSDT", "pending_entry", 0.45),
+                (10, 103, "DOGEUSDT", "pending_entry", 0.15),
+            ],
+            start=1,
+        ):
+            candidate = SignalCandidate(
+                raw_message_id=1_000 + index,
+                symbol=symbol,
+                side="long",
+                review_status="approved",
+                created_at=NOW - timedelta(hours=index),
+            )
+            candidates.append(candidate)
+            session.add(candidate)
+            session.flush()
+            lifecycle = StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=chat_id,
+                message_id=message_id,
+                symbol=symbol,
+                side="long",
+                lifecycle_status=lifecycle_status,
+                signal_at=NOW - timedelta(hours=index),
+                entered_at=(
+                    NOW - timedelta(hours=index)
+                    if lifecycle_status == "entered"
+                    else None
+                ),
+                stop_loss=stop_loss,
+                updated_at=NOW - timedelta(minutes=40 + index),
+            )
+            lifecycles.append(lifecycle)
+            session.add(lifecycle)
+
+        session.flush()
+        for candidate in candidates:
+            session.add(_decision(candidate.raw_message_id))
+
+        missing_stop_binding = _binding(
+            chat_id=10,
+            message_id=102,
+            symbol="ETHUSDT",
+            strategy_instance_id="strategy-missing-stop",
+        )
+        failed_binding = _binding(
+            chat_id=10,
+            message_id=103,
+            symbol="DOGEUSDT",
+            strategy_instance_id="strategy-failed",
+            status="rejected",
+        )
+        session.add_all([missing_stop_binding, failed_binding])
+        session.flush()
+        lifecycles[1].execution_binding_id = missing_stop_binding.id
+        lifecycles[1].updated_at = NOW - timedelta(minutes=2)
+        lifecycles[4].execution_binding_id = failed_binding.id
+
+        disagreement = session.query(RecognitionDecision).filter_by(
+            raw_message_id=candidates[3].raw_message_id
+        ).one()
+        disagreement.disagreement_severity = "critical"
+        disagreement.agreement_status = "disagreed"
+        disagreement.updated_at = NOW - timedelta(minutes=5)
+
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=failed_binding.id,
+                strategy_instance_id="strategy-failed",
+                action="open_position",
+                status="failed",
+                chat_id=10,
+                message_id=103,
+                symbol="DOGEUSDT",
+                side="long",
+                created_at=NOW - timedelta(minutes=10),
+            )
+        )
+        session.commit()
+
+        return {
+            "normal": lifecycles[0].id,
+            "missing_stop": lifecycles[1].id,
+            "without_binding": lifecycles[2].id,
+            "disagreement": lifecycles[3].id,
+            "execution_failed": lifecycles[4].id,
+        }
+
+
+def test_load_strategy_record_summaries_orders_attention_and_exposes_stable_shape(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "records.db")
+    ids = _seed_strategy_records(session_factory)
+
+    rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "大镖客", 20: "峰哥"},
+        filter_name="needs_attention",
+        limit=50,
+        now=NOW,
+    )
+
+    assert rows[0].keys() >= {
+        "lifecycle_id",
+        "chat_id",
+        "group_name",
+        "message_id",
+        "symbol",
+        "side",
+        "lifecycle_state",
+        "recognition_state",
+        "execution_state",
+        "attribution_state",
+        "attention",
+        "latest_changed_at",
+        "detail_href",
+    }
+    assert rows[0]["lifecycle_id"] == ids["missing_stop"]
+    assert rows[0]["attention"] == {
+        "severity": "critical",
+        "code": "missing_stop",
+        "label": "真实持仓缺少止损",
+    }
+    assert all(row["attention"] is not None for row in rows)
+    assert [row["attention"]["severity"] for row in rows] == sorted(
+        [row["attention"]["severity"] for row in rows],
+        key={"critical": 0, "warning": 1, "review": 2}.get,
+    )
+    assert {row["attention"]["code"] for row in rows} == {
+        "missing_stop",
+        "entered_without_binding",
+        "recognition_disagreement",
+        "execution_failed",
+    }
+
+
+def test_load_strategy_record_summaries_all_includes_normal_and_filters_group(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "records.db")
+    ids = _seed_strategy_records(session_factory)
+
+    all_rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "大镖客", 20: "峰哥"},
+        filter_name="all",
+        limit=50,
+        now=NOW,
+    )
+    group_rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "大镖客", 20: "峰哥"},
+        filter_name="all",
+        chat_id=20,
+        limit=50,
+        now=NOW,
+    )
+
+    normal_row = next(row for row in all_rows if row["lifecycle_id"] == ids["normal"])
+    assert normal_row["attention"] is None
+    assert normal_row["attention_reasons"] == []
+    assert normal_row["recognition_state"] == "是策略"
+    assert normal_row["detail_href"] == f"/strategy-records/{ids['normal']}"
+    assert {row["chat_id"] for row in group_rows} == {20}
+    assert {row["group_name"] for row in group_rows} == {"峰哥"}
+
+
+def test_missing_candidate_or_authoritative_decision_requires_attention(tmp_path):
+    session_factory = create_session_factory(tmp_path / "missing-recognition.db")
+    with session_factory() as session:
+        unlinked_raw_message = RawMessage(
+            chat_id=10,
+            message_id=702,
+            posted_at=NOW,
+            text="ETH 做多",
+        )
+        session.add(unlinked_raw_message)
+        session.flush()
+        session.add(_decision(unlinked_raw_message.id))
+        candidate = SignalCandidate(raw_message_id=7001, symbol="BTCUSDT", side="long")
+        session.add(candidate)
+        session.flush()
+        without_decision = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=10,
+            message_id=701,
+            symbol="BTCUSDT",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=NOW,
+            stop_loss=65_000,
+            updated_at=NOW,
+        )
+        without_candidate = StrategyLifecycle(
+            chat_id=10,
+            message_id=702,
+            symbol="ETHUSDT",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=NOW - timedelta(minutes=1),
+            stop_loss=2_900,
+            updated_at=NOW - timedelta(minutes=1),
+        )
+        session.add_all([without_decision, without_candidate])
+        session.commit()
+        without_decision_id = without_decision.id
+        without_candidate_id = without_candidate.id
+
+    rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "测试群"},
+        filter_name="needs_attention",
+        limit=10,
+        now=NOW,
+    )
+
+    assert len(rows) == 2
+    assert {row["attention"]["code"] for row in rows} == {
+        "recognition_evidence_missing"
+    }
+    assert {row["recognition_state"] for row in rows} == {"unknown"}
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=without_decision_id,
+        group_labels_by_chat_id={10: "测试群"},
+    )
+    assert detail["overview"]["recognition_evidence_state"] == "missing"
+    assert "recognition_decision" in detail["evidence"]["missing"]
+    unlinked_detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=without_candidate_id,
+        group_labels_by_chat_id={10: "测试群"},
+    )
+    assert unlinked_detail["overview"]["recognition_evidence_state"] == "missing"
+    assert "signal_candidate" in unlinked_detail["evidence"]["missing"]
+
+
+def test_execution_events_fail_closed_when_legacy_strategy_instance_is_not_unique(tmp_path):
+    session_factory = create_session_factory(tmp_path / "event-ownership.db")
+    with session_factory() as session:
+        bindings = [
+            _binding(chat_id=10, message_id=801 + index, symbol="BTCUSDT", strategy_instance_id="reused")
+            for index in range(2)
+        ]
+        session.add_all(bindings)
+        session.flush()
+        lifecycles = []
+        for index, binding in enumerate(bindings):
+            candidate = SignalCandidate(
+                raw_message_id=8_001 + index,
+                symbol="BTCUSDT",
+                side="long",
+            )
+            session.add(candidate)
+            session.flush()
+            session.add(_decision(candidate.raw_message_id))
+            lifecycle = StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=10,
+                message_id=801 + index,
+                symbol="BTCUSDT",
+                side="long",
+                lifecycle_status="pending_entry",
+                signal_at=NOW,
+                execution_binding_id=binding.id,
+                updated_at=NOW,
+            )
+            lifecycles.append(lifecycle)
+            session.add(lifecycle)
+        session.flush()
+        session.add_all(
+            [
+                ExecutionEvent(
+                    execution_binding_id=bindings[0].id,
+                    strategy_instance_id="reused",
+                    action="submit",
+                    status="succeeded",
+                    created_at=NOW,
+                ),
+                ExecutionEvent(
+                    execution_binding_id=None,
+                    strategy_instance_id="reused",
+                    action="legacy-reconcile",
+                    status="failed",
+                    created_at=NOW - timedelta(minutes=1),
+                ),
+            ]
+        )
+        session.commit()
+        lifecycle_ids = [row.id for row in lifecycles]
+
+    rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "测试群"},
+        filter_name="all",
+        limit=10,
+        now=NOW,
+    )
+    by_id = {row["lifecycle_id"]: row for row in rows}
+    assert by_id[lifecycle_ids[0]]["execution_state"] == "succeeded"
+    assert by_id[lifecycle_ids[1]]["execution_state"] == "open"
+    assert "execution_failed" not in {
+        reason["code"] for reason in by_id[lifecycle_ids[0]]["attention_reasons"]
+    }
+    assert "execution_failed" not in {
+        reason["code"] for reason in by_id[lifecycle_ids[1]]["attention_reasons"]
+    }
+    attention_rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "测试群"},
+        filter_name="needs_attention",
+        limit=10,
+        now=NOW,
+    )
+    assert attention_rows == []
+
+    first_detail = load_strategy_record_detail(
+        session_factory, lifecycle_id=lifecycle_ids[0], group_labels_by_chat_id={10: "测试群"}
+    )
+    second_detail = load_strategy_record_detail(
+        session_factory, lifecycle_id=lifecycle_ids[1], group_labels_by_chat_id={10: "测试群"}
+    )
+    assert [event["action"] for event in first_detail["execution"]["events"]] == ["submit"]
+    assert second_detail["execution"]["events"] == []
+
+
+def test_execution_events_use_null_binding_legacy_fallback_when_binding_is_unique(tmp_path):
+    session_factory = create_session_factory(tmp_path / "unique-legacy-event.db")
+    with session_factory() as session:
+        candidate = SignalCandidate(raw_message_id=8_100, symbol="ETHUSDT", side="long")
+        session.add(candidate)
+        session.flush()
+        session.add(_decision(candidate.raw_message_id))
+        binding = _binding(
+            chat_id=10,
+            message_id=810,
+            symbol="ETHUSDT",
+            strategy_instance_id="unique-legacy",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=10,
+            message_id=810,
+            symbol="ETHUSDT",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=NOW,
+            execution_binding_id=binding.id,
+            updated_at=NOW,
+        )
+        session.add(lifecycle)
+        session.flush()
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=None,
+                strategy_instance_id="unique-legacy",
+                action="legacy-submit",
+                status="failed",
+                created_at=NOW,
+            )
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "测试群"},
+        filter_name="needs_attention",
+        limit=10,
+        now=NOW,
+    )
+    assert [row["lifecycle_id"] for row in rows] == [lifecycle_id]
+    assert "execution_failed" in {
+        reason["code"] for reason in rows[0]["attention_reasons"]
+    }
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={10: "测试群"},
+    )
+    assert [event["action"] for event in detail["execution"]["events"]] == [
+        "legacy-submit"
+    ]
+
+
+def test_needs_attention_is_not_hidden_by_newer_normal_records(tmp_path):
+    session_factory = create_session_factory(tmp_path / "records.db")
+    with session_factory() as session:
+        for index in range(101):
+            candidate = SignalCandidate(
+                raw_message_id=20_000 + index,
+                symbol="BTCUSDT",
+                side="long",
+            )
+            session.add(candidate)
+            session.flush()
+            session.add_all(
+                [
+                    _decision(candidate.raw_message_id),
+                    StrategyLifecycle(
+                        signal_candidate_id=candidate.id,
+                        chat_id=10,
+                        message_id=1_000 + index,
+                        symbol="BTCUSDT",
+                        side="long",
+                        lifecycle_status="pending_entry",
+                        signal_at=NOW - timedelta(minutes=index),
+                        stop_loss=65_000.0,
+                        updated_at=NOW - timedelta(minutes=index),
+                    ),
+                ]
+            )
+        critical = StrategyLifecycle(
+            chat_id=20,
+            message_id=999,
+            symbol="ETHUSDT",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW - timedelta(days=2),
+            entered_at=NOW - timedelta(days=2),
+            stop_loss=2_900.0,
+            updated_at=NOW - timedelta(days=2),
+        )
+        session.add(critical)
+        session.commit()
+        critical_id = critical.id
+
+    rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "大镖客", 20: "峰哥"},
+        filter_name="needs_attention",
+        limit=10,
+        now=NOW,
+    )
+
+    assert [row["lifecycle_id"] for row in rows] == [critical_id]
+    assert rows[0]["attention"]["code"] == "recognition_evidence_missing"
+    assert "entered_without_binding" in {
+        reason["code"] for reason in rows[0]["attention_reasons"]
+    }
+
+
+def test_attention_reasons_and_latest_changed_at_include_all_batched_sources(tmp_path):
+    session_factory = create_session_factory(tmp_path / "records.db")
+    with session_factory() as session:
+        candidate = SignalCandidate(
+            raw_message_id=7_001,
+            symbol="BTCUSDT",
+            side="long",
+            created_at=NOW - timedelta(hours=6),
+        )
+        session.add(candidate)
+        session.flush()
+        decision = RecognitionDecision(
+            raw_message_id=candidate.raw_message_id,
+            input_kind="text",
+            authoritative_model="mimo-v2.5",
+            authoritative_status="识别失败",
+            authoritative_payload_json="{}",
+            agreement_status="disagreed",
+            differences_json="[]",
+            prompt_versions_json="{}",
+            disagreement_severity="critical",
+            updated_at=NOW - timedelta(hours=4),
+        )
+        binding = _binding(
+            chat_id=10,
+            message_id=701,
+            symbol="BTCUSDT",
+            strategy_instance_id="strategy-multiple-reasons",
+        )
+        binding.updated_at = NOW - timedelta(hours=3)
+        session.add_all([decision, binding])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=10,
+            message_id=701,
+            symbol="BTCUSDT",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW - timedelta(hours=8),
+            entered_at=NOW - timedelta(hours=7),
+            stop_loss=None,
+            execution_binding_id=binding.id,
+            updated_at=NOW - timedelta(hours=5),
+        )
+        session.add(lifecycle)
+        session.flush()
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                action="open_position",
+                status="succeeded",
+                created_at=NOW - timedelta(hours=2),
+            )
+        )
+        latest_at = NOW - timedelta(minutes=1)
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="multi-reason-batch",
+                raw_message_id=candidate.raw_message_id,
+                recognition_decision_id=decision.id,
+                recognition_generation="mimo_only_v2",
+                target_lifecycle_id=lifecycle.id,
+                strategy_instance_id=str(binding.strategy_instance_id),
+                execution_binding_id=binding.id,
+                intent="risk_update",
+                effective_action="move_stop",
+                execution_mode="live",
+                status="reconciling",
+                target_fingerprint="target-multiple-reasons",
+                planned_at=NOW - timedelta(hours=1),
+                updated_at=latest_at,
+            )
+        )
+        session.commit()
+
+    rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "大镖客"},
+        filter_name="needs_attention",
+        limit=10,
+        now=NOW,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["attention"] == {
+        "severity": "critical",
+        "code": "recognition_failed",
+        "label": "AI识别失败",
+    }
+    assert [reason["code"] for reason in rows[0]["attention_reasons"]] == [
+        "recognition_failed",
+        "recognition_disagreement",
+        "missing_stop",
+        "management_unconfirmed",
+    ]
+    assert rows[0]["latest_changed_at"] == latest_at
+
+
+def test_critical_attention_precedes_newer_review_rows_before_limit(tmp_path):
+    session_factory = create_session_factory(tmp_path / "records.db")
+    with session_factory() as session:
+        for index in range(11):
+            candidate = SignalCandidate(
+                raw_message_id=9_000 + index,
+                symbol="XRPUSDT",
+                side="long",
+            )
+            session.add(candidate)
+            session.flush()
+            session.add(_decision(candidate.raw_message_id, severity="critical"))
+            session.add(
+                StrategyLifecycle(
+                    signal_candidate_id=candidate.id,
+                    chat_id=10,
+                    message_id=9_000 + index,
+                    symbol="XRPUSDT",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=NOW - timedelta(minutes=index),
+                    stop_loss=0.45,
+                    updated_at=NOW - timedelta(minutes=index),
+                )
+            )
+        critical = StrategyLifecycle(
+            chat_id=20,
+            message_id=8_999,
+            symbol="ETHUSDT",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW - timedelta(days=2),
+            entered_at=NOW - timedelta(days=2),
+            stop_loss=2_900.0,
+            updated_at=NOW - timedelta(days=2),
+        )
+        session.add(critical)
+        session.commit()
+        critical_id = critical.id
+
+    rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "大镖客", 20: "峰哥"},
+        filter_name="needs_attention",
+        limit=10,
+        now=NOW,
+    )
+
+    assert len(rows) == 10
+    assert rows[0]["lifecycle_id"] == critical_id
+    assert rows[0]["attention"]["severity"] == "critical"
+    assert all(row["attention"]["severity"] == "review" for row in rows[1:])
+
+
+def test_loader_query_count_does_not_scale_with_strategy_count(tmp_path):
+    session_factory = create_session_factory(tmp_path / "records.db")
+    _seed_strategy_records(session_factory)
+    engine = session_factory.kw["bind"]
+    select_count = 0
+
+    def count_selects(_connection, _cursor, statement, _parameters, _context, _many):
+        nonlocal select_count
+        if statement.lstrip().upper().startswith("SELECT"):
+            select_count += 1
+
+    event.listen(engine, "before_cursor_execute", count_selects)
+    try:
+        load_strategy_record_summaries(
+            session_factory,
+            group_labels_by_chat_id={10: "大镖客", 20: "峰哥"},
+            filter_name="all",
+            limit=50,
+            now=NOW,
+        )
+        baseline_count = select_count
+        with session_factory() as session:
+            for index in range(20):
+                session.add(
+                    StrategyLifecycle(
+                        chat_id=30,
+                        message_id=8_000 + index,
+                        symbol="SOLUSDT",
+                        side="long",
+                        lifecycle_status="pending_entry",
+                        signal_at=NOW - timedelta(days=1, minutes=index),
+                        updated_at=NOW - timedelta(days=1, minutes=index),
+                    )
+                )
+            session.commit()
+        select_count = 0
+        load_strategy_record_summaries(
+            session_factory,
+            group_labels_by_chat_id={10: "大镖客", 20: "峰哥", 30: "测试组"},
+            filter_name="all",
+            limit=50,
+            now=NOW,
+        )
+        expanded_count = select_count
+    finally:
+        event.remove(engine, "before_cursor_execute", count_selects)
+
+    assert baseline_count == expanded_count == 8

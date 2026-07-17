@@ -1,0 +1,228 @@
+{% extends "base.html" %}
+
+{% block title %}{{ record.identity.symbol or '策略' }} 记录 #{{ record.identity.lifecycle_id }}{% endblock %}
+{% block body_class %}strategy-record-page{% endblock %}
+
+{% block body %}
+<main class="home-dashboard strategy-record-detail" data-strategy-record-detail>
+  <nav class="strategy-record-back" aria-label="返回策略记录">
+    <a href="{{ return_href }}">← 返回策略记录</a>
+  </nav>
+
+  <header class="panel panel-heading">
+    <div>
+      <small>{{ record.identity.group_name }} · 消息 #{{ record.identity.message_id }}</small>
+      <h1>{{ record.identity.symbol or '未知币种' }} · {{ record.identity.side or '方向未知' }}</h1>
+      <p>策略记录 #{{ record.identity.lifecycle_id }}</p>
+    </div>
+  </header>
+
+  <section class="panel" aria-labelledby="strategy-overview-title" data-strategy-detail-section="overview">
+    <h2 id="strategy-overview-title">概览</h2>
+    <dl>
+      <dt>策略状态</dt><dd>{{ record.overview.lifecycle_status }}</dd>
+      <dt>AI 主判模型</dt><dd>{{ record.overview.authoritative_model or '证据缺失' }}</dd>
+      <dt>AI 识别状态</dt><dd>{{ record.overview.authoritative_status }}</dd>
+      <dt>AI 权威证据</dt><dd>{% if record.overview.recognition_evidence_state == 'present' %}已记录{% else %}缺失，需人工核对{% endif %}</dd>
+      <dt>模型一致性</dt><dd>{{ record.overview.agreement_status }}</dd>
+      <dt>入场区间</dt><dd>{{ record.overview.entry_range_low or '-' }} – {{ record.overview.entry_range_high or '-' }}</dd>
+      <dt>止损</dt><dd>{{ record.overview.stop_loss or '未设置' }}</dd>
+      <dt>止盈</dt>
+      <dd>
+        <span class="strategy-value-list" data-strategy-take-profits>
+          {% if record.overview.take_profit is iterable and record.overview.take_profit is not string %}
+            {% for value in record.overview.take_profit %}<span class="strategy-value-chip">{{ value }}</span>{% endfor %}
+          {% else %}
+            <span class="strategy-value-chip">{{ record.overview.take_profit or '未设置' }}</span>
+          {% endif %}
+        </span>
+      </dd>
+    </dl>
+  </section>
+
+  <section class="panel" aria-labelledby="strategy-timeline-title" data-strategy-detail-section="timeline">
+    <h2 id="strategy-timeline-title">时间线</h2>
+    <ol>
+      {% for item in record.timeline %}
+        <li>
+          <time datetime="{{ item.timestamp or '' }}">{{ item.timestamp or '时间缺失' }}</time>
+          <strong>{{ item.kind }}</strong>
+          <span>{{ item.status }}{% if item.role %} · {{ item.role }}{% endif %}</span>
+        </li>
+      {% else %}
+        <li>暂无时间线证据</li>
+      {% endfor %}
+    </ol>
+  </section>
+
+  <section
+    class="panel{% if exchange.state == 'unknown' %} is-stale{% endif %}"
+    aria-labelledby="strategy-execution-title"
+    data-strategy-detail-section="execution"
+    data-exchange-state="{{ exchange.state }}"
+  >
+    <h2 id="strategy-execution-title">执行与真实持仓</h2>
+    <p role="status">{{ exchange.message }}</p>
+    {% if exchange.reasons %}<p>归属证据：{{ exchange.reasons | join('、') }}</p>{% endif %}
+    <dl>
+      <dt>归属状态</dt><dd>{{ exchange.state }}</dd>
+      <dt>pos_id</dt><dd><span class="strategy-identifier">{{ record.execution.binding.pos_id if record.execution.binding else '未绑定' }}</span></dd>
+      <dt>订单腿</dt><dd>{{ record.execution.order_legs | length }}</dd>
+      <dt>执行事件</dt><dd>{{ record.execution.events | length }}</dd>
+      <dt>仓位管理批次</dt><dd>{{ record.execution.management_batches | length }}</dd>
+    </dl>
+
+    {% if record.execution.binding %}
+      <article aria-labelledby="execution-binding-title">
+        <h3 id="execution-binding-title">执行绑定</h3>
+        <dl>
+          <dt>数据库 binding ID</dt><dd><span class="strategy-identifier">{{ record.execution.binding.id }}</span></dd>
+          <dt>strategy_instance_id</dt><dd><span class="strategy-identifier">{{ record.execution.binding.strategy_instance_id or '-' }}</span></dd>
+          <dt>交易所</dt><dd>{{ record.execution.binding.venue or '-' }}</dd>
+          <dt>归属消息</dt><dd>chat {{ record.execution.binding.chat_id }} · message {{ record.execution.binding.message_id }}</dd>
+          <dt>pos_id</dt><dd><span class="strategy-identifier">{{ record.execution.binding.pos_id or '-' }}</span></dd>
+          <dt>交易所订单 ID</dt><dd><span class="strategy-identifier">{{ record.execution.binding.order_id or '-' }}</span></dd>
+          <dt>客户端订单 ID</dt><dd><span class="strategy-identifier">{{ record.execution.binding.client_order_id or '-' }}</span></dd>
+          <dt>状态</dt><dd>{{ record.execution.binding.status }} · {{ record.execution.binding.last_exchange_status or '无交易所状态' }}</dd>
+        </dl>
+        <details>
+          <summary>查看绑定载荷（已脱敏）</summary>
+          <pre>{{ record.execution.binding.payload | tojson(indent=2) }}</pre>
+        </details>
+      </article>
+    {% else %}
+      <p>执行绑定证据缺失</p>
+    {% endif %}
+
+    <div aria-label="订单腿证据">
+      <h3>订单腿</h3>
+      {% for leg in record.execution.order_legs %}
+        <article>
+          <h4>订单腿 #{{ leg.id }} · {{ leg.purpose }} · {{ leg.status }}</h4>
+          <dl>
+            <dt>binding ID</dt><dd><span class="strategy-identifier">{{ leg.execution_binding_id }}</span></dd>
+            <dt>leg index</dt><dd>{{ leg.leg_index }}</dd>
+            <dt>订单类型</dt><dd>{{ leg.order_kind }}</dd>
+            <dt>pos_id</dt><dd><span class="strategy-identifier">{{ leg.pos_id or '-' }}</span></dd>
+            <dt>交易所订单 ID</dt><dd><span class="strategy-identifier">{{ leg.order_id or '-' }}</span></dd>
+            <dt>客户端订单 ID</dt><dd><span class="strategy-identifier">{{ leg.client_order_id or '-' }}</span></dd>
+            <dt>归属状态</dt><dd>{{ leg.attribution_status }}</dd>
+          </dl>
+          <details>
+            <summary>查看订单腿请求、响应与归属证据</summary>
+            <pre>{{ {"attribution": leg.attribution_evidence, "request": leg.request, "response": leg.response} | tojson(indent=2) }}</pre>
+          </details>
+        </article>
+      {% else %}
+        <p>暂无订单腿</p>
+      {% endfor %}
+    </div>
+
+    <div aria-label="执行事件证据">
+      <h3>执行事件</h3>
+      {% for event in record.execution.events %}
+        <article>
+          <h4>执行事件 #{{ event.id }} · {{ event.action }} · {{ event.status }}</h4>
+          <dl>
+            <dt>binding ID</dt><dd><span class="strategy-identifier">{{ event.execution_binding_id or '-' }}</span></dd>
+            <dt>strategy_instance_id</dt><dd><span class="strategy-identifier">{{ event.strategy_instance_id or '-' }}</span></dd>
+            <dt>source message ID</dt><dd>{{ event.source_message_id or '-' }}</dd>
+            <dt>pos_id</dt><dd><span class="strategy-identifier">{{ event.pos_id or '-' }}</span></dd>
+            <dt>交易所订单 ID</dt><dd><span class="strategy-identifier">{{ event.order_id or '-' }}</span></dd>
+            <dt>客户端订单 ID</dt><dd><span class="strategy-identifier">{{ event.client_order_id or '-' }}</span></dd>
+            <dt>原因</dt><dd>{{ event.reason or '-' }}</dd>
+            <dt>交易所时间</dt><dd>{{ event.exchange_event_time or '-' }}</dd>
+          </dl>
+          <details>
+            <summary>查看执行前后、请求与响应</summary>
+            <pre>{{ {"before": event.before, "after": event.after, "request": event.request, "response": event.response} | tojson(indent=2) }}</pre>
+          </details>
+        </article>
+      {% else %}
+        <p>暂无执行事件</p>
+      {% endfor %}
+    </div>
+
+    <div aria-label="仓位管理证据">
+      <h3>仓位管理批次</h3>
+      {% for batch in record.execution.management_batches %}
+        <article
+          data-management-lifecycle-id="{{ batch.target_lifecycle_id }}"
+          data-management-binding-id="{{ batch.execution_binding_id }}"
+        >
+          <h4>管理批次 #{{ batch.id }} · {{ batch.intent }} → {{ batch.effective_action }}</h4>
+          <dl>
+            <dt>raw_message ID</dt><dd>{{ batch.raw_message_id }}</dd>
+            <dt>recognition_decision ID</dt><dd>{{ batch.recognition_decision_id }}</dd>
+            <dt>lifecycle ID</dt><dd>{{ batch.target_lifecycle_id }}</dd>
+            <dt>binding ID</dt><dd>{{ batch.execution_binding_id }}</dd>
+            <dt>strategy_instance_id</dt><dd>{{ batch.strategy_instance_id }}</dd>
+            <dt>执行模式</dt><dd>{{ batch.execution_mode }}</dd>
+            <dt>状态</dt><dd>{{ batch.status }} · {{ batch.reason_code or '无原因码' }}</dd>
+            <dt>对账时间</dt><dd>{{ batch.reconciled_at or '未对账' }}</dd>
+            <dt>完成时间</dt><dd>{{ batch.completed_at or '未完成' }}</dd>
+          </dl>
+          <details>
+            <summary>查看管理目标快照</summary>
+            <pre>{{ batch.target_snapshot | tojson(indent=2) }}</pre>
+          </details>
+          {% for leg in batch.legs %}
+            <section
+              aria-labelledby="management-leg-{{ batch.id }}-{{ leg.id }}"
+              data-management-position-id="{{ leg.pos_id }}"
+              data-management-leg-status="{{ leg.status }}"
+            >
+              <h5 id="management-leg-{{ batch.id }}-{{ leg.id }}">管理腿 #{{ leg.id }} · index {{ leg.leg_index }}</h5>
+              <dl>
+                <dt>execution_order_leg ID</dt><dd>{{ leg.execution_order_leg_id }}</dd>
+                <dt>pos_id</dt><dd><span class="strategy-identifier">{{ leg.pos_id }}</span></dd>
+                <dt>状态</dt><dd>{{ leg.status }}</dd>
+                <dt>执行前数量</dt><dd>{{ leg.preflight_size or '-' }}</dd>
+                <dt>计划平仓数量</dt><dd>{{ leg.planned_close_size or '-' }}</dd>
+                <dt>客户端订单 ID</dt><dd><span class="strategy-identifier">{{ leg.client_order_id or '-' }}</span></dd>
+                <dt>交易所订单 ID</dt><dd><span class="strategy-identifier">{{ leg.exchange_order_id or '-' }}</span></dd>
+                <dt>最后错误（已脱敏）</dt><dd>{% if leg.last_error %}<pre>{{ leg.last_error | tojson(indent=2) }}</pre>{% else %}无{% endif %}</dd>
+              </dl>
+              <details>
+                <summary>查看管理腿请求、响应、保护与对账快照</summary>
+                <pre>{{ {"request": leg.request, "response": leg.response, "old_tpsl": leg.old_tpsl, "planned_tpsl": leg.planned_tpsl, "last_exchange_snapshot": leg.last_exchange_snapshot} | tojson(indent=2) }}</pre>
+              </details>
+            </section>
+          {% else %}
+            <p>该批次暂无管理腿</p>
+          {% endfor %}
+        </article>
+      {% else %}
+        <p>暂无仓位管理批次</p>
+      {% endfor %}
+    </div>
+
+    {% if exchange.position %}
+      <details>
+        <summary>查看 Deepcoin 实时证据</summary>
+        <pre>{{ exchange.position | tojson(indent=2) }}</pre>
+      </details>
+    {% endif %}
+  </section>
+
+  <section class="panel" aria-labelledby="strategy-evidence-title" data-strategy-detail-section="evidence">
+    <h2 id="strategy-evidence-title">原始证据</h2>
+    {% if record.evidence.raw_message %}
+      <article>
+        <h3>入场消息</h3>
+        <p class="strategy-evidence-text" data-strategy-message-evidence>{{ record.evidence.raw_message.text or '空消息' }}</p>
+        <small>raw_message_id: {{ record.evidence.raw_message.id }}</small>
+      </article>
+    {% else %}
+      <p>入场消息证据缺失</p>
+    {% endif %}
+    <details>
+      <summary>查看 AI 识别证据</summary>
+      <pre>{{ record.evidence.recognition_decision | tojson(indent=2) }}</pre>
+    </details>
+    {% if record.evidence.missing %}
+      <p>缺失证据：{{ record.evidence.missing | join('、') }}</p>
+    {% endif %}
+  </section>
+</main>
+{% endblock %}

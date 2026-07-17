@@ -23,7 +23,7 @@ def test_management_batch_assets_only_load_read_only_api(tmp_path):
     assert "view === 'management-batches'" in js
     assert "group-context-success" in js
     assert "ensureWorkbenchViewLoaded('management-batches', { force: true })" in js
-    assert "view === 'strategies' || view === 'messages' || view === 'management-batches'" in js
+    assert "view === 'activity' || view === 'groups' || view === 'management-batches'" in js
     assert "method: 'POST'" not in management_slice
     assert "management-batch-card" in css
     for forbidden in ("retryManagementBatch", "closeManagementBatch", "cancelManagementBatch"):
@@ -255,6 +255,51 @@ def test_app_css_includes_mobile_first_workbench_visual_contract(tmp_path):
     assert "env(safe-area-inset-bottom" in css
 
 
+def test_strategy_record_css_exposes_phone_first_accessibility_contract(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    css = client.get("/static/app.css").text
+
+    assert ".strategy-record-card" in css
+    assert ".strategy-record-detail" in css
+    assert "min-height: 44px" in css
+    assert "env(safe-area-inset-bottom)" in css
+    assert "overflow-wrap: anywhere" in css
+    assert "@media (min-width: 761px)" in css
+    assert ":focus-visible" in css
+
+
+def test_strategy_record_css_resets_legacy_event_grid_and_wraps_detail_terms(tmp_path):
+    css = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.css"
+    ).text
+
+    assert ".strategy-record-card.home-event-card {" in css
+    assert ".strategy-record-card.home-event-card .strategy-record-statuses {" in css
+    assert ".strategy-record-card.home-event-card .strategy-record-attention-label {" in css
+    card_start = css.index(".strategy-record-card.home-event-card {")
+    card_block = css[card_start : css.index("}", card_start)]
+    statuses_start = css.index(
+        ".strategy-record-card.home-event-card .strategy-record-statuses {"
+    )
+    statuses_block = css[statuses_start : css.index("}", statuses_start)]
+    attention_start = css.index(
+        ".strategy-record-card.home-event-card .strategy-record-attention-label {"
+    )
+    attention_block = css[attention_start : css.index("}", attention_start)]
+    detail_term_start = css.index(".strategy-record-detail dt {")
+    detail_term_block = css[detail_term_start : css.index("}", detail_term_start)]
+
+    assert "grid-template-columns: minmax(0, 1fr);" in card_block
+    for block in (statuses_block, attention_block):
+        assert "grid-column: 1 / -1;" in block
+        assert "grid-row: auto;" in block
+        assert "align-self: auto;" in block
+    assert "color: inherit;" in statuses_block
+    assert "color: #fde68a;" in attention_block
+    assert "overflow-wrap: anywhere;" in detail_term_block
+
+
 def test_group_context_responsive_contract(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
     css = client.get("/static/app.css").text
@@ -284,15 +329,124 @@ def test_app_js_lazy_loads_workbench_destinations_without_forced_startup_refresh
 
     assert "workbenchLoadState" in js
     assert "ensureWorkbenchViewLoaded" in js
-    assert "loadHomeDashboard" in js
+    assert "loadStrategyRecords" in js
+    assert "'/strategy-records?filter=needs_attention'" in js
     assert "loadPositionsPanel" in js
-    assert "bindHomeEventNavigation" in js
-    assert "bindHomeEventNavigation();" in js
-    assert "[data-home-dashboard] [data-workbench-view]" in js
+    assert "fetch(`/strategy-records?${params}`, { cache: 'no-store' })" in js
     assert js.count("bindWorkflowFilters();") >= 5
     assert "workflowFilterBound" in js
     assert "refreshFromDatabaseChanges({ force: true });" not in js
     assert "scheduleRecoveryRefresh" in js
+
+
+def test_strategy_record_controller_persists_independent_scope_and_guards_stale_responses(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+
+    assert "telegram-workbench:strategy-filter" in js
+    assert "telegram-workbench:strategy-group" in js
+    assert "telegram-workbench:strategy-scroll" in js
+    assert "let strategyRecordRequestId = 0;" in js
+    assert "let strategyRecordHasPendingChanges = false;" in js
+    load_start = js.index("async function loadStrategyRecords")
+    load_end = js.index("\nasync function ", load_start + 1)
+    load_block = js[load_start:load_end]
+    assert "const requestId = ++strategyRecordRequestId;" in load_block
+    assert "if (requestId !== strategyRecordRequestId) return false;" in load_block
+    assert load_block.index("if (requestId !== strategyRecordRequestId) return false;") < load_block.index(
+        "replaceStrategyRecordList"
+    )
+
+
+def test_strategy_record_controller_defers_live_changes_and_preserves_last_success(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+
+    assert "function noteStrategyRecordChanges" in js
+    assert "strategyRecordHasPendingChanges = true;" in js
+    assert "有新变化，点击查看" in js
+    assert "条新变化" not in js
+    assert "force: true, revealChanges: true, scrollMode: 'preserve'" in js
+    assert "showStrategyRecordLoadError" in js
+    assert "lastSuccessfulStrategyRecordAt" in js
+    assert "bindStrategyRecordController();" in js
+    assert "saveStrategyRecordScrollPosition" in js
+    assert "restoreStrategyRecordScrollPosition" in js
+    load_start = js.index("async function loadStrategyRecords")
+    load_end = js.index("\nasync function ", load_start + 1)
+    load_block = js[load_start:load_end]
+    assert "if (revealChanges) strategyRecordHasPendingChanges = false;" in load_block
+    assert load_block.index("if (requestId !== strategyRecordRequestId) return false;") < load_block.index(
+        "if (revealChanges) strategyRecordHasPendingChanges = false;"
+    )
+    assert "if (force || revealChanges)" not in load_block
+
+
+def test_strategy_record_reconnect_marks_changes_without_reloading_the_page(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    start = js.index("function connectLiveUpdates")
+    end = js.index("\nfunction startPollingUpdates", start)
+    block = js[start:end]
+
+    assert "source.onopen" in block
+    assert "noteStrategyRecordChanges();" in block
+    assert "state: 'monitoring'" in block
+    assert "window.location.reload" not in block
+
+
+def test_strategy_record_filter_and_group_commit_only_after_guarded_success(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    load_start = js.index("async function loadStrategyRecords")
+    load_end = js.index("\nasync function ", load_start + 1)
+    load_block = js[load_start:load_end]
+    catch_block = load_block[load_block.index("} catch (error) {"):]
+
+    assert "lastSuccessfulStrategyRecordSelection" in js
+    assert "commitSuccessfulStrategyRecordSelection" in load_block
+    assert load_block.index("if (requestId !== strategyRecordRequestId) return false;") < load_block.index(
+        "commitSuccessfulStrategyRecordSelection"
+    )
+    assert "if (strategyRecordSelectionMatches(selection))" in catch_block
+    assert "rollbackStrategyRecordSelection();" in catch_block
+    assert catch_block.index("if (requestId !== strategyRecordRequestId) return false;") < catch_block.index(
+        "rollbackStrategyRecordSelection();"
+    )
+    assert js.count("strategyRecordStorageSet(STRATEGY_RECORD_FILTER_KEY") == 1
+    assert js.count("strategyRecordStorageSet(STRATEGY_RECORD_GROUP_KEY") == 1
+    assert "scrollMode: 'reset'" in js
+
+
+def test_strategy_record_scroll_modes_reset_scope_changes_and_restore_returns(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+
+    assert "function resetStrategyRecordScrollPosition" in js
+    assert "function replaceStrategyRecordList(fragment, { scrollMode })" in js
+    assert "if (scrollMode === 'reset')" in js
+    assert "resetStrategyRecordScrollPosition();" in js
+    assert "restoreStrategyRecordScrollPosition();" in js
+    assert "scrollMode: 'reset'" in js
+    assert "scrollMode: 'preserve'" in js
+
+
+def test_strategy_record_scroll_restore_only_runs_when_the_list_is_mounted(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    ready_start = js.index("window.addEventListener('DOMContentLoaded'")
+    ready_block = js[ready_start:]
+    guard = "if (document.querySelector('[data-strategy-record-list]')) {"
+
+    assert guard in ready_block
+    guard_start = ready_block.index(guard)
+    guard_end = ready_block.index("\n  }", guard_start)
+    assert "restoreStrategyRecordScrollPosition();" in ready_block[guard_start:guard_end]
+    assert "restoreStrategyRecordScrollPosition();" not in ready_block[:guard_start]
 
 
 def test_app_js_restores_persisted_group_as_state_without_clicking_it(tmp_path):
@@ -316,9 +470,9 @@ def test_app_js_binds_mobile_work_navigation_to_existing_dashboard_views(tmp_pat
 
     assert response.status_code == 200
     assert "function bindMobileWorkNavigation" in response.text
-    assert "[data-mobile-work-view]" in response.text
-    assert "setMobileWorkView('overview')" in response.text
-    assert '[data-dashboard-tab="exchange-positions"]' in response.text
+    assert "[data-workbench-view]" in response.text
+    assert "const WORKBENCH_VIEWS = ['strategies', 'positions', 'activity', 'groups', 'more'];" in response.text
+    assert "view === 'positions' ? 'exchange-positions' : null" in response.text
     assert "bindMobileWorkNavigation();" in response.text
 
 
@@ -337,6 +491,104 @@ def test_app_js_binds_workbench_navigation_and_home_event_filters(tmp_path):
     assert "function bindGroupContext" in response.text
     assert "telegram-workbench:selected-group" in response.text
     assert "[data-group-picker-search]" in response.text
+
+
+def test_app_js_defaults_to_strategy_records_and_keeps_orphan_position_deep_link(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+
+    assert "home: { key: null, promise: null }" not in js
+    assert "activity: { key: null, promise: null }" in js
+    assert "groups: { key: null, promise: null }" in js
+    assert "setWorkbenchView(requestedView || 'strategies')" in js
+    assert "params.get('view')" in js
+    assert "setWorkbenchView('positions')" in js
+
+
+def test_app_js_schedules_initial_requested_view_after_first_paint(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+
+    scheduler_start = js.index("function scheduleInitialWorkbenchView")
+    scheduler_end = js.index("\nfunction ", scheduler_start + 1)
+    scheduler = js[scheduler_start:scheduler_end]
+    dom_ready_start = js.index("window.addEventListener('DOMContentLoaded'")
+    dom_ready = js[dom_ready_start:]
+
+    assert scheduler.count("window.requestAnimationFrame") >= 2
+    assert "setWorkbenchView(requestedView || 'strategies')" in scheduler
+    assert "scheduleInitialWorkbenchView();" in dom_ready
+    assert "setWorkbenchView(requestedView || 'strategies')" not in dom_ready
+    assert "focusRequestedPosition().catch(() => {});" not in dom_ready
+    assert "await ensureWorkbenchViewLoaded('positions')" in scheduler
+
+
+def test_workbench_loader_returns_explicit_success_for_every_path(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    start = js.index("async function ensureWorkbenchViewLoaded")
+    end = js.index("\nasync function focusRequestedPosition", start)
+    block = js[start:end]
+
+    assert "if (!state) return false" in block
+    assert "state.key === key) return true" in block
+    assert "if (state.promise) return state.promise" in block
+    assert "if (!loaded)" in block
+    assert "return false" in block
+    assert "return true" in block
+    assert ".catch((error) =>" not in block
+    assert "catch (error)" in block
+    assert "showWorkbenchLoadError(view, error)" in block
+
+
+def test_activity_and_settings_failures_keep_a_visible_retry_surface(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+
+    activity_start = js.index("async function retryActivityAfterGroups")
+    activity_end = js.index("\nasync function ", activity_start + 1)
+    activity_retry = js[activity_start:activity_end]
+    ensure_start = js.index("async function ensureWorkbenchViewLoaded")
+    ensure_end = js.index("\nasync function focusRequestedPosition", ensure_start)
+    ensure_block = js[ensure_start:ensure_end]
+    settings_start = js.index("async function openDashboardPanel")
+    settings_end = js.index("\nfunction bindDashboardTabs", settings_start)
+    settings_block = js[settings_start:settings_end]
+    bind_start = js.index("function bindDashboardTabs")
+    bind_end = js.index("\nfunction bindWorkbenchNavigation", bind_start)
+    bind_block = js[bind_start:bind_end]
+
+    assert "ensureWorkbenchViewLoaded('groups', { force: true })" in activity_retry
+    assert "ensureWorkbenchViewLoaded('activity', { force: true })" in activity_retry
+    assert "showActivityBootstrapError" in ensure_block
+    assert "if (!groupsLoaded || !getSelectedChatId())" in ensure_block
+    assert "const moreLoaded = await ensureWorkbenchViewLoaded('more')" in settings_block
+    assert "const targetPanel = document.querySelector" in settings_block
+    assert "if (!moreLoaded || !targetPanel)" in settings_block
+    assert "showDashboardPanelLoadError" in settings_block
+    assert settings_block.index("if (!moreLoaded || !targetPanel)") < settings_block.index(
+        "dashboard.dataset.activeWorkbenchView = 'settings'"
+    )
+    assert ".catch((error) => showDashboardPanelLoadError(tab, error))" in bind_block
+
+
+def test_missing_settings_target_retry_forces_more_panel_refetch(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    retry_start = js.index("async function retryDashboardPanelLoad")
+    retry_end = js.index("\nfunction ", retry_start + 1)
+    retry_block = js[retry_start:retry_end]
+    error_start = js.index("function showDashboardPanelLoadError")
+    error_end = js.index("\nfunction ", error_start + 1)
+    error_block = js[error_start:error_end]
+
+    assert "workbenchLoadState.more.key = null" in retry_block
+    assert "ensureWorkbenchViewLoaded('more', { force: true })" in retry_block
+    assert "return openDashboardPanel(tab)" in retry_block
+    assert "retryDashboardPanelLoad(tab)" in error_block
 
 
 def test_app_js_coordinates_workbench_and_settings_as_one_primary_surface(tmp_path):

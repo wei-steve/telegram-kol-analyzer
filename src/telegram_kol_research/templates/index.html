@@ -54,12 +54,13 @@
 
   {% include "_workbench_nav.html" %}
 
-  <section class="workbench-panel is-active" data-workbench-panel="home">
-    <div data-lazy-workbench="home" aria-busy="true">
-      {% with loading_text='正在加载首页实时数据…' %}{% include "_workbench_loading.html" %}{% endwith %}
+  <section class="workbench-panel is-active" data-workbench-panel="strategies">
+    <div data-lazy-workbench="strategies" data-strategy-records-url="/strategy-records?filter=needs_attention" aria-busy="true">
+      {% with loading_text='正在加载待处理策略记录…' %}{% include "_workbench_loading.html" %}{% endwith %}
     </div>
   </section>
 
+  {% if render_deferred_more %}
   <section class="dashboard-tab-panel" data-dashboard-panel="prompt">
     {% include "_ai_prompt_center.html" %}
     {# Legacy YAML prompt editor retained only in source history; runtime editing now uses the registry. #}
@@ -370,6 +371,7 @@
       </form>
     </section>
   </section>
+  {% endif %}
 
   <section class="dashboard-tab-panel workbench-panel" data-dashboard-panel="exchange-positions" data-workbench-panel="positions">
     <div data-lazy-workbench="positions" aria-busy="false">
@@ -377,27 +379,25 @@
     </div>
   </section>
 
-  <section class="dashboard-tab-panel workbench-panel" data-dashboard-panel="main" data-workbench-panel="strategies">
-    {% include "_group_context.html" %}
-    <div class="trader-shell">
-      <aside class="panel trader-groups-panel" data-layout-scroll-panel data-mobile-work-region="overview">
+  <section class="workbench-panel" data-workbench-panel="groups">
+    <div class="trader-shell" data-mobile-work-region="groups">
+      <aside class="panel trader-groups-panel" data-layout-scroll-panel data-lazy-workbench="groups" aria-busy="false">
         <div class="panel-heading">
           <h2>群组 / KOL</h2>
-          <span>{{ groups|length }} 群组</span>
+          <span>按需加载</span>
         </div>
-        {% with groups=trader_dashboard.group_rows, selected_chat_id=selected_chat_id %}
-          {% include "_kol_strategy_list.html" %}
-        {% endwith %}
+        {% with loading_text='打开群组后加载群组与自动化状态' %}{% include "_workbench_loading.html" %}{% endwith %}
       </aside>
 
-      <section class="trader-strategy-panel" data-strategy-panel data-mobile-work-region="strategies" data-lazy-workbench="strategies" aria-busy="false">
-        {% with loading_text='打开策略后加载当前群组数据' %}{% include "_workbench_loading.html" %}{% endwith %}
-      </section>
-
-      <section class="trader-detail-panel" data-detail-panel data-mobile-work-region="messages" data-lazy-workbench="messages" aria-busy="false">
-        {% with loading_text='打开消息后加载当前群组记录' %}{% include "_workbench_loading.html" %}{% endwith %}
+      <section class="trader-strategy-panel" data-strategy-panel>
+        {% with loading_text='选择群组后加载原策略视图' %}{% include "_workbench_loading.html" %}{% endwith %}
       </section>
     </div>
+  </section>
+  <section class="workbench-panel" data-workbench-panel="activity">
+    <section class="trader-detail-panel" data-detail-panel data-mobile-work-region="activity" data-lazy-workbench="activity" aria-busy="false">
+      {% with loading_text='打开动态后加载当前群组消息与执行记录' %}{% include "_workbench_loading.html" %}{% endwith %}
+    </section>
   </section>
   <section class="workbench-panel management-batches-panel" data-workbench-panel="management-batches" data-management-batches-panel>
     <div class="panel-heading">
@@ -412,8 +412,8 @@
   </section>
   <section class="workbench-panel more-workbench-panel" data-workbench-panel="more">
     <h2>更多工具</h2>
-    <div class="more-workbench-grid">
-      <button type="button" data-workbench-view="management-batches">策略管理批次</button>
+    <div class="more-workbench-grid" data-lazy-workbench="more" aria-busy="false">
+      <button type="button" data-legacy-workbench-view="management-batches">策略管理批次</button>
       <button type="button" data-dashboard-tab="trading-settings">交易设置</button>
       <button type="button" data-dashboard-tab="prompt">AI 识别提示词</button>
       <button type="button" data-dashboard-tab="config">AI 配置</button>

@@ -3267,7 +3267,7 @@ def test_ai_recognition_config_api_ignores_legacy_prompt_fields(tmp_path):
     assert "直接阅读图片和文字。" not in page.text
 
 
-def test_index_page_renders_prompt_registry_without_legacy_prompt_inputs(tmp_path):
+def test_more_panel_renders_prompt_registry_without_legacy_prompt_inputs(tmp_path):
     config_path = tmp_path / "ai_recognition.yaml"
     app = create_web_app(
         database_path=tmp_path / "research.db",
@@ -3275,7 +3275,7 @@ def test_index_page_renders_prompt_registry_without_legacy_prompt_inputs(tmp_pat
     )
     client = TestClient(app)
 
-    response = client.get("/")
+    response = client.get("/more-panel")
 
     assert response.status_code == 200
     assert "data-ai-prompt-center" in response.text

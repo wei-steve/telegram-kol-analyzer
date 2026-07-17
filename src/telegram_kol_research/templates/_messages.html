@@ -288,6 +288,13 @@
             </div>
           </details>
           <div class="message-actions">
+            {% if strategy_related and message.strategy_lifecycle_id %}
+              <a
+                class="secondary-button"
+                href="/strategy-records/{{ message.strategy_lifecycle_id }}"
+                data-message-strategy-record="{{ message.strategy_lifecycle_id }}"
+              >查看策略记录</a>
+            {% endif %}
             <button
               type="button"
               class="secondary-button message-recognize-button"

@@ -35,7 +35,7 @@
 
 {% macro position_card(item) -%}
   {% set attr = item.attribution if item.attribution is defined else none %}
-  <article class="exchange-position-card">
+  <article class="exchange-position-card"{% if item.pos_id is defined and item.pos_id %} data-position-pos-id="{{ item.pos_id }}" tabindex="-1"{% endif %}>
     <div class="exchange-card-head">
       <div>
         <strong>{{ item.symbol }}</strong>
@@ -44,6 +44,13 @@
       <code>持仓</code>
     </div>
     {{ exchange_attribution(item) }}
+    {% if attr and attr.state == 'bound' and item.lifecycle_id is defined and item.lifecycle_id %}
+      <a
+        class="secondary-button exchange-strategy-record-link"
+        href="/strategy-records/{{ item.lifecycle_id }}"
+        data-strategy-record-link="{{ item.lifecycle_id }}"
+      >查看策略记录</a>
+    {% endif %}
     <div class="exchange-account-row">
       {% if item.sender_name %}<span>{{ item.sender_name }}</span>{% endif %}
       {% if item.execution_status is defined %}<span>{{ item.execution_status }}</span>{% endif %}
@@ -201,7 +208,7 @@
   </div>
 
   {% if exchange_snapshot.error %}
-    <p class="exchange-empty">Deepcoin 数据读取失败：{{ exchange_snapshot.error }}</p>
+    <p class="exchange-empty" role="status">Deepcoin 数据暂不可用，请稍后重试。</p>
   {% endif %}
 
   <div class="exchange-tab-panels">

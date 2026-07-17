@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import time
+from urllib.parse import urlencode
 
 import httpx
 from sqlalchemy import func
@@ -120,6 +121,13 @@ from telegram_kol_research.recovery_runner import run_recovery_dry_run
 from telegram_kol_research.semantic_disagreement_review import run_semantic_review_loop
 from telegram_kol_research.strategy_management_worker import (
     run_strategy_management_worker_loop,
+)
+from telegram_kol_research.strategy_records import (
+    count_strategy_records,
+    enrich_strategy_records_with_exchange,
+    load_live_bindings_without_lifecycle,
+    load_strategy_record_detail,
+    load_strategy_record_summaries,
 )
 from telegram_kol_research.strategy_alerts import (
     StrategyAlertConfig,
@@ -568,20 +576,211 @@ def _group_label_by_chat_id(group_config: GroupConfig) -> dict[int, str]:
     }
 
 
+def _strategy_record_api_sort_key(record: dict[str, object]) -> tuple[int, float, int]:
+    attention = record.get("attention")
+    severity = (
+        str(attention.get("severity") or "")
+        if isinstance(attention, dict)
+        else ""
+    )
+    severity_rank = {"critical": 0, "warning": 1, "review": 2}.get(severity, 3)
+    latest_changed_at = record.get("latest_changed_at")
+    if isinstance(latest_changed_at, datetime):
+        if latest_changed_at.tzinfo is None:
+            latest_changed_at = latest_changed_at.replace(tzinfo=UTC)
+        timestamp = latest_changed_at.timestamp()
+    else:
+        timestamp = 0.0
+    lifecycle_id = record.get("lifecycle_id")
+    return (
+        severity_rank,
+        -timestamp,
+        -int(lifecycle_id) if lifecycle_id is not None else 0,
+    )
+
+
+STRATEGY_RECORD_FILTERS = {
+    "needs_attention",
+    "all",
+    "executing",
+    "pending_entry",
+    "finished",
+}
+
+
+def _strategy_record_matches_filter(
+    record: dict[str, object],
+    *,
+    filter_name: str,
+) -> bool:
+    """Apply mobile record filters only after exchange enrichment."""
+
+    if filter_name == "all":
+        return True
+    if filter_name == "needs_attention":
+        return record.get("attention") is not None
+
+    lifecycle_state = str(record.get("lifecycle_state") or "").strip().lower()
+    if filter_name == "pending_entry":
+        return lifecycle_state == "pending_entry"
+    if filter_name == "finished":
+        return lifecycle_state in {
+            "cancelled",
+            "exited",
+            "expired",
+            "finished",
+            "invalidated",
+            "rejected",
+        }
+    if filter_name == "executing":
+        return lifecycle_state == "entered" or record.get("real_position") is not None
+    return False
+
+
+def _strategy_detail_position_ownership(
+    *,
+    detail: dict[str, object],
+    binding: dict[str, object],
+    position: dict[str, object],
+) -> tuple[str, str, list[str]]:
+    """Fail closed unless exchange attribution proves the requested owner."""
+
+    attribution = position.get("attribution")
+    attribution = attribution if isinstance(attribution, dict) else {}
+    binding_venue = str(binding.get("venue") or "").strip().lower()
+    if binding_venue != "deepcoin":
+        return (
+            "conflict",
+            "执行绑定不是 Deepcoin，禁止确认 Deepcoin 仓位归属",
+            [f"binding.venue={binding_venue or 'unknown'}"],
+        )
+
+    terminal_states = {
+        "cancelled",
+        "canceled",
+        "closed",
+        "exchange_cancelled",
+        "exchange_closed",
+        "expired",
+        "failed",
+        "manually_cancelled",
+        "manually_closed",
+        "rejected",
+        "stale",
+        "terminal",
+    }
+    binding_status = str(binding.get("status") or "unknown").strip().lower()
+    if binding_status not in {"open", "active"}:
+        return (
+            "conflict" if binding_status in terminal_states else "unconfirmed",
+            "本地执行绑定不是可确认的活跃状态",
+            [f"binding.status={binding_status}"],
+        )
+
+    attribution_state = str(attribution.get("state") or "").strip().lower()
+    execution_status = str(position.get("execution_status") or "").strip().lower()
+    exchange_status = str(position.get("exchange_status") or "").strip().lower()
+    binding_exchange_status = str(
+        binding.get("last_exchange_status") or ""
+    ).strip().lower()
+    if attribution_state == "conflict" or execution_status == "system_attribution_conflict":
+        return (
+            "conflict",
+            "Deepcoin 快照明确标记了归属冲突",
+            [
+                item
+                for item in (
+                    f"attribution.state={attribution_state}" if attribution_state else None,
+                    f"execution_status={execution_status}" if execution_status else None,
+                )
+                if item is not None
+            ],
+        )
+    terminal_snapshot_states = terminal_states.intersection(
+        {execution_status, exchange_status, binding_exchange_status}
+    )
+    if terminal_snapshot_states:
+        return (
+            "conflict",
+            "Deepcoin 快照或绑定包含终态执行证据",
+            sorted(terminal_snapshot_states),
+        )
+    if attribution_state != "bound":
+        return (
+            "unconfirmed",
+            "Deepcoin 仓位存在，但策略归属尚未唯一确认",
+            ["交易所归属状态不是 bound"],
+        )
+
+    identity = detail.get("identity")
+    identity = identity if isinstance(identity, dict) else {}
+    mismatches: list[str] = []
+    missing: list[str] = []
+
+    expected_strategy_id = binding.get("strategy_instance_id")
+    actual_strategy_id = attribution.get("strategy_id")
+    if expected_strategy_id in {None, ""} or actual_strategy_id in {None, ""}:
+        missing.append("strategy_instance_id")
+    elif str(actual_strategy_id) != str(expected_strategy_id):
+        mismatches.append("strategy_instance_id")
+
+    expected_pos_id = binding.get("pos_id")
+    actual_attribution_pos_id = attribution.get("pos_id")
+    actual_position_pos_id = position.get("pos_id") or position.get("posId")
+    if actual_attribution_pos_id in {None, ""}:
+        missing.append("attribution.pos_id")
+    elif str(actual_attribution_pos_id) != str(expected_pos_id):
+        mismatches.append("attribution.pos_id")
+    if str(actual_position_pos_id or "") != str(expected_pos_id or ""):
+        mismatches.append("position.pos_id")
+
+    expected_chat_id = binding.get("chat_id")
+    expected_message_id = binding.get("message_id")
+    for label, actual, expected in (
+        ("attribution.chat_id", attribution.get("chat_id"), expected_chat_id),
+        ("position.chat_id", position.get("chat_id"), expected_chat_id),
+        ("position.message_id", position.get("message_id"), expected_message_id),
+        ("record.chat_id", identity.get("chat_id"), expected_chat_id),
+        ("record.message_id", identity.get("message_id"), expected_message_id),
+    ):
+        if actual not in {None, ""} and str(actual) != str(expected):
+            mismatches.append(label)
+
+    if mismatches:
+        return (
+            "conflict",
+            "Deepcoin 仓位已匹配，但策略归属身份不一致",
+            mismatches,
+        )
+    if missing:
+        return (
+            "unconfirmed",
+            "Deepcoin 仓位已匹配，但策略归属身份证据不完整",
+            missing,
+        )
+    return (
+        "confirmed",
+        "Deepcoin 实时仓位及策略归属已确认",
+        [],
+    )
+
+
 def _load_deepcoin_live_position_rows(
     session_factory,
     *,
     deepcoin_client_factory,
     group_label_by_chat_id: dict[int, str],
     error_state: dict[str, str] | None = None,
+    deepcoin_client=None,
 ) -> list[dict[str, object]]:
     try:
-        deepcoin_client = deepcoin_client_factory()
+        if deepcoin_client is None:
+            deepcoin_client = deepcoin_client_factory()
         positions = deepcoin_client.list_positions()
-    except Exception as exc:
+    except Exception:
         logger.exception("Deepcoin live position load failed")
         if error_state is not None:
-            error_state["error"] = str(exc)
+            error_state["error"] = "unavailable"
         return []
 
     active_positions = [
@@ -625,6 +824,21 @@ def _load_deepcoin_live_position_rows(
                 else []
             )
         }
+        lifecycle_candidates_by_binding_id: dict[int, list[StrategyLifecycle]] = {}
+        if binding_ids:
+            bound_lifecycles = (
+                session.query(StrategyLifecycle)
+                .filter(StrategyLifecycle.execution_binding_id.in_(binding_ids))
+                .order_by(
+                    StrategyLifecycle.execution_binding_id.asc(),
+                    StrategyLifecycle.id.asc(),
+                )
+                .all()
+            )
+            for lifecycle_candidate in bound_lifecycles:
+                lifecycle_candidates_by_binding_id.setdefault(
+                    int(lifecycle_candidate.execution_binding_id), []
+                ).append(lifecycle_candidate)
 
         rows: list[dict[str, object]] = []
         for position in active_positions:
@@ -673,17 +887,16 @@ def _load_deepcoin_live_position_rows(
                 and binding is not None
                 and str(binding.status or "").lower() in {"open", "active"}
             )
-            lifecycle = None
-            if binding is not None:
-                lifecycle = (
-                    session.query(StrategyLifecycle)
-                    .filter(StrategyLifecycle.chat_id == binding.chat_id)
-                    .filter(StrategyLifecycle.message_id == binding.message_id)
-                    .filter(StrategyLifecycle.symbol == binding.symbol)
-                    .filter(StrategyLifecycle.side == binding.side)
-                    .order_by(StrategyLifecycle.id.desc())
-                    .first()
-                )
+            lifecycle_candidates = (
+                lifecycle_candidates_by_binding_id.get(int(binding.id), [])
+                if binding is not None
+                else []
+            )
+            lifecycle = (
+                lifecycle_candidates[0]
+                if len(lifecycle_candidates) == 1
+                else None
+            )
             symbol = (
                 binding.symbol
                 if binding is not None
@@ -779,14 +992,8 @@ def _load_exchange_position_snapshot(
     order_limit: int = 100,
 ) -> dict[str, Any]:
     """Load the exchange-style dashboard snapshot from Deepcoin read APIs."""
-
-    positions = _load_deepcoin_live_position_rows(
-        session_factory,
-        deepcoin_client_factory=deepcoin_client_factory,
-        group_label_by_chat_id=group_label_by_chat_id,
-    )
     snapshot: dict[str, Any] = {
-        "positions": positions,
+        "positions": [],
         "open_orders": [],
         "order_history": [],
         "position_history": [],
@@ -794,9 +1001,22 @@ def _load_exchange_position_snapshot(
     }
     try:
         client = deepcoin_client_factory()
-    except Exception as exc:
+    except Exception:
         logger.exception("Deepcoin exchange snapshot client creation failed")
-        snapshot["error"] = str(exc)
+        snapshot["error"] = "unavailable"
+        return snapshot
+
+    position_error: dict[str, str] = {}
+    positions = _load_deepcoin_live_position_rows(
+        session_factory,
+        deepcoin_client_factory=deepcoin_client_factory,
+        group_label_by_chat_id=group_label_by_chat_id,
+        error_state=position_error,
+        deepcoin_client=client,
+    )
+    snapshot["positions"] = positions
+    if position_error:
+        snapshot["error"] = position_error["error"]
         return snapshot
 
     raw_open_orders = _safe_deepcoin_list(client, "list_open_orders")
@@ -2638,6 +2858,404 @@ def create_web_app(
             "exited_positions": exited_positions,
         }
 
+    def build_strategy_record_payload(
+        *,
+        filter_name: str,
+        chat_id: int | None,
+        limit: int,
+        page: int = 1,
+    ) -> dict[str, Any]:
+        group_labels = _group_label_by_chat_id(app.state.group_config)
+        # One request owns one read-only, already-annotated exchange snapshot.
+        # Enrichment below is pure and never calls Deepcoin from a record loop.
+        positions_context = build_positions_panel_context()
+        exchange_snapshot = positions_context["exchange_snapshot"]
+        exchange_pos_ids = {
+            str(row.get("pos_id") or row.get("posId"))
+            for row in exchange_snapshot.get("positions", [])
+            if row.get("pos_id") or row.get("posId")
+        }
+
+        # Recent history is intentionally bounded for mobile response size. Local
+        # SQL attention is loaded independently so newer normal records cannot
+        # crowd it out. Current exchange pos_ids are loaded directly so an older
+        # live binding is not mislabeled as an orphan due to the recent bound.
+        scan_limit = max(200, page * limit)
+        recent_limit = scan_limit
+        local_attention_limit = scan_limit
+        lifecycle_page_filter = (
+            filter_name
+            if filter_name in {"executing", "pending_entry", "finished"}
+            else "all"
+        )
+        recent_records = load_strategy_record_summaries(
+            app.state.session_factory,
+            group_labels_by_chat_id=group_labels,
+            filter_name=lifecycle_page_filter,
+            chat_id=chat_id,
+            limit=recent_limit,
+            now=app.state.now_provider(),
+        )
+        local_attention_records = load_strategy_record_summaries(
+            app.state.session_factory,
+            group_labels_by_chat_id=group_labels,
+            filter_name="needs_attention",
+            chat_id=chat_id,
+            limit=local_attention_limit,
+            now=app.state.now_provider(),
+        )
+        current_live_binding_records = load_strategy_record_summaries(
+            app.state.session_factory,
+            group_labels_by_chat_id=group_labels,
+            filter_name="all",
+            chat_id=chat_id,
+            live_binding_only=True,
+            limit=None,
+            now=app.state.now_provider(),
+        )
+        orphan_live_binding_records = load_live_bindings_without_lifecycle(
+            app.state.session_factory,
+            group_labels_by_chat_id=group_labels,
+            chat_id=chat_id,
+        )
+        current_position_records = (
+            load_strategy_record_summaries(
+                app.state.session_factory,
+                group_labels_by_chat_id=group_labels,
+                filter_name="all",
+                chat_id=chat_id,
+                pos_ids=exchange_pos_ids,
+                limit=None,
+                now=app.state.now_provider(),
+            )
+            if exchange_pos_ids
+            else []
+        )
+
+        candidates_by_lifecycle_id: dict[int, dict[str, object]] = {}
+        for record in [
+            *local_attention_records,
+            *current_live_binding_records,
+            *current_position_records,
+            *recent_records,
+        ]:
+            lifecycle_id = record.get("lifecycle_id")
+            if lifecycle_id is not None:
+                candidates_by_lifecycle_id[int(lifecycle_id)] = record
+        enriched = enrich_strategy_records_with_exchange(
+            [
+                *candidates_by_lifecycle_id.values(),
+                *orphan_live_binding_records,
+            ],
+            exchange_snapshot=exchange_snapshot,
+        )
+        if chat_id is not None:
+            enriched = [row for row in enriched if row.get("chat_id") == chat_id]
+        unfiltered_enriched = enriched
+        enriched = [
+            row
+            for row in unfiltered_enriched
+            if _strategy_record_matches_filter(row, filter_name=filter_name)
+        ]
+        enriched.sort(key=_strategy_record_api_sort_key)
+
+        summary_counts = count_strategy_records(
+            app.state.session_factory,
+            chat_id=chat_id,
+        )
+        exchange_applicable_count = summary_counts.pop("_exchange_applicable")
+        attention_exchange_applicable_count = summary_counts.pop(
+            "_attention_exchange_applicable"
+        )
+        lifecycle_sources = {
+            int(row["lifecycle_id"]): row
+            for row in [
+                *local_attention_records,
+                *current_live_binding_records,
+                *current_position_records,
+                *recent_records,
+            ]
+            if row.get("lifecycle_id") is not None
+        }
+        enriched_by_lifecycle_id = {
+            int(row["lifecycle_id"]): row
+            for row in unfiltered_enriched
+            if row.get("lifecycle_id") is not None
+        }
+        if exchange_snapshot.get("error"):
+            summary_counts["needs_attention"] += (
+                exchange_applicable_count - attention_exchange_applicable_count
+            )
+        else:
+            summary_counts["needs_attention"] += sum(
+                1
+                for lifecycle_id, row in enriched_by_lifecycle_id.items()
+                if row.get("attention") is not None
+                and lifecycle_sources.get(lifecycle_id, {}).get("attention") is None
+            )
+        for name in STRATEGY_RECORD_FILTERS - {"all", "needs_attention"}:
+            summary_counts[name] += sum(
+                1
+                for lifecycle_id, row in enriched_by_lifecycle_id.items()
+                if _strategy_record_matches_filter(row, filter_name=name)
+                and not _strategy_record_matches_filter(
+                    lifecycle_sources.get(lifecycle_id, {}),
+                    filter_name=name,
+                )
+            )
+        synthetic_records = [
+            row for row in unfiltered_enriched if row.get("lifecycle_id") is None
+        ]
+        for name in STRATEGY_RECORD_FILTERS:
+            summary_counts[name] += sum(
+                1
+                for row in synthetic_records
+                if _strategy_record_matches_filter(row, filter_name=name)
+            )
+
+        start = (page - 1) * limit
+        page_records = enriched[start : start + limit]
+        total = summary_counts[filter_name]
+
+        return {
+            "read_only": True,
+            "filter": filter_name,
+            "chat_id": chat_id,
+            "exchange_state": (
+                "unknown" if exchange_snapshot.get("error") else "current"
+            ),
+            "exchange_error": bool(exchange_snapshot.get("error")),
+            "exchange_message": (
+                "Deepcoin 仓位快照暂不可用"
+                if exchange_snapshot.get("error")
+                else "Deepcoin 仓位快照已读取"
+            ),
+            "exchange_snapshot": exchange_snapshot,
+            "records": page_records,
+            "summary_counts": summary_counts,
+            "page": page,
+            "has_more": start + len(page_records) < total,
+            "next_page": page + 1 if start + len(page_records) < total else None,
+            "scan_scope": {
+                "recent_limit": recent_limit,
+                "local_attention_limit": local_attention_limit,
+                "current_live_binding_scope": "all",
+                "orphan_live_binding_scope": "all",
+                "orphan_live_binding_count": len(orphan_live_binding_records),
+                "current_exchange_pos_id_count": len(exchange_pos_ids),
+            },
+        }
+
+    @app.get("/api/strategy-records")
+    def api_strategy_records(
+        filter_name: str = "needs_attention",
+        chat_id: int | None = None,
+        limit: int = 100,
+        page: int = 1,
+    ):
+        if filter_name not in STRATEGY_RECORD_FILTERS:
+            raise HTTPException(status_code=422, detail="invalid strategy record filter")
+        if not 1 <= limit <= 200 or page < 1:
+            raise HTTPException(status_code=422, detail="invalid strategy record limit")
+        payload = build_strategy_record_payload(
+            filter_name=filter_name,
+            chat_id=chat_id,
+            limit=limit,
+            page=page,
+        )
+        payload.pop("exchange_snapshot", None)
+        return payload
+
+    @app.get("/strategy-records")
+    def strategy_record_list_partial(
+        request: Request,
+        filter: str = "needs_attention",
+        chat_id: str | None = None,
+        limit: int = 50,
+        page: int = 1,
+    ):
+        if (
+            filter not in STRATEGY_RECORD_FILTERS
+            or not 1 <= limit <= 100
+            or page < 1
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="invalid strategy record query",
+            )
+        try:
+            normalized_chat_id = int(chat_id) if chat_id not in {None, ""} else None
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="invalid strategy record query",
+            ) from exc
+        payload = build_strategy_record_payload(
+            filter_name=filter,
+            chat_id=normalized_chat_id,
+            limit=limit,
+            page=page,
+        )
+        payload.pop("exchange_snapshot", None)
+        monitor_status = build_monitor_status()
+        freshness = load_database_freshness(
+            app.state.session_factory,
+            now=app.state.now_provider(),
+        )
+        database_state = (
+            "stale"
+            if freshness["stale_hours"] is not None and freshness["stale_hours"] > 1
+            else "current"
+        )
+        group_options = [
+            {
+                "chat_id": int(group.chat_id),
+                "label": group.custom_group_label or group.chat_title,
+            }
+            for group in app.state.group_config.groups
+            if group.chat_id is not None
+        ]
+        list_context_query: dict[str, object] = {"filter": filter}
+        if normalized_chat_id is not None:
+            list_context_query["chat_id"] = normalized_chat_id
+        list_context_query["limit"] = limit
+        list_context_query["page"] = page
+        return templates.TemplateResponse(
+            request,
+            "_strategy_record_list.html",
+            {
+                **payload,
+                "asset_version": app.state.asset_version,
+                "applied_filter": filter,
+                "applied_chat_id": normalized_chat_id,
+                "applied_limit": limit,
+                "applied_page": page,
+                "detail_query": urlencode(list_context_query),
+                "group_options": group_options,
+                "last_success_at": freshness["latest_message_at"],
+                "service_states": {
+                    "telegram": monitor_status["state"],
+                    "database": database_state,
+                    "deepcoin": payload["exchange_state"],
+                },
+            },
+        )
+
+    @app.get("/strategy-records/{lifecycle_id}")
+    def strategy_record_detail(
+        request: Request,
+        lifecycle_id: int,
+        filter: str = "needs_attention",
+        chat_id: str | None = None,
+        limit: int = 50,
+        page: int = 1,
+    ):
+        if (
+            filter not in STRATEGY_RECORD_FILTERS
+            or not 1 <= limit <= 100
+            or page < 1
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="invalid strategy record return context",
+            )
+        try:
+            normalized_chat_id = int(chat_id) if chat_id not in {None, ""} else None
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="invalid strategy record return context",
+            ) from exc
+        return_query: dict[str, object] = {"filter": filter}
+        if normalized_chat_id is not None:
+            return_query["chat_id"] = normalized_chat_id
+        return_query["limit"] = limit
+        return_query["page"] = page
+        return_href = f"/strategy-records?{urlencode(return_query)}"
+        group_labels = _group_label_by_chat_id(app.state.group_config)
+        detail = load_strategy_record_detail(
+            app.state.session_factory,
+            lifecycle_id=lifecycle_id,
+            group_labels_by_chat_id=group_labels,
+        )
+        if detail is None:
+            raise HTTPException(status_code=404, detail="strategy record not found")
+
+        binding = detail["execution"].get("binding")
+        binding = binding if isinstance(binding, dict) else None
+        binding_venue = str(
+            binding.get("venue") if binding is not None else "deepcoin"
+        ).strip().lower()
+        pos_id = binding.get("pos_id") if binding is not None else None
+        if binding is not None and binding_venue != "deepcoin":
+            exchange_evidence = {
+                "state": "not_applicable",
+                "message": f"非 Deepcoin 绑定（{binding_venue or '未知交易所'}），未读取或匹配 Deepcoin 仓位",
+                "position": None,
+                "reasons": [],
+            }
+        else:
+            # The detail request captures exactly one annotated snapshot and
+            # never fetches from inside a per-evidence loop.
+            positions_context = build_positions_panel_context()
+            exchange_snapshot = positions_context["exchange_snapshot"]
+            if exchange_snapshot.get("error"):
+                exchange_evidence = {
+                    "state": "unknown",
+                    "message": "Deepcoin 仓位快照暂不可用",
+                    "position": None,
+                    "reasons": [],
+                }
+            else:
+                matched_positions = [
+                    row
+                    for row in exchange_snapshot.get("positions", [])
+                    if pos_id
+                    and str(row.get("pos_id") or row.get("posId") or "")
+                    == str(pos_id)
+                ]
+                if len(matched_positions) == 1 and binding is not None:
+                    position = matched_positions[0]
+                    state, message, reasons = _strategy_detail_position_ownership(
+                        detail=detail,
+                        binding=binding,
+                        position=position,
+                    )
+                    exchange_evidence = {
+                        "state": state,
+                        "message": message,
+                        "position": position,
+                        "reasons": reasons,
+                    }
+                else:
+                    exchange_evidence = {
+                        "state": (
+                            "conflict" if len(matched_positions) > 1 else "not_found"
+                        ),
+                        "message": (
+                            "同一 pos_id 匹配到多条 Deepcoin 仓位，无法安全确认"
+                            if len(matched_positions) > 1
+                            else (
+                                "该策略未绑定实时仓位"
+                                if not pos_id
+                                else "当前 Deepcoin 快照中未找到已绑定仓位"
+                            )
+                        ),
+                        "position": None,
+                        "reasons": [],
+                    }
+        detail["execution"]["exchange_evidence"] = exchange_evidence
+        return templates.TemplateResponse(
+            request,
+            "strategy_record_detail.html",
+            {
+                "asset_version": app.state.asset_version,
+                "record": detail,
+                "exchange": exchange_evidence,
+                "return_href": return_href,
+            },
+        )
+
     @app.get("/home-dashboard")
     def home_dashboard_partial(request: Request):
         return templates.TemplateResponse(
@@ -2656,65 +3274,16 @@ def create_web_app(
 
     @app.get("/")
     def index(request: Request):
-        groups = load_group_rows(
-            app.state.session_factory,
-            group_labels_by_title=app.state.group_labels_by_title,
-            configured_groups=app.state.group_config.groups,
-        )
-        selected_chat_id = groups[0]["chat_id"] if groups else None
-        selected_group = next(
-            (group for group in groups if group["chat_id"] == selected_chat_id),
-            None,
-        )
         freshness = load_database_freshness(
             app.state.session_factory,
             now=app.state.now_provider(),
         )
-        symbol_whitelist_by_chat_id = _symbol_whitelist_by_chat_id(app.state.group_config)
-        pending_entry_signals = list_pending_strategies(
-            app.state.session_factory,
-            chat_id=None,
-            limit=200,
-            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
-        )
-        # ── lifecycle data ──
-        lifecycle_counts_by_chat_id = load_lifecycle_counts_by_chat_id(
-            app.state.session_factory,
-            symbol_whitelist_by_chat_id=symbol_whitelist_by_chat_id,
-        )
-        holding_positions = list_holding_strategies(
-            app.state.session_factory,
-            chat_id=None,
-            limit=200,
-        )
         monitor_status = build_monitor_status()
         live_listener_enabled = monitor_status["state"] == "monitoring"
-        refresh_mode_label = (
-            "实时监听 + SSE"
-            if live_listener_enabled
-            else "仅本地快照"
-        )
-        trader_dashboard = _build_trader_dashboard_state(
-            groups=groups,
-            group_config=app.state.group_config,
-            active_positions=[],
-            pending_entry_signals=pending_entry_signals,
-            holding_positions=holding_positions,
-            lifecycle_counts_by_chat_id=lifecycle_counts_by_chat_id,
-            live_listener_enabled=live_listener_enabled,
-            refresh_mode_label=refresh_mode_label,
-        )
-        trading_settings = load_trading_settings(app.state.session_factory)
-        ai_recognition_config = load_ai_recognition_config(
-            app.state.ai_recognition_config_path
-        )
         return templates.TemplateResponse(
             request,
             "index.html",
             {
-                "groups": groups,
-                "selected_chat_id": selected_chat_id,
-                "selected_group": selected_group,
                 "live_listener_enabled": live_listener_enabled,
                 "monitor_status": monitor_status,
                 "live_listener_status_reason": app.state.live_listener_status_reason,
@@ -2724,12 +3293,38 @@ def create_web_app(
                 "database_latest_message_at": freshness["latest_message_at"],
                 "database_stale_hours": freshness["stale_hours"],
                 "asset_version": app.state.asset_version,
-                "refresh_mode_label": refresh_mode_label,
-                "trader_dashboard": trader_dashboard,
+                "render_deferred_more": False,
+            },
+        )
+
+    @app.get("/more-panel")
+    def more_panel_partial(request: Request):
+        freshness = load_database_freshness(
+            app.state.session_factory,
+            now=app.state.now_provider(),
+        )
+        monitor_status = build_monitor_status()
+        ai_recognition_config = load_ai_recognition_config(
+            app.state.ai_recognition_config_path
+        )
+        return templates.TemplateResponse(
+            request,
+            "more_panel.html",
+            {
+                "live_listener_enabled": monitor_status["state"] == "monitoring",
+                "monitor_status": monitor_status,
+                "live_listener_status_reason": app.state.live_listener_status_reason,
+                "session_lock_owner_pid": _extract_session_lock_owner_pid(
+                    app.state.live_listener_status_reason
+                ),
+                "database_latest_message_at": freshness["latest_message_at"],
+                "database_stale_hours": freshness["stale_hours"],
+                "asset_version": app.state.asset_version,
+                "render_deferred_more": True,
                 "ai_recognition_config": ai_recognition_config,
                 "ai_prompt_views": build_ai_prompt_views(ai_recognition_config),
                 "recognition_profiles": list_recognition_profiles(),
-                "trading_settings": trading_settings,
+                "trading_settings": load_trading_settings(app.state.session_factory),
             },
         )
 

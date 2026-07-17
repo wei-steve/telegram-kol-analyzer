@@ -226,25 +226,45 @@ Confirmed runtime mode:
 
 ## Current Web Workbench Direction
 
-The confirmed workbench structure is mobile-first and uses the same Flask/Jinja application on phone and desktop:
+The current workbench is a mobile-first strategy record center in the existing
+FastAPI/Jinja application. Phone navigation is `策略 / 持仓 / 动态 / 群组 / 更多`;
+`策略` is first and is the default destination. Its initial query is all groups
+with `需要处理` (`needs_attention`), not a previously selected group.
 
-- `首页`: four high-priority risk/operations metrics, independent Telegram/database/Deepcoin health, and a unified event feed.
-- `持仓`: open positions, orders, attribution, risk warnings, and history.
-- `策略`: executing, confirmation, pending-entry, completed, and abnormal workflows.
-- `消息`: latest-activity KOL/group navigation and chronological messages with recognition details.
-- `更多`: trading settings, AI configuration, prompts, profiles, and logs.
+The strategy list and detail are read-only presentation projections. They
+collect existing evidence but do not become a second operational state store.
+Interpret each record through the authority chain:
 
-Group context rules:
+`message -> candidate -> lifecycle -> binding -> exchange state`
 
-- `策略` and `消息` use the same selected Telegram group.
-- The shared selection is persisted in the browser and restored only when that group still exists.
-- Mobile selects through a searchable bottom sheet; desktop uses the same group data in an overlay.
-- `首页` continues to aggregate all groups so other KOL events are not hidden.
-- Existing sidebar group rows are auxiliary controls and must delegate to the same selected-group state.
+- MiMo is authoritative for the recognition result; semantic review is
+  supporting evidence only.
+- Lifecycle rows are authoritative for the local strategy phase, but cannot by
+  themselves prove a real position exists or has closed.
+- A unique execution binding plus current Deepcoin/reconciliation evidence is
+  required for real-position ownership.
+- Deepcoin unavailable, stale, or failed means `unknown`, never confirmed zero
+  and never confirmed no-position.
+- Management intent and batch rows show planned/local execution; current
+  exchange evidence is required before the UI calls the result confirmed.
 
-The event feed normalizes existing source records for display and links back to their detail views. It must not become a second source of truth.
+Cross-navigation fails closed. A message links to a strategy only through its
+selected `SignalCandidate` ID and only when that candidate owns one lifecycle.
+A real-position row links to a strategy only through a unique
+`execution_binding_id`. Do not infer ownership from matching chat/message,
+symbol, side, group label, or text.
 
-Mobile home pages do not expose dangerous trading mutations. Closing or binding a live position and changing trading configuration require entering the corresponding detail view, reviewing concrete instrument/side/quantity/source context, and confirming the action. Backend validation and idempotency remain authoritative.
+The list has no dangerous trading actions. Closing, binding, protection changes,
+and trading-setting changes keep their established detail-only confirmation,
+backend validation, reservation, idempotency, and ownership requirements.
+
+Release verification is server-only for current data. After a reviewed GitHub
+deployment, inspect the served UI read-only at 390x844 and 1440x900 and trace at
+least one real record from source message through MiMo, lifecycle, binding,
+execution/management evidence, and current Deepcoin position/TPSL. Confirm
+unknown/ambiguous/unassigned states stay visibly unconfirmed and submit no
+mutation during this check. Local deterministic tests are necessary but cannot
+replace this production evidence.
 
 ## Deepcoin Requirements
 

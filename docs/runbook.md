@@ -135,32 +135,66 @@ export TELEGRAM_KOL_LLM_TIMEOUT_SECONDS="60"
 
 Current web workbench behavior:
 
-- Group list is ordered by latest message time and prefers configured aliases
-- Message timeline is newest-first
-- Clicking a group refreshes only the message panel instead of the whole page
-- Message panel supports free-text search within the current group
-- Message panel supports sender-name filtering
-- Load more appends older messages while preserving the active filters
-- Downloaded image media is served locally through the app
-- Message header shows database freshness plus the current refresh mode
-- AI panel defaults to grounded context from the current group's latest 50 messages
-- The user can override the default recent-message count in natural language, such as `最近 100 条` or `最近 200 条`
-- AI panel now uses a simplified single-input workflow without manual scope or date controls
-- Each group has its own editable default prompt in the AI panel, and prompt changes affect the next question immediately
-- The backend orders the scoped message context chronologically before sending it to the model so recent discussion evolution is clearer
-- `/api/events` provides SSE notifications for new messages, and the browser consumes them with `EventSource`
-- Reconcile windows replay a small safety overlap to reduce missed-message risk
+- Phone navigation is `策略 / 持仓 / 动态 / 群组 / 更多`; `策略` opens first.
+- The strategy list starts with all groups plus `需要处理` and offers lifecycle
+  and group filters without disruptive refresh or scroll loss.
+- Strategy details combine source, MiMo recognition, lifecycle, binding,
+  execution, management, and current exchange evidence in a read-only chain.
+- `动态` retains chronological messages, downloaded media, search/sender
+  filtering, bounded load-more behavior, and recognition detail access.
+- `群组` retains configured aliases and per-group AI/prompt context.
+- `/api/events` supplies non-disruptive new-change notification through SSE;
+  reconcile windows still replay a small safety overlap.
+- Telegram, database, and Deepcoin freshness/failure remain independent; a
+  failed Deepcoin read preserves an explicit unknown state.
 
 Recommended browser flow:
 
-1. Open the target group from the left-hand list.
-2. Use the Search field to narrow messages by keyword.
-3. Use the Sender field when you want to inspect a single poster.
-4. Click `Apply filters` to refresh the message panel in place.
-5. Click `Load more` to append older matching messages without losing the current filters.
-6. Ask a question in the AI panel; if you do not specify a range, it analyzes the current group's latest 50 messages.
-7. If needed, ask for a different bounded range in natural language, for example `总结最近 200 条消息`.
-8. Adjust the group-specific default prompt at the top of the AI panel when you want a different standing analysis style for that group.
+1. Open the workbench; `策略` is the default phone destination.
+2. Start with all groups plus `需要处理`, then use `全部 / 执行中 / 待入场 /
+   已结束` or the group selector only when narrowing is useful.
+3. Open a strategy record to inspect recognition, source evidence, lifecycle,
+   binding, execution events, real position/TPSL, and management batches.
+4. Use `持仓` for exchange-first inspection, `动态` for message/event-first
+   inspection, `群组` for per-KOL context, and `更多` for configuration/logs.
+5. Treat `无法确认` or Deepcoin `unknown` as missing current evidence. Never read
+   it as zero position size or proof that no position exists.
+
+### Strategy record authority and safe verification
+
+Strategy records are read-only views. The operational authority chain is:
+
+`message -> candidate -> lifecycle -> binding -> exchange state`
+
+List/detail and cross-destination links must preserve unique IDs. Message links
+use the selected candidate ID and fail closed if it owns multiple lifecycles.
+Position links use a unique execution binding ID. Do not infer a strategy owner
+from chat/message, symbol, side, group name, or rendered labels.
+
+The strategy list must not expose close, bind, order, TPSL, or settings
+mutations. Existing detail confirmation and server-side validation remain in
+force. During UI verification, use read-only navigation and refresh only.
+
+Before production approval, deploy a reviewed commit through the documented
+GitHub/server workflow and verify both 390x844 and 1440x900 against server-served
+current data. Check:
+
+- the default is `策略`, all groups, and `需要处理`;
+- list filters and group selection preserve current state and scroll;
+- a real record traces source message, authoritative MiMo decision, lifecycle,
+  binding, execution events, current position/TPSL, and management batches;
+- unassigned, ambiguous, conflicting, stale, and unavailable exchange evidence
+  remains visibly unconfirmed;
+- Deepcoin failure does not render confirmed zero;
+- long evidence has no horizontal overflow, navigation does not cover content,
+  phone touch targets are at least 44px, and desktop uses the same data model;
+- no trade or configuration mutation is submitted.
+
+Record deployed commit, service state, route/asset HTTP results, phone and
+desktop screenshots, and deferred limitations in `docs/migration-handoff.md`.
+Local screenshots or deterministic tests are not substitutes for this server
+gate. As of 2026-07-17 the gate is pending because the managed local environment
+blocks port binding and local `file:` navigation; do not describe it as passed.
 
 ## Per-group automatic-entry position cap
 

@@ -183,6 +183,10 @@ body {
 .is-empty { color: var(--color-muted); }
 .is-stale { border-color: rgba(251, 191, 36, 0.38); }
 .is-error { color: var(--color-loss); }
+.strategy-record-position-target {
+  border-color: rgba(96, 165, 250, 0.85);
+  box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.24);
+}
 [aria-busy="true"] { cursor: progress; opacity: 0.68; }
 
 .strategy-workflow-filters,
@@ -216,6 +220,369 @@ body {
 .group-picker-check { color: #93c5fd; font-weight: 800; }
 .group-picker-empty, .group-context-status { padding: 12px; margin: 0; color: var(--color-muted); text-align: center; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+
+/* ── Strategy record center: phone-first observation surface ── */
+.strategy-record-page {
+  overflow-x: hidden;
+  background: var(--surface-page);
+}
+
+.strategy-record-list,
+.strategy-record-detail {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 10px calc(78px + env(safe-area-inset-bottom));
+}
+
+.strategy-record-list > .panel-heading,
+.strategy-record-detail > .panel-heading {
+  padding: 14px;
+  border: 0;
+  background: linear-gradient(145deg, rgba(23, 32, 51, 0.98), rgba(17, 24, 39, 0.96));
+}
+
+.strategy-record-list > .panel-heading h1,
+.strategy-record-detail > .panel-heading h1 {
+  margin: 4px 0;
+  color: var(--color-text);
+  font-size: clamp(1.25rem, 5vw, 1.65rem);
+}
+
+.strategy-record-list > .panel-heading p,
+.strategy-record-detail > .panel-heading p {
+  margin: 0;
+  color: var(--color-muted);
+  line-height: 1.5;
+}
+
+.strategy-record-list button,
+.strategy-record-list select,
+.strategy-record-list a,
+.strategy-record-detail summary,
+.strategy-record-back a {
+  min-height: 44px;
+}
+
+.strategy-record-list button,
+.strategy-record-list select {
+  font: inherit;
+}
+
+.strategy-record-sticky-controls {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: grid;
+  gap: 6px;
+  padding: 6px 0;
+  background: linear-gradient(180deg, var(--surface-page) 86%, rgba(9, 14, 26, 0));
+}
+
+.strategy-record-sticky-controls .home-service-health {
+  gap: 5px;
+}
+
+.strategy-record-sticky-controls .home-service-health span {
+  padding: 4px 7px;
+  font-size: 0.7rem;
+}
+
+.strategy-record-sticky-controls .home-priority-risk {
+  min-height: 44px;
+  padding: 7px 10px;
+  font-size: 0.78rem;
+}
+
+.strategy-workflow-filters {
+  gap: 5px;
+  padding: 0 0 2px;
+  border: 0;
+  scrollbar-width: thin;
+}
+
+.strategy-workflow-filters a {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(30, 41, 59, 0.78);
+  color: #cbd5e1;
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.strategy-workflow-filters a.is-active,
+.strategy-workflow-filters a[aria-current="page"] {
+  background: rgba(37, 99, 235, 0.32);
+  color: #dbeafe;
+  box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.45);
+}
+
+.strategy-record-scope {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+}
+
+.strategy-record-scope label {
+  color: var(--color-muted);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.strategy-record-scope select {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0 11px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 9px;
+  background: var(--surface-panel);
+  color: var(--color-text);
+}
+
+.strategy-record-list .home-event-feed {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.strategy-record-card.home-event-card {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 7px 10px;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 14px 13px 14px 16px;
+  border-color: rgba(148, 163, 184, 0.12);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.strategy-record-card time,
+.strategy-record-card .home-event-source,
+.strategy-record-card > strong {
+  grid-column: 1 / -1;
+}
+
+.strategy-record-card > strong {
+  font-size: 1.05rem;
+  line-height: 1.35;
+}
+
+.strategy-record-card.home-event-card .strategy-record-statuses {
+  display: flex;
+  flex-wrap: wrap;
+  grid-column: 1 / -1;
+  grid-row: auto;
+  align-self: auto;
+  gap: 5px;
+  color: inherit;
+}
+
+.strategy-record-status-label,
+.strategy-record-attention-label,
+.strategy-value-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  overflow-wrap: anywhere;
+}
+
+.strategy-record-status-label {
+  padding: 4px 7px;
+  background: rgba(51, 65, 85, 0.72);
+  color: #dbe4f0;
+  font-size: 0.73rem;
+  line-height: 1.3;
+}
+
+.strategy-record-card.home-event-card .strategy-record-attention-label {
+  grid-column: 1 / -1;
+  grid-row: auto;
+  align-self: auto;
+  justify-self: start;
+  padding: 4px 8px;
+  color: #fde68a;
+  background: rgba(120, 53, 15, 0.3);
+}
+
+.strategy-record-card[data-strategy-state-label="normal"] .strategy-record-attention-label {
+  color: #a7f3d0;
+  background: rgba(6, 78, 59, 0.28);
+}
+
+.strategy-record-back a {
+  display: inline-flex;
+  align-items: center;
+  color: #bfdbfe;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.strategy-record-detail .panel {
+  border-color: rgba(148, 163, 184, 0.12);
+  overflow: visible;
+}
+
+.strategy-record-detail h2,
+.strategy-record-detail h3,
+.strategy-record-detail h4,
+.strategy-record-detail h5 {
+  overflow-wrap: anywhere;
+}
+
+.strategy-record-detail h2 {
+  margin-top: 0;
+  font-size: 1.05rem;
+}
+
+.strategy-record-detail article,
+.strategy-record-detail [aria-label$="证据"] > article {
+  min-width: 0;
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: 9px;
+  background: rgba(15, 23, 42, 0.58);
+}
+
+.strategy-record-detail dl {
+  display: grid;
+  grid-template-columns: minmax(92px, 0.42fr) minmax(0, 1fr);
+  gap: 7px 10px;
+  margin: 10px 0;
+}
+
+.strategy-record-detail dt {
+  color: var(--color-muted);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.strategy-record-detail dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+.strategy-record-detail ol {
+  display: grid;
+  gap: 10px;
+  padding-left: 22px;
+}
+
+.strategy-record-detail li {
+  padding-left: 4px;
+  overflow-wrap: anywhere;
+}
+
+.strategy-value-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.strategy-value-chip {
+  padding: 3px 8px;
+  background: rgba(30, 64, 175, 0.25);
+  color: #bfdbfe;
+  font-size: 0.8rem;
+}
+
+.strategy-identifier,
+.strategy-evidence-text,
+.strategy-record-detail pre {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.strategy-identifier {
+  display: inline-block;
+  max-width: 100%;
+  color: #dbeafe;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+}
+
+.strategy-evidence-text {
+  margin: 8px 0;
+  color: #e2e8f0;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.strategy-record-detail details {
+  min-width: 0;
+  margin-top: 8px;
+}
+
+.strategy-record-detail summary {
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  color: #bfdbfe;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.strategy-record-detail pre {
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 10px;
+  overflow-x: auto;
+  border-radius: 8px;
+  background: #020617;
+  color: #cbd5e1;
+  white-space: pre-wrap;
+}
+
+.strategy-record-page :focus-visible {
+  outline: 3px solid #93c5fd;
+  outline-offset: 3px;
+}
+
+@media (min-width: 761px) {
+  .strategy-record-list {
+    max-width: 1040px;
+    padding: 18px 20px 42px;
+  }
+
+  .strategy-record-detail {
+    max-width: 960px;
+    padding: 20px 24px 48px;
+  }
+
+  .strategy-record-list .home-event-feed {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+
+  .strategy-record-sticky-controls {
+    position: static;
+    grid-template-columns: minmax(0, 1fr) minmax(240px, 0.42fr);
+    align-items: center;
+    background: transparent;
+  }
+
+  .strategy-record-sticky-controls .home-service-health,
+  .strategy-record-sticky-controls .home-priority-risk {
+    grid-column: 1 / -1;
+  }
+
+  .strategy-record-scope {
+    justify-self: stretch;
+  }
+
+  .strategy-record-detail dl {
+    grid-template-columns: minmax(180px, 0.34fr) minmax(0, 1fr);
+  }
+}
+
 @media (max-width: 760px) {
   .group-picker-surface { left: 0; right: 0; top: auto; bottom: 0; width: 100%; max-height: min(78dvh, 680px); transform: none; border-radius: 18px 18px 0 0; padding-bottom: env(safe-area-inset-bottom); }
 }

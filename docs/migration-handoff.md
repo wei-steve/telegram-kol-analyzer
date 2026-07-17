@@ -61,17 +61,63 @@ credential source is `/etc/telegram-kol-monitor.credentials`.
 
 ## Mobile-first web workbench
 
-The main web console now follows one shared mobile-first information architecture rather than adapting the old three-column desktop shell independently. Its five primary destinations are `首页`, `持仓`, `策略`, `消息`, and `更多`.
+The Web console is now a mobile-first strategy record center. Its five primary
+destinations, in order, are `策略`, `持仓`, `动态`, `群组`, and `更多`.
+`策略` is the phone landing destination and defaults to all groups plus
+`需要处理` (`needs_attention`), so recognition, execution, position-management,
+and attribution exceptions are visible without first finding a Telegram group.
 
-The home destination leads with account risk and service health, then combines recent Telegram messages, strategy lifecycle changes, and Deepcoin execution records into a normalized read-only event feed. Source tables remain authoritative; the feed does not copy trading state.
+A strategy record is a read-only projection for observation. It is not an
+operational source of truth and must never write inferred state back to the
+recognition, lifecycle, binding, execution, management, or reconciliation
+tables. The evidence/authority chain is:
 
-Mobile is the primary layout. Desktop enhances the same hierarchy with a left navigation rail and wider content area. Do not create a separate `/mobile` application or duplicate backend actions.
+`message -> candidate -> lifecycle -> binding -> exchange state`
+
+The detail view may also display execution events, management batches,
+reconciliation evidence, and AI audit records, but those source records retain
+their existing authority. MiMo remains authoritative for recognition decisions.
+Current Deepcoin reads and exact reconciliation/binding evidence remain
+authoritative for real-position state. Deepcoin unavailable, stale, or failed
+is `unknown`; it is never displayed as confirmed zero or as proof that no
+position exists.
+
+Mobile is the primary layout. Desktop enhances the same hierarchy with a left
+navigation rail and wider content area. Do not create a separate `/mobile`
+application or duplicate backend actions. The release gate includes a real
+browser check at 390x844 and 1440x900 using server-served, current data. Verify
+44px touch targets, safe-area padding, long evidence wrapping, no horizontal
+overflow, and unobstructed navigation/content.
 
 Low-risk actions such as refresh, filtering, navigation, and opening details can happen directly. Position close, live-position binding, and trading-setting changes remain detail-only actions with explicit confirmation, pending-state feedback, and duplicate-submit protection.
 
-`策略` and `消息` share one persisted current-group context. Their canonical selector is the sticky context bar above the shared workbench. Mobile opens a searchable bottom sheet; desktop opens the same picker as a compact overlay. `首页`, `持仓`, and `更多` remain global and must not be implicitly filtered by this selected group.
+Strategy list/detail cross-links and links from `动态` messages or `持仓` rows
+must use unique authoritative identifiers only. A message-to-strategy link uses
+the selected `SignalCandidate` ID and must fail closed when it resolves to more
+than one lifecycle. A position-to-strategy link uses the unique
+`execution_binding_id` relation. Never reconstruct ownership from a matching
+chat, message, symbol, side, label, or card text.
 
-The workbench shell uses destination-level lazy loading. `GET /` must not call Deepcoin or embed the selected group's message timeline, strategy cards, or exchange-position panel. The home dashboard loads asynchronously after first paint; `持仓`, `策略`, and `消息` load when first opened. Restoring a persisted group changes selection state only and must not simulate a group click while the user is still on `首页`. Focus/visibility recovery requests are coalesced to avoid duplicate refresh bursts.
+The workbench shell uses destination-level lazy loading. `GET /` must not call
+Deepcoin or embed group strategy/config/profile/trading-form data. `策略` loads
+after first paint; `持仓`, `动态`, `群组`, and `更多` load when opened. Restoring
+filters or group selection must not replace a newer request or steal list scroll
+position. Focus/visibility recovery requests remain coalesced.
+
+Dangerous-operation boundaries are unchanged. Strategy summary cards contain no
+close, bind, TPSL, order, or trading-setting mutation. Existing detail-only
+confirmation, backend validation, reservation, idempotency, and fail-closed
+ownership checks remain authoritative.
+
+Local implementation verification does not prove live behavior. Production
+verification requires a reviewed commit pushed through GitHub, server pull and
+service restart, route/asset HTTP checks, then read-only inspection of at least
+one real record across MiMo recognition, source message, lifecycle, binding,
+exchange position/TPSL, execution events, and management batches. Do not submit
+a trade mutation merely to verify the redesign. As of 2026-07-17 this production
+and live-browser verification is intentionally pending: the local sandbox
+forbids Git metadata writes and local port binding, and the in-app browser blocks
+local `file:` URLs.
 
 Design and implementation references:
 
@@ -81,6 +127,8 @@ Design and implementation references:
 - `docs/plans/2026-07-12-shared-group-context.md`
 - `docs/plans/2026-07-13-lazy-workbench-loading-design.md`
 - `docs/plans/2026-07-13-lazy-workbench-loading.md`
+- `docs/plans/2026-07-16-mobile-strategy-record-center-design.md`
+- `docs/plans/2026-07-16-mobile-strategy-record-center.md`
 
 ## MiMo-authoritative recognition and exit safety
 

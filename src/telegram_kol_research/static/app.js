@@ -8,12 +8,20 @@ let promptCenterState = {
 };
 let hasDeferredMessageRefresh = false;
 let recoveryRefreshPromise = null;
+const STRATEGY_RECORD_FILTER_KEY = 'telegram-workbench:strategy-filter';
+const STRATEGY_RECORD_GROUP_KEY = 'telegram-workbench:strategy-group';
+const STRATEGY_RECORD_SCROLL_KEY = 'telegram-workbench:strategy-scroll';
+let strategyRecordRequestId = 0;
+let strategyRecordHasPendingChanges = false;
+let lastSuccessfulStrategyRecordAt = null;
+let lastSuccessfulStrategyRecordSelection = null;
 
 const workbenchLoadState = {
-  home: { key: null, promise: null },
-  positions: { key: null, promise: null },
   strategies: { key: null, promise: null },
-  messages: { key: null, promise: null },
+  positions: { key: null, promise: null },
+  activity: { key: null, promise: null },
+  groups: { key: null, promise: null },
+  more: { key: null, promise: null },
   'management-batches': { key: null, promise: null },
 };
 
@@ -1104,9 +1112,9 @@ function bindGroupLinks() {
       const strategyPanel = document.querySelector('[data-strategy-panel]');
       const filterInput = document.querySelector('[data-strategy-filter-input]');
       const filter = filterInput ? filterInput.value : 'holding';
-      const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView === 'messages'
-        ? 'messages'
-        : 'strategies';
+      const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView === 'activity'
+        ? 'activity'
+        : 'groups';
       setAiStatus('');
       document.dispatchEvent(new CustomEvent('group-context-pending', { detail: { chatId } }));
       try {
@@ -1114,7 +1122,7 @@ function bindGroupLinks() {
         if (requestId !== groupSwitchRequestId) return;
         markWorkbenchLoaded(activeView, chatId);
         syncSelectedGroupState(chatId, { focus: true });
-        if (activeView === 'strategies') {
+        if (activeView === 'groups') {
           loadDesktopStrategyCompanion({ chatId, detailPanel, requestId }).catch(() => {});
         }
         applyGroupPromptToEditor(String(chatId));
@@ -1132,7 +1140,7 @@ function bindGroupLinks() {
 }
 
 async function loadVisibleGroupDestination({ activeView, chatId, filter, detailPanel, strategyPanel, requestId }) {
-  if (activeView === 'messages') {
+  if (activeView === 'activity') {
     const nextContent = await fetchDetailPanel(chatId);
     if (requestId !== groupSwitchRequestId) return false;
     if (!detailPanel) throw new Error('missing detail panel');
@@ -1216,7 +1224,7 @@ function bindGroupPromptEditor() {
 }
 
 function workbenchLoadKey(view) {
-  if (view === 'strategies' || view === 'messages' || view === 'management-batches') {
+  if (view === 'activity' || view === 'groups' || view === 'management-batches') {
     return String(getSelectedChatId() || 0);
   }
   return 'global';
@@ -1228,10 +1236,14 @@ function markWorkbenchLoaded(view, key = workbenchLoadKey(view)) {
   }
 }
 
-function showWorkbenchLoadError(view, error) {
+function showWorkbenchLoadError(view, error, retryLoader = null) {
   const container = document.querySelector(`[data-lazy-workbench="${view}"]`);
   if (!container) return;
-  container.innerHTML = '';
+  if (view === 'more') {
+    container.querySelectorAll('.workbench-load-error').forEach((notice) => notice.remove());
+  } else {
+    container.innerHTML = '';
+  }
   container.setAttribute('aria-busy', 'false');
   const message = document.createElement('p');
   message.className = 'workbench-load-error';
@@ -1240,8 +1252,60 @@ function showWorkbenchLoadError(view, error) {
   retry.type = 'button';
   retry.className = 'secondary-button';
   retry.textContent = '重新加载';
-  retry.addEventListener('click', () => ensureWorkbenchViewLoaded(view, { force: true }));
+  retry.addEventListener('click', () => {
+    const load = retryLoader || (() => ensureWorkbenchViewLoaded(view, { force: true }));
+    load();
+  });
   container.append(message, retry);
+}
+
+function showActivityBootstrapError(error) {
+  showWorkbenchLoadError('activity', error, retryActivityAfterGroups);
+}
+
+async function retryActivityAfterGroups() {
+  const groupsLoaded = await ensureWorkbenchViewLoaded('groups', { force: true });
+  if (!groupsLoaded || !getSelectedChatId()) {
+    showActivityBootstrapError(new Error('群组加载失败或暂无可用群组'));
+    return false;
+  }
+  return ensureWorkbenchViewLoaded('activity', { force: true });
+}
+
+function showDashboardPanelLoadError(tab, error) {
+  const activeWorkbench = document.querySelector('[data-workbench-panel].is-active');
+  const host = activeWorkbench?.querySelector('[data-lazy-workbench]') || activeWorkbench;
+  if (!host) return;
+  host.querySelector('[data-dashboard-load-error]')?.remove();
+  const notice = document.createElement('aside');
+  notice.className = 'workbench-load-error';
+  notice.dataset.dashboardLoadError = '';
+  notice.setAttribute('role', 'alert');
+  const message = document.createElement('p');
+  message.textContent = `设置加载失败：${error?.message || '请检查服务状态'}`;
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'secondary-button';
+  retry.textContent = '重新加载';
+  retry.addEventListener('click', () => {
+    retryDashboardPanelLoad(tab).catch((retryError) => showDashboardPanelLoadError(tab, retryError));
+  });
+  notice.append(message, retry);
+  host.prepend(notice);
+}
+
+async function retryDashboardPanelLoad(tab) {
+  workbenchLoadState.more.key = null;
+  const moreReloaded = await ensureWorkbenchViewLoaded('more', { force: true });
+  if (!moreReloaded) {
+    showDashboardPanelLoadError(tab, new Error('更多工具重新加载失败'));
+    return false;
+  }
+  return openDashboardPanel(tab);
+}
+
+function clearDashboardPanelLoadError() {
+  document.querySelectorAll('[data-dashboard-load-error]').forEach((notice) => notice.remove());
 }
 
 async function fetchWorkbenchPartial(url, selector) {
@@ -1254,14 +1318,280 @@ async function fetchWorkbenchPartial(url, selector) {
   return fragment;
 }
 
-async function loadHomeDashboard() {
-  const container = document.querySelector('[data-lazy-workbench="home"]');
+function strategyRecordStorageGet(key, fallback = '') {
+  try {
+    return window.localStorage.getItem(key) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function strategyRecordStorageSet(key, value) {
+  try {
+    window.localStorage.setItem(key, String(value));
+  } catch {
+    // The list remains usable when private browsing disables storage.
+  }
+}
+
+function strategyRecordSelectionFromRoot(root = document.querySelector('[data-strategy-record-list]')) {
+  const lazyContainer = document.querySelector('[data-lazy-workbench="strategies"]');
+  const defaultUrl = lazyContainer?.dataset.strategyRecordsUrl || '/strategy-records?filter=needs_attention';
+  const defaultFilter = new URLSearchParams(defaultUrl.split('?')[1] || '').get('filter') || 'needs_attention';
+  const activeFilter = root?.querySelector('[data-strategy-record-filter][aria-current="page"]');
+  const groupFilter = root?.querySelector('[data-strategy-group-filter]');
+  return {
+    filter: activeFilter?.dataset.strategyRecordFilter
+      || strategyRecordStorageGet(STRATEGY_RECORD_FILTER_KEY, defaultFilter),
+    group: groupFilter ? groupFilter.value : strategyRecordStorageGet(STRATEGY_RECORD_GROUP_KEY, ''),
+    limit: root?.dataset.strategyRecordLimit || '100',
+    page: root?.dataset.strategyRecordPage || '1',
+  };
+}
+
+function currentStrategyRecordParams(selection = strategyRecordSelectionFromRoot()) {
+  const params = new URLSearchParams({ filter: selection.filter, limit: selection.limit, page: selection.page || '1' });
+  if (selection.group) params.set('chat_id', selection.group);
+  return params;
+}
+
+function strategyRecordSelectionMatches(selection) {
+  const current = strategyRecordSelectionFromRoot();
+  return current.filter === selection.filter && current.group === selection.group && current.page === selection.page;
+}
+
+function applyStrategyRecordSelection(selection) {
+  const root = document.querySelector('[data-strategy-record-list]');
+  if (!root || !selection) return;
+  root.querySelectorAll('[data-strategy-record-filter]').forEach((item) => {
+    const selected = item.dataset.strategyRecordFilter === selection.filter;
+    item.classList.toggle('is-active', selected);
+    if (selected) item.setAttribute('aria-current', 'page');
+    else item.removeAttribute('aria-current');
+  });
+  const groupFilter = root.querySelector('[data-strategy-group-filter]');
+  if (groupFilter) groupFilter.value = selection.group;
+}
+
+function commitSuccessfulStrategyRecordSelection(root) {
+  const selection = strategyRecordSelectionFromRoot(root);
+  lastSuccessfulStrategyRecordSelection = selection;
+  strategyRecordStorageSet(STRATEGY_RECORD_FILTER_KEY, selection.filter);
+  strategyRecordStorageSet(STRATEGY_RECORD_GROUP_KEY, selection.group);
+}
+
+function rollbackStrategyRecordSelection() {
+  applyStrategyRecordSelection(lastSuccessfulStrategyRecordSelection);
+}
+
+function getStrategyRecordScrollTop() {
+  const surface = document.querySelector('[data-strategy-record-scroll]');
+  return Math.max(Number(surface?.scrollTop || 0), Number(window.scrollY || 0));
+}
+
+function saveStrategyRecordScrollPosition() {
+  strategyRecordStorageSet(STRATEGY_RECORD_SCROLL_KEY, getStrategyRecordScrollTop());
+}
+
+function restoreStrategyRecordScrollPosition() {
+  const top = Number(strategyRecordStorageGet(STRATEGY_RECORD_SCROLL_KEY, '0'));
+  if (!Number.isFinite(top) || top < 0) return;
+  window.requestAnimationFrame(() => {
+    const surface = document.querySelector('[data-strategy-record-scroll]');
+    if (surface) surface.scrollTop = top;
+    window.scrollTo({ top, behavior: 'auto' });
+  });
+}
+
+function resetStrategyRecordScrollPosition() {
+  strategyRecordStorageSet(STRATEGY_RECORD_SCROLL_KEY, 0);
+  window.requestAnimationFrame(() => {
+    const surface = document.querySelector('[data-strategy-record-scroll]');
+    if (surface) surface.scrollTop = 0;
+    window.scrollTo({ top: 0, behavior: 'auto' });
+  });
+}
+
+function formatStrategyRecordSuccessTime(value) {
+  if (!value) return '尚未完成更新';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return `上次成功更新：${value}`;
+  return `上次成功更新：${date.toLocaleString()}`;
+}
+
+function updateStrategyRecordStatus({ error = null } = {}) {
+  const root = document.querySelector('[data-strategy-record-list]');
+  const status = root?.querySelector('[data-strategy-record-status]');
+  const timestamp = root?.querySelector('[data-strategy-record-last-success]');
+  const retry = root?.querySelector('[data-strategy-record-retry]');
+  if (!status || !timestamp || !retry) return;
+  timestamp.textContent = error
+    ? `数据可能不是最新：${error.message || '请检查服务状态'}。${formatStrategyRecordSuccessTime(lastSuccessfulStrategyRecordAt)}`
+    : formatStrategyRecordSuccessTime(lastSuccessfulStrategyRecordAt);
+  status.classList.toggle('is-error', Boolean(error));
+  status.setAttribute('role', error ? 'alert' : 'status');
+  retry.hidden = !error;
+}
+
+function updateStrategyRecordChangesBadge() {
+  const badge = document.querySelector('[data-strategy-new-changes]');
+  if (!badge) return;
+  badge.hidden = !strategyRecordHasPendingChanges;
+  badge.textContent = '有新变化，点击查看';
+}
+
+function noteStrategyRecordChanges() {
+  strategyRecordHasPendingChanges = true;
+  updateStrategyRecordChangesBadge();
+}
+
+function showStrategyRecordLoadError(error) {
+  const container = document.querySelector('[data-lazy-workbench="strategies"]');
+  const root = document.querySelector('[data-strategy-record-list]');
+  if (root) {
+    updateStrategyRecordStatus({ error });
+    return;
+  }
   if (!container) return;
-  const fragment = await fetchWorkbenchPartial('/home-dashboard', '[data-home-dashboard]');
-  container.innerHTML = '';
-  container.appendChild(fragment);
-  bindHomeEventFilters();
-  bindHomeEventNavigation();
+  let notice = container.querySelector('[data-strategy-record-bootstrap-error]');
+  if (!notice) {
+    notice = document.createElement('aside');
+    notice.dataset.strategyRecordBootstrapError = '';
+    notice.className = 'workbench-load-error';
+    notice.setAttribute('role', 'alert');
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'secondary-button';
+    retry.dataset.strategyRecordRetry = '';
+    retry.textContent = '重试';
+    retry.addEventListener('click', () => loadStrategyRecords({
+      force: true, revealChanges: true, scrollMode: 'restore',
+    }));
+    notice.append(document.createElement('span'), retry);
+    container.appendChild(notice);
+  }
+  notice.querySelector('span').textContent = `加载失败：${error.message || '请检查服务状态'}`;
+}
+
+function replaceStrategyRecordList(fragment, { scrollMode }) {
+  const container = document.querySelector('[data-lazy-workbench="strategies"]');
+  const current = document.querySelector('[data-strategy-record-list]');
+  if (container) {
+    container.replaceChildren(fragment);
+  } else if (current) {
+    current.replaceWith(fragment);
+  }
+  bindStrategyRecordController();
+  if (scrollMode === 'reset') {
+    resetStrategyRecordScrollPosition();
+  } else {
+    restoreStrategyRecordScrollPosition();
+  }
+}
+
+async function loadStrategyRecords({
+  force = false,
+  revealChanges = false,
+  attemptedSelection = null,
+  scrollMode = null,
+} = {}) {
+  const container = document.querySelector('[data-lazy-workbench="strategies"]');
+  const current = document.querySelector('[data-strategy-record-list]');
+  if (!container && !current) return false;
+  const requestId = ++strategyRecordRequestId;
+  const selection = attemptedSelection || strategyRecordSelectionFromRoot(current);
+  const params = currentStrategyRecordParams(selection);
+  const resolvedScrollMode = scrollMode || (current ? 'preserve' : 'restore');
+  if (current && resolvedScrollMode === 'preserve') saveStrategyRecordScrollPosition();
+  if (container) container.setAttribute('aria-busy', 'true');
+  try {
+    const response = await fetch(`/strategy-records?${params}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`请求失败 (${response.status})`);
+    const html = await response.text();
+    if (requestId !== strategyRecordRequestId) return false;
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const fragment = doc.querySelector('[data-strategy-record-list]');
+    if (!fragment) throw new Error('返回内容不完整');
+    lastSuccessfulStrategyRecordAt = new Date().toISOString();
+    commitSuccessfulStrategyRecordSelection(fragment);
+    if (revealChanges) strategyRecordHasPendingChanges = false;
+    replaceStrategyRecordList(fragment, { scrollMode: resolvedScrollMode });
+    updateStrategyRecordStatus();
+    updateStrategyRecordChangesBadge();
+    return true;
+  } catch (error) {
+    if (requestId !== strategyRecordRequestId) return false;
+    if (strategyRecordSelectionMatches(selection)) {
+      rollbackStrategyRecordSelection();
+    }
+    showStrategyRecordLoadError(error);
+    return false;
+  } finally {
+    if (requestId === strategyRecordRequestId && container) {
+      container.setAttribute('aria-busy', 'false');
+    }
+  }
+}
+
+function bindStrategyRecordController() {
+  const root = document.querySelector('[data-strategy-record-list]');
+  if (!root) return;
+  if (!lastSuccessfulStrategyRecordAt) {
+    lastSuccessfulStrategyRecordAt = root.querySelector('[data-last-success-at]')?.dataset.lastSuccessAt || null;
+  }
+  if (!lastSuccessfulStrategyRecordSelection) {
+    commitSuccessfulStrategyRecordSelection(root);
+  }
+  const groupFilter = root.querySelector('[data-strategy-group-filter]');
+  root.querySelectorAll('[data-strategy-record-filter]').forEach((filter) => {
+    if (filter.dataset.strategyRecordFilterBound === 'true') return;
+    filter.dataset.strategyRecordFilterBound = 'true';
+    filter.addEventListener('click', (event) => {
+      event.preventDefault();
+      root.querySelectorAll('[data-strategy-record-filter]').forEach((item) => {
+        const selected = item === filter;
+        item.classList.toggle('is-active', selected);
+        if (selected) item.setAttribute('aria-current', 'page');
+        else item.removeAttribute('aria-current');
+      });
+      const attemptedSelection = { ...strategyRecordSelectionFromRoot(root), page: '1' };
+      loadStrategyRecords({ force: true, attemptedSelection, scrollMode: 'reset' });
+    });
+  });
+  if (groupFilter && groupFilter.dataset.strategyGroupFilterBound !== 'true') {
+    groupFilter.dataset.strategyGroupFilterBound = 'true';
+    groupFilter.addEventListener('change', () => {
+      const attemptedSelection = { ...strategyRecordSelectionFromRoot(root), page: '1' };
+      loadStrategyRecords({ force: true, attemptedSelection, scrollMode: 'reset' });
+    });
+  }
+  root.querySelectorAll('[data-strategy-record-refresh], [data-strategy-record-retry], [data-strategy-new-changes]')
+    .forEach((button) => {
+      if (button.dataset.strategyRecordActionBound === 'true') return;
+      button.dataset.strategyRecordActionBound = 'true';
+      button.addEventListener('click', () => loadStrategyRecords({
+        force: true, revealChanges: true, scrollMode: 'preserve',
+      }));
+    });
+  root.querySelectorAll('[data-strategy-record-card]').forEach((card) => {
+    if (card.dataset.strategyRecordNavigationBound === 'true') return;
+    card.dataset.strategyRecordNavigationBound = 'true';
+    card.addEventListener('click', saveStrategyRecordScrollPosition);
+  });
+  root.querySelectorAll('[data-strategy-record-next-page]').forEach((link) => {
+    if (link.dataset.strategyRecordNextBound === 'true') return;
+    link.dataset.strategyRecordNextBound = 'true';
+    link.addEventListener('click', (event) => {
+      event.preventDefault();
+      const attemptedSelection = {
+        ...strategyRecordSelectionFromRoot(root),
+        page: link.dataset.strategyRecordNextPage,
+      };
+      loadStrategyRecords({ force: true, attemptedSelection, scrollMode: 'reset' });
+    });
+  });
+  updateStrategyRecordStatus();
+  updateStrategyRecordChangesBadge();
 }
 
 async function loadPositionsPanel() {
@@ -1275,6 +1605,56 @@ async function loadPositionsPanel() {
   bindBoundPositionCloseButtons();
   bindDeepcoinPositionSync();
   bindLivePositionAttributionButtons();
+}
+
+function persistedSelectedChatId() {
+  try {
+    return Number(window.localStorage.getItem('telegram-workbench:selected-group') || 0);
+  } catch {
+    return 0;
+  }
+}
+
+async function loadGroupsPanel() {
+  const container = document.querySelector('[data-lazy-workbench="groups"]');
+  if (!container) return false;
+  const requestedChatId = getSelectedChatId() || persistedSelectedChatId();
+  const params = new URLSearchParams();
+  if (requestedChatId) params.set('selected_chat_id', String(requestedChatId));
+  const suffix = params.toString() ? `?${params}` : '';
+  const fragment = await fetchWorkbenchPartial(`/groups${suffix}`, '.kol-strategy-list');
+  container.querySelector('.kol-strategy-list')?.remove();
+  container.querySelector('.workbench-loading')?.remove();
+  container.querySelector('.workbench-load-error')?.remove();
+  container.appendChild(fragment);
+  bindGroupLinks();
+  bindGroupAutomationToggles();
+  const requestedExists = requestedChatId
+    && document.querySelector(`[data-group-link][data-chat-id="${requestedChatId}"]`);
+  const selectedLink = requestedExists || document.querySelector('[data-group-link]');
+  const selectedChatId = Number(selectedLink?.dataset.chatId || 0);
+  if (selectedChatId) syncSelectedGroupState(selectedChatId);
+  return true;
+}
+
+async function loadMorePanel() {
+  const container = document.querySelector('[data-lazy-workbench="more"]');
+  if (!container) return;
+  const response = await fetch(`/more-panel?_t=${Date.now()}`, { cache: 'no-store' });
+  if (!response.ok) throw new Error(`请求失败 (${response.status})`);
+  const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+  const dashboard = document.querySelector('[data-trader-dashboard]');
+  if (!dashboard) throw new Error('工作台容器不完整');
+  doc.querySelectorAll('[data-dashboard-panel]:not([data-workbench-panel])').forEach((panel) => {
+    const name = panel.dataset.dashboardPanel;
+    if (!document.querySelector(`[data-dashboard-panel="${name}"]`)) dashboard.appendChild(panel);
+  });
+  bindDashboardTabs();
+  bindTradingSettingsForm();
+  bindAiRecognitionPromptForm();
+  bindAiPromptCenter();
+  bindAiModelSelectionForm();
+  container.querySelector('.workbench-load-error')?.remove();
 }
 
 function managementBatchValue(value) {
@@ -1341,8 +1721,9 @@ async function loadSelectedGroupDestination(view) {
   const requestId = ++groupSwitchRequestId;
   const filterInput = document.querySelector('[data-strategy-filter-input]');
   const filter = filterInput ? filterInput.value : 'holding';
+  const legacyView = view === 'activity' ? 'activity' : 'strategies';
   const committed = await loadVisibleGroupDestination({
-    activeView: view,
+    activeView: legacyView,
     chatId,
     filter,
     detailPanel: document.querySelector('[data-detail-panel]'),
@@ -1350,7 +1731,7 @@ async function loadSelectedGroupDestination(view) {
     requestId,
   });
   if (!committed) return false;
-  if (view === 'strategies') {
+  if (view === 'groups') {
     loadDesktopStrategyCompanion({
       chatId,
       detailPanel: document.querySelector('[data-detail-panel]'),
@@ -1362,35 +1743,74 @@ async function loadSelectedGroupDestination(view) {
 
 async function ensureWorkbenchViewLoaded(view, options = {}) {
   const state = workbenchLoadState[view];
-  if (!state) return;
+  if (!state) return false;
   const key = workbenchLoadKey(view);
-  if (!options.force && state.key === key) return;
+  if (!options.force && state.key === key) return true;
   if (state.promise) return state.promise;
   const container = document.querySelector(`[data-lazy-workbench="${view}"]`);
   if (container) container.setAttribute('aria-busy', 'true');
   state.promise = (async () => {
     let loaded = true;
-    if (view === 'home') {
-      await loadHomeDashboard();
+    if (view === 'strategies') {
+      loaded = await loadStrategyRecords();
     } else if (view === 'positions') {
       await loadPositionsPanel();
     } else if (view === 'management-batches') {
       await loadManagementBatches();
-    } else {
+    } else if (view === 'groups') {
+      loaded = await loadGroupsPanel();
+    } else if (view === 'activity') {
+      const groupsLoaded = await ensureWorkbenchViewLoaded('groups');
+      if (!groupsLoaded || !getSelectedChatId()) {
+        showActivityBootstrapError(new Error('群组加载失败或暂无可用群组'));
+        if (container) container.setAttribute('aria-busy', 'false');
+        return false;
+      }
       loaded = await loadSelectedGroupDestination(view);
+    } else if (view === 'more') {
+      await loadMorePanel();
     }
     if (!loaded) {
       if (container) container.setAttribute('aria-busy', 'false');
-      return;
+      if (view === 'activity') {
+        showActivityBootstrapError(new Error('动态记录暂时无法加载'));
+      }
+      return false;
     }
-    state.key = key;
+    state.key = workbenchLoadKey(view);
     if (container) container.setAttribute('aria-busy', 'false');
-  })().catch((error) => {
+    return true;
+  })();
+  try {
+    return await state.promise;
+  } catch (error) {
     showWorkbenchLoadError(view, error);
-  }).finally(() => {
+    if (view === 'activity') showActivityBootstrapError(error);
+    return false;
+  } finally {
     state.promise = null;
-  });
-  return state.promise;
+  }
+}
+
+async function focusRequestedPosition() {
+  const params = new URLSearchParams(window.location.search);
+  const requestedView = params.get('view');
+  const posId = params.get('pos_id');
+  if (requestedView !== 'positions' || !posId) return;
+
+  setWorkbenchView('positions');
+  const positionsLoaded = await ensureWorkbenchViewLoaded('positions');
+  if (!positionsLoaded) return false;
+  const selector = `[data-position-pos-id="${CSS.escape(posId)}"]`;
+  const card = document.querySelector(selector);
+  if (!card) return;
+  card.classList.add('strategy-record-position-target');
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  card.focus({ preventScroll: true });
+  window.setTimeout(() => {
+    card.classList.remove('strategy-record-position-target');
+  }, 5000);
+  return true;
 }
 
 function setActiveDashboardPanel(tab) {
@@ -1407,18 +1827,17 @@ function setActiveDashboardPanel(tab) {
   }
 }
 
-const WORKBENCH_VIEWS = ['home', 'positions', 'strategies', 'messages', 'management-batches', 'more'];
+const WORKBENCH_VIEWS = ['strategies', 'positions', 'activity', 'groups', 'more'];
 
 function setWorkbenchView(requestedView) {
   const dashboard = document.querySelector('[data-trader-dashboard]');
   const buttons = document.querySelectorAll('[data-workbench-view]');
   const panels = document.querySelectorAll('[data-workbench-panel]');
   if (!dashboard || !buttons.length || !panels.length) return;
-  const view = WORKBENCH_VIEWS.includes(requestedView) ? requestedView : 'home';
-  const legacyView = view === 'home' ? 'overview' : view;
+  const view = WORKBENCH_VIEWS.includes(requestedView) ? requestedView : 'strategies';
   dashboard.dataset.activeWorkbenchView = view;
-  dashboard.classList.remove(...['overview', 'positions', 'strategies', 'messages', 'management-batches', 'more'].map((item) => `mobile-view-${item}`));
-  dashboard.classList.add(`mobile-view-${legacyView}`);
+  dashboard.classList.remove(...WORKBENCH_VIEWS.map((item) => `mobile-view-${item}`));
+  dashboard.classList.add(`mobile-view-${view}`);
   buttons.forEach((button) => {
     const isActive = button.dataset.workbenchView === view;
     button.classList.toggle('is-active', isActive);
@@ -1430,32 +1849,39 @@ function setWorkbenchView(requestedView) {
   });
   panels.forEach((panel) => {
     const panelView = panel.dataset.workbenchPanel;
-    const isActive = panelView === view || (view === 'messages' && panelView === 'strategies');
+    const isActive = panelView === view;
     panel.classList.toggle('is-active', isActive);
   });
-  const dashboardPanel = view === 'positions'
-    ? 'exchange-positions'
-    : (view === 'strategies' || view === 'messages') ? 'main' : null;
+  const dashboardPanel = view === 'positions' ? 'exchange-positions' : null;
   setActiveDashboardPanel(dashboardPanel);
   ensureWorkbenchViewLoaded(view);
 }
 
-function openDashboardPanel(tab) {
+async function openDashboardPanel(tab) {
   const dashboard = document.querySelector('[data-trader-dashboard]');
-  if (!dashboard) return;
+  if (!dashboard) return false;
   if (tab === 'main') {
-    setWorkbenchView(dashboard.getAttribute('data-return-workbench-view') || 'home');
-    return;
+    setWorkbenchView(dashboard.getAttribute('data-return-workbench-view') || 'strategies');
+    return true;
   }
   if (tab === 'exchange-positions') {
     setWorkbenchView('positions');
-    return;
+    return true;
   }
+  const moreLoaded = await ensureWorkbenchViewLoaded('more');
+  const targetPanel = document.querySelector(`[data-dashboard-panel="${tab}"]`);
+  if (!moreLoaded || !targetPanel) {
+    showDashboardPanelLoadError(tab, new Error(
+      moreLoaded ? '返回内容缺少目标面板' : '更多工具暂时无法加载',
+    ));
+    return false;
+  }
+  clearDashboardPanelLoadError();
   const currentView = dashboard.dataset.activeWorkbenchView;
   if (WORKBENCH_VIEWS.includes(currentView)) {
     dashboard.setAttribute('data-return-workbench-view', currentView);
   } else if (!dashboard.hasAttribute('data-return-workbench-view')) {
-    dashboard.setAttribute('data-return-workbench-view', 'home');
+    dashboard.setAttribute('data-return-workbench-view', 'strategies');
   }
   dashboard.dataset.activeWorkbenchView = 'settings';
   document.querySelectorAll('[data-workbench-panel]').forEach((panel) => {
@@ -1466,6 +1892,7 @@ function openDashboardPanel(tab) {
     button.removeAttribute('aria-current');
   });
   setActiveDashboardPanel(tab);
+  return true;
 }
 
 function bindDashboardTabs() {
@@ -1475,11 +1902,10 @@ function bindDashboardTabs() {
     button.dataset.dashboardTabBound = 'true';
     button.addEventListener('click', () => {
       const tab = button.dataset.dashboardTab || 'main';
-      openDashboardPanel(tab);
       const menu = button.closest('details');
-      if (menu) {
-        menu.open = false;
-      }
+      openDashboardPanel(tab).then((opened) => {
+        if (opened && menu) menu.open = false;
+      }).catch((error) => showDashboardPanelLoadError(tab, error));
     });
   });
 }
@@ -1504,10 +1930,39 @@ function bindWorkbenchNavigation() {
     if (button.dataset.workbenchViewBound === 'true') return;
     button.dataset.workbenchViewBound = 'true';
     button.addEventListener('click', () => {
-      setWorkbenchView(button.dataset.workbenchView || 'home');
+      setWorkbenchView(button.dataset.workbenchView || 'strategies');
     });
   });
-  setWorkbenchView('home');
+  document.querySelectorAll('[data-legacy-workbench-view]').forEach((button) => {
+    if (button.dataset.legacyWorkbenchViewBound === 'true') return;
+    button.dataset.legacyWorkbenchViewBound = 'true';
+    button.addEventListener('click', () => {
+      const legacyView = button.dataset.legacyWorkbenchView;
+      if (legacyView !== 'management-batches') return;
+      dashboard.dataset.activeWorkbenchView = legacyView;
+      panels.forEach((panel) => panel.classList.toggle('is-active', panel.dataset.workbenchPanel === legacyView));
+      buttons.forEach((item) => {
+        item.classList.remove('is-active');
+        item.removeAttribute('aria-current');
+      });
+      setActiveDashboardPanel(null);
+      ensureWorkbenchViewLoaded(legacyView);
+    });
+  });
+}
+
+function scheduleInitialWorkbenchView() {
+  const params = new URLSearchParams(window.location.search);
+  const requestedView = params.get('view');
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(async () => {
+      setWorkbenchView(requestedView || 'strategies');
+      if (requestedView === 'positions') {
+        await ensureWorkbenchViewLoaded('positions');
+        await focusRequestedPosition();
+      }
+    });
+  });
 }
 
 function bindHomeEventNavigation() {
@@ -1587,8 +2042,7 @@ function bindWorkflowFilters() {
 }
 
 function bindMobileWorkNavigation() {
-  // Legacy entry point retained for [data-mobile-work-view] compatibility:
-  // setMobileWorkView('overview') and [data-dashboard-tab="exchange-positions"]
+  // Legacy entry point retained while callers migrate to the unified workbench.
   bindWorkbenchNavigation();
 }
 
@@ -2947,6 +3401,9 @@ async function refreshFromDatabaseChanges() {
   const selectedHasNewerMessage = hasNewerSelectedMessage(snapshot, latestFreshnessSnapshot);
   latestFreshnessSnapshot = snapshot;
 
+  if (globalChanged || selectedChanged) {
+    noteStrategyRecordChanges();
+  }
   if (globalChanged) {
     await refreshGroupList();
   }
@@ -2960,8 +3417,7 @@ async function refreshFromDatabaseChanges() {
       markWorkbenchLoaded('messages');
       markWorkbenchLoaded('strategies');
     } else if (activeView === 'strategies') {
-      await refreshStrategyMidPanel();
-      markWorkbenchLoaded('strategies');
+      updateStrategyRecordChangesBadge();
     }
   }
 }
@@ -2977,6 +3433,7 @@ function connectLiveUpdates() {
         payload = null;
       }
       if (!payload) return;
+      noteStrategyRecordChanges();
       const homePending = document.querySelector('[data-new-home-events]');
       if (homePending) {
         const count = Number(homePending.dataset.count || 0) + 1;
@@ -2995,8 +3452,7 @@ function connectLiveUpdates() {
         markWorkbenchLoaded('messages');
         markWorkbenchLoaded('strategies');
       } else if (activeView === 'strategies') {
-        await refreshStrategyMidPanel();
-        markWorkbenchLoaded('strategies');
+        updateStrategyRecordChangesBadge();
       }
     });
     let sseWasDisconnected = false;
@@ -3013,9 +3469,14 @@ function connectLiveUpdates() {
     };
     source.onopen = () => {
       if (sseWasDisconnected) {
-        // Only reload on reconnection, not on initial connect
-        setAiStatus('实时连接已恢复，刷新界面...');
-        window.location.reload();
+        sseWasDisconnected = false;
+        setAiStatus('实时连接已恢复，有新变化时可手动查看。');
+        setMonitorStatus({
+          state: 'monitoring',
+          label: '监控中',
+          detail: '实时事件连接已恢复',
+        });
+        noteStrategyRecordChanges();
       }
     };
     return;
@@ -3349,9 +3810,14 @@ window.addEventListener('DOMContentLoaded', () => {
   bindDetailPanelControls();
   bindDashboardTabs();
   bindMobileWorkNavigation();
+  scheduleInitialWorkbenchView();
   bindHomeEventFilters();
   bindGroupContext();
   bindWorkflowFilters();
+  bindStrategyRecordController();
+  if (document.querySelector('[data-strategy-record-list]')) {
+    restoreStrategyRecordScrollPosition();
+  }
   bindExchangePositionTabs();
   bindTradingSettingsForm();
   bindStrategyFilterBadges();

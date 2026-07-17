@@ -1,20 +1,17 @@
 {% set workbench_destinations = [
-  ('home', '首页'),
-  ('positions', '持仓'),
   ('strategies', '策略'),
-  ('messages', '消息'),
-  ('management-batches', '批次'),
+  ('positions', '持仓'),
+  ('activity', '动态'),
+  ('groups', '群组'),
   ('more', '更多')
 ] %}
 <nav class="desktop-workbench-nav" data-desktop-workbench-nav aria-label="桌面工作区导航">
   {% for view, label in workbench_destinations %}
-    <button type="button" class="{% if view == 'home' %}is-active{% endif %}" data-workbench-view="{{ view }}" {% if view == 'home' %}aria-current="page"{% endif %}>{{ label }}</button>
+    <button type="button" class="{% if view == 'strategies' %}is-active{% endif %}" data-workbench-view="{{ view }}" {% if view == 'strategies' %}aria-current="page"{% endif %}>{{ label }}</button>
   {% endfor %}
 </nav>
 <nav class="mobile-work-nav" data-mobile-work-nav aria-label="移动工作区导航">
   {% for view, label in workbench_destinations %}
-    {% if view != 'management-batches' %}
-      <button type="button" class="{% if view == 'home' %}is-active{% endif %}" data-workbench-view="{{ view }}" data-mobile-work-view="{{ 'overview' if view == 'home' else view }}" {% if view == 'home' %}aria-current="page"{% endif %}>{{ label }}</button>
-    {% endif %}
+    <button type="button" class="{% if view == 'strategies' %}is-active{% endif %}" data-workbench-view="{{ view }}" data-mobile-work-view="{{ view }}" {% if view == 'strategies' %}aria-current="page"{% endif %}>{{ label }}</button>
   {% endfor %}
 </nav>

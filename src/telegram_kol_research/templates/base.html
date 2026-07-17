@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{% block title %}Telegram KOL Research{% endblock %}</title>
     <link rel="stylesheet" href="{{ request.url_for('static', path='app.css') }}?v={{ asset_version }}" />
   </head>
-  <body>
+  <body class="{% block body_class %}{% endblock %}">
     {% block body %}{% endblock %}
     <script src="{{ request.url_for('static', path='app.js') }}?v={{ asset_version }}"></script>
   </body>
