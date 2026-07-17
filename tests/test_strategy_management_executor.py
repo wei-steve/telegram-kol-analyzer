@@ -24,6 +24,7 @@ from telegram_kol_research.models import (
 from telegram_kol_research.protection_attribution import snapshot_protection_rows
 from telegram_kol_research.protection_ledger import (
     list_verified_ledger_rows_for_positions,
+    upsert_protection_ledger_row,
 )
 from telegram_kol_research.strategy_management_batches import (
     ManagementLegCreate,
@@ -840,6 +841,67 @@ def test_protection_batch_records_replacement_orders_in_ledger(tmp_path):
     ]
     assert {row.execution_binding_id for row in rows} == {batch.execution_binding_id}
     assert {row.evidence_source for row in rows} == {"management_tpsl_replacement"}
+
+
+def test_protection_preflight_accepts_ledger_confirmed_unscoped_rows(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    with session_factory() as session:
+        for leg in batch.legs:
+            entry_leg = session.get(ExecutionOrderLeg, leg.execution_order_leg_id)
+            rows = rows_by_pos[leg.pos_id]
+            for row in rows:
+                upsert_protection_ledger_row(
+                    session,
+                    venue="deepcoin",
+                    execution_binding_id=batch.execution_binding_id,
+                    execution_order_leg_id=entry_leg.id,
+                    strategy_instance_id=batch.strategy_instance_id,
+                    pos_id=leg.pos_id,
+                    instrument_id="BTC-USDT-SWAP",
+                    side="short",
+                    order_id=row["ordId"],
+                    purpose=(
+                        "take_profit"
+                        if row.get("tpTriggerPx") not in {None, "", "0"}
+                        else "stop_loss"
+                    ),
+                    trigger_price=row.get("tpTriggerPx") or row.get("slTriggerPx"),
+                    size_text=row.get("sz"),
+                    status="verified",
+                    evidence_source="entry_protection_response",
+                    evidence={"match": "exact_written_order"},
+                    seen_at=NOW,
+                )
+        session.commit()
+    unscoped_rows_by_pos = {}
+    for pos_id, rows in rows_by_pos.items():
+        unscoped_rows_by_pos[pos_id] = [
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"posId", "cTime"}
+            }
+            for row in rows
+        ]
+    client = _ProtectionClient(session_factory, unscoped_rows_by_pos)
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "succeeded"
+    assert [call["ordId"] for call in client.cancel_calls] == [
+        "tp-1a",
+        "tp-1b",
+        "sl-1",
+        "tp-2",
+        "sl-2",
+    ]
 
 
 def test_break_even_uses_each_positions_own_average_entry(tmp_path):

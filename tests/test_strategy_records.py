@@ -1011,6 +1011,90 @@ def test_blocked_protection_management_batch_requires_attention(tmp_path):
     }
 
 
+def test_blocked_unavailable_protection_evidence_requires_attention(tmp_path):
+    session_factory = create_session_factory(tmp_path / "blocked-unavailable.db")
+    with session_factory() as session:
+        entry_raw = RawMessage(chat_id=10, message_id=201, posted_at=NOW, text="ETH long")
+        management_raw = RawMessage(
+            chat_id=10,
+            message_id=202,
+            posted_at=NOW + timedelta(minutes=5),
+            text="移动止损",
+        )
+        session.add_all([entry_raw, management_raw])
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=entry_raw.id,
+            symbol="ETHUSDT",
+            side="long",
+            event_type="entry_signal",
+        )
+        session.add(candidate)
+        session.flush()
+        decision = _decision(entry_raw.id)
+        session.add(decision)
+        session.flush()
+        binding = _binding(
+            chat_id=10,
+            message_id=201,
+            symbol="ETHUSDT",
+            strategy_instance_id="blocked-unavailable-strategy",
+            status="active",
+        )
+        binding.pos_id = "pos-unavailable"
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=10,
+            message_id=201,
+            symbol="ETHUSDT",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            stop_loss=1800,
+            execution_binding_id=binding.id,
+            updated_at=NOW,
+        )
+        session.add(lifecycle)
+        session.flush()
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="blocked-unavailable",
+                raw_message_id=management_raw.id,
+                recognition_decision_id=decision.id,
+                recognition_generation="generation-1",
+                target_lifecycle_id=lifecycle.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                execution_binding_id=binding.id,
+                intent="move_stop_to_break_even",
+                effective_action="move_stop_to_break_even",
+                execution_mode="live",
+                partial_round_before=0,
+                status="blocked",
+                reason_code="target_protection_evidence_unavailable",
+                target_fingerprint="blocked-unavailable-target",
+                target_snapshot_json="{}",
+                planned_at=NOW + timedelta(minutes=6),
+                created_at=NOW + timedelta(minutes=6),
+                updated_at=NOW + timedelta(minutes=6),
+            )
+        )
+        session.commit()
+
+    rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "测试群"},
+        filter_name="needs_attention",
+        now=NOW + timedelta(minutes=10),
+    )
+
+    assert len(rows) == 1
+    assert "management_blocked" in {
+        reason["code"] for reason in rows[0]["attention_reasons"]
+    }
+
+
 def test_exchange_enrichment_does_not_infer_drift_without_management_message():
     record = _strategy_record(pos_id="pos-entry-only")
     record["expected_stop_loss"] = 63_575.875

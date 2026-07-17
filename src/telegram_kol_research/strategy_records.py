@@ -72,6 +72,7 @@ ACTIONABLE_MANAGEMENT_BLOCK_REASONS = frozenset(
         "protection_price_or_size_mismatch",
         "protection_ledger_stale",
         "protection_evidence_unavailable",
+        "target_protection_evidence_unavailable",
         "target_protection_not_verified",
         "target_protection_order_identity_unavailable",
     }

@@ -37,6 +37,7 @@ from telegram_kol_research.protection_attribution import (
     snapshot_protection_rows,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.protection_ledger import list_verified_ledger_rows_for_positions
 from telegram_kol_research.strategy_management_batches import (
     ManagementBatchRecord,
     claim_ready_batch,
@@ -425,6 +426,7 @@ def _execute_protection_batch(
         # This is deliberately the final read before the first exchange cancel.
         pending = list(deepcoin_client.list_trigger_orders_pending(inst_id=inst_id))
         _preflight_exact_protection_rows(
+            session_factory=session_factory,
             batch=batch,
             live_positions=live_positions,
             pending=pending,
@@ -956,11 +958,15 @@ def _other_exact_strategy_position_ids(
 
 def _preflight_exact_protection_rows(
     *,
+    session_factory: sessionmaker,
     batch: ManagementBatchRecord,
     live_positions: list[dict[str, Any]],
     pending: list[dict[str, Any]],
 ) -> None:
     matches = match_position_protection(live_positions, pending)
+    ledger_rows_by_pos_id = _ledger_rows_by_pos_id(
+        session_factory, [leg.pos_id for leg in batch.legs]
+    )
     seen_ids: set[str] = set()
     for leg in batch.legs:
         protection = matches.by_pos_id.get(leg.pos_id)
@@ -968,12 +974,20 @@ def _preflight_exact_protection_rows(
         current_rows = (
             snapshot_protection_rows(protection.rows) if protection is not None else []
         )
+        if (
+            (protection is None or protection.status != "verified")
+            and expected.get("order_ids")
+        ):
+            current_rows = _ledger_confirmed_current_snapshots(
+                leg=leg,
+                expected=expected,
+                pending=pending,
+                ledger_rows=ledger_rows_by_pos_id.get(str(leg.pos_id), []),
+            )
         expected_rows = expected.get("row_snapshots") or []
         current_ids = [row.get("order_id") for row in current_rows]
         if (
-            protection is None
-            or protection.status != "verified"
-            or current_rows != expected_rows
+            current_rows != expected_rows
             or current_ids != expected.get("order_ids")
             or any(not order_id or order_id in seen_ids for order_id in current_ids)
         ):
@@ -981,6 +995,92 @@ def _preflight_exact_protection_rows(
                 "protection_preflight_rows_ambiguous_or_drifted"
             )
         seen_ids.update(str(order_id) for order_id in current_ids)
+
+
+def _ledger_rows_by_pos_id(session_factory: sessionmaker, pos_ids: list[str]) -> dict[str, list[Any]]:
+    with session_factory() as session:
+        rows = list_verified_ledger_rows_for_positions(session, pos_ids)
+        result: dict[str, list[Any]] = {}
+        for row in rows:
+            result.setdefault(str(row.pos_id), []).append(row)
+        return result
+
+
+def _ledger_confirmed_current_snapshots(
+    *,
+    leg: Any,
+    expected: dict[str, Any],
+    pending: list[dict[str, Any]],
+    ledger_rows: list[Any],
+) -> list[dict[str, Any]]:
+    if not ledger_rows:
+        return []
+    expected_order_ids = [str(order_id) for order_id in expected.get("order_ids") or []]
+    pending_by_order_id = {
+        order_id: row
+        for row in pending
+        if (order_id := _first_text(row, "ordId", "orderId", "order_id")) is not None
+    }
+    ledger_by_order_id = {str(row.order_id): row for row in ledger_rows}
+    current_rows: list[dict[str, Any]] = []
+    for order_id in expected_order_ids:
+        ledger = ledger_by_order_id.get(order_id)
+        pending_row = pending_by_order_id.get(order_id)
+        if ledger is None or pending_row is None:
+            return []
+        if (
+            int(ledger.execution_order_leg_id) != int(leg.execution_order_leg_id)
+            or str(ledger.pos_id) != str(leg.pos_id)
+            or not _ledger_matches_pending_row(ledger, pending_row)
+        ):
+            return []
+        snapshot = snapshot_protection_rows([pending_row])
+        if len(snapshot) != 1:
+            return []
+        current_rows.extend(snapshot)
+    return current_rows
+
+
+def _ledger_matches_pending_row(ledger: Any, row: dict[str, Any]) -> bool:
+    if str(row.get("triggerOrderType") or "TPSL").upper() != "TPSL":
+        return False
+    if str(row.get("instId") or "").upper() != str(ledger.instrument_id or "").upper():
+        return False
+    side = str(row.get("posSide") or row.get("side") or "").lower()
+    side = {"buy": "long", "sell": "short"}.get(side, side)
+    if side != str(ledger.side or "").lower():
+        return False
+    ledger_price = _decimal_or_none(ledger.trigger_price)
+    if ledger_price is not None:
+        current_price = _pending_row_trigger_price(row, str(ledger.purpose or ""))
+        if current_price is None or current_price != ledger_price:
+            return False
+    ledger_size = _decimal_or_none(ledger.size_text)
+    row_size = _decimal_or_none(row.get("sz") or row.get("size"))
+    if ledger_size is not None and row_size is not None and row_size != ledger_size:
+        return False
+    return True
+
+
+def _pending_row_trigger_price(row: dict[str, Any], purpose: str) -> Decimal | None:
+    keys = (
+        ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+        if purpose in {"stop_loss", "sl", "loss"}
+        else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
+    )
+    for key in keys:
+        value = _decimal_or_none(row.get(key))
+        if value is not None and value != 0:
+            return value
+    return None
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return result if result.is_finite() else None
 
 
 def _adjusted_protection_rows(
