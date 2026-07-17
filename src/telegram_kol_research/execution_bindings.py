@@ -1635,6 +1635,11 @@ def _sync_missing_verified_entry_legs(
             or str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
         ):
             continue
+        if not (
+            has_authoritative_persisted_position(leg, session=session)
+            or _has_prior_authoritative_position_audit(session, leg=leg)
+        ):
+            continue
         if not _position_history_proves_full_close(
             history_reader,
             binding=binding,
