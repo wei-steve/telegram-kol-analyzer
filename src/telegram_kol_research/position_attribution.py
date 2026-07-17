@@ -1229,8 +1229,6 @@ def _build_best_edge(
         return None
     if _normalize_side(leg.side) != _normalize_side(position.side):
         return None
-    if not _compatible_size(leg.requested_size, position.size):
-        return None
 
     candidates: list[_Edge] = []
     if leg.pos_id and leg.pos_id == position.pos_id:
@@ -1242,6 +1240,15 @@ def _build_best_edge(
                 evidence_type="direct_pos_id",
                 evidence_source="persisted_leg",
             )
+        )
+    if not _compatible_size(leg.requested_size, position.size):
+        return (
+            min(
+                candidates,
+                key=lambda edge: (edge.rank, edge.evidence_type, edge.evidence_source),
+            )
+            if candidates
+            else None
         )
 
     for fill in evidence:

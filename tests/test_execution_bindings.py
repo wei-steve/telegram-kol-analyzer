@@ -1579,6 +1579,67 @@ def test_reconcile_does_not_grandfather_legacy_weak_verified_position(tmp_path):
     assert leg.attribution_status == "attribution_conflict"
 
 
+def test_reconcile_preserves_verified_position_after_partial_close_size_drift(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            order_id="pos-partial",
+            pos_id="pos-partial",
+            status="active",
+        ),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        order_id="pos-partial",
+        pos_id="pos-partial",
+        status="active",
+        attribution_status="verified",
+        request={
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "sz": "9",
+            "px": "63050",
+        },
+    )
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-partial",
+                    "posSide": "long",
+                    "pos": "5",
+                    "avgPx": "63050",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                    "cTime": "1784266812000",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 7, 17, 11, 30),
+    )
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.query(ExecutionOrderLeg).one()
+
+    assert binding.status == "active"
+    assert binding.pos_id == "pos-partial"
+    assert binding.last_exchange_status == "position_ownership_verified"
+    assert leg.status == "active"
+    assert leg.pos_id == "pos-partial"
+    assert leg.attribution_status == "verified"
+
+
 def test_reconcile_maps_multiple_current_policy_positions_back_to_matching_order_legs(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(

@@ -123,6 +123,36 @@ def test_equivalent_closed_2x2_component_is_classified_without_assignments():
     assert match_entry_legs_to_positions(legs, positions, []).assignments == {}
 
 
+def test_authoritative_direct_pos_id_survives_partial_close_size_drift():
+    leg = _equivalent_leg(
+        1,
+        order_id="pos-partial",
+        pos_id="pos-partial",
+        requested_size=9.0,
+        side="long",
+        symbol="BTC-USDT-SWAP",
+        entry_price=63050.0,
+        stop_loss=62000.0,
+        take_profits=(64100.0,),
+    )
+    position = _equivalent_position(
+        "pos-partial",
+        symbol="BTC-USDT-SWAP",
+        side="long",
+        size=5.0,
+        average_price=63050.0,
+        entry_price=63050.0,
+        stop_loss=62000.0,
+        take_profits=(64100.0,),
+    )
+
+    result = match_entry_legs_to_positions([leg], [position], [])
+
+    assert result.assignments == {1: "pos-partial"}
+    assert result.evidence_by_leg[1]["evidence_type"] == "direct_pos_id"
+    assert result.evidence_by_leg[1]["evidence_source"] == "persisted_leg"
+
+
 def test_canonical_live_position_economics_accepts_deepcoin_mrg_position_key():
     economics = canonical_live_position_economics(
         [
