@@ -267,7 +267,12 @@ def match_position_protection(
         if pos_id in ambiguous_pos_ids:
             continue
         group = groups[group_index]
-        rows = [*exact_rows[pos_id], *group.rows]
+        rows = [
+            row
+            for row in exact_rows[pos_id]
+            if row.get("_evidence_source") != "position"
+        ]
+        rows.extend(group.rows)
         exact_rows[pos_id] = rows
         rank = next(edge[2] for edge in edges if edge[0] == group_index and edge[1] == pos_id)
         by_pos_id[pos_id] = _verified_protection(

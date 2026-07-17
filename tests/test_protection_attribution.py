@@ -183,6 +183,34 @@ def test_many_same_side_positions_match_only_time_and_size_compatible_groups():
     assert result.by_pos_id["pos-c"].order_ids == ["c"]
 
 
+def test_inline_position_prices_are_not_cancellable_order_rows():
+    result = match_position_protection(
+        [
+            _position(
+                "pos-a",
+                size="19",
+                created_at="15000",
+                slTriggerPx="62070",
+                tpTriggerPx="64880",
+            )
+        ],
+        [
+            _tpsl(
+                created_at="15000",
+                ordId="position-tpsl",
+                size="19",
+                slTriggerPrice="62070",
+                tpTriggerPrice="64880",
+            )
+        ],
+    )
+
+    protection = result.by_pos_id["pos-a"]
+    assert protection.status == "verified"
+    assert protection.order_ids == ["position-tpsl"]
+    assert [row.get("ordId") for row in protection.rows] == ["position-tpsl"]
+
+
 def test_full_stop_does_not_hide_partial_target_size_mismatch():
     result = match_position_protection(
         [
@@ -296,6 +324,7 @@ def test_unrelated_pending_order_does_not_hide_exact_inline_position_prices():
                 size="5",
                 ordId="position-tpsl",
                 slTriggerPrice="66500",
+                tpTriggerPrice="63300",
             ),
             _tpsl(
                 created_at="20000",
