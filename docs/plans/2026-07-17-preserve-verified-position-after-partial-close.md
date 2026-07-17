@@ -112,7 +112,41 @@ python -m pytest tests/test_execution_bindings.py::test_reconcile_recovers_prior
 
 Expected: PASS.
 
-### Task 4: Focused Verification And Deployment
+### Task 4: Terminalize Missing Split Legs With History Proof
+
+**Files:**
+- Modify: `tests/test_execution_bindings.py`
+- Modify: `src/telegram_kol_research/execution_bindings.py`
+
+**Step 1: Write the failing split-leg terminalization test**
+
+Create a binding with two verified entry legs: one live position and one missing position. Make the fake Deepcoin history prove the missing exact `posId` is fully closed. Assert `sync_manual_closed_deepcoin_positions` marks only the missing leg as `manually_closed`, keeps the binding active, and leaves the lifecycle `entered`.
+
+**Step 2: Run test to verify it fails**
+
+Run:
+
+```bash
+python -m pytest tests/test_execution_bindings.py::test_sync_manual_closed_positions_terminalizes_only_missing_verified_leg -v
+```
+
+Expected before implementation: FAIL because the sync skips the binding when any position remains live.
+
+**Step 3: Implement exact missing-leg sync**
+
+When a binding has some live positions, inspect missing verified entry legs. For each missing leg, require `list_position_history(inst_id, pos_id)` to prove same instrument, same side, positive `pos`, and `closePos == pos`. Terminalize only that leg and re-derive the binding from remaining live verified legs.
+
+**Step 4: Run focused manual-close tests**
+
+Run:
+
+```bash
+python -m pytest tests/test_execution_bindings.py::test_sync_manual_closed_positions_terminalizes_only_missing_verified_leg tests/test_execution_bindings.py::test_reconcile_then_sync_closes_a_previously_verified_missing_position -q
+```
+
+Expected: PASS.
+
+### Task 5: Focused Verification And Deployment
 
 **Files:**
 - Modify only if needed: `docs/migration-handoff.md`

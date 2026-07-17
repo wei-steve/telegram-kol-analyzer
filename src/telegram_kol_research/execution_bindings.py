@@ -111,6 +111,7 @@ class ExecutionReconciliationResult:
 class ManualCloseSyncResult:
     checked: int = 0
     manually_closed: int = 0
+    partial_legs_closed: int = 0
     skipped_without_pos_id: int = 0
 
 
@@ -1550,6 +1551,13 @@ def sync_manual_closed_deepcoin_positions(
                 continue
             result.checked += 1
             if any(pos_id in active_pos_ids for pos_id in pos_ids):
+                result.partial_legs_closed += _sync_missing_verified_entry_legs(
+                    session,
+                    binding=row,
+                    client=client,
+                    active_pos_ids=active_pos_ids,
+                    synced_at=now,
+                )
                 continue
             if _binding_has_unresolved_entry_leg(session, row):
                 row.status = "open"
@@ -1598,6 +1606,104 @@ def sync_manual_closed_deepcoin_positions(
                         trade_idea.closed_at = now
         session.commit()
     return result
+
+
+def _sync_missing_verified_entry_legs(
+    session,
+    *,
+    binding: ExecutionBinding,
+    client: DeepcoinReadOnlyClient,
+    active_pos_ids: set[str],
+    synced_at: datetime,
+) -> int:
+    history_reader = getattr(client, "list_position_history", None)
+    if history_reader is None:
+        return 0
+    legs = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.execution_binding_id == int(binding.id))
+        .filter(ExecutionOrderLeg.purpose == "entry")
+        .all()
+    )
+    closed = 0
+    for leg in legs:
+        pos_id = str(leg.pos_id or "")
+        if (
+            not pos_id
+            or pos_id in active_pos_ids
+            or str(leg.attribution_status or "") != "verified"
+            or str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+        ):
+            continue
+        if not _position_history_proves_full_close(
+            history_reader,
+            binding=binding,
+            pos_id=pos_id,
+        ):
+            continue
+        leg.status = "manually_closed"
+        leg.terminal_reason = "manual_position_missing"
+        leg.updated_at = synced_at
+        closed += 1
+    if closed:
+        _derive_binding_from_entry_legs(
+            session,
+            binding=binding,
+            legs=legs,
+            live_position_ids=active_pos_ids,
+            recovered_at=synced_at,
+        )
+    return closed
+
+
+def _position_history_proves_full_close(
+    history_reader,
+    *,
+    binding: ExecutionBinding,
+    pos_id: str,
+) -> bool:
+    instrument_id = _binding_instrument_id(binding)
+    try:
+        rows = history_reader(inst_id=instrument_id, pos_id=pos_id)
+    except Exception:
+        return False
+    expected_side = _normalize_position_side(str(binding.side or ""))
+    for row in (rows if isinstance(rows, list) else []):
+        if not isinstance(row, dict):
+            continue
+        if _first_string(row, "posId", "pos_id", "id") != pos_id:
+            continue
+        row_instrument_id = _binding_instrument_id_from_value(
+            row.get("instId") or row.get("symbol")
+        )
+        if row_instrument_id != instrument_id:
+            continue
+        row_side = _normalize_position_side(
+            str(row.get("posSide") or row.get("side") or "")
+        )
+        if row_side != expected_side:
+            continue
+        opened = _to_float(row.get("pos") or row.get("size"))
+        closed = _to_float(
+            row.get("closePos") or row.get("close_pos") or row.get("closedSize")
+        )
+        if (
+            opened is not None
+            and opened > 0
+            and closed is not None
+            and abs(opened - closed) <= 1e-9
+        ):
+            return True
+    return False
+
+
+def _binding_instrument_id(binding: ExecutionBinding) -> str:
+    return _binding_instrument_id_from_value(binding.symbol)
+
+
+def _binding_instrument_id_from_value(value: Any) -> str:
+    text = str(value or "").upper().replace("_", "-")
+    return text if "-" in text else f"{text}-USDT-SWAP"
 
 
 def bind_deepcoin_position_to_lifecycle(

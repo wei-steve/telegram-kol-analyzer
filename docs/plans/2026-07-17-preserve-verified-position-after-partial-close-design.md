@@ -16,6 +16,8 @@ This rule does not create new ownership. It only preserves an already authoritat
 
 If an earlier buggy reconcile has already demoted a leg to `attribution_conflict`, a later reconcile may recover it only when the append-only `position_attribution_audits` table contains a prior `ownership_verified -> verified` audit for the same `execution_order_leg_id` and exact `posId` under the current attribution policy. This recovery path is still exact-position only and remains subject to the global one-owner check.
 
+For split-position strategies where one verified leg is gone but another leg remains live, manual-close sync must not close the whole lifecycle. It may terminalize only the missing leg when Deepcoin position history proves the exact `posId` was fully closed (`closePos == pos` for the same instrument and side), then re-derive the binding from the remaining live verified legs.
+
 ## Out Of Scope
 
 This change does not loosen TPSL mutation safety. Deepcoin pending TPSL rows that lack `closePosId` or exact `posId` remain fail-closed when the planner cannot uniquely prove which position's protection would be cancelled or replaced. It also does not submit compensation trades or directly edit production SQLite.
@@ -26,6 +28,7 @@ Add tests proving:
 
 - A previously authoritative verified leg stays verified when the same live `posId` has a reduced size after partial close.
 - A previously authoritative leg that was already demoted to conflict can recover only from matching prior verified audit evidence.
+- A missing verified leg inside a still-live split strategy can be terminalized only with exact full-close position-history evidence.
 - A weak legacy verified leg with the same `posId` and changed size is not grandfathered.
 - Existing exact-position and conflict tests still pass.
 

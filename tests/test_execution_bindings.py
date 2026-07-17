@@ -3151,6 +3151,93 @@ def test_reconcile_then_sync_closes_a_previously_verified_missing_position(tmp_p
     assert leg.terminal_reason == "manual_position_missing"
 
 
+def test_sync_manual_closed_positions_terminalizes_only_missing_verified_leg(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(pos_id="pos-live,pos-closed", status="active", symbol="ETH"),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=1,
+        pos_id="pos-live",
+        status="active",
+        attribution_status="verified",
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=2,
+        pos_id="pos-closed",
+        status="active",
+        attribution_status="verified",
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="ETH",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+                entered_at=datetime(2026, 6, 30, 9, 1),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-live",
+                    "posSide": "long",
+                    "pos": "4.2",
+                }
+            ]
+
+        def list_position_history(self, *, inst_id, pos_id):
+            assert (inst_id, pos_id) == ("ETH-USDT-SWAP", "pos-closed")
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-closed",
+                    "posSide": "long",
+                    "pos": "3.7",
+                    "closePos": "3.7",
+                }
+            ]
+
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=FakeClient(),
+        synced_at=datetime(2026, 6, 30, 10, 0),
+    )
+
+    assert result.checked == 1
+    assert result.manually_closed == 0
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = session.query(StrategyLifecycle).one()
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id)
+            .order_by(ExecutionOrderLeg.leg_index.asc())
+            .all()
+        )
+
+    assert binding.status == "active"
+    assert binding.last_exchange_status == "position_ownership_verified"
+    assert lifecycle.lifecycle_status == "entered"
+    assert [(leg.pos_id, leg.status, leg.terminal_reason) for leg in legs] == [
+        ("pos-live", "active", None),
+        ("pos-closed", "manually_closed", "manual_position_missing"),
+    ]
+
+
 def test_sync_closed_position_finalizes_pending_kol_exit_exactly_once(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
