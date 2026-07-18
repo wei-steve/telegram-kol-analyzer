@@ -175,6 +175,7 @@ from telegram_kol_research.lifecycle_monitor import (
 from telegram_kol_research.telegram_live_listener import (
     _build_authoritative_notification_payload,
     _filter_callable_kwargs,
+    _handle_authoritative_failure_notification,
     _schedule_authoritative_notification,
     launch_live_listener_task,
     run_live_listener,
@@ -4216,13 +4217,15 @@ def create_web_app(
                 conflict_payload is not None
                 and system_operator_bot_enabled(app.state.system_operator_bot_config)
             ):
-                _schedule_authoritative_notification(
+                notification_scheduled = _handle_authoritative_failure_notification(
                     session_factory=app.state.session_factory,
                     raw_message_id=raw_message_id,
                     sender=send_ai_recognition_conflict_review,
                     config=app.state.system_operator_bot_config,
                     payload=conflict_payload,
                 )
+            else:
+                notification_scheduled = False
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
@@ -4251,8 +4254,7 @@ def create_web_app(
             "semantic_review_status": semantic_review_status,
             "differences": [],
             "notification_scheduled": (
-                conflict_payload is not None
-                and system_operator_bot_enabled(app.state.system_operator_bot_config)
+                notification_scheduled
             ),
         }
 

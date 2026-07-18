@@ -143,6 +143,21 @@ Design and implementation references:
 
 All production recognition paths use MiMo as the authority for text and media. A successful MiMo decision is first persisted as unclaimable `execution_pending`. Immediately before the existing lifecycle safety and automation path, that exact generation must atomically claim durable ownership with `execution_pending -> execution_running`. A newer recognition may replace an unclaimed pending generation, but cannot overwrite a running generation; if an older generation loses the claim, it performs no lifecycle mutation or auto-trade. Only the exact running generation may persist its automation outcome and transition to claimable `pending` (or back to `completed` for an unchanged completed comparison). A post-submit outcome-write failure intentionally remains `execution_running`, blocking duplicate execution until recovery. DeepSeek semantic comparison runs later in the Web service worker and never sits on the execution critical path. MiMo failure blocks automatic mutation, is notified independently, and does not create a semantic-review job; its terminal audit write uses the same durable status/token guard and is rejected before apply/auto/audit mutation when another generation owns `execution_running`.
 
+MiMo authoritative recognition makes one immediate retry for transient provider
+failures and invalid/schema-incomplete model responses before writing a
+terminal `authoritative_failed` decision. Local deterministic failures such as
+missing model configuration, empty input, or declared-but-unreadable image media
+still fail closed without treating DeepSeek as execution authority. For
+high-risk failed messages that mention crypto symbols, active positions,
+take-profit, stop-loss, exit, protection, or position-management terms, the
+operator alert is preserved and a single delayed background authoritative retry
+is scheduled. That delayed retry uses the same MiMo authority, lifecycle,
+automation, idempotency, and ownership gates; it must not replay through
+DeepSeek or bypass execution safeguards. Clearly external-stock-only failures,
+such as a standalone 美光/MU idea with no crypto or position-management context,
+are persisted as `notification_status=suppressed_low_value` and do not send the
+system-operator bot message.
+
 The unified MiMo prompt incorporates the established DeepSeek strategy and lifecycle rules and adds explicit image-reading instructions. Decisions and model comparisons are persisted in `recognition_decisions`, including automation and notification outcomes.
 
 For a live-bound Deepcoin strategy, recognizing or submitting an exit is not proof that the position is closed. The lifecycle records `exit_requested` and remains active until exchange reconciliation confirms the exact bound position and any live entry order are absent. This rule applies to realtime, manual-recognition, and missed-message recovery paths.

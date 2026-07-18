@@ -18,10 +18,10 @@ class _FakeSender:
 
 
 class _FakeMessage:
-    def __init__(self) -> None:
+    def __init__(self, text: str = "live hello") -> None:
         self.id = 42
         self.sender_id = 7
-        self.message = "live hello"
+        self.message = text
         self.reply_to_msg_id = None
         self.date = datetime(2026, 4, 19, 10, 0, tzinfo=UTC)
         self.edit_date = None
@@ -34,9 +34,9 @@ class _FakeMessage:
 
 
 class _FakeEvent:
-    def __init__(self) -> None:
+    def __init__(self, text: str = "live hello") -> None:
         self.chat_id = 123
-        self.message = _FakeMessage()
+        self.message = _FakeMessage(text=text)
 
 
 def test_persist_live_message_event_writes_db_and_broker_event(tmp_path):
@@ -418,3 +418,231 @@ def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
         await asyncio.sleep(0)
 
     asyncio.run(scenario())
+
+
+def test_authoritative_mimo_failure_suppresses_obvious_external_stock_noise(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    broker = LiveUpdateBroker()
+    sent: list[dict] = []
+    audit: list[dict] = []
+
+    def authoritative_processor(raw_message_id):
+        return SimpleNamespace(
+            assessment=SimpleNamespace(
+                agreement_status="authoritative_failed",
+                differences=[],
+                mimo=SimpleNamespace(
+                    status="识别失败",
+                    payload={},
+                    model="mimo-v2.5",
+                    error_message="The read operation timed out",
+                ),
+                deepseek_payload=None,
+            ),
+            recognition=MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="识别失败",
+                reason="timeout",
+                parse_source="mimo_authoritative",
+            ),
+            automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
+        )
+
+    async def sender(**kwargs):
+        sent.append(kwargs)
+
+    def record_audit(*args, **kwargs):
+        audit.append(kwargs)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
+        record_audit,
+    )
+
+    text = "美光MU 800出头比如810附近还能再吃一次，850和880分批走。"
+    asyncio.run(
+        persist_live_message_event(
+            event=_FakeEvent(text=text),
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            chat_title="舒琴会员群-11分组",
+            ai_recognition_config=AiRecognitionConfig(),
+            authoritative_processor=authoritative_processor,
+            system_operator_bot_config=SystemOperatorBotConfig(
+                bot_token="system-token",
+                chat_id="system-chat",
+            ),
+            system_operator_conflict_sender=sender,
+        )
+    )
+
+    assert sent == []
+    assert [row["notification_status"] for row in audit] == [
+        "suppressed_low_value"
+    ]
+    assert audit[0]["automation_reason"] == "mimo_authoritative_failed"
+
+
+def test_authoritative_mimo_failure_still_alerts_position_management_text(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    broker = LiveUpdateBroker()
+    sent: list[dict] = []
+    audit: list[dict] = []
+
+    def authoritative_processor(raw_message_id):
+        return SimpleNamespace(
+            assessment=SimpleNamespace(
+                agreement_status="authoritative_failed",
+                differences=[],
+                mimo=SimpleNamespace(
+                    status="识别失败",
+                    payload={},
+                    model="mimo-v2.5",
+                    error_message="The read operation timed out",
+                ),
+                deepseek_payload=None,
+            ),
+            recognition=MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="识别失败",
+                reason="timeout",
+                parse_source="mimo_authoritative",
+            ),
+            automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
+        )
+
+    async def sender(**kwargs):
+        sent.append(kwargs)
+
+    def record_audit(*args, **kwargs):
+        audit.append(kwargs)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
+        record_audit,
+    )
+
+    text = "移动保本损 剩余30%挂65000全部止盈 我怕后半夜搞事情"
+    asyncio.run(
+        persist_live_message_event(
+            event=_FakeEvent(text=text),
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            chat_title="峰哥高级会员群-11分组",
+            ai_recognition_config=AiRecognitionConfig(),
+            authoritative_processor=authoritative_processor,
+            system_operator_bot_config=SystemOperatorBotConfig(
+                bot_token="system-token",
+                chat_id="system-chat",
+            ),
+            system_operator_conflict_sender=sender,
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0]["payload"]["agreement_status"] == "authoritative_failed"
+    assert sent[0]["payload"]["text"] == text
+    assert [row["notification_status"] for row in audit] == [
+        "scheduled",
+        "sent",
+    ]
+
+
+def test_authoritative_mimo_failure_retries_high_risk_message_after_alert(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    broker = LiveUpdateBroker()
+    calls: list[int] = []
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
+        lambda *args, **kwargs: None,
+    )
+
+    def authoritative_processor(raw_message_id):
+        calls.append(raw_message_id)
+        if len(calls) == 1:
+            return SimpleNamespace(
+                assessment=SimpleNamespace(
+                    agreement_status="authoritative_failed",
+                    differences=[],
+                    mimo=SimpleNamespace(
+                        status="识别失败",
+                        payload={},
+                        model="mimo-v2.5",
+                        error_message="The read operation timed out",
+                    ),
+                    deepseek_payload=None,
+                ),
+                recognition=MessageRecognitionResult(
+                    raw_message_id=raw_message_id,
+                    status="识别失败",
+                    reason="timeout",
+                    parse_source="mimo_authoritative",
+                ),
+                automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
+            )
+        return SimpleNamespace(
+            assessment=SimpleNamespace(
+                agreement_status="pending",
+                differences=[],
+                mimo=SimpleNamespace(
+                    status="非策略",
+                    payload={
+                        "lifecycle_event": {
+                            "event_type": "position_update",
+                            "management_action": "move_stop_to_protect",
+                        }
+                    },
+                    model="mimo-v2.5",
+                    error_message=None,
+                ),
+                deepseek_payload=None,
+            ),
+            recognition=MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="非策略",
+                reason="retry recovered",
+                parse_source="mimo_authoritative",
+            ),
+            automation={"status": "completed", "reason": None},
+        )
+
+    async def sender(**kwargs):
+        sent.append(kwargs)
+
+    async def scenario():
+        await persist_live_message_event(
+            event=_FakeEvent(text="移动保本损 剩余30%挂65000全部止盈"),
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            chat_title="峰哥高级会员群-11分组",
+            ai_recognition_config=AiRecognitionConfig(),
+            authoritative_processor=authoritative_processor,
+            authoritative_failure_retry_delay_seconds=0,
+            system_operator_bot_config=SystemOperatorBotConfig(
+                bot_token="system-token",
+                chat_id="system-chat",
+            ),
+            system_operator_conflict_sender=sender,
+        )
+        for _ in range(10):
+            if len(calls) >= 2:
+                break
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert len(sent) == 1
+    assert len(calls) == 2

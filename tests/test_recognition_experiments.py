@@ -122,6 +122,76 @@ def test_run_mimo_authoritative_for_message_contains_failure(tmp_path, monkeypat
     assert "mimo timeout" in (result.error_message or "")
 
 
+def test_run_mimo_authoritative_retries_once_after_transient_failure(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=11, text="移动保本损 剩余30%挂65000全部止盈")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    calls: list[str] = []
+    payload = {
+        "recognition_result": "非策略",
+        "reason": "当前消息是持仓管理",
+        "strategy": {},
+        "lifecycle_event": {
+            "event_type": "position_update",
+            "target_lifecycle_id": 88,
+            "symbol": "BTC",
+            "side": "long",
+            "take_profit": "65000",
+            "management_action": "move_stop_to_protect",
+            "confidence": 0.93,
+            "reason": "移动保本损并设置剩余止盈",
+        },
+        "input_reading": {
+            "observed_text": "移动保本损 剩余30%挂65000全部止盈",
+            "image_quality": "none",
+        },
+        "confidence": 0.93,
+    }
+
+    def flaky_call(**kwargs):
+        calls.append(kwargs["raw_message"].text)
+        if len(calls) == 1:
+            raise TimeoutError("mimo timeout")
+        return payload
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        flaky_call,
+    )
+
+    result = run_mimo_authoritative_for_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(
+            ai_models=[
+                AiModelConfig(
+                    id="mimo-v2.5",
+                    label="MiMo",
+                    base_url="https://api.xiaomimimo.com/v1",
+                    model="mimo-v2.5",
+                )
+            ]
+        ),
+    )
+
+    assert len(calls) == 2
+    assert result.status == "非策略"
+    assert result.error_message is None
+    assert result.payload["lifecycle_event"]["event_type"] == "position_update"
+    with session_factory() as session:
+        experiment = session.query(RecognitionExperiment).one()
+        invocation = session.query(AiPromptInvocation).one()
+        assert experiment.status == "非策略"
+        assert experiment.error_message is None
+        assert invocation.status == "completed"
+
+
 def test_run_mimo_authoritative_includes_recent_context_and_active_strategies(
     tmp_path, monkeypatch
 ):

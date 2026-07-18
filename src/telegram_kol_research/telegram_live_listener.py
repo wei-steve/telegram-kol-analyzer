@@ -39,6 +39,23 @@ from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidate
 
 
 logger = logging.getLogger(__name__)
+AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS = 60.0
+
+_CRYPTO_FAILURE_TERMS = (
+    "BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "ADA", "SUI", "ZEC",
+    "HYPE", "LINK", "AVAX", "BCH", "LTC", "TON", "TRX", "DOT", "OP",
+    "ARB", "PEPE", "WIF", "USDT", "USDC", "比特币", "大饼", "以太",
+    "币圈", "合约",
+)
+_POSITION_FAILURE_TERMS = (
+    "止盈", "止损", "平仓", "全平", "出局", "离场", "保本", "保护",
+    "减仓", "仓位", "持仓", "多单", "空单", "开多", "开空", "做多",
+    "做空", "挂单", "挂到", "挂在",
+)
+_EXTERNAL_MARKET_TERMS = (
+    "美光", "MU", "INTEL", "DELL", "NVDA", "英伟达", "美股", "纳斯达克",
+    "A股", "三星", "海力士",
+)
 
 
 async def persist_live_message_event(
@@ -56,6 +73,9 @@ async def persist_live_message_event(
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
+    authoritative_failure_retry_delay_seconds: float = (
+        AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
+    ),
     system_operator_bot_config: Any | None = None,
     system_operator_conflict_sender=send_ai_recognition_conflict_review,
 ) -> dict[str, int]:
@@ -142,12 +162,14 @@ async def persist_live_message_event(
                         chat_title=chat_title,
                         processing_result=processing_result,
                     )
-                    _schedule_authoritative_notification(
+                    _handle_authoritative_failure_notification(
                         session_factory=session_factory,
                         raw_message_id=raw_message.id,
                         sender=system_operator_conflict_sender,
                         config=system_operator_bot_config,
                         payload=conflict_payload,
+                        retry_processor=authoritative_processor,
+                        retry_delay_seconds=authoritative_failure_retry_delay_seconds,
                     )
             else:
                 recog_result = await asyncio.to_thread(
@@ -290,6 +312,85 @@ def _schedule_authoritative_notification(
             )
 
     asyncio.create_task(send_in_background())
+
+
+def _handle_authoritative_failure_notification(
+    *,
+    session_factory,
+    raw_message_id: int,
+    sender,
+    config,
+    payload: dict[str, Any] | None,
+    retry_processor: Callable[[int], Any] | None = None,
+    retry_delay_seconds: float = AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS,
+) -> bool:
+    if payload is None:
+        return False
+    notification_status = _classify_authoritative_failure_notification(payload)
+    if notification_status == "suppressed_low_value":
+        update_recognition_execution_outcome(
+            session_factory,
+            raw_message_id=raw_message_id,
+            automation_status=str(
+                payload.get("automation", {}).get("status") or "unknown"
+            ),
+            automation_reason=payload.get("automation", {}).get("reason"),
+            notification_status=notification_status,
+        )
+        return False
+    _schedule_authoritative_notification(
+        session_factory=session_factory,
+        raw_message_id=raw_message_id,
+        sender=sender,
+        config=config,
+        payload=payload,
+    )
+    if retry_processor is not None:
+        _schedule_authoritative_failure_retry(
+            raw_message_id=raw_message_id,
+            retry_processor=retry_processor,
+            retry_delay_seconds=retry_delay_seconds,
+        )
+    return True
+
+
+def _schedule_authoritative_failure_retry(
+    *,
+    raw_message_id: int,
+    retry_processor: Callable[[int], Any],
+    retry_delay_seconds: float,
+) -> None:
+    async def retry_in_background() -> None:
+        if retry_delay_seconds > 0:
+            await asyncio.sleep(retry_delay_seconds)
+        try:
+            await asyncio.to_thread(retry_processor, raw_message_id)
+        except Exception:  # pragma: no cover - defensive background path
+            logger.exception("authoritative recognition delayed retry failed")
+
+    asyncio.create_task(retry_in_background())
+
+
+def _classify_authoritative_failure_notification(payload: dict[str, Any]) -> str:
+    if str(payload.get("agreement_status") or "") != "authoritative_failed":
+        return "scheduled"
+    if _is_low_value_external_market_failure(str(payload.get("text") or "")):
+        return "suppressed_low_value"
+    return "scheduled"
+
+
+def _is_low_value_external_market_failure(text: str) -> bool:
+    normalized = text.upper()
+    if not normalized.strip():
+        return False
+    has_external_marker = any(
+        term.upper() in normalized for term in _EXTERNAL_MARKET_TERMS
+    )
+    if not has_external_marker:
+        return False
+    has_crypto_marker = any(term.upper() in normalized for term in _CRYPTO_FAILURE_TERMS)
+    has_position_marker = any(term.upper() in normalized for term in _POSITION_FAILURE_TERMS)
+    return not has_crypto_marker and not has_position_marker
 
 
 def _build_ai_recognition_conflict_payload(
@@ -474,6 +575,9 @@ async def run_reconcile_once(
     authoritative_processor: Callable[[int], Any] | None = None,
     system_operator_bot_config: Any | None = None,
     system_operator_conflict_sender=send_ai_recognition_conflict_review,
+    authoritative_failure_retry_delay_seconds: float = (
+        AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
+    ),
     discover_dialogs_fn=discover_dialogs,
     fetch_dialog_messages_fn=fetch_dialog_messages,
 ) -> dict[str, int]:
@@ -581,12 +685,14 @@ async def run_reconcile_once(
                 if notification_payload is not None and system_operator_bot_enabled(
                     system_operator_bot_config
                 ):
-                    _schedule_authoritative_notification(
+                    _handle_authoritative_failure_notification(
                         session_factory=session_factory,
                         raw_message_id=raw_message.id,
                         sender=system_operator_conflict_sender,
                         config=system_operator_bot_config,
                         payload=notification_payload,
+                        retry_processor=authoritative_processor,
+                        retry_delay_seconds=authoritative_failure_retry_delay_seconds,
                     )
             with session_factory() as session:
                 inserted_candidates += max(
@@ -643,6 +749,9 @@ async def run_periodic_reconcile(
     strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
     system_operator_bot_config: Any | None = None,
+    authoritative_failure_retry_delay_seconds: float = (
+        AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
+    ),
 ) -> None:
     """Periodically replay a small recent history window for missed-message recovery."""
 
@@ -659,6 +768,7 @@ async def run_periodic_reconcile(
                 strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
                 authoritative_processor=authoritative_processor,
                 system_operator_bot_config=system_operator_bot_config,
+                authoritative_failure_retry_delay_seconds=authoritative_failure_retry_delay_seconds,
             )
         else:
             async with operation_lock:
@@ -673,5 +783,6 @@ async def run_periodic_reconcile(
                     strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
                     authoritative_processor=authoritative_processor,
                     system_operator_bot_config=system_operator_bot_config,
+                    authoritative_failure_retry_delay_seconds=authoritative_failure_retry_delay_seconds,
                 )
         await asyncio.sleep(interval_seconds)

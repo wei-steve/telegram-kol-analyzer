@@ -3063,6 +3063,70 @@ def test_message_recognition_api_reports_pending_without_scheduling_review(
     assert auto_trade_calls == [raw_message_id]
 
 
+def test_message_recognition_api_suppresses_low_value_authoritative_failure(
+    tmp_path, monkeypatch
+):
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
+    )
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="system-token",
+        chat_id="system-chat",
+    )
+    audit: list[dict] = []
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
+        lambda *args, **kwargs: audit.append(kwargs),
+    )
+
+    with app.state.session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=3346,
+            sender_name="舒琴会员群-11分组",
+            text="美光MU 800出头比如810附近还能再吃一次，850和880分批走。",
+        )
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    def fake_authoritative_processor(message_id):
+        return SimpleNamespace(
+            recognition=MessageRecognitionResult(
+                raw_message_id=message_id,
+                status="识别失败",
+                summary=None,
+                reason="timeout",
+                parse_source="mimo_authoritative",
+            ),
+            assessment=SimpleNamespace(
+                agreement_status="authoritative_failed",
+                semantic_review_status="completed",
+                differences=[],
+                mimo=SimpleNamespace(
+                    model="mimo-v2.5",
+                    status="识别失败",
+                    payload={},
+                    error_message="The read operation timed out",
+                ),
+                deepseek_payload=None,
+            ),
+            automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
+        )
+
+    app.state.authoritative_processor = fake_authoritative_processor
+
+    response = TestClient(app).post(f"/api/messages/{raw_message_id}/recognize")
+
+    assert response.status_code == 200
+    assert response.json()["notification_scheduled"] is False
+    assert [row["notification_status"] for row in audit] == [
+        "suppressed_low_value"
+    ]
+
+
 @pytest.mark.parametrize("semantic_review_status", ["execution_pending", "execution_running"])
 def test_message_recognition_api_preserves_execution_review_state(
     tmp_path, semantic_review_status

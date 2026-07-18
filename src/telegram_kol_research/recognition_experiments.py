@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -31,6 +32,8 @@ from telegram_kol_research.prompt_registry import (
 MIMO_DIRECT_EXPERIMENT_NAME = "mimo_direct_v1"
 MIMO_DIRECT_PROMPT_VERSION = "mimo_direct_v1"
 MIMO_AUTHORITATIVE_PROMPT_VERSION = "mimo_authoritative_v1"
+MIMO_AUTHORITATIVE_MAX_ATTEMPTS = 2
+MIMO_AUTHORITATIVE_RETRY_DELAY_SECONDS = 1.0
 MIMO_EXPERIMENT_STATUSES = {
     "是策略",
     "非策略",
@@ -305,19 +308,14 @@ def run_mimo_authoritative_for_message(
             model_kind="mimo",
             context=effective_context,
         )
-        try:
-            payload = _call_mimo_direct_model(
-                raw_message=raw_message,
-                media_assets=media_assets,
-                model_config=model_config,
-                prompt=composition.system_prompt,
-                media_root=media_root,
-                context_text=composition.context,
-            )
-            _validate_authoritative_payload(payload)
-        except Exception as exc:
-            payload = {}
-            error_message = str(exc)
+        payload, error_message = _call_mimo_authoritative_with_retry(
+            raw_message=raw_message,
+            media_assets=media_assets,
+            model_config=model_config,
+            prompt=composition.system_prompt,
+            media_root=media_root,
+            context_text=composition.context,
+        )
         experiment = _upsert_experiment_result(
             session,
             raw_message=raw_message,
@@ -350,6 +348,45 @@ def run_mimo_authoritative_for_message(
             error_message=error_message,
             prompt_versions=composition.version_map,
         )
+
+
+def _call_mimo_authoritative_with_retry(
+    *,
+    raw_message: RawMessage,
+    media_assets: list[MediaAsset],
+    model_config: AiModelConfig,
+    prompt: str,
+    media_root: str | Path,
+    context_text: str,
+    max_attempts: int = MIMO_AUTHORITATIVE_MAX_ATTEMPTS,
+    retry_delay_seconds: float = MIMO_AUTHORITATIVE_RETRY_DELAY_SECONDS,
+) -> tuple[dict[str, Any], str | None]:
+    errors: list[str] = []
+    attempts = max(1, max_attempts)
+    for attempt in range(1, attempts + 1):
+        try:
+            payload = _call_mimo_direct_model(
+                raw_message=raw_message,
+                media_assets=media_assets,
+                model_config=model_config,
+                prompt=prompt,
+                media_root=media_root,
+                context_text=context_text,
+            )
+            _validate_authoritative_payload(payload)
+            return payload, None
+        except Exception as exc:
+            errors.append(str(exc))
+            if attempt >= attempts:
+                break
+            if retry_delay_seconds > 0:
+                time.sleep(retry_delay_seconds)
+    if len(errors) == 1:
+        return {}, errors[0]
+    return {}, (
+        f"MiMo failed after {len(errors)} attempts: "
+        + " | ".join(f"attempt {idx + 1}: {error}" for idx, error in enumerate(errors))
+    )
 
 
 def _validate_authoritative_payload(payload: dict[str, Any]) -> None:
