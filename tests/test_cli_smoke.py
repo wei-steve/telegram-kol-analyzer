@@ -31,6 +31,7 @@ def test_cli_help_renders():
     assert "report" in result.stdout
     assert "recovery-dry-run" in result.stdout
     assert "repair-position-attribution" in result.stdout
+    assert "repair-entry-protection-ledger" in result.stdout
     assert "audit-management-batches" in result.stdout
     assert "archive-unbound-holdings" in result.stdout
     assert "monitor-production-safety" in result.stdout

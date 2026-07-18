@@ -493,3 +493,16 @@ bounded to five seconds so a shielded or failed Telegram cleanup cannot hold
 FastAPI lifespan open until systemd sends `SIGKILL`. Production verification
 still requires one controlled service restart and journal confirmation that
 the old PID exits before `TimeoutStopSec`.
+
+Historical entry-protection TPSL repair is allowed only through
+`repair-entry-protection-ledger`. The command is dry-run first and apply is
+guarded by the displayed fingerprint. A repair action must start from a local
+`execution_events` row whose action/reason is `set_position_tpsl` /
+`entry_protection`, whose request carries the exact `posId`, instrument, side,
+TP, and SL, and whose response returns at least one Deepcoin TPSL order id.
+The returned id must still exist in current pending TPSL rows and match the
+same instrument/side/requested trigger price within the event-time window.
+Sibling TPSL rows may be written only when they share the returned order's
+exchange timestamp group, match the remaining requested TP/SL exactly, and are
+unique. Price-only, symbol/side-only, or non-unique historical rows stay
+unrepaired and must continue rendering as unverified rather than owned.

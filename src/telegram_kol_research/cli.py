@@ -30,6 +30,10 @@ from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.execution_bindings import (
     repair_execution_order_legs_from_binding_payloads,
 )
+from telegram_kol_research.entry_protection_ledger_repair import (
+    apply_entry_protection_ledger_repair_plan,
+    build_entry_protection_ledger_repair_plan,
+)
 from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
@@ -1979,6 +1983,57 @@ def repair_position_attribution(
         expected_fingerprint=expected_fingerprint,
     )
     typer.echo(f"Applied {result.applied} repair action(s).")
+
+
+@app.command("repair-entry-protection-ledger")
+def repair_entry_protection_ledger(
+    database_path: Path = Path("data/research.db"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+    binding_id: int | None = typer.Option(None, "--binding-id"),
+    event_id: int | None = typer.Option(None, "--event-id"),
+    pos_id: str | None = typer.Option(None, "--pos-id"),
+) -> None:
+    """Dry-run or repair historical entry-protection TPSL ledger rows."""
+
+    session_factory = create_session_factory(database_path)
+    client = build_deepcoin_client_from_env()
+    plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime.now(UTC),
+        binding_id=binding_id,
+        event_id=event_id,
+        pos_id=pos_id,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "mode": "apply" if apply else "dry_run",
+                "database_path": str(database_path),
+                "plan": asdict(plan),
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
+    if not apply:
+        return
+    if plan.has_actions and not expected_fingerprint:
+        typer.echo(
+            "Refusing apply: --expected-fingerprint is required for a nonempty plan.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    result = apply_entry_protection_ledger_repair_plan(
+        session_factory,
+        plan,
+        expected_fingerprint=expected_fingerprint or "",
+    )
+    typer.echo(f"Applied {result.applied} entry protection ledger repair(s).")
 
 
 @app.command("archive-unbound-holdings")

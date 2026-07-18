@@ -1,0 +1,606 @@
+"""Strict repair of historical entry-protection TPSL ledger rows."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
+import hashlib
+import json
+from typing import Any
+
+from telegram_kol_research.models import (
+    ExecutionEvent,
+    ExecutionOrderLeg,
+    PositionProtectionLedger,
+)
+from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+
+
+@dataclass(frozen=True, slots=True)
+class EntryProtectionLedgerRepairAction:
+    event_id: int
+    binding_id: int
+    leg_id: int
+    strategy_instance_id: str | None
+    pos_id: str
+    instrument_id: str
+    side: str
+    order_id: str
+    purpose: str
+    trigger_price: str | None
+    size_text: str | None
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class EntryProtectionLedgerRepairRefusal:
+    event_id: int | None
+    binding_id: int | None
+    pos_id: str | None
+    reason: str
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class EntryProtectionLedgerRepairPlan:
+    created_at: datetime
+    actions: tuple[EntryProtectionLedgerRepairAction, ...]
+    refusals: tuple[EntryProtectionLedgerRepairRefusal, ...]
+    fingerprint: str
+
+    @property
+    def has_actions(self) -> bool:
+        return bool(self.actions)
+
+
+@dataclass(frozen=True, slots=True)
+class EntryProtectionLedgerRepairResult:
+    applied: int
+
+
+def build_entry_protection_ledger_repair_plan(
+    session_factory,
+    *,
+    deepcoin_client,
+    now: datetime | None = None,
+    binding_id: int | None = None,
+    event_id: int | None = None,
+    pos_id: str | None = None,
+    max_event_to_order_seconds: int = 120,
+    max_sibling_time_seconds: int = 3,
+) -> EntryProtectionLedgerRepairPlan:
+    """Build a dry-run repair plan from exchange-returned TPSL order ids."""
+
+    created_at = now or datetime.now(UTC)
+    pending_cache: dict[str, list[dict[str, Any]]] = {}
+    actions: list[EntryProtectionLedgerRepairAction] = []
+    refusals: list[EntryProtectionLedgerRepairRefusal] = []
+    with session_factory() as session:
+        events_query = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.venue == "deepcoin")
+            .filter(ExecutionEvent.action == "set_position_tpsl")
+            .filter(ExecutionEvent.reason == "entry_protection")
+            .filter(ExecutionEvent.execution_binding_id.isnot(None))
+        )
+        if binding_id is not None:
+            events_query = events_query.filter(
+                ExecutionEvent.execution_binding_id == int(binding_id)
+            )
+        if event_id is not None:
+            events_query = events_query.filter(ExecutionEvent.id == int(event_id))
+        clean_pos_id = str(pos_id or "").strip()
+        if clean_pos_id:
+            events_query = events_query.filter(ExecutionEvent.pos_id == clean_pos_id)
+        events = events_query.order_by(ExecutionEvent.id.asc()).all()
+        existing_order_ids = {
+            str(row.order_id)
+            for row in session.query(PositionProtectionLedger.order_id)
+            .filter(PositionProtectionLedger.venue == "deepcoin")
+            .all()
+            if str(row.order_id or "")
+        }
+        for event in events:
+            planned, refusal = _plan_event_repair(
+                session,
+                event,
+                deepcoin_client=deepcoin_client,
+                pending_cache=pending_cache,
+                existing_order_ids=existing_order_ids,
+                max_event_to_order_seconds=max_event_to_order_seconds,
+                max_sibling_time_seconds=max_sibling_time_seconds,
+            )
+            if refusal is not None:
+                refusals.append(refusal)
+                continue
+            actions.extend(planned)
+            existing_order_ids.update(action.order_id for action in planned)
+
+    actions_tuple = tuple(sorted(actions, key=lambda row: (row.binding_id, row.order_id)))
+    refusals_tuple = tuple(
+        sorted(
+            refusals,
+            key=lambda row: (
+                -1 if row.binding_id is None else row.binding_id,
+                -1 if row.event_id is None else row.event_id,
+                row.reason,
+            ),
+        )
+    )
+    return EntryProtectionLedgerRepairPlan(
+        created_at=created_at,
+        actions=actions_tuple,
+        refusals=refusals_tuple,
+        fingerprint=_plan_fingerprint(actions_tuple, refusals_tuple),
+    )
+
+
+def apply_entry_protection_ledger_repair_plan(
+    session_factory,
+    plan: EntryProtectionLedgerRepairPlan,
+    *,
+    expected_fingerprint: str,
+    seen_at: datetime | None = None,
+) -> EntryProtectionLedgerRepairResult:
+    """Apply a previously reviewed plan, guarded by its fingerprint."""
+
+    if not expected_fingerprint:
+        raise ValueError("expected_fingerprint is required")
+    if expected_fingerprint != plan.fingerprint:
+        raise ValueError("repair plan fingerprint mismatch")
+    applied = 0
+    with session_factory() as session:
+        for action in plan.actions:
+            row = upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=action.binding_id,
+                execution_order_leg_id=action.leg_id,
+                strategy_instance_id=action.strategy_instance_id,
+                pos_id=action.pos_id,
+                instrument_id=action.instrument_id,
+                side=action.side,
+                order_id=action.order_id,
+                purpose=action.purpose,
+                trigger_price=action.trigger_price,
+                size_text=action.size_text,
+                status="verified",
+                evidence_source="entry_protection_event_repair",
+                evidence=action.evidence,
+                seen_at=seen_at,
+            )
+            if row is not None:
+                applied += 1
+        session.commit()
+    return EntryProtectionLedgerRepairResult(applied=applied)
+
+
+def _plan_event_repair(
+    session,
+    event: ExecutionEvent,
+    *,
+    deepcoin_client,
+    pending_cache: dict[str, list[dict[str, Any]]],
+    existing_order_ids: set[str],
+    max_event_to_order_seconds: int,
+    max_sibling_time_seconds: int,
+) -> tuple[list[EntryProtectionLedgerRepairAction], EntryProtectionLedgerRepairRefusal | None]:
+    binding_id = int(event.execution_binding_id or 0)
+    pos_id = str(event.pos_id or "").strip()
+    request = _loads_json(event.request_json)
+    response = _loads_json(event.response_json)
+    expected_rows = _expected_protection_rows(request)
+    instrument_id = _request_instrument_id(request) or _event_instrument_id(event)
+    side = _request_side(request) or str(event.side or "").lower()
+    if not binding_id or not pos_id or not expected_rows or not instrument_id or not side:
+        return [], _refusal(event, "missing_event_identity")
+    request_pos_id = _request_pos_id(request)
+    if request_pos_id and request_pos_id != pos_id:
+        return [], _refusal(
+            event,
+            "request_position_mismatch",
+            {"request_pos_id": request_pos_id},
+        )
+    leg = _verified_entry_leg(session, binding_id=binding_id, pos_id=pos_id)
+    if leg is None:
+        return [], _refusal(event, "verified_entry_leg_missing")
+    response_order_ids = _response_order_ids(response)
+    if not response_order_ids:
+        return [], _refusal(event, "response_order_id_missing")
+    pending_rows = pending_cache.setdefault(
+        instrument_id,
+        _safe_pending_tpsl_rows(deepcoin_client, inst_id=instrument_id),
+    )
+    pending_by_order_id = {
+        order_id: row
+        for row in pending_rows
+        if (order_id := _row_order_id(row))
+        and _row_matches_exchange_identity(
+            row, instrument_id=instrument_id, side=side, pos_id=pos_id
+        )
+    }
+    returned_rows = [
+        (order_id, pending_by_order_id.get(order_id)) for order_id in response_order_ids
+    ]
+    if any(row is None for _, row in returned_rows):
+        return [], _refusal(
+            event,
+            "returned_order_not_pending",
+            {"response_order_ids": response_order_ids},
+        )
+    event_time = _coerce_utc_naive(event.created_at)
+    returned_times = [_row_time(row) for _, row in returned_rows if row is not None]
+    if not returned_times or any(time is None for time in returned_times):
+        return [], _refusal(event, "returned_order_time_missing")
+    if any(
+        abs((time - event_time).total_seconds()) > max_event_to_order_seconds
+        for time in returned_times
+        if time is not None
+    ):
+        return [], _refusal(event, "returned_order_time_mismatch")
+
+    expected_by_purpose = {row["purpose"]: row for row in expected_rows}
+    planned: list[EntryProtectionLedgerRepairAction] = []
+    matched_purposes: set[str] = set()
+    returned_order_id_set = {order_id for order_id, _ in returned_rows}
+    for order_id, row in returned_rows:
+        if row is None:
+            continue
+        purpose = _row_matching_expected_purpose(row, expected_rows)
+        if purpose is None:
+            return [], _refusal(
+                event,
+                "returned_order_price_mismatch",
+                {"order_id": order_id},
+            )
+        matched_purposes.add(purpose)
+        if order_id not in existing_order_ids:
+            planned.append(
+                _action_from_expected(
+                    event,
+                    leg,
+                    expected_by_purpose[purpose],
+                    row,
+                    order_id=order_id,
+                    match="response_anchored_order",
+                    anchor_order_ids=response_order_ids,
+                )
+            )
+
+    missing_purposes = [
+        purpose for purpose in expected_by_purpose if purpose not in matched_purposes
+    ]
+    for purpose in missing_purposes:
+        candidates = [
+            row
+            for row in pending_rows
+            if _row_order_id(row) not in returned_order_id_set
+            and _row_matches_exchange_identity(
+                row, instrument_id=instrument_id, side=side, pos_id=pos_id
+            )
+            and _row_matches_expected(row, expected_by_purpose[purpose])
+            and _row_time_within(row, returned_times, max_sibling_time_seconds)
+            and _row_time_within(row, [event_time], max_event_to_order_seconds)
+        ]
+        unique_order_ids = sorted({_row_order_id(row) for row in candidates if _row_order_id(row)})
+        if len(unique_order_ids) != 1:
+            return [], _refusal(
+                event,
+                "sibling_tpsl_not_unique" if unique_order_ids else "sibling_tpsl_missing",
+                {
+                    "purpose": purpose,
+                    "candidate_order_ids": unique_order_ids,
+                    "anchor_order_ids": response_order_ids,
+                },
+            )
+        row = next(row for row in candidates if _row_order_id(row) == unique_order_ids[0])
+        if unique_order_ids[0] not in existing_order_ids:
+            planned.append(
+                _action_from_expected(
+                    event,
+                    leg,
+                    expected_by_purpose[purpose],
+                    row,
+                    order_id=unique_order_ids[0],
+                    match="response_anchored_sibling_tpsl",
+                    anchor_order_ids=response_order_ids,
+                )
+            )
+    return planned, None
+
+
+def _verified_entry_leg(session, *, binding_id: int, pos_id: str) -> ExecutionOrderLeg | None:
+    legs = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.venue == "deepcoin")
+        .filter(ExecutionOrderLeg.execution_binding_id == binding_id)
+        .filter(ExecutionOrderLeg.purpose == "entry")
+        .filter(ExecutionOrderLeg.pos_id == pos_id)
+        .filter(ExecutionOrderLeg.attribution_status == "verified")
+        .all()
+    )
+    return legs[0] if len(legs) == 1 else None
+
+
+def _action_from_expected(
+    event: ExecutionEvent,
+    leg: ExecutionOrderLeg,
+    expected: dict[str, str | None],
+    pending_row: dict[str, Any],
+    *,
+    order_id: str,
+    match: str,
+    anchor_order_ids: list[str],
+) -> EntryProtectionLedgerRepairAction:
+    row_time = _row_time(pending_row)
+    return EntryProtectionLedgerRepairAction(
+        event_id=int(event.id),
+        binding_id=int(event.execution_binding_id or 0),
+        leg_id=int(leg.id),
+        strategy_instance_id=leg.strategy_instance_id,
+        pos_id=str(event.pos_id or ""),
+        instrument_id=str(
+            _request_instrument_id(_loads_json(event.request_json))
+            or _event_instrument_id(event)
+        ),
+        side=str(_request_side(_loads_json(event.request_json)) or event.side or "").lower(),
+        order_id=order_id,
+        purpose=str(expected["purpose"]),
+        trigger_price=expected.get("trigger_price"),
+        size_text=_row_size_text(pending_row) or expected.get("size_text"),
+        evidence={
+            "match": match,
+            "execution_event_id": int(event.id),
+            "anchor_order_ids": anchor_order_ids,
+            "exchange_order_created_at": row_time.isoformat() if row_time else None,
+        },
+    )
+
+
+def _refusal(
+    event: ExecutionEvent,
+    reason: str,
+    evidence: dict[str, Any] | None = None,
+) -> EntryProtectionLedgerRepairRefusal:
+    return EntryProtectionLedgerRepairRefusal(
+        event_id=int(event.id) if event.id is not None else None,
+        binding_id=int(event.execution_binding_id) if event.execution_binding_id else None,
+        pos_id=str(event.pos_id) if event.pos_id else None,
+        reason=reason,
+        evidence=evidence or {},
+    )
+
+
+def _safe_pending_tpsl_rows(deepcoin_client, *, inst_id: str) -> list[dict[str, Any]]:
+    method = getattr(deepcoin_client, "list_trigger_orders_pending", None)
+    if method is None:
+        return []
+    rows = method(inst_id=inst_id)
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _expected_protection_rows(protection_request: Any) -> list[dict[str, str | None]]:
+    requests = protection_request if isinstance(protection_request, list) else [protection_request]
+    rows: list[dict[str, str | None]] = []
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        size_text = str(request.get("sz")) if request.get("sz") is not None else None
+        for purpose, keys in (
+            ("take_profit", ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")),
+            ("stop_loss", ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")),
+        ):
+            trigger_price = _first_nonzero_text(request, *keys)
+            if trigger_price is not None:
+                rows.append(
+                    {
+                        "purpose": purpose,
+                        "trigger_price": trigger_price,
+                        "size_text": size_text,
+                    }
+                )
+    return rows
+
+
+def _request_instrument_id(request: Any) -> str | None:
+    for row in request if isinstance(request, list) else [request]:
+        if isinstance(row, dict):
+            value = _first_nonzero_text(row, "instId", "instrument_id", "instrumentId")
+            if value:
+                return value.upper()
+    return None
+
+
+def _request_side(request: Any) -> str | None:
+    for row in request if isinstance(request, list) else [request]:
+        if isinstance(row, dict):
+            value = _first_nonzero_text(row, "posSide", "side")
+            if value:
+                return value.lower()
+    return None
+
+
+def _request_pos_id(request: Any) -> str | None:
+    for row in request if isinstance(request, list) else [request]:
+        if isinstance(row, dict):
+            value = _first_nonzero_text(row, "posId", "pos_id", "closePosId")
+            if value:
+                return value
+    return None
+
+
+def _event_instrument_id(event: ExecutionEvent) -> str | None:
+    symbol = str(event.symbol or "").strip().upper()
+    return f"{symbol}-USDT-SWAP" if symbol else None
+
+
+def _response_order_ids(response: Any) -> list[str]:
+    ids: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"ordId", "orderId", "order_id", "algoId", "triggerOrderId"}:
+                    text = str(child or "").strip()
+                    if text and text not in ids:
+                        ids.append(text)
+                else:
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(response)
+    return ids
+
+
+def _row_matches_exchange_identity(
+    row: dict[str, Any], *, instrument_id: str, side: str, pos_id: str
+) -> bool:
+    if str(row.get("triggerOrderType") or "TPSL").upper() != "TPSL":
+        return False
+    if str(row.get("instId") or "").upper() != instrument_id.upper():
+        return False
+    if str(row.get("posSide") or row.get("side") or "").lower() != side.lower():
+        return False
+    row_pos_id = _first_nonzero_text(
+        row, "closePosId", "close_pos_id", "closePositionId", "posId", "pos_id", "positionId"
+    )
+    return row_pos_id in (None, pos_id)
+
+
+def _row_matching_expected_purpose(
+    row: dict[str, Any], expected_rows: list[dict[str, str | None]]
+) -> str | None:
+    matches = [
+        str(expected["purpose"])
+        for expected in expected_rows
+        if _row_matches_expected(row, expected)
+    ]
+    unique = sorted(set(matches))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _row_matches_expected(row: dict[str, Any], expected: dict[str, str | None]) -> bool:
+    expected_price = expected.get("trigger_price")
+    if expected_price is None:
+        return False
+    purpose = str(expected.get("purpose") or "")
+    keys = (
+        ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
+        if purpose == "take_profit"
+        else ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+    )
+    price = _first_nonzero_text(row, *keys)
+    if price is None:
+        price = _first_nonzero_text(row, "triggerPx", "triggerPrice")
+    return bool(price and _same_numeric_text(price, expected_price))
+
+
+def _row_time_within(
+    row: dict[str, Any], anchors: list[datetime | None], seconds: int
+) -> bool:
+    row_time = _row_time(row)
+    if row_time is None:
+        return False
+    return any(
+        anchor is not None and abs((row_time - anchor).total_seconds()) <= seconds
+        for anchor in anchors
+    )
+
+
+def _row_time(row: dict[str, Any]) -> datetime | None:
+    for key in ("cTime", "uTime", "createdAt", "created_at", "createdTime"):
+        value = row.get(key)
+        parsed = _parse_datetime(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    try:
+        if text.isdigit():
+            numeric = int(text)
+            if numeric > 10_000_000_000:
+                return datetime.fromtimestamp(numeric / 1000, UTC).replace(tzinfo=None)
+            return datetime.fromtimestamp(numeric, UTC).replace(tzinfo=None)
+        return _coerce_utc_naive(datetime.fromisoformat(text.replace("Z", "+00:00")))
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def _coerce_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _row_order_id(row: dict[str, Any]) -> str | None:
+    return _first_nonzero_text(row, "ordId", "orderId", "order_id", "algoId", "triggerOrderId")
+
+
+def _row_size_text(row: dict[str, Any]) -> str | None:
+    return _first_nonzero_text(row, "sz", "size", "orderSize")
+
+
+def _first_nonzero_text(row: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = row.get(key)
+        if value in (None, "", "0", 0):
+            continue
+        return str(value)
+    return None
+
+
+def _same_numeric_text(left: str, right: str) -> bool:
+    try:
+        return Decimal(str(left)) == Decimal(str(right))
+    except (InvalidOperation, ValueError):
+        return str(left) == str(right)
+
+
+def _loads_json(value: str | None) -> Any:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def _plan_fingerprint(
+    actions: tuple[EntryProtectionLedgerRepairAction, ...],
+    refusals: tuple[EntryProtectionLedgerRepairRefusal, ...],
+) -> str:
+    payload = {
+        "actions": [
+            {
+                "event_id": row.event_id,
+                "binding_id": row.binding_id,
+                "leg_id": row.leg_id,
+                "pos_id": row.pos_id,
+                "order_id": row.order_id,
+                "purpose": row.purpose,
+                "trigger_price": row.trigger_price,
+            }
+            for row in actions
+        ],
+        "refusals": [
+            {
+                "event_id": row.event_id,
+                "binding_id": row.binding_id,
+                "pos_id": row.pos_id,
+                "reason": row.reason,
+            }
+            for row in refusals
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
