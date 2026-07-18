@@ -20,7 +20,9 @@ from telegram_kol_research.execution_bindings import upsert_execution_binding
 from telegram_kol_research.execution_bindings import upsert_execution_order_leg
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
+from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import StrategyLifecycle
+from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.trade_signals import TradeSignalRecord
 from telegram_kol_research.trade_signals import MANUAL_MANAGEMENT_SOURCE_TYPES
@@ -421,6 +423,15 @@ def _submit_recovery_signal_direct(
         strategy_instance_id=str(draft.get("strategy_instance_id") or trade_signal.strategy_instance_id or ""),
         submitted_orders=submitted_orders,
     )
+    _record_entry_protection_ledger_rows(
+        session_factory,
+        binding_id=binding_id,
+        draft=draft,
+        submitted_orders=submitted_orders,
+        side=side_key,
+        deepcoin_client=deepcoin_client,
+        seen_at=now,
+    )
     _attach_lifecycle_binding(
         session_factory,
         chat_id=int(source.get("chat_id") or trade_signal.chat_id),
@@ -554,6 +565,299 @@ def _record_submitted_order_legs(
                 response=order.get("response") if isinstance(order.get("response"), dict) else None,
             ),
         )
+
+
+def _record_entry_protection_ledger_rows(
+    session_factory: sessionmaker,
+    *,
+    binding_id: int,
+    draft: dict[str, Any],
+    submitted_orders: list[dict[str, Any]],
+    side: str,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    seen_at: datetime,
+) -> None:
+    inst_id = str(draft.get("instrument_id") or "")
+    if not inst_id:
+        return
+    pending_tpsl_rows = _safe_pending_tpsl_rows(deepcoin_client, inst_id=inst_id)
+    with session_factory() as session:
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == int(binding_id))
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .all()
+        )
+        leg_by_pos_id = {str(leg.pos_id): leg for leg in legs if leg.pos_id}
+        for order in submitted_orders:
+            if str(order.get("execution_type") or "").lower() != "market":
+                continue
+            pos_id = str(order.get("pos_id") or "")
+            if not pos_id:
+                continue
+            leg = leg_by_pos_id.get(pos_id)
+            if leg is None:
+                continue
+            rows = _entry_protection_ledger_rows(
+                protection_request=order.get("protection_request"),
+                protection_response=order.get("protection_response"),
+                pending_tpsl_rows=pending_tpsl_rows,
+                inst_id=inst_id,
+                side=side,
+                pos_id=pos_id,
+            )
+            for row in rows:
+                upsert_protection_ledger_row(
+                    session,
+                    venue=str(leg.venue or "deepcoin"),
+                    execution_binding_id=binding_id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id=leg.strategy_instance_id,
+                    pos_id=pos_id,
+                    instrument_id=inst_id,
+                    side=side,
+                    order_id=row["order_id"],
+                    purpose=row["purpose"],
+                    trigger_price=row["trigger_price"],
+                    size_text=row.get("size_text"),
+                    status="verified",
+                    evidence_source="entry_protection_response",
+                    evidence=_entry_protection_ledger_evidence(row),
+                    seen_at=seen_at,
+                )
+        session.commit()
+
+
+def _entry_protection_ledger_rows(
+    *,
+    protection_request: Any,
+    protection_response: Any,
+    pending_tpsl_rows: list[dict[str, Any]],
+    inst_id: str,
+    side: str,
+    pos_id: str,
+) -> list[dict[str, str | None]]:
+    expected_rows = _expected_protection_rows(protection_request)
+    if not expected_rows:
+        return []
+    combined_row = _combined_entry_protection_ledger_row(
+        expected_rows=expected_rows,
+        pending_tpsl_rows=pending_tpsl_rows,
+        inst_id=inst_id,
+        side=side,
+        pos_id=pos_id,
+    )
+    if combined_row is not None:
+        return [combined_row]
+    response_order_ids = _protection_response_order_ids(protection_response)
+    response_ids_align_with_rows = len(response_order_ids) == len(expected_rows)
+    resolved: list[dict[str, str | None]] = []
+    used_order_ids: set[str] = set()
+    for index, expected in enumerate(expected_rows):
+        order_id = (
+            response_order_ids[index]
+            if response_ids_align_with_rows and index < len(response_order_ids)
+            else None
+        )
+        evidence_match = "exchange_returned_order_id"
+        pending_order_id = _match_pending_tpsl_order_id(
+            pending_tpsl_rows,
+            inst_id=inst_id,
+            side=side,
+            pos_id=pos_id,
+            purpose=str(expected["purpose"]),
+            trigger_price=str(expected["trigger_price"]),
+        )
+        if pending_order_id:
+            order_id = pending_order_id
+            evidence_match = "pending_tpsl_unique_price"
+        if not order_id or order_id in used_order_ids:
+            continue
+        used_order_ids.add(order_id)
+        resolved.append(
+            {
+                **expected,
+                "order_id": order_id,
+                "evidence_match": evidence_match,
+            }
+        )
+    return resolved
+
+
+def _combined_entry_protection_ledger_row(
+    *,
+    expected_rows: list[dict[str, str | None]],
+    pending_tpsl_rows: list[dict[str, Any]],
+    inst_id: str,
+    side: str,
+    pos_id: str,
+) -> dict[str, str | None] | None:
+    expected_by_purpose = {
+        str(row["purpose"]): str(row["trigger_price"])
+        for row in expected_rows
+        if row.get("purpose") in {"stop_loss", "take_profit"}
+        and row.get("trigger_price") is not None
+    }
+    if set(expected_by_purpose) != {"stop_loss", "take_profit"}:
+        return None
+    matches: list[dict[str, Any]] = []
+    for row in pending_tpsl_rows:
+        if not _pending_tpsl_row_matches_identity(
+            row, inst_id=inst_id, side=side, pos_id=pos_id
+        ):
+            continue
+        stop_price = _first_nonzero_text(
+            row, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice"
+        )
+        take_profit_price = _first_nonzero_text(
+            row, "tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice"
+        )
+        if (
+            stop_price is not None
+            and take_profit_price is not None
+            and _same_numeric_text(stop_price, expected_by_purpose["stop_loss"])
+            and _same_numeric_text(take_profit_price, expected_by_purpose["take_profit"])
+        ):
+            matches.append(row)
+    if len(matches) != 1:
+        return None
+    order_id = _first_nonzero_text(
+        matches[0], "ordId", "orderId", "order_id", "algoId", "triggerOrderId", "id"
+    )
+    if not order_id:
+        return None
+    size_text = str(matches[0].get("sz")) if matches[0].get("sz") is not None else None
+    return {
+        "purpose": "combined",
+        "trigger_price": None,
+        "size_text": size_text,
+        "order_id": order_id,
+        "evidence_match": "pending_tpsl_combined_exact_pos_id",
+        "stop_loss": expected_by_purpose["stop_loss"],
+        "take_profit": expected_by_purpose["take_profit"],
+    }
+
+
+def _entry_protection_ledger_evidence(row: dict[str, str | None]) -> dict[str, Any]:
+    evidence: dict[str, Any] = {"match": row["evidence_match"]}
+    for key in ("stop_loss", "take_profit"):
+        if row.get(key) is not None:
+            evidence[key] = row[key]
+    return evidence
+
+
+def _expected_protection_rows(protection_request: Any) -> list[dict[str, str | None]]:
+    requests = protection_request if isinstance(protection_request, list) else [protection_request]
+    rows: list[dict[str, str | None]] = []
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        size_text = str(request.get("sz")) if request.get("sz") is not None else None
+        for purpose, keys in (
+            ("stop_loss", ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")),
+            ("take_profit", ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")),
+        ):
+            trigger_price = _first_nonzero_text(request, *keys)
+            if trigger_price is None:
+                continue
+            rows.append(
+                {
+                    "purpose": purpose,
+                    "trigger_price": trigger_price,
+                    "size_text": size_text,
+                }
+            )
+    return rows
+
+
+def _protection_response_order_ids(protection_response: Any) -> list[str]:
+    responses = protection_response if isinstance(protection_response, list) else [protection_response]
+    order_ids: list[str] = []
+    for response in responses:
+        if not isinstance(response, dict):
+            continue
+        order_id = _extract_order_id(response)
+        if order_id and order_id not in order_ids:
+            order_ids.append(order_id)
+    return order_ids
+
+
+def _safe_pending_tpsl_rows(
+    deepcoin_client: DeepcoinTradingClientProtocol, *, inst_id: str
+) -> list[dict[str, Any]]:
+    method = getattr(deepcoin_client, "list_trigger_orders_pending", None)
+    if method is None:
+        return []
+    try:
+        rows = method(inst_id=inst_id)
+    except Exception:
+        return []
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _match_pending_tpsl_order_id(
+    pending_tpsl_rows: list[dict[str, Any]],
+    *,
+    inst_id: str,
+    side: str,
+    pos_id: str,
+    purpose: str,
+    trigger_price: str,
+) -> str | None:
+    matches: list[str] = []
+    for row in pending_tpsl_rows:
+        if not _pending_tpsl_row_matches_identity(
+            row, inst_id=inst_id, side=side, pos_id=pos_id
+        ):
+            continue
+        keys = (
+            ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+            if purpose == "stop_loss"
+            else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
+        )
+        row_price = _first_nonzero_text(row, *keys)
+        if row_price is None or not _same_numeric_text(row_price, trigger_price):
+            continue
+        order_id = _first_nonzero_text(
+            row, "ordId", "orderId", "order_id", "algoId", "triggerOrderId", "id"
+        )
+        if order_id:
+            matches.append(order_id)
+    unique = sorted(set(matches))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _pending_tpsl_row_matches_identity(
+    row: dict[str, Any], *, inst_id: str, side: str, pos_id: str
+) -> bool:
+    if str(row.get("triggerOrderType") or "TPSL").upper() != "TPSL":
+        return False
+    if str(row.get("instId") or "").upper() != inst_id.upper():
+        return False
+    if str(row.get("posSide") or row.get("side") or "").lower() != side.lower():
+        return False
+    row_pos_id = _first_nonzero_text(
+        row, "closePosId", "close_pos_id", "closePositionId", "posId", "pos_id", "positionId"
+    )
+    return row_pos_id == str(pos_id)
+
+
+def _same_numeric_text(left: str, right: str) -> bool:
+    try:
+        return float(left) == float(right)
+    except (TypeError, ValueError):
+        return str(left) == str(right)
+
+
+def _first_nonzero_text(row: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = row.get(key)
+        if value in (None, "", "0", 0):
+            continue
+        return str(value)
+    return None
 
 
 def _upsert_protection_failed_binding(

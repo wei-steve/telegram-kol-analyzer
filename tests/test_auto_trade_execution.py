@@ -14,7 +14,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, MediaAsset, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
@@ -93,6 +93,39 @@ class _FakeDeepcoinClient:
         return 68100.0
 
 
+class _SequencedProtectionDeepcoinClient(_FakeDeepcoinClient):
+    def set_position_sltp(self, protection_payload):
+        self.protections.append(protection_payload)
+        order_ids = []
+        if protection_payload.get("slTriggerPx"):
+            order_ids.append(f"sltp-{len(self.trigger_pending) + 1}")
+            self.trigger_pending.append(
+                {
+                    "instId": protection_payload.get("instId"),
+                    "ordId": order_ids[-1],
+                    "posId": protection_payload.get("posId"),
+                    "posSide": protection_payload.get("posSide"),
+                    "triggerOrderType": "TPSL",
+                    "slTriggerPrice": protection_payload.get("slTriggerPx"),
+                    "sz": protection_payload.get("sz", "0"),
+                }
+            )
+        if protection_payload.get("tpTriggerPx"):
+            order_ids.append(f"sltp-{len(self.trigger_pending) + 1}")
+            self.trigger_pending.append(
+                {
+                    "instId": protection_payload.get("instId"),
+                    "ordId": order_ids[-1],
+                    "posId": protection_payload.get("posId"),
+                    "posSide": protection_payload.get("posSide"),
+                    "triggerOrderType": "TPSL",
+                    "tpTriggerPrice": protection_payload.get("tpTriggerPx"),
+                    "sz": protection_payload.get("sz", "0"),
+                }
+            )
+        return {"code": "0", "data": {"ordId": order_ids[0]}}
+
+
 class _TickerForbiddenDeepcoinClient(_FakeDeepcoinClient):
     def __init__(self):
         super().__init__()
@@ -101,6 +134,24 @@ class _TickerForbiddenDeepcoinClient(_FakeDeepcoinClient):
     def get_ticker_price(self, *, inst_id):
         self.ticker_calls += 1
         raise AssertionError("position limit must be checked before ticker access")
+
+
+class _CombinedProtectionDeepcoinClient(_FakeDeepcoinClient):
+    def set_position_sltp(self, protection_payload):
+        self.protections.append(protection_payload)
+        self.trigger_pending.append(
+            {
+                "instId": protection_payload.get("instId"),
+                "ordId": "combined-sltp-1",
+                "posId": protection_payload.get("posId"),
+                "posSide": protection_payload.get("posSide"),
+                "triggerOrderType": "TPSL",
+                "slTriggerPrice": protection_payload.get("slTriggerPx"),
+                "tpTriggerPrice": protection_payload.get("tpTriggerPx"),
+                "sz": protection_payload.get("sz", "0"),
+            }
+        )
+        return {"code": "0", "data": {"ordId": "combined-sltp-1"}}
 
 
 def test_hold_update_is_informational_and_needs_no_deepcoin_client(tmp_path):
@@ -1051,6 +1102,168 @@ def test_auto_process_message_trade_signal_submits_market_order_then_position_sl
     assert '"stop_loss": "67500.0"' in (events[1].after_json or "")
     assert '"take_profit": "69000.0"' in (events[2].after_json or "")
     assert '"take_profit": "70000.0"' in (events[3].after_json or "")
+
+
+def test_auto_process_message_trade_signal_records_entry_protection_ledger(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="ETH 现价开多 SL 1788 TP 1955",
+        entry_text="现价入场",
+        stop_loss_text="1788",
+        take_profit_text="1955",
+        symbol="ETH",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _SequencedProtectionDeepcoinClient()
+    fake_client.ticker_prices["ETH-USDT-SWAP"] = 1844.0
+    fake_client.positions = [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "long",
+            "pos": "2.6",
+            "mrgPosition": "split",
+            "mgnMode": "cross",
+        }
+    ]
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 18, 7, 47, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    with session_factory() as session:
+        rows = (
+            session.query(PositionProtectionLedger)
+            .order_by(PositionProtectionLedger.order_id.asc())
+            .all()
+        )
+        binding_ids = {binding.id for binding in session.query(ExecutionBinding).all()}
+        leg_ids = {leg.id for leg in session.query(ExecutionOrderLeg).all()}
+    assert [(row.order_id, row.pos_id, row.purpose, row.trigger_price) for row in rows] == [
+        ("sltp-1", "pos-1", "stop_loss", "1788.0"),
+        ("sltp-2", "pos-1", "take_profit", "1955.0"),
+    ]
+    assert {row.execution_binding_id for row in rows} == binding_ids
+    assert {row.execution_order_leg_id for row in rows} == leg_ids
+    assert {row.evidence_source for row in rows} == {"entry_protection_response"}
+
+
+def test_auto_process_message_trade_signal_does_not_ledger_price_only_tpsl(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="ETH 现价开多 SL 1788 TP 1955",
+        entry_text="现价入场",
+        stop_loss_text="1788",
+        take_profit_text="1955",
+        symbol="ETH",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _SequencedProtectionDeepcoinClient()
+    fake_client.ticker_prices["ETH-USDT-SWAP"] = 1844.0
+    fake_client.positions = [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "long",
+            "pos": "2.6",
+            "mrgPosition": "split",
+            "mgnMode": "cross",
+        }
+    ]
+    original_set_position_sltp = fake_client.set_position_sltp
+
+    def set_position_sltp_without_position_identity(payload):
+        response = original_set_position_sltp(payload)
+        for row in fake_client.trigger_pending:
+            row.pop("posId", None)
+            row.pop("closePosId", None)
+        return response
+
+    fake_client.set_position_sltp = set_position_sltp_without_position_identity
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 18, 7, 47, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    with session_factory() as session:
+        rows = session.query(PositionProtectionLedger).all()
+    assert rows == []
+
+
+def test_auto_process_message_trade_signal_records_combined_entry_protection(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="ETH 现价开多 SL 1788 TP 1955",
+        entry_text="现价入场",
+        stop_loss_text="1788",
+        take_profit_text="1955",
+        symbol="ETH",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _CombinedProtectionDeepcoinClient()
+    fake_client.ticker_prices["ETH-USDT-SWAP"] = 1844.0
+    fake_client.positions = [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "long",
+            "pos": "2.6",
+            "mrgPosition": "split",
+            "mgnMode": "cross",
+        }
+    ]
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 18, 7, 47, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    with session_factory() as session:
+        rows = session.query(PositionProtectionLedger).all()
+    assert [(row.order_id, row.purpose, row.trigger_price) for row in rows] == [
+        ("combined-sltp-1", "combined", None)
+    ]
 
 
 def test_auto_process_message_trade_signal_accepts_nearby_single_entry_price(tmp_path):

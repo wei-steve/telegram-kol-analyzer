@@ -10,6 +10,7 @@ from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import MediaAsset
 from telegram_kol_research.models import MessageRecognition
+from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import RecognitionDecision
 from telegram_kol_research.models import SignalCandidate
@@ -1850,6 +1851,202 @@ def test_exchange_current_order_uses_execution_binding_attribution(tmp_path):
     assert "order bound-open-order-1" in response.text
     assert "已绑定" in response.text
     assert "Charlie Group" in response.text
+
+
+def test_exchange_current_tpsl_order_uses_protection_ledger_attribution(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:220",
+            chat_id=220,
+            message_id=30,
+            symbol="ETH",
+            side="long",
+            venue="deepcoin",
+            order_id="entry-order-1",
+            pos_id="pos-eth-1",
+            status="active",
+            strategy_instance_id="deepcoin:220:30:ETH:long",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            order_id="entry-order-1",
+            pos_id="pos-eth-1",
+            venue="deepcoin",
+            attribution_status="verified",
+            status="active",
+        )
+        session.add(leg)
+        session.flush()
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                pos_id="pos-eth-1",
+                instrument_id="ETH-USDT-SWAP",
+                side="long",
+                order_id="tpsl-verified-1",
+                purpose="take_profit",
+                trigger_price="1955",
+                size_text="0",
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence_json='{"match":"exchange_returned_order_id"}',
+            )
+        )
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "tpsl-verified-1",
+                    "posSide": "long",
+                    "side": "sell",
+                    "triggerOrderType": "TPSL",
+                    "tpTriggerPrice": "1955",
+                    "sz": "0",
+                }
+            ]
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+    client = TestClient(
+        create_web_app(
+            database_path=database_path,
+            group_config=GroupConfig(
+                groups=[
+                    TargetGroupConfig(
+                        chat_title="Ledger Group",
+                        chat_id=220,
+                        ai_strategy_enabled=True,
+                        trading_mode="auto_trade",
+                    )
+                ]
+            ),
+            deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        )
+    )
+    response = client.get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "order tpsl-verified-1" in response.text
+    assert "已验证保护" in response.text
+    assert "Ledger Group" in response.text
+    assert "pos pos-eth-1" in response.text
+
+
+def test_exchange_current_tpsl_order_without_ledger_is_not_candidate_attributed(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=230,
+            message_id=40,
+            posted_at=datetime(2026, 7, 18, 7, 47, tzinfo=UTC),
+            sender_name="candidate group",
+            text="ETH long 1844 SL 1788 TP 1955",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw_message.id,
+                symbol="ETH",
+                side="long",
+                event_type="entry_signal",
+                entry_text="1844",
+                stop_loss_text="1788",
+                take_profit_text="1955",
+                parse_source="mimo_authoritative",
+                confidence=0.94,
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                chat_id=230,
+                message_id=40,
+                symbol="ETH",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 18, 7, 47, tzinfo=UTC),
+                entry_range_low=1844,
+                entry_range_high=1844,
+                stop_loss=1788,
+                take_profit="1955",
+            )
+        )
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "tpsl-unverified-1",
+                    "posSide": "long",
+                    "side": "sell",
+                    "triggerOrderType": "TPSL",
+                    "tpTriggerPrice": "1955",
+                    "sz": "0",
+                }
+            ]
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+    client = TestClient(
+        create_web_app(
+            database_path=database_path,
+            group_config=GroupConfig(
+                groups=[
+                    TargetGroupConfig(
+                        chat_title="Candidate Group",
+                        chat_id=230,
+                        ai_strategy_enabled=True,
+                        trading_mode="auto_trade",
+                    )
+                ]
+            ),
+            deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        )
+    )
+    response = client.get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "order tpsl-unverified-1" in response.text
+    assert "保护归属未验证" in response.text
+    assert "可能归属" not in response.text
+    assert "Candidate Group" not in response.text
 
 
 def test_exchange_tpsl_order_row_uses_non_zero_trigger_price():

@@ -269,6 +269,16 @@ unique result may be displayed and mutated. Ambiguous protection displays
 exposes cancellable order IDs. Missing timestamps, incompatible sizes, or two
 protection groups competing for one position are ambiguous and fail closed.
 Unscoped TPSL matching is global and mutual-unique across all live positions.
+Initial TP/SL protection created immediately after a market entry must also be
+persisted into `position_protection_ledger`, not merely recorded as an
+`execution_events` row. When Deepcoin returns one protection order ID but the
+pending TPSL snapshot shows distinct TP and SL order IDs, record only rows that
+are tied to the exact `posId`/`closePosId` and uniquely match instrument, side,
+purpose, and trigger price. Price-only matches are never verified protection
+evidence. The Web
+current-order view must display TPSL ownership from the protection ledger first;
+TPSL rows without ledger evidence are `保护归属未验证` and must not be grouped
+under a strategy by symbol, side, price, message text, or group label alone.
 
 Within the single `telegram-kol.service` process, reconciliation and management
 mutations share one authority lock from evidence read through exchange request,

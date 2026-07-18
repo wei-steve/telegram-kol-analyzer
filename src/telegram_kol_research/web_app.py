@@ -59,6 +59,7 @@ from telegram_kol_research.models import (
     AiPromptTestRun,
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionProtectionLedger,
     RecognitionDecision,
     StrategyManagementBatch,
     StrategyManagementLeg,
@@ -1134,18 +1135,16 @@ def _annotate_exchange_snapshot_attribution(
             "order_role": None,
         }
     for item in snapshot.get("open_orders", []):
-        item["attribution"] = _exchange_item_attribution(
+        item["attribution"] = _order_item_attribution(
             item,
             candidates=[*pending_entry_signals, *holding_positions],
             group_label_by_chat_id=group_label_by_chat_id,
-            default_order_role=_infer_exchange_order_role(item),
         )
     for item in snapshot.get("order_history", []):
-        item["attribution"] = _exchange_item_attribution(
+        item["attribution"] = _order_item_attribution(
             item,
             candidates=[*exited_positions, *holding_positions, *pending_entry_signals],
             group_label_by_chat_id=group_label_by_chat_id,
-            default_order_role=_infer_exchange_order_role(item),
         )
     for item in snapshot.get("position_history", []):
         item["attribution"] = _exchange_item_attribution(
@@ -1161,6 +1160,38 @@ def _annotate_exchange_snapshot_attribution(
         "position_history": _group_exchange_items(snapshot.get("position_history", [])),
     }
     return snapshot
+
+
+def _order_item_attribution(
+    item: dict[str, Any],
+    *,
+    candidates: list[dict[str, Any]],
+    group_label_by_chat_id: dict[int, str],
+) -> dict[str, Any]:
+    persisted = item.get("persisted_attribution")
+    if isinstance(persisted, dict):
+        return persisted
+    default_order_role = _infer_exchange_order_role(item)
+    if _is_tpsl_exchange_order(item):
+        return {
+            "state": "conflict",
+            "label": "保护归属未验证",
+            "chat_id": None,
+            "group_name": "未归属",
+            "strategy_id": None,
+            "strategy_summary": "TPSL 未命中保护 ledger · 自动管理已冻结",
+            "source_excerpt": "",
+            "score": 0,
+            "reasons": ["缺少 position_protection_ledger 强证据"],
+            "order_role": default_order_role,
+            "automatic_management_frozen": True,
+        }
+    return _exchange_item_attribution(
+        item,
+        candidates=candidates,
+        group_label_by_chat_id=group_label_by_chat_id,
+        default_order_role=default_order_role,
+    )
 
 
 def _persisted_position_attribution(
@@ -1640,12 +1671,32 @@ def _attach_exchange_order_bindings(
     if not wanted_ids:
         return
     with session_factory() as session:
+        ledger_rows = (
+            session.query(PositionProtectionLedger, ExecutionBinding, ExecutionOrderLeg)
+            .join(
+                ExecutionBinding,
+                ExecutionBinding.id == PositionProtectionLedger.execution_binding_id,
+            )
+            .join(
+                ExecutionOrderLeg,
+                ExecutionOrderLeg.id == PositionProtectionLedger.execution_order_leg_id,
+            )
+            .filter(PositionProtectionLedger.venue == "deepcoin")
+            .filter(PositionProtectionLedger.status == "verified")
+            .filter(PositionProtectionLedger.order_id.in_(wanted_ids))
+            .all()
+        )
         bindings = (
             session.query(ExecutionBinding)
             .filter(ExecutionBinding.venue == "deepcoin")
             .order_by(ExecutionBinding.updated_at.desc(), ExecutionBinding.id.desc())
             .all()
         )
+    ledger_by_order_id: dict[str, tuple[PositionProtectionLedger, ExecutionBinding, ExecutionOrderLeg]] = {}
+    for ledger, binding, leg in ledger_rows:
+        order_id = str(ledger.order_id or "")
+        if order_id and order_id not in ledger_by_order_id:
+            ledger_by_order_id[order_id] = (ledger, binding, leg)
     bindings_by_order_id: dict[str, ExecutionBinding] = {}
     for binding in bindings:
         binding_ids = [
@@ -1656,6 +1707,23 @@ def _attach_exchange_order_bindings(
             if binding_id in wanted_ids and binding_id not in bindings_by_order_id:
                 bindings_by_order_id[binding_id] = binding
     for row in rows:
+        ledger_match = ledger_by_order_id.get(str(row.get("order_id") or ""))
+        if ledger_match is not None:
+            ledger, binding, leg = ledger_match
+            row["chat_id"] = binding.chat_id
+            row["message_id"] = binding.message_id
+            row["group_label"] = group_label_by_chat_id.get(binding.chat_id, str(binding.chat_id))
+            row["symbol"] = binding.symbol or row.get("symbol")
+            row["side"] = binding.side or row.get("side")
+            row["execution_status"] = binding.status
+            row["persisted_attribution"] = _protection_ledger_attribution(
+                ledger=ledger,
+                binding=binding,
+                leg=leg,
+                group_label_by_chat_id=group_label_by_chat_id,
+                default_order_role=_infer_exchange_order_role(row),
+            )
+            continue
         binding = bindings_by_order_id.get(str(row.get("order_id") or ""))
         if binding is None:
             binding = bindings_by_order_id.get(str(row.get("client_order_id") or ""))
@@ -1667,6 +1735,61 @@ def _attach_exchange_order_bindings(
         row["symbol"] = binding.symbol or row.get("symbol")
         row["side"] = binding.side or row.get("side")
         row["execution_status"] = binding.status
+
+
+def _protection_ledger_attribution(
+    *,
+    ledger: PositionProtectionLedger,
+    binding: ExecutionBinding,
+    leg: ExecutionOrderLeg,
+    group_label_by_chat_id: dict[int, str],
+    default_order_role: str | None,
+) -> dict[str, Any]:
+    chat_id = binding.chat_id
+    group_name = group_label_by_chat_id.get(chat_id, str(chat_id))
+    purpose_label = {
+        "take_profit": "止盈保护",
+        "stop_loss": "止损保护",
+        "combined": "止盈止损保护",
+    }.get(str(ledger.purpose or ""), "TPSL 保护")
+    last_verified_at = ledger.last_verified_at or ledger.last_seen_at
+    if last_verified_at is not None:
+        if last_verified_at.tzinfo is None:
+            last_verified_at = last_verified_at.replace(tzinfo=UTC)
+        last_verified_display = last_verified_at.astimezone(
+            DEFAULT_LOCAL_TIMEZONE
+        ).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        last_verified_display = None
+    return {
+        "state": "bound",
+        "label": "已验证保护",
+        "chat_id": chat_id,
+        "group_name": group_name,
+        "strategy_id": binding.strategy_instance_id,
+        "strategy_summary": " · ".join(
+            part
+            for part in (
+                binding.strategy_instance_id,
+                f"{binding.symbol} {binding.side}",
+                purpose_label,
+            )
+            if part
+        ),
+        "source_excerpt": "",
+        "score": 100,
+        "reasons": ["保护 ledger 已验证"],
+        "order_role": default_order_role or purpose_label,
+        "evidence_type": ledger.evidence_source,
+        "pos_id": ledger.pos_id or leg.pos_id,
+        "last_verified_at": last_verified_display,
+        "ownership_state": "verified",
+        "automatic_management_frozen": False,
+    }
+
+
+def _is_tpsl_exchange_order(item: dict[str, Any]) -> bool:
+    return str(item.get("order_type") or "").upper() == "TPSL"
 
 
 def _split_exchange_binding_ids(value: str | None) -> list[str]:
