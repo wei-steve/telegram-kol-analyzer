@@ -1616,7 +1616,12 @@ def test_missing_candidate_or_authoritative_decision_requires_attention(tmp_path
         session.add(unlinked_raw_message)
         session.flush()
         session.add(_decision(unlinked_raw_message.id))
-        candidate = SignalCandidate(raw_message_id=7001, symbol="BTCUSDT", side="long")
+        candidate = SignalCandidate(
+            raw_message_id=7001,
+            symbol="BTCUSDT",
+            side="long",
+            parse_source="mimo_authoritative",
+        )
         session.add(candidate)
         session.flush()
         without_decision = StrategyLifecycle(
@@ -1672,6 +1677,58 @@ def test_missing_candidate_or_authoritative_decision_requires_attention(tmp_path
     )
     assert unlinked_detail["overview"]["recognition_evidence_state"] == "missing"
     assert "signal_candidate" in unlinked_detail["evidence"]["missing"]
+
+
+def test_legacy_candidate_without_authoritative_decision_does_not_fill_attention(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "legacy-recognition.db")
+    with session_factory() as session:
+        candidate = SignalCandidate(
+            raw_message_id=7_101,
+            symbol="BTCUSDT",
+            side="long",
+            parse_source="text",
+            review_status="approved",
+        )
+        session.add(candidate)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            signal_candidate_id=candidate.id,
+            chat_id=10,
+            message_id=710,
+            symbol="BTCUSDT",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=NOW,
+            stop_loss=65_000,
+            updated_at=NOW,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    attention_rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "测试群"},
+        filter_name="needs_attention",
+        limit=10,
+        now=NOW,
+    )
+    all_rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "测试群"},
+        filter_name="all",
+        limit=10,
+        now=NOW,
+    )
+
+    assert attention_rows == []
+    assert len(all_rows) == 1
+    assert all_rows[0]["lifecycle_id"] == lifecycle_id
+    assert all_rows[0]["attention"] is None
+    assert all_rows[0]["attention_reasons"] == []
+    assert all_rows[0]["recognition_state"] == "legacy"
 
 
 def test_execution_events_fail_closed_when_legacy_strategy_instance_is_not_unique(tmp_path):

@@ -292,10 +292,16 @@ groups:
         media_root,
         strategy_alert_config=None,
         strategy_alert_enabled_for_title=None,
+        ai_recognition_config_path=None,
+        authoritative_processor=None,
+        system_operator_bot_config=None,
     ):
         captured["client"] = client
         captured["target_titles"] = set(target_titles)
         captured["strategy_alert_config"] = strategy_alert_config
+        captured["ai_recognition_config_path"] = ai_recognition_config_path
+        captured["authoritative_processor"] = authoritative_processor
+        captured["system_operator_bot_config"] = system_operator_bot_config
 
     fake_client = object()
     fake_alert_config = StrategyAlertConfig(
@@ -346,6 +352,9 @@ groups:
     assert result.exit_code == 0
     assert captured["target_titles"] == {"Demo Group"}
     assert captured["strategy_alert_config"] is fake_alert_config
+    assert captured["ai_recognition_config_path"].name == "ai_recognition.yaml"
+    assert callable(captured["authoritative_processor"])
+    assert captured["system_operator_bot_config"] is not None
     assert captured["lock_entered"] is True
     assert captured["lock_exited"] is True
 

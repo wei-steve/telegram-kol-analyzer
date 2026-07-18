@@ -36,6 +36,7 @@ ATTENTION_SEVERITY_RANK = MappingProxyType(
 FAILED_EXECUTION_STATUSES = frozenset({"failed", "rejected", "error"})
 LIVE_BINDING_STATUSES = frozenset({"open", "active"})
 SAFE_MANAGEMENT_STATUSES = frozenset({"succeeded", "blocked", "resolved"})
+AUTHORITATIVE_CANDIDATE_PARSE_SOURCES = frozenset({"mimo_authoritative"})
 FINISHED_LIFECYCLE_STATUSES = frozenset(
     {"cancelled", "exited", "expired", "finished", "invalidated", "rejected"}
 )
@@ -1287,6 +1288,7 @@ def load_strategy_record_summaries(
         batches = batches_by_lifecycle_id.get(int(lifecycle.id), [])
         attention_reasons = _attention_reasons(
             lifecycle=lifecycle,
+            candidate=candidate,
             decision=decision,
             recognition=recognition,
             binding=binding,
@@ -1320,7 +1322,11 @@ def load_strategy_record_summaries(
                 "symbol": lifecycle.symbol,
                 "side": lifecycle.side,
                 "lifecycle_state": lifecycle.lifecycle_status,
-                "recognition_state": _recognition_state(decision, recognition),
+                "recognition_state": _recognition_state(
+                    decision,
+                    recognition,
+                    candidate,
+                ),
                 "execution_state": _execution_state(binding, lifecycle_events),
                 "attribution_state": _attribution_state(binding),
                 "pos_id": str(binding.pos_id) if binding is not None and binding.pos_id else None,
@@ -1960,10 +1966,20 @@ def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
             StrategyLifecycle.execution_binding_id == ExecutionBinding.id,
         )
     )
-    recognition_evidence_missing = or_(
+    candidate_evidence_missing = or_(
         StrategyLifecycle.signal_candidate_id.is_(None),
         SignalCandidate.id.is_(None),
+    )
+    authoritative_decision_missing = and_(
+        SignalCandidate.id.is_not(None),
+        func.lower(func.coalesce(SignalCandidate.parse_source, "")).in_(
+            AUTHORITATIVE_CANDIDATE_PARSE_SOURCES
+        ),
         RecognitionDecision.id.is_(None),
+    )
+    recognition_evidence_missing = or_(
+        candidate_evidence_missing,
+        authoritative_decision_missing,
     )
     recognition_failed = or_(
         func.lower(RecognitionDecision.authoritative_status).in_(
@@ -2107,6 +2123,7 @@ def _events_for_binding(
 def _attention_reasons(
     *,
     lifecycle: StrategyLifecycle,
+    candidate: SignalCandidate | None,
     decision: RecognitionDecision | None,
     recognition: MessageRecognition | None,
     binding: ExecutionBinding | None,
@@ -2114,9 +2131,15 @@ def _attention_reasons(
     management_batches: list[StrategyManagementBatch],
 ) -> list[dict[str, str]]:
     codes: list[str] = []
-    if lifecycle.signal_candidate_id is None or decision is None:
+    if lifecycle.signal_candidate_id is None or candidate is None:
         codes.append("recognition_evidence_missing")
-    recognition_status = _recognition_state(decision, recognition).strip().lower()
+    elif decision is None and _candidate_requires_authoritative_decision(candidate):
+        codes.append("recognition_evidence_missing")
+    recognition_status = _recognition_state(
+        decision,
+        recognition,
+        candidate,
+    ).strip().lower()
     if recognition_status in _FAILED_RECOGNITION_STATUSES:
         codes.append("recognition_failed")
     if decision is not None and str(decision.disagreement_severity or "").lower() not in (
@@ -2156,12 +2179,22 @@ def _attention_reasons(
 def _recognition_state(
     decision: RecognitionDecision | None,
     recognition: MessageRecognition | None,
+    candidate: SignalCandidate | None = None,
 ) -> str:
     if decision is not None:
         return str(decision.authoritative_status)
     if recognition is not None:
         return str(recognition.status)
+    if candidate is not None and not _candidate_requires_authoritative_decision(candidate):
+        return "legacy"
     return "unknown"
+
+
+def _candidate_requires_authoritative_decision(candidate: SignalCandidate) -> bool:
+    return (
+        str(candidate.parse_source or "").strip().lower()
+        in AUTHORITATIVE_CANDIDATE_PARSE_SOURCES
+    )
 
 
 def _execution_state(

@@ -2440,6 +2440,7 @@ def session_release(pid: int = typer.Option(..., "--pid")) -> None:
 def alerts(
     database_path: Path = Path("data/research.db"),
     config_path: Path = Path("config/groups.yaml"),
+    ai_recognition_config_path: Path = Path("config/ai_recognition.yaml"),
     media_root: Path = Path("data/media"),
 ) -> None:
     """Run realtime AI strategy alert forwarding without the web UI."""
@@ -2469,6 +2470,19 @@ def alerts(
             client = create_telegram_client(auth_config)
             session_factory = create_session_factory(database_path)
             broker = LiveUpdateBroker()
+            system_operator_bot_config = load_system_operator_bot_config()
+
+            def authoritative_processor(raw_message_id: int):
+                return process_authoritative_message(
+                    session_factory,
+                    raw_message_id=raw_message_id,
+                    ai_recognition_config=load_ai_recognition_config(
+                        ai_recognition_config_path
+                    ),
+                    media_root=media_root,
+                    auto_trade_executor=None,
+                )
+
             try:
                 asyncio.run(
                     run_live_listener(
@@ -2484,6 +2498,9 @@ def alerts(
                             and group.chat_title == title
                             for group in group_config.groups
                         ),
+                        ai_recognition_config_path=ai_recognition_config_path,
+                        authoritative_processor=authoritative_processor,
+                        system_operator_bot_config=system_operator_bot_config,
                     )
                 )
             finally:

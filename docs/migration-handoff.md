@@ -158,6 +158,12 @@ Operator interpretation of `recognition_decisions.comparison_status` is:
 
 Completed results use `none`, `normal`, or `critical`. Only `critical` schedules a system-operator notification. `none` and `normal` remain database-audited and Web-visible; normal details are collapsed by default. Pre-migration completed rows have no semantic severity and the Web labels them `待重新复核` (`unclassified`) instead of falsely reporting agreement.
 
+The strategy-record center treats missing `recognition_decisions` as actionable
+only for missing candidates or candidates produced by the MiMo-authoritative
+path. Legacy `SignalCandidate` rows from older `text`, `text+ocr`, or `llm`
+parse sources remain visible as `AI legacy`, but they do not fill the default
+`待处理` view solely because the post-migration audit row does not exist.
+
 Review retries are bounded to three attempts with increasing delay. Stale `running` work is reclaimed through a new claim token, so an old worker cannot complete over a newer owner. Critical notification delivery separately freezes an immutable payload and fingerprint and commits `scheduled` before the network call. `scheduled`, `sent`, and `failed` are never automatically claimed again, providing at-most-once sending across retries and restarts; a crash after `scheduled` can therefore require manual delivery investigation rather than an automatic resend.
 
 Design and implementation references:
