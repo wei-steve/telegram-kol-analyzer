@@ -244,6 +244,50 @@ def load_strategy_record_detail(
             )
             .one_or_none()
         )
+        if entry_candidate is None and lifecycle_entry_message is not None:
+            fallback_entry_candidate = (
+                session.query(SignalCandidate)
+                .filter(SignalCandidate.raw_message_id == lifecycle_entry_message.id)
+                .order_by(
+                    case(
+                        (SignalCandidate.target_lifecycle_id == lifecycle.id, 0),
+                        else_=1,
+                    ),
+                    case(
+                        (
+                            func.lower(func.coalesce(SignalCandidate.parse_source, ""))
+                            .in_(AUTHORITATIVE_CANDIDATE_PARSE_SOURCES),
+                            0,
+                        ),
+                        else_=1,
+                    ),
+                    case(
+                        (
+                            func.lower(func.coalesce(SignalCandidate.symbol, ""))
+                            == str(lifecycle.symbol or "").lower(),
+                            0,
+                        ),
+                        else_=1,
+                    ),
+                    case(
+                        (
+                            func.lower(func.coalesce(SignalCandidate.side, ""))
+                            == str(lifecycle.side or "").lower(),
+                            0,
+                        ),
+                        else_=1,
+                    ),
+                    case((SignalCandidate.event_type == "entry_signal", 0), else_=1),
+                    SignalCandidate.id.desc(),
+                )
+                .first()
+            )
+            if fallback_entry_candidate is not None:
+                entry_candidate = fallback_entry_candidate
+                candidates.append(fallback_entry_candidate)
+                candidates_by_id[int(fallback_entry_candidate.id)] = (
+                    fallback_entry_candidate
+                )
         raw_message_ids = {
             int(row.raw_message_id) for row in candidates
         } | {int(row.raw_message_id) for row in management_batches}

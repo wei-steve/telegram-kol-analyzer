@@ -540,6 +540,57 @@ def test_strategy_detail_entry_message_fallback_is_not_management_message(tmp_pa
     ] == [("entry", entry_raw_id), ("management", management_raw_id)]
 
 
+def test_strategy_detail_falls_back_to_raw_message_candidate_when_link_missing(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "entry-candidate-fallback.db")
+    with session_factory() as session:
+        entry_raw = RawMessage(
+            chat_id=20,
+            message_id=9610,
+            posted_at=NOW,
+            text="BTC short 64400-64700",
+        )
+        session.add(entry_raw)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=entry_raw.id,
+            symbol="BTC",
+            side="short",
+            parse_source="mimo_authoritative",
+            event_type="entry_signal",
+            review_status="pending",
+        )
+        decision = _decision(entry_raw.id)
+        session.add_all([candidate, decision])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=20,
+            message_id=9610,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            entered_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+        candidate_id = candidate.id
+
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={},
+    )
+
+    assert detail["overview"]["recognition_evidence_state"] == "present"
+    assert detail["evidence"]["signal_candidate"]["id"] == candidate_id
+    assert "signal_candidate" not in detail["evidence"]["missing"]
+    assert "recognition_decision" not in detail["evidence"]["missing"]
+
+
 def _strategy_record(
     *, pos_id: str = "pos-1", venue: str = "deepcoin"
 ) -> dict[str, object]:
