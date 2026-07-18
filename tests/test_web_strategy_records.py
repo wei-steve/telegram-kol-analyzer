@@ -624,9 +624,18 @@ def test_strategy_records_attention_count_and_second_page_include_201st_record(t
     database_path = tmp_path / "attention-pages.db"
     session_factory = create_session_factory(database_path)
     with session_factory() as session:
-        session.add_all(
-            [
+        for index in range(201):
+            candidate = SignalCandidate(
+                raw_message_id=10_000 + index,
+                symbol="BTCUSDT",
+                side="long",
+                parse_source="mimo_authoritative",
+            )
+            session.add(candidate)
+            session.flush()
+            session.add(
                 StrategyLifecycle(
+                    signal_candidate_id=candidate.id,
                     chat_id=77,
                     message_id=10_000 + index,
                     symbol="BTCUSDT",
@@ -635,9 +644,7 @@ def test_strategy_records_attention_count_and_second_page_include_201st_record(t
                     signal_at=NOW,
                     updated_at=NOW,
                 )
-                for index in range(201)
-            ]
-        )
+            )
         session.commit()
     factory_calls = []
 

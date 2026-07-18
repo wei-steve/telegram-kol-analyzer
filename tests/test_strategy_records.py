@@ -1604,7 +1604,7 @@ def test_load_strategy_record_summaries_all_includes_normal_and_filters_group(
     assert {row["group_name"] for row in group_rows} == {"峰哥"}
 
 
-def test_missing_candidate_or_authoritative_decision_requires_attention(tmp_path):
+def test_missing_authoritative_decision_requires_attention_without_legacy_noise(tmp_path):
     session_factory = create_session_factory(tmp_path / "missing-recognition.db")
     with session_factory() as session:
         unlinked_raw_message = RawMessage(
@@ -1658,11 +1658,22 @@ def test_missing_candidate_or_authoritative_decision_requires_attention(tmp_path
         now=NOW,
     )
 
-    assert len(rows) == 2
-    assert {row["attention"]["code"] for row in rows} == {
-        "recognition_evidence_missing"
-    }
-    assert {row["recognition_state"] for row in rows} == {"unknown"}
+    assert len(rows) == 1
+    assert rows[0]["lifecycle_id"] == without_decision_id
+    assert rows[0]["attention"]["code"] == "recognition_evidence_missing"
+    assert rows[0]["recognition_state"] == "unknown"
+    all_rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "测试群"},
+        filter_name="all",
+        limit=10,
+        now=NOW,
+    )
+    without_candidate_row = next(
+        row for row in all_rows if row["lifecycle_id"] == without_candidate_id
+    )
+    assert without_candidate_row["attention"] is None
+    assert without_candidate_row["recognition_state"] == "legacy"
     detail = load_strategy_record_detail(
         session_factory,
         lifecycle_id=without_decision_id,
@@ -1932,7 +1943,7 @@ def test_needs_attention_is_not_hidden_by_newer_normal_records(tmp_path):
     )
 
     assert [row["lifecycle_id"] for row in rows] == [critical_id]
-    assert rows[0]["attention"]["code"] == "recognition_evidence_missing"
+    assert rows[0]["attention"]["code"] == "entered_without_binding"
     assert "entered_without_binding" in {
         reason["code"] for reason in rows[0]["attention_reasons"]
     }

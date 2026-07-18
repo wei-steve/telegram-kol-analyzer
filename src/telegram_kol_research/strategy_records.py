@@ -1966,10 +1966,6 @@ def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
             StrategyLifecycle.execution_binding_id == ExecutionBinding.id,
         )
     )
-    candidate_evidence_missing = or_(
-        StrategyLifecycle.signal_candidate_id.is_(None),
-        SignalCandidate.id.is_(None),
-    )
     authoritative_decision_missing = and_(
         SignalCandidate.id.is_not(None),
         func.lower(func.coalesce(SignalCandidate.parse_source, "")).in_(
@@ -1977,10 +1973,7 @@ def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
         ),
         RecognitionDecision.id.is_(None),
     )
-    recognition_evidence_missing = or_(
-        candidate_evidence_missing,
-        authoritative_decision_missing,
-    )
+    recognition_evidence_missing = authoritative_decision_missing
     recognition_failed = or_(
         func.lower(RecognitionDecision.authoritative_status).in_(
             _FAILED_RECOGNITION_STATUSES
@@ -2131,9 +2124,11 @@ def _attention_reasons(
     management_batches: list[StrategyManagementBatch],
 ) -> list[dict[str, str]]:
     codes: list[str] = []
-    if lifecycle.signal_candidate_id is None or candidate is None:
-        codes.append("recognition_evidence_missing")
-    elif decision is None and _candidate_requires_authoritative_decision(candidate):
+    if (
+        candidate is not None
+        and decision is None
+        and _candidate_requires_authoritative_decision(candidate)
+    ):
         codes.append("recognition_evidence_missing")
     recognition_status = _recognition_state(
         decision,
@@ -2185,7 +2180,7 @@ def _recognition_state(
         return str(decision.authoritative_status)
     if recognition is not None:
         return str(recognition.status)
-    if candidate is not None and not _candidate_requires_authoritative_decision(candidate):
+    if candidate is None or not _candidate_requires_authoritative_decision(candidate):
         return "legacy"
     return "unknown"
 
