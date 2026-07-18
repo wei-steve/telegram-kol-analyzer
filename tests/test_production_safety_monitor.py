@@ -107,7 +107,6 @@ def test_monitor_inputs_and_result_are_frozen():
     ("snapshot", "expected_reasons"),
     [
         (_snapshot(service_state="inactive"), ("service_inactive",)),
-        (_snapshot(head=OTHER_HEAD), ("head_drift",)),
         (
             _snapshot(
                 settings={
@@ -134,6 +133,17 @@ def test_system_drift_and_adapter_failure_alert(snapshot, expected_reasons):
 
     assert result.healthy is False
     assert result.reason_codes == tuple(sorted(expected_reasons))
+
+
+def test_head_drift_is_version_context_not_safety_failure():
+    result = evaluate_monitor_snapshot(_snapshot(head=OTHER_HEAD), EXPECTATIONS)
+
+    assert result.healthy is True
+    assert result.reason_codes == ()
+    assert result.details == {
+        "head": OTHER_HEAD,
+        "expected_head": REVIEWED_HEAD,
+    }
 
 
 @pytest.mark.parametrize("invalid_expected", [1, "true", None])
@@ -325,9 +335,10 @@ def test_formatter_uses_fixed_chinese_labels_and_sorted_reason_codes():
 
     assert text.startswith("【生产安全监控异常】")
     assert "检查时间：2026-07-16T09:30:00+00:00" in text
-    assert "异常代码：head_drift,journal_errors,service_inactive" in text
+    assert "异常代码：journal_errors,service_inactive" in text
     assert "服务状态：inactive" in text
     assert f"当前版本：{OTHER_HEAD[:12]}" in text
+    assert f"期望版本：{REVIEWED_HEAD[:12]}" in text
     assert "日志错误数：2" in text
 
 
@@ -587,7 +598,7 @@ def test_same_low_priority_monitor_notification_stays_suppressed_after_six_hours
     now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
     result = MonitorResult(
         healthy=False,
-        reason_codes=("audit_abnormal", "head_drift"),
+        reason_codes=("audit_abnormal",),
         details={
             "head": OTHER_HEAD,
             "expected_head": REVIEWED_HEAD,
@@ -611,7 +622,7 @@ def test_changed_low_priority_monitor_fingerprint_notifies_immediately():
     now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
     previous = MonitorResult(
         healthy=False,
-        reason_codes=("audit_abnormal", "head_drift"),
+        reason_codes=("audit_abnormal",),
         details={
             "head": OTHER_HEAD,
             "expected_head": REVIEWED_HEAD,
@@ -621,7 +632,7 @@ def test_changed_low_priority_monitor_fingerprint_notifies_immediately():
     )
     changed = MonitorResult(
         healthy=False,
-        reason_codes=("audit_abnormal", "head_drift"),
+        reason_codes=("audit_abnormal",),
         details={
             "head": OTHER_HEAD,
             "expected_head": REVIEWED_HEAD,
@@ -1215,7 +1226,7 @@ def test_persistent_low_priority_anomaly_suppresses_repeat_but_advances_window(
     state = load_monitor_state(state_path)
 
     assert first.notification_status == "sent"
-    assert second.result.reason_codes == ("audit_abnormal", "head_drift")
+    assert second.result.reason_codes == ("audit_abnormal",)
     assert second.notification_status == "suppressed"
     assert state.last_window_at == "2026-07-17T01:00:00+00:00"
     assert state.last_notification_at == "2026-07-16T01:00:00+00:00"

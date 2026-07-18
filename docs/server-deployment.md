@@ -140,8 +140,10 @@ journalctl -u telegram-kol-monitor.service -n 50 --no-pager
 ```
 
 Verify the main service remains active and the expected HEAD and live gates
-remain unchanged. A later reviewed deployment must rerun the installer to
-advance the frozen HEAD. To roll back the monitor without touching trading:
+remain unchanged. A later reviewed deployment may rerun the installer to
+advance the frozen HEAD, but valid HEAD drift is treated as deployment context
+rather than a standalone production-safety failure. To roll back the monitor
+without touching trading:
 
 ```bash
 sudo systemctl disable --now telegram-kol-monitor.timer

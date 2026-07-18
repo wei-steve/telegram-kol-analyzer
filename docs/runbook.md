@@ -242,12 +242,12 @@ abnormalities are eligible for monitor alerts.
 Monitor alert delivery is reason-aware. High-priority abnormalities, including
 service/settings drift, journal errors, adapter failures, malformed snapshots,
 state-file integrity problems, abnormal execution events, and incomplete audit
-evidence, retain the six-hour repeat reminder while unchanged. Stable
-low-priority residue limited to `head_drift` and/or `audit_abnormal` sends once
-per unique fingerprint and then becomes log-only until the fingerprint changes.
-This only reduces Telegram noise: the monitor result remains `healthy=false`,
-the systemd oneshot still exits non-zero, and the latest JSON result remains in
-the journal.
+evidence, retain the six-hour repeat reminder while unchanged. Valid HEAD drift
+is deployment context, not a standalone safety failure: the monitor records the
+current and expected versions and includes them with any real alert, but a
+version mismatch alone stays healthy. Stable low-priority `audit_abnormal`
+residue sends once per unique fingerprint and then becomes log-only until the
+fingerprint changes.
 
 The management audit reports informational keep-holding history separately as
 `counts.informational_noop`. Only exact historical zero-leg

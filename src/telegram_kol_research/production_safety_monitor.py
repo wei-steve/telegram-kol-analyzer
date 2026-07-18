@@ -71,7 +71,6 @@ _FIXED_REASON_CODES = frozenset(
         "duplicate_manual_close",
         "event_recovery_status",
         "event_unknown_status",
-        "head_drift",
         "journal_errors",
         "malformed_snapshot",
         "management_execution_mode_drift",
@@ -80,7 +79,7 @@ _FIXED_REASON_CODES = frozenset(
         "state_invalid",
     }
 )
-_LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal", "head_drift"})
+_LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal"})
 _STATE_FIELDS = frozenset(
     {
         "last_window_at",
@@ -853,8 +852,7 @@ def evaluate_monitor_snapshot(
     expected_head = _safe_git_head(expectations.head)
     if observed_head is None or expected_head is None:
         reasons.add("malformed_snapshot")
-    if observed_head != expected_head:
-        reasons.add("head_drift")
+    elif observed_head != expected_head:
         details["head"] = observed_head or "invalid"
         details["expected_head"] = expected_head or "invalid"
 

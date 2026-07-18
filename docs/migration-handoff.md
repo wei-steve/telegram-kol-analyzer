@@ -41,12 +41,13 @@ Its independent writable state lives outside the trading database. Normal trade 
 duplicated; the monitor alerts only on actionable system abnormalities and has
 no authority to restart `telegram-kol.service`, change settings, write the
 production database, or mutate Deepcoin state.
-Notification repeats are reason-aware: unchanged high-priority monitor
-fingerprints still remind every six hours, but unchanged low-priority
-fingerprints containing only `head_drift` and/or `audit_abnormal` are delivered
-once and then kept log-only until the fingerprint changes. This does not soften
-the health contract; those low-priority residues still make the monitor
-`healthy=false` and exit non-zero.
+Version drift is deployment context, not a production-safety failure by itself:
+when current and expected HEADs are both well-formed but differ, the monitor
+records the two versions in details and includes them with any real alert, but
+does not mark the snapshot unhealthy for that reason alone. Notification repeats
+remain reason-aware: unchanged high-priority monitor fingerprints still remind
+every six hours, while unchanged low-priority `audit_abnormal` residue is
+delivered once and then kept log-only until the fingerprint changes.
 
 On each reviewed server deployment, first run
 `systemctl disable --now telegram-kol-monitor.timer`, then require both
