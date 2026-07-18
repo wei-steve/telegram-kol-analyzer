@@ -99,6 +99,18 @@ def test_root_shell_skips_group_strategy_and_configuration_loaders(tmp_path, mon
     assert "data-ai-model-api-key" not in response.text
 
 
+def test_groups_workbench_shell_keeps_message_detail_host_on_root(tmp_path):
+    response = TestClient(create_web_app(database_path=tmp_path / "research.db")).get("/")
+
+    assert response.status_code == 200
+    groups_start = response.text.index('data-workbench-panel="groups"')
+    activity_start = response.text.index('data-workbench-panel="activity"')
+    groups_panel = response.text[groups_start:activity_start]
+    assert "data-detail-panel" in groups_panel
+    assert 'data-mobile-work-region="messages"' not in groups_panel
+    assert "选择群组后加载消息列表" in groups_panel
+
+
 def test_groups_and_more_partials_retain_deferred_controls(tmp_path):
     client = TestClient(
         create_web_app(

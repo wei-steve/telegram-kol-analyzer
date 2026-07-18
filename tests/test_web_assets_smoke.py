@@ -660,6 +660,32 @@ def test_app_js_loads_guarded_desktop_message_companion_from_strategy_view(tmp_p
     assert "fetchDetailPanel(chatId)" in companion_block
 
 
+def test_app_js_routes_group_detail_updates_to_the_active_workbench_panel(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    js = client.get("/static/app.js").text
+
+    assert "function getDetailPanelForWorkbenchView" in js
+    helper_start = js.index("function getDetailPanelForWorkbenchView")
+    helper_end = js.index("\nasync function ", helper_start + 1)
+    helper_block = js[helper_start:helper_end]
+    assert '[data-workbench-panel="${activeView}"] [data-detail-panel]' in helper_block
+
+    selected_start = js.index("async function loadSelectedGroupDestination")
+    selected_end = js.index("\nasync function ", selected_start + 1)
+    selected_block = js[selected_start:selected_end]
+    assert "const legacyView = view === 'activity' ? 'activity' : 'strategies';" in selected_block
+    assert "activeView: legacyView" in selected_block
+    assert "detailPanel: getDetailPanelForWorkbenchView(view)" in selected_block
+
+    group_link_start = js.index("function bindGroupLinks")
+    group_link_end = js.index("\nasync function ", group_link_start + 1)
+    group_link_block = js[group_link_start:group_link_end]
+    assert "activeView = document.querySelector" in group_link_block
+    assert "const detailPanel = getDetailPanelForWorkbenchView(activeView);" in group_link_block
+    assert "document.querySelector('[data-detail-panel]')" not in group_link_block
+
+
 def test_mobile_assets_use_five_destinations_and_bottom_sheet_settings(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

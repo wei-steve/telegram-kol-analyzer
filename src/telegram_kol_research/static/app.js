@@ -1082,7 +1082,8 @@ async function refreshSelectedGroupPanel() {
 
 async function refreshStrategyPanels(chatId) {
   // Refresh the complete detail panel for the selected group
-  const detailPanel = document.querySelector('[data-detail-panel]');
+  const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView || 'groups';
+  const detailPanel = getDetailPanelForWorkbenchView(activeView);
   if (!detailPanel || !chatId) return;
   try {
     const nextPanel = await fetchDetailPanel(chatId);
@@ -1108,13 +1109,13 @@ function bindGroupLinks() {
       const chatId = Number(element.dataset.chatId);
       const requestId = ++groupSwitchRequestId;
       hasDeferredMessageRefresh = false;
-      const detailPanel = document.querySelector('[data-detail-panel]');
-      const strategyPanel = document.querySelector('[data-strategy-panel]');
       const filterInput = document.querySelector('[data-strategy-filter-input]');
       const filter = filterInput ? filterInput.value : 'holding';
       const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView === 'activity'
         ? 'activity'
         : 'groups';
+      const detailPanel = getDetailPanelForWorkbenchView(activeView);
+      const strategyPanel = document.querySelector('[data-strategy-panel]');
       setAiStatus('');
       document.dispatchEvent(new CustomEvent('group-context-pending', { detail: { chatId } }));
       try {
@@ -1158,6 +1159,15 @@ async function loadVisibleGroupDestination({ activeView, chatId, filter, detailP
   bindStrategyFilterBadges();
   bindWorkflowFilters();
   return true;
+}
+
+function getDetailPanelForWorkbenchView(view = null) {
+  const dashboard = document.querySelector('[data-trader-dashboard]');
+  const activeView = view || dashboard?.dataset.activeWorkbenchView || 'groups';
+  const scopedPanel = document.querySelector(`[data-workbench-panel="${activeView}"] [data-detail-panel]`);
+  if (scopedPanel) return scopedPanel;
+  return document.querySelector('[data-workbench-panel].is-active [data-detail-panel]')
+    || document.querySelector('[data-detail-panel]');
 }
 
 async function loadDesktopStrategyCompanion({ chatId, detailPanel, requestId }) {
@@ -1726,7 +1736,7 @@ async function loadSelectedGroupDestination(view) {
     activeView: legacyView,
     chatId,
     filter,
-    detailPanel: document.querySelector('[data-detail-panel]'),
+    detailPanel: getDetailPanelForWorkbenchView(view),
     strategyPanel: document.querySelector('[data-strategy-panel]'),
     requestId,
   });
@@ -1734,7 +1744,7 @@ async function loadSelectedGroupDestination(view) {
   if (view === 'groups') {
     loadDesktopStrategyCompanion({
       chatId,
-      detailPanel: document.querySelector('[data-detail-panel]'),
+      detailPanel: getDetailPanelForWorkbenchView(view),
       requestId,
     }).catch(() => {});
   }

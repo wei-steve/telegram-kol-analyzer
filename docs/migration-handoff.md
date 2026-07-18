@@ -110,6 +110,14 @@ after first paint; `持仓`, `动态`, `群组`, and `更多` load when opened. 
 filters or group selection must not replace a newer request or steal list scroll
 position. Focus/visibility recovery requests remain coalesced.
 
+The `群组` destination remains the desktop three-column observation surface:
+group list, original per-group strategy list, and the companion message/detail
+panel. Its root shell must keep a scoped `data-detail-panel` host inside the
+`groups` workbench panel so `/groups/{chat_id}/detail` can render next to the
+strategy list. Client code must resolve detail panels by active workbench view
+instead of writing to the first global `[data-detail-panel]`, because `activity`
+also owns a detail panel.
+
 Standalone strategy-record routes (`/strategy-records` and
 `/strategy-records/{lifecycle_id}`) stay read-only and outside the workbench
 shell, but they must expose a visible `完整工作台` navigation block linking to
