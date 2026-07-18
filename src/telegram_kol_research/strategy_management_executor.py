@@ -425,7 +425,7 @@ def _execute_protection_batch(
         )
         # This is deliberately the final read before the first exchange cancel.
         pending = list(deepcoin_client.list_trigger_orders_pending(inst_id=inst_id))
-        _preflight_exact_protection_rows(
+        current_protection_rows_by_pos_id = _preflight_exact_protection_rows(
             session_factory=session_factory,
             batch=batch,
             live_positions=live_positions,
@@ -433,7 +433,7 @@ def _execute_protection_batch(
         )
         prepared_legs = []
         for leg in batch.legs:
-            old_rows = list(leg.old_tpsl["row_snapshots"])
+            old_rows = list(current_protection_rows_by_pos_id[leg.pos_id])
             prepared_legs.append(
                 (
                     leg,
@@ -962,12 +962,13 @@ def _preflight_exact_protection_rows(
     batch: ManagementBatchRecord,
     live_positions: list[dict[str, Any]],
     pending: list[dict[str, Any]],
-) -> None:
+) -> dict[str, list[dict[str, Any]]]:
     matches = match_position_protection(live_positions, pending)
     ledger_rows_by_pos_id = _ledger_rows_by_pos_id(
         session_factory, [leg.pos_id for leg in batch.legs]
     )
     seen_ids: set[str] = set()
+    current_rows_by_pos_id: dict[str, list[dict[str, Any]]] = {}
     for leg in batch.legs:
         protection = matches.by_pos_id.get(leg.pos_id)
         expected = leg.old_tpsl or {}
@@ -987,7 +988,12 @@ def _preflight_exact_protection_rows(
         expected_rows = expected.get("row_snapshots") or []
         current_ids = [row.get("order_id") for row in current_rows]
         if (
-            current_rows != expected_rows
+            not _protection_rows_match_expected_snapshot(
+                batch=batch,
+                leg=leg,
+                current_rows=current_rows,
+                expected_rows=expected_rows,
+            )
             or current_ids != expected.get("order_ids")
             or any(not order_id or order_id in seen_ids for order_id in current_ids)
         ):
@@ -995,6 +1001,55 @@ def _preflight_exact_protection_rows(
                 "protection_preflight_rows_ambiguous_or_drifted"
             )
         seen_ids.update(str(order_id) for order_id in current_ids)
+        current_rows_by_pos_id[str(leg.pos_id)] = current_rows
+    return current_rows_by_pos_id
+
+
+def _protection_rows_match_expected_snapshot(
+    *,
+    batch: ManagementBatchRecord,
+    leg: Any,
+    current_rows: list[dict[str, Any]],
+    expected_rows: list[dict[str, Any]],
+) -> bool:
+    if current_rows == expected_rows:
+        return True
+    if batch.effective_action != "partial_then_break_even":
+        return False
+    if len(current_rows) != len(expected_rows):
+        return False
+    remaining_size = _remaining_size_after_partial_close(leg)
+    if remaining_size is None:
+        return False
+    for current, expected in zip(current_rows, expected_rows, strict=False):
+        if _row_without_size(current) != _row_without_size(expected):
+            return False
+        expected_size = _decimal_or_none(expected.get("size"))
+        current_size = _decimal_or_none(current.get("size"))
+        if expected_size is None or current_size is None:
+            return False
+        if expected_size == current_size:
+            continue
+        if expected_size != _decimal_or_none(leg.preflight_size):
+            return False
+        if current_size != remaining_size:
+            return False
+    return True
+
+
+def _row_without_size(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    normalized.pop("size", None)
+    return normalized
+
+
+def _remaining_size_after_partial_close(leg: Any) -> Decimal | None:
+    preflight = _decimal_or_none(leg.preflight_size)
+    close_size = _decimal_or_none(leg.planned_close_size)
+    if preflight is None or close_size is None:
+        return None
+    remaining = preflight - close_size
+    return remaining if remaining > 0 else None
 
 
 def _ledger_rows_by_pos_id(session_factory: sessionmaker, pos_ids: list[str]) -> dict[str, list[Any]]:

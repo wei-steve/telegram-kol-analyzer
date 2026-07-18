@@ -423,7 +423,8 @@ def test_strategy_records_api_never_crowds_out_old_missing_live_binding(tmp_path
     )
     assert old_record["attention"]["code"] == "position_missing"
     assert payload["summary_counts"]["all"] == 1_002
-    assert payload["summary_counts"]["needs_attention"] == 1_002
+    assert payload["summary_counts"]["pending_entry"] == 1_001
+    assert payload["summary_counts"]["needs_attention"] == 1
 
 
 def test_strategy_records_api_returns_exchange_orphan_evidence(tmp_path):
@@ -641,7 +642,7 @@ def test_strategy_records_api_never_reconciles_other_venue_pos_id_with_deepcoin(
             database_path=database_path,
             deepcoin_client_factory=DeepcoinCollisionClient,
         )
-    ).get("/api/strategy-records")
+    ).get("/api/strategy-records?filter_name=all")
 
     assert response.status_code == 200
     records = response.json()["records"]
@@ -664,7 +665,7 @@ def test_strategy_records_api_never_reconciles_other_venue_pos_id_with_deepcoin(
         for row in deepcoin_records
     )
     assert response.json()["summary_counts"]["all"] == 3
-    assert response.json()["summary_counts"]["needs_attention"] == 3
+    assert response.json()["summary_counts"]["needs_attention"] == 2
 
 
 def test_deferred_home_marks_deepcoin_error_without_blocking_the_shell(tmp_path):
@@ -2410,6 +2411,65 @@ def test_critical_semantic_review_opens_outer_ai_disclosure_for_non_strategy(tmp
         r'open role="alert" aria-label="AI复核：严重分歧"',
         response.text,
     )
+
+
+def test_context_semantic_review_renders_open_without_critical_alert(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=77,
+            message_id=21,
+            text="多单移动止损至开仓价",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            MessageRecognition(
+                raw_message_id=raw_message.id,
+                status="非策略",
+                reason="管理已有仓位",
+                engine="mimo-v2.5",
+            )
+        )
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json="{}",
+                agreement_status="disagreed",
+                differences_json='["target_lifecycle_id", "symbol"]',
+                comparison_status="completed",
+                disagreement_severity="critical",
+                comparison_model="deepseek-v4-flash",
+                comparison_payload_json=json.dumps(
+                    {
+                        "reason": "当前消息未指定目标生命周期，独立判断无法确认504。",
+                        "conflict_types": ["symbol", "target_lifecycle"],
+                        "independent_action": {
+                            "action_type": "position_update",
+                            "symbol": None,
+                            "side": "long",
+                            "target_lifecycle_id": None,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/detail/tab/messages"
+    )
+
+    assert response.status_code == 200
+    assert "AI复核：上下文待核对" in response.text
+    assert 'class="semantic-review semantic-review-context"' in response.text
+    assert 'aria-label="AI复核：上下文待核对"' in response.text
+    assert 'role="alert" aria-label="AI复核：严重分歧"' not in response.text
 
 
 def test_management_batch_panel_is_read_only_and_has_safety_labels(tmp_path):

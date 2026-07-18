@@ -384,6 +384,66 @@ def test_load_group_messages_defensively_serializes_malformed_semantic_review_js
     }
 
 
+def test_load_group_messages_labels_context_only_target_disagreement(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(chat_id=9, message_id=1, text="多单移动止损至开仓价")
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json=json.dumps(
+                    {
+                        "lifecycle_event": {
+                            "event_type": "position_update",
+                            "symbol": "BTC",
+                            "side": "long",
+                            "target_lifecycle_id": 504,
+                            "management_action": "partial_then_break_even",
+                        }
+                    }
+                ),
+                agreement_status="disagreed",
+                differences_json='["target_lifecycle_id", "symbol"]',
+                comparison_status="completed",
+                disagreement_severity="critical",
+                comparison_model="deepseek-v4-flash",
+                comparison_payload_json=json.dumps(
+                    {
+                        "reason": "当前消息未指定目标生命周期，独立判断无法确认504。",
+                        "conflict_types": ["symbol", "target_lifecycle"],
+                        "independent_action": {
+                            "action_type": "position_update",
+                            "symbol": None,
+                            "side": "long",
+                            "target_lifecycle_id": None,
+                            "management_action": "partial_take_profit, move_stop_to_protect",
+                            "stop_loss": None,
+                            "take_profit": None,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        session.commit()
+
+    row = load_group_messages(session_factory, chat_id=9, limit=10)[0]
+
+    assert row["semantic_review"] == {
+        "status": "completed",
+        "severity": "context",
+        "label": "上下文待核对",
+        "reason": "当前消息未指定目标生命周期，独立判断无法确认504。",
+        "conflict_types": ["symbol", "target_lifecycle"],
+        "model": "deepseek-v4-flash",
+    }
+
+
 @pytest.mark.parametrize("agreement_status", ["disagreed", "unknown", "agreed"])
 def test_load_group_messages_marks_completed_legacy_review_without_severity_unclassified(
     tmp_path, agreement_status

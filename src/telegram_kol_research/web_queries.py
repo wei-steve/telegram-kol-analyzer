@@ -641,6 +641,13 @@ def _serialize_semantic_review(
     if status == "failed" or decision.agreement_status == "authoritative_failed":
         severity = "failed"
         label = "失败"
+    elif (
+        status == "completed"
+        and decision.disagreement_severity == "critical"
+        and _is_context_only_target_review(payload=payload, conflict_types=conflict_types)
+    ):
+        severity = "context"
+        label = "上下文待核对"
     elif status == "completed" and decision.disagreement_severity == "critical":
         severity = "critical"
         label = "严重分歧"
@@ -671,6 +678,26 @@ def _serialize_semantic_review(
         "conflict_types": conflict_types,
         "model": decision.comparison_model,
     }
+
+
+def _is_context_only_target_review(
+    *,
+    payload: dict[str, object],
+    conflict_types: list[str],
+) -> bool:
+    conflicts = {str(item) for item in conflict_types}
+    if not conflicts or not conflicts <= {"symbol", "target_lifecycle"}:
+        return False
+    independent = payload.get("independent_action")
+    if not isinstance(independent, dict):
+        return False
+    action_type = str(independent.get("action_type") or "")
+    if action_type not in {"position_update", "exit_partial"}:
+        return False
+    return (
+        independent.get("target_lifecycle_id") is None
+        or independent.get("symbol") is None
+    )
 
 
 def _build_recognition_comparison(

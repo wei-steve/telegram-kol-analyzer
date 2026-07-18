@@ -100,7 +100,7 @@
         {% endfor %}
         {% set strategy_related = strategy_ns.value %}
       {% endif %}
-      {% set message_default_expanded = strategy_related or ai_panel_class != 'is-not-strategy' or (semantic_review and semantic_review.severity == 'critical') %}
+      {% set message_default_expanded = strategy_related or ai_panel_class != 'is-not-strategy' or (semantic_review and semantic_review.severity in ['critical', 'context']) %}
       <article
         class="message-card{% if not message_default_expanded %} is-message-collapsed{% endif %}"
         id="message-{{ message.raw_message_id }}"
@@ -180,7 +180,7 @@
           <details
             class="message-ai-insights {{ ai_panel_class }}"
             data-message-ai-insights
-            {% if strategy_related or (semantic_review and semantic_review.severity == 'critical') %}open{% endif %}
+            {% if strategy_related or (semantic_review and semantic_review.severity in ['critical', 'context']) %}open{% endif %}
           >
             <summary class="message-ai-summary">
               <span class="message-ai-summary-status">AI识别结果：{{ detection.status if detection else '待识别' }}</span>
@@ -219,9 +219,10 @@
                 </div>
               {% endif %}
               {% if semantic_review %}
-                {% if semantic_review.severity in ['normal', 'critical'] %}
+                {% if semantic_review.severity in ['normal', 'critical', 'context'] %}
                   <details class="semantic-review semantic-review-{{ semantic_review.severity }}"
                     {% if semantic_review.severity == 'critical' %}open role="alert" aria-label="AI复核：严重分歧"{% endif %}
+                    {% if semantic_review.severity == 'context' %}open aria-label="AI复核：上下文待核对"{% endif %}
                   >
                     <summary>AI复核：{{ semantic_review.label }}</summary>
                     <div class="semantic-review-details">

@@ -3084,6 +3084,11 @@ body {
 
 .semantic-review-agreed { border-left-color: #22c55e; color: #dcfce7; }
 .semantic-review-normal { border-left-color: #f59e0b; color: #fde68a; }
+.semantic-review-context {
+  border-left-color: #38bdf8;
+  background: rgba(14, 116, 144, 0.18);
+  color: #cffafe;
+}
 .semantic-review-unclassified {
   display: grid;
   gap: 2px;

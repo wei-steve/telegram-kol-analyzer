@@ -1042,6 +1042,93 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
     ]
 
 
+def test_partial_then_break_even_replaces_protection_after_exchange_resizes_old_tpsl(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+    from telegram_kol_research.strategy_management_reconciliation import (
+        reconcile_strategy_management_batches,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory,
+        action="partial_then_break_even",
+        stop_loss=None,
+        keep_close_plan=True,
+    )
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    close_result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+    assert close_result["status"] == "reconciling"
+
+    stored = load_management_batch(session_factory, batch.id)
+    order_rows = [
+        {
+            "ordId": leg.exchange_order_id,
+            "clOrdId": leg.client_order_id,
+            "instId": "BTC-USDT-SWAP",
+        }
+        for leg in stored.legs
+    ]
+    snapshot = SimpleNamespace(
+        positions=[
+            {
+                "posId": "pos-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "1",
+                "avgPx": "64000",
+                "cTime": "1000",
+            },
+            {
+                "posId": "pos-2",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "2",
+                "avgPx": "64500",
+                "cTime": "1001",
+            },
+        ],
+        open_orders=[],
+        order_history=order_rows,
+        trade_fills=[],
+        errors={},
+    )
+    reconcile_strategy_management_batches(
+        session_factory, snapshot=snapshot, reconciled_at=NOW
+    )
+    assert load_management_batch(session_factory, batch.id).status == "protection_ready"
+
+    client.positions = list(snapshot.positions)
+    for row in client.pending:
+        if row.get("posId") == "pos-2" and row.get("ordId") == "tp-2":
+            row["sz"] = "2"
+
+    protection_result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert protection_result["status"] == "succeeded"
+    assert [row["ordId"] for row in client.cancel_calls] == [
+        "tp-1a",
+        "tp-1b",
+        "sl-1",
+        "tp-2",
+        "sl-2",
+    ]
+    assert [
+        (row["posId"], row.get("tpTriggerPx"), row.get("slTriggerPx"), row.get("sz"))
+        for row in client.set_calls
+        if row["posId"] == "pos-2"
+    ] == [
+        ("pos-2", "62500", None, "2"),
+        ("pos-2", None, "64500", None),
+    ]
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
