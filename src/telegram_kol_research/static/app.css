@@ -48,6 +48,31 @@ body {
 .workbench-panel.is-active { display: block; }
 .workbench-detail-drawer { min-width: 0; }
 
+.trader-layout .workbench-panel[data-workbench-panel="strategies"].is-active {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  height: 100%;
+  overflow: hidden;
+}
+
+.trader-layout [data-lazy-workbench="strategies"] {
+  min-height: 0;
+}
+
+.trader-layout [data-lazy-workbench="strategies"] > .strategy-record-list {
+  height: 100%;
+  min-height: 0;
+  grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
+  overflow: hidden;
+}
+
+.trader-layout [data-lazy-workbench="strategies"] > .strategy-record-list .home-event-feed {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
 .home-dashboard {
   width: min(880px, 100%);
   margin: 0 auto;

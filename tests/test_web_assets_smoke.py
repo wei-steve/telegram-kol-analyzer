@@ -269,6 +269,40 @@ def test_strategy_record_css_exposes_phone_first_accessibility_contract(tmp_path
     assert ":focus-visible" in css
 
 
+def test_embedded_strategy_records_get_a_desktop_scroll_container(tmp_path):
+    css = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.css"
+    ).text
+
+    panel_selector = (
+        '.trader-layout .workbench-panel[data-workbench-panel="strategies"].is-active {'
+    )
+    list_selector = (
+        '.trader-layout [data-lazy-workbench="strategies"] > .strategy-record-list {'
+    )
+    feed_selector = (
+        '.trader-layout [data-lazy-workbench="strategies"] > '
+        ".strategy-record-list .home-event-feed {"
+    )
+    assert panel_selector in css
+    assert list_selector in css
+    assert feed_selector in css
+
+    panel_start = css.index(panel_selector)
+    panel_block = css[panel_start : css.index("}", panel_start)]
+    list_start = css.index(list_selector)
+    list_block = css[list_start : css.index("}", list_start)]
+    feed_start = css.index(feed_selector)
+    feed_block = css[feed_start : css.index("}", feed_start)]
+
+    assert "display: grid;" in panel_block
+    assert "grid-template-rows: minmax(0, 1fr);" in panel_block
+    assert "overflow: hidden;" in panel_block
+    assert "grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;" in list_block
+    assert "min-height: 0;" in feed_block
+    assert "overflow-y: auto;" in feed_block
+
+
 def test_strategy_record_pagination_keeps_a_44px_phone_touch_target(tmp_path):
     css = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
         "/static/app.css"
