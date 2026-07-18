@@ -15,6 +15,7 @@ from telegram_kol_research.execution_bindings import (
     list_execution_order_legs,
     upsert_execution_binding,
 )
+from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
 from telegram_kol_research.production_safety_monitor import (
     MonitorExpectations,
     MonitorSnapshot,
@@ -31,7 +32,157 @@ def test_cli_help_renders():
     assert "recovery-dry-run" in result.stdout
     assert "repair-position-attribution" in result.stdout
     assert "audit-management-batches" in result.stdout
+    assert "archive-unbound-holdings" in result.stdout
     assert "monitor-production-safety" in result.stdout
+
+
+def test_archive_unbound_holdings_dry_run_then_apply(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 18, 1, 0),
+            entered_at=datetime(2026, 7, 18, 1, 5),
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    dry_run = CliRunner().invoke(
+        app,
+        [
+            "archive-unbound-holdings",
+            "--database-path",
+            str(database_path),
+            "--lifecycle-id",
+            str(lifecycle_id),
+        ],
+    )
+
+    assert dry_run.exit_code == 0, dry_run.stdout
+    dry_run_payload = json.loads(dry_run.stdout)
+    assert dry_run_payload["mode"] == "dry_run"
+    assert dry_run_payload["applied"] == 0
+    assert dry_run_payload["rows"][0]["status"] == "would_archive"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert lifecycle.lifecycle_status == "entered"
+
+    applied = CliRunner().invoke(
+        app,
+        [
+            "archive-unbound-holdings",
+            "--database-path",
+            str(database_path),
+            "--lifecycle-id",
+            str(lifecycle_id),
+            "--expected-count",
+            "1",
+            "--apply",
+        ],
+    )
+
+    assert applied.exit_code == 0, applied.stdout
+    payload = json.loads(applied.stdout)
+    assert payload["mode"] == "apply"
+    assert payload["applied"] == 1
+    assert payload["rows"][0]["status"] == "archived"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert lifecycle.lifecycle_status == "invalidated"
+        assert lifecycle.exit_reason == "context_invalidated"
+        assert lifecycle.management_action == "operator_archived_unbound_holding"
+
+
+def test_archive_unbound_holdings_refuses_deepcoin_binding(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 18, 1, 0),
+            entered_at=datetime(2026, 7, 18, 1, 5),
+        )
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="active",
+        )
+        session.add_all([lifecycle, binding])
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "archive-unbound-holdings",
+            "--database-path",
+            str(database_path),
+            "--lifecycle-id",
+            str(lifecycle_id),
+            "--expected-count",
+            "1",
+            "--apply",
+        ],
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["applied"] == 0
+    assert payload["rows"][0]["status"] == "refused"
+    assert payload["rows"][0]["reasons"] == ["matching_deepcoin_binding_exists"]
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert lifecycle.lifecycle_status == "entered"
+
+
+def test_archive_unbound_holdings_apply_requires_expected_count(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 18, 1, 0),
+            entered_at=datetime(2026, 7, 18, 1, 5),
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "archive-unbound-holdings",
+            "--database-path",
+            str(database_path),
+            "--lifecycle-id",
+            str(lifecycle_id),
+            "--apply",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--expected-count is required" in result.stderr
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert lifecycle.lifecycle_status == "entered"
 
 
 def test_monitor_production_safety_help_has_required_flags():

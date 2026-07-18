@@ -50,7 +50,14 @@ from telegram_kol_research.llm_adjudication import (
 from telegram_kol_research.llm_import import import_llm_adjudication_results
 from telegram_kol_research.media_retention import cleanup_media_files
 from telegram_kol_research.media_dedupe import dedupe_media_assets
-from telegram_kol_research.models import RawMessage, SignalCandidate
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    StrategyLifecycle,
+    StrategyManagementBatch,
+    TradeIdea,
+    RawMessage,
+    SignalCandidate,
+)
 from telegram_kol_research.models import SyncCheckpoint
 from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
 from telegram_kol_research.reporting import load_leaderboard_rows, write_report
@@ -1972,6 +1979,153 @@ def repair_position_attribution(
         expected_fingerprint=expected_fingerprint,
     )
     typer.echo(f"Applied {result.applied} repair action(s).")
+
+
+@app.command("archive-unbound-holdings")
+def archive_unbound_holdings(
+    lifecycle_ids: list[int] = typer.Option(
+        ...,
+        "--lifecycle-id",
+        "-i",
+        help="Strategy lifecycle ID to archive. Repeat for multiple IDs.",
+    ),
+    database_path: Path = Path("data/research.db"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_count: int | None = typer.Option(
+        None,
+        "--expected-count",
+        min=1,
+        help="Refuse --apply unless this equals the number of unique lifecycle IDs.",
+    ),
+    note: str = typer.Option(
+        "operator_unbound_holding_cleanup",
+        "--note",
+        help="Short note stored on archived lifecycle rows.",
+    ),
+) -> None:
+    """Archive entered lifecycle rows that have no Deepcoin execution ownership."""
+
+    unique_ids = list(dict.fromkeys(int(item) for item in lifecycle_ids))
+    if apply and expected_count is None:
+        typer.echo("Refusing apply: --expected-count is required.", err=True)
+        raise typer.Exit(code=2)
+    if apply and expected_count != len(unique_ids):
+        typer.echo(
+            f"Refusing apply: expected-count={expected_count} but ids={len(unique_ids)}.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    session_factory = create_session_factory(database_path)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    rows: list[dict[str, object]] = []
+    refused: list[dict[str, object]] = []
+
+    with session_factory() as session:
+        for lifecycle_id in unique_ids:
+            lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+            row: dict[str, object] = {
+                "lifecycle_id": lifecycle_id,
+                "status": "would_archive",
+                "reasons": [],
+            }
+            reasons: list[str] = []
+            if lifecycle is None:
+                reasons.append("lifecycle_not_found")
+            else:
+                row.update(
+                    {
+                        "chat_id": lifecycle.chat_id,
+                        "message_id": lifecycle.message_id,
+                        "symbol": lifecycle.symbol,
+                        "side": lifecycle.side,
+                        "lifecycle_status": lifecycle.lifecycle_status,
+                        "execution_binding_id": lifecycle.execution_binding_id,
+                    }
+                )
+                if lifecycle.lifecycle_status != "entered":
+                    reasons.append("lifecycle_not_entered")
+                if lifecycle.execution_binding_id is not None:
+                    reasons.append("lifecycle_has_execution_binding")
+                matching_bindings = (
+                    session.query(ExecutionBinding)
+                    .filter(ExecutionBinding.venue == "deepcoin")
+                    .filter(ExecutionBinding.chat_id == lifecycle.chat_id)
+                    .filter(ExecutionBinding.message_id == lifecycle.message_id)
+                    .filter(ExecutionBinding.symbol == lifecycle.symbol)
+                    .filter(ExecutionBinding.side == lifecycle.side)
+                    .count()
+                )
+                if matching_bindings:
+                    reasons.append("matching_deepcoin_binding_exists")
+                management_batches = (
+                    session.query(StrategyManagementBatch)
+                    .filter(StrategyManagementBatch.target_lifecycle_id == lifecycle.id)
+                    .count()
+                )
+                if management_batches:
+                    reasons.append("management_batch_exists")
+
+            if reasons:
+                row["status"] = "refused"
+                row["reasons"] = reasons
+                refused.append(row)
+            rows.append(row)
+
+        if apply and refused:
+            typer.echo(
+                json.dumps(
+                    {
+                        "mode": "apply",
+                        "applied": 0,
+                        "refused": refused,
+                        "rows": rows,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                )
+            )
+            typer.echo("Refusing apply: at least one lifecycle is unsafe to archive.", err=True)
+            raise typer.Exit(code=2)
+
+        applied = 0
+        if apply:
+            for row in rows:
+                lifecycle = session.get(StrategyLifecycle, int(row["lifecycle_id"]))
+                if lifecycle is None:
+                    continue
+                lifecycle.lifecycle_status = "invalidated"
+                lifecycle.exit_reason = "context_invalidated"
+                lifecycle.exited_at = now
+                lifecycle.updated_at = now
+                lifecycle.management_action = "operator_archived_unbound_holding"
+                lifecycle.management_note = note[:512]
+                if lifecycle.trade_idea_id is not None:
+                    trade_idea = session.get(TradeIdea, lifecycle.trade_idea_id)
+                    if trade_idea is not None and trade_idea.status == "open":
+                        trade_idea.status = "closed"
+                        trade_idea.closed_at = now
+                row["status"] = "archived"
+                row["lifecycle_status"] = "invalidated"
+                row["exit_reason"] = "context_invalidated"
+                applied += 1
+            session.commit()
+
+    typer.echo(
+        json.dumps(
+            {
+                "mode": "apply" if apply else "dry_run",
+                "requested": len(unique_ids),
+                "applied": applied,
+                "refused": len(refused),
+                "rows": rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
 
 
 def _build_recovery_market_provider(market_provider: str):

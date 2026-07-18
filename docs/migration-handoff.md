@@ -285,6 +285,28 @@ bootstrap leaves the unique index pending so this read-only/dry-run repair path
 can start; runtime ownership gates still reject the duplicate. After repair,
 restart once more to create the unique index.
 
+Unbound holding cleanup is separate from manual close and attribution repair.
+Use it only after a current Deepcoin snapshot shows zero live positions and zero
+current orders, and only for reviewed `entered` lifecycles that have no
+`execution_binding_id`, no matching Deepcoin execution binding, and no
+management batch. The command is dry-run-first and refuses any row with
+exchange ownership evidence:
+
+```bash
+telegram-kol-research archive-unbound-holdings --database-path data/research.db \
+  --lifecycle-id <id> --lifecycle-id <id>
+telegram-kol-research archive-unbound-holdings --database-path data/research.db \
+  --lifecycle-id <id> --lifecycle-id <id> \
+  --expected-count <reviewed-id-count> --apply
+```
+
+It marks eligible local lifecycle rows `invalidated` with
+`exit_reason=context_invalidated` and records
+`management_action=operator_archived_unbound_holding`. It must not be used for
+`position_attribution_conflict`, `bound_non_live`, `active`, pending order, or
+management-batch residue. Those require their own evidence review so the
+operator does not convert ambiguous exchange history into a clean local archive.
+
 Entry construction and historical attribution follow an additional economic
 identity invariant. A strategy with one normalized entry price produces one
 100% entry leg. If distinct draft range prices collapse to the same exchange
