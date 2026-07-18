@@ -4,12 +4,13 @@
 {% block body_class %}strategy-record-page{% endblock %}
 
 {% block body %}
-<main class="home-dashboard strategy-record-detail" data-strategy-record-detail>
+<main class="strategy-record-workbench-shell">
+  {% include "_strategy_record_workbench_nav.html" %}
+
+  <section class="home-dashboard strategy-record-detail" data-strategy-record-detail>
   <nav class="strategy-record-back" aria-label="返回策略记录">
     <a href="{{ return_href }}">← 返回策略记录</a>
   </nav>
-
-  {% include "_strategy_record_workbench_nav.html" %}
 
   <header class="panel panel-heading">
     <div>
@@ -251,6 +252,7 @@
     {% if record.evidence.missing %}
       <p>缺失证据：{{ record.evidence.missing | join('、') }}</p>
     {% endif %}
+  </section>
   </section>
 </main>
 {% endblock %}

@@ -269,6 +269,8 @@ def test_strategy_record_standalone_pages_link_back_to_full_workbench(tmp_path):
     assert list_response.status_code == 200
     assert detail_response.status_code == 200
     for response in (list_response, detail_response):
+        assert 'class="strategy-record-workbench-shell"' in response.text
+        assert "strategy-record-workbench-rail" in response.text
         assert 'aria-label="完整工作台导航"' in response.text
         for view, label in (
             ("strategies", "策略"),

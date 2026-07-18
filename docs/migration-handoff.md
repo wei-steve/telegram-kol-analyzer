@@ -109,7 +109,9 @@ Standalone strategy-record routes (`/strategy-records` and
 shell, but they must expose a visible `完整工作台` navigation block linking to
 `/?view=strategies`, `/?view=positions`, `/?view=activity`, `/?view=groups`, and
 `/?view=more` so desktop and phone users can recover the same five primary
-destinations without guessing the root route.
+destinations without guessing the root route. Desktop renders that block as a
+left rail so the sidebar does not appear to disappear when moving between the
+workbench shell and standalone record/detail routes.
 
 Dangerous-operation boundaries are unchanged. Strategy summary cards contain no
 close, bind, TPSL, order, or trading-setting mutation. Existing detail-only

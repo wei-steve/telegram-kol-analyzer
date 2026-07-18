@@ -4,9 +4,10 @@
 {% block body_class %}strategy-record-page{% endblock %}
 
 {% block body %}
-<main class="home-dashboard strategy-record-list" data-strategy-record-list data-strategy-record-limit="{{ applied_limit }}" data-strategy-record-page="{{ applied_page }}">
+<main class="strategy-record-workbench-shell">
   {% include "_strategy_record_workbench_nav.html" %}
 
+  <section class="home-dashboard strategy-record-list" data-strategy-record-list data-strategy-record-limit="{{ applied_limit }}" data-strategy-record-page="{{ applied_page }}">
   <header class="panel panel-heading">
     <div>
       <small>实盘观察台</small>
@@ -112,5 +113,6 @@
       >下一页</a>
     </nav>
   {% endif %}
+  </section>
 </main>
 {% endblock %}
