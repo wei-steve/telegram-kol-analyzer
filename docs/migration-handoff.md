@@ -104,6 +104,13 @@ after first paint; `持仓`, `动态`, `群组`, and `更多` load when opened. 
 filters or group selection must not replace a newer request or steal list scroll
 position. Focus/visibility recovery requests remain coalesced.
 
+Standalone strategy-record routes (`/strategy-records` and
+`/strategy-records/{lifecycle_id}`) stay read-only and outside the workbench
+shell, but they must expose a visible `完整工作台` navigation block linking to
+`/?view=strategies`, `/?view=positions`, `/?view=activity`, `/?view=groups`, and
+`/?view=more` so desktop and phone users can recover the same five primary
+destinations without guessing the root route.
+
 Dangerous-operation boundaries are unchanged. Strategy summary cards contain no
 close, bind, TPSL, order, or trading-setting mutation. Existing detail-only
 confirmation, backend validation, reservation, idempotency, and fail-closed

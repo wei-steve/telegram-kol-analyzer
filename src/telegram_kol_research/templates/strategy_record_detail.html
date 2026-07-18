@@ -9,6 +9,8 @@
     <a href="{{ return_href }}">← 返回策略记录</a>
   </nav>
 
+  {% include "_strategy_record_workbench_nav.html" %}
+
   <header class="panel panel-heading">
     <div>
       <small>{{ record.identity.group_name }} · 消息 #{{ record.identity.message_id }}</small>

@@ -255,11 +255,47 @@ body {
   line-height: 1.5;
 }
 
+.strategy-record-workbench-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 12px;
+  background: rgba(17, 24, 39, 0.82);
+}
+
+.strategy-record-workbench-links span {
+  margin-right: 4px;
+  color: var(--color-muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.strategy-record-workbench-links a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 9px;
+  background: rgba(30, 41, 59, 0.78);
+  color: #dbeafe;
+  font-size: 0.82rem;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.strategy-record-workbench-links a:hover {
+  background: rgba(37, 99, 235, 0.30);
+}
+
 .strategy-record-list button,
 .strategy-record-list select,
 .strategy-record-list a,
 .strategy-record-detail summary,
-.strategy-record-back a {
+.strategy-record-back a,
+.strategy-record-workbench-links a {
   min-height: 44px;
 }
 

@@ -5,6 +5,8 @@
 
 {% block body %}
 <main class="home-dashboard strategy-record-list" data-strategy-record-list data-strategy-record-limit="{{ applied_limit }}" data-strategy-record-page="{{ applied_page }}">
+  {% include "_strategy_record_workbench_nav.html" %}
+
   <header class="panel panel-heading">
     <div>
       <small>实盘观察台</small>

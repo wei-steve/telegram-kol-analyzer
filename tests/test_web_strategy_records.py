@@ -260,6 +260,27 @@ def test_strategy_record_list_exposes_mobile_controller_hooks(tmp_path):
     assert "data-strategy-record-last-success" in response.text
 
 
+def test_strategy_record_standalone_pages_link_back_to_full_workbench(tmp_path):
+    client, lifecycle_id = _client(tmp_path)
+
+    list_response = client.get("/strategy-records")
+    detail_response = client.get(f"/strategy-records/{lifecycle_id}")
+
+    assert list_response.status_code == 200
+    assert detail_response.status_code == 200
+    for response in (list_response, detail_response):
+        assert 'aria-label="完整工作台导航"' in response.text
+        for view, label in (
+            ("strategies", "策略"),
+            ("positions", "持仓"),
+            ("activity", "动态"),
+            ("groups", "群组"),
+            ("more", "更多"),
+        ):
+            assert f'href="/?view={view}"' in response.text
+            assert f">{label}</a>" in response.text
+
+
 def test_strategy_record_detail_is_semantic_read_only_and_escapes_evidence(tmp_path):
     client, lifecycle_id = _client(tmp_path)
 
