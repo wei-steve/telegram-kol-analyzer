@@ -80,6 +80,7 @@ _FIXED_REASON_CODES = frozenset(
         "state_invalid",
     }
 )
+_LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal", "head_drift"})
 _STATE_FIELDS = frozenset(
     {
         "last_window_at",
@@ -788,7 +789,7 @@ def decide_monitor_notification(
     *,
     now: datetime,
 ) -> MonitorNotificationDecision:
-    """Apply fingerprint change and six-hour repeat-notification policy."""
+    """Apply fingerprint change and reason-aware repeat-notification policy."""
 
     _monitor_state_payload(state)
     now_rendered = _canonical_aware_datetime(now)
@@ -808,6 +809,8 @@ def decide_monitor_notification(
     if not should_notify:
         if state.last_notification_at is None:
             should_notify = True
+        elif _uses_low_repeat_policy(result):
+            should_notify = False
         else:
             last_notification = datetime.fromisoformat(state.last_notification_at)
             should_notify = now - last_notification >= _NOTIFICATION_SUPPRESSION
@@ -822,6 +825,11 @@ def decide_monitor_notification(
             last_notification_at=now_rendered,
         ),
     )
+
+
+def _uses_low_repeat_policy(result: MonitorResult) -> bool:
+    reason_codes = set(result.reason_codes)
+    return bool(reason_codes) and reason_codes <= _LOW_REPEAT_REASON_CODES
 
 
 def evaluate_monitor_snapshot(

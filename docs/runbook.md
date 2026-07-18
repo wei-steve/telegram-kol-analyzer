@@ -239,6 +239,16 @@ production database, call a Deepcoin mutation, or restart the trading service.
 Normal trade notifications are not duplicated: only actionable system
 abnormalities are eligible for monitor alerts.
 
+Monitor alert delivery is reason-aware. High-priority abnormalities, including
+service/settings drift, journal errors, adapter failures, malformed snapshots,
+state-file integrity problems, abnormal execution events, and incomplete audit
+evidence, retain the six-hour repeat reminder while unchanged. Stable
+low-priority residue limited to `head_drift` and/or `audit_abnormal` sends once
+per unique fingerprint and then becomes log-only until the fingerprint changes.
+This only reduces Telegram noise: the monitor result remains `healthy=false`,
+the systemd oneshot still exits non-zero, and the latest JSON result remains in
+the journal.
+
 The management audit reports informational keep-holding history separately as
 `counts.informational_noop`. Only exact historical zero-leg
 `hold_update`/`blocked` rows with reason

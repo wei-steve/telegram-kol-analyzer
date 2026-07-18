@@ -583,6 +583,64 @@ def test_same_monitor_notification_is_suppressed_for_six_hours():
     assert eligible.next_state.last_notification_at == now.isoformat()
 
 
+def test_same_low_priority_monitor_notification_stays_suppressed_after_six_hours():
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
+    result = MonitorResult(
+        healthy=False,
+        reason_codes=("audit_abnormal", "head_drift"),
+        details={
+            "head": OTHER_HEAD,
+            "expected_head": REVIEWED_HEAD,
+            "audit_abnormal_count": 4,
+            "audit_abnormal": True,
+        },
+    )
+    fingerprint = fingerprint_monitor_result(result)
+    state = MonitorState(
+        anomaly_fingerprint=fingerprint,
+        last_notification_at=(now - timedelta(hours=24)).isoformat(),
+    )
+
+    decision = decide_monitor_notification(result, state, now=now)
+
+    assert decision.should_notify is False
+    assert decision.next_state == state
+
+
+def test_changed_low_priority_monitor_fingerprint_notifies_immediately():
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
+    previous = MonitorResult(
+        healthy=False,
+        reason_codes=("audit_abnormal", "head_drift"),
+        details={
+            "head": OTHER_HEAD,
+            "expected_head": REVIEWED_HEAD,
+            "audit_abnormal_count": 4,
+            "audit_abnormal": True,
+        },
+    )
+    changed = MonitorResult(
+        healthy=False,
+        reason_codes=("audit_abnormal", "head_drift"),
+        details={
+            "head": OTHER_HEAD,
+            "expected_head": REVIEWED_HEAD,
+            "audit_abnormal_count": 5,
+            "audit_abnormal": True,
+        },
+    )
+    state = MonitorState(
+        anomaly_fingerprint=fingerprint_monitor_result(previous),
+        last_notification_at=(now - timedelta(minutes=1)).isoformat(),
+    )
+
+    decision = decide_monitor_notification(changed, state, now=now)
+
+    assert decision.should_notify is True
+    assert decision.next_state.anomaly_fingerprint == fingerprint_monitor_result(changed)
+    assert decision.next_state.last_notification_at == now.isoformat()
+
+
 def test_healthy_monitor_result_silently_clears_active_fingerprint():
     now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
     previous_notification = (now - timedelta(minutes=30)).isoformat()
@@ -606,10 +664,11 @@ def test_healthy_monitor_result_silently_clears_active_fingerprint():
 
 
 class _RecordingAdapters:
-    def __init__(self, *, service_state="active", audit=None):
+    def __init__(self, *, service_state="active", audit=None, head=REVIEWED_HEAD):
         self.calls = []
         self.service_state = service_state
         self.audit = audit or _healthy_audit()
+        self.head = head
 
     def read_service_state(self):
         self.calls.append("service")
@@ -617,7 +676,7 @@ class _RecordingAdapters:
 
     def read_git_head(self):
         self.calls.append("head")
-        return REVIEWED_HEAD
+        return self.head
 
     def read_settings(self):
         self.calls.append("settings")
@@ -1129,6 +1188,38 @@ def test_changed_persistent_anomaly_after_combined_delivery_notifies_immediately
     assert changed.result.details["service_state"] == "failed"
     assert changed.notification_status == "sent"
     assert len(deliveries) == 2
+
+
+def test_persistent_low_priority_anomaly_suppresses_repeat_but_advances_window(
+    tmp_path,
+):
+    state_path = tmp_path / "state.json"
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+    deliveries = []
+    audit = _healthy_audit(counts={**_healthy_audit()["counts"], "blocked": 4})
+
+    def run(now):
+        return run_production_safety_monitor(
+            expectations=EXPECTATIONS,
+            state_path=state_path,
+            adapters=_RecordingAdapters(audit=audit, head=OTHER_HEAD),
+            now=now,
+            notify=True,
+            force_full_audit=True,
+            load_bot_config=lambda: config,
+            send_bot_message=lambda **payload: deliveries.append(payload),
+        )
+
+    first = run(datetime(2026, 7, 16, 1, 0, tzinfo=UTC))
+    second = run(datetime(2026, 7, 17, 1, 0, tzinfo=UTC))
+    state = load_monitor_state(state_path)
+
+    assert first.notification_status == "sent"
+    assert second.result.reason_codes == ("audit_abnormal", "head_drift")
+    assert second.notification_status == "suppressed"
+    assert state.last_window_at == "2026-07-17T01:00:00+00:00"
+    assert state.last_notification_at == "2026-07-16T01:00:00+00:00"
+    assert len(deliveries) == 1
 
 
 @pytest.mark.parametrize(

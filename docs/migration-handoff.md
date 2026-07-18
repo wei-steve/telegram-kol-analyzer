@@ -41,6 +41,12 @@ Its independent writable state lives outside the trading database. Normal trade 
 duplicated; the monitor alerts only on actionable system abnormalities and has
 no authority to restart `telegram-kol.service`, change settings, write the
 production database, or mutate Deepcoin state.
+Notification repeats are reason-aware: unchanged high-priority monitor
+fingerprints still remind every six hours, but unchanged low-priority
+fingerprints containing only `head_drift` and/or `audit_abnormal` are delivered
+once and then kept log-only until the fingerprint changes. This does not soften
+the health contract; those low-priority residues still make the monitor
+`healthy=false` and exit non-zero.
 
 On each reviewed server deployment, first run
 `systemctl disable --now telegram-kol-monitor.timer`, then require both
