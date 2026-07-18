@@ -1686,8 +1686,10 @@ def test_missing_authoritative_decision_requires_attention_without_legacy_noise(
         lifecycle_id=without_candidate_id,
         group_labels_by_chat_id={10: "测试群"},
     )
-    assert unlinked_detail["overview"]["recognition_evidence_state"] == "missing"
+    assert unlinked_detail["overview"]["recognition_evidence_state"] == "present"
+    assert unlinked_detail["overview"]["authoritative_model"] == "mimo-v2.5"
     assert "signal_candidate" in unlinked_detail["evidence"]["missing"]
+    assert "recognition_decision" not in unlinked_detail["evidence"]["missing"]
 
 
 def test_legacy_candidate_without_authoritative_decision_does_not_fill_attention(

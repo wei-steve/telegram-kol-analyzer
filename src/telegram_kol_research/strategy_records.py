@@ -551,9 +551,7 @@ def load_strategy_record_detail(
         "overview": {
             "lifecycle_status": lifecycle.lifecycle_status,
             "recognition_evidence_state": (
-                "present"
-                if entry_candidate is not None and authoritative_decision is not None
-                else "missing"
+                "present" if authoritative_decision is not None else "missing"
             ),
             "authoritative_model": (
                 authoritative_decision.authoritative_model
