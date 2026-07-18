@@ -1377,6 +1377,11 @@ def _derive_binding_from_entry_legs(
         binding.status = "active"
         binding.last_exchange_status = "position_ownership_verified"
         _attach_binding_to_lifecycle(session, binding, recovered_at)
+    elif all_terminal:
+        binding.pos_id = None
+        binding.status = "closed"
+        binding.last_exchange_status = "entry_legs_terminal"
+        _cancel_missing_entry_lifecycle(session, binding, recovered_at)
     elif verified_missing_pos_ids:
         binding.pos_id = _join_unique_ids(verified_missing_pos_ids)
         binding.status = "stale"
@@ -1398,11 +1403,6 @@ def _derive_binding_from_entry_legs(
         binding.status = "open"
         binding.last_exchange_status = "entry_order_pending"
         _mark_lifecycle_pending(session, binding=binding, updated_at=recovered_at)
-    elif all_terminal:
-        binding.pos_id = None
-        binding.status = "closed"
-        binding.last_exchange_status = "entry_legs_terminal"
-        _cancel_missing_entry_lifecycle(session, binding, recovered_at)
     else:
         binding.pos_id = None
         binding.status = "stale"
@@ -1540,16 +1540,21 @@ def sync_manual_closed_deepcoin_positions(
         rows = (
             session.query(ExecutionBinding)
             .filter(ExecutionBinding.venue == "deepcoin")
-            .filter(ExecutionBinding.status.in_(["open", "active", "stale"]))
+            .filter(
+                ExecutionBinding.status.in_(["open", "active", "stale", "unknown"])
+            )
             .order_by(ExecutionBinding.id.asc())
             .all()
         )
         for row in rows:
-            pos_ids = _split_ids(row.pos_id)
+            entry_legs = _entry_legs_for_binding(session, row)
+            pos_ids = _split_ids(row.pos_id) or _entry_leg_position_ids(entry_legs)
             if not pos_ids:
                 result.skipped_without_pos_id += 1
                 continue
             result.checked += 1
+            if str(row.status or "") == "unknown" and not entry_legs:
+                continue
             if any(pos_id in active_pos_ids for pos_id in pos_ids):
                 result.partial_legs_closed += _sync_missing_verified_entry_legs(
                     session,
@@ -1558,6 +1563,17 @@ def sync_manual_closed_deepcoin_positions(
                     active_pos_ids=active_pos_ids,
                     synced_at=now,
                 )
+                continue
+            if _binding_close_requires_exact_position_history(session, legs=entry_legs):
+                if _sync_terminal_exited_history_closed_entry_legs(
+                    session,
+                    binding=row,
+                    legs=entry_legs,
+                    client=client,
+                    active_pos_ids=active_pos_ids,
+                    synced_at=now,
+                ):
+                    result.manually_closed += 1
                 continue
             if _binding_has_unresolved_entry_leg(session, row):
                 row.status = "open"
@@ -1606,6 +1622,107 @@ def sync_manual_closed_deepcoin_positions(
                         trade_idea.closed_at = now
         session.commit()
     return result
+
+
+def _entry_legs_for_binding(
+    session, binding: ExecutionBinding
+) -> list[ExecutionOrderLeg]:
+    return (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.execution_binding_id == int(binding.id))
+        .filter(ExecutionOrderLeg.purpose == "entry")
+        .all()
+    )
+
+
+def _entry_leg_position_ids(legs: list[ExecutionOrderLeg]) -> list[str]:
+    joined = _join_unique_ids(
+        str(leg.pos_id)
+        for leg in legs
+        if leg.pos_id
+        and str(leg.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
+    )
+    return _split_ids(joined)
+
+
+def _binding_close_requires_exact_position_history(
+    session,
+    *,
+    legs: list[ExecutionOrderLeg],
+) -> bool:
+    for leg in legs:
+        if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+            continue
+        if not leg.pos_id:
+            continue
+        if str(leg.attribution_status or "") != "verified":
+            return True
+        if not (
+            has_authoritative_persisted_position(leg, session=session)
+            or _has_prior_authoritative_position_audit(session, leg=leg)
+        ):
+            return True
+    return False
+
+
+def _sync_terminal_exited_history_closed_entry_legs(
+    session,
+    *,
+    binding: ExecutionBinding,
+    legs: list[ExecutionOrderLeg],
+    client: DeepcoinReadOnlyClient,
+    active_pos_ids: set[str],
+    synced_at: datetime,
+) -> bool:
+    history_reader = getattr(client, "list_position_history", None)
+    if history_reader is None:
+        return False
+    lifecycle = _latest_lifecycle_for_binding(session, binding)
+    if lifecycle is None or not _is_terminal_exited_lifecycle(lifecycle):
+        return False
+    nonterminal_legs = [
+        leg
+        for leg in legs
+        if str(leg.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
+    ]
+    if not nonterminal_legs:
+        return False
+    for leg in nonterminal_legs:
+        pos_id = str(leg.pos_id or "")
+        if not pos_id or pos_id in active_pos_ids:
+            return False
+        if not _position_history_proves_full_close(
+            history_reader,
+            binding=binding,
+            pos_id=pos_id,
+        ):
+            return False
+    for leg in nonterminal_legs:
+        leg.status = "manually_closed"
+        leg.terminal_reason = "manual_position_missing"
+        leg.updated_at = synced_at
+    _derive_binding_from_entry_legs(
+        session,
+        binding=binding,
+        legs=legs,
+        live_position_ids=active_pos_ids,
+        recovered_at=synced_at,
+    )
+    return True
+
+
+def _latest_lifecycle_for_binding(session, binding: ExecutionBinding):
+    from telegram_kol_research.models import StrategyLifecycle
+
+    return (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.chat_id == binding.chat_id)
+        .filter(StrategyLifecycle.message_id == binding.message_id)
+        .filter(StrategyLifecycle.symbol == binding.symbol)
+        .filter(StrategyLifecycle.side == binding.side)
+        .order_by(StrategyLifecycle.id.desc())
+        .first()
+    )
 
 
 def _sync_missing_verified_entry_legs(

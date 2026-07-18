@@ -3315,6 +3315,133 @@ def test_sync_manual_closed_positions_skips_weak_verified_missing_leg(tmp_path):
     assert weak_leg.terminal_reason is None
 
 
+def test_sync_manual_closed_positions_terminalizes_exited_conflict_legs_with_exact_history(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            pos_id=None,
+            status="unknown",
+            order_id="order-1,order-2",
+            client_order_id="client-1,client-2",
+        ),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=1,
+        order_id="order-1",
+        client_order_id="client-1",
+        pos_id="pos-closed-1",
+        status="active",
+        attribution_status="attribution_conflict",
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=2,
+        order_id="order-2",
+        client_order_id="client-2",
+        pos_id="pos-closed-2",
+        status="active",
+        attribution_status="attribution_conflict",
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="exited",
+                exit_reason="kol_signal",
+                signal_at=datetime(2026, 6, 30, 9, 0),
+                entered_at=datetime(2026, 6, 30, 9, 1),
+                exited_at=datetime(2026, 6, 30, 9, 30),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return []
+
+        def list_position_history(self, *, inst_id, pos_id):
+            assert inst_id == "BTC-USDT-SWAP"
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": pos_id,
+                    "posSide": "long",
+                    "pos": "7",
+                    "closePos": "7",
+                }
+            ]
+
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=FakeClient(),
+        synced_at=datetime(2026, 6, 30, 10, 0),
+    )
+
+    assert result.checked == 1
+    assert result.manually_closed == 1
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = session.query(StrategyLifecycle).one()
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id)
+            .order_by(ExecutionOrderLeg.leg_index.asc())
+            .all()
+        )
+
+    assert binding.status == "closed"
+    assert binding.pos_id is None
+    assert binding.last_exchange_status == "entry_legs_terminal"
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "kol_signal"
+    assert [(leg.status, leg.terminal_reason) for leg in legs] == [
+        ("manually_closed", "manual_position_missing"),
+        ("manually_closed", "manual_position_missing"),
+    ]
+    assert [leg.attribution_status for leg in legs] == [
+        "attribution_conflict",
+        "attribution_conflict",
+    ]
+
+
+def test_sync_manual_closed_positions_keeps_unknown_legacy_binding_without_entry_legs(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(pos_id="legacy-pos", status="unknown"),
+    )
+
+    class FakeClient:
+        def list_positions(self):
+            return []
+
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=FakeClient(),
+        synced_at=datetime(2026, 6, 30, 10, 0),
+    )
+
+    assert result.checked == 1
+    assert result.manually_closed == 0
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+
+    assert binding.status == "unknown"
+    assert binding.pos_id == "legacy-pos"
+
+
 def test_sync_closed_position_finalizes_pending_kol_exit_exactly_once(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(

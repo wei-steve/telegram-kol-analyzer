@@ -253,6 +253,13 @@ lifecycle state. The permitted ownership states are `verified`, `unassigned`,
 failure freezes automatic close and TPSL mutation. API failure is never treated
 as position/order absence.
 
+Exact Deepcoin `position_history` can terminalize already-exited historical
+entry legs whose persisted `posId` is no longer live only when the queried row
+matches the requested `posId`, instrument, and side, and proves `closePos ==
+pos`. This cleanup removes stale alert noise from terminal strategies; it does
+not convert conflicted evidence into verified live-position ownership and never
+authorizes close or TPSL mutation.
+
 Strategy-management source isolation is end to end. The management raw
 message, authoritative candidate, and recognition decision must identify the
 same raw row and chat; the target lifecycle, strategy instance, and binding
