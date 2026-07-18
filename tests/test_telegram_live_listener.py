@@ -530,8 +530,8 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
     )
 
     text = "移动保本损 剩余30%挂65000全部止盈 我怕后半夜搞事情"
-    asyncio.run(
-        persist_live_message_event(
+    async def scenario():
+        await persist_live_message_event(
             event=_FakeEvent(text=text),
             session_factory=session_factory,
             broker=broker,
@@ -545,7 +545,12 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
             ),
             system_operator_conflict_sender=sender,
         )
-    )
+        for _ in range(10):
+            if len(audit) >= 2:
+                break
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
 
     assert len(sent) == 1
     assert sent[0]["payload"]["agreement_status"] == "authoritative_failed"
