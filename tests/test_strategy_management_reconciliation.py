@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from telegram_kol_research.models import (
     RawMessage,
     RecognitionDecision,
     StrategyLifecycle,
+    StrategyManagementBatch,
 )
 from telegram_kol_research.strategy_management_batches import (
     ManagementLegCreate,
@@ -368,6 +370,52 @@ def test_partially_confirmed_multi_position_partial_freezes_strategy(tmp_path):
     assert stored.status == "recovery_required"
     assert [leg.status for leg in stored.legs] == ["confirmed", "submitted"]
     assert stored.reconciled_at is None
+
+
+def test_planned_deferred_range_entry_leg_allows_partial_then_break_even_handoff(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(
+        sf,
+        action="partial_then_break_even",
+        sizes=("1",),
+        preflight=("2",),
+    )
+    with sf() as session:
+        deferred = ExecutionOrderLeg(
+            execution_binding_id=batch.execution_binding_id,
+            strategy_instance_id=batch.strategy_instance_id,
+            leg_index=2,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="entry-pending",
+            pos_id=None,
+            venue="deepcoin",
+            attribution_status="unassigned",
+            status="pending",
+        )
+        session.add(deferred)
+        session.flush()
+        row = session.get(StrategyManagementBatch, batch.id)
+        row.target_snapshot_json = json.dumps(
+            {
+                "identity": {
+                    "execution_binding_id": batch.execution_binding_id,
+                    "deferred_entry_leg_ids": [deferred.id],
+                }
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        session.commit()
+
+    _reconcile_management(sf, positions=[_position("pos-1", "1")])
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "protection_ready"
+    assert stored.reason_code == "management_close_confirmed_protection_ready"
+    assert stored.legs[0].status == "confirmed"
 
 
 def test_definite_failure_is_preserved_when_other_leg_confirms(tmp_path):

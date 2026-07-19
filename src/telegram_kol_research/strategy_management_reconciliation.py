@@ -45,6 +45,10 @@ _CLIENT_ORDER_ID_KEYS = ("clOrdId", "clientOrderId", "client_order_id")
 _PROTECTION_PHASE_LEG_STATES = frozenset(
     {"succeeded", "restored", "recovery_required"}
 )
+_MANAGEABLE_ENTRY_LEG_STATES = frozenset(
+    {"active", "open", "filled", "partial_closed"}
+)
+_DEFERRED_ENTRY_LEG_STATES = frozenset({"open", "pending", "submitted"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,12 +337,17 @@ def _identity_is_exact(session, batch, legs) -> bool:
         )
     ):
         return False
+    managed_identity = {
+        (int(leg.execution_order_leg_id), str(leg.pos_id)) for leg in legs
+    }
+    deferred_leg_ids = _snapshot_deferred_entry_leg_ids(batch)
     seen: set[str] = set()
     for leg in legs:
         if not leg.pos_id or str(leg.pos_id) in seen:
             return False
         seen.add(str(leg.pos_id))
         entry = session.get(ExecutionOrderLeg, leg.execution_order_leg_id)
+        entry_status = str(getattr(entry, "status", "") or "").lower()
         if (
             entry is None
             or entry.execution_binding_id != batch.execution_binding_id
@@ -346,7 +355,8 @@ def _identity_is_exact(session, batch, legs) -> bool:
             or entry.purpose != "entry"
             or entry.pos_id != leg.pos_id
             or entry.attribution_status != "verified"
-            or str(entry.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+            or entry_status in TERMINAL_ENTRY_LEG_STATES
+            or entry_status not in _MANAGEABLE_ENTRY_LEG_STATES
             or entry.terminal_reason is not None
         ):
             return False
@@ -356,18 +366,47 @@ def _identity_is_exact(session, batch, legs) -> bool:
         .filter(ExecutionOrderLeg.purpose == "entry")
         .all()
     )
-    if any(
-        row.strategy_instance_id != batch.strategy_instance_id
-        or row.attribution_status != "verified"
-        or not row.pos_id
-        or str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
-        or row.terminal_reason is not None
-        for row in all_entry_rows
-    ):
+    for row in all_entry_rows:
+        if row.strategy_instance_id != batch.strategy_instance_id:
+            return False
+        row_identity = (int(row.id), str(row.pos_id)) if row.pos_id else None
+        if row_identity in managed_identity:
+            continue
+        if int(row.id) in deferred_leg_ids and _is_deferred_pending_entry_leg(row):
+            continue
         return False
-    return {(int(row.id), str(row.pos_id)) for row in all_entry_rows} == {
-        (int(leg.execution_order_leg_id), str(leg.pos_id)) for leg in legs
-    }
+    return True
+
+
+def _snapshot_deferred_entry_leg_ids(batch) -> set[int]:
+    try:
+        snapshot = json.loads(batch.target_snapshot_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return set()
+    if not isinstance(snapshot, dict):
+        return set()
+    identity = snapshot.get("identity")
+    if not isinstance(identity, dict):
+        return set()
+    result: set[int] = set()
+    for value in identity.get("deferred_entry_leg_ids") or []:
+        try:
+            result.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _is_deferred_pending_entry_leg(entry: ExecutionOrderLeg) -> bool:
+    status = str(entry.status or "").lower()
+    state = str(entry.attribution_status or "unassigned")
+    return bool(
+        status in _DEFERRED_ENTRY_LEG_STATES
+        and status not in TERMINAL_ENTRY_LEG_STATES
+        and entry.terminal_reason is None
+        and not entry.pos_id
+        and state not in {"attribution_conflict", "evidence_unavailable"}
+    )
 
 
 def _terminalize_full_close(session, *, batch, legs, now: datetime) -> None:
