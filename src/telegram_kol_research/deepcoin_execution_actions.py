@@ -818,6 +818,127 @@ def cancel_entry_order(
 
 
 @serialized_position_authority_mutation
+def cancel_pending_entry_legs(
+    session_factory: sessionmaker,
+    *,
+    trade_signal: TradeSignalRecord,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    executed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Cancel only unfilled entry legs while preserving an already-entered binding."""
+
+    now = executed_at or datetime.now(UTC)
+    binding = _load_binding_for_signal(session_factory, trade_signal)
+    pending_leg_keys = _pending_entry_leg_order_keys(session_factory, binding.id)
+    if not pending_leg_keys["order_ids"] and not pending_leg_keys["client_order_ids"]:
+        raise DeepcoinExecutionActionError("no_pending_entry_leg_to_cancel")
+
+    inst_id = _to_deepcoin_swap_instrument(binding.symbol)
+    trigger_orders = _select_orders_by_known_ids(
+        deepcoin_client.list_trigger_orders_pending(inst_id=inst_id),
+        order_ids=pending_leg_keys["order_ids"],
+        client_order_ids=pending_leg_keys["client_order_ids"],
+    )
+    regular_orders = _select_orders_by_known_ids(
+        deepcoin_client.list_open_orders(inst_id=inst_id),
+        order_ids=pending_leg_keys["order_ids"],
+        client_order_ids=pending_leg_keys["client_order_ids"],
+    )
+    if not trigger_orders and not regular_orders:
+        raise DeepcoinExecutionActionError("no_bound_pending_entry_order")
+
+    cancelled_orders: list[dict[str, Any]] = []
+    for cancel_type, orders in (("trigger", trigger_orders), ("regular", regular_orders)):
+        for order in orders:
+            order_id = _order_id_from_payload(order)
+            client_order_id = _first_string(
+                order, "clOrdId", "clientOrderId", "client_order_id"
+            )
+            if not order_id and not client_order_id:
+                raise DeepcoinExecutionActionError("missing_cancel_order_id")
+            cancel_payload: dict[str, Any] = {"instId": inst_id}
+            if order_id:
+                cancel_payload["ordId"] = order_id
+            if client_order_id:
+                cancel_payload["clOrdId"] = client_order_id
+            if cancel_type == "trigger":
+                response = deepcoin_client.cancel_trigger_order(cancel_payload)
+                event_action = "cancel_trigger_entry"
+            else:
+                cancel_payload["mrgPosition"] = _deepcoin_position_mode(binding.position_mode)
+                response = deepcoin_client.cancel_order(cancel_payload)
+                event_action = "cancel_regular_entry"
+            cancelled_orders.append(
+                {
+                    "order_id": order_id,
+                    "client_order_id": client_order_id,
+                    "cancel_type": cancel_type,
+                    "request": cancel_payload,
+                    "response": response,
+                }
+            )
+            record_execution_event(
+                session_factory,
+                ExecutionEventRecord(
+                    execution_binding_id=binding.id,
+                    trade_signal_id=trade_signal.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    kol_id=binding.kol_id,
+                    chat_id=binding.chat_id,
+                    message_id=binding.message_id,
+                    source_message_id=trade_signal.message_id,
+                    symbol=binding.symbol,
+                    side=binding.side,
+                    action=event_action,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    reason=trade_signal.action,
+                    before=order,
+                    request=cancel_payload,
+                    response=response,
+                    created_at=now,
+                ),
+            )
+
+    for cancelled_order in cancelled_orders:
+        _update_entry_leg_status(
+            session_factory,
+            binding.id,
+            status="cancelled",
+            terminal_reason="operator_cancelled_unfilled_entry_leg",
+            updated_at=now,
+            order_id=cancelled_order.get("order_id"),
+            client_order_id=cancelled_order.get("client_order_id"),
+        )
+    _remove_cancelled_order_ids_from_active_binding(
+        session_factory,
+        binding=binding,
+        cancelled_order_ids={
+            str(item["order_id"]) for item in cancelled_orders if item.get("order_id")
+        },
+        cancelled_client_order_ids={
+            str(item["client_order_id"])
+            for item in cancelled_orders
+            if item.get("client_order_id")
+        },
+        updated_at=now,
+    )
+    return {
+        "submitted": True,
+        "venue": "deepcoin",
+        "signal_id": trade_signal.id,
+        "action": trade_signal.action,
+        "binding_id": binding.id,
+        "order_id": ",".join(item["order_id"] for item in cancelled_orders if item["order_id"]),
+        "client_order_id": ",".join(
+            item["client_order_id"] for item in cancelled_orders if item["client_order_id"]
+        ),
+        "cancelled_orders": cancelled_orders,
+        "executed_at": now.isoformat(),
+    }
+
+
+@serialized_position_authority_mutation
 def recreate_trigger_entry_tpsl(
     session_factory: sessionmaker,
     *,
@@ -1003,6 +1124,32 @@ def _load_exact_active_binding_for_position(
         )
 
 
+def _pending_entry_leg_order_keys(
+    session_factory: sessionmaker, binding_id: int
+) -> dict[str, set[str]]:
+    with session_factory() as session:
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == int(binding_id))
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .filter(ExecutionOrderLeg.pos_id.is_(None))
+            .filter(ExecutionOrderLeg.status.in_(["pending", "open", "submitted"]))
+            .all()
+        )
+    return {
+        "order_ids": {
+            str(leg.order_id).strip()
+            for leg in legs
+            if str(leg.order_id or "").strip()
+        },
+        "client_order_ids": {
+            str(leg.client_order_id).strip()
+            for leg in legs
+            if str(leg.client_order_id or "").strip()
+        },
+    }
+
+
 def _require_verified_binding_positions(
     session_factory: sessionmaker,
     binding: _LoadedBinding,
@@ -1112,6 +1259,24 @@ def _select_bound_orders(
 ) -> list[dict[str, Any]]:
     order_ids = set(_split_ids(binding.order_id))
     client_order_ids = set(_split_ids(binding.client_order_id))
+    matches = []
+    for order in orders:
+        order_id = _order_id_from_payload(order)
+        client_order_id = _first_string(order, "clOrdId", "clientOrderId", "client_order_id")
+        if order_id and order_id in order_ids:
+            matches.append(order)
+            continue
+        if client_order_id and client_order_id in client_order_ids:
+            matches.append(order)
+    return matches
+
+
+def _select_orders_by_known_ids(
+    orders: list[dict[str, Any]],
+    *,
+    order_ids: set[str],
+    client_order_ids: set[str],
+) -> list[dict[str, Any]]:
     matches = []
     for order in orders:
         order_id = _order_id_from_payload(order)
@@ -1532,6 +1697,34 @@ def _update_binding_order(
             session.commit()
 
 
+def _remove_cancelled_order_ids_from_active_binding(
+    session_factory: sessionmaker,
+    *,
+    binding: _LoadedBinding,
+    cancelled_order_ids: set[str],
+    cancelled_client_order_ids: set[str],
+    updated_at: datetime,
+) -> None:
+    remaining_order_ids = [
+        order_id
+        for order_id in _split_ids(binding.order_id)
+        if order_id not in cancelled_order_ids
+    ]
+    remaining_client_order_ids = [
+        client_order_id
+        for client_order_id in _split_ids(binding.client_order_id)
+        if client_order_id not in cancelled_client_order_ids
+    ]
+    _update_binding_order(
+        session_factory,
+        binding.id,
+        order_id=",".join(remaining_order_ids) or None,
+        client_order_id=",".join(remaining_client_order_ids) or None,
+        last_exchange_status="pending_entry_leg_cancelled",
+        updated_at=updated_at,
+    )
+
+
 def _update_entry_leg_status(
     session_factory: sessionmaker,
     binding_id: int,
@@ -1543,6 +1736,7 @@ def _update_entry_leg_status(
     pos_id: str | None = None,
     new_order_id: str | None = None,
     new_client_order_id: str | None = None,
+    terminal_reason: str | None = None,
 ) -> None:
     with session_factory() as session:
         query = (
@@ -1563,6 +1757,8 @@ def _update_entry_leg_status(
             return
         for leg in query.all():
             leg.status = status
+            if terminal_reason is not None:
+                leg.terminal_reason = terminal_reason
             if new_order_id is not None:
                 leg.order_id = new_order_id
             if new_client_order_id is not None:

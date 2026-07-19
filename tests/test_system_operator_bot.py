@@ -346,6 +346,8 @@ def test_every_management_alert_state_is_persisted_on_create_and_transition(
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionEvent,
+    ExecutionOrderLeg,
     PositionAttributionAudit,
     StrategyLifecycle,
     TradeSignal,
@@ -860,13 +862,28 @@ def test_process_expiry_continue_does_not_revert_already_entered_strategy(tmp_pa
     assert lifecycle.management_action == "expiry_review_continued"
 
 
-def test_process_entered_expiry_expire_cancel_does_not_expire_live_strategy(tmp_path):
-    class FailingDeepcoinClient:
+def test_process_entered_expiry_expire_cancel_cancels_only_pending_entry_leg(tmp_path):
+    class FakeDeepcoinClient:
+        def __init__(self):
+            self.cancel_payloads = []
+
         def list_trigger_orders_pending(self, inst_id):
-            raise AssertionError("entered pending-leg review must not auto-cancel")
+            return [
+                {
+                    "instId": inst_id,
+                    "ordId": "entry-pending",
+                    "triggerOrderType": "Conditional",
+                    "side": "sell",
+                    "posSide": "short",
+                }
+            ]
 
         def list_open_orders(self, inst_id):
-            raise AssertionError("entered pending-leg review must not auto-cancel")
+            return []
+
+        def cancel_trigger_order(self, cancel_payload):
+            self.cancel_payloads.append(dict(cancel_payload))
+            return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
 
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
@@ -881,9 +898,37 @@ def test_process_entered_expiry_expire_cancel_does_not_expire_live_strategy(tmp_
             order_id="entry-live,entry-pending",
             pos_id="pos-live",
             position_mode="split",
+            strategy_instance_id="deepcoin:88:3251:ETH:short",
         )
         session.add(binding)
         session.flush()
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="entry-live",
+                    pos_id="pos-live",
+                    venue="deepcoin",
+                    status="active",
+                    attribution_status="verified",
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=2,
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id="entry-pending",
+                    venue="deepcoin",
+                    status="pending",
+                    attribution_status="unassigned",
+                ),
+            ]
+        )
         lifecycle = StrategyLifecycle(
             chat_id=88,
             message_id=3251,
@@ -900,25 +945,46 @@ def test_process_entered_expiry_expire_cancel_does_not_expire_live_strategy(tmp_
         lifecycle_id = lifecycle.id
         binding_id = binding.id
 
+    fake_client = FakeDeepcoinClient()
     response = process_system_operator_callback_data(
         session_factory,
         f"expiry_expire_cancel:{lifecycle_id}",
         now=datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
-        deepcoin_client=FailingDeepcoinClient(),
+        deepcoin_client=fake_client,
     )
 
     with session_factory() as session:
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         binding = session.get(ExecutionBinding, binding_id)
         trade_signal_count = session.query(TradeSignal).count()
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == binding_id)
+            .order_by(ExecutionOrderLeg.leg_index)
+            .all()
+        )
+        events = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.execution_binding_id == binding_id)
+            .order_by(ExecutionEvent.id)
+            .all()
+        )
 
-    assert "持仓策略保持已入场" in response
+    assert "已撤销未触发入场挂单" in response
+    assert fake_client.cancel_payloads == [
+        {"instId": "ETH-USDT-SWAP", "ordId": "entry-pending"}
+    ]
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.entered_at is not None
     assert lifecycle.exited_at is None
-    assert lifecycle.management_action == "expiry_pending_leg_cancel_requested"
+    assert lifecycle.management_action == "expiry_pending_leg_cancelled"
     assert binding.status == "active"
-    assert trade_signal_count == 0
+    assert legs[0].status == "active"
+    assert legs[1].status == "cancelled"
+    assert trade_signal_count == 1
+    assert [(event.action, event.status, event.order_id) for event in events] == [
+        ("cancel_trigger_entry", "submitted", "entry-pending")
+    ]
 
 
 def test_process_entered_expiry_expire_keep_preserves_live_strategy(tmp_path):

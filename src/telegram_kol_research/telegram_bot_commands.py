@@ -16,7 +16,10 @@ from telegram_kol_research.strategy_alerts import StrategyAlertConfig
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.web_queries import list_holding_strategies, list_pending_strategies
 from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle, utc_now
-from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
+from telegram_kol_research.deepcoin_execution_actions import (
+    cancel_pending_entry_legs,
+    execute_deepcoin_management_signal,
+)
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 
 
@@ -272,6 +275,60 @@ def _process_expiry_action(
             return f"策略 #{lifecycle_id} 已继续等待。"
 
         if lifecycle_was_entered:
+            if command == EXPIRY_EXPIRE_CANCEL_COMMAND and deepcoin_client is not None:
+                binding = (
+                    session.get(ExecutionBinding, lifecycle.execution_binding_id)
+                    if lifecycle.execution_binding_id is not None
+                    else None
+                )
+                if binding is None:
+                    lifecycle.management_action = "expiry_pending_leg_cancel_failed"
+                    lifecycle.management_note = (
+                        "人工请求撤销未触发入场挂单，但未找到执行绑定；"
+                        "持仓策略保持已入场，请人工确认 Deepcoin 当前委托。"
+                    )
+                    lifecycle.last_checked_at = event_at
+                    lifecycle.updated_at = event_at
+                    session.commit()
+                    return (
+                        f"策略 #{lifecycle_id} 未找到执行绑定，"
+                        "未触发入场挂单未自动撤销；请人工确认 Deepcoin 当前委托。"
+                    )
+                trade_signal = enqueue_trade_signal(
+                    session_factory,
+                    venue="deepcoin",
+                    source_type="system_operator",
+                    kol_id=binding.kol_id,
+                    chat_id=lifecycle.chat_id,
+                    message_id=lifecycle.message_id,
+                    symbol=lifecycle.symbol,
+                    side=lifecycle.side,
+                    action="cancel_entry",
+                    payload={
+                        "binding_id": lifecycle.execution_binding_id,
+                        "lifecycle_id": lifecycle.id,
+                    },
+                    strategy_instance_id=binding.strategy_instance_id,
+                    enqueued_at=event_at,
+                )
+                result = cancel_pending_entry_legs(
+                    session_factory,
+                    trade_signal=trade_signal,
+                    deepcoin_client=deepcoin_client,
+                    executed_at=event_at,
+                )
+                lifecycle.management_action = "expiry_pending_leg_cancelled"
+                lifecycle.management_note = (
+                    "人工确认撤销未触发入场挂单；"
+                    "持仓策略保持已入场，已成交仓位不受影响。"
+                )
+                lifecycle.last_checked_at = event_at
+                lifecycle.updated_at = event_at
+                session.commit()
+                return (
+                    f"策略 #{lifecycle_id} 已撤销未触发入场挂单 "
+                    f"{result.get('order_id') or ''}，持仓策略保持已入场。"
+                )
             lifecycle.management_action = (
                 "expiry_pending_leg_keep_order"
                 if command == EXPIRY_EXPIRE_KEEP_COMMAND
