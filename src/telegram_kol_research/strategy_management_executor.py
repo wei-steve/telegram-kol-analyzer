@@ -1147,15 +1147,7 @@ def _decimal_or_none(value: Any) -> Decimal | None:
 def _adjusted_protection_rows(
     *, batch: ManagementBatchRecord, leg: Any, old_rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    if batch.effective_action in {
-        "move_stop_to_break_even",
-        "partial_then_break_even",
-    }:
-        stop_price = leg.avg_entry_price
-    else:
-        stop_price = (leg.planned_tpsl or {}).get("stop_loss_text")
-    if stop_price in (None, ""):
-        raise ManagementBatchExecutionError("planned_stop_loss_missing")
+    stop_price = _planned_stop_price(batch=batch, leg=leg)
     adjusted: list[dict[str, Any]] = []
     found_stop = False
     for old in old_rows:
@@ -1163,16 +1155,87 @@ def _adjusted_protection_rows(
         if row.get("purpose") == "stop_loss":
             row["trigger_price"] = str(stop_price)
             found_stop = True
+            adjusted.append(row)
         elif row.get("purpose") == "combined":
-            row["stop_loss"] = {
-                **dict(row["stop_loss"]),
-                "trigger_price": str(stop_price),
-            }
-            found_stop = True
-        adjusted.append(row)
+            adjusted_row, includes_stop = _adjusted_combined_protection_row(
+                row=row, stop_price=str(stop_price)
+            )
+            found_stop = found_stop or includes_stop
+            adjusted.append(adjusted_row)
+        else:
+            adjusted.append(row)
     if not found_stop:
         raise ManagementBatchExecutionError("existing_stop_loss_missing")
     return adjusted
+
+
+def _planned_stop_price(*, batch: ManagementBatchRecord, leg: Any) -> str:
+    planned_tpsl = leg.planned_tpsl or {}
+    explicit = planned_tpsl.get("stop_loss_text")
+    if explicit not in (None, ""):
+        parsed = _decimal_or_none(explicit)
+        if parsed is None or parsed <= 0:
+            raise ManagementBatchExecutionError("planned_stop_loss_invalid")
+        return str(explicit).strip()
+
+    if batch.effective_action in {
+        "move_stop_to_break_even",
+        "partial_then_break_even",
+    }:
+        parsed = _decimal_or_none(leg.avg_entry_price)
+        if parsed is None or parsed <= 0:
+            raise ManagementBatchExecutionError("planned_stop_loss_missing")
+        return str(leg.avg_entry_price).strip()
+
+    raise ManagementBatchExecutionError("planned_stop_loss_missing")
+
+
+def _adjusted_combined_protection_row(
+    *, row: dict[str, Any], stop_price: str
+) -> tuple[dict[str, Any], bool]:
+    take_profit = dict(row.get("take_profit") or {})
+    stop_loss = dict(row.get("stop_loss") or {})
+    has_take_profit = _has_positive_trigger(take_profit)
+    has_stop_loss = _has_positive_trigger(stop_loss)
+
+    if has_take_profit and has_stop_loss:
+        row["take_profit"] = take_profit
+        row["stop_loss"] = {**stop_loss, "trigger_price": stop_price}
+        return row, True
+
+    common = {
+        "order_id": row.get("order_id"),
+        "size": row.get("size"),
+        "full_position": row.get("full_position"),
+    }
+    if has_take_profit:
+        return (
+            {
+                **common,
+                "purpose": "take_profit",
+                "trigger_price": take_profit.get("trigger_price"),
+                "trigger_type": take_profit.get("trigger_type"),
+                "order_price": take_profit.get("order_price"),
+            },
+            False,
+        )
+    if has_stop_loss:
+        return (
+            {
+                **common,
+                "purpose": "stop_loss",
+                "trigger_price": stop_price,
+                "trigger_type": stop_loss.get("trigger_type"),
+                "order_price": stop_loss.get("order_price"),
+            },
+            True,
+        )
+    raise ManagementBatchExecutionError("existing_protection_row_missing_trigger")
+
+
+def _has_positive_trigger(row: dict[str, Any]) -> bool:
+    parsed = _decimal_or_none(row.get("trigger_price"))
+    return parsed is not None and parsed > 0
 
 
 def _protection_payload_common(

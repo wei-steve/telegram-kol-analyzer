@@ -1015,6 +1015,168 @@ def test_break_even_uses_each_positions_own_average_entry(tmp_path):
     ]
 
 
+def test_partial_then_break_even_uses_explicit_stop_and_ignores_zero_combined_side(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+    from telegram_kol_research.strategy_management_reconciliation import (
+        reconcile_strategy_management_batches,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory,
+        action="partial_then_break_even",
+        stop_loss="64100",
+        keep_close_plan=True,
+    )
+    rows_by_pos["pos-1"] = [
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "legacy-tp-zero-sl",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "posId": "pos-1",
+            "tpTriggerPx": "63000",
+            "tpTriggerPxType": "mark",
+            "tpOrdPx": "-1",
+            "slTriggerPx": "0",
+            "slTriggerPxType": "last",
+            "slOrdPx": "-1",
+            "sz": "1",
+            "cTime": "1000",
+        },
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "legacy-sl-zero-tp",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "posId": "pos-1",
+            "tpTriggerPx": "0",
+            "tpTriggerPxType": "last",
+            "tpOrdPx": "-1",
+            "slTriggerPx": "65500",
+            "slTriggerPxType": "index",
+            "slOrdPx": "-1",
+            "sz": "0",
+            "cTime": "1000",
+        },
+    ]
+    legacy_snapshots = [
+        {
+            "order_id": "legacy-tp-zero-sl",
+            "purpose": "combined",
+            "take_profit": {
+                "trigger_price": "63000",
+                "trigger_type": "mark",
+                "order_price": "-1",
+            },
+            "stop_loss": {
+                "trigger_price": "0",
+                "trigger_type": "last",
+                "order_price": "-1",
+            },
+            "size": "1",
+            "full_position": False,
+        },
+        {
+            "order_id": "legacy-sl-zero-tp",
+            "purpose": "combined",
+            "take_profit": {
+                "trigger_price": "0",
+                "trigger_type": "last",
+                "order_price": "-1",
+            },
+            "stop_loss": {
+                "trigger_price": "65500",
+                "trigger_type": "index",
+                "order_price": "-1",
+            },
+            "size": "0",
+            "full_position": True,
+        },
+    ]
+    with session_factory() as session:
+        leg = (
+            session.query(StrategyManagementLeg)
+            .filter(
+                StrategyManagementLeg.management_batch_id == batch.id,
+                StrategyManagementLeg.pos_id == "pos-1",
+            )
+            .one()
+        )
+        leg.avg_entry_price = "64103.8"
+        leg.old_tpsl_json = json.dumps(
+            {
+                "status": "verified",
+                "order_ids": ["legacy-tp-zero-sl", "legacy-sl-zero-tp"],
+                "rows": rows_by_pos["pos-1"],
+                "row_snapshots": legacy_snapshots,
+            }
+        )
+        session.commit()
+
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    close_result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+    assert close_result["status"] == "reconciling"
+
+    stored = load_management_batch(session_factory, batch.id)
+    order_rows = [
+        {
+            "ordId": leg.exchange_order_id,
+            "clOrdId": leg.client_order_id,
+            "instId": "BTC-USDT-SWAP",
+        }
+        for leg in stored.legs
+    ]
+    snapshot = SimpleNamespace(
+        positions=[
+            {
+                "posId": "pos-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "1",
+                "avgPx": "64103.8",
+                "cTime": "1000",
+            },
+            {
+                "posId": "pos-2",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "2",
+                "avgPx": "64500",
+                "cTime": "1001",
+            },
+        ],
+        open_orders=[],
+        order_history=order_rows,
+        trade_fills=[],
+        errors={},
+    )
+    reconcile_strategy_management_batches(
+        session_factory, snapshot=snapshot, reconciled_at=NOW
+    )
+    assert load_management_batch(session_factory, batch.id).status == "protection_ready"
+
+    client.positions = list(snapshot.positions)
+    protection_result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert protection_result["status"] == "succeeded"
+    assert [
+        (row["posId"], row.get("tpTriggerPx"), row.get("slTriggerPx"), row.get("sz"))
+        for row in client.set_calls
+        if row["posId"] == "pos-1"
+    ] == [
+        ("pos-1", "63000", None, "1"),
+        ("pos-1", None, "64100", None),
+    ]
+    assert all(row.get("slTriggerPx") != "64103.8" for row in client.set_calls)
+
+
 def test_second_partial_promoted_to_full_exit_never_creates_new_stop(tmp_path):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
 
