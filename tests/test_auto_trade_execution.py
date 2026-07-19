@@ -402,6 +402,7 @@ def _persist_candidate(
     take_profit_text="69000 / 70000",
     symbol="BTC",
     side="long",
+    parse_source=None,
 ):
     with session_factory() as session:
         raw = RawMessage(
@@ -424,7 +425,7 @@ def _persist_candidate(
                 entry_text=entry_text,
                 stop_loss_text=stop_loss_text,
                 take_profit_text=take_profit_text,
-                parse_source="mimo_direct" if with_media else "text_ai",
+                parse_source=parse_source or ("mimo_direct" if with_media else "text_ai"),
                 confidence=confidence,
             )
         )
@@ -438,6 +439,35 @@ def _persist_candidate(
             )
         session.commit()
         return raw.id
+
+
+def test_auto_process_skips_symbol_price_scale_review_candidate_before_exchange_access(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="BTC 空单，进场 1840-1860，止损 1905，止盈 1780/1720",
+        entry_text="1840-1860",
+        stop_loss_text="1905",
+        take_profit_text="1780/1720",
+        symbol="ETH",
+        side="short",
+        confidence=0.69,
+        parse_source="mimo_symbol_review",
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=None,
+    )
+
+    assert result == {
+        "status": "skipped",
+        "reason": "symbol_price_scale_conflict_review_required",
+    }
 
 
 def _group_config():

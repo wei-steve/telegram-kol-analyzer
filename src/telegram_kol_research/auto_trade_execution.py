@@ -128,11 +128,19 @@ def auto_process_message_trade_signal(
     loaded = _load_best_entry_candidate(session_factory, raw_message_id=raw_message_id)
     if loaded is None:
         return {"status": "skipped", "reason": "no_entry_signal_candidate"}
+    raw_message, candidate, source, has_media = loaded
+    if candidate.parse_source == "mimo_symbol_review":
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason="symbol_price_scale_conflict_review_required",
+            processed_at=now,
+        )
     if not settings.auto_trade_enabled:
         return {"status": "skipped", "reason": "auto_trade_disabled"}
     if deepcoin_client is None:
         return {"status": "blocked", "reason": "deepcoin_client_unavailable"}
-    raw_message, candidate, source, has_media = loaded
     if candidate.parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
         return _record_entry_auto_trade_skip(
             session_factory,

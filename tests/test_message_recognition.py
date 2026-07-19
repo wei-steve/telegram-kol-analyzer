@@ -2827,6 +2827,68 @@ def test_glm_ocr_caption_message_falls_back_to_text_strategy(tmp_path, monkeypat
     assert media_asset.ocr_text.startswith("<table>")
 
 
+def test_authoritative_mimo_routes_btc_eth_price_scale_conflict_to_manual_review(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=7001,
+            sender_name="智哥",
+            posted_at=datetime(2026, 7, 20, 9, 30, tzinfo=UTC),
+            text="BTC 空单，进场 1840-1860，止损 1905，止盈 1780/1720",
+        )
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    payload = {
+        "recognition_result": "是策略",
+        "reason": "当前消息包含空单入场、止损和止盈",
+        "strategy": {
+            "symbol": "BTC",
+            "side": "short",
+            "entry": "1840-1860",
+            "stop_loss": "1905",
+            "take_profit": "1780/1720",
+            "order_type": "limit",
+        },
+        "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+        "input_reading": {
+            "observed_text": "BTC 空单，进场 1840-1860，止损 1905，止盈 1780/1720",
+            "image_quality": "none",
+        },
+        "confidence": 0.92,
+    }
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload=payload,
+        model="mimo-v2.5",
+        authoritative_generation="generation-1",
+    )
+
+    assert result.status == "识别失败"
+    assert result.reason is not None
+    assert "symbol_price_scale_conflict" in result.reason
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        recognition = session.query(MessageRecognition).one()
+        lifecycle_count = session.query(StrategyLifecycle).count()
+
+    assert candidate.symbol == "ETH"
+    assert candidate.side == "short"
+    assert candidate.entry_text == "1840-1860"
+    assert candidate.parse_source == "mimo_symbol_review"
+    assert candidate.review_status == "needs_review"
+    assert candidate.confidence == pytest.approx(0.69)
+    assert "BTC/ETH" in (candidate.review_note or "")
+    assert recognition.status == "识别失败"
+    assert lifecycle_count == 0
+
+
 def test_glm_ocr_recap_caption_does_not_import_old_screenshot_strategy(
     tmp_path, monkeypatch
 ):

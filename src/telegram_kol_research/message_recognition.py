@@ -135,6 +135,13 @@ class MessageRecognitionResult:
     parse_source: str | None = None
 
 
+@dataclass(frozen=True)
+class _SymbolPriceScaleConflict:
+    original_symbol: str
+    suggested_symbol: str
+    reason: str
+
+
 def recognize_message_now(
     session_factory: sessionmaker,
     *,
@@ -1853,7 +1860,32 @@ def apply_authoritative_mimo_payload(
             parse_source="mimo_authoritative",
         )
         if result.status == "是策略":
-            _persist_ai_result(session, raw_message, result, engine=model)
+            conflict = _detect_strategy_symbol_price_scale_conflict(
+                payload.get("strategy") if isinstance(payload.get("strategy"), dict) else {},
+                raw_message.text or "",
+            )
+            if conflict is not None:
+                review_strategy = dict(payload.get("strategy") or {})
+                review_strategy["symbol"] = conflict.suggested_symbol
+                review_candidate = _upsert_ai_signal_candidate(
+                    session,
+                    raw_message,
+                    strategy=review_strategy,
+                    confidence=min(float(payload.get("confidence") or 0.0), 0.69),
+                    parse_source="mimo_symbol_review",
+                )
+                review_candidate.review_status = "needs_review"
+                review_candidate.review_note = conflict.reason
+                result = MessageRecognitionResult(
+                    raw_message_id=raw_message_id,
+                    status="识别失败",
+                    reason=conflict.reason,
+                    ai_payload=payload,
+                    parse_source="mimo_authoritative",
+                )
+                _upsert_recognition(session, result, engine=model)
+            else:
+                _persist_ai_result(session, raw_message, result, engine=model)
         else:
             _upsert_recognition(session, result, engine=model)
         session.commit()
@@ -1952,6 +1984,63 @@ def _normalize_ai_strategy(strategy: dict[str, Any]) -> dict[str, str | None]:
         "leverage": _normalize_strategy_text(strategy.get("leverage"), separator="/"),
         "order_type": _normalize_strategy_text(strategy.get("order_type"), separator="/"),
     }
+
+
+def _detect_strategy_symbol_price_scale_conflict(
+    strategy: dict[str, Any],
+    raw_text: str,
+) -> _SymbolPriceScaleConflict | None:
+    normalized = _normalize_ai_strategy(strategy)
+    symbol = normalized.get("symbol")
+    if symbol not in {"BTC", "ETH"}:
+        return None
+    field_texts = [
+        value
+        for value in (
+            normalized.get("entry"),
+            normalized.get("stop_loss"),
+            normalized.get("take_profit"),
+        )
+        if value
+    ]
+    prices = _extract_strategy_price_values(field_texts)
+    if len(prices) < 2:
+        return None
+    if symbol == "BTC":
+        joined = " ".join([raw_text, *field_texts]).lower()
+        if "万" in joined or re.search(r"\d(?:\.\d+)?\s*w\b", joined):
+            return None
+        if min(prices) >= 500 and max(prices) < 10000:
+            return _SymbolPriceScaleConflict(
+                original_symbol="BTC",
+                suggested_symbol="ETH",
+                reason=(
+                    "symbol_price_scale_conflict: MiMo 输出 BTC，但入场/止损/止盈价格"
+                    "整体处于 ETH 千位区间，疑似原文 BTC/ETH 笔误；已转入人工复核，禁止自动执行。"
+                ),
+            )
+    if symbol == "ETH" and min(prices) >= 10000:
+        return _SymbolPriceScaleConflict(
+            original_symbol="ETH",
+            suggested_symbol="BTC",
+            reason=(
+                "symbol_price_scale_conflict: MiMo 输出 ETH，但入场/止损/止盈价格"
+                "整体处于 BTC 万位区间，疑似原文 BTC/ETH 笔误；已转入人工复核，禁止自动执行。"
+            ),
+        )
+    return None
+
+
+def _extract_strategy_price_values(field_texts: list[str]) -> list[float]:
+    values: list[float] = []
+    for text in field_texts:
+        for match in re.finditer(r"(?<![A-Za-z])(\d+(?:\.\d+)?)(\s*[万wW])?", text):
+            number = float(match.group(1))
+            suffix = (match.group(2) or "").strip().lower()
+            if suffix in {"万", "w"}:
+                number *= 10000
+            values.append(number)
+    return values
 
 
 def _normalize_symbol(value: Any) -> str | None:
