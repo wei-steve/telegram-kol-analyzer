@@ -65,7 +65,9 @@ def format_pending_entry_expiry_review_message(payload: dict[str, Any]) -> str:
     side = payload.get("side") or "-"
     entry = _format_range(payload.get("entry_range_low"), payload.get("entry_range_high"))
     max_age_hours = payload.get("max_age_hours") or "-"
-    review_reason = payload.get("review_reason") or f"\u5f85\u5165\u573a\u5df2\u8d85\u8fc7 {max_age_hours} \u5c0f\u65f6"
+    review_reason = payload.get("review_reason") or (
+        f"\u5f85\u5165\u573a\u5df2\u8d85\u8fc7 {max_age_hours} \u5c0f\u65f6"
+    )
     lines = [
         "\u3010\u5f85\u5165\u573a\u7b56\u7565\u8d85\u65f6\u590d\u6838\u3011",
         f"\u7fa4\u7ec4: {chat_title}",
@@ -86,6 +88,15 @@ def format_pending_entry_expiry_review_message(payload: dict[str, Any]) -> str:
         f"\u6b62\u76c8: {_format_value(payload.get('take_profit'))}",
         f"\u539f\u56e0: {review_reason}\uff0c\u8bf7\u786e\u8ba4\u5982\u4f55\u5904\u7406\u3002",
     ])
+    pending_order_ids = [
+        str(item)
+        for item in (payload.get("pending_order_ids") or [])
+        if str(item or "").strip()
+    ]
+    if pending_order_ids:
+        lines.append(
+            f"\u672a\u89e6\u53d1\u5165\u573a\u6302\u5355: {', '.join(pending_order_ids)}"
+        )
     return "\n".join(lines)
 
 

@@ -344,7 +344,12 @@ def test_every_management_alert_state_is_persisted_on_create_and_transition(
         assert len(events) == 2
         assert {event.state for event in events} == {state}
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import ExecutionBinding, PositionAttributionAudit, StrategyLifecycle
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    PositionAttributionAudit,
+    StrategyLifecycle,
+    TradeSignal,
+)
 from telegram_kol_research.telegram_bot_commands import (
     _bot_http_timeout,
     _format_callback_resolution_text,
@@ -400,6 +405,7 @@ def test_format_pending_entry_expiry_review_message_includes_operator_choices():
             "entry_range_high": 63200,
             "stop_loss": 64200,
             "take_profit": "61000",
+            "pending_order_ids": ["order-pending"],
         }
     )
 
@@ -407,6 +413,7 @@ def test_format_pending_entry_expiry_review_message_includes_operator_choices():
     assert "#442" in message
     assert "BTC short" in message
     assert "62900-63200" in message
+    assert "order-pending" in message
     assert "/expiry_continue" not in message
 
 
@@ -847,10 +854,104 @@ def test_process_expiry_continue_does_not_revert_already_entered_strategy(tmp_pa
     with session_factory() as session:
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
 
-    assert "\u5df2\u4e0d\u662f\u5f85\u5165\u573a" in response
+    assert "继续等待" in response
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.entered_at is not None
-    assert lifecycle.management_action == "expiry_review_requested"
+    assert lifecycle.management_action == "expiry_review_continued"
+
+
+def test_process_entered_expiry_expire_cancel_does_not_expire_live_strategy(tmp_path):
+    class FailingDeepcoinClient:
+        def list_trigger_orders_pending(self, inst_id):
+            raise AssertionError("entered pending-leg review must not auto-cancel")
+
+        def list_open_orders(self, inst_id):
+            raise AssertionError("entered pending-leg review must not auto-cancel")
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="miya",
+            chat_id=88,
+            message_id=3251,
+            symbol="ETH",
+            side="short",
+            venue="deepcoin",
+            status="active",
+            order_id="entry-live,entry-pending",
+            pos_id="pos-live",
+            position_mode="split",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3251,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 2, 21, 0, tzinfo=UTC),
+            execution_binding_id=binding.id,
+            management_action="expiry_review_requested",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+        binding_id = binding.id
+
+    response = process_system_operator_callback_data(
+        session_factory,
+        f"expiry_expire_cancel:{lifecycle_id}",
+        now=datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
+        deepcoin_client=FailingDeepcoinClient(),
+    )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, binding_id)
+        trade_signal_count = session.query(TradeSignal).count()
+
+    assert "持仓策略保持已入场" in response
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.entered_at is not None
+    assert lifecycle.exited_at is None
+    assert lifecycle.management_action == "expiry_pending_leg_cancel_requested"
+    assert binding.status == "active"
+    assert trade_signal_count == 0
+
+
+def test_process_entered_expiry_expire_keep_preserves_live_strategy(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3251,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 2, 21, 0, tzinfo=UTC),
+            management_action="expiry_review_requested",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    response = process_system_operator_callback_data(
+        session_factory,
+        f"expiry_expire_keep:{lifecycle_id}",
+        now=datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert "持仓策略保持已入场" in response
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.entered_at is not None
+    assert lifecycle.exited_at is None
+    assert lifecycle.management_action == "expiry_pending_leg_keep_order"
 
 
 def test_process_expiry_expire_cancel_does_not_expire_while_live_binding_needs_cancel(tmp_path):

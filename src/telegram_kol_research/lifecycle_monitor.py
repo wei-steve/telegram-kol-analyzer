@@ -31,6 +31,7 @@ from telegram_kol_research.lifecycle_exit_intents import (
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionOrderLeg,
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
@@ -240,7 +241,7 @@ class StateTransition:
 @dataclass
 class LifecycleMonitorConfig:
     cycle_interval_seconds: int = 60
-    max_age_hours: int = 6
+    max_age_hours: int = 3
     max_age_days: int = 7  # how far back to load active signals
     candle_per_page: int = 1000
     http_timeout_seconds: float = 10.0
@@ -625,7 +626,11 @@ class LifecycleMonitor:
         with self._session_factory() as session:
             rows = (
                 session.query(StrategyLifecycle)
-                .filter(StrategyLifecycle.lifecycle_status == "pending_entry")
+                .filter(
+                    StrategyLifecycle.lifecycle_status.in_(
+                        ["pending_entry", "entered"]
+                    )
+                )
                 .filter(
                     or_(
                         StrategyLifecycle.management_action.is_(None),
@@ -633,6 +638,8 @@ class LifecycleMonitor:
                             [
                                 "expiry_review_requested",
                                 "expiry_cancel_requested",
+                                "expiry_pending_leg_keep_order",
+                                "expiry_pending_leg_cancel_requested",
                             ]
                         ),
                     )
@@ -640,11 +647,27 @@ class LifecycleMonitor:
                 .all()
             )
             for row in rows:
+                pending_leg_context = (
+                    self._entered_lifecycle_pending_entry_leg_context(session, row)
+                    if row.lifecycle_status == "entered"
+                    else {}
+                )
+                if row.lifecycle_status == "entered" and not pending_leg_context:
+                    continue
                 if not self._expiry_review_due(row, now):
                     continue
                 expiry_at = self._next_expiry_review_at(row)
-                previous_review_at = row.last_checked_at if row.management_action == "expiry_review_continued" else None
-                review_reason = self._expiry_review_reason(row)
+                previous_review_at = (
+                    row.last_checked_at
+                    if row.management_action == "expiry_review_continued"
+                    else None
+                )
+                review_reason = self._expiry_review_reason(
+                    row,
+                    pending_entry_leg_count=len(
+                        pending_leg_context.get("pending_leg_ids", [])
+                    ),
+                )
                 row.management_action = "expiry_review_requested"
                 row.management_note = (
                     f"{review_reason}，"
@@ -655,6 +678,7 @@ class LifecycleMonitor:
                 review_payloads.append(
                     {
                         "lifecycle_id": row.id,
+                        "lifecycle_status": row.lifecycle_status,
                         "chat_id": row.chat_id,
                         "message_id": row.message_id,
                         "symbol": row.symbol,
@@ -668,6 +692,7 @@ class LifecycleMonitor:
                         "entry_range_high": row.entry_range_high,
                         "stop_loss": row.stop_loss,
                         "take_profit": row.take_profit,
+                        **pending_leg_context,
                     }
                 )
             if review_payloads:
@@ -683,6 +708,50 @@ class LifecycleMonitor:
                     "Pending-entry expiry review notifier failed lifecycle_id=%s",
                     payload.get("lifecycle_id"),
                 )
+
+    @staticmethod
+    def _entered_lifecycle_pending_entry_leg_context(
+        session, row: StrategyLifecycle
+    ) -> dict[str, Any]:
+        binding_id = getattr(row, "execution_binding_id", None)
+        if binding_id is None:
+            return {}
+        binding = session.get(ExecutionBinding, binding_id)
+        if (
+            binding is None
+            or binding.chat_id != row.chat_id
+            or binding.message_id != row.message_id
+        ):
+            return {}
+        pending_statuses = {
+            "open",
+            "pending",
+            "submitted",
+        }
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == binding.id)
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .order_by(ExecutionOrderLeg.leg_index.asc(), ExecutionOrderLeg.id.asc())
+            .all()
+        )
+        pending_legs = [
+            leg
+            for leg in legs
+            if str(leg.status or "").lower() in pending_statuses
+            and leg.terminal_reason is None
+            and not leg.pos_id
+            and str(leg.attribution_status or "unassigned")
+            not in {"attribution_conflict", "evidence_unavailable"}
+        ]
+        if not pending_legs:
+            return {}
+        return {
+            "pending_leg_ids": [leg.id for leg in pending_legs],
+            "pending_order_ids": [
+                str(leg.order_id) for leg in pending_legs if leg.order_id
+            ],
+        }
 
     @staticmethod
     def _attach_management_event_times(session, signals: list[StrategyLifecycle]) -> None:
@@ -1131,9 +1200,16 @@ class LifecycleMonitor:
             return review_base + timedelta(hours=self._config.max_age_hours)
         return self._expiry_at(sig)
 
-    def _expiry_review_reason(self, sig: StrategyLifecycle) -> str:
+    def _expiry_review_reason(
+        self, sig: StrategyLifecycle, *, pending_entry_leg_count: int = 0
+    ) -> str:
         if getattr(sig, "management_action", None) == "expiry_review_continued":
             return f"上次人工选择继续等待后又超过 {self._config.max_age_hours} 小时"
+        if pending_entry_leg_count:
+            return (
+                f"已入场策略仍有 {pending_entry_leg_count} 条入场腿超过 "
+                f"{self._config.max_age_hours} 小时未触发"
+            )
         return f"待入场策略已超过 {self._config.max_age_hours} 小时"
 
     # ── persistence ────────────────────────────────────────────────

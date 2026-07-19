@@ -65,6 +65,12 @@ PROTECTION_INTENTS = frozenset(
 SUPPORTED_INTENTS = frozenset(
     {"partial_take_profit", "full_exit", *PROTECTION_INTENTS}
 )
+MANAGEABLE_ENTRY_LEG_STATES = frozenset(
+    {"active", "open", "filled", "partial_closed"}
+)
+DEFERRED_ENTRY_LEG_STATES = frozenset(
+    {"open", "pending", "submitted"}
+)
 RETRYABLE_PREFLIGHT_BLOCK_REASONS = frozenset(
     {
         "target_contract_spec_unavailable",
@@ -108,6 +114,13 @@ class _PlanningIdentity:
     lifecycle: StrategyLifecycle
     binding: ExecutionBinding
     entry_legs: tuple[ExecutionOrderLeg, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryLegManagementPlan:
+    target_legs: tuple[ExecutionOrderLeg, ...]
+    deferred_legs: tuple[ExecutionOrderLeg, ...]
+    block_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,24 +251,26 @@ def _plan_strategy_management_batch_locked(
             target_lifecycle_id=lifecycle.id,
         )
 
-    unsafe_reason = _unsafe_entry_leg_reason(identity.entry_legs, binding=binding)
-    if unsafe_reason is not None:
+    entry_leg_plan = _entry_leg_management_plan(identity.entry_legs, binding=binding)
+    if entry_leg_plan.block_reason is not None:
         return _persist_blocked(
             session_factory,
             identity=identity,
             raw_message_id=raw_message_id,
             intent=intent,
-            reason_code=unsafe_reason,
+            reason_code=entry_leg_plan.block_reason,
             planned_at=now,
             execution_mode=execution_mode,
         )
+    target_entry_legs = entry_leg_plan.target_legs
+    target_legs_by_pos_id = _leg_by_pos_id(target_entry_legs)
 
     instrument_id = f"{str(lifecycle.symbol).upper()}-USDT-SWAP"
     try:
         live_positions = list(reconciliation_snapshot.positions)
         economics = canonical_live_position_economics(
             live_positions,
-            target_pos_ids=[str(leg.pos_id) for leg in identity.entry_legs],
+            target_pos_ids=[str(leg.pos_id) for leg in target_entry_legs],
             instrument_id=instrument_id,
             side=str(lifecycle.side),
         )
@@ -271,7 +286,7 @@ def _plan_strategy_management_batch_locked(
                 raise PositionAttributionError(
                     "target_identity_changed_during_planning"
                 )
-            for detached_leg in identity.entry_legs:
+            for detached_leg in target_entry_legs:
                 current_leg = session.get(ExecutionOrderLeg, detached_leg.id)
                 if (
                     current_leg is None
@@ -376,7 +391,7 @@ def _plan_strategy_management_batch_locked(
             if protection is None or protection.status != "verified":
                 protection = _ledger_confirmed_position_protection(
                     position=position,
-                    entry_leg=_leg_by_pos_id(identity.entry_legs)[position["pos_id"]],
+                    entry_leg=target_legs_by_pos_id[position["pos_id"]],
                     binding=binding,
                     tpsl_orders=tpsl_orders,
                     ledger_rows=ledger_rows_by_pos_id.get(position["pos_id"], []),
@@ -471,21 +486,31 @@ def _plan_strategy_management_batch_locked(
             "target_lifecycle_id": lifecycle.id,
             "execution_binding_id": binding.id,
             "strategy_instance_id": binding.strategy_instance_id,
+            "manageable_entry_leg_ids": [leg.id for leg in target_entry_legs],
+            "deferred_entry_leg_ids": [leg.id for leg in entry_leg_plan.deferred_legs],
         },
         "positions": [
             {
                 **position,
-                "execution_order_leg_id": _leg_by_pos_id(identity.entry_legs)[
-                    position["pos_id"]
-                ].id,
+                "execution_order_leg_id": target_legs_by_pos_id[position["pos_id"]].id,
             }
             for position in economics
+        ],
+        "deferred_entry_legs": [
+            {
+                "execution_order_leg_id": leg.id,
+                "leg_index": leg.leg_index,
+                "order_id": leg.order_id,
+                "status": leg.status,
+                "attribution_status": leg.attribution_status,
+            }
+            for leg in entry_leg_plan.deferred_legs
         ],
         "contract_spec": contract_spec.to_dict(),
         "protection": protection_by_pos_id,
     }
     target_fingerprint = management_target_fingerprint(target_snapshot)
-    legs_by_pos_id = _leg_by_pos_id(identity.entry_legs)
+    legs_by_pos_id = target_legs_by_pos_id
     batch_legs = [
         ManagementLegCreate(
             execution_order_leg_id=legs_by_pos_id[position["pos_id"]].id,
@@ -737,33 +762,78 @@ def _binding_position_id_set(binding_pos_id: str | None) -> set[str]:
     }
 
 
-def _unsafe_entry_leg_reason(
+def _entry_leg_management_plan(
     entry_legs: tuple[ExecutionOrderLeg, ...], *, binding: ExecutionBinding
-) -> str | None:
+) -> _EntryLegManagementPlan:
     if not entry_legs:
-        return "target_position_ownership_not_found"
+        return _EntryLegManagementPlan((), (), "target_position_ownership_not_found")
     position_ids: list[str] = []
+    target_legs: list[ExecutionOrderLeg] = []
+    deferred_legs: list[ExecutionOrderLeg] = []
+    terminal_legs: list[ExecutionOrderLeg] = []
     for leg in entry_legs:
         if leg.execution_binding_id != binding.id or (
             leg.strategy_instance_id != binding.strategy_instance_id
         ):
-            return "target_strategy_identity_mismatch"
-        if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
-            return "target_position_ownership_terminal"
+            return _EntryLegManagementPlan(
+                (), (), "target_strategy_identity_mismatch"
+            )
+        status = str(leg.status or "").lower()
+        if status in TERMINAL_ENTRY_LEG_STATES:
+            terminal_legs.append(leg)
+            continue
         state = str(leg.attribution_status or "unassigned")
         if state == "attribution_conflict":
-            return "target_position_ownership_conflict"
+            return _EntryLegManagementPlan(
+                (), (), "target_position_ownership_conflict"
+            )
         if state == "evidence_unavailable":
-            return "target_position_evidence_unavailable"
-        if state != "verified" or not leg.pos_id:
-            return "target_position_ownership_not_verified"
-        position_ids.append(str(leg.pos_id))
+            return _EntryLegManagementPlan(
+                (), (), "target_position_evidence_unavailable"
+            )
+        if (
+            state == "verified"
+            and leg.pos_id
+            and status in MANAGEABLE_ENTRY_LEG_STATES
+        ):
+            target_legs.append(leg)
+            position_ids.append(str(leg.pos_id))
+            continue
+        if (
+            status in DEFERRED_ENTRY_LEG_STATES
+            and leg.terminal_reason is None
+            and not leg.pos_id
+            and state not in {"attribution_conflict", "evidence_unavailable"}
+        ):
+            deferred_legs.append(leg)
+            continue
+        return _EntryLegManagementPlan(
+            (), tuple(deferred_legs), "target_position_ownership_not_verified"
+        )
+    if not target_legs:
+        if terminal_legs and not deferred_legs:
+            return _EntryLegManagementPlan(
+                (), (), "target_position_ownership_terminal"
+            )
+        return _EntryLegManagementPlan(
+            (), tuple(deferred_legs), "target_position_ownership_not_verified"
+        )
     if len(position_ids) != len(set(position_ids)):
-        return "target_position_ownership_not_unique"
+        return _EntryLegManagementPlan(
+            (), tuple(deferred_legs), "target_position_ownership_not_unique"
+        )
     binding_position_ids = _binding_position_id_set(binding.pos_id)
     if binding_position_ids and not binding_position_ids.issubset(set(position_ids)):
-        return "target_binding_position_mismatch"
-    return None
+        return _EntryLegManagementPlan(
+            (), tuple(deferred_legs), "target_binding_position_mismatch"
+        )
+    return _EntryLegManagementPlan(tuple(target_legs), tuple(deferred_legs), None)
+
+
+def _unsafe_entry_leg_reason(
+    entry_legs: tuple[ExecutionOrderLeg, ...], *, binding: ExecutionBinding
+) -> str | None:
+    return _entry_leg_management_plan(entry_legs, binding=binding).block_reason
 
 
 def _binding_matches_lifecycle(
@@ -838,11 +908,14 @@ def _require_frozen_identity_current(session, identity: _PlanningIdentity) -> No
         raise ManagementPlanningStateChanged(
             "target_identity_changed_during_planning"
         )
-    if _unsafe_entry_leg_reason(tuple(current_legs), binding=current_binding) is not None:
+    entry_leg_plan = _entry_leg_management_plan(
+        tuple(current_legs), binding=current_binding
+    )
+    if entry_leg_plan.block_reason is not None:
         raise ManagementPlanningStateChanged(
             "target_identity_changed_during_planning"
         )
-    for leg in current_legs:
+    for leg in entry_leg_plan.target_legs:
         try:
             owner = require_verified_position_ownership(
                 session, venue="deepcoin", pos_id=str(leg.pos_id)

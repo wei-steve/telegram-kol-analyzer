@@ -11,6 +11,7 @@ from telegram_kol_research.lifecycle_monitor import (
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionOrderLeg,
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
@@ -806,6 +807,206 @@ def test_lifecycle_monitor_continued_expiry_review_repeats_after_interval(tmp_pa
     assert review_requests[0]["lifecycle_id"] == lifecycle_id
     assert review_requests[0]["previous_review_at"] == last_review_at.replace(tzinfo=None)
     assert review_requests[0]["expiry_at"] == datetime(2026, 6, 30, 12, 0, tzinfo=UTC)
+
+
+def test_lifecycle_monitor_default_pending_review_window_is_three_hours():
+    assert LifecycleMonitorConfig().max_age_hours == 3
+
+
+def test_lifecycle_monitor_requests_review_for_stale_pending_leg_on_entered_strategy(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    signal_at = datetime(2026, 6, 30, 0, 0, tzinfo=UTC)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="miya",
+            chat_id=88,
+            message_id=504,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="active",
+            pos_id="pos-live",
+            order_id="order-live,order-pending",
+            strategy_instance_id="deepcoin:88:504:BTC:long",
+        )
+        session.add(binding)
+        session.flush()
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="order-live",
+                    pos_id="pos-live",
+                    venue="deepcoin",
+                    attribution_status="verified",
+                    status="active",
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=2,
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id="order-pending",
+                    pos_id=None,
+                    venue="deepcoin",
+                    attribution_status="unassigned",
+                    status="pending",
+                ),
+            ]
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=504,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=signal_at,
+            entered_at=signal_at,
+            entry_range_low=63800,
+            entry_range_high=64100,
+            stop_loss=62800,
+            take_profit="65600",
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    class FakeLifecycleMonitor(LifecycleMonitor):
+        async def _fetch_candles_full(self, contract, from_, to_):
+            return []
+
+    review_requests = []
+
+    async def fake_notifier(payload):
+        review_requests.append(payload)
+
+    monitor = FakeLifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        now_provider=lambda: datetime(2026, 6, 30, 3, 1, tzinfo=UTC),
+        expiry_review_notifier=fake_notifier,
+    )
+
+    transitions = asyncio.run(monitor.run_once())
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert transitions == []
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.management_action == "expiry_review_requested"
+    assert len(review_requests) == 1
+    assert review_requests[0]["lifecycle_id"] == lifecycle_id
+    assert review_requests[0]["pending_order_ids"] == ["order-pending"]
+
+
+def test_lifecycle_monitor_does_not_repeat_entered_pending_leg_review_after_action(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    signal_at = datetime(2026, 6, 30, 0, 0, tzinfo=UTC)
+    handled_actions = [
+        "expiry_pending_leg_keep_order",
+        "expiry_pending_leg_cancel_requested",
+    ]
+    with session_factory() as session:
+        for index, action in enumerate(handled_actions, start=1):
+            binding = ExecutionBinding(
+                kol_id="miya",
+                chat_id=88,
+                message_id=600 + index,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                status="active",
+                pos_id=f"pos-live-{index}",
+                order_id=f"order-live-{index},order-pending-{index}",
+                strategy_instance_id=f"deepcoin:88:{600 + index}:BTC:long",
+            )
+            session.add(binding)
+            session.flush()
+            session.add_all(
+                [
+                    ExecutionOrderLeg(
+                        execution_binding_id=binding.id,
+                        strategy_instance_id=binding.strategy_instance_id,
+                        leg_index=1,
+                        purpose="entry",
+                        order_kind="market",
+                        order_id=f"order-live-{index}",
+                        pos_id=f"pos-live-{index}",
+                        venue="deepcoin",
+                        attribution_status="verified",
+                        status="active",
+                    ),
+                    ExecutionOrderLeg(
+                        execution_binding_id=binding.id,
+                        strategy_instance_id=binding.strategy_instance_id,
+                        leg_index=2,
+                        purpose="entry",
+                        order_kind="trigger_limit",
+                        order_id=f"order-pending-{index}",
+                        pos_id=None,
+                        venue="deepcoin",
+                        attribution_status="unassigned",
+                        status="pending",
+                    ),
+                ]
+            )
+            session.add(
+                StrategyLifecycle(
+                    chat_id=88,
+                    message_id=600 + index,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="entered",
+                    signal_at=signal_at,
+                    entered_at=signal_at,
+                    execution_binding_id=binding.id,
+                    management_action=action,
+                    last_checked_at=datetime(2026, 6, 30, 3, 5, tzinfo=UTC),
+                )
+            )
+        session.commit()
+
+    class FakeLifecycleMonitor(LifecycleMonitor):
+        async def _fetch_candles_full(self, contract, from_, to_):
+            return []
+
+    review_requests = []
+
+    async def fake_notifier(payload):
+        review_requests.append(payload)
+
+    monitor = FakeLifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        now_provider=lambda: datetime(2026, 6, 30, 6, 30, tzinfo=UTC),
+        expiry_review_notifier=fake_notifier,
+    )
+
+    transitions = asyncio.run(monitor.run_once())
+
+    with session_factory() as session:
+        actions = [
+            action
+            for (action,) in session.query(StrategyLifecycle.management_action)
+            .filter(StrategyLifecycle.message_id.in_([601, 602]))
+            .order_by(StrategyLifecycle.message_id.asc())
+            .all()
+        ]
+
+    assert transitions == []
+    assert review_requests == []
+    assert actions == handled_actions
 
 
 def test_lifecycle_monitor_requested_expiry_review_keeps_scanning_for_entry(tmp_path):

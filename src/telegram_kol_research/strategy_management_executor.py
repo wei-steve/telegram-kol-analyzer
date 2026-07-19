@@ -55,6 +55,12 @@ _PROTECTION_ACTIONS = frozenset({"adjust_stop_loss", "move_stop_to_break_even"})
 _PROTECTION_PHASE_LEG_STATES = frozenset(
     {"succeeded", "restored", "recovery_required"}
 )
+_MANAGEABLE_ENTRY_LEG_STATES = frozenset(
+    {"active", "open", "filled", "partial_closed"}
+)
+_DEFERRED_ENTRY_LEG_STATES = frozenset(
+    {"open", "pending", "submitted"}
+)
 
 
 class ManagementBatchExecutionError(RuntimeError):
@@ -1317,31 +1323,51 @@ def _require_exact_entry_legs(
             raise ManagementBatchExecutionError("batch_entry_set_not_exact")
         for entry in all_entries:
             status = str(entry.status or "").lower()
-            if (
-                entry.strategy_instance_id != batch.strategy_instance_id
-                or entry.attribution_status != "verified"
-                or not entry.pos_id
-                or status in TERMINAL_ENTRY_LEG_STATES
-                or status not in {"active", "open", "filled", "partial_closed"}
-                or entry.terminal_reason is not None
-            ):
+            if entry.strategy_instance_id != batch.strategy_instance_id:
                 raise ManagementBatchExecutionError("batch_entry_set_not_exact")
-            current_identity.add((int(entry.id), str(entry.pos_id)))
+            identity = (int(entry.id), str(entry.pos_id)) if entry.pos_id else None
+            if identity in batch_identity:
+                if (
+                    entry.attribution_status != "verified"
+                    or status in TERMINAL_ENTRY_LEG_STATES
+                    or status not in _MANAGEABLE_ENTRY_LEG_STATES
+                    or entry.terminal_reason is not None
+                ):
+                    raise ManagementBatchExecutionError("batch_entry_set_not_exact")
+                current_identity.add(identity)
+                continue
+            if _is_deferred_pending_entry_leg(entry):
+                continue
+            raise ManagementBatchExecutionError("batch_entry_set_not_exact")
         if current_identity != batch_identity:
             raise ManagementBatchExecutionError("batch_entry_set_not_exact")
         for leg in batch.legs:
             entry = session.get(ExecutionOrderLeg, leg.execution_order_leg_id)
+            status = str(entry.status or "").lower() if entry is not None else ""
             if (
                 entry is None
                 or entry.execution_binding_id != batch.execution_binding_id
                 or entry.strategy_instance_id != batch.strategy_instance_id
                 or entry.pos_id != leg.pos_id
-                or entry.status not in {"active", "open", "filled", "partial_closed"}
+                or status not in _MANAGEABLE_ENTRY_LEG_STATES
                 or entry.attribution_status != "verified"
+                or entry.terminal_reason is not None
             ):
                 raise ManagementBatchExecutionError(
                     f"batch_entry_leg_not_exact_or_active:{leg.id}"
                 )
+
+
+def _is_deferred_pending_entry_leg(entry: ExecutionOrderLeg) -> bool:
+    status = str(entry.status or "").lower()
+    state = str(entry.attribution_status or "unassigned")
+    return bool(
+        status in _DEFERRED_ENTRY_LEG_STATES
+        and status not in TERMINAL_ENTRY_LEG_STATES
+        and entry.terminal_reason is None
+        and not entry.pos_id
+        and state not in {"attribution_conflict", "evidence_unavailable"}
+    )
 
 
 def _close_payload(

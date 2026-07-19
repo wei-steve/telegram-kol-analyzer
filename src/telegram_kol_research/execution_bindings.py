@@ -38,7 +38,7 @@ from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
 
-PENDING_ENTRY_RECOVERY_WINDOW_HOURS = 6
+PENDING_ENTRY_RECOVERY_WINDOW_HOURS = 3
 
 
 @dataclass(slots=True)

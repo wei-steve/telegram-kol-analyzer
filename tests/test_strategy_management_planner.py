@@ -245,6 +245,115 @@ def _persist_exact_management_target(
         return management.id, lifecycle_b.id, binding_b.id if binding_b else None
 
 
+def _persist_partial_filled_range_management_target(session_factory, *, both_pending=False):
+    with session_factory() as session:
+        entry = RawMessage(
+            chat_id=200,
+            message_id=504,
+            posted_at=PLANNED_AT,
+            text="BTC long 64100-63800",
+        )
+        management = RawMessage(
+            chat_id=200,
+            message_id=506,
+            posted_at=PLANNED_AT,
+            text="BTC long take profit half and move stop",
+        )
+        session.add_all([entry, management])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=200,
+            message_id=504,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=PLANNED_AT,
+            entered_at=PLANNED_AT,
+            entry_range_low=63800,
+            entry_range_high=64100,
+            stop_loss=62800,
+            take_profit="65600",
+        )
+        session.add(lifecycle)
+        session.flush()
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:200:504:BTC:long",
+            kol_id="miya",
+            chat_id=200,
+            message_id=504,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            order_id="order-live,order-pending",
+            pos_id=None if both_pending else "pos-live",
+            status="open" if both_pending else "active",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="order-live",
+                    client_order_id="TKMYA504E1",
+                    pos_id=None if both_pending else "pos-live",
+                    venue="deepcoin",
+                    attribution_status="unassigned" if both_pending else "verified",
+                    attribution_evidence_json=None
+                    if both_pending
+                    else json.dumps(
+                        {"policy_version": 2, "source": "direct_order_identity"}
+                    ),
+                    status="pending" if both_pending else "active",
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=2,
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id="order-pending",
+                    client_order_id="TKMYA504E2",
+                    pos_id=None,
+                    venue="deepcoin",
+                    attribution_status="unassigned",
+                    status="pending",
+                ),
+            ]
+        )
+        decision = RecognitionDecision(
+            raw_message_id=management.id,
+            input_kind="text",
+            authoritative_model="mimo",
+            authoritative_status="非策略",
+            authoritative_payload_json="{}",
+            agreement_status="authoritative_only",
+            differences_json="[]",
+        )
+        session.add(decision)
+        session.add(
+            SignalCandidate(
+                raw_message_id=management.id,
+                symbol="BTC",
+                side="long",
+                event_type="position_update",
+                target_lifecycle_id=lifecycle.id,
+                management_action="partial_then_break_even",
+                management_fraction=0.5,
+                recognition_generation="generation-miya",
+                parse_source="mimo_authoritative",
+                confidence=0.9,
+            )
+        )
+        session.commit()
+        return management.id, lifecycle.id, binding.id
+
+
 def _disable_reconciliation(monkeypatch, planner):
     calls = []
     monkeypatch.setattr(
@@ -496,6 +605,125 @@ def test_reconciliation_happens_before_identity_rows_are_reloaded(monkeypatch, t
 
     assert result.status == "ready"
     assert [leg.pos_id for leg in result.batch.legs] == ["resolved-pos"]
+
+
+def test_partial_filled_range_entry_manages_verified_live_leg(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_partial_filled_range_management_target(session_factory)
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [
+                _position(
+                    "pos-live",
+                    size="7",
+                    avg_px="64103.8",
+                    side="long",
+                )
+            ],
+            tpsl_orders=[
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "triggerOrderType": "TPSL",
+                    "tpTriggerPx": "65600",
+                    "sz": "0",
+                    "ordId": "tp-live",
+                    "cTime": "1721000000000",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "triggerOrderType": "TPSL",
+                    "slTriggerPx": "62800",
+                    "sz": "0",
+                    "ordId": "sl-live",
+                    "cTime": "1721000000000",
+                },
+            ],
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.status == "ready"
+    assert result.batch.intent == "partial_then_break_even"
+    assert result.batch.effective_action == "partial_then_break_even"
+    assert [(leg.pos_id, leg.preflight_size, leg.planned_close_size) for leg in result.batch.legs] == [
+        ("pos-live", "7", "3")
+    ]
+
+
+def test_pending_only_range_entry_still_blocks_management(monkeypatch, tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_partial_filled_range_management_target(
+        session_factory, both_pending=True
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "target_position_ownership_not_verified"
+    assert result.batch.legs == ()
+
+
+@pytest.mark.parametrize(
+    ("status", "attribution_status", "pos_id", "reason_code"),
+    [
+        ("partially_filled", "unassigned", None, "target_position_ownership_not_verified"),
+        ("pending", "unassigned", "pos-unsafe", "target_position_ownership_not_verified"),
+        ("pending", "attribution_conflict", None, "target_position_ownership_conflict"),
+        ("pending", "evidence_unavailable", None, "target_position_evidence_unavailable"),
+    ],
+)
+def test_partial_filled_range_entry_blocks_unsafe_deferred_leg(
+    monkeypatch, tmp_path, status, attribution_status, pos_id, reason_code
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_partial_filled_range_management_target(
+        session_factory
+    )
+    with session_factory() as session:
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, leg_index=2)
+            .one()
+        )
+        leg.status = status
+        leg.attribution_status = attribution_status
+        leg.pos_id = pos_id
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [_position("pos-live", size="7", avg_px="64103.8", side="long")]
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == reason_code
+    assert result.batch.legs == ()
 
 
 def test_changed_target_snapshot_fails_immutable_fingerprint_check(monkeypatch, tmp_path):

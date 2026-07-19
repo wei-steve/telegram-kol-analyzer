@@ -433,6 +433,97 @@ def test_close_legs_are_committed_reserved_before_exact_market_submission(tmp_pa
         assert [entry.status for entry in entries] == ["active", "active"]
 
 
+def test_close_batch_accepts_verified_entry_subset_with_pending_range_leg(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory, sizes=("3", "2"))
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        binding.pos_id = "pos-1"
+        second_batch_leg = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=batch.id, pos_id="pos-2")
+            .one()
+        )
+        session.delete(second_batch_leg)
+        second_entry = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=batch.execution_binding_id, pos_id="pos-2")
+            .one()
+        )
+        second_entry.order_kind = "trigger_limit"
+        second_entry.pos_id = None
+        second_entry.status = "pending"
+        second_entry.attribution_status = "unassigned"
+        second_entry.attribution_evidence_json = None
+        session.commit()
+
+    client = _FakeClient(session_factory, [{"code": "0", "data": {"ordId": "close-1"}}])
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "reconciling"
+    assert [payload["closePosId"] for payload, _status in client.calls] == ["pos-1"]
+    stored = load_management_batch(session_factory, batch.id)
+    assert [leg.pos_id for leg in stored.legs] == ["pos-1"]
+    assert stored.legs[0].status == "submitted"
+
+
+@pytest.mark.parametrize(
+    ("status", "attribution_status", "pos_id"),
+    [
+        ("partially_filled", "unassigned", None),
+        ("pending", "unassigned", "pos-unsafe"),
+        ("pending", "attribution_conflict", None),
+        ("pending", "evidence_unavailable", None),
+    ],
+)
+def test_close_batch_rejects_unsafe_deferred_range_leg(
+    tmp_path, status, attribution_status, pos_id
+):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory, sizes=("3", "2"))
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        binding.pos_id = "pos-1"
+        second_batch_leg = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=batch.id, pos_id="pos-2")
+            .one()
+        )
+        session.delete(second_batch_leg)
+        second_entry = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=batch.execution_binding_id, pos_id="pos-2")
+            .one()
+        )
+        second_entry.order_kind = "trigger_limit"
+        second_entry.pos_id = pos_id
+        second_entry.status = status
+        second_entry.attribution_status = attribution_status
+        second_entry.attribution_evidence_json = None
+        session.commit()
+
+    client = _FakeClient(session_factory, [{"code": "0", "data": {"ordId": "close-1"}}])
+
+    with pytest.raises(
+        ManagementBatchExecutionError, match="batch_entry_set_not_exact"
+    ):
+        execute_management_batch(
+            session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+        )
+
+    assert client.calls == []
+
+
 @pytest.mark.parametrize("failure", ["snapshot_error", "size_drift", "missing", "extra"])
 def test_sync_live_final_close_preflight_freezes_before_place_order(
     failure, tmp_path

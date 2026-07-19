@@ -245,22 +245,58 @@ def _process_expiry_action(
         if lifecycle is None:
             return f"未找到策略 #{lifecycle_id}。"
 
-        if lifecycle.lifecycle_status != "pending_entry":
+        if lifecycle.lifecycle_status not in {"pending_entry", "entered"}:
             return (
                 f"\u7b56\u7565 #{lifecycle_id} \u5df2\u4e0d\u662f\u5f85\u5165\u573a"
                 f"\uff08\u5f53\u524d: {lifecycle.lifecycle_status}\uff09\uff0c\u672c\u6b21\u64cd\u4f5c\u5df2\u5ffd\u7565\u3002"
             )
+        lifecycle_was_entered = lifecycle.lifecycle_status == "entered"
 
         if command == EXPIRY_CONTINUE_COMMAND:
-            lifecycle.lifecycle_status = "pending_entry"
-            lifecycle.exit_reason = None
-            lifecycle.exited_at = None
+            if not lifecycle_was_entered:
+                lifecycle.lifecycle_status = "pending_entry"
+                lifecycle.exit_reason = None
+                lifecycle.exited_at = None
             lifecycle.management_action = "expiry_review_continued"
-            lifecycle.management_note = "人工确认继续等待，暂不标记过期。"
+            lifecycle.management_note = (
+                (
+                    "人工确认已入场策略的未触发入场腿继续等待，"
+                    "持仓策略保持已入场。"
+                )
+                if lifecycle_was_entered
+                else "人工确认继续等待，暂不标记过期。"
+            )
             lifecycle.last_checked_at = event_at
             lifecycle.updated_at = event_at
             session.commit()
             return f"策略 #{lifecycle_id} 已继续等待。"
+
+        if lifecycle_was_entered:
+            lifecycle.management_action = (
+                "expiry_pending_leg_keep_order"
+                if command == EXPIRY_EXPIRE_KEEP_COMMAND
+                else "expiry_pending_leg_cancel_requested"
+            )
+            lifecycle.management_note = (
+                "人工确认保留未触发入场挂单，持仓策略保持已入场。"
+                if command == EXPIRY_EXPIRE_KEEP_COMMAND
+                else (
+                    "人工请求撤销未触发入场挂单；"
+                    "持仓策略保持已入场，未自动标记过期。"
+                )
+            )
+            lifecycle.last_checked_at = event_at
+            lifecycle.updated_at = event_at
+            session.commit()
+            if command == EXPIRY_EXPIRE_KEEP_COMMAND:
+                return (
+                    f"策略 #{lifecycle_id} 已保留未触发入场挂单，"
+                    "持仓策略保持已入场。"
+                )
+            return (
+                f"策略 #{lifecycle_id} 已记录撤销未触发入场挂单请求，"
+                "持仓策略保持已入场；请人工确认 Deepcoin 当前委托。"
+            )
 
         if command == EXPIRY_EXPIRE_KEEP_COMMAND:
             lifecycle.lifecycle_status = "expired"
