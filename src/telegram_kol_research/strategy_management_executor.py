@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -27,6 +28,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     RawMessage,
     StrategyLifecycle,
+    StrategyManagementBatch,
 )
 from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 from telegram_kol_research.position_authority_lock import (
@@ -122,6 +124,28 @@ def execute_management_batch(
         raise ManagementBatchExecutionError(f"batch_not_executable:{batch.status}")
     binding = _load_exact_binding(session_factory, batch)
     _require_exact_entry_legs(session_factory, batch)
+    if batch.effective_action in {"full_close", "full_exit"}:
+        try:
+            _cancel_deferred_entry_legs(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                deepcoin_client=deepcoin_client,
+                cancelled_at=now,
+            )
+        except Exception:
+            transition_batch(
+                session_factory,
+                batch.id,
+                expected_statuses={"executing"},
+                new_status="recovery_required",
+                transitioned_at=now,
+                reason_code="deferred_entry_cancel_preflight_failed",
+            )
+            return _result(
+                load_management_batch(session_factory, batch.id),
+                reason="deferred_entry_cancel_preflight_failed",
+            )
     try:
         _require_fresh_close_write_boundary(
             session_factory,
@@ -1431,6 +1455,225 @@ def _is_deferred_pending_entry_leg(entry: ExecutionOrderLeg) -> bool:
         and not entry.pos_id
         and state not in {"attribution_conflict", "evidence_unavailable"}
     )
+
+
+def _load_exact_deferred_entry_legs(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+) -> list[ExecutionOrderLeg]:
+    """Load the exact pending entry legs named by the persisted batch snapshot."""
+
+    with session_factory() as session:
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        try:
+            target_snapshot = json.loads(stored_batch.target_snapshot_json)
+            identity = target_snapshot["identity"]
+            deferred_leg_ids = identity["deferred_entry_leg_ids"]
+        except (AttributeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ManagementBatchExecutionError(
+                "deferred_entry_cancel_identity_drift"
+            ) from exc
+        if (
+            not isinstance(target_snapshot, dict)
+            or not isinstance(identity, dict)
+            or not isinstance(deferred_leg_ids, list)
+            or any(type(leg_id) is not int or leg_id <= 0 for leg_id in deferred_leg_ids)
+            or len(set(deferred_leg_ids)) != len(deferred_leg_ids)
+        ):
+            raise ManagementBatchExecutionError(
+                "deferred_entry_cancel_identity_drift"
+            )
+        if not deferred_leg_ids:
+            return []
+
+        rows = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.id.in_(deferred_leg_ids))
+            .all()
+        )
+        rows_by_id = {int(row.id): row for row in rows}
+        if len(rows_by_id) != len(deferred_leg_ids):
+            raise ManagementBatchExecutionError(
+                "deferred_entry_cancel_identity_drift"
+            )
+        ordered_rows = [rows_by_id[leg_id] for leg_id in deferred_leg_ids]
+        for entry in ordered_rows:
+            if (
+                entry.execution_binding_id != batch.execution_binding_id
+                or entry.strategy_instance_id != batch.strategy_instance_id
+                or entry.purpose != "entry"
+                or not (_stored_text(entry.order_id) or _stored_text(entry.client_order_id))
+            ):
+                raise ManagementBatchExecutionError(
+                    "deferred_entry_cancel_identity_drift"
+                )
+            status = str(entry.status or "").lower()
+            if (
+                status not in _DEFERRED_ENTRY_LEG_STATES
+                or status in TERMINAL_ENTRY_LEG_STATES
+                or entry.terminal_reason is not None
+                or entry.pos_id
+            ):
+                raise ManagementBatchExecutionError(
+                    "deferred_entry_cancel_leg_not_pending"
+                )
+            session.expunge(entry)
+        return ordered_rows
+
+
+def _stored_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _exchange_order_matches_entry_leg(
+    order: dict[str, Any], entry: ExecutionOrderLeg
+) -> bool:
+    order_id = _first_text(order, "ordId", "orderId", "id")
+    client_order_id = _first_text(order, "clOrdId", "clientOrderId")
+    return bool(
+        (_stored_text(entry.order_id) and order_id == _stored_text(entry.order_id))
+        or (
+            _stored_text(entry.client_order_id)
+            and client_order_id == _stored_text(entry.client_order_id)
+        )
+    )
+
+
+def _match_exact_deferred_exchange_orders(
+    *,
+    deferred_entries: list[ExecutionOrderLeg],
+    binding: ExecutionBinding,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+) -> list[tuple[ExecutionOrderLeg, str, dict[str, Any]]]:
+    """Match each snapshotted leg to exactly one live exchange order."""
+
+    if not deferred_entries:
+        return []
+    inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
+    trigger_orders = list(deepcoin_client.list_trigger_orders_pending(inst_id=inst_id))
+    regular_orders = list(deepcoin_client.list_open_orders(inst_id=inst_id))
+    exchange_rows = [
+        (cancel_type, index, order)
+        for cancel_type, orders in (
+            ("trigger", trigger_orders),
+            ("regular", regular_orders),
+        )
+        for index, order in enumerate(orders)
+        if isinstance(order, dict)
+    ]
+    matched_row_keys: set[tuple[str, int]] = set()
+    exact_matches: list[tuple[ExecutionOrderLeg, str, dict[str, Any]]] = []
+    for entry in deferred_entries:
+        matches = [
+            (cancel_type, index, order)
+            for cancel_type, index, order in exchange_rows
+            if _exchange_order_matches_entry_leg(order, entry)
+        ]
+        if len(matches) != 1:
+            raise ManagementBatchExecutionError(
+                "deferred_entry_cancel_exchange_state_drift"
+            )
+        cancel_type, index, order = matches[0]
+        row_key = (cancel_type, index)
+        if row_key in matched_row_keys:
+            raise ManagementBatchExecutionError(
+                "deferred_entry_cancel_exchange_state_drift"
+            )
+        matched_row_keys.add(row_key)
+        exact_matches.append((entry, cancel_type, order))
+    return exact_matches
+
+
+def _cancel_deferred_entry_legs(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+    binding: ExecutionBinding,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    cancelled_at: datetime,
+) -> None:
+    """Cancel only batch-snapshotted deferred entry orders before a full exit."""
+
+    deferred_entries = _load_exact_deferred_entry_legs(
+        session_factory, batch=batch
+    )
+    exact_matches = _match_exact_deferred_exchange_orders(
+        deferred_entries=deferred_entries,
+        binding=binding,
+        deepcoin_client=deepcoin_client,
+    )
+    inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
+    for detached_entry, cancel_type, exchange_order in exact_matches:
+        order_id = _first_text(exchange_order, "ordId", "orderId", "id")
+        client_order_id = _first_text(
+            exchange_order, "clOrdId", "clientOrderId"
+        )
+        cancel_payload: dict[str, Any] = {"instId": inst_id}
+        if order_id:
+            cancel_payload["ordId"] = order_id
+        if client_order_id:
+            cancel_payload["clOrdId"] = client_order_id
+        if cancel_type == "trigger":
+            response = deepcoin_client.cancel_trigger_order(cancel_payload)
+            action = "strategy_management_cancel_deferred_trigger_entry"
+        else:
+            cancel_payload["mrgPosition"] = normalize_deepcoin_position_mode(
+                binding.position_mode
+            )
+            response = deepcoin_client.cancel_order(cancel_payload)
+            action = "strategy_management_cancel_deferred_regular_entry"
+
+        with session_factory() as session:
+            entry = session.get(ExecutionOrderLeg, detached_entry.id)
+            if (
+                entry is None
+                or entry.execution_binding_id != batch.execution_binding_id
+                or entry.strategy_instance_id != batch.strategy_instance_id
+                or entry.purpose != "entry"
+                or str(entry.status or "").lower() not in _DEFERRED_ENTRY_LEG_STATES
+                or entry.status.lower() in TERMINAL_ENTRY_LEG_STATES
+                or entry.terminal_reason is not None
+                or entry.pos_id
+                or entry.order_id != detached_entry.order_id
+                or entry.client_order_id != detached_entry.client_order_id
+            ):
+                raise ManagementBatchExecutionError(
+                    "deferred_entry_cancel_leg_not_pending"
+                )
+            entry.status = "cancelled"
+            entry.terminal_reason = (
+                "management_full_close_cancelled_unfilled_entry_leg"
+            )
+            entry.last_verified_at = cancelled_at
+            entry.updated_at = cancelled_at
+            session.commit()
+
+        record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                execution_binding_id=binding.id,
+                strategy_instance_id=batch.strategy_instance_id,
+                venue="deepcoin",
+                action=action,
+                kol_id=binding.kol_id,
+                chat_id=binding.chat_id,
+                message_id=binding.message_id,
+                source_message_id=batch.raw_message_id,
+                symbol=binding.symbol,
+                side=binding.side,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                reason="management_full_close_cancelled_unfilled_entry_leg",
+                before=exchange_order,
+                request=cancel_payload,
+                response=response,
+                created_at=cancelled_at,
+            ),
+        )
 
 
 def _close_payload(
