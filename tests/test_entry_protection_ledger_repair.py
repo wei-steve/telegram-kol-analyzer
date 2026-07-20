@@ -1,10 +1,12 @@
 import json
+import hashlib
 from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_protection_ledger_repair import (
     apply_entry_protection_ledger_repair_plan,
     build_entry_protection_ledger_repair_plan,
+    plan_trigger_protection_intent_adoption,
     plan_verified_trigger_entry_protection_adoption,
 )
 from telegram_kol_research.models import (
@@ -12,6 +14,7 @@ from telegram_kol_research.models import (
     ExecutionEvent,
     ExecutionOrderLeg,
     PositionProtectionLedger,
+    TriggerProtectionIntent,
 )
 
 
@@ -375,6 +378,184 @@ def test_adoption_plans_one_exact_trigger_entry_protection_without_session_write
         assert result.action.order_id == "tpsl-1"
         assert result.refusal is None
         assert session.query(PositionProtectionLedger).count() == 0
+
+
+def test_intent_adoption_plans_one_new_exact_trigger_entry_protection(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_entry_fill(
+        session_factory,
+        binding_id=152,
+        legs=[{
+            "leg_id": 289, "leg_index": 1, "order_id": "entry-1",
+            "client_order_id": "entry-client-1", "pos_id": "pos-1",
+            "size": "4.4", "entry_price": "1883.0",
+        }],
+    )
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, 289)
+        event = session.query(ExecutionEvent).one()
+        request = json.loads(leg.request_json)
+        fingerprint_payload = dict(request)
+        fingerprint_payload["tpTriggerPx"] = request.get("tpTriggerPx")
+        fingerprint_payload["slTriggerPx"] = request.get("slTriggerPx")
+        intent = TriggerProtectionIntent(
+            venue="deepcoin", execution_binding_id=152, execution_order_leg_id=289,
+            request_fingerprint=hashlib.sha256(json.dumps(
+                fingerprint_payload, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()).hexdigest(),
+            pre_submit_tpsl_baseline_json="[]", correlation_id="intent-289",
+            parent_trigger_order_id="entry-1",
+        )
+        result = plan_trigger_protection_intent_adoption(
+            session,
+            entry_leg=leg,
+            intent=intent,
+            parent_event=event,
+            pending_tpsl_rows=[_pending_tpsl_row(
+                "tpsl-new", purpose="combined", price="1860", stop_price="1900",
+                ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP",
+                side="short", size="4.4",
+            )],
+            history_tpsl_rows=[],
+            existing_ledger_rows=[],
+            existing_intents=[intent],
+        )
+
+    assert result.action is not None
+    assert result.action.order_id == "tpsl-new"
+    assert result.deferred is None
+    assert result.refusal is None
+
+
+def test_intent_adoption_refuses_candidate_present_in_pre_submit_baseline(tmp_path):
+    result = _plan_intent_adoption(tmp_path, baseline='[{"ord_id":"tpsl-new"}]')
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_in_baseline"
+
+
+def test_intent_adoption_refuses_duplicate_candidates_across_pending_and_history(tmp_path):
+    result = _plan_intent_adoption(
+        tmp_path,
+        history_rows=[_pending_tpsl_row(
+            "tpsl-history", purpose="combined", price="1860", stop_price="1900",
+            ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4",
+        )],
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_not_unique"
+
+
+def test_intent_adoption_refuses_conflicting_returned_position_id(tmp_path):
+    result = _plan_intent_adoption(tmp_path, pending_update={"posId": "other-pos"})
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_position_conflict"
+
+
+def test_intent_adoption_accepts_history_only_with_parent_proof_and_explicit_range(tmp_path):
+    row = _pending_tpsl_row(
+        "tpsl-history", purpose="combined", price="1860", stop_price="1900",
+        ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4",
+    )
+    row["parentOrdId"] = "entry-1"
+    result = _plan_intent_adoption(
+        tmp_path, pending_rows=[], history_rows=[row],
+        history_time_range_start=datetime(2026, 7, 20, 0, 11),
+        history_time_range_end=datetime(2026, 7, 20, 0, 12),
+    )
+
+    assert result.action is not None
+    assert result.action.order_id == "tpsl-history"
+
+
+def test_intent_adoption_refuses_history_only_without_explicit_proof_or_range(tmp_path):
+    result = _plan_intent_adoption(
+        tmp_path, pending_rows=[], history_rows=[_pending_tpsl_row(
+            "tpsl-history", purpose="combined", price="1860", stop_price="1900",
+            ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4",
+        )],
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_history_unproven"
+
+
+def test_intent_adoption_refuses_existing_ledger_or_other_intent_ownership(tmp_path):
+    ledger = PositionProtectionLedger(
+        venue="deepcoin", execution_binding_id=999, execution_order_leg_id=998,
+        pos_id="other-pos", instrument_id="ETH-USDT-SWAP", side="short",
+        order_id="tpsl-new", purpose="combined", status="verified", evidence_source="test",
+    )
+    result = _plan_intent_adoption(tmp_path, existing_ledger_rows=[ledger])
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_order_owned"
+
+    other_intent = TriggerProtectionIntent(
+        id=777, venue="deepcoin", execution_binding_id=999, execution_order_leg_id=998,
+        request_fingerprint="a" * 64, pre_submit_tpsl_baseline_json="[]",
+        correlation_id="other", adopted_order_id="tpsl-new",
+    )
+    other_tmp_path = tmp_path / "other"
+    other_tmp_path.mkdir()
+    result = _plan_intent_adoption(other_tmp_path, existing_intents=[other_intent])
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_order_owned"
+
+
+def test_intent_adoption_planner_cannot_access_session_for_client_or_writes(tmp_path):
+    class NoSessionAccess:
+        def __getattr__(self, name):
+            raise AssertionError(f"planner accessed session.{name}")
+
+    result = _plan_intent_adoption(tmp_path, planner_session=NoSessionAccess())
+
+    assert result.action is not None
+
+
+def _plan_intent_adoption(
+    tmp_path, *, baseline="[]", pending_rows=None, history_rows=None, pending_update=None,
+    existing_ledger_rows=None, history_time_range_start=None, history_time_range_end=None,
+    planner_session=None, existing_intents=None,
+):
+    session_factory = create_session_factory(tmp_path / "intent-adoption.db")
+    _seed_trigger_entry_fill(session_factory, binding_id=152, legs=[{
+        "leg_id": 289, "leg_index": 1, "order_id": "entry-1",
+        "client_order_id": "entry-client-1", "pos_id": "pos-1", "size": "4.4", "entry_price": "1883.0",
+    }])
+    row = _pending_tpsl_row("tpsl-new", purpose="combined", price="1860", stop_price="1900", ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4")
+    row.update(pending_update or {})
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, 289)
+        event = session.query(ExecutionEvent).one()
+        request = json.loads(leg.request_json)
+        payload = dict(request)
+        payload["tpTriggerPx"] = request.get("tpTriggerPx")
+        payload["slTriggerPx"] = request.get("slTriggerPx")
+        intent = TriggerProtectionIntent(
+            venue="deepcoin", execution_binding_id=152, execution_order_leg_id=289,
+            request_fingerprint=hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            pre_submit_tpsl_baseline_json=baseline, correlation_id="intent-289", parent_trigger_order_id="entry-1",
+        )
+        return plan_trigger_protection_intent_adoption(
+            session if planner_session is None else planner_session,
+            entry_leg=leg, intent=intent, parent_event=event,
+            pending_tpsl_rows=[row] if pending_rows is None else pending_rows,
+            history_tpsl_rows=history_rows or [], existing_ledger_rows=existing_ledger_rows or [],
+            existing_intents=[intent] if existing_intents is None else [intent, *existing_intents],
+            history_time_range_start=history_time_range_start,
+            history_time_range_end=history_time_range_end,
+        )
 
 
 def test_adoption_refuses_pending_row_without_order_id(tmp_path):

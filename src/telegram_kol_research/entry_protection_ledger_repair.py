@@ -13,6 +13,7 @@ from telegram_kol_research.models import (
     ExecutionEvent,
     ExecutionOrderLeg,
     PositionProtectionLedger,
+    TriggerProtectionIntent,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 
@@ -52,6 +53,27 @@ class EntryProtectionLedgerRepairAdoptionResult:
     def __post_init__(self) -> None:
         if self.action is not None and self.refusal is not None:
             raise ValueError("adoption result cannot contain both action and refusal")
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerProtectionIntentAdoptionDeferred:
+    """A strict recovery candidate is not yet safely observable."""
+
+    reason: str
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerProtectionIntentAdoptionResult:
+    """Exactly one pure post-baseline trigger-protection outcome."""
+
+    action: EntryProtectionLedgerRepairAction | None = None
+    deferred: TriggerProtectionIntentAdoptionDeferred | None = None
+    refusal: EntryProtectionLedgerRepairRefusal | None = None
+
+    def __post_init__(self) -> None:
+        if sum(value is not None for value in (self.action, self.deferred, self.refusal)) != 1:
+            raise ValueError("intent adoption result must have exactly one outcome")
 
 
 @dataclass(frozen=True, slots=True)
@@ -577,6 +599,206 @@ def plan_verified_trigger_entry_protection_adoption(
             },
         )
     )
+
+
+def plan_trigger_protection_intent_adoption(
+    session,
+    *,
+    entry_leg: ExecutionOrderLeg,
+    intent: TriggerProtectionIntent,
+    parent_event: ExecutionEvent,
+    pending_tpsl_rows: list[dict[str, Any]],
+    history_tpsl_rows: list[dict[str, Any]],
+    existing_ledger_rows: list[PositionProtectionLedger],
+    existing_intents: list[TriggerProtectionIntent],
+    history_time_range_start: datetime | None = None,
+    history_time_range_end: datetime | None = None,
+) -> TriggerProtectionIntentAdoptionResult:
+    """Plan one post-baseline attached-protection adoption without I/O or writes.
+
+    History is deliberately weaker than pending visibility: a history-only row
+    needs an explicit parent reference and a caller-calibrated time range.
+    """
+
+    del session
+    binding_id = int(entry_leg.execution_binding_id or 0)
+    pos_id = str(entry_leg.pos_id or "").strip()
+    request = _loads_json(entry_leg.request_json)
+    event_request = _loads_json(parent_event.request_json)
+    expected_rows = _expected_protection_rows(request)
+    instrument_id = _request_instrument_id(request)
+    side = _request_side(request)
+    expected_parent = str(intent.parent_trigger_order_id or "").strip()
+    if (
+        not binding_id
+        or int(intent.execution_binding_id or 0) != binding_id
+        or int(intent.execution_order_leg_id or 0) != int(entry_leg.id or 0)
+        or str(intent.venue or "").lower() != "deepcoin"
+        or str(entry_leg.venue or "").lower() != "deepcoin"
+        or str(entry_leg.purpose or "") != "entry"
+        or str(entry_leg.order_kind or "") != "trigger_limit"
+        or str(entry_leg.attribution_status or "") != "verified"
+        or str(entry_leg.status or "").lower() != "active"
+        or not pos_id
+        or not expected_rows
+        or not instrument_id
+        or not side
+        or not expected_parent
+        or not _same_nonempty_text(expected_parent, entry_leg.order_id)
+        or not _same_nonempty_text(expected_parent, parent_event.order_id)
+        or parent_event.action != "create_trigger_entry"
+        or str(parent_event.venue or "").lower() != "deepcoin"
+        or int(parent_event.execution_binding_id or 0) != binding_id
+        or _trigger_protection_fingerprint(request) != intent.request_fingerprint
+        or _trigger_protection_fingerprint(event_request) != intent.request_fingerprint
+    ):
+        return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_intent_identity_invalid")
+
+    baseline_ids = _baseline_order_ids(intent.pre_submit_tpsl_baseline_json)
+    if baseline_ids is None:
+        return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_baseline_invalid")
+    candidates: list[tuple[dict[str, Any], str]] = []
+    for source, rows in (("pending", pending_tpsl_rows), ("history", history_tpsl_rows)):
+        for row in rows:
+            if not isinstance(row, dict) or not _row_order_id(row):
+                continue
+            if (
+                _row_matches_instrument_side(row, instrument_id=instrument_id, side=side)
+                and _row_matches_expected_protection_set(row, expected_rows)
+                and _same_size_text(_row_size_text(row), _request_size_text(request))
+                and not _row_position_ids_match(row, pos_id)
+            ):
+                return _intent_refusal(
+                    parent_event, binding_id, pos_id,
+                    "trigger_protection_candidate_position_conflict", [_row_order_id(row)],
+                )
+            if (
+                _row_matches_exchange_identity(
+                    row, instrument_id=instrument_id, side=side, pos_id=pos_id
+                )
+                and _row_matches_expected_protection_set(row, expected_rows)
+                and _same_size_text(_row_size_text(row), _request_size_text(request))
+            ):
+                candidates.append((row, source))
+    if not candidates:
+        return TriggerProtectionIntentAdoptionResult(
+            deferred=TriggerProtectionIntentAdoptionDeferred(
+                reason="trigger_protection_not_yet_observable",
+                evidence={"parent_trigger_order_id": expected_parent},
+            )
+        )
+    candidate_ids = [_row_order_id(row) for row, _ in candidates]
+    if any(order_id in baseline_ids for order_id in candidate_ids):
+        return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_candidate_in_baseline", candidate_ids)
+    if len(candidates) != 1:
+        return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_candidate_not_unique", candidate_ids)
+    row, source = candidates[0]
+    order_id = _row_order_id(row)
+    assert order_id is not None
+    if source == "history" and not _history_row_is_proven_in_range(
+        row,
+        parent_order_id=expected_parent,
+        start=history_time_range_start,
+        end=history_time_range_end,
+    ):
+        return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_history_unproven", [order_id])
+    for ledger in existing_ledger_rows:
+        if str(ledger.order_id or "").strip() == order_id:
+            if int(ledger.execution_order_leg_id or 0) == int(entry_leg.id or 0):
+                return TriggerProtectionIntentAdoptionResult(
+                    deferred=TriggerProtectionIntentAdoptionDeferred(reason="trigger_protection_already_adopted")
+                )
+            return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_order_owned", [order_id])
+    for other_intent in existing_intents:
+        if (
+            int(other_intent.id or 0) != int(intent.id or 0)
+            and str(other_intent.adopted_order_id or "").strip() == order_id
+        ):
+            return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_order_owned", [order_id])
+    return TriggerProtectionIntentAdoptionResult(
+        action=EntryProtectionLedgerRepairAction(
+            event_id=int(parent_event.id), binding_id=binding_id, leg_id=int(entry_leg.id),
+            strategy_instance_id=entry_leg.strategy_instance_id, pos_id=pos_id,
+            instrument_id=instrument_id, side=side, order_id=order_id, purpose="combined",
+            trigger_price=None, size_text=_row_size_text(row) or _request_size_text(request),
+            evidence={
+                "match": "trigger_protection_intent_post_baseline",
+                "intent_id": int(intent.id) if intent.id is not None else None,
+                "parent_trigger_order_id": expected_parent,
+                "source": source,
+            },
+        )
+    )
+
+
+def _intent_refusal(
+    event: ExecutionEvent, binding_id: int, pos_id: str, reason: str, candidate_ids: list[str | None] | None = None
+) -> TriggerProtectionIntentAdoptionResult:
+    return TriggerProtectionIntentAdoptionResult(
+        refusal=EntryProtectionLedgerRepairRefusal(
+            event_id=int(event.id) if event.id is not None else None,
+            binding_id=binding_id or None, pos_id=pos_id or None, reason=reason,
+            evidence={"candidate_order_ids": sorted({value for value in candidate_ids or [] if value})},
+        )
+    )
+
+
+def _trigger_protection_fingerprint(request: Any) -> str:
+    if not isinstance(request, dict):
+        return ""
+    payload = dict(request)
+    payload["tpTriggerPx"] = request.get("tpTriggerPx")
+    payload["slTriggerPx"] = request.get("slTriggerPx")
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _baseline_order_ids(value: str | None) -> set[str] | None:
+    parsed = _loads_json(value)
+    if not isinstance(parsed, (list, dict)):
+        return None
+    rows = parsed if isinstance(parsed, list) else parsed.get("orders", [])
+    if not isinstance(rows, list):
+        return None
+    return {str(row.get("ord_id") or row.get("ordId") or row.get("orderId") or "").strip() for row in rows if isinstance(row, dict)} - {""}
+
+
+def _row_matches_expected_protection_set(row: dict[str, Any], expected_rows: list[dict[str, str | None]]) -> bool:
+    expected_by_purpose = {str(item["purpose"]): item for item in expected_rows}
+    return bool(expected_by_purpose) and all(
+        _row_matches_expected(row, expected, allow_generic_trigger_price=False)
+        for expected in expected_by_purpose.values()
+    )
+
+
+def _row_matches_instrument_side(row: dict[str, Any], *, instrument_id: str, side: str) -> bool:
+    return (
+        str(row.get("triggerOrderType") or "TPSL").upper() == "TPSL"
+        and str(row.get("instId") or "").upper() == instrument_id.upper()
+        and str(row.get("posSide") or row.get("side") or "").lower() == side.lower()
+    )
+
+
+def _row_position_ids_match(row: dict[str, Any], pos_id: str) -> bool:
+    return all(
+        str(row.get(key) or "").strip() == pos_id
+        for key in ("closePosId", "close_pos_id", "closePositionId", "posId", "pos_id", "positionId")
+        if str(row.get(key) or "").strip()
+    )
+
+
+def _history_row_is_proven_in_range(
+    row: dict[str, Any], *, parent_order_id: str, start: datetime | None, end: datetime | None
+) -> bool:
+    if start is None or end is None or end < start:
+        return False
+    row_time = _row_time(row)
+    if row_time is None or not (start <= row_time <= end):
+        return False
+    parent_ids = {
+        str(row.get(key) or "").strip()
+        for key in ("parentOrdId", "parentOrderId", "parent_order_id", "triggerOrderId")
+    }
+    return parent_order_id in parent_ids
 
 
 def _protection_association(
