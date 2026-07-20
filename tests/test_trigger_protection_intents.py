@@ -87,6 +87,82 @@ def test_create_or_get_preserves_immutable_normalized_evidence(tmp_path):
                 pre_submit_tpsl_baseline_json=baseline,
                 correlation_id="corr-1",
             )
+        with pytest.raises(ValueError, match="immutable"):
+            create_or_get_trigger_protection_intent(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=leg_id,
+                request_fingerprint="f" * 64,
+                pre_submit_tpsl_baseline_json='{"orders":[]}',
+                correlation_id="corr-1",
+            )
+        with pytest.raises(ValueError, match="correlation"):
+            create_or_get_trigger_protection_intent(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=leg_id,
+                request_fingerprint="f" * 64,
+                pre_submit_tpsl_baseline_json=baseline,
+                correlation_id="corr-changed",
+            )
+
+
+@pytest.mark.parametrize(
+    ("request_fingerprint", "baseline", "correlation_id"),
+    [
+        ("", "{}", "corr-1"),
+        ("not-json", "{}", "corr-1"),
+        ("a" * 64, "", "corr-1"),
+        ("a" * 64, "not-json", "corr-1"),
+        ("a" * 64, "{}", ""),
+    ],
+)
+def test_create_or_get_rejects_empty_or_non_normalized_immutable_evidence(
+    tmp_path, request_fingerprint, baseline, correlation_id
+):
+    session_factory = create_session_factory(tmp_path / "intents.db")
+    leg_id = _leg(session_factory)
+
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="immutable evidence"):
+            create_or_get_trigger_protection_intent(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=leg_id,
+                request_fingerprint=request_fingerprint,
+                pre_submit_tpsl_baseline_json=baseline,
+                correlation_id=correlation_id,
+            )
+
+
+def test_create_or_get_rejects_non_entry_or_cross_venue_leg(tmp_path):
+    session_factory = create_session_factory(tmp_path / "intents.db")
+    exit_leg_id = _leg(session_factory, leg_index=0)
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, exit_leg_id)
+        leg.purpose = "take_profit"
+        session.commit()
+        with pytest.raises(ValueError, match="entry"):
+            create_or_get_trigger_protection_intent(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=exit_leg_id,
+                request_fingerprint="d" * 64,
+                pre_submit_tpsl_baseline_json="{}",
+                correlation_id="corr-exit",
+            )
+
+    entry_leg_id = _leg(session_factory, leg_index=1)
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="venue"):
+            create_or_get_trigger_protection_intent(
+                session,
+                venue="other-venue",
+                execution_order_leg_id=entry_leg_id,
+                request_fingerprint="e" * 64,
+                pre_submit_tpsl_baseline_json="{}",
+                correlation_id="corr-venue",
+            )
 
 
 def test_parent_and_adopted_order_identities_are_exclusive_per_venue(tmp_path):
