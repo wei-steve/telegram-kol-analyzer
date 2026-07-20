@@ -334,8 +334,15 @@ def split_strategy_management_notification(
 ) -> list[str]:
     """Return deterministic line-bounded Telegram messages below 4096 chars."""
 
+    return _split_telegram_notification_text(
+        format_strategy_management_notification(payload), max_chars=max_chars
+    )
+
+
+def _split_telegram_notification_text(text: str, *, max_chars: int) -> list[str]:
+    """Split display text deterministically on lines within Telegram's limit."""
+
     limit = max(1, min(int(max_chars), 4095))
-    text = format_strategy_management_notification(payload)
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
@@ -355,6 +362,77 @@ def split_strategy_management_notification(
     if current:
         chunks.append(current)
     return chunks
+
+
+def format_message_instruction_summary(payload: dict[str, Any]) -> str:
+    """Render a bounded, payload-only outcome summary for one source message."""
+
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    ordered_items = sorted(
+        (item for item in items if isinstance(item, dict)),
+        key=lambda item: (_summary_sequence(item), _summary_item_id(item)),
+    )
+    lines = [
+        "【同消息策略指令结果】",
+        (
+            f"来源: {payload.get('chat_title') or payload.get('group_label') or '-'} / "
+            f"{payload.get('chat_id') or '-'} / #{payload.get('message_id') or '-'}"
+        ),
+    ]
+    management_failed = False
+    entry_attempted = False
+    for item in ordered_items[:100]:
+        kind = str(item.get("instruction_kind") or "-").strip().lower()
+        status = _safe_management_text(item.get("status"), limit=48)
+        label = {"management": "仓位管理", "entry": "新策略开仓"}.get(kind, kind or "-")
+        strategy = _safe_management_text(item.get("strategy_instance_id"), limit=255)
+        reason = _safe_management_text(_summary_item_reason(item), limit=180)
+        lines.append(
+            f"#{_summary_sequence(item)} {label}: {status} / "
+            f"strategy={strategy} / 原因: {reason}"
+        )
+        management_failed = management_failed or (
+            kind == "management" and status in {"failed", "unknown"}
+        )
+        entry_attempted = entry_attempted or (
+            kind == "entry" and status not in {"pending", "executing", "-"}
+        )
+    if not ordered_items:
+        lines.append("未持久化可展示的指令结果。")
+    elif management_failed and entry_attempted:
+        lines.append("仓位管理异常；后续开仓已继续尝试。")
+    return "\n".join(lines)
+
+
+def split_message_instruction_summary(
+    payload: dict[str, Any], *, max_chars: int = _MANAGEMENT_TELEGRAM_MAX_CHARS
+) -> list[str]:
+    """Split a message-level instruction summary using the Telegram-safe splitter."""
+
+    return _split_telegram_notification_text(
+        format_message_instruction_summary(payload), max_chars=max_chars
+    )
+
+
+def _summary_sequence(item: dict[str, Any]) -> int:
+    sequence = item.get("sequence")
+    return sequence if type(sequence) is int and sequence >= 0 else 999_999_999
+
+
+def _summary_item_id(item: dict[str, Any]) -> int:
+    item_id = item.get("item_id")
+    return item_id if type(item_id) is int and item_id >= 0 else 999_999_999
+
+
+def _summary_item_reason(item: dict[str, Any]) -> Any:
+    if item.get("reason") not in (None, ""):
+        return item["reason"]
+    result = item.get("result")
+    if isinstance(result, dict):
+        for key in ("reason", "reason_code", "status"):
+            if result.get(key) not in (None, ""):
+                return result[key]
+    return "-"
 
 
 def _safe_management_text(value: Any, *, limit: int = 300) -> str:
@@ -836,6 +914,15 @@ async def send_system_operator_bot_message(
             json=payload,
         )
         response.raise_for_status()
+
+
+async def send_message_instruction_summary_notification(
+    *, config: SystemOperatorBotConfig, payload: dict[str, Any]
+) -> None:
+    """Deliver every bounded chunk of a persisted message outcome payload."""
+
+    for text in split_message_instruction_summary(payload):
+        await send_system_operator_bot_message(config=config, text=text)
 
 
 async def deliver_pending_position_attribution_incidents(

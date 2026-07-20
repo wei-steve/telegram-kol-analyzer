@@ -22,6 +22,68 @@ from telegram_kol_research.system_operator_bot import (
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
 
 
+def test_message_instruction_summary_reports_management_failure_and_entry_attempt():
+    payload = {
+        "message_id": 901,
+        "chat_id": -10088,
+        "items": [
+            {
+                "sequence": 0,
+                "instruction_kind": "management",
+                "strategy_instance_id": "deepcoin:-10088:811:BTC:short",
+                "status": "failed",
+                "reason": "management_close_order_not_found",
+            },
+            {
+                "sequence": 1,
+                "instruction_kind": "entry",
+                "strategy_instance_id": "deepcoin:-10088:901:BTC:long",
+                "status": "submitted",
+                "result": {"reason": "entry_order_submitted"},
+            },
+        ],
+    }
+
+    text = operator_bot_module.format_message_instruction_summary(payload)
+
+    assert "仓位管理: failed" in text
+    assert "新策略开仓: submitted" in text
+    assert "后续开仓已继续尝试" in text
+    assert "#0" in text
+    assert "deepcoin:-10088:811:BTC:short" in text
+
+
+def test_message_instruction_summary_sanitizes_persisted_reason_and_splits():
+    payload = {
+        "items": [
+            {
+                "sequence": 0,
+                "instruction_kind": "management",
+                "strategy_instance_id": "strategy-0",
+                "status": "failed",
+                "reason": "Authorization: secret-value " + "x" * 500,
+            },
+            *[
+                {
+                    "sequence": index,
+                    "instruction_kind": "entry",
+                    "strategy_instance_id": f"strategy-{index}-" + "s" * 255,
+                    "status": "submitted",
+                    "result": {"reason": "entry_order_submitted"},
+                }
+                for index in range(1, 30)
+            ],
+        ],
+    }
+
+    chunks = operator_bot_module.split_message_instruction_summary(payload)
+
+    assert "[redacted]" in "\n".join(chunks)
+    assert "secret-value" not in "\n".join(chunks)
+    assert len(chunks) > 1
+    assert all(0 < len(chunk) < 4096 for chunk in chunks)
+
+
 def test_management_notification_formatter_has_exact_identity_and_safety_labels():
     message = operator_bot_module.format_strategy_management_notification(
         {
