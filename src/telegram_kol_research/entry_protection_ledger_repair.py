@@ -71,6 +71,35 @@ class EntryProtectionLedgerRepairResult:
     applied: int
 
 
+def upsert_entry_protection_ledger_action(
+    session,
+    action: EntryProtectionLedgerRepairAction,
+    *,
+    evidence_source: str,
+    seen_at: datetime | None = None,
+) -> PositionProtectionLedger | None:
+    """Persist one already-planned action without performing exchange I/O."""
+
+    return upsert_protection_ledger_row(
+        session,
+        venue="deepcoin",
+        execution_binding_id=action.binding_id,
+        execution_order_leg_id=action.leg_id,
+        strategy_instance_id=action.strategy_instance_id,
+        pos_id=action.pos_id,
+        instrument_id=action.instrument_id,
+        side=action.side,
+        order_id=action.order_id,
+        purpose=action.purpose,
+        trigger_price=action.trigger_price,
+        size_text=action.size_text,
+        status="verified",
+        evidence_source=evidence_source,
+        evidence=action.evidence,
+        seen_at=seen_at,
+    )
+
+
 def build_entry_protection_ledger_repair_plan(
     session_factory,
     *,
@@ -198,22 +227,10 @@ def apply_entry_protection_ledger_repair_plan(
     applied = 0
     with session_factory() as session:
         for action in plan.actions:
-            row = upsert_protection_ledger_row(
+            row = upsert_entry_protection_ledger_action(
                 session,
-                venue="deepcoin",
-                execution_binding_id=action.binding_id,
-                execution_order_leg_id=action.leg_id,
-                strategy_instance_id=action.strategy_instance_id,
-                pos_id=action.pos_id,
-                instrument_id=action.instrument_id,
-                side=action.side,
-                order_id=action.order_id,
-                purpose=action.purpose,
-                trigger_price=action.trigger_price,
-                size_text=action.size_text,
-                status="verified",
+                action,
                 evidence_source="entry_protection_event_repair",
-                evidence=action.evidence,
                 seen_at=seen_at,
             )
             if row is not None:

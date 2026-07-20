@@ -22,6 +22,7 @@ from telegram_kol_research.models import BoundPositionCloseReservation
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionAttributionAudit
+from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.position_attribution import (
     ATTRIBUTION_POLICY_VERSION,
     FillEvidence,
@@ -105,6 +106,9 @@ class ExecutionReconciliationResult:
     open: int = 0
     stale: int = 0
     updated: int = 0
+    protection_adopted: int = 0
+    protection_adoption_refused: int = 0
+    protection_snapshot_unavailable: int = 0
 
 
 @dataclass(slots=True)
@@ -490,6 +494,9 @@ def _apply_reconcile_snapshot(
         }
 
         if snapshot.errors:
+            result.protection_snapshot_unavailable = _trigger_protection_exposure_count(
+                session, legs=legs
+            )
             for leg in legs:
                 if int(leg.execution_binding_id) in manual_terminal_binding_ids:
                     continue
@@ -662,6 +669,14 @@ def _apply_reconcile_snapshot(
                 leg.attribution_status = "unassigned"
                 leg.attribution_evidence_json = None
 
+        _adopt_verified_trigger_entry_protection(
+            session,
+            legs=legs,
+            snapshot=snapshot,
+            recovered_at=recovered_at,
+            result=result,
+        )
+
         for binding in bindings:
             binding.strategy_instance_id = binding.strategy_instance_id or build_strategy_instance_id(
                 venue=binding.venue,
@@ -693,6 +708,227 @@ def _apply_reconcile_snapshot(
         result.updated = len(bindings)
         session.commit()
     return result
+
+
+def _adopt_verified_trigger_entry_protection(
+    session,
+    *,
+    legs: list[ExecutionOrderLeg],
+    snapshot: _ReconcileSnapshot,
+    recovered_at: datetime,
+    result: ExecutionReconciliationResult,
+) -> None:
+    """Adopt strict trigger-entry protection from the bounded read snapshot."""
+
+    from telegram_kol_research.entry_protection_ledger_repair import (
+        EntryProtectionLedgerRepairRefusal,
+        plan_verified_trigger_entry_protection_adoption,
+        upsert_entry_protection_ledger_action,
+    )
+
+    eligible_legs = [
+        leg
+        for leg in legs
+        if str(leg.venue or "deepcoin").lower() == "deepcoin"
+        and str(leg.purpose or "") == "entry"
+        and str(leg.order_kind or "") == "trigger_limit"
+        and str(leg.attribution_status or "") == "verified"
+        and str(leg.status or "").lower() == "active"
+        and bool(str(leg.pos_id or "").strip())
+        and _request_has_combined_trigger_protection(leg.request_json)
+    ]
+    if not eligible_legs:
+        return
+    protected_leg_ids = {
+        int(leg_id)
+        for (leg_id,) in (
+            session.query(PositionProtectionLedger.execution_order_leg_id)
+            .filter(PositionProtectionLedger.status == "verified")
+            .filter(
+                PositionProtectionLedger.execution_order_leg_id.in_(
+                    [int(leg.id) for leg in eligible_legs]
+                )
+            )
+            .all()
+        )
+    }
+    existing_order_ids = {
+        str(order_id)
+        for (order_id,) in session.query(PositionProtectionLedger.order_id).all()
+        if str(order_id or "").strip()
+    }
+    events_by_binding: dict[int, list[ExecutionEvent]] = {}
+    for event in (
+        session.query(ExecutionEvent)
+        .filter(ExecutionEvent.venue == "deepcoin")
+        .filter(ExecutionEvent.action == "create_trigger_entry")
+        .filter(
+            ExecutionEvent.execution_binding_id.in_(
+                sorted({int(leg.execution_binding_id) for leg in eligible_legs})
+            )
+        )
+        .order_by(ExecutionEvent.id.asc())
+        .all()
+    ):
+        events_by_binding.setdefault(int(event.execution_binding_id), []).append(event)
+
+    for leg in sorted(eligible_legs, key=lambda row: int(row.id)):
+        if int(leg.id) in protected_leg_ids:
+            continue
+        matching_events = [
+            event
+            for event in events_by_binding.get(int(leg.execution_binding_id), [])
+            if _same_present_text(event.order_id, leg.order_id)
+            and _same_present_text(event.client_order_id, leg.client_order_id)
+        ]
+        if len(matching_events) != 1:
+            refusal = EntryProtectionLedgerRepairRefusal(
+                event_id=(
+                    int(matching_events[0].id) if len(matching_events) == 1 else None
+                ),
+                binding_id=int(leg.execution_binding_id),
+                pos_id=str(leg.pos_id),
+                reason=(
+                    "trigger_entry_event_not_unique"
+                    if matching_events
+                    else "trigger_entry_event_missing"
+                ),
+                evidence={"candidate_event_count": len(matching_events)},
+            )
+            result.protection_adoption_refused += 1
+            _record_protection_adoption_refusal(
+                session, leg=leg, refusal=refusal, created_at=recovered_at
+            )
+            continue
+        adoption = plan_verified_trigger_entry_protection_adoption(
+            session,
+            entry_leg=leg,
+            event=matching_events[0],
+            pending_tpsl_rows=snapshot.pending_trigger_orders,
+            existing_order_ids=existing_order_ids,
+        )
+        if adoption.action is not None:
+            row = upsert_entry_protection_ledger_action(
+                session,
+                adoption.action,
+                evidence_source="reconciliation_trigger_entry_adoption",
+                seen_at=recovered_at,
+            )
+            if row is not None:
+                existing_order_ids.add(adoption.action.order_id)
+                protected_leg_ids.add(int(leg.id))
+                result.protection_adopted += 1
+        elif adoption.refusal is not None:
+            result.protection_adoption_refused += 1
+            _record_protection_adoption_refusal(
+                session,
+                leg=leg,
+                refusal=adoption.refusal,
+                created_at=recovered_at,
+            )
+
+
+def _record_protection_adoption_refusal(
+    session,
+    *,
+    leg: ExecutionOrderLeg,
+    refusal: Any,
+    created_at: datetime,
+) -> None:
+    evidence = _bounded_protection_refusal_evidence(refusal)
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "binding_id": int(leg.execution_binding_id),
+                "leg_id": int(leg.id),
+                "pos_id": str(leg.pos_id or ""),
+                "event_type": "protection_adoption_refused",
+                "evidence": evidence,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    exists = (
+        session.query(PositionAttributionAudit.id)
+        .filter(PositionAttributionAudit.fingerprint == fingerprint)
+        .first()
+    )
+    if exists is not None:
+        return
+    session.add(
+        PositionAttributionAudit(
+            execution_binding_id=int(leg.execution_binding_id),
+            execution_order_leg_id=int(leg.id),
+            venue=str(leg.venue or "deepcoin"),
+            pos_id=str(leg.pos_id or "") or None,
+            event_type="protection_adoption_refused",
+            prior_state=str(leg.attribution_status or "unassigned"),
+            new_state="protection_adoption_refused",
+            fingerprint=fingerprint,
+            evidence_json=json.dumps(
+                evidence,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            notification_status="pending",
+            created_at=created_at,
+        )
+    )
+
+
+def _bounded_protection_refusal_evidence(refusal: Any) -> dict[str, Any]:
+    raw = refusal.evidence if isinstance(getattr(refusal, "evidence", None), dict) else {}
+    evidence: dict[str, Any] = {"reason": str(refusal.reason or "unknown")[:128]}
+    candidate_order_ids = raw.get("candidate_order_ids")
+    if isinstance(candidate_order_ids, list):
+        evidence["candidate_order_ids"] = sorted(
+            {str(item)[:255] for item in candidate_order_ids if str(item or "").strip()}
+        )[:20]
+    for key, limit in (
+        ("trigger_entry_order_id", 255),
+        ("size_text", 64),
+    ):
+        if raw.get(key) not in (None, ""):
+            evidence[key] = str(raw[key])[:limit]
+    if raw.get("candidate_event_count") is not None:
+        try:
+            evidence["candidate_event_count"] = max(
+                0, min(int(raw["candidate_event_count"]), 1000)
+            )
+        except (TypeError, ValueError):
+            pass
+    return evidence
+
+
+def _trigger_protection_exposure_count(
+    session, *, legs: list[ExecutionOrderLeg]
+) -> int:
+    return sum(
+        1
+        for leg in legs
+        if str(leg.venue or "deepcoin").lower() == "deepcoin"
+        and str(leg.purpose or "") == "entry"
+        and str(leg.order_kind or "") == "trigger_limit"
+        and str(leg.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
+        and _request_has_combined_trigger_protection(leg.request_json)
+    )
+
+
+def _request_has_combined_trigger_protection(request_json: str | None) -> bool:
+    request = _safe_json_object(request_json)
+    return bool(
+        _to_float(request.get("tpTriggerPx"))
+        and _to_float(request.get("slTriggerPx"))
+    )
+
+
+def _same_present_text(left: Any, right: Any) -> bool:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    return bool(left_text and right_text and left_text == right_text)
 
 
 def _manual_terminal_binding_ids(

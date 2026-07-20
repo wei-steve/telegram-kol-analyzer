@@ -30,6 +30,7 @@ from telegram_kol_research.models import (
     ExecutionEvent,
     ExecutionOrderLeg,
     PositionAttributionAudit,
+    PositionProtectionLedger,
     StrategyLifecycle,
 )
 from telegram_kol_research.position_attribution import FillEvidence
@@ -87,6 +88,212 @@ def _add_entry_leg(
             request=request,
         ),
     )
+
+
+def _seed_trigger_protection_adoption(session_factory):
+    request = {
+        "clOrdId": "entry-client-1",
+        "instId": "ETH-USDT-SWAP",
+        "orderType": "limit",
+        "posSide": "short",
+        "price": "1883",
+        "side": "sell",
+        "slOrdPx": -1,
+        "slTriggerPx": "1900",
+        "sz": "4.4",
+        "tdMode": "cross",
+        "tpOrdPx": -1,
+        "tpTriggerPx": "1860",
+        "triggerPrice": "1883",
+    }
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            symbol="ETH",
+            side="short",
+            order_id="entry-1",
+            client_order_id="entry-client-1",
+            status="open",
+        ),
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=1,
+            order_kind="trigger_limit",
+            order_id="entry-1",
+            client_order_id="entry-client-1",
+            status="submitted",
+            attribution_status="unassigned",
+            request=request,
+        ),
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=binding_id,
+                strategy_instance_id=binding.strategy_instance_id,
+                venue="deepcoin",
+                action="create_trigger_entry",
+                status="submitted",
+                symbol="ETH",
+                side="short",
+                order_id="entry-1",
+                client_order_id="entry-client-1",
+                reason="live_signal_auto_trade",
+                request_json=json.dumps(request),
+                response_json=json.dumps({"data": {"ordId": "entry-1"}}),
+                created_at=datetime(2026, 7, 20, 8, 0),
+            )
+        )
+        session.commit()
+    return binding_id
+
+
+class _ProtectionAdoptionReconciliationClient:
+    def __init__(self, pending_rows=None, *, pending_error=None):
+        self.pending_rows = list(pending_rows or [])
+        self.pending_error = pending_error
+        self.pending_calls = 0
+
+    def list_positions(self):
+        return [
+            {
+                "instId": "ETH-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "short",
+                "pos": "4.4",
+                "avgPx": "1883",
+                "cTime": "1784512860000",
+            }
+        ]
+
+    def list_open_orders(self):
+        return []
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        assert inst_id == "ETH-USDT-SWAP"
+        self.pending_calls += 1
+        if self.pending_error is not None:
+            raise self.pending_error
+        return self.pending_rows
+
+    def list_order_history(self, *, inst_id=None):
+        return [
+            {
+                "instId": "ETH-USDT-SWAP",
+                "ordId": "entry-1",
+                "clOrdId": "entry-client-1",
+                "posId": "pos-1",
+                "state": "filled",
+                "posSide": "short",
+                "fillSz": "4.4",
+                "avgPx": "1883",
+                "fillTime": "1784512860000",
+            }
+        ]
+
+    def list_trade_fills(self, *, inst_id=None):
+        return []
+
+    def list_trigger_order_history(self, *, inst_id=None):
+        return []
+
+
+def _pending_combined_tpsl(order_id):
+    return {
+        "ordId": order_id,
+        "instId": "ETH-USDT-SWAP",
+        "posId": "pos-1",
+        "posSide": "short",
+        "triggerOrderType": "TPSL",
+        "sz": "4.4",
+        "tpTriggerPx": "1860",
+        "slTriggerPx": "1900",
+    }
+
+
+def test_reconcile_protection_adoption_records_unique_exact_trigger_entry_tpsl(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    client = _ProtectionAdoptionReconciliationClient(
+        [_pending_combined_tpsl("tpsl-1")]
+    )
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=client,
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).one()
+        rows = session.query(PositionProtectionLedger).all()
+    assert leg.attribution_status == "verified"
+    assert leg.pos_id == "pos-1"
+    assert [(row.pos_id, row.order_id, row.purpose, row.status) for row in rows] == [
+        ("pos-1", "tpsl-1", "combined", "verified")
+    ]
+    assert result.protection_adopted == 1
+    assert result.protection_adoption_refused == 0
+    assert result.protection_snapshot_unavailable == 0
+    assert client.pending_calls == 1
+
+
+def test_reconcile_protection_adoption_refuses_duplicate_exact_candidates(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    client = _ProtectionAdoptionReconciliationClient(
+        [_pending_combined_tpsl("tpsl-1"), _pending_combined_tpsl("tpsl-2")]
+    )
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=client,
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        rows = session.query(PositionProtectionLedger).all()
+        audit = (
+            session.query(PositionAttributionAudit)
+            .filter(PositionAttributionAudit.event_type == "protection_adoption_refused")
+            .one()
+        )
+    assert rows == []
+    assert result.protection_adopted == 0
+    assert result.protection_adoption_refused == 1
+    assert result.protection_snapshot_unavailable == 0
+    assert json.loads(audit.evidence_json) == {
+        "candidate_order_ids": ["tpsl-1", "tpsl-2"],
+        "reason": "trigger_entry_tpsl_not_unique",
+        "size_text": "4.4",
+        "trigger_entry_order_id": "entry-1",
+    }
+    assert client.pending_calls == 1
+
+
+def test_reconcile_protection_adoption_counts_unavailable_pending_snapshot(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    client = _ProtectionAdoptionReconciliationClient(
+        pending_error=RuntimeError("pending TPSL unavailable")
+    )
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=client,
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        assert session.query(PositionProtectionLedger).count() == 0
+    assert result.protection_adopted == 0
+    assert result.protection_adoption_refused == 0
+    assert result.protection_snapshot_unavailable == 1
+    assert client.pending_calls == 1
 
 
 def test_database_bootstrap_creates_execution_bindings_table(tmp_path):
