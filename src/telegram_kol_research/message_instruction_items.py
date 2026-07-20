@@ -1,0 +1,256 @@
+"""Durable per-candidate work items for multi-instruction messages."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime
+
+from sqlalchemy import case, update
+from sqlalchemy.orm import Session, sessionmaker
+
+from telegram_kol_research.execution_bindings import build_strategy_instance_id
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    MessageInstructionItem,
+    RawMessage,
+    SignalCandidate,
+    StrategyLifecycle,
+)
+
+
+MANAGEMENT_EVENT_TYPES = frozenset({"close_signal", "position_update"})
+FINISH_STATUSES = frozenset({"submitted", "succeeded", "failed", "unknown"})
+ERROR_STATUSES = frozenset({"failed", "unknown"})
+
+
+def create_message_instruction_items_in_session(
+    session: Session,
+    *,
+    raw_message_id: int,
+) -> list[MessageInstructionItem]:
+    """Create one stable item per actionable candidate and return sequence order."""
+
+    raw_message = session.get(RawMessage, int(raw_message_id))
+    if raw_message is None:
+        raise LookupError("raw message not found")
+
+    kind_order = case(
+        (SignalCandidate.event_type.in_(sorted(MANAGEMENT_EVENT_TYPES)), 0),
+        (SignalCandidate.event_type == "entry_signal", 1),
+        else_=2,
+    )
+    candidates = (
+        session.query(SignalCandidate)
+        .filter(SignalCandidate.raw_message_id == int(raw_message_id))
+        .filter(
+            SignalCandidate.event_type.in_(
+                [*sorted(MANAGEMENT_EVENT_TYPES), "entry_signal"]
+            )
+        )
+        .order_by(kind_order, SignalCandidate.id)
+        .all()
+    )
+    existing_by_candidate_id = {
+        item.signal_candidate_id: item
+        for item in session.query(MessageInstructionItem)
+        .filter(MessageInstructionItem.raw_message_id == int(raw_message_id))
+        .all()
+    }
+
+    items: list[MessageInstructionItem] = []
+    for sequence, candidate in enumerate(candidates):
+        instruction_kind = _instruction_kind(candidate)
+        strategy_instance_id = _candidate_strategy_instance_id(
+            session,
+            raw_message=raw_message,
+            candidate=candidate,
+            instruction_kind=instruction_kind,
+        )
+        item = existing_by_candidate_id.get(candidate.id)
+        if item is None:
+            item = MessageInstructionItem(
+                raw_message_id=raw_message.id,
+                signal_candidate_id=candidate.id,
+                sequence=sequence,
+                instruction_kind=instruction_kind,
+                strategy_instance_id=strategy_instance_id,
+                idempotency_key=_idempotency_key(
+                    raw_message_id=raw_message.id,
+                    signal_candidate_id=candidate.id,
+                    instruction_kind=instruction_kind,
+                    target_lifecycle_id=candidate.target_lifecycle_id,
+                    strategy_instance_id=strategy_instance_id,
+                ),
+                status="pending",
+            )
+            session.add(item)
+        else:
+            item.sequence = sequence
+        items.append(item)
+
+    session.flush()
+    return items
+
+
+def claim_next_message_instruction_item(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    now: datetime,
+) -> MessageInstructionItem | None:
+    """Atomically claim the first pending item without bypassing active work."""
+
+    with session_factory() as session:
+        while True:
+            executing_exists = (
+                session.query(MessageInstructionItem.id)
+                .filter(
+                    MessageInstructionItem.raw_message_id == int(raw_message_id),
+                    MessageInstructionItem.status == "executing",
+                )
+                .first()
+                is not None
+            )
+            if executing_exists:
+                return None
+
+            item_id = (
+                session.query(MessageInstructionItem.id)
+                .filter(
+                    MessageInstructionItem.raw_message_id == int(raw_message_id),
+                    MessageInstructionItem.status == "pending",
+                )
+                .order_by(
+                    MessageInstructionItem.sequence,
+                    MessageInstructionItem.id,
+                )
+                .limit(1)
+                .scalar()
+            )
+            if item_id is None:
+                return None
+
+            result = session.execute(
+                update(MessageInstructionItem)
+                .where(
+                    MessageInstructionItem.id == item_id,
+                    MessageInstructionItem.status == "pending",
+                )
+                .values(status="executing", updated_at=now)
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                continue
+
+            session.commit()
+            item = session.get(MessageInstructionItem, item_id)
+            if item is None:
+                raise RuntimeError("claimed instruction item disappeared")
+            session.expunge(item)
+            return item
+
+
+def finish_message_instruction_item(
+    session_factory: sessionmaker,
+    *,
+    item_id: int,
+    status: str,
+    result: dict,
+    now: datetime,
+) -> None:
+    """Finish a claimed item exactly once and persist its result channel."""
+
+    if status not in FINISH_STATUSES:
+        raise ValueError(f"unsupported finish status: {status}")
+
+    payload_json = json.dumps(
+        result,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    values = {
+        "status": status,
+        "result_json": None if status in ERROR_STATUSES else payload_json,
+        "error_json": payload_json if status in ERROR_STATUSES else None,
+        "updated_at": now,
+    }
+    with session_factory() as session:
+        update_result = session.execute(
+            update(MessageInstructionItem)
+            .where(
+                MessageInstructionItem.id == int(item_id),
+                MessageInstructionItem.status == "executing",
+            )
+            .values(**values)
+        )
+        if update_result.rowcount != 1:
+            session.rollback()
+            raise RuntimeError("instruction item is missing or not executing")
+        session.commit()
+
+
+def _instruction_kind(candidate: SignalCandidate) -> str:
+    if candidate.event_type in MANAGEMENT_EVENT_TYPES:
+        return "management"
+    return "entry"
+
+
+def _candidate_strategy_instance_id(
+    session: Session,
+    *,
+    raw_message: RawMessage,
+    candidate: SignalCandidate,
+    instruction_kind: str,
+) -> str | None:
+    if instruction_kind == "entry":
+        if not candidate.symbol or not candidate.side:
+            return None
+        return build_strategy_instance_id(
+            venue="deepcoin",
+            chat_id=raw_message.chat_id,
+            message_id=raw_message.message_id,
+            symbol=candidate.symbol,
+            side=candidate.side,
+        )
+
+    if candidate.target_lifecycle_id is None:
+        return None
+    lifecycle = session.get(StrategyLifecycle, candidate.target_lifecycle_id)
+    if lifecycle is None:
+        return None
+    binding = (
+        session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        if lifecycle.execution_binding_id is not None
+        else None
+    )
+    if binding is not None and binding.strategy_instance_id:
+        return str(binding.strategy_instance_id)
+    return build_strategy_instance_id(
+        venue="deepcoin",
+        chat_id=lifecycle.chat_id,
+        message_id=lifecycle.message_id,
+        symbol=lifecycle.symbol,
+        side=lifecycle.side,
+    )
+
+
+def _idempotency_key(
+    *,
+    raw_message_id: int,
+    signal_candidate_id: int,
+    instruction_kind: str,
+    target_lifecycle_id: int | None,
+    strategy_instance_id: str | None,
+) -> str:
+    canonical = ":".join(
+        (
+            str(raw_message_id),
+            str(signal_candidate_id),
+            instruction_kind,
+            str(target_lifecycle_id) if target_lifecycle_id is not None else "",
+            strategy_instance_id or "",
+        )
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()

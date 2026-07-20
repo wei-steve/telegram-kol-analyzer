@@ -91,6 +91,53 @@ class SignalCandidate(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class MessageInstructionItem(Base):
+    __tablename__ = "message_instruction_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_message_id",
+            "signal_candidate_id",
+            name="uq_message_instruction_items_message_candidate",
+        ),
+        Index(
+            "uq_message_instruction_items_idempotency",
+            "idempotency_key",
+            unique=True,
+        ),
+        Index(
+            "ix_message_instruction_items_message_status_sequence",
+            "raw_message_id",
+            "status",
+            "sequence",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    signal_candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("signal_candidates.id"), nullable=False, index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    instruction_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    strategy_instance_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending"
+    )
+    result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
 class MessageRecognition(Base):
     __tablename__ = "message_recognitions"
     __table_args__ = (

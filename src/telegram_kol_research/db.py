@@ -221,6 +221,21 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
+    "uq_message_instruction_items_message_candidate": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_message_instruction_items_message_candidate "
+        "ON message_instruction_items (raw_message_id, signal_candidate_id)"
+    ),
+    "uq_message_instruction_items_idempotency": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_message_instruction_items_idempotency "
+        "ON message_instruction_items (idempotency_key)"
+    ),
+    "ix_message_instruction_items_message_status_sequence": (
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_message_instruction_items_message_status_sequence "
+        "ON message_instruction_items (raw_message_id, status, sequence)"
+    ),
     "ix_raw_messages_chat_posted_message": (
         "CREATE INDEX IF NOT EXISTS ix_raw_messages_chat_posted_message "
         "ON raw_messages (chat_id, posted_at, message_id)"
