@@ -472,6 +472,213 @@ def test_full_close_terminalizes_only_after_every_exact_position_disappears(tmp_
     assert all(entry.terminal_reason == "management_full_close_confirmed" for entry in entries)
 
 
+def test_full_close_reconciliation_accepts_only_snapshotted_management_cancelled_deferred_entry(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action="full_close", sizes=("2",), preflight=("2",))
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        deferred = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=2,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="deferred-entry",
+            venue="deepcoin",
+            attribution_status="unassigned",
+            status="cancelled",
+            terminal_reason="management_full_close_cancelled_unfilled_entry_leg",
+            last_verified_at=NOW,
+        )
+        session.add(deferred)
+        session.flush()
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored_batch.target_snapshot_json)
+        snapshot["identity"]["deferred_entry_leg_ids"] = [deferred.id]
+        stored_batch.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+    result = _reconcile_management(sf, positions=[])
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.succeeded == 1
+    assert stored.status == "succeeded"
+
+
+def test_full_close_reconciliation_rejects_snapshotted_deferred_entry_still_pending(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action="full_close", sizes=("2",), preflight=("2",))
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        deferred = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=2,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="deferred-entry",
+            venue="deepcoin",
+            attribution_status="unassigned",
+            status="pending",
+        )
+        session.add(deferred)
+        session.flush()
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored_batch.target_snapshot_json)
+        snapshot["identity"]["deferred_entry_leg_ids"] = [deferred.id]
+        stored_batch.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+    result = _reconcile_management(sf, positions=[])
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.frozen == 1
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "management_reconciliation_identity_mismatch"
+
+
+@pytest.mark.parametrize("malformed", ["string", "float", "duplicate"])
+def test_full_close_reconciliation_rejects_malformed_deferred_entry_allowlist(
+    tmp_path, malformed
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action="full_close", sizes=("2",), preflight=("2",))
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        deferred = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=2,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="deferred-entry",
+            venue="deepcoin",
+            attribution_status="unassigned",
+            status="cancelled",
+            terminal_reason="management_full_close_cancelled_unfilled_entry_leg",
+            last_verified_at=NOW,
+        )
+        session.add(deferred)
+        session.flush()
+        malformed_ids = {
+            "string": [str(deferred.id)],
+            "float": [float(deferred.id)],
+            "duplicate": [deferred.id, deferred.id],
+        }[malformed]
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored_batch.target_snapshot_json)
+        snapshot["identity"]["deferred_entry_leg_ids"] = malformed_ids
+        stored_batch.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+    result = _reconcile_management(sf, positions=[])
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.frozen == 1
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "management_reconciliation_identity_mismatch"
+
+
+@pytest.mark.parametrize("identity_drift", ["missing", "wrong_binding"])
+def test_full_close_reconciliation_requires_every_deferred_entry_allowlist_row(
+    tmp_path, identity_drift
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action="full_close", sizes=("2",), preflight=("2",))
+    with sf() as session:
+        if identity_drift == "missing":
+            deferred_id = 999_999
+        else:
+            other_binding = ExecutionBinding(
+                strategy_instance_id="deepcoin:200:20:BTC:short",
+                kol_id="bob",
+                chat_id=200,
+                message_id=20,
+                symbol="BTC",
+                side="short",
+                venue="deepcoin",
+                status="active",
+            )
+            session.add(other_binding)
+            session.flush()
+            other_entry = ExecutionOrderLeg(
+                execution_binding_id=other_binding.id,
+                strategy_instance_id=other_binding.strategy_instance_id,
+                leg_index=0,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id="other-deferred-entry",
+                venue="deepcoin",
+                attribution_status="unassigned",
+                status="cancelled",
+                terminal_reason="management_full_close_cancelled_unfilled_entry_leg",
+                last_verified_at=NOW,
+            )
+            session.add(other_entry)
+            session.flush()
+            deferred_id = other_entry.id
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored_batch.target_snapshot_json)
+        snapshot["identity"]["deferred_entry_leg_ids"] = [deferred_id]
+        stored_batch.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+    result = _reconcile_management(sf, positions=[])
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.frozen == 1
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "management_reconciliation_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("snapshotted", "terminal_reason"),
+    [
+        (False, "management_full_close_cancelled_unfilled_entry_leg"),
+        (True, "exchange_cancelled"),
+    ],
+)
+def test_full_close_reconciliation_rejects_other_terminal_deferred_entries(
+    tmp_path, snapshotted, terminal_reason
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action="full_close", sizes=("2",), preflight=("2",))
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        deferred = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=2,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="deferred-entry",
+            venue="deepcoin",
+            attribution_status="unassigned",
+            status="cancelled",
+            terminal_reason=terminal_reason,
+            last_verified_at=NOW,
+        )
+        session.add(deferred)
+        session.flush()
+        if snapshotted:
+            stored_batch = session.get(StrategyManagementBatch, batch.id)
+            snapshot = json.loads(stored_batch.target_snapshot_json)
+            snapshot["identity"]["deferred_entry_leg_ids"] = [deferred.id]
+            stored_batch.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+    result = _reconcile_management(sf, positions=[])
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.frozen == 1
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "management_reconciliation_identity_mismatch"
+
+
 def test_manual_close_during_full_close_reconciliation_preserves_audit(tmp_path):
     sf = create_session_factory(tmp_path / "research.db")
     batch = _persist_batch(sf, action="full_close", sizes=("2",), preflight=("2",))

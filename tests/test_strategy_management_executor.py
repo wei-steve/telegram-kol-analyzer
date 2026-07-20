@@ -801,6 +801,427 @@ def test_full_close_does_not_submit_when_deferred_entry_order_match_is_ambiguous
     assert client.calls == []
 
 
+def _configure_deferred_full_exit(
+    session_factory,
+    batch,
+    *,
+    include_extra_deferred=False,
+):
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        binding.pos_id = "pos-1"
+        second_batch_leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch.id, pos_id="pos-2"
+        ).one()
+        session.delete(second_batch_leg)
+        deferred = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=batch.execution_binding_id, pos_id="pos-2"
+        ).one()
+        deferred.order_kind = "trigger_limit"
+        deferred.order_id = "deferred-order-1"
+        deferred.client_order_id = "deferred-client-1"
+        deferred.pos_id = None
+        deferred.status = "pending"
+        deferred.attribution_status = "unassigned"
+        deferred_ids = [deferred.id]
+        if include_extra_deferred:
+            extra = ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=2,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id="deferred-order-2",
+                client_order_id="deferred-client-2",
+                venue="deepcoin",
+                attribution_status="unassigned",
+                status="pending",
+            )
+            session.add(extra)
+            session.flush()
+            deferred_ids.append(extra.id)
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored_batch.target_snapshot_json)
+        snapshot["identity"]["deferred_entry_leg_ids"] = list(deferred_ids)
+        stored_batch.target_snapshot_json = json.dumps(snapshot)
+        binding_before = {
+            "status": binding.status,
+            "order_id": binding.order_id,
+            "client_order_id": binding.client_order_id,
+            "pos_id": binding.pos_id,
+        }
+        session.commit()
+    return deferred_ids, binding_before
+
+
+def test_full_close_rejects_unsnapshotted_eligible_deferred_entry_before_any_cancel(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    deferred_ids, _ = _configure_deferred_full_exit(session_factory, batch)
+    with session_factory() as session:
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored_batch.target_snapshot_json)
+        snapshot["identity"]["deferred_entry_leg_ids"] = []
+        stored_batch.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+    client = _FakeClient(session_factory)
+    client.trigger_pending = [
+        {"ordId": "deferred-order-1", "clOrdId": "deferred-client-1"}
+    ]
+
+    with pytest.raises(ManagementBatchExecutionError, match="batch_entry_set_not_exact"):
+        execute_management_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=client,
+            executed_at=NOW,
+        )
+
+    assert client.cancel_trigger_calls == []
+    assert client.cancel_order_calls == []
+    assert client.calls == []
+    with session_factory() as session:
+        assert session.get(ExecutionOrderLeg, deferred_ids[0]).status == "pending"
+
+
+def test_full_close_missing_later_snapshot_deferred_entry_cancels_nothing(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    deferred_ids, _ = _configure_deferred_full_exit(
+        session_factory, batch, include_extra_deferred=True
+    )
+    client = _FakeClient(session_factory)
+    client.trigger_pending = [
+        {"ordId": "deferred-order-1", "clOrdId": "deferred-client-1"}
+    ]
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert client.cancel_trigger_calls == []
+    assert client.cancel_order_calls == []
+    assert client.calls == []
+    with session_factory() as session:
+        assert {
+            session.get(ExecutionOrderLeg, leg_id).status for leg_id in deferred_ids
+        } == {"pending"}
+
+
+def test_full_close_later_deferred_entry_leg_missing_after_exchange_preflight_cancels_nothing(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    deferred_ids, _ = _configure_deferred_full_exit(
+        session_factory, batch, include_extra_deferred=True
+    )
+
+    class DeleteLaterLegDuringExchangePreflight(_FakeClient):
+        def list_open_orders(self, *, inst_id=None):
+            with self.session_factory() as session:
+                session.delete(session.get(ExecutionOrderLeg, deferred_ids[1]))
+                session.commit()
+            return []
+
+    client = DeleteLaterLegDuringExchangePreflight(session_factory)
+    client.trigger_pending = [
+        {"ordId": "deferred-order-1", "clOrdId": "deferred-client-1"},
+        {"ordId": "deferred-order-2", "clOrdId": "deferred-client-2"},
+    ]
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert client.cancel_trigger_calls == []
+    assert client.cancel_order_calls == []
+    assert client.calls == []
+    with session_factory() as session:
+        assert session.get(ExecutionOrderLeg, deferred_ids[0]).status == "pending"
+
+
+def test_full_close_rejects_one_exchange_row_reused_across_two_deferred_entry_legs(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    deferred_ids, _ = _configure_deferred_full_exit(
+        session_factory, batch, include_extra_deferred=True
+    )
+    with session_factory() as session:
+        second = session.get(ExecutionOrderLeg, deferred_ids[1])
+        second.order_id = "different-order"
+        second.client_order_id = "deferred-client-1"
+        session.commit()
+    client = _FakeClient(session_factory)
+    client.trigger_pending = [
+        {"ordId": "deferred-order-1", "clOrdId": "deferred-client-1"}
+    ]
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert client.cancel_trigger_calls == []
+    assert client.cancel_order_calls == []
+    assert client.calls == []
+
+
+def test_deferred_entry_match_checks_order_id_aliases_independently(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    _configure_deferred_full_exit(session_factory, batch)
+    client = _FakeClient(session_factory, [{"code": "0", "data": {"ordId": "close-1"}}])
+    client.trigger_pending = [
+        {
+            "ordId": "unrelated-preferred-id",
+            "orderId": "deferred-order-1",
+            "clOrdId": "deferred-client-1",
+        }
+    ]
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "reconciling"
+    assert client.cancel_trigger_calls == [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "ordId": "unrelated-preferred-id",
+            "clOrdId": "deferred-client-1",
+        }
+    ]
+
+
+def test_deferred_entry_leg_and_event_write_roll_back_together_on_event_failure(
+    monkeypatch, tmp_path
+):
+    import telegram_kol_research.strategy_management_executor as executor
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    deferred_ids, _ = _configure_deferred_full_exit(session_factory, batch)
+    client = _FakeClient(session_factory)
+    client.trigger_pending = [
+        {"ordId": "deferred-order-1", "clOrdId": "deferred-client-1"}
+    ]
+
+    def fail_event_write(*_args, **_kwargs):
+        raise RuntimeError("simulated execution event write failure")
+
+    monkeypatch.setattr(executor, "record_execution_event", fail_event_write)
+    result = executor.execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert client.cancel_trigger_calls
+    assert client.calls == []
+    with session_factory() as session:
+        deferred = session.get(ExecutionOrderLeg, deferred_ids[0])
+        assert deferred.status == "pending"
+        assert deferred.terminal_reason is None
+
+
+def test_deferred_entry_event_is_exact_and_binding_identity_is_unchanged(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    deferred_ids, binding_before = _configure_deferred_full_exit(session_factory, batch)
+    exchange_row = {
+        "instId": "BTC-USDT-SWAP",
+        "ordId": "deferred-order-1",
+        "clOrdId": "deferred-client-1",
+        "state": "live",
+    }
+    client = _FakeClient(session_factory, [{"code": "0", "data": {"ordId": "close-1"}}])
+    client.trigger_pending = [exchange_row]
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "reconciling"
+    events = list_execution_events(
+        session_factory,
+        execution_binding_id=batch.execution_binding_id,
+        action="strategy_management_cancel_deferred_trigger_entry",
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert event.created_at.replace(tzinfo=UTC) == NOW
+    assert event.before == exchange_row
+    assert event.request == {
+        "instId": "BTC-USDT-SWAP",
+        "ordId": "deferred-order-1",
+        "clOrdId": "deferred-client-1",
+    }
+    assert event.response == {"code": "0", "data": {"ordId": "deferred-order-1"}}
+    assert event.order_id == "deferred-order-1"
+    assert event.client_order_id == "deferred-client-1"
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        assert {
+            "status": binding.status,
+            "order_id": binding.order_id,
+            "client_order_id": binding.client_order_id,
+            "pos_id": binding.pos_id,
+        } == binding_before
+        deferred = session.get(ExecutionOrderLeg, deferred_ids[0])
+        assert deferred.last_verified_at.replace(tzinfo=UTC) == NOW
+
+
+def test_execute_full_close_with_deferred_entry_then_reconcile_reaches_completion(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+    from telegram_kol_research.strategy_management_reconciliation import (
+        reconcile_strategy_management_batches,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    deferred_ids, _ = _configure_deferred_full_exit(session_factory, batch)
+    client = _FakeClient(
+        session_factory, [{"code": "0", "data": {"ordId": "close-pos-1"}}]
+    )
+    client.trigger_pending = [
+        {"ordId": "deferred-order-1", "clOrdId": "deferred-client-1"}
+    ]
+
+    executed = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+    submitted = load_management_batch(session_factory, batch.id)
+    reconciled = reconcile_strategy_management_batches(
+        session_factory,
+        snapshot=SimpleNamespace(
+            positions=[],
+            open_orders=[
+                {
+                    "ordId": submitted.legs[0].exchange_order_id,
+                    "clOrdId": submitted.legs[0].client_order_id,
+                }
+            ],
+            order_history=[],
+            trade_fills=[],
+            errors={},
+        ),
+        reconciled_at=NOW,
+        batch_ids={batch.id},
+    )
+
+    final = load_management_batch(session_factory, batch.id)
+    assert executed["status"] == "reconciling"
+    assert reconciled.succeeded == 1
+    assert final.status == "succeeded"
+    with session_factory() as session:
+        deferred = session.get(ExecutionOrderLeg, deferred_ids[0])
+        assert deferred.status == "cancelled"
+        assert deferred.terminal_reason == (
+            "management_full_close_cancelled_unfilled_entry_leg"
+        )
+
+
+def test_deferred_cancel_failure_transition_conflict_is_explicit(monkeypatch, tmp_path):
+    import telegram_kol_research.strategy_management_executor as executor
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    _configure_deferred_full_exit(session_factory, batch)
+
+    class FailingCancelClient(_FakeClient):
+        def cancel_trigger_order(self, payload):
+            super().cancel_trigger_order(payload)
+            raise RuntimeError("cancel unavailable")
+
+    client = FailingCancelClient(session_factory)
+    client.trigger_pending = [
+        {"ordId": "deferred-order-1", "clOrdId": "deferred-client-1"}
+    ]
+    monkeypatch.setattr(executor, "transition_batch", lambda *_args, **_kwargs: False)
+
+    with pytest.raises(
+        executor.ManagementBatchExecutionError,
+        match="management_batch_deferred_cancel_transition_conflict",
+    ):
+        executor.execute_management_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=client,
+            executed_at=NOW,
+        )
+
+    assert client.calls == []
+
+
 @pytest.mark.parametrize(
     ("status", "attribution_status", "pos_id"),
     [

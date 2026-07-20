@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from telegram_kol_research.models import ExecutionEvent
 
@@ -70,38 +70,47 @@ class ExecutionEventView:
 def record_execution_event(
     session_factory: sessionmaker,
     record: ExecutionEventRecord,
+    *,
+    session: Session | None = None,
 ) -> int:
-    """Persist one immutable execution event and return its id."""
+    """Persist one immutable execution event and return its id.
+
+    When ``session`` is supplied, the caller owns the surrounding transaction.
+    """
 
     now = record.created_at or datetime.now(UTC)
-    with session_factory() as session:
-        row = ExecutionEvent(
-            execution_binding_id=record.execution_binding_id,
-            trade_signal_id=record.trade_signal_id,
-            strategy_instance_id=record.strategy_instance_id,
-            venue=record.venue.lower(),
-            action=record.action,
-            status=record.status,
-            kol_id=record.kol_id,
-            chat_id=record.chat_id,
-            message_id=record.message_id,
-            source_message_id=record.source_message_id,
-            symbol=record.symbol.upper() if record.symbol else None,
-            side=record.side.lower() if record.side else None,
-            order_id=record.order_id,
-            client_order_id=record.client_order_id,
-            pos_id=record.pos_id,
-            related_order_id=record.related_order_id,
-            reason=record.reason,
-            before_json=_json_or_none(record.before),
-            after_json=_json_or_none(record.after),
-            request_json=_json_or_none(record.request),
-            response_json=_json_or_none(record.response),
-            exchange_event_time=record.exchange_event_time,
-            created_at=now,
-        )
+    row = ExecutionEvent(
+        execution_binding_id=record.execution_binding_id,
+        trade_signal_id=record.trade_signal_id,
+        strategy_instance_id=record.strategy_instance_id,
+        venue=record.venue.lower(),
+        action=record.action,
+        status=record.status,
+        kol_id=record.kol_id,
+        chat_id=record.chat_id,
+        message_id=record.message_id,
+        source_message_id=record.source_message_id,
+        symbol=record.symbol.upper() if record.symbol else None,
+        side=record.side.lower() if record.side else None,
+        order_id=record.order_id,
+        client_order_id=record.client_order_id,
+        pos_id=record.pos_id,
+        related_order_id=record.related_order_id,
+        reason=record.reason,
+        before_json=_json_or_none(record.before),
+        after_json=_json_or_none(record.after),
+        request_json=_json_or_none(record.request),
+        response_json=_json_or_none(record.response),
+        exchange_event_time=record.exchange_event_time,
+        created_at=now,
+    )
+    if session is not None:
         session.add(row)
-        session.commit()
+        session.flush()
+        return int(row.id)
+    with session_factory() as owned_session:
+        owned_session.add(row)
+        owned_session.commit()
         return int(row.id)
 
 

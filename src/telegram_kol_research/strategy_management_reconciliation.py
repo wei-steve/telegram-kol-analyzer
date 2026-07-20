@@ -341,6 +341,8 @@ def _identity_is_exact(session, batch, legs) -> bool:
         (int(leg.execution_order_leg_id), str(leg.pos_id)) for leg in legs
     }
     deferred_leg_ids = _snapshot_deferred_entry_leg_ids(batch)
+    if deferred_leg_ids is None:
+        return False
     seen: set[str] = set()
     for leg in legs:
         if not leg.pos_id or str(leg.pos_id) in seen:
@@ -366,35 +368,43 @@ def _identity_is_exact(session, batch, legs) -> bool:
         .filter(ExecutionOrderLeg.purpose == "entry")
         .all()
     )
+    accepted_deferred_ids: set[int] = set()
     for row in all_entry_rows:
         if row.strategy_instance_id != batch.strategy_instance_id:
             return False
         row_identity = (int(row.id), str(row.pos_id)) if row.pos_id else None
         if row_identity in managed_identity:
             continue
-        if int(row.id) in deferred_leg_ids and _is_deferred_pending_entry_leg(row):
-            continue
+        if int(row.id) in deferred_leg_ids:
+            if batch.effective_action in {"full_close", "full_exit"}:
+                if _is_management_cancelled_deferred_entry_leg(row):
+                    accepted_deferred_ids.add(int(row.id))
+                    continue
+            elif _is_deferred_pending_entry_leg(row):
+                accepted_deferred_ids.add(int(row.id))
+                continue
         return False
-    return True
+    return accepted_deferred_ids == deferred_leg_ids
 
 
-def _snapshot_deferred_entry_leg_ids(batch) -> set[int]:
+def _snapshot_deferred_entry_leg_ids(batch) -> set[int] | None:
     try:
         snapshot = json.loads(batch.target_snapshot_json or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
-        return set()
+        return None
     if not isinstance(snapshot, dict):
-        return set()
+        return None
     identity = snapshot.get("identity")
     if not isinstance(identity, dict):
-        return set()
-    result: set[int] = set()
-    for value in identity.get("deferred_entry_leg_ids") or []:
-        try:
-            result.add(int(value))
-        except (TypeError, ValueError):
-            continue
-    return result
+        return None
+    values = identity.get("deferred_entry_leg_ids", [])
+    if (
+        not isinstance(values, list)
+        or any(type(value) is not int or value <= 0 for value in values)
+        or len(set(values)) != len(values)
+    ):
+        return None
+    return set(values)
 
 
 def _is_deferred_pending_entry_leg(entry: ExecutionOrderLeg) -> bool:
@@ -406,6 +416,15 @@ def _is_deferred_pending_entry_leg(entry: ExecutionOrderLeg) -> bool:
         and entry.terminal_reason is None
         and not entry.pos_id
         and state not in {"attribution_conflict", "evidence_unavailable"}
+    )
+
+
+def _is_management_cancelled_deferred_entry_leg(entry: ExecutionOrderLeg) -> bool:
+    return bool(
+        str(entry.status or "").lower() == "cancelled"
+        and entry.terminal_reason
+        == "management_full_close_cancelled_unfilled_entry_leg"
+        and not entry.pos_id
     )
 
 
