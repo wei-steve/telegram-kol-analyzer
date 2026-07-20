@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_draft
@@ -25,6 +26,11 @@ from telegram_kol_research.models import (
     SignalCandidate,
     Source,
     StrategyLifecycle,
+)
+from telegram_kol_research.message_instruction_items import (
+    claim_next_message_instruction_item,
+    finish_message_instruction_item,
+    list_message_instruction_item_results,
 )
 from telegram_kol_research.price_normalization import extract_normalized_prices
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
@@ -58,13 +64,138 @@ def auto_process_message_trade_signal(
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     processed_at: datetime | None = None,
 ) -> dict[str, Any]:
-    """Turn one fresh entry SignalCandidate into a queued and submitted live order."""
+    """Execute projected items, or use the legacy single-candidate path."""
+
+    if list_message_instruction_item_results(
+        session_factory,
+        raw_message_id=raw_message_id,
+    ):
+        return execute_message_instruction_items(
+            session_factory,
+            raw_message_id=raw_message_id,
+            group_config=group_config,
+            deepcoin_client=deepcoin_client,
+            contract_spec_provider=contract_spec_provider,
+            processed_at=processed_at,
+        )
+    return _auto_process_single_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=group_config,
+        deepcoin_client=deepcoin_client,
+        contract_spec_provider=contract_spec_provider,
+        processed_at=processed_at,
+    )
+
+
+def execute_message_instruction_items(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    group_config: GroupConfig,
+    deepcoin_client: DeepcoinTradingClientProtocol | None,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    processed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Claim and execute each durable instruction independently in sequence."""
+
+    now = processed_at or datetime.now(UTC)
+    while True:
+        item = claim_next_message_instruction_item(
+            session_factory,
+            raw_message_id=raw_message_id,
+            now=now,
+        )
+        if item is None:
+            break
+        try:
+            result = _auto_process_single_message_trade_signal(
+                session_factory,
+                raw_message_id=raw_message_id,
+                group_config=group_config,
+                deepcoin_client=deepcoin_client,
+                contract_spec_provider=contract_spec_provider,
+                processed_at=now,
+                instruction_kind=item.instruction_kind,
+                candidate_id=item.signal_candidate_id,
+            )
+        except DeepcoinRequestOutcomeUnknown as exc:
+            finish_status = "unknown"
+            result = {"type": type(exc).__name__, "message": str(exc)}
+        except Exception as exc:
+            finish_status = "failed"
+            result = {"type": type(exc).__name__, "message": str(exc)}
+        else:
+            finish_status = _instruction_finish_status(result)
+        finish_message_instruction_item(
+            session_factory,
+            item_id=item.id,
+            status=finish_status,
+            result=result,
+            now=now,
+        )
+
+    items = list_message_instruction_item_results(
+        session_factory,
+        raw_message_id=raw_message_id,
+    )
+    return {"status": _message_instruction_status(items), "items": items}
+
+
+def _instruction_finish_status(result: dict[str, Any]) -> str:
+    status = str(result.get("status") or "").strip().lower()
+    reason = str(result.get("reason") or "").strip().lower()
+    leg_statuses = {
+        str(leg.get("status") or "").strip().lower()
+        for leg in result.get("legs", [])
+        if isinstance(leg, dict)
+    }
+    if (
+        status in {"unknown", "submit_unknown", "recovery_required"}
+        or "unknown" in reason
+        or "submit_unknown" in leg_statuses
+    ):
+        return "unknown"
+    if status in {"failed", "partial_failed", "blocked"}:
+        return "failed"
+    if status == "submitted" or result.get("submitted") is True:
+        return "submitted"
+    return "succeeded"
+
+
+def _message_instruction_status(items: list[dict[str, Any]]) -> str:
+    statuses = {str(item.get("status") or "") for item in items}
+    if statuses & {"pending", "executing"}:
+        return "in_progress"
+    if "unknown" in statuses:
+        return "unknown"
+    if "failed" in statuses:
+        return "partial_failed"
+    return "completed"
+
+
+def _auto_process_single_message_trade_signal(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    group_config: GroupConfig,
+    deepcoin_client: DeepcoinTradingClientProtocol | None,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    processed_at: datetime | None = None,
+    instruction_kind: str | None = None,
+    candidate_id: int | None = None,
+) -> dict[str, Any]:
+    """Execute exactly one selected candidate through the existing venue path."""
 
     now = processed_at or datetime.now(UTC)
     settings = load_trading_settings(session_factory)
-    management_loaded = _load_best_management_candidate(
-        session_factory, raw_message_id=raw_message_id
-    )
+    management_loaded = None
+    if instruction_kind != "entry":
+        management_loaded = _load_best_management_candidate(
+            session_factory,
+            raw_message_id=raw_message_id,
+            candidate_id=candidate_id if instruction_kind == "management" else None,
+        )
     if management_loaded is not None:
         if _is_informational_management_candidate(management_loaded[1]):
             raw_message, candidate, _source, _has_media = management_loaded
@@ -125,7 +256,13 @@ def auto_process_message_trade_signal(
             settings=settings,
             processed_at=now,
         )
-    loaded = _load_best_entry_candidate(session_factory, raw_message_id=raw_message_id)
+    if instruction_kind == "management":
+        return {"status": "blocked", "reason": "management_candidate_unavailable"}
+    loaded = _load_best_entry_candidate(
+        session_factory,
+        raw_message_id=raw_message_id,
+        candidate_id=candidate_id if instruction_kind == "entry" else None,
+    )
     if loaded is None:
         return {"status": "skipped", "reason": "no_entry_signal_candidate"}
     raw_message, candidate, source, has_media = loaded
@@ -445,6 +582,15 @@ def disabled_management_message_needs_no_client(
 ) -> bool:
     """Return true only for a management candidate gated off before planning."""
 
+    item_results = list_message_instruction_item_results(
+        session_factory,
+        raw_message_id=raw_message_id,
+    )
+    if any(
+        item["instruction_kind"] == "entry" and item["status"] == "pending"
+        for item in item_results
+    ):
+        return False
     settings = load_trading_settings(session_factory)
     loaded = _load_best_management_candidate(
         session_factory, raw_message_id=raw_message_id
@@ -652,6 +798,7 @@ def _load_best_entry_candidate(
     session_factory: sessionmaker,
     *,
     raw_message_id: int,
+    candidate_id: int | None = None,
 ) -> tuple[RawMessage, SignalCandidate, Source | None, bool] | None:
     with session_factory() as session:
         query = (
@@ -661,6 +808,8 @@ def _load_best_entry_candidate(
             .filter(RawMessage.id == raw_message_id)
             .filter(SignalCandidate.event_type == "entry_signal")
         )
+        if candidate_id is not None:
+            query = query.filter(SignalCandidate.id == int(candidate_id))
         if session.query(RecognitionDecision.id).filter(
             RecognitionDecision.raw_message_id == raw_message_id
         ).first() is not None:
@@ -688,6 +837,7 @@ def _load_best_management_candidate(
     session_factory: sessionmaker,
     *,
     raw_message_id: int,
+    candidate_id: int | None = None,
 ) -> tuple[RawMessage, SignalCandidate, Source | None, bool] | None:
     with session_factory() as session:
         query = (
@@ -697,6 +847,8 @@ def _load_best_management_candidate(
             .filter(RawMessage.id == raw_message_id)
             .filter(SignalCandidate.event_type.in_(["close_signal", "position_update"]))
         )
+        if candidate_id is not None:
+            query = query.filter(SignalCandidate.id == int(candidate_id))
         if session.query(RecognitionDecision.id).filter(
             RecognitionDecision.raw_message_id == raw_message_id
         ).first() is not None:

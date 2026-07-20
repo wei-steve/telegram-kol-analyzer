@@ -206,6 +206,53 @@ def finish_message_instruction_item(
         session.commit()
 
 
+def list_message_instruction_item_results(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+) -> list[dict]:
+    """Return stable, sequence-ordered public results for one message."""
+
+    with session_factory() as session:
+        items = (
+            session.query(MessageInstructionItem)
+            .filter(MessageInstructionItem.raw_message_id == int(raw_message_id))
+            .order_by(MessageInstructionItem.sequence, MessageInstructionItem.id)
+            .all()
+        )
+        return [_public_item_result(item) for item in items]
+
+
+def _public_item_result(item: MessageInstructionItem) -> dict:
+    summary = {
+        "item_id": item.id,
+        "instruction_kind": item.instruction_kind,
+        "status": item.status,
+    }
+    payload_text = (
+        item.error_json if item.status in ERROR_STATUSES else item.result_json
+    )
+    payload = json.loads(payload_text) if payload_text else None
+    if item.status in ERROR_STATUSES:
+        summary["reason"] = _payload_reason(payload, fallback=item.status)
+    elif payload is not None:
+        summary["result"] = payload
+    else:
+        summary["reason"] = item.status
+    return summary
+
+
+def _payload_reason(payload, *, fallback: str) -> str:
+    if isinstance(payload, dict):
+        for key in ("reason", "message", "error"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                return str(value)
+    if payload not in (None, ""):
+        return str(payload)
+    return fallback
+
+
 def _instruction_kind(candidate: SignalCandidate) -> str:
     if candidate.event_type in MANAGEMENT_EVENT_TYPES:
         return "management"

@@ -9,11 +9,14 @@ from telegram_kol_research.auto_trade_execution import _load_active_execution_bi
 from telegram_kol_research.auto_trade_execution import _extract_partial_close_fraction
 from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
 from telegram_kol_research.auto_trade_execution import disabled_management_message_needs_no_client
+from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
+from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord, ExecutionOrderLegRecord, upsert_execution_binding, upsert_execution_order_leg
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
+from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
 from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal
 from telegram_kol_research.trading_settings import save_trading_settings
 
@@ -152,6 +155,220 @@ class _CombinedProtectionDeepcoinClient(_FakeDeepcoinClient):
             }
         )
         return {"code": "0", "data": {"ordId": "combined-sltp-1"}}
+
+
+def _persist_same_message_instruction_items(
+    session_factory, *, management_action="full_exit"
+):
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=903,
+            text="close the old BTC strategy and open a new ETH strategy",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        management = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="BTC",
+            side="short",
+            event_type="close_signal",
+            management_action=management_action,
+            parse_source="mimo_authoritative",
+            confidence=0.99,
+        )
+        entry = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="ETH",
+            side="long",
+            event_type="entry_signal",
+            entry_text="1580-1590",
+            stop_loss_text="1550",
+            take_profit_text="1650",
+            parse_source="mimo_authoritative",
+            confidence=0.99,
+        )
+        session.add_all([management, entry])
+        session.flush()
+        create_message_instruction_items_in_session(session, raw_message_id=raw.id)
+        identifiers = raw.id, management.id, entry.id
+        session.commit()
+        return identifiers
+
+
+@pytest.mark.parametrize(
+    ("management_action", "management_execution_mode"),
+    [("full_exit", "disabled"), ("hold_update", "live")],
+)
+def test_same_message_entry_still_requires_client_when_management_needs_no_client(
+    tmp_path, management_action, management_execution_mode
+):
+    session_factory = create_session_factory(tmp_path / "dual-client-gate.db")
+    raw_message_id, _, _ = _persist_same_message_instruction_items(
+        session_factory,
+        management_action=management_action,
+    )
+    save_trading_settings(
+        session_factory,
+        {"management_execution_mode": management_execution_mode},
+    )
+
+    assert disabled_management_message_needs_no_client(
+        session_factory,
+        raw_message_id=raw_message_id,
+    ) is False
+
+
+def test_management_failure_does_not_block_same_message_entry(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "independent-failure.db")
+    raw_message_id, management_id, entry_id = _persist_same_message_instruction_items(
+        session_factory
+    )
+    calls = []
+
+    def execute_one(*args, instruction_kind, candidate_id, **kwargs):
+        calls.append((instruction_kind, candidate_id))
+        if instruction_kind == "management":
+            raise DeepcoinDefiniteRejection("close rejected")
+        return {"status": "submitted", "order_id": "entry-1"}
+
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    monkeypatch.setattr(
+        auto_module,
+        "_auto_process_single_message_trade_signal",
+        execute_one,
+        raising=False,
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+    )
+
+    assert calls == [("management", management_id), ("entry", entry_id)]
+    assert [item["instruction_kind"] for item in result["items"]] == [
+        "management",
+        "entry",
+    ]
+    assert result["items"][0]["status"] == "failed"
+    assert result["items"][0]["reason"] == "close rejected"
+    assert result["items"][1]["status"] == "submitted"
+    assert result["items"][1]["result"]["order_id"] == "entry-1"
+
+
+def test_same_message_management_submission_precedes_entry_submission(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "ordered-submission.db")
+    raw_message_id, _, _ = _persist_same_message_instruction_items(session_factory)
+    call_log = []
+
+    def execute_one(*args, instruction_kind, **kwargs):
+        call_log.append(instruction_kind)
+        return {"status": "submitted", "kind": instruction_kind}
+
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    monkeypatch.setattr(
+        auto_module,
+        "_auto_process_single_message_trade_signal",
+        execute_one,
+        raising=False,
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+    )
+
+    assert call_log == ["management", "entry"]
+    assert [item["status"] for item in result["items"]] == [
+        "submitted",
+        "submitted",
+    ]
+
+
+def test_unknown_management_submission_does_not_retry_or_block_same_message_entry(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "unknown-submission.db")
+    raw_message_id, _, _ = _persist_same_message_instruction_items(session_factory)
+    call_counts = {"management": 0, "entry": 0}
+
+    def execute_one(*args, instruction_kind, **kwargs):
+        call_counts[instruction_kind] += 1
+        if instruction_kind == "management":
+            raise DeepcoinRequestOutcomeUnknown("close submission timed out")
+        return {"status": "submitted", "order_id": "entry-1"}
+
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    monkeypatch.setattr(
+        auto_module,
+        "_auto_process_single_message_trade_signal",
+        execute_one,
+        raising=False,
+    )
+
+    first = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+    )
+    second = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+    )
+
+    assert call_counts == {"management": 1, "entry": 1}
+    assert [item["status"] for item in first["items"]] == ["unknown", "submitted"]
+    assert second == first
+
+
+def test_management_recovery_required_is_unknown_and_does_not_block_same_message_entry(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "recovery-required.db")
+    raw_message_id, _, _ = _persist_same_message_instruction_items(session_factory)
+    call_log = []
+
+    def execute_one(*args, instruction_kind, **kwargs):
+        call_log.append(instruction_kind)
+        if instruction_kind == "management":
+            return {
+                "status": "recovery_required",
+                "reason": "protection_recovery_required",
+                "legs": [{"status": "recovery_required"}],
+            }
+        return {"status": "submitted", "order_id": "entry-1"}
+
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    monkeypatch.setattr(
+        auto_module,
+        "_auto_process_single_message_trade_signal",
+        execute_one,
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+    )
+
+    assert call_log == ["management", "entry"]
+    assert [item["status"] for item in result["items"]] == ["unknown", "submitted"]
+    assert result["items"][0]["reason"] == "protection_recovery_required"
 
 
 def test_hold_update_is_informational_and_needs_no_deepcoin_client(tmp_path):
