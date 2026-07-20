@@ -1,8 +1,10 @@
 import asyncio
 import json
 from datetime import UTC, datetime
+import httpx
 import pytest
 
+import telegram_kol_research.telegram_bot_commands as bot_commands_module
 import telegram_kol_research.system_operator_bot as operator_bot_module
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
@@ -1130,7 +1132,7 @@ def test_process_expiry_expire_cancel_executes_deepcoin_cancel_when_client_is_av
     assert lifecycle.management_action == "expiry_cancelled_and_expired"
 
 
-def test_process_expiry_expire_cancel_without_live_binding_keeps_pending_for_manual_review(tmp_path):
+def test_process_expiry_expire_cancel_without_live_binding_marks_expired(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         lifecycle = StrategyLifecycle(
@@ -1157,10 +1159,59 @@ def test_process_expiry_expire_cancel_without_live_binding_keeps_pending_for_man
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
 
     assert "未找到本地 live 挂单" in response
-    assert "未标记过期" in response
-    assert lifecycle.lifecycle_status == "pending_entry"
-    assert lifecycle.exit_reason is None
-    assert lifecycle.management_action == "expiry_cancel_failed_no_live_order"
+    assert "已标记过期" in response
+    assert lifecycle.lifecycle_status == "expired"
+    assert lifecycle.exit_reason == "expired"
+    assert lifecycle.exited_at == datetime(2026, 7, 3, 0, 0)
+    assert lifecycle.management_action == "expiry_expired_no_live_order"
+
+
+def test_callback_response_edits_message_when_callback_answer_fails():
+    class FakeResponse:
+        def __init__(self, *, status_code=200):
+            self.status_code = status_code
+            self.request = httpx.Request("POST", "https://example.test")
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    "bad request",
+                    request=self.request,
+                    response=httpx.Response(self.status_code, request=self.request),
+                )
+
+    class FakeClient:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, url, json):
+            self.posts.append((url, json))
+            if url.endswith("/answerCallbackQuery"):
+                return FakeResponse(status_code=400)
+            return FakeResponse()
+
+    client = FakeClient()
+
+    asyncio.run(
+        bot_commands_module._finish_system_operator_callback_response(
+            client,
+            "https://api.telegram.org/bot-token",
+            callback_query_id="callback-1",
+            chat_id="123",
+            message_id=456,
+            callback_data="expiry_expire_cancel:789",
+            response_text="策略 #789 未找到本地 live 挂单，已标记过期并停止跟踪。",
+            operator_name="operator",
+            original_message_text="【待入场策略超时复核】\n内部ID: 789",
+        )
+    )
+
+    assert [url.rsplit("/", 1)[-1] for url, _ in client.posts] == [
+        "answerCallbackQuery",
+        "editMessageText",
+    ]
+    assert "已处理：过期并撤单" in client.posts[1][1]["text"]
+    assert "已标记过期并停止跟踪" in client.posts[1][1]["text"]
 
 
 def test_process_expiry_expire_keep_marks_expired_without_cancelling_binding(tmp_path):

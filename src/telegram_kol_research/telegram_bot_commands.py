@@ -143,24 +143,24 @@ async def run_system_operator_bot_command_loop(
                             callback_data,
                             deepcoin_client=deepcoin_client,
                         )
-                        await _answer_callback_query(
-                            client,
-                            base_url,
-                            callback_query_id=str(callback.get("id") or ""),
-                            text=response_text or "未识别的操作",
-                        )
                         if response_text:
-                            await _edit_message_text(
+                            await _finish_system_operator_callback_response(
                                 client,
                                 base_url,
+                                callback_query_id=str(callback.get("id") or ""),
                                 chat_id=chat_id,
                                 message_id=int(message.get("message_id") or 0),
-                                text=_format_callback_resolution_text(
-                                    callback_data=callback_data,
-                                    response_text=response_text,
-                                    operator_name=_callback_operator_name(callback),
-                                    original_message_text=str(message.get("text") or ""),
-                                ),
+                                callback_data=callback_data,
+                                response_text=response_text,
+                                operator_name=_callback_operator_name(callback),
+                                original_message_text=str(message.get("text") or ""),
+                            )
+                        else:
+                            await _answer_callback_query(
+                                client,
+                                base_url,
+                                callback_query_id=str(callback.get("id") or ""),
+                                text="未识别的操作",
                             )
                         continue
 
@@ -404,12 +404,14 @@ def _process_expiry_action(
             session.commit()
             return f"策略 #{lifecycle_id} 已请求撤销交易所挂单，撤单完成前不会标记过期。"
 
-        lifecycle.management_action = "expiry_cancel_failed_no_live_order"
-        lifecycle.management_note = "人工确认过期并撤单，但未找到本地 live 绑定；未标记过期，请人工确认交易所挂单。"
-        lifecycle.last_checked_at = event_at
+        lifecycle.lifecycle_status = "expired"
+        lifecycle.exit_reason = "expired"
+        lifecycle.exited_at = event_at
+        lifecycle.management_action = "expiry_expired_no_live_order"
+        lifecycle.management_note = "人工确认过期并撤单；未找到本地 live 挂单，策略已停止跟踪。"
         lifecycle.updated_at = event_at
         session.commit()
-        return f"策略 #{lifecycle_id} 未找到本地 live 挂单，未标记过期；请人工确认 Deepcoin 当前委托。"
+        return f"策略 #{lifecycle_id} 未找到本地 live 挂单，已标记过期并停止跟踪。"
 
 
 def _parse_operator_lifecycle_identifier(
@@ -716,6 +718,43 @@ async def _answer_callback_query(
         },
     )
     response.raise_for_status()
+
+
+async def _finish_system_operator_callback_response(
+    client: httpx.AsyncClient,
+    base_url: str,
+    *,
+    callback_query_id: str,
+    chat_id: str,
+    message_id: int,
+    callback_data: str,
+    response_text: str,
+    operator_name: str,
+    original_message_text: str = "",
+) -> None:
+    try:
+        await _answer_callback_query(
+            client,
+            base_url,
+            callback_query_id=callback_query_id,
+            text=response_text,
+        )
+    except httpx.HTTPStatusError:
+        logger.warning(
+            "System operator bot callback answer failed; editing message anyway"
+        )
+    await _edit_message_text(
+        client,
+        base_url,
+        chat_id=chat_id,
+        message_id=message_id,
+        text=_format_callback_resolution_text(
+            callback_data=callback_data,
+            response_text=response_text,
+            operator_name=operator_name,
+            original_message_text=original_message_text,
+        ),
+    )
 
 
 async def _edit_message_text(
