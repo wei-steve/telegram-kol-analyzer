@@ -260,6 +260,29 @@ def format_strategy_management_notification(payload: dict[str, Any]) -> str:
     ]
     if state == "recovery_required":
         lines.append("安全限制: 禁止自动重试")
+    deferred_entry_legs = (
+        payload.get("deferred_entry_legs")
+        if isinstance(payload.get("deferred_entry_legs"), list) else []
+    )
+    if payload.get("reason") == "deferred_entry_cancel_preflight_failed":
+        lines.extend([
+            "未成交进场腿撤单未完成：为防止旧策略残留订单成交，系统未提交平仓单。",
+            "请核对交易所挂单与以下腿的订单ID；确认撤销后再执行恢复处理。",
+            "恢复处理完成前，请勿启用替代策略。",
+            f"批次ID: {payload.get('batch_id') or '-'}",
+            "未成交进场腿:",
+        ])
+        for entry in deferred_entry_legs[:20]:
+            if not isinstance(entry, dict):
+                continue
+            lines.append(
+                "- "
+                f"腿: {entry.get('execution_order_leg_id') or '-'} "
+                f"订单: {entry.get('order_id') or '-'} "
+                f"客户订单: {entry.get('client_order_id') or '-'}"
+            )
+        if not deferred_entry_legs:
+            lines.append("- -")
     legs = payload.get("legs") if isinstance(payload.get("legs"), list) else []
     lines.append("仓位/腿结果:")
     for leg in legs[:20]:
@@ -327,7 +350,9 @@ def canonical_management_error_summary(value: Any) -> dict[str, str]:
 
 
 def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[str, Any]:
-    from telegram_kol_research.models import RawMessage, StrategyManagementLeg
+    from telegram_kol_research.models import (
+        ExecutionOrderLeg, RawMessage, StrategyManagementLeg,
+    )
 
     raw = session.get(RawMessage, batch.raw_message_id)
     # The raw row is the source-of-truth isolation boundary. Never infer a chat
@@ -355,6 +380,35 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
                 "error_summary": canonical_management_error_summary(leg.last_error),
             }
         )
+    deferred_entry_legs = []
+    snapshot = _decode_mapping(batch.target_snapshot_json)
+    identity = snapshot.get("identity")
+    deferred_entry_leg_ids = (
+        identity.get("deferred_entry_leg_ids") if isinstance(identity, dict) else []
+    )
+    if (
+        isinstance(deferred_entry_leg_ids, list)
+        and all(type(leg_id) is int and leg_id > 0 for leg_id in deferred_entry_leg_ids)
+    ):
+        for entry in (
+            session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.id.in_(deferred_entry_leg_ids),
+                ExecutionOrderLeg.execution_binding_id == batch.execution_binding_id,
+                ExecutionOrderLeg.strategy_instance_id == batch.strategy_instance_id,
+                ExecutionOrderLeg.purpose == "entry",
+            )
+            .order_by(ExecutionOrderLeg.id.asc())
+        ):
+            deferred_entry_legs.append(
+                {
+                    "execution_order_leg_id": entry.id,
+                    "order_id": _safe_management_text(entry.order_id, limit=120),
+                    "client_order_id": _safe_management_text(
+                        entry.client_order_id, limit=120
+                    ),
+                }
+            )
     return {
         "batch_id": batch.id,
         "state": batch.status,
@@ -372,6 +426,7 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
         "intent": _safe_management_text(batch.intent, limit=64),
         "effective_action": _safe_management_text(batch.effective_action, limit=64),
         "reason": _safe_management_text(batch.reason_code, limit=240),
+        "deferred_entry_legs": deferred_entry_legs,
         "legs": legs,
     }
 

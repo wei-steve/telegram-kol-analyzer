@@ -78,6 +78,54 @@ def test_management_notification_formatter_covers_every_alert_state(state):
     assert state in message
 
 
+def test_deferred_entry_cancel_recovery_notification_names_blocked_order(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionBinding, ExecutionOrderLeg, RawMessage, StrategyManagementBatch,
+    )
+
+    sf = create_session_factory(tmp_path / "deferred-entry-cancel-alert.db")
+    with sf() as session:
+        raw = RawMessage(chat_id=-10001, message_id=101, text="full exit")
+        session.add(raw); session.flush()
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:-10001:101:BTC:long", kol_id="kol",
+            chat_id=-10001, message_id=101, symbol="BTC", side="long", status="open",
+        )
+        session.add(binding); session.flush()
+        entry = ExecutionOrderLeg(
+            execution_binding_id=binding.id, strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0, purpose="entry", order_kind="trigger_limit",
+            order_id="deferred-order-1", client_order_id="deferred-client-1",
+            status="pending", attribution_status="unassigned",
+        )
+        session.add(entry); session.flush()
+        batch = StrategyManagementBatch(
+            idempotency_fingerprint="a" * 64, raw_message_id=raw.id,
+            recognition_decision_id=1, recognition_generation="g1",
+            target_lifecycle_id=1, strategy_instance_id=binding.strategy_instance_id,
+            execution_binding_id=binding.id, intent="full_exit", effective_action="full_exit",
+            partial_round_before=0, status="recovery_required",
+            reason_code="deferred_entry_cancel_preflight_failed", target_fingerprint="b" * 64,
+            target_snapshot_json=json.dumps({
+                "identity": {"deferred_entry_leg_ids": [entry.id]},
+            }),
+            planned_at=NOW,
+        )
+        session.add(batch); session.flush()
+        payload = operator_bot_module._management_payload_for_batch(session, batch)
+
+    text = operator_bot_module.format_strategy_management_notification(payload)
+
+    assert "未成交进场腿撤单未完成" in text
+    assert f"批次ID: {batch.id}" in text
+    assert binding.strategy_instance_id in text
+    assert f"腿: {entry.id}" in text
+    assert f"订单: {entry.order_id}" in text
+    assert f"客户订单: {entry.client_order_id}" in text
+    assert "请勿启用替代策略" in text
+
+
 def test_management_notification_dedup_retry_and_concurrent_claim(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from telegram_kol_research.models import (
