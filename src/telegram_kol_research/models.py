@@ -733,6 +733,63 @@ class PositionProtectionLedger(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class TriggerProtectionIntent(Base):
+    """Durable recovery record for a trigger-protection submission."""
+
+    __tablename__ = "trigger_protection_intents"
+    __table_args__ = (
+        UniqueConstraint(
+            "venue",
+            "execution_order_leg_id",
+            name="uq_trigger_protection_intents_venue_leg",
+        ),
+        Index(
+            "uq_trigger_protection_intents_venue_parent_trigger",
+            "venue",
+            "parent_trigger_order_id",
+            unique=True,
+            sqlite_where=text(
+                "parent_trigger_order_id IS NOT NULL AND parent_trigger_order_id != ''"
+            ),
+        ),
+        Index(
+            "uq_trigger_protection_intents_venue_adopted_order",
+            "venue",
+            "adopted_order_id",
+            unique=True,
+            sqlite_where=text("adopted_order_id IS NOT NULL AND adopted_order_id != ''"),
+        ),
+        Index(
+            "ix_trigger_protection_intents_recovery_next_attempt",
+            "recovery_state",
+            "next_attempt_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    pre_submit_tpsl_baseline_json: Mapped[str] = mapped_column(Text, nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    parent_trigger_order_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    recovery_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending"
+    )
+    retry_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    adopted_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class ExecutionEvent(Base):
     __tablename__ = "execution_events"
     __table_args__ = (

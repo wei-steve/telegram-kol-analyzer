@@ -351,6 +351,23 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
         "CREATE INDEX IF NOT EXISTS ix_trade_signals_strategy_instance "
         "ON trade_signals (strategy_instance_id)"
     ),
+    "uq_trigger_protection_intents_venue_parent_trigger": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_trigger_protection_intents_venue_parent_trigger "
+        "ON trigger_protection_intents (venue, parent_trigger_order_id) "
+        "WHERE parent_trigger_order_id IS NOT NULL AND parent_trigger_order_id != ''"
+    ),
+    "uq_trigger_protection_intents_venue_adopted_order": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_trigger_protection_intents_venue_adopted_order "
+        "ON trigger_protection_intents (venue, adopted_order_id) "
+        "WHERE adopted_order_id IS NOT NULL AND adopted_order_id != ''"
+    ),
+    "ix_trigger_protection_intents_recovery_next_attempt": (
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_trigger_protection_intents_recovery_next_attempt "
+        "ON trigger_protection_intents (recovery_state, next_attempt_at)"
+    ),
 }
 
 
