@@ -136,12 +136,14 @@ def build_entry_protection_ledger_repair_plan(
         if clean_pos_id:
             events_query = events_query.filter(ExecutionEvent.pos_id == clean_pos_id)
         events = events_query.order_by(ExecutionEvent.id.asc()).all()
+        existing_ledger_rows = session.query(PositionProtectionLedger).all()
         existing_order_ids = {
             str(row.order_id)
-            for row in session.query(PositionProtectionLedger.order_id)
-            .filter(PositionProtectionLedger.venue == "deepcoin")
-            .all()
+            for row in existing_ledger_rows
             if str(row.order_id or "")
+        }
+        existing_order_associations = {
+            _protection_association(row) for row in existing_ledger_rows
         }
         for event in events:
             planned, refusal = _plan_event_repair(
@@ -158,6 +160,9 @@ def build_entry_protection_ledger_repair_plan(
                 continue
             actions.extend(planned)
             existing_order_ids.update(action.order_id for action in planned)
+            existing_order_associations.update(
+                _action_protection_association(action) for action in planned
+            )
         if include_trigger_entries:
             trigger_events_query = (
                 session.query(ExecutionEvent)
@@ -181,6 +186,7 @@ def build_entry_protection_ledger_repair_plan(
                     deepcoin_client=deepcoin_client,
                     pending_cache=pending_cache,
                     existing_order_ids=existing_order_ids,
+                    existing_order_associations=existing_order_associations,
                 )
                 if clean_pos_id:
                     planned = [row for row in planned if row.pos_id == clean_pos_id]
@@ -191,6 +197,9 @@ def build_entry_protection_ledger_repair_plan(
                     continue
                 actions.extend(planned)
                 existing_order_ids.update(action.order_id for action in planned)
+                existing_order_associations.update(
+                    _action_protection_association(action) for action in planned
+                )
 
     actions_tuple = tuple(sorted(actions, key=lambda row: (row.binding_id, row.order_id)))
     refusals_tuple = tuple(
@@ -380,6 +389,7 @@ def _plan_trigger_entry_repair(
     deepcoin_client,
     pending_cache: dict[str, list[dict[str, Any]]],
     existing_order_ids: set[str],
+    existing_order_associations: set[tuple[str, str, int, int, str, str]],
 ) -> tuple[list[EntryProtectionLedgerRepairAction], EntryProtectionLedgerRepairRefusal | None]:
     binding_id = int(event.execution_binding_id or 0)
     request = _loads_json(event.request_json)
@@ -394,14 +404,38 @@ def _plan_trigger_entry_repair(
     )
     if leg is None:
         return [], _refusal(event, "verified_trigger_entry_leg_missing")
-    if (
-        session.query(PositionProtectionLedger.id)
+    exact_rows = (
+        session.query(PositionProtectionLedger)
+        .filter(PositionProtectionLedger.venue == "deepcoin")
+        .filter(PositionProtectionLedger.execution_binding_id == binding_id)
         .filter(PositionProtectionLedger.execution_order_leg_id == int(leg.id))
+        .filter(PositionProtectionLedger.pos_id == str(leg.pos_id or ""))
         .filter(PositionProtectionLedger.status == "verified")
-        .first()
-        is not None
-    ):
-        return [], None
+        .all()
+    )
+    if exact_rows:
+        exact_order_ids = sorted({str(row.order_id) for row in exact_rows})
+        if all(
+            {
+                association
+                for association in existing_order_associations
+                if association[0] == order_id
+            }
+            == {
+                _protection_association(row)
+                for row in exact_rows
+                if str(row.order_id) == order_id
+            }
+            for order_id in exact_order_ids
+        ):
+            return [], None
+        return [], EntryProtectionLedgerRepairRefusal(
+            event_id=int(event.id) if event.id is not None else None,
+            binding_id=binding_id,
+            pos_id=str(leg.pos_id or "") or None,
+            reason="trigger_entry_tpsl_identity_conflict",
+            evidence={"candidate_order_ids": exact_order_ids},
+        )
     pending_rows = pending_cache.setdefault(
         instrument_id,
         _safe_pending_tpsl_rows(deepcoin_client, inst_id=instrument_id),
@@ -412,6 +446,7 @@ def _plan_trigger_entry_repair(
         event=event,
         pending_tpsl_rows=pending_rows,
         existing_order_ids=existing_order_ids,
+        existing_order_associations=existing_order_associations,
     )
     return ([result.action] if result.action is not None else []), result.refusal
 
@@ -423,6 +458,7 @@ def plan_verified_trigger_entry_protection_adoption(
     event: ExecutionEvent,
     pending_tpsl_rows: list[dict[str, Any]],
     existing_order_ids: set[str],
+    existing_order_associations: set[tuple[str, str, int, int, str, str]],
 ) -> EntryProtectionLedgerRepairAdoptionResult:
     """Purely match one verified trigger entry to one pending TPSL order.
 
@@ -490,7 +526,34 @@ def plan_verified_trigger_entry_protection_adoption(
         )
     order_id = unique_order_ids[0]
     if order_id in existing_order_ids:
-        return EntryProtectionLedgerRepairAdoptionResult()
+        expected_association = (
+            order_id,
+            "deepcoin",
+            binding_id,
+            int(entry_leg.id),
+            pos_id,
+            "verified",
+        )
+        candidate_associations = {
+            association
+            for association in existing_order_associations
+            if association[0] == order_id
+        }
+        if candidate_associations == {expected_association}:
+            return EntryProtectionLedgerRepairAdoptionResult()
+        return EntryProtectionLedgerRepairAdoptionResult(
+            refusal=EntryProtectionLedgerRepairRefusal(
+                event_id=int(event.id) if event.id is not None else None,
+                binding_id=binding_id,
+                pos_id=pos_id,
+                reason="trigger_entry_tpsl_identity_conflict",
+                evidence={
+                    "candidate_order_ids": [order_id],
+                    "trigger_entry_order_id": event.order_id,
+                    "size_text": _request_size_text(request),
+                },
+            )
+        )
     row = next(row for row in candidates if _row_order_id(row) == order_id)
     return EntryProtectionLedgerRepairAdoptionResult(
         action=EntryProtectionLedgerRepairAction(
@@ -513,6 +576,32 @@ def plan_verified_trigger_entry_protection_adoption(
                 "stop_loss": _expected_price(expected_rows, "stop_loss"),
             },
         )
+    )
+
+
+def _protection_association(
+    row: PositionProtectionLedger,
+) -> tuple[str, str, int, int, str, str]:
+    return (
+        str(row.order_id or ""),
+        str(row.venue or "").lower(),
+        int(row.execution_binding_id),
+        int(row.execution_order_leg_id),
+        str(row.pos_id or ""),
+        str(row.status or "").lower(),
+    )
+
+
+def _action_protection_association(
+    action: EntryProtectionLedgerRepairAction,
+) -> tuple[str, str, int, int, str, str]:
+    return (
+        action.order_id,
+        "deepcoin",
+        action.binding_id,
+        action.leg_id,
+        action.pos_id,
+        "verified",
     )
 
 

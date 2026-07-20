@@ -368,6 +368,7 @@ def test_adoption_plans_one_exact_trigger_entry_protection_without_session_write
             event=entry_event,
             pending_tpsl_rows=pending_rows,
             existing_order_ids=set(),
+            existing_order_associations=set(),
         )
         assert result.action is not None
         assert result.action.pos_id == "pos-1"
@@ -436,6 +437,7 @@ def test_adoption_refuses_generic_trigger_price_when_tp_and_sl_prices_are_equal(
             event=entry_event,
             pending_tpsl_rows=[pending_row],
             existing_order_ids=set(),
+            existing_order_associations=set(),
         )
 
     assert result.action is None
@@ -456,6 +458,9 @@ def test_adoption_is_noop_for_already_verified_ledger_order(tmp_path):
         tmp_path,
         pending_row={},
         existing_order_ids={"tpsl-1"},
+        existing_order_associations={
+            ("tpsl-1", "deepcoin", 152, 289, "pos-1", "verified")
+        },
     )
 
     assert result.action is None
@@ -716,7 +721,13 @@ def _seed_trigger_entry_fill(session_factory, *, binding_id, legs):
         session.commit()
 
 
-def _plan_trigger_entry_adoption(tmp_path, *, pending_row, existing_order_ids=None):
+def _plan_trigger_entry_adoption(
+    tmp_path,
+    *,
+    pending_row,
+    existing_order_ids=None,
+    existing_order_associations=None,
+):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_entry_fill(
         session_factory,
@@ -751,6 +762,7 @@ def _plan_trigger_entry_adoption(tmp_path, *, pending_row, existing_order_ids=No
             event=session.query(ExecutionEvent).one(),
             pending_tpsl_rows=[row],
             existing_order_ids=existing_order_ids or set(),
+            existing_order_associations=existing_order_associations or set(),
         )
 
 

@@ -739,23 +739,49 @@ def _adopt_verified_trigger_entry_protection(
     ]
     if not eligible_legs:
         return
-    protected_leg_ids = {
-        int(leg_id)
-        for (leg_id,) in (
-            session.query(PositionProtectionLedger.execution_order_leg_id)
-            .filter(PositionProtectionLedger.status == "verified")
-            .filter(
-                PositionProtectionLedger.execution_order_leg_id.in_(
-                    [int(leg.id) for leg in eligible_legs]
-                )
-            )
-            .all()
+    eligible_legs_by_id = {int(leg.id): leg for leg in eligible_legs}
+    existing_ledger_rows = session.query(PositionProtectionLedger).all()
+    existing_order_associations = {
+        (
+            str(row.order_id or ""),
+            str(row.venue or "").lower(),
+            int(row.execution_binding_id),
+            int(row.execution_order_leg_id),
+            str(row.pos_id or ""),
+            str(row.status or "").lower(),
         )
+        for row in existing_ledger_rows
+    }
+    protected_leg_ids = {
+        int(row.execution_order_leg_id)
+        for row in existing_ledger_rows
+        if str(row.venue or "").lower() == "deepcoin"
+        and str(row.status or "").lower() == "verified"
+        and int(row.execution_order_leg_id) in eligible_legs_by_id
+        and int(row.execution_binding_id)
+        == int(eligible_legs_by_id[int(row.execution_order_leg_id)].execution_binding_id)
+        and str(row.pos_id or "")
+        == str(eligible_legs_by_id[int(row.execution_order_leg_id)].pos_id or "")
+        and {
+            association
+            for association in existing_order_associations
+            if association[0] == str(row.order_id or "")
+        }
+        == {
+            (
+                str(row.order_id or ""),
+                "deepcoin",
+                int(row.execution_binding_id),
+                int(row.execution_order_leg_id),
+                str(row.pos_id or ""),
+                "verified",
+            )
+        }
     }
     existing_order_ids = {
-        str(order_id)
-        for (order_id,) in session.query(PositionProtectionLedger.order_id).all()
-        if str(order_id or "").strip()
+        str(row.order_id)
+        for row in existing_ledger_rows
+        if str(row.order_id or "").strip()
     }
     events_by_binding: dict[int, list[ExecutionEvent]] = {}
     for event in (
@@ -806,6 +832,7 @@ def _adopt_verified_trigger_entry_protection(
             event=matching_events[0],
             pending_tpsl_rows=snapshot.pending_trigger_orders,
             existing_order_ids=existing_order_ids,
+            existing_order_associations=existing_order_associations,
         )
         if adoption.action is not None:
             row = upsert_entry_protection_ledger_action(
@@ -816,6 +843,16 @@ def _adopt_verified_trigger_entry_protection(
             )
             if row is not None:
                 existing_order_ids.add(adoption.action.order_id)
+                existing_order_associations.add(
+                    (
+                        adoption.action.order_id,
+                        "deepcoin",
+                        adoption.action.binding_id,
+                        adoption.action.leg_id,
+                        adoption.action.pos_id,
+                        "verified",
+                    )
+                )
                 protected_leg_ids.add(int(leg.id))
                 result.protection_adopted += 1
         elif adoption.refusal is not None:

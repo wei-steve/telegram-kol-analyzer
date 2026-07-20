@@ -275,6 +275,97 @@ def test_reconcile_protection_adoption_refuses_duplicate_exact_candidates(tmp_pa
     assert client.pending_calls == 1
 
 
+def test_reconcile_protection_adoption_refuses_order_id_owned_by_other_venue_leg(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    other_binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            message_id=56,
+            symbol="ETH",
+            order_id="other-entry",
+            client_order_id="other-entry-client",
+        ),
+    )
+    other_leg_id = _add_entry_leg(
+        session_factory,
+        other_binding_id,
+        order_id="other-entry",
+        client_order_id="other-entry-client",
+    )
+    with session_factory() as session:
+        other_binding = session.get(ExecutionBinding, other_binding_id)
+        target_leg = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.client_order_id == "entry-client-1")
+            .one()
+        )
+        target_leg_id = int(target_leg.id)
+        session.add_all(
+            [
+                PositionProtectionLedger(
+                    venue="deepcoin",
+                    execution_binding_id=target_leg.execution_binding_id,
+                    execution_order_leg_id=target_leg.id,
+                    strategy_instance_id=target_leg.strategy_instance_id,
+                    pos_id="pos-1",
+                    instrument_id="ETH-USDT-SWAP",
+                    side="short",
+                    order_id="tpsl-1",
+                    purpose="combined",
+                    status="verified",
+                    evidence_source="test",
+                ),
+                PositionProtectionLedger(
+                    venue="other-venue",
+                    execution_binding_id=other_binding_id,
+                    execution_order_leg_id=other_leg_id,
+                    strategy_instance_id=other_binding.strategy_instance_id,
+                    pos_id="other-pos",
+                    instrument_id="ETH-USDT-SWAP",
+                    side="long",
+                    order_id="tpsl-1",
+                    purpose="combined",
+                    status="verified",
+                    evidence_source="test",
+                ),
+            ]
+        )
+        session.commit()
+    client = _ProtectionAdoptionReconciliationClient(
+        [_pending_combined_tpsl("tpsl-1")]
+    )
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=client,
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    assert result.protection_adopted == 0
+    assert result.protection_adoption_refused == 1
+    with session_factory() as session:
+        rows = session.query(PositionProtectionLedger).all()
+        audit = (
+            session.query(PositionAttributionAudit)
+            .filter(PositionAttributionAudit.event_type == "protection_adoption_refused")
+            .one()
+        )
+    assert sorted((row.venue, row.execution_order_leg_id) for row in rows) == [
+        ("deepcoin", target_leg_id),
+        ("other-venue", other_leg_id),
+    ]
+    assert json.loads(audit.evidence_json) == {
+        "candidate_order_ids": ["tpsl-1"],
+        "reason": "trigger_entry_tpsl_identity_conflict",
+        "size_text": "4.4",
+        "trigger_entry_order_id": "entry-1",
+    }
+    assert client.pending_calls == 1
+
+
 def test_reconcile_protection_adoption_counts_unavailable_pending_snapshot(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_protection_adoption(session_factory)
