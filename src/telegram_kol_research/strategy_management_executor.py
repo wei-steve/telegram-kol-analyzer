@@ -78,6 +78,10 @@ class DeferredEntryCancellationError(ManagementBatchExecutionError):
         self.diagnostics = diagnostics
 
 
+class DeferredEntryIdentityDriftError(DeferredEntryCancellationError):
+    """Exact deferred-entry DB identity changed after batch planning."""
+
+
 @dataclass(frozen=True, slots=True)
 class _DeferredExchangeMatch:
     entry: ExecutionOrderLeg
@@ -152,7 +156,15 @@ def execute_management_batch(
                 deepcoin_client=deepcoin_client,
                 cancelled_at=now,
             )
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, DeferredEntryIdentityDriftError):
+                _persist_deferred_cancel_diagnostics(
+                    session_factory,
+                    batch=batch,
+                    binding=binding,
+                    diagnostics=exc.diagnostics,
+                    created_at=now,
+                )
             if not transition_batch(
                 session_factory,
                 batch.id,
@@ -933,7 +945,17 @@ def validate_management_restart_snapshot(
         raise ManagementBatchExecutionError("restart_snapshot_exchange_read_failed")
     batch = load_management_batch(session_factory, int(batch_id))
     binding = _load_exact_binding(session_factory, batch)
-    _require_exact_entry_legs(session_factory, batch)
+    try:
+        _require_exact_entry_legs(session_factory, batch)
+    except DeferredEntryIdentityDriftError as exc:
+        _persist_deferred_cancel_diagnostics(
+            session_factory,
+            batch=batch,
+            binding=binding,
+            diagnostics=exc.diagnostics,
+            created_at=datetime.now(UTC),
+        )
+        raise
     inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
     positions = _preflight_exact_position_identity(
         batch=batch,
@@ -1421,18 +1443,42 @@ def _require_exact_entry_legs(
 ) -> None:
     with session_factory() as session:
         stored_batch = session.get(StrategyManagementBatch, batch.id)
-        deferred_snapshot_ids = set(
-            _parse_exact_deferred_entry_leg_ids(
-                getattr(stored_batch, "target_snapshot_json", None),
-                error_code="batch_entry_set_not_exact",
-            )
+        deferred_snapshot_id_list = _parse_exact_deferred_entry_leg_ids(
+            getattr(stored_batch, "target_snapshot_json", None),
+            error_code="batch_entry_set_not_exact",
         )
+        deferred_snapshot_ids = set(deferred_snapshot_id_list)
         all_entries = (
             session.query(ExecutionOrderLeg)
             .filter(ExecutionOrderLeg.execution_binding_id == batch.execution_binding_id)
             .filter(ExecutionOrderLeg.purpose == "entry")
             .all()
         )
+        if batch.effective_action in {"full_close", "full_exit"}:
+            snapshot_rows = (
+                session.query(ExecutionOrderLeg)
+                .filter(ExecutionOrderLeg.id.in_(deferred_snapshot_id_list))
+                .all()
+                if deferred_snapshot_id_list
+                else []
+            )
+            snapshot_rows_by_id = {int(entry.id): entry for entry in snapshot_rows}
+            current_deferred_entries = [
+                entry
+                for entry in all_entries
+                if entry.strategy_instance_id == batch.strategy_instance_id
+                and _is_deferred_pending_entry_leg(entry)
+            ]
+            identity_diagnostics = _deferred_entry_identity_diagnostics(
+                batch=batch,
+                snapshot_leg_ids=deferred_snapshot_id_list,
+                snapshot_rows_by_id=snapshot_rows_by_id,
+                current_deferred_entries=current_deferred_entries,
+            )
+            if identity_diagnostics:
+                raise DeferredEntryIdentityDriftError(
+                    "batch_entry_set_not_exact", identity_diagnostics
+                )
         batch_identity = {
             (int(leg.execution_order_leg_id), str(leg.pos_id)) for leg in batch.legs
         }
@@ -1479,6 +1525,103 @@ def _require_exact_entry_legs(
                 raise ManagementBatchExecutionError(
                     f"batch_entry_leg_not_exact_or_active:{leg.id}"
                 )
+
+
+def _deferred_entry_identity_diagnostics(
+    *,
+    batch: ManagementBatchRecord,
+    snapshot_leg_ids: list[int],
+    snapshot_rows_by_id: dict[int, ExecutionOrderLeg],
+    current_deferred_entries: list[ExecutionOrderLeg],
+) -> list[dict[str, Any]]:
+    """Describe only bounded identifiers needed to resolve exact-set drift."""
+
+    diagnostics: list[dict[str, Any]] = []
+    current_deferred_ids = {int(entry.id) for entry in current_deferred_entries}
+    for leg_id in snapshot_leg_ids:
+        entry = snapshot_rows_by_id.get(leg_id)
+        if entry is None:
+            diagnostics.append(
+                _deferred_identity_diagnostic(
+                    leg_id=leg_id,
+                    identity_state="snapshot_leg_missing",
+                    reason="snapshot_deferred_entry_leg_missing",
+                )
+            )
+            continue
+        if (
+            entry.execution_binding_id != batch.execution_binding_id
+            or entry.strategy_instance_id != batch.strategy_instance_id
+            or entry.purpose != "entry"
+        ):
+            diagnostics.append(
+                _deferred_identity_diagnostic(
+                    leg_id=leg_id,
+                    identity_state="snapshot_leg_reassigned",
+                    reason="snapshot_deferred_entry_leg_reassigned",
+                )
+            )
+            continue
+        if leg_id not in current_deferred_ids:
+            diagnostics.append(
+                _deferred_identity_diagnostic(
+                    leg_id=leg_id,
+                    identity_state="snapshot_leg_state_drift",
+                    reason="snapshot_deferred_entry_leg_state_drift",
+                    order_id=entry.order_id,
+                    client_order_id=entry.client_order_id,
+                )
+            )
+    snapshot_ids = set(snapshot_leg_ids)
+    diagnostics.extend(
+        _deferred_identity_diagnostic(
+            leg_id=int(entry.id),
+            identity_state="unsnapshotted_pending",
+            reason="unsnapshotted_pending_entry_leg",
+            order_id=entry.order_id,
+            client_order_id=entry.client_order_id,
+        )
+        for entry in sorted(current_deferred_entries, key=lambda item: int(item.id))
+        if int(entry.id) not in snapshot_ids
+    )
+    return diagnostics[:20]
+
+
+def _deferred_identity_diagnostic(
+    *,
+    leg_id: int,
+    identity_state: str,
+    reason: str,
+    order_id: Any = None,
+    client_order_id: Any = None,
+) -> dict[str, Any]:
+    diagnostic = {
+        "execution_order_leg_id": int(leg_id),
+        "identity_state": identity_state,
+        "live_match_source": "not_checked",
+        "match_type": "identity",
+        "status": "unresolved",
+        "reason": reason,
+    }
+    bounded_order_id = _bounded_diagnostic_identifier(order_id)
+    bounded_client_order_id = _bounded_diagnostic_identifier(client_order_id)
+    if bounded_order_id:
+        diagnostic["order_id"] = bounded_order_id
+    if bounded_client_order_id:
+        diagnostic["client_order_id"] = bounded_client_order_id
+    return diagnostic
+
+
+def _bounded_diagnostic_identifier(value: Any) -> str | None:
+    text = _stored_text(value)
+    if text is None:
+        return None
+    if any(
+        marker in text.lower()
+        for marker in ("api-key", "api_key", "authorization", "passphrase", "secret")
+    ):
+        return "[redacted]"
+    return text[:120]
 
 
 def _is_deferred_pending_entry_leg(entry: ExecutionOrderLeg) -> bool:

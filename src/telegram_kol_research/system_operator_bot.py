@@ -281,23 +281,36 @@ def format_strategy_management_notification(payload: dict[str, Any]) -> str:
         for entry in deferred_entry_legs[:20]:
             if not isinstance(entry, dict):
                 continue
+            identity_state = _safe_management_text(
+                entry.get("identity_state") or "snapshotted", limit=40
+            )
+            unavailable_identifier = (
+                "不可用(快照腿缺失或漂移)"
+                if identity_state in {
+                    "snapshot_leg_missing",
+                    "snapshot_leg_reassigned",
+                    "snapshot_leg_state_drift",
+                }
+                else "-"
+            )
             lines.append(
                 "- "
-                f"腿: {entry.get('execution_order_leg_id') or '-'} "
-                f"订单: {entry.get('order_id') or '-'} "
-                f"客户订单: {entry.get('client_order_id') or '-'}"
+                f"腿: {_safe_management_text(entry.get('execution_order_leg_id'), limit=24)} "
+                f"身份: {identity_state} "
+                f"订单: {_safe_management_text(entry.get('order_id') or unavailable_identifier, limit=120)} "
+                f"客户订单: {_safe_management_text(entry.get('client_order_id') or unavailable_identifier, limit=120)}"
             )
             diagnostic = entry.get("cancellation_diagnostic")
             if isinstance(diagnostic, dict):
                 lines.append(
                     "  撤单诊断: "
-                    f"live={diagnostic.get('live_match_source') or '-'} "
-                    f"type={diagnostic.get('match_type') or '-'} "
-                    f"status={diagnostic.get('status') or '-'} "
-                    f"reason={diagnostic.get('reason') or '-'}"
+                    f"live={_safe_management_text(diagnostic.get('live_match_source'), limit=40)} "
+                    f"type={_safe_management_text(diagnostic.get('match_type'), limit=24)} "
+                    f"status={_safe_management_text(diagnostic.get('status'), limit=32)} "
+                    f"reason={_safe_management_text(diagnostic.get('reason'), limit=80)}"
                 )
         if not deferred_entry_legs:
-            lines.append("- -")
+            lines.append("- 身份漂移诊断未持久化，请立即人工核对快照和待处理进场腿。")
     legs = payload.get("legs") if isinstance(payload.get("legs"), list) else []
     lines.append("仓位/腿结果:")
     for leg in legs[:20]:
@@ -424,7 +437,7 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
             }
         )
     deferred_entry_legs = []
-    cancellation_diagnostics: dict[int, dict[str, str]] = {}
+    cancellation_diagnostics: dict[int, dict[str, Any]] = {}
     for event in (
         session.query(ExecutionEvent)
         .filter(
@@ -436,9 +449,13 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
         .limit(100)
     ):
         diagnostic = _canonical_deferred_cancel_diagnostic(event.after_json)
-        leg_id = diagnostic.pop("execution_order_leg_id", None)
+        leg_id = diagnostic.get("execution_order_leg_id")
         if isinstance(leg_id, int) and leg_id not in cancellation_diagnostics:
-            cancellation_diagnostics[leg_id] = diagnostic
+            cancellation_diagnostics[leg_id] = {
+                key: value
+                for key, value in diagnostic.items()
+                if key != "execution_order_leg_id"
+            }
     snapshot = _decode_mapping(batch.target_snapshot_json)
     identity = snapshot.get("identity")
     deferred_entry_leg_ids = (
@@ -448,43 +465,80 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
         isinstance(deferred_entry_leg_ids, list)
         and all(type(leg_id) is int and leg_id > 0 for leg_id in deferred_entry_leg_ids)
     ):
-        for entry in (
-            session.query(ExecutionOrderLeg)
-            .filter(
-                ExecutionOrderLeg.id.in_(deferred_entry_leg_ids),
-                ExecutionOrderLeg.execution_binding_id == batch.execution_binding_id,
-                ExecutionOrderLeg.strategy_instance_id == batch.strategy_instance_id,
-                ExecutionOrderLeg.purpose == "entry",
+        diagnostic_leg_ids = list(cancellation_diagnostics)
+        display_leg_ids = []
+        for leg_id in [*diagnostic_leg_ids, *deferred_entry_leg_ids]:
+            if leg_id not in display_leg_ids:
+                display_leg_ids.append(leg_id)
+            if len(display_leg_ids) == 20:
+                break
+        entries_by_id = {
+            int(entry.id): entry
+            for entry in (
+                session.query(ExecutionOrderLeg)
+                .filter(
+                    ExecutionOrderLeg.id.in_(display_leg_ids),
+                    ExecutionOrderLeg.execution_binding_id
+                    == batch.execution_binding_id,
+                    ExecutionOrderLeg.strategy_instance_id
+                    == batch.strategy_instance_id,
+                    ExecutionOrderLeg.purpose == "entry",
+                )
+                .order_by(ExecutionOrderLeg.id.asc())
             )
-            .order_by(ExecutionOrderLeg.id.asc())
-        ):
+        }
+        for leg_id in display_leg_ids:
+            entry = entries_by_id.get(leg_id)
+            diagnostic = cancellation_diagnostics.get(leg_id, {})
+            identity_state = diagnostic.get("identity_state") or "snapshotted"
+            order_id = (
+                entry.order_id if entry is not None else diagnostic.get("order_id")
+            )
+            client_order_id = (
+                entry.client_order_id
+                if entry is not None
+                else diagnostic.get("client_order_id")
+            )
             deferred_entry_legs.append(
                 {
-                    "execution_order_leg_id": entry.id,
-                    "order_id": _safe_management_text(entry.order_id, limit=120),
-                    "client_order_id": _safe_management_text(
-                        entry.client_order_id, limit=120
+                    "execution_order_leg_id": leg_id,
+                    "identity_state": _safe_management_text(
+                        identity_state, limit=40
                     ),
-                    "cancellation_diagnostic": cancellation_diagnostics.get(
-                        int(entry.id),
-                        {
-                            "live_match_source": "unknown",
-                            "match_type": (
-                                "trigger"
-                                if "trigger" in str(entry.order_kind or "").lower()
-                                else "regular"
-                            ),
-                            "status": (
-                                "resolved"
-                                if str(entry.status or "").lower() == "cancelled"
-                                else "unresolved"
-                            ),
-                            "reason": _safe_management_text(
-                                entry.terminal_reason or batch.reason_code,
-                                limit=80,
-                            ),
-                        },
+                    "order_id": (
+                        _safe_management_text(order_id, limit=120)
+                        if order_id not in (None, "")
+                        else None
                     ),
+                    "client_order_id": (
+                        _safe_management_text(client_order_id, limit=120)
+                        if client_order_id not in (None, "")
+                        else None
+                    ),
+                    "cancellation_diagnostic": diagnostic or {
+                        "live_match_source": "unknown",
+                        "match_type": (
+                            "trigger"
+                            if entry is not None
+                            and "trigger" in str(entry.order_kind or "").lower()
+                            else "regular"
+                        ),
+                        "status": (
+                            "resolved"
+                            if entry is not None
+                            and str(entry.status or "").lower() == "cancelled"
+                            else "unresolved"
+                        ),
+                        "reason": _safe_management_text(
+                            (
+                                entry.terminal_reason
+                                if entry is not None
+                                else None
+                            )
+                            or batch.reason_code,
+                            limit=80,
+                        ),
+                    },
                 }
             )
     return {
@@ -516,7 +570,7 @@ def _canonical_deferred_cancel_diagnostic(value: Any) -> dict[str, Any]:
     leg_id = decoded.get("execution_order_leg_id")
     if type(leg_id) is not int or leg_id <= 0:
         return {}
-    return {
+    diagnostic = {
         "execution_order_leg_id": leg_id,
         "live_match_source": _safe_management_text(
             decoded.get("live_match_source"), limit=40
@@ -525,6 +579,18 @@ def _canonical_deferred_cancel_diagnostic(value: Any) -> dict[str, Any]:
         "status": _safe_management_text(decoded.get("status"), limit=32),
         "reason": _safe_management_text(decoded.get("reason"), limit=80),
     }
+    identity_state = decoded.get("identity_state")
+    if identity_state in {
+        "snapshot_leg_missing",
+        "snapshot_leg_reassigned",
+        "snapshot_leg_state_drift",
+        "unsnapshotted_pending",
+    }:
+        diagnostic["identity_state"] = identity_state
+    for key in ("order_id", "client_order_id"):
+        if decoded.get(key) not in (None, ""):
+            diagnostic[key] = _safe_management_text(decoded.get(key), limit=120)
+    return diagnostic
 
 
 def _management_payload_fingerprint(payload: dict[str, Any]) -> str:

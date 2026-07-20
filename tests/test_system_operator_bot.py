@@ -149,6 +149,94 @@ def test_deferred_entry_cancel_recovery_notification_names_blocked_order(tmp_pat
     assert "请勿启用替代策略" in text
 
 
+def test_identity_drift_recovery_notification_renders_persisted_missing_and_extra_legs(
+    tmp_path, monkeypatch,
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, RawMessage,
+        StrategyManagementBatch,
+    )
+
+    sf = create_session_factory(tmp_path / "deferred-entry-identity-alert.db")
+    with sf() as session:
+        raw = RawMessage(chat_id=-10001, message_id=102, text="full exit")
+        session.add(raw); session.flush()
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:-10001:102:BTC:long", kol_id="kol",
+            chat_id=-10001, message_id=102, symbol="BTC", side="long", status="open",
+        )
+        session.add(binding); session.flush()
+        extra = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=1, purpose="entry", order_kind="trigger_limit",
+            order_id="unsnap-order-1", client_order_id="unsnap-client-1",
+            status="pending", attribution_status="unassigned",
+        )
+        session.add(extra); session.flush()
+        missing_leg_id = extra.id + 1000
+        batch = StrategyManagementBatch(
+            idempotency_fingerprint="c" * 64, raw_message_id=raw.id,
+            recognition_decision_id=1, recognition_generation="g1",
+            target_lifecycle_id=1, strategy_instance_id=binding.strategy_instance_id,
+            execution_binding_id=binding.id, intent="full_exit", effective_action="full_exit",
+            partial_round_before=0, status="recovery_required",
+            reason_code="deferred_entry_cancel_preflight_failed", target_fingerprint="d" * 64,
+            target_snapshot_json=json.dumps({
+                "identity": {"deferred_entry_leg_ids": [missing_leg_id]},
+            }),
+            planned_at=NOW,
+        )
+        session.add(batch); session.flush()
+        for diagnostic in (
+            {
+                "execution_order_leg_id": missing_leg_id,
+                "identity_state": "snapshot_leg_missing",
+                "live_match_source": "not_checked", "match_type": "identity",
+                "status": "unresolved", "reason": "snapshot_deferred_entry_leg_missing",
+            },
+            {
+                "execution_order_leg_id": extra.id,
+                "order_id": extra.order_id, "client_order_id": extra.client_order_id,
+                "identity_state": "unsnapshotted_pending",
+                "live_match_source": "not_checked", "match_type": "identity",
+                "status": "unresolved", "reason": "unsnapshotted_pending_entry_leg",
+            },
+        ):
+            session.add(ExecutionEvent(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                venue="deepcoin",
+                action="strategy_management_deferred_entry_cancel_diagnostic",
+                status="failed", source_message_id=raw.id,
+                reason=diagnostic["reason"], after_json=json.dumps(diagnostic),
+                created_at=NOW,
+            ))
+        session.flush()
+        payload = operator_bot_module._management_payload_for_batch(session, batch)
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "_management_payload_for_batch",
+        lambda *_args, **_kwargs: pytest.fail("formatter must not read the database"),
+    )
+    text = operator_bot_module.format_strategy_management_notification(payload)
+
+    assert f"腿: {missing_leg_id}" in text
+    assert "身份: snapshot_leg_missing" in text
+    assert "订单: 不可用(快照腿缺失或漂移)" in text
+    assert f"腿: {extra.id}" in text
+    assert "身份: unsnapshotted_pending" in text
+    assert "订单: unsnap-order-1" in text
+    assert "客户订单: unsnap-client-1" in text
+    assert "- -" not in text.split("未成交进场腿:", 1)[1].split("仓位/腿结果:", 1)[0]
+    assert all(
+        len(chunk) < 4096
+        for chunk in operator_bot_module.split_strategy_management_notification(payload)
+    )
+
+
 def test_management_notification_splits_maximum_identifiers_below_telegram_limit():
     max_id = 9_223_372_036_854_775_807
     payload = {

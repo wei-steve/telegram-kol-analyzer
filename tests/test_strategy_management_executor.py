@@ -890,6 +890,78 @@ def test_full_close_rejects_unsnapshotted_eligible_deferred_entry_before_any_can
     assert client.calls == []
     with session_factory() as session:
         assert session.get(ExecutionOrderLeg, deferred_ids[0]).status == "pending"
+    diagnostics = list_execution_events(
+        session_factory,
+        execution_binding_id=batch.execution_binding_id,
+        action="strategy_management_deferred_entry_cancel_diagnostic",
+    )
+    assert [event.after for event in diagnostics] == [
+        {
+            "execution_order_leg_id": deferred_ids[0],
+            "order_id": "deferred-order-1",
+            "client_order_id": "deferred-client-1",
+            "identity_state": "unsnapshotted_pending",
+            "live_match_source": "not_checked",
+            "match_type": "identity",
+            "status": "unresolved",
+            "reason": "unsnapshotted_pending_entry_leg",
+        }
+    ]
+
+
+@pytest.mark.parametrize("drift", ["deleted", "reassigned"])
+def test_full_close_persists_snapshot_deferred_entry_identity_drift(
+    tmp_path, drift,
+):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / f"{drift}.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    deferred_ids, _ = _configure_deferred_full_exit(session_factory, batch)
+    with session_factory() as session:
+        deferred = session.get(ExecutionOrderLeg, deferred_ids[0])
+        if drift == "deleted":
+            session.delete(deferred)
+        else:
+            deferred.strategy_instance_id = "deepcoin:other:strategy:BTC:short"
+        session.commit()
+
+    client = _FakeClient(session_factory)
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert result["reason"] == "deferred_entry_cancel_preflight_failed"
+    assert client.cancel_trigger_calls == []
+    assert client.cancel_order_calls == []
+    assert client.calls == []
+    diagnostics = list_execution_events(
+        session_factory,
+        execution_binding_id=batch.execution_binding_id,
+        action="strategy_management_deferred_entry_cancel_diagnostic",
+    )
+    expected_state = "snapshot_leg_missing" if drift == "deleted" else "snapshot_leg_reassigned"
+    expected_reason = (
+        "snapshot_deferred_entry_leg_missing"
+        if drift == "deleted"
+        else "snapshot_deferred_entry_leg_reassigned"
+    )
+    assert [event.after for event in diagnostics] == [
+        {
+            "execution_order_leg_id": deferred_ids[0],
+            "identity_state": expected_state,
+            "live_match_source": "not_checked",
+            "match_type": "identity",
+            "status": "unresolved",
+            "reason": expected_reason,
+        }
+    ]
 
 
 def test_full_close_missing_later_snapshot_deferred_entry_cancels_nothing(tmp_path):
