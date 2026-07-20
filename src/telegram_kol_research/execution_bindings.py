@@ -1021,7 +1021,140 @@ def _snapshot_fill_evidence(
                     ),
                 )
             )
+    _append_trigger_child_order_fill_evidence(
+        result,
+        snapshot=snapshot,
+        legs=legs,
+        bindings_by_id=bindings_by_id,
+    )
     return result
+
+
+def _append_trigger_child_order_fill_evidence(
+    result: list[FillEvidence],
+    *,
+    snapshot: _ReconcileSnapshot,
+    legs: list[ExecutionOrderLeg],
+    bindings_by_id: dict[int, ExecutionBinding],
+) -> None:
+    for trigger_row in snapshot.trigger_history:
+        sourced_trigger = {**trigger_row, "_evidence_source": "trigger_fill"}
+        if not is_fill_evidence(sourced_trigger):
+            continue
+        matching_legs = [
+            leg for leg in legs if _exchange_row_matches_leg(trigger_row, leg)
+        ]
+        if len(matching_legs) != 1:
+            continue
+        child_rows = [
+            row
+            for row in snapshot.order_history
+            if _trigger_child_order_matches(trigger_row, row)
+        ]
+        if len(child_rows) != 1:
+            continue
+        leg = matching_legs[0]
+        binding = bindings_by_id[int(leg.execution_binding_id)]
+        child_row = child_rows[0]
+        child_order_id = _first_string(child_row, "ordId", "orderId", "order_id", "id")
+        if not child_order_id or child_order_id == str(leg.order_id or ""):
+            continue
+        result.append(
+            FillEvidence(
+                source="trigger_child_order",
+                order_id=str(leg.order_id) if leg.order_id else None,
+                client_order_id=leg.client_order_id,
+                pos_id=child_order_id,
+                symbol=str(
+                    child_row.get("instId")
+                    or trigger_row.get("instId")
+                    or f"{binding.symbol}-USDT-SWAP"
+                ),
+                side=_normalize_position_side(
+                    str(
+                        child_row.get("posSide")
+                        or child_row.get("side")
+                        or trigger_row.get("posSide")
+                        or trigger_row.get("side")
+                        or binding.side
+                    )
+                ),
+                size=_order_row_size(child_row),
+                price=_order_row_price(child_row),
+                created_at_ms=_first_timestamp_ms(
+                    child_row, "fillTime", "cTime", "uTime", "ts"
+                ),
+            )
+        )
+
+
+def _trigger_child_order_matches(
+    trigger_row: dict[str, Any], child_row: dict[str, Any]
+) -> bool:
+    child_state = classify_leg_exchange_state(child_row)
+    if child_state not in {"filled", "partially_filled"}:
+        return False
+    child_order_id = _first_string(child_row, "ordId", "orderId", "order_id", "id")
+    trigger_order_id = _first_string(trigger_row, "ordId", "orderId", "order_id", "id")
+    if not child_order_id or child_order_id == trigger_order_id:
+        return False
+    trigger_inst = str(trigger_row.get("instId") or "").upper()
+    child_inst = str(child_row.get("instId") or "").upper()
+    if trigger_inst and child_inst and trigger_inst != child_inst:
+        return False
+    trigger_side = _normalize_position_side(
+        str(trigger_row.get("posSide") or trigger_row.get("side") or "")
+    )
+    child_side = _normalize_position_side(
+        str(child_row.get("posSide") or child_row.get("side") or "")
+    )
+    if trigger_side and child_side and trigger_side != child_side:
+        return False
+    if not _numbers_equal(_order_row_size(trigger_row), _order_row_size(child_row)):
+        return False
+    if not _numbers_equal(_order_row_price(trigger_row), _order_row_price(child_row)):
+        return False
+    trigger_times = _timestamp_ms_values(
+        trigger_row, "triggerTime", "fillTime", "cTime", "uTime", "ts"
+    )
+    child_times = _timestamp_ms_values(child_row, "fillTime", "cTime", "uTime", "ts")
+    return bool(trigger_times and child_times and trigger_times & child_times)
+
+
+def _order_row_size(row: dict[str, Any]) -> float | None:
+    return _to_float(
+        row.get("fillSz") or row.get("accFillSz") or row.get("sz") or row.get("size")
+    )
+
+
+def _order_row_price(row: dict[str, Any]) -> float | None:
+    return _to_float(
+        row.get("fillPx")
+        or row.get("avgPx")
+        or row.get("px")
+        or row.get("triggerPx")
+        or row.get("price")
+    )
+
+
+def _first_timestamp_ms(row: dict[str, Any], *keys: str) -> int | None:
+    values = _timestamp_ms_values(row, *keys)
+    return min(values) if values else None
+
+
+def _timestamp_ms_values(row: dict[str, Any], *keys: str) -> set[int]:
+    result: set[int] = set()
+    for key in keys:
+        value = _to_int(row.get(key))
+        if value is not None:
+            result.add(value)
+    return result
+
+
+def _numbers_equal(left: float | None, right: float | None) -> bool:
+    if left is None or right is None:
+        return False
+    return abs(left - right) <= 1e-8
 
 
 def _leg_has_successful_fill_evidence(

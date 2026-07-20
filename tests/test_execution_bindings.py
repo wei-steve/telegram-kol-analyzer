@@ -1914,6 +1914,237 @@ def test_reconcile_uses_trigger_history_to_pick_position_after_trigger_entry_fil
     assert lifecycle.execution_binding_id == binding.id
 
 
+def test_reconcile_links_delayed_live_position_through_trigger_child_order_history(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            symbol="ETH",
+            side="short",
+            order_id="1001124198560580",
+            client_order_id="TKSQ3347E1",
+            status="open",
+        ),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        order_id="1001124198560580",
+        client_order_id="TKSQ3347E1",
+        status="pending",
+        request={
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "short",
+            "side": "sell",
+            "price": "1883.0",
+            "sz": "4.4",
+        },
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=-1002370796392,
+                message_id=3347,
+                symbol="ETH",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 18, 20, 15, 52),
+                entered_at=datetime(2026, 7, 20, 0, 10),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "1001124219349221",
+                    "posSide": "short",
+                    "pos": "4.4",
+                    "avgPx": "1883",
+                    # Deepcoin live position can be created after the child
+                    # order-history fill time.
+                    "cTime": "1784506273000",
+                    "uTime": "1784506273000",
+                }
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            assert inst_id == "ETH-USDT-SWAP"
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "1001124219349221",
+                    "clOrdId": "",
+                    "state": "filled",
+                    "side": "sell",
+                    "posSide": "short",
+                    "avgPx": "1883",
+                    "fillPx": "1883",
+                    "fillSz": "4.4",
+                    "sz": "4.4",
+                    "px": "1883",
+                    "cTime": "1784506226000",
+                    "uTime": "1784506273000",
+                }
+            ]
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            assert inst_id == "ETH-USDT-SWAP"
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "1001124198560580",
+                    "side": "sell",
+                    "posSide": "short",
+                    "sz": "4.4",
+                    "px": "1883",
+                    "triggerPx": "1883",
+                    # Deepcoin returns this field in seconds for trigger history.
+                    "triggerTime": "1784506226",
+                    "uTime": "1784506226000",
+                    "errorCode": "0",
+                }
+            ]
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 7, 20, 0, 20),
+    )
+
+    assert result.active == 1
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.query(ExecutionOrderLeg).one()
+
+    assert binding.pos_id == "1001124219349221"
+    assert binding.last_exchange_status == "position_ownership_verified"
+    assert leg.pos_id == "1001124219349221"
+    assert leg.status == "active"
+    assert leg.attribution_status == "verified"
+
+
+def test_reconcile_does_not_link_trigger_child_when_order_history_is_ambiguous(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            symbol="ETH",
+            side="short",
+            order_id="parent-trigger",
+            client_order_id="parent-client",
+            status="open",
+        ),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        order_id="parent-trigger",
+        client_order_id="parent-client",
+        status="pending",
+        request={
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "short",
+            "side": "sell",
+            "price": "1883",
+            "sz": "4.4",
+        },
+    )
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "child-a",
+                    "posSide": "short",
+                    "pos": "4.4",
+                    "avgPx": "1883",
+                    "cTime": "1784506273000",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "child-b",
+                    "posSide": "short",
+                    "pos": "4.4",
+                    "avgPx": "1883",
+                    "cTime": "1784506274000",
+                },
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "child-a",
+                    "state": "filled",
+                    "side": "sell",
+                    "posSide": "short",
+                    "avgPx": "1883",
+                    "fillSz": "4.4",
+                    "cTime": "1784506226000",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "child-b",
+                    "state": "filled",
+                    "side": "sell",
+                    "posSide": "short",
+                    "avgPx": "1883",
+                    "fillSz": "4.4",
+                    "cTime": "1784506226000",
+                },
+            ]
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "parent-trigger",
+                    "side": "sell",
+                    "posSide": "short",
+                    "sz": "4.4",
+                    "px": "1883",
+                    "triggerTime": "1784506226",
+                    "uTime": "1784506226000",
+                    "errorCode": "0",
+                }
+            ]
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 7, 20, 0, 20),
+    )
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.query(ExecutionOrderLeg).one()
+
+    assert binding.pos_id is None
+    assert leg.pos_id is None
+    assert leg.attribution_status == "unassigned"
+
+
 def test_reconcile_appends_filled_second_leg_position_id(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
