@@ -715,26 +715,44 @@ def plan_trigger_protection_intent_adoption(
         end=history_time_range_end,
     ):
         return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_history_unproven", [order_id])
-    for ledger in existing_ledger_rows:
-        if str(ledger.order_id or "").strip() == order_id:
-            if (
-                str(ledger.venue or "").lower() == "deepcoin"
-                and int(ledger.execution_binding_id or 0) == binding_id
-                and int(ledger.execution_order_leg_id or 0) == int(entry_leg.id or 0)
-                and str(ledger.pos_id or "") == pos_id
-                and str(ledger.status or "").lower() == "verified"
-                and str(intent.adopted_order_id or "").strip() == order_id
-            ):
-                return TriggerProtectionIntentAdoptionResult(
-                    deferred=TriggerProtectionIntentAdoptionDeferred(reason="trigger_protection_already_adopted")
-                )
-            return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_order_owned", [order_id])
     for other_intent in existing_intents:
+        same_intent = other_intent is intent or (
+            intent.id is not None and other_intent.id == intent.id
+        )
         if (
-            int(other_intent.id or 0) != int(intent.id or 0)
+            not same_intent
             and str(other_intent.adopted_order_id or "").strip() == order_id
         ):
             return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_order_owned", [order_id])
+    adopted_order_id = str(intent.adopted_order_id or "").strip()
+    if adopted_order_id:
+        if adopted_order_id != order_id:
+            return _intent_refusal(
+                parent_event, binding_id, pos_id,
+                "trigger_protection_adopted_order_conflict", [order_id],
+            )
+    matching_ledgers = [
+        ledger
+        for ledger in existing_ledger_rows
+        if str(ledger.order_id or "").strip() == order_id
+    ]
+    if matching_ledgers:
+        exact_ledger = len(matching_ledgers) == 1 and (
+            str(matching_ledgers[0].venue or "").lower() == "deepcoin"
+            and int(matching_ledgers[0].execution_binding_id or 0) == binding_id
+            and int(matching_ledgers[0].execution_order_leg_id or 0) == int(entry_leg.id or 0)
+            and str(matching_ledgers[0].pos_id or "") == pos_id
+            and str(matching_ledgers[0].status or "").lower() == "verified"
+        )
+        if adopted_order_id and exact_ledger:
+            return TriggerProtectionIntentAdoptionResult(
+                deferred=TriggerProtectionIntentAdoptionDeferred(reason="trigger_protection_already_adopted")
+            )
+        return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_order_owned", [order_id])
+    if adopted_order_id:
+        return TriggerProtectionIntentAdoptionResult(
+            deferred=TriggerProtectionIntentAdoptionDeferred(reason="trigger_protection_already_adopted")
+        )
     return TriggerProtectionIntentAdoptionResult(
         action=EntryProtectionLedgerRepairAction(
             event_id=int(parent_event.id), binding_id=binding_id, leg_id=int(entry_leg.id),

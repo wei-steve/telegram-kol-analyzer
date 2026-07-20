@@ -497,6 +497,43 @@ def test_intent_adoption_refuses_same_leg_ledger_without_exact_association(tmp_p
     assert result.refusal.reason == "trigger_protection_order_owned"
 
 
+def test_intent_adoption_checks_other_intent_collision_before_exact_ledger_defer(tmp_path):
+    ledger = PositionProtectionLedger(
+        venue="deepcoin", execution_binding_id=152, execution_order_leg_id=289,
+        pos_id="pos-1", instrument_id="ETH-USDT-SWAP", side="short",
+        order_id="tpsl-new", purpose="combined", status="verified", evidence_source="test",
+    )
+    other_intent = TriggerProtectionIntent(
+        id=777, venue="deepcoin", execution_binding_id=999, execution_order_leg_id=998,
+        request_fingerprint="a" * 64, pre_submit_tpsl_baseline_json="[]",
+        correlation_id="other", adopted_order_id="tpsl-new",
+    )
+    result = _plan_intent_adoption(
+        tmp_path, adopted_order_id="tpsl-new", existing_ledger_rows=[ledger],
+        existing_intents=[other_intent],
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_order_owned"
+
+
+def test_intent_adoption_refuses_candidate_different_from_immutable_adopted_order(tmp_path):
+    result = _plan_intent_adoption(tmp_path, adopted_order_id="already-adopted")
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_adopted_order_conflict"
+
+
+def test_intent_adoption_defers_when_current_intent_already_adopted_without_ledger(tmp_path):
+    result = _plan_intent_adoption(tmp_path, adopted_order_id="tpsl-new")
+
+    assert result.action is None
+    assert result.deferred is not None
+    assert result.deferred.reason == "trigger_protection_already_adopted"
+
+
 def test_intent_adoption_accepts_history_only_with_parent_proof_and_explicit_range(tmp_path):
     row = _pending_tpsl_row(
         "tpsl-history", purpose="combined", price="1860", stop_price="1900",
@@ -569,7 +606,7 @@ def test_intent_adoption_planner_cannot_access_session_for_client_or_writes(tmp_
 def _plan_intent_adoption(
     tmp_path, *, baseline="[]", pending_rows=None, history_rows=None, pending_update=None,
     existing_ledger_rows=None, history_time_range_start=None, history_time_range_end=None,
-    planner_session=None, existing_intents=None, request_update=None,
+    planner_session=None, existing_intents=None, request_update=None, adopted_order_id=None,
 ):
     session_factory = create_session_factory(tmp_path / "intent-adoption.db")
     _seed_trigger_entry_fill(session_factory, binding_id=152, legs=[{
@@ -593,6 +630,7 @@ def _plan_intent_adoption(
             venue="deepcoin", execution_binding_id=152, execution_order_leg_id=289,
             request_fingerprint=hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
             pre_submit_tpsl_baseline_json=baseline, correlation_id="intent-289", parent_trigger_order_id="entry-1",
+            adopted_order_id=adopted_order_id,
         )
         return plan_trigger_protection_intent_adoption(
             session if planner_session is None else planner_session,
