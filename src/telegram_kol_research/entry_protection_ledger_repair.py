@@ -664,18 +664,31 @@ def plan_trigger_protection_intent_adoption(
                 continue
             if (
                 _row_matches_instrument_side(row, instrument_id=instrument_id, side=side)
-                and _row_matches_expected_protection_set(row, expected_rows)
                 and _same_size_text(_row_size_text(row), _request_size_text(request))
-                and not _row_position_ids_match(row, pos_id)
             ):
-                return _intent_refusal(
-                    parent_event, binding_id, pos_id,
-                    "trigger_protection_candidate_position_conflict", [_row_order_id(row)],
-                )
+                candidate_pos_id = _canonical_row_pos_id(row)
+                if candidate_pos_id == pos_id and not _row_matches_expected_protection_set(
+                    row, expected_rows
+                ):
+                    return _intent_refusal(
+                        parent_event, binding_id, pos_id,
+                        "trigger_protection_candidate_protection_conflict", [_row_order_id(row)],
+                    )
+                if not _row_matches_expected_protection_set(row, expected_rows):
+                    continue
+                if candidate_pos_id is None:
+                    return _intent_refusal(
+                        parent_event, binding_id, pos_id,
+                        "trigger_protection_candidate_position_invalid", [_row_order_id(row)],
+                    )
+                if candidate_pos_id != pos_id:
+                    return _intent_refusal(
+                        parent_event, binding_id, pos_id,
+                        "trigger_protection_candidate_position_conflict", [_row_order_id(row)],
+                    )
             if (
-                _row_matches_exchange_identity(
-                    row, instrument_id=instrument_id, side=side, pos_id=pos_id
-                )
+                _row_matches_instrument_side(row, instrument_id=instrument_id, side=side)
+                and _canonical_row_pos_id(row) == pos_id
                 and _row_matches_expected_protection_set(row, expected_rows)
                 and _same_size_text(_row_size_text(row), _request_size_text(request))
             ):
@@ -704,7 +717,14 @@ def plan_trigger_protection_intent_adoption(
         return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_history_unproven", [order_id])
     for ledger in existing_ledger_rows:
         if str(ledger.order_id or "").strip() == order_id:
-            if int(ledger.execution_order_leg_id or 0) == int(entry_leg.id or 0):
+            if (
+                str(ledger.venue or "").lower() == "deepcoin"
+                and int(ledger.execution_binding_id or 0) == binding_id
+                and int(ledger.execution_order_leg_id or 0) == int(entry_leg.id or 0)
+                and str(ledger.pos_id or "") == pos_id
+                and str(ledger.status or "").lower() == "verified"
+                and str(intent.adopted_order_id or "").strip() == order_id
+            ):
                 return TriggerProtectionIntentAdoptionResult(
                     deferred=TriggerProtectionIntentAdoptionDeferred(reason="trigger_protection_already_adopted")
                 )
@@ -764,9 +784,24 @@ def _baseline_order_ids(value: str | None) -> set[str] | None:
 
 def _row_matches_expected_protection_set(row: dict[str, Any], expected_rows: list[dict[str, str | None]]) -> bool:
     expected_by_purpose = {str(item["purpose"]): item for item in expected_rows}
-    return bool(expected_by_purpose) and all(
-        _row_matches_expected(row, expected, allow_generic_trigger_price=False)
-        for expected in expected_by_purpose.values()
+    if not expected_by_purpose:
+        return False
+    candidate_prices = {
+        "take_profit": _first_nonzero_text(
+            row, "tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice"
+        ),
+        "stop_loss": _first_nonzero_text(
+            row, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice"
+        ),
+    }
+    if set(expected_by_purpose) != {
+        purpose for purpose, price in candidate_prices.items() if price is not None
+    }:
+        return False
+    return all(
+        _same_numeric_text(candidate_prices[purpose], str(expected["trigger_price"]))
+        for purpose, expected in expected_by_purpose.items()
+        if candidate_prices[purpose] is not None and expected.get("trigger_price") is not None
     )
 
 
@@ -778,12 +813,13 @@ def _row_matches_instrument_side(row: dict[str, Any], *, instrument_id: str, sid
     )
 
 
-def _row_position_ids_match(row: dict[str, Any], pos_id: str) -> bool:
-    return all(
-        str(row.get(key) or "").strip() == pos_id
+def _canonical_row_pos_id(row: dict[str, Any]) -> str | None:
+    position_ids = {
+        str(row.get(key) or "").strip()
         for key in ("closePosId", "close_pos_id", "closePositionId", "posId", "pos_id", "positionId")
         if str(row.get(key) or "").strip()
-    )
+    }
+    return next(iter(position_ids)) if len(position_ids) == 1 else None
 
 
 def _history_row_is_proven_in_range(

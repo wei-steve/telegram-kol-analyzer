@@ -361,6 +361,7 @@ def test_adoption_plans_one_exact_trigger_entry_protection_without_session_write
             size="4.4",
         )
     ]
+    pending_rows[0]["posId"] = "pos-1"
 
     with session_factory() as session:
         entry_leg = session.get(ExecutionOrderLeg, 289)
@@ -412,11 +413,14 @@ def test_intent_adoption_plans_one_new_exact_trigger_entry_protection(tmp_path):
             entry_leg=leg,
             intent=intent,
             parent_event=event,
-            pending_tpsl_rows=[_pending_tpsl_row(
-                "tpsl-new", purpose="combined", price="1860", stop_price="1900",
-                ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP",
-                side="short", size="4.4",
-            )],
+            pending_tpsl_rows=[{
+                **_pending_tpsl_row(
+                    "tpsl-new", purpose="combined", price="1860", stop_price="1900",
+                    ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP",
+                    side="short", size="4.4",
+                ),
+                "posId": "pos-1",
+            }],
             history_tpsl_rows=[],
             existing_ledger_rows=[],
             existing_intents=[intent],
@@ -439,10 +443,13 @@ def test_intent_adoption_refuses_candidate_present_in_pre_submit_baseline(tmp_pa
 def test_intent_adoption_refuses_duplicate_candidates_across_pending_and_history(tmp_path):
     result = _plan_intent_adoption(
         tmp_path,
-        history_rows=[_pending_tpsl_row(
-            "tpsl-history", purpose="combined", price="1860", stop_price="1900",
-            ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4",
-        )],
+        history_rows=[{
+            **_pending_tpsl_row(
+                "tpsl-history", purpose="combined", price="1860", stop_price="1900",
+                ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4",
+            ),
+            "posId": "pos-1",
+        }],
     )
 
     assert result.action is None
@@ -458,12 +465,45 @@ def test_intent_adoption_refuses_conflicting_returned_position_id(tmp_path):
     assert result.refusal.reason == "trigger_protection_candidate_position_conflict"
 
 
+def test_intent_adoption_requires_one_explicit_returned_position_id(tmp_path):
+    result = _plan_intent_adoption(tmp_path, pending_update={"posId": ""})
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_position_invalid"
+
+
+def test_intent_adoption_requires_absent_unrequested_protection_side(tmp_path):
+    result = _plan_intent_adoption(
+        tmp_path,
+        request_update={"slTriggerPx": None},
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_protection_conflict"
+
+
+def test_intent_adoption_refuses_same_leg_ledger_without_exact_association(tmp_path):
+    ledger = PositionProtectionLedger(
+        venue="deepcoin", execution_binding_id=152, execution_order_leg_id=289,
+        pos_id="other-pos", instrument_id="ETH-USDT-SWAP", side="short",
+        order_id="tpsl-new", purpose="combined", status="verified", evidence_source="test",
+    )
+    result = _plan_intent_adoption(tmp_path, existing_ledger_rows=[ledger])
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_order_owned"
+
+
 def test_intent_adoption_accepts_history_only_with_parent_proof_and_explicit_range(tmp_path):
     row = _pending_tpsl_row(
         "tpsl-history", purpose="combined", price="1860", stop_price="1900",
         ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4",
     )
     row["parentOrdId"] = "entry-1"
+    row["posId"] = "pos-1"
     result = _plan_intent_adoption(
         tmp_path, pending_rows=[], history_rows=[row],
         history_time_range_start=datetime(2026, 7, 20, 0, 11),
@@ -476,10 +516,13 @@ def test_intent_adoption_accepts_history_only_with_parent_proof_and_explicit_ran
 
 def test_intent_adoption_refuses_history_only_without_explicit_proof_or_range(tmp_path):
     result = _plan_intent_adoption(
-        tmp_path, pending_rows=[], history_rows=[_pending_tpsl_row(
-            "tpsl-history", purpose="combined", price="1860", stop_price="1900",
-            ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4",
-        )],
+        tmp_path, pending_rows=[], history_rows=[{
+            **_pending_tpsl_row(
+                "tpsl-history", purpose="combined", price="1860", stop_price="1900",
+                ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4",
+            ),
+            "posId": "pos-1",
+        }],
     )
 
     assert result.action is None
@@ -526,7 +569,7 @@ def test_intent_adoption_planner_cannot_access_session_for_client_or_writes(tmp_
 def _plan_intent_adoption(
     tmp_path, *, baseline="[]", pending_rows=None, history_rows=None, pending_update=None,
     existing_ledger_rows=None, history_time_range_start=None, history_time_range_end=None,
-    planner_session=None, existing_intents=None,
+    planner_session=None, existing_intents=None, request_update=None,
 ):
     session_factory = create_session_factory(tmp_path / "intent-adoption.db")
     _seed_trigger_entry_fill(session_factory, binding_id=152, legs=[{
@@ -534,11 +577,15 @@ def _plan_intent_adoption(
         "client_order_id": "entry-client-1", "pos_id": "pos-1", "size": "4.4", "entry_price": "1883.0",
     }])
     row = _pending_tpsl_row("tpsl-new", purpose="combined", price="1860", stop_price="1900", ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4")
+    row["posId"] = "pos-1"
     row.update(pending_update or {})
     with session_factory() as session:
         leg = session.get(ExecutionOrderLeg, 289)
         event = session.query(ExecutionEvent).one()
         request = json.loads(leg.request_json)
+        request.update(request_update or {})
+        leg.request_json = json.dumps(request)
+        event.request_json = json.dumps(request)
         payload = dict(request)
         payload["tpTriggerPx"] = request.get("tpTriggerPx")
         payload["slTriggerPx"] = request.get("slTriggerPx")
