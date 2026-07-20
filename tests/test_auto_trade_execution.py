@@ -17,7 +17,8 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageInstructionItem, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageInstructionItem, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent
+from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
@@ -1192,9 +1193,95 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     assert fake_client.protections == []
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
+        assert session.query(TriggerProtectionIntent).count() == 2
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
     assert binding.margin_mode == "cross"
     assert binding.position_mode == "split"
+
+
+def test_trigger_limit_entry_persists_tpsl_intent_before_parent_submission(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC"],
+            "max_market_entry_deviation_pct": 0.01,
+        },
+    )
+
+    class _OrderedClient(_FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.call_order = []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.call_order.append(("snapshot", inst_id))
+            return []
+
+        def trigger_order(self, order_payload):
+            self.call_order.append(("trigger", order_payload["instId"]))
+            return super().trigger_order(order_payload)
+
+    client = _OrderedClient()
+    auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 20, 8, 1, tzinfo=UTC),
+    )
+
+    assert client.call_order[:4] == [
+        ("snapshot", "BTC-USDT-SWAP"),
+        ("trigger", "BTC-USDT-SWAP"),
+        ("snapshot", "BTC-USDT-SWAP"),
+        ("trigger", "BTC-USDT-SWAP"),
+    ]
+    with session_factory() as session:
+        intents = session.query(TriggerProtectionIntent).order_by(TriggerProtectionIntent.id).all()
+        legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.id).all()
+    assert [intent.execution_order_leg_id for intent in intents] == [leg.id for leg in legs]
+    assert [json.loads(intent.pre_submit_tpsl_baseline_json) for intent in intents] == [[], []]
+    assert all(len(intent.request_fingerprint) == 64 for intent in intents)
+    assert [intent.parent_trigger_order_id for intent in intents] == ["trigger-1", "trigger-2"]
+
+
+def test_trigger_limit_entry_defers_when_tpsl_snapshot_is_malformed(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC"],
+            "max_market_entry_deviation_pct": 0.01,
+        },
+    )
+
+    class _MalformedSnapshotClient(_FakeDeepcoinClient):
+        def list_trigger_orders_pending(self, *, inst_id):
+            return {"data": []}
+
+    client = _MalformedSnapshotClient()
+    with pytest.raises(RecoveryLiveSubmitError, match="trigger_protection_baseline_malformed"):
+        auto_process_message_trade_signal(
+            session_factory,
+            raw_message_id=raw_message_id,
+            group_config=_group_config(),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=datetime(2026, 7, 20, 8, 1, tzinfo=UTC),
+        )
+
+    assert client.trigger_orders == []
+    with session_factory() as session:
+        assert session.query(TriggerProtectionIntent).count() == 0
+        assert session.query(TradeSignal).one().status == "failed"
 
 
 def test_auto_process_range_entry_uses_half_market_half_midpoint_limit_when_near_edge(tmp_path):
@@ -1238,6 +1325,7 @@ def test_auto_process_range_entry_uses_half_market_half_midpoint_limit_when_near
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
+        assert session.query(TriggerProtectionIntent).count() == 1
     assert binding.symbol == "ETH"
     assert binding.order_id == "order-1,trigger-1"
     assert [event.action for event in events] == [

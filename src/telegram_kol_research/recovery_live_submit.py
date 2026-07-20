@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import math
 import time
+import hashlib
+import json
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from threading import RLock
 from typing import Any
 
 from sqlalchemy.orm import sessionmaker
@@ -22,7 +26,12 @@ from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import StrategyLifecycle
+from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.trigger_protection_intents import (
+    create_or_get_trigger_protection_intent,
+    record_trigger_protection_parent,
+)
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.trade_signals import TradeSignalRecord
 from telegram_kol_research.trade_signals import MANUAL_MANAGEMENT_SOURCE_TYPES
@@ -38,6 +47,21 @@ from telegram_kol_research.trading_settings import load_trading_settings
 
 class RecoveryLiveSubmitError(RuntimeError):
     """Raised when a live recovery order cannot be submitted safely."""
+
+
+_TRIGGER_PROTECTION_LOCKS: dict[tuple[str, str, str], RLock] = {}
+_TRIGGER_PROTECTION_LOCKS_GUARD = RLock()
+
+
+@contextmanager
+def _trigger_protection_submission_lock(*, venue: str, inst_id: str, side: str):
+    """Serialize one account/instrument/side trigger-protection handoff."""
+
+    key = (venue.lower(), inst_id.upper(), side.lower())
+    with _TRIGGER_PROTECTION_LOCKS_GUARD:
+        lock = _TRIGGER_PROTECTION_LOCKS.setdefault(key, RLock())
+    with lock:
+        yield
 
 
 def submit_recovery_order_live(
@@ -334,16 +358,40 @@ def _submit_recovery_signal_direct(
                 warnings.append("position_protection_failed_after_entry_submitted")
         elif order_type == "limit":
             order_payload = build_deepcoin_trigger_order_payload(draft, leg)
+            protection_intent = None
+            if _has_embedded_trigger_protection(order_payload):
+                protection_intent = _prepare_trigger_protection_intent(
+                    session_factory,
+                    trade_signal=trade_signal,
+                    draft=draft,
+                    leg=leg,
+                    leg_index=index,
+                    binding_context={
+                        "kol_id": kol_id,
+                        "symbol": symbol_key,
+                        "side": side_key,
+                        "source": source,
+                    },
+                    order_payload=order_payload,
+                )
             try:
-                response = deepcoin_client.trigger_order(order_payload)
+                if protection_intent is None:
+                    response = deepcoin_client.trigger_order(order_payload)
+                else:
+                    response = _submit_trigger_with_protection_intent(
+                        session_factory,
+                        deepcoin_client=deepcoin_client,
+                        order_payload=order_payload,
+                        execution_order_leg_id=protection_intent,
+                    )
             except DeepcoinClientError:
+                raise
+            except RecoveryLiveSubmitError:
                 raise
             except Exception as exc:  # pragma: no cover - defensive boundary
                 raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
 
-            order_id = _extract_order_id(response)
-            if not order_id:
-                raise DeepcoinClientError("Deepcoin trigger limit order response missing order id")
+            order_id = _normalized_trigger_order_id(response)
             pos_id = _extract_position_id(response)
             client_order_id = str(leg.get("client_order_id") or "")
             protection_payload = {
@@ -482,6 +530,181 @@ def _submission_order_legs(
     if not all(isinstance(leg, dict) for leg in copied_legs):
         return copied_legs
     return _coalesce_equivalent_entry_legs(copied_legs)
+
+
+def _has_embedded_trigger_protection(order_payload: dict[str, Any]) -> bool:
+    return all(
+        order_payload.get(key) not in (None, "")
+        for key in ("tpTriggerPx", "slTriggerPx")
+    )
+
+
+def _prepare_trigger_protection_intent(
+    session_factory: sessionmaker,
+    *,
+    trade_signal: TradeSignalRecord,
+    draft: dict[str, Any],
+    leg: dict[str, Any],
+    leg_index: int,
+    binding_context: dict[str, Any],
+    order_payload: dict[str, Any],
+) -> int:
+    """Create the local entry leg needed to durably identify the intent."""
+
+    source = binding_context["source"]
+    binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id=str(binding_context["kol_id"]),
+            chat_id=int(source.get("chat_id") or trade_signal.chat_id),
+            message_id=int(source.get("message_id") or trade_signal.message_id),
+            symbol=str(binding_context["symbol"]),
+            side=str(binding_context["side"]),
+            venue="deepcoin",
+            margin_mode=str(draft.get("margin_mode") or "cross"),
+            position_mode=str(draft.get("position_mode") or "split"),
+            payload={"draft": draft},
+            last_exchange_status="submitting",
+            status="open",
+            strategy_instance_id=str(draft.get("strategy_instance_id") or ""),
+        ),
+    )
+    return upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id=str(draft.get("strategy_instance_id") or trade_signal.strategy_instance_id or ""),
+            leg_index=leg_index,
+            purpose="entry",
+            order_kind="trigger_limit",
+            client_order_id=str(leg.get("client_order_id") or order_payload.get("clOrdId") or "") or None,
+            status="submitting",
+            request=_persisted_order_request(order_payload, leg),
+        ),
+    )
+
+
+def _submit_trigger_with_protection_intent(
+    session_factory: sessionmaker,
+    *,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    order_payload: dict[str, Any],
+    execution_order_leg_id: int,
+) -> dict[str, Any]:
+    """Snapshot, persist intent, submit parent, and bind its returned identity."""
+
+    inst_id = str(order_payload.get("instId") or "").upper()
+    side = str(order_payload.get("posSide") or order_payload.get("side") or "").lower()
+    if not inst_id or not side:
+        raise RecoveryLiveSubmitError("missing_trigger_protection_identity")
+    with _trigger_protection_submission_lock(venue="deepcoin", inst_id=inst_id, side=side):
+        baseline_json = _normalized_pending_tpsl_baseline(
+            deepcoin_client,
+            inst_id=inst_id,
+        )
+        request_fingerprint = hashlib.sha256(
+            json.dumps(order_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        correlation_id = f"trigger-protection:{execution_order_leg_id}"
+        with session_factory() as session:
+            intent = create_or_get_trigger_protection_intent(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=execution_order_leg_id,
+                request_fingerprint=request_fingerprint,
+                pre_submit_tpsl_baseline_json=baseline_json,
+                correlation_id=correlation_id,
+            )
+            session.commit()
+        try:
+            response = deepcoin_client.trigger_order(order_payload)
+        except DeepcoinClientError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
+        parent_order_id = _normalized_trigger_order_id(response)
+        with session_factory() as session:
+            intent = (
+                session.query(TriggerProtectionIntent)
+                .filter(TriggerProtectionIntent.venue == "deepcoin")
+                .filter(TriggerProtectionIntent.execution_order_leg_id == execution_order_leg_id)
+                .one_or_none()
+            )
+            if intent is None:  # pragma: no cover - durable intent was just committed
+                raise RecoveryLiveSubmitError("trigger_protection_intent_missing")
+            record_trigger_protection_parent(
+                session,
+                intent,
+                parent_trigger_order_id=parent_order_id,
+            )
+            session.commit()
+        return response
+
+
+def _normalized_pending_tpsl_baseline(
+    deepcoin_client: DeepcoinTradingClientProtocol, *, inst_id: str
+) -> str:
+    method = getattr(deepcoin_client, "list_trigger_orders_pending", None)
+    if method is None:
+        raise RecoveryLiveSubmitError("trigger_protection_baseline_unavailable")
+    try:
+        rows = method(inst_id=inst_id)
+    except Exception as exc:
+        raise RecoveryLiveSubmitError("trigger_protection_baseline_unavailable") from exc
+    if not isinstance(rows, list):
+        raise RecoveryLiveSubmitError("trigger_protection_baseline_malformed")
+    normalized: list[dict[str, str | None]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RecoveryLiveSubmitError("trigger_protection_baseline_malformed")
+        if str(row.get("triggerOrderType") or "").upper() != "TPSL":
+            continue
+        normalized.append(_normalized_tpsl_row(row))
+    normalized.sort(key=lambda row: (row["ord_id"] or "", row["exchange_created_at"] or ""))
+    return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _normalized_tpsl_row(row: dict[str, Any]) -> dict[str, str | None]:
+    ord_id = _required_snapshot_text(row, "ordId", "orderId", "order_id", "algoId")
+    instrument = _required_snapshot_text(row, "instId", "instrumentId")
+    side = _required_snapshot_text(row, "posSide", "side").lower()
+    return {
+        "ord_id": ord_id,
+        "instrument": instrument.upper(),
+        "side": side,
+        "trigger_order_type": "TPSL",
+        "size": _optional_snapshot_text(row, "sz", "size", "quantity"),
+        "take_profit_trigger_price": _optional_snapshot_text(row, "tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice"),
+        "stop_loss_trigger_price": _optional_snapshot_text(row, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice"),
+        "exchange_created_at": _optional_snapshot_text(row, "cTime", "createdAt", "created_at", "createdTime"),
+        "exchange_updated_at": _optional_snapshot_text(row, "uTime", "updatedAt", "updated_at", "updatedTime"),
+    }
+
+
+def _required_snapshot_text(row: dict[str, Any], *keys: str) -> str:
+    value = _optional_snapshot_text(row, *keys)
+    if value is None:
+        raise RecoveryLiveSubmitError("trigger_protection_baseline_malformed")
+    return value
+
+
+def _optional_snapshot_text(row: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            text = str(value).strip()
+            if text:
+                return text
+    return None
+
+
+def _normalized_trigger_order_id(response: Any) -> str:
+    if not isinstance(response, dict):
+        raise DeepcoinClientError("Deepcoin trigger order response missing order id")
+    order_id = _extract_order_id(response)
+    if not order_id or not order_id.strip():
+        raise DeepcoinClientError("Deepcoin trigger order response missing order id")
+    return order_id.strip()
 
 
 def _persisted_order_request(
