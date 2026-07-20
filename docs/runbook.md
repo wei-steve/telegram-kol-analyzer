@@ -690,6 +690,51 @@ older Miya repair output and fingerprints are void. After deployment:
 These are deployment-time audit requirements, not a claim that production has
 already been checked or repaired.
 
+## 11a. Audit Trigger-Entry Protection-Ledger Adoption
+
+Use this server-only, read-only audit to inspect the historical TPSL protection
+ownership for one reviewed trigger-entry binding and exact position. It reads
+the current Deepcoin pending-TPSL snapshot and prints a dry-run plan; it does
+not submit, cancel, modify, or otherwise mutate an exchange order.
+
+```bash
+cd /opt/telegram-kol-analyzer
+.venv/bin/telegram-kol-research repair-entry-protection-ledger \
+  --database-path data/research.db \
+  --binding-id 158 \
+  --pos-id 1001124227079271 \
+  --include-trigger-entries
+```
+
+Treat the printed plan as an audit artifact. A safe outcome is either zero
+actions, or only the precisely reviewed ledger action(s) that map the verified
+trigger-entry leg's exact `posId` to an exact current TPSL `ordId`; explicit
+refusals for missing, conflicting, partial-size, or non-unique evidence are
+safe fail-closed outcomes. Do not infer ownership from symbol, side, price,
+group, message, or proximity, and do not treat a refusal as proof that no
+protection exists.
+
+An application is permitted only after the immediately preceding dry run shows
+precisely the action set the operator reviewed. Copy that dry run's fingerprint
+verbatim and use it explicitly:
+
+```bash
+.venv/bin/telegram-kol-research repair-entry-protection-ledger \
+  --database-path data/research.db \
+  --binding-id 158 \
+  --pos-id 1001124227079271 \
+  --include-trigger-entries \
+  --apply \
+  --expected-fingerprint <fingerprint-from-reviewed-dry-run>
+```
+
+Never apply a historical entry-protection repair after an operator manually
+changes TP/SL, cancels protection, or otherwise changes protection on the
+exchange without first taking a fresh snapshot and obtaining a new operator
+review. The old dry-run output and fingerprint are then void. If the rebuilt
+plan differs, contains an unexpected action, or contains an unresolved refusal,
+stop and investigate read-only; do not edit the production database directly.
+
 ## 12. Record External Manual Position Closure
 
 Closing a position directly in Deepcoin does not, by itself, authorize the

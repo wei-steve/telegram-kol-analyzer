@@ -173,6 +173,53 @@ systemctl restart telegram-kol.service
 The repair is idempotent. Re-running it updates the same `(binding, purpose,
 leg_index)` rows instead of creating duplicates.
 
+### Audit trigger-entry protection-ledger adoption
+
+After deploying the reviewed trigger-entry protection adoption commit, inspect
+the service health first, then run this server-only read-only audit before any
+historical ledger application:
+
+```bash
+cd /opt/telegram-kol-analyzer
+systemctl is-active telegram-kol.service
+.venv/bin/telegram-kol-research repair-entry-protection-ledger \
+  --database-path data/research.db \
+  --binding-id 158 \
+  --pos-id 1001124227079271 \
+  --include-trigger-entries
+```
+
+The expected safe outcomes are no planned action, or only the exact reviewed
+association from the verified trigger-entry leg's `posId` to its current TPSL
+`ordId`. Missing, conflicting, partial-size, or non-unique candidate evidence
+must remain an explicit refusal and must not be overridden by a symbol/side,
+price, group, message, or time-proximity guess. This audit is read-only: it
+does not place, cancel, or modify an exchange order.
+
+Only when the just-produced dry run contains precisely the reviewed action set
+may an operator apply it with the exact displayed fingerprint:
+
+```bash
+.venv/bin/telegram-kol-research repair-entry-protection-ledger \
+  --database-path data/research.db \
+  --binding-id 158 \
+  --pos-id 1001124227079271 \
+  --include-trigger-entries \
+  --apply \
+  --expected-fingerprint <fingerprint-from-reviewed-dry-run>
+```
+
+Do not apply a historical entry-protection repair after any manual protection
+change (including TP/SL modification, cancellation, or replacement) without a
+fresh exchange snapshot and a new operator review. That manual change voids
+the prior dry-run output and fingerprint. If the current plan differs,
+contains an unexpected action, or records a refusal, stop and keep the work
+read-only rather than modifying production rows directly.
+
+After the read-only audit, inspect one newly created trigger-entry lifecycle
+through `message -> entry leg -> posId -> ledger ordId -> management preflight`.
+Never use a live management message as a test fixture.
+
 ### Repair Deepcoin position attribution
 
 Keep automation fail closed while repairing ownership. Back up SQLite before
