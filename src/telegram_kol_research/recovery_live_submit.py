@@ -102,7 +102,7 @@ def _trigger_protection_account_identity(deepcoin_client: DeepcoinTradingClientP
         if isinstance(api_key, str) and api_key:
             raw_identity = f"api-key:{api_key}"
         else:
-            raw_identity = f"client-instance:{id(deepcoin_client)}"
+            raw_identity = "unknown-account"
     return hashlib.sha256(raw_identity.encode("utf-8")).hexdigest()
 
 
@@ -568,7 +568,7 @@ def _submission_order_legs(
 
 
 def _has_embedded_trigger_protection(order_payload: dict[str, Any]) -> bool:
-    return all(
+    return any(
         order_payload.get(key) not in (None, "")
         for key in ("tpTriggerPx", "slTriggerPx")
     )
@@ -655,9 +655,7 @@ def _submit_trigger_with_protection_intent(
             binding_context=binding_context,
             order_payload=order_payload,
         )
-        request_fingerprint = hashlib.sha256(
-            json.dumps(order_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        request_fingerprint = _trigger_protection_request_fingerprint(order_payload)
         correlation_id = f"trigger-protection:{execution_order_leg_id}"
         with session_factory() as session:
             intent = create_or_get_trigger_protection_intent(
@@ -715,6 +713,22 @@ def _normalized_pending_tpsl_baseline(
         normalized.append(_normalized_tpsl_row(row))
     normalized.sort(key=lambda row: (row["ord_id"] or "", row["exchange_created_at"] or ""))
     return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _trigger_protection_request_fingerprint(order_payload: dict[str, Any]) -> str:
+    """Fingerprint an attached-protection request with both protection sides explicit."""
+
+    fingerprint_payload = dict(order_payload)
+    for key in ("tpTriggerPx", "slTriggerPx"):
+        fingerprint_payload[key] = order_payload.get(key)
+    return hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _normalized_tpsl_row(row: dict[str, Any]) -> dict[str, str | None]:

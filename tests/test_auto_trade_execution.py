@@ -22,6 +22,7 @@ from telegram_kol_research.message_instruction_items import create_message_instr
 from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageInstructionItem, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
+from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
@@ -1341,6 +1342,71 @@ def test_trigger_protection_lock_key_separates_distinct_account_identities():
     assert first != second
     assert first[0] == second[0] == "deepcoin"
     assert first[2:] == second[2:] == ("BTC-USDT-SWAP", "long")
+
+
+def test_trigger_protection_lock_key_shares_unknown_account_identity():
+    class _UnknownAccountClient:
+        pass
+
+    first = _trigger_protection_lock_key(
+        deepcoin_client=_UnknownAccountClient(),
+        venue="deepcoin",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+    )
+    second = _trigger_protection_lock_key(
+        deepcoin_client=_UnknownAccountClient(),
+        venue="deepcoin",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+    )
+
+    assert first == second
+
+
+def test_sl_only_trigger_entry_snapshots_and_persists_protection_intent(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="BTC long 68000-68200 SL 67500",
+        take_profit_text=None,
+    )
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True, "default_max_loss_usdt": 20, "allowed_symbols": ["BTC"]},
+    )
+
+    class _OrderedClient(_FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.call_order = []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.call_order.append("snapshot")
+            return []
+
+        def trigger_order(self, order_payload):
+            self.call_order.append("trigger")
+            return super().trigger_order(order_payload)
+
+    client = _OrderedClient()
+    auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 20, 8, 1, tzinfo=UTC),
+    )
+
+    assert client.call_order[:2] == ["snapshot", "trigger"]
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+    assert intent.parent_trigger_order_id == "trigger-1"
+    assert len(intent.request_fingerprint) == 64
+    assert _trigger_protection_request_fingerprint({"slTriggerPx": 67500}) == (
+        _trigger_protection_request_fingerprint({"slTriggerPx": 67500, "tpTriggerPx": None})
+    )
 
 
 def test_auto_process_range_entry_uses_half_market_half_midpoint_limit_when_near_edge(tmp_path):
