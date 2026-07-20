@@ -1227,6 +1227,17 @@ def test_trigger_limit_entry_persists_tpsl_intent_before_parent_submission(tmp_p
 
         def trigger_order(self, order_payload):
             self.call_order.append(("trigger", order_payload["instId"]))
+            with session_factory() as session:
+                intent = (
+                    session.query(TriggerProtectionIntent)
+                    .filter(
+                        TriggerProtectionIntent.request_fingerprint
+                        == _trigger_protection_request_fingerprint(order_payload)
+                    )
+                    .one()
+                )
+                assert intent.pre_submit_tpsl_baseline_json == "[]"
+                assert intent.parent_trigger_order_id is None
             return super().trigger_order(order_payload)
 
     client = _OrderedClient()
