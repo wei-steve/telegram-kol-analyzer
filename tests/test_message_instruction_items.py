@@ -1,9 +1,14 @@
 import hashlib
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import event
+from sqlalchemy.orm import Query, Session
+from sqlalchemy.sql.dml import Update
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_instruction_items import (
@@ -114,6 +119,44 @@ def test_items_are_unique_and_management_sorts_before_entry(tmp_path):
         assert len(stored) == 2
 
 
+def test_concurrent_item_creation_reloads_unique_conflict_winner(tmp_path):
+    session_factory = create_session_factory(tmp_path / "concurrent-create.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    barrier = threading.Barrier(2)
+
+    def synchronize_first_item_flush(session, _flush_context, _instances):
+        if session.info.get("instruction_item_flush_synchronized"):
+            return
+        if not any(
+            isinstance(item, MessageInstructionItem) for item in session.new
+        ):
+            return
+        session.info["instruction_item_flush_synchronized"] = True
+        barrier.wait(timeout=5)
+
+    event.listen(Session, "before_flush", synchronize_first_item_flush)
+    try:
+        def create_items():
+            with session_factory() as session:
+                items = create_message_instruction_items_in_session(
+                    session,
+                    raw_message_id=raw_id,
+                )
+                session.commit()
+                return [item.id for item in items]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_ids, second_ids = list(
+                pool.map(lambda _index: create_items(), range(2))
+            )
+    finally:
+        event.remove(Session, "before_flush", synchronize_first_item_flush)
+
+    assert first_ids == second_ids
+    with session_factory() as session:
+        assert session.query(MessageInstructionItem).count() == 2
+
+
 def test_claim_transitions_only_pending_items_in_sequence(tmp_path):
     session_factory = create_session_factory(tmp_path / "claim.db")
     raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
@@ -143,6 +186,77 @@ def test_claim_transitions_only_pending_items_in_sequence(tmp_path):
     assert entry.status == "executing"
 
 
+def test_racing_claim_cannot_bypass_pending_or_executing_management(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "claim-race.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        create_message_instruction_items_in_session(session, raw_message_id=raw_id)
+        session.commit()
+
+    delayed_worker_ready = threading.Event()
+    release_delayed_worker = threading.Event()
+    original_scalar = Query.scalar
+    original_session_scalar = Session.scalar
+
+    def pause_old_claim_gap(query):
+        if threading.current_thread().name == "delayed-instruction-claimer":
+            delayed_worker_ready.set()
+            assert release_delayed_worker.wait(timeout=5)
+        return original_scalar(query)
+
+    def pause_atomic_claim(session, statement, *args, **kwargs):
+        if (
+            threading.current_thread().name == "delayed-instruction-claimer"
+            and isinstance(statement, Update)
+            and statement.table.name == MessageInstructionItem.__tablename__
+        ):
+            delayed_worker_ready.set()
+            assert release_delayed_worker.wait(timeout=5)
+        return original_session_scalar(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Query, "scalar", pause_old_claim_gap)
+    monkeypatch.setattr(Session, "scalar", pause_atomic_claim)
+    delayed_result = []
+
+    def delayed_claim():
+        delayed_result.append(
+            claim_next_message_instruction_item(
+                session_factory,
+                raw_message_id=raw_id,
+                now=NOW,
+            )
+        )
+
+    worker = threading.Thread(
+        target=delayed_claim,
+        name="delayed-instruction-claimer",
+    )
+    worker.start()
+    assert delayed_worker_ready.wait(timeout=5)
+    management = claim_next_message_instruction_item(
+        session_factory,
+        raw_message_id=raw_id,
+        now=NOW,
+    )
+    release_delayed_worker.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert management is not None
+    assert management.instruction_kind == "management"
+    assert delayed_result == [None]
+    with session_factory() as session:
+        items = (
+            session.query(MessageInstructionItem)
+            .filter(MessageInstructionItem.raw_message_id == raw_id)
+            .order_by(MessageInstructionItem.sequence)
+            .all()
+        )
+        assert [item.status for item in items] == ["executing", "pending"]
+
+
 def test_claim_never_returns_unknown_item(tmp_path):
     session_factory = create_session_factory(tmp_path / "unknown.db")
     raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
@@ -160,6 +274,28 @@ def test_claim_never_returns_unknown_item(tmp_path):
         )
         is None
     )
+
+
+def test_unknown_management_is_not_reclaimed_and_does_not_block_entry(tmp_path):
+    session_factory = create_session_factory(tmp_path / "unknown-management.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session, raw_message_id=raw_id
+        )
+        items[0].status = "unknown"
+        unknown_id = items[0].id
+        session.commit()
+
+    claimed = claim_next_message_instruction_item(
+        session_factory, raw_message_id=raw_id, now=NOW
+    )
+
+    assert claimed is not None
+    assert claimed.instruction_kind == "entry"
+    assert claimed.id != unknown_id
+    with session_factory() as session:
+        assert session.get(MessageInstructionItem, unknown_id).status == "unknown"
 
 
 @pytest.mark.parametrize(

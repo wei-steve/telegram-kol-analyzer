@@ -6,8 +6,9 @@ import hashlib
 import json
 from datetime import datetime
 
-from sqlalchemy import case, update
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import case, exists, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, aliased, sessionmaker
 
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
 from telegram_kol_research.models import (
@@ -69,24 +70,48 @@ def create_message_instruction_items_in_session(
         )
         item = existing_by_candidate_id.get(candidate.id)
         if item is None:
-            item = MessageInstructionItem(
+            idempotency_key = _idempotency_key(
                 raw_message_id=raw_message.id,
                 signal_candidate_id=candidate.id,
-                sequence=sequence,
                 instruction_kind=instruction_kind,
+                target_lifecycle_id=candidate.target_lifecycle_id,
                 strategy_instance_id=strategy_instance_id,
-                idempotency_key=_idempotency_key(
-                    raw_message_id=raw_message.id,
-                    signal_candidate_id=candidate.id,
-                    instruction_kind=instruction_kind,
-                    target_lifecycle_id=candidate.target_lifecycle_id,
-                    strategy_instance_id=strategy_instance_id,
-                ),
-                status="pending",
             )
-            session.add(item)
-        else:
-            item.sequence = sequence
+            try:
+                with session.begin_nested():
+                    item = MessageInstructionItem(
+                        raw_message_id=raw_message.id,
+                        signal_candidate_id=candidate.id,
+                        sequence=sequence,
+                        instruction_kind=instruction_kind,
+                        strategy_instance_id=strategy_instance_id,
+                        idempotency_key=idempotency_key,
+                        status="pending",
+                    )
+                    session.add(item)
+                    session.flush()
+            except IntegrityError:
+                item = (
+                    session.query(MessageInstructionItem)
+                    .filter(
+                        MessageInstructionItem.raw_message_id == raw_message.id,
+                        MessageInstructionItem.signal_candidate_id == candidate.id,
+                    )
+                    .one_or_none()
+                )
+                if item is None:
+                    item = (
+                        session.query(MessageInstructionItem)
+                        .filter(
+                            MessageInstructionItem.idempotency_key
+                            == idempotency_key
+                        )
+                        .one_or_none()
+                    )
+                if item is None:
+                    raise
+            existing_by_candidate_id[candidate.id] = item
+        item.sequence = sequence
         items.append(item)
 
     session.flush()
@@ -102,53 +127,43 @@ def claim_next_message_instruction_item(
     """Atomically claim the first pending item without bypassing active work."""
 
     with session_factory() as session:
-        while True:
-            executing_exists = (
-                session.query(MessageInstructionItem.id)
-                .filter(
-                    MessageInstructionItem.raw_message_id == int(raw_message_id),
-                    MessageInstructionItem.status == "executing",
-                )
-                .first()
-                is not None
+        pending_item = aliased(MessageInstructionItem)
+        executing_item = aliased(MessageInstructionItem)
+        next_item_id = (
+            select(pending_item.id)
+            .where(
+                pending_item.raw_message_id == int(raw_message_id),
+                pending_item.status == "pending",
+                ~exists(
+                    select(executing_item.id).where(
+                        executing_item.raw_message_id == int(raw_message_id),
+                        executing_item.status == "executing",
+                    )
+                ),
             )
-            if executing_exists:
-                return None
-
-            item_id = (
-                session.query(MessageInstructionItem.id)
-                .filter(
-                    MessageInstructionItem.raw_message_id == int(raw_message_id),
-                    MessageInstructionItem.status == "pending",
-                )
-                .order_by(
-                    MessageInstructionItem.sequence,
-                    MessageInstructionItem.id,
-                )
-                .limit(1)
-                .scalar()
+            .order_by(pending_item.sequence, pending_item.id)
+            .limit(1)
+            .scalar_subquery()
+        )
+        item_id = session.scalar(
+            update(MessageInstructionItem)
+            .where(
+                MessageInstructionItem.id == next_item_id,
+                MessageInstructionItem.status == "pending",
             )
-            if item_id is None:
-                return None
+            .values(status="executing", updated_at=now)
+            .returning(MessageInstructionItem.id)
+        )
+        if item_id is None:
+            session.rollback()
+            return None
 
-            result = session.execute(
-                update(MessageInstructionItem)
-                .where(
-                    MessageInstructionItem.id == item_id,
-                    MessageInstructionItem.status == "pending",
-                )
-                .values(status="executing", updated_at=now)
-            )
-            if result.rowcount != 1:
-                session.rollback()
-                continue
-
-            session.commit()
-            item = session.get(MessageInstructionItem, item_id)
-            if item is None:
-                raise RuntimeError("claimed instruction item disappeared")
-            session.expunge(item)
-            return item
+        session.commit()
+        item = session.get(MessageInstructionItem, item_id)
+        if item is None:
+            raise RuntimeError("claimed instruction item disappeared")
+        session.expunge(item)
+        return item
 
 
 def finish_message_instruction_item(
