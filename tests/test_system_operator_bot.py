@@ -6,6 +6,11 @@ import pytest
 
 import telegram_kol_research.telegram_bot_commands as bot_commands_module
 import telegram_kol_research.system_operator_bot as operator_bot_module
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.message_instruction_items import (
+    create_message_instruction_items_in_session,
+)
+from telegram_kol_research.models import RawMessage, SignalCandidate
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
     build_pending_entry_expiry_review_reply_markup,
@@ -82,6 +87,130 @@ def test_message_instruction_summary_sanitizes_persisted_reason_and_splits():
     assert "secret-value" not in "\n".join(chunks)
     assert len(chunks) > 1
     assert all(0 < len(chunk) < 4096 for chunk in chunks)
+
+
+def test_message_instruction_summary_delivery_retries_failed_claim_once(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "summary-delivery.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=901, text="ETH long")
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="ETH",
+                side="long",
+                event_type="entry_signal",
+            )
+        )
+        session.flush()
+        item = create_message_instruction_items_in_session(
+            session,
+            raw_message_id=raw.id,
+        )[0]
+        item.status = "succeeded"
+        item.result_json = '{"status":"completed"}'
+        raw_id = raw.id
+        session.commit()
+
+    attempts = 0
+
+    async def flaky_sender(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("temporary Telegram failure")
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "send_message_instruction_summary_notification",
+        flaky_sender,
+    )
+    config = SystemOperatorBotConfig(bot_token="token", chat_id="chat")
+
+    first = asyncio.run(
+        operator_bot_module.deliver_message_instruction_summary_notification(
+            session_factory,
+            config=config,
+            raw_message_id=raw_id,
+            claimed_at=NOW,
+        )
+    )
+    second = asyncio.run(
+        operator_bot_module.deliver_message_instruction_summary_notification(
+            session_factory,
+            config=config,
+            raw_message_id=raw_id,
+            claimed_at=NOW,
+        )
+    )
+    third = asyncio.run(
+        operator_bot_module.deliver_message_instruction_summary_notification(
+            session_factory,
+            config=config,
+            raw_message_id=raw_id,
+            claimed_at=NOW,
+        )
+    )
+
+    assert (first, second, third) == (False, True, False)
+    assert attempts == 2
+
+
+def test_pending_summary_scan_skips_ineligible_prefix(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "summary-scan.db")
+    ready_raw_id = None
+    with session_factory() as session:
+        for index in range(7):
+            raw = RawMessage(chat_id=88, message_id=1000 + index, text="ETH long")
+            session.add(raw)
+            session.flush()
+            session.add(
+                SignalCandidate(
+                    raw_message_id=raw.id,
+                    symbol="ETH",
+                    side="long",
+                    event_type="entry_signal",
+                )
+            )
+            session.flush()
+            item = create_message_instruction_items_in_session(
+                session,
+                raw_message_id=raw.id,
+            )[0]
+            if index == 6:
+                item.status = "succeeded"
+                item.result_json = '{"status":"completed"}'
+                item.summary_notification_status = "failed"
+                ready_raw_id = raw.id
+        session.commit()
+
+    delivered: list[int] = []
+
+    async def fake_deliver(*args, **kwargs):
+        delivered.append(kwargs["raw_message_id"])
+        return True
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "deliver_message_instruction_summary_notification",
+        fake_deliver,
+    )
+
+    count = asyncio.run(
+        operator_bot_module.deliver_pending_message_instruction_summaries(
+            session_factory,
+            config=SystemOperatorBotConfig(bot_token="token", chat_id="chat"),
+            claimed_at=NOW,
+            limit=1,
+        )
+    )
+
+    assert count == 1
+    assert delivered == [ready_raw_id]
 
 
 def test_management_notification_formatter_has_exact_identity_and_safety_labels():

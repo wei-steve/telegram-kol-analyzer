@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+import uuid
+from collections.abc import Collection
+from datetime import datetime, timedelta
 
-from sqlalchemy import case, exists, select, update
+from sqlalchemy import and_, case, exists, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased, sessionmaker
 
@@ -23,12 +25,14 @@ from telegram_kol_research.models import (
 MANAGEMENT_EVENT_TYPES = frozenset({"close_signal", "position_update"})
 FINISH_STATUSES = frozenset({"submitted", "succeeded", "failed", "unknown"})
 ERROR_STATUSES = frozenset({"failed", "unknown"})
+SUMMARY_NOTIFICATION_LEASE = timedelta(minutes=5)
 
 
 def create_message_instruction_items_in_session(
     session: Session,
     *,
     raw_message_id: int,
+    candidate_ids: Collection[int] | None = None,
 ) -> list[MessageInstructionItem]:
     """Create one stable item per actionable candidate and return sequence order."""
 
@@ -41,7 +45,7 @@ def create_message_instruction_items_in_session(
         (SignalCandidate.event_type == "entry_signal", 1),
         else_=2,
     )
-    candidates = (
+    candidate_query = (
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == int(raw_message_id))
         .filter(
@@ -49,9 +53,15 @@ def create_message_instruction_items_in_session(
                 [*sorted(MANAGEMENT_EVENT_TYPES), "entry_signal"]
             )
         )
-        .order_by(kind_order, SignalCandidate.id)
-        .all()
     )
+    if candidate_ids is not None:
+        normalized_candidate_ids = {int(candidate_id) for candidate_id in candidate_ids}
+        if not normalized_candidate_ids:
+            return []
+        candidate_query = candidate_query.filter(
+            SignalCandidate.id.in_(normalized_candidate_ids)
+        )
+    candidates = candidate_query.order_by(kind_order, SignalCandidate.id).all()
     existing_by_candidate_id = {
         item.signal_candidate_id: item
         for item in session.query(MessageInstructionItem)
@@ -112,6 +122,7 @@ def create_message_instruction_items_in_session(
                     raise
             existing_by_candidate_id[candidate.id] = item
         item.sequence = sequence
+        item.retired_at = None
         items.append(item)
 
     session.flush()
@@ -134,6 +145,7 @@ def claim_next_message_instruction_item(
             .where(
                 pending_item.raw_message_id == int(raw_message_id),
                 pending_item.status == "pending",
+                pending_item.retired_at.is_(None),
                 ~exists(
                     select(executing_item.id).where(
                         executing_item.raw_message_id == int(raw_message_id),
@@ -150,6 +162,7 @@ def claim_next_message_instruction_item(
             .where(
                 MessageInstructionItem.id == next_item_id,
                 MessageInstructionItem.status == "pending",
+                MessageInstructionItem.retired_at.is_(None),
             )
             .values(status="executing", updated_at=now)
             .returning(MessageInstructionItem.id)
@@ -217,16 +230,181 @@ def list_message_instruction_item_results(
         items = (
             session.query(MessageInstructionItem)
             .filter(MessageInstructionItem.raw_message_id == int(raw_message_id))
+            .filter(MessageInstructionItem.retired_at.is_(None))
             .order_by(MessageInstructionItem.sequence, MessageInstructionItem.id)
             .all()
         )
         return [_public_item_result(item) for item in items]
 
 
+def has_message_instruction_items(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+) -> bool:
+    """Return whether orchestration was ever projected for the message."""
+
+    with session_factory() as session:
+        return (
+            session.query(MessageInstructionItem.id)
+            .filter(MessageInstructionItem.raw_message_id == int(raw_message_id))
+            .first()
+            is not None
+        )
+
+
+def claim_message_instruction_summary(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    claimed_at: datetime,
+    chat_title: str | None = None,
+) -> dict | None:
+    """Claim one terminal active-item summary before any external delivery."""
+
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        items = (
+            session.query(MessageInstructionItem)
+            .filter(MessageInstructionItem.raw_message_id == int(raw_message_id))
+            .filter(MessageInstructionItem.retired_at.is_(None))
+            .order_by(MessageInstructionItem.sequence, MessageInstructionItem.id)
+            .all()
+        )
+        if not items or any(item.status not in FINISH_STATUSES for item in items):
+            return None
+        lease_cutoff = claimed_at - SUMMARY_NOTIFICATION_LEASE
+        if any(
+            item.summary_notification_status == "delivering"
+            and item.summary_notification_claimed_at is not None
+            and _datetime_after(item.summary_notification_claimed_at, lease_cutoff)
+            for item in items
+        ):
+            return None
+        claimable_item_ids = [
+            item.id
+            for item in items
+            if item.summary_notification_status != "delivered"
+            and (
+                item.summary_notification_status != "delivering"
+                or item.summary_notification_claimed_at is None
+                or not _datetime_after(
+                    item.summary_notification_claimed_at,
+                    lease_cutoff,
+                )
+            )
+        ]
+        if not claimable_item_ids:
+            return None
+
+        claim_token = uuid.uuid4().hex
+        claimed = session.execute(
+            update(MessageInstructionItem)
+            .where(
+                MessageInstructionItem.id.in_(claimable_item_ids),
+                MessageInstructionItem.retired_at.is_(None),
+                or_(
+                    MessageInstructionItem.summary_notification_status.in_(
+                        ["pending", "failed"]
+                    ),
+                    MessageInstructionItem.summary_notification_status.is_(None),
+                    and_(
+                        MessageInstructionItem.summary_notification_status
+                        == "delivering",
+                        or_(
+                            MessageInstructionItem.summary_notification_claimed_at.is_(
+                                None
+                            ),
+                            MessageInstructionItem.summary_notification_claimed_at
+                            <= lease_cutoff,
+                        ),
+                    ),
+                ),
+            )
+            .values(
+                summary_notification_status="delivering",
+                summary_notification_claim_token=claim_token,
+                summary_notification_claimed_at=claimed_at,
+                summary_notification_error=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if claimed.rowcount != len(claimable_item_ids):
+            session.rollback()
+            return None
+        payload = {
+            "raw_message_id": raw_message.id,
+            "chat_id": raw_message.chat_id,
+            "message_id": raw_message.message_id,
+            "chat_title": chat_title or raw_message.sender_name,
+            "notification_id": _summary_notification_id(items),
+            "notification_claim_token": claim_token,
+            "notification_item_ids": claimable_item_ids,
+            "items": [_public_item_result(item) for item in items],
+        }
+        session.commit()
+        return payload
+
+
+def finish_message_instruction_summary_delivery(
+    session_factory: sessionmaker,
+    *,
+    claim_token: str,
+    item_ids: Collection[int],
+    delivered: bool,
+    completed_at: datetime,
+    error: str | None = None,
+) -> None:
+    """Finalize one leased summary delivery without accepting a stale worker."""
+
+    normalized_item_ids = [int(item_id) for item_id in item_ids]
+    if not normalized_item_ids:
+        raise ValueError("notification item ids are required")
+    values = {
+        "summary_notification_status": "delivered" if delivered else "failed",
+        "summary_notification_claim_token": None,
+        "summary_notification_error": (
+            None if delivered else str(error or "delivery_failed")[:1000]
+        ),
+        "summary_notified_at": completed_at if delivered else None,
+    }
+    with session_factory() as session:
+        finalized = session.execute(
+            update(MessageInstructionItem)
+            .where(
+                MessageInstructionItem.id.in_(normalized_item_ids),
+                MessageInstructionItem.summary_notification_status == "delivering",
+                MessageInstructionItem.summary_notification_claim_token == claim_token,
+            )
+            .values(**values)
+        )
+        if finalized.rowcount != len(normalized_item_ids):
+            session.rollback()
+            raise RuntimeError("message instruction summary claim is stale")
+        session.commit()
+
+
+def _summary_notification_id(items: list[MessageInstructionItem]) -> str:
+    canonical = ":".join(item.idempotency_key for item in items)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:24]
+
+
+def _datetime_after(value: datetime, boundary: datetime) -> bool:
+    if value.tzinfo is None and boundary.tzinfo is not None:
+        boundary = boundary.replace(tzinfo=None)
+    elif value.tzinfo is not None and boundary.tzinfo is None:
+        value = value.replace(tzinfo=None)
+    return value > boundary
+
+
 def _public_item_result(item: MessageInstructionItem) -> dict:
     summary = {
         "item_id": item.id,
+        "sequence": item.sequence,
         "instruction_kind": item.instruction_kind,
+        "strategy_instance_id": item.strategy_instance_id,
         "status": item.status,
     }
     payload_text = (

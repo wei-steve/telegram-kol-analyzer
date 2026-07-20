@@ -14,7 +14,7 @@ from telegram_kol_research.message_recognition import (
     MessageRecognitionResult,
     apply_authoritative_mimo_payload,
 )
-from telegram_kol_research.models import SignalCandidate
+from telegram_kol_research.models import MessageInstructionItem
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
     claim_authoritative_execution,
@@ -243,9 +243,9 @@ def process_authoritative_message(
 def _has_current_mimo_candidate(session_factory: sessionmaker, raw_message_id: int) -> bool:
     with session_factory() as session:
         return (
-            session.query(SignalCandidate.id)
-            .filter(SignalCandidate.raw_message_id == raw_message_id)
-            .filter(SignalCandidate.parse_source == "mimo_authoritative")
+            session.query(MessageInstructionItem.id)
+            .filter(MessageInstructionItem.raw_message_id == raw_message_id)
+            .filter(MessageInstructionItem.retired_at.is_(None))
             .first()
             is not None
         )

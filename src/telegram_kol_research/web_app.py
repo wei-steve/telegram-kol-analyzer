@@ -174,6 +174,7 @@ from telegram_kol_research.lifecycle_monitor import (
 )
 from telegram_kol_research.telegram_live_listener import (
     _build_authoritative_notification_payload,
+    _deliver_authoritative_instruction_summary,
     _filter_callable_kwargs,
     _handle_authoritative_failure_notification,
     _schedule_authoritative_notification,
@@ -4273,6 +4274,14 @@ def create_web_app(
                 )
             else:
                 notification_scheduled = False
+            await _deliver_authoritative_instruction_summary(
+                processing_result=processing_result,
+                session_factory=app.state.session_factory,
+                raw_message_id=raw_message_id,
+                chat_title=raw_message.sender_name,
+                system_operator_bot_config=app.state.system_operator_bot_config,
+                claimed_at=app.state.now_provider(),
+            )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:

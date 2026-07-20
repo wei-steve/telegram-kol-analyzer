@@ -17,7 +17,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageInstructionItem, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
@@ -332,6 +332,35 @@ def test_unknown_management_submission_does_not_retry_or_block_same_message_entr
     assert call_counts == {"management": 1, "entry": 1}
     assert [item["status"] for item in first["items"]] == ["unknown", "submitted"]
     assert second == first
+
+
+def test_retired_instruction_set_never_falls_back_to_candidate_execution(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "retired-items.db")
+    raw_message_id, _, _ = _persist_same_message_instruction_items(session_factory)
+    with session_factory() as session:
+        for item in session.query(MessageInstructionItem).all():
+            item.retired_at = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+        session.commit()
+
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    monkeypatch.setattr(
+        auto_module,
+        "_auto_process_single_message_trade_signal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("retired durable items must block legacy fallback")
+        ),
+    )
+
+    assert auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+    ) == {"status": "completed", "items": []}
 
 
 def test_management_recovery_required_is_unknown_and_does_not_block_same_message_entry(

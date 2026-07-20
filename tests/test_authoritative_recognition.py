@@ -14,6 +14,7 @@ from telegram_kol_research.authoritative_recognition import (
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
+    MessageInstructionItem,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -536,10 +537,27 @@ def test_authoritative_generation_supersedes_candidate_generation(tmp_path):
     )
 
     with session_factory() as session:
-        candidate = session.query(SignalCandidate).one()
-        assert candidate.parse_source == "mimo_authoritative"
-        assert candidate.target_lifecycle_id == lifecycle_id
-        assert candidate.recognition_generation == "generation-b"
+        candidates = session.query(SignalCandidate).order_by(SignalCandidate.id).all()
+        active_item = (
+            session.query(MessageInstructionItem)
+            .filter(MessageInstructionItem.retired_at.is_(None))
+            .one()
+        )
+        active_candidate = session.get(
+            SignalCandidate,
+            active_item.signal_candidate_id,
+        )
+        assert [candidate.recognition_generation for candidate in candidates] == [
+            "generation-a",
+            "generation-b",
+        ]
+        assert all(
+            candidate.parse_source == "mimo_authoritative"
+            and candidate.target_lifecycle_id == lifecycle_id
+            for candidate in candidates
+        )
+        assert active_candidate is not None
+        assert active_candidate.recognition_generation == "generation-b"
 
 
 def test_running_generation_blocks_new_process_until_it_finalizes(tmp_path, monkeypatch):

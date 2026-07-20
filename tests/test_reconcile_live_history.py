@@ -2,7 +2,16 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import MediaAsset, RawMessage, SyncCheckpoint
+from telegram_kol_research.message_instruction_items import (
+    create_message_instruction_items_in_session,
+)
+from telegram_kol_research.models import (
+    MediaAsset,
+    RawMessage,
+    SignalCandidate,
+    SyncCheckpoint,
+)
+from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_live_listener import run_live_listener, run_reconcile_once
 
 
@@ -147,6 +156,125 @@ def test_reconcile_processes_each_new_message_authoritatively_exactly_once(tmp_p
             for raw_message_id in processed
         }
     assert processed_message_ids == {77, 78}
+
+
+def test_reconcile_delivers_completed_instruction_summaries(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "summary.db")
+    delivered: list[int] = []
+
+    def authoritative_processor(raw_message_id):
+        return SimpleNamespace(
+            recognition=SimpleNamespace(status="是策略"),
+            assessment=SimpleNamespace(
+                agreement_status="pending",
+                differences=[],
+                mimo=SimpleNamespace(
+                    model="mimo-v2.5",
+                    status="是策略",
+                    payload={},
+                    error_message=None,
+                ),
+                deepseek_payload=None,
+            ),
+            automation={
+                "status": "completed",
+                "items": [
+                    {
+                        "item_id": raw_message_id,
+                        "sequence": 0,
+                        "instruction_kind": "entry",
+                        "strategy_instance_id": f"strategy-{raw_message_id}",
+                        "status": "submitted",
+                    }
+                ],
+            },
+        )
+
+    async def fake_deliver(*args, **kwargs):
+        delivered.append(kwargs["raw_message_id"])
+        return True
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener."
+        "deliver_message_instruction_summary_notification",
+        fake_deliver,
+    )
+
+    __import__("asyncio").run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            authoritative_processor=authoritative_processor,
+            system_operator_bot_config=SystemOperatorBotConfig(
+                bot_token="system-token",
+                chat_id="system-chat",
+            ),
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=_fake_fetch_dialog_messages,
+        )
+    )
+
+    assert len(delivered) == 2
+
+
+def test_reconcile_retries_failed_summary_without_new_messages(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "summary-retry.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=9001, message_id=88, text="ETH long")
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="ETH",
+                side="long",
+                event_type="entry_signal",
+            )
+        )
+        session.flush()
+        item = create_message_instruction_items_in_session(
+            session,
+            raw_message_id=raw.id,
+        )[0]
+        item.status = "succeeded"
+        item.result_json = '{"status":"completed"}'
+        item.summary_notification_status = "failed"
+        raw_id = raw.id
+        session.commit()
+
+    delivered: list[int] = []
+
+    async def fake_deliver(*args, **kwargs):
+        delivered.append(kwargs["raw_message_id"])
+        return True
+
+    monkeypatch.setattr(
+        "telegram_kol_research.system_operator_bot."
+        "deliver_message_instruction_summary_notification",
+        fake_deliver,
+    )
+
+    async def no_dialogs(client):
+        return []
+
+    __import__("asyncio").run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            system_operator_bot_config=SystemOperatorBotConfig(
+                bot_token="system-token",
+                chat_id="system-chat",
+            ),
+            discover_dialogs_fn=no_dialogs,
+            fetch_dialog_messages_fn=_fake_fetch_dialog_messages,
+        )
+    )
+
+    assert delivered == [raw_id]
 
 
 def test_run_reconcile_once_limits_media_downloads_to_new_messages(tmp_path):

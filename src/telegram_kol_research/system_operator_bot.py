@@ -6,6 +6,7 @@ import os
 import json
 import asyncio
 import hashlib
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -14,11 +15,21 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import or_, update
+from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from telegram_kol_research.llm_chat import _load_env_file_values
+from telegram_kol_research.message_instruction_items import (
+    FINISH_STATUSES,
+    SUMMARY_NOTIFICATION_LEASE,
+    claim_message_instruction_summary,
+    finish_message_instruction_summary_delivery,
+)
 from telegram_kol_research.time_utils import utc_naive_to_local
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -379,6 +390,8 @@ def format_message_instruction_summary(payload: dict[str, Any]) -> str:
             f"{payload.get('chat_id') or '-'} / #{payload.get('message_id') or '-'}"
         ),
     ]
+    if payload.get("notification_id"):
+        lines.append(f"通知ID: {payload['notification_id']}")
     management_failed = False
     entry_attempted = False
     for item in ordered_items[:100]:
@@ -923,6 +936,123 @@ async def send_message_instruction_summary_notification(
 
     for text in split_message_instruction_summary(payload):
         await send_system_operator_bot_message(config=config, text=text)
+
+
+async def deliver_message_instruction_summary_notification(
+    session_factory,
+    *,
+    config: SystemOperatorBotConfig,
+    raw_message_id: int,
+    chat_title: str | None = None,
+    claimed_at: datetime | None = None,
+) -> bool:
+    """Deliver a completed summary through the leased durable outbox."""
+
+    payload = claim_message_instruction_summary(
+        session_factory,
+        raw_message_id=raw_message_id,
+        claimed_at=claimed_at or datetime.now(UTC),
+        chat_title=chat_title,
+    )
+    if payload is None:
+        return False
+    completed_at = claimed_at or datetime.now(UTC)
+    try:
+        await send_message_instruction_summary_notification(
+            config=config,
+            payload=payload,
+        )
+    except Exception as exc:
+        finish_message_instruction_summary_delivery(
+            session_factory,
+            claim_token=payload["notification_claim_token"],
+            item_ids=payload["notification_item_ids"],
+            delivered=False,
+            completed_at=completed_at,
+            error=str(exc),
+        )
+        logger.exception(
+            "message instruction summary delivery failed for raw_message_id=%s",
+            raw_message_id,
+        )
+        return False
+    finish_message_instruction_summary_delivery(
+        session_factory,
+        claim_token=payload["notification_claim_token"],
+        item_ids=payload["notification_item_ids"],
+        delivered=True,
+        completed_at=completed_at,
+    )
+    return True
+
+
+async def deliver_pending_message_instruction_summaries(
+    session_factory,
+    *,
+    config: SystemOperatorBotConfig,
+    claimed_at: datetime | None = None,
+    limit: int = 20,
+) -> int:
+    """Retry a bounded batch of pending, failed, or expired summary deliveries."""
+
+    from telegram_kol_research.models import MessageInstructionItem
+
+    now = claimed_at or datetime.now(UTC)
+    lease_cutoff = now - SUMMARY_NOTIFICATION_LEASE
+    with session_factory() as session:
+        candidate_item = aliased(MessageInstructionItem)
+        blocking_item = aliased(MessageInstructionItem)
+        raw_message_ids = [
+            int(raw_message_id)
+            for (raw_message_id,) in (
+                session.query(candidate_item.raw_message_id)
+                .filter(candidate_item.retired_at.is_(None))
+                .filter(candidate_item.status.in_(sorted(FINISH_STATUSES)))
+                .filter(
+                    or_(
+                        candidate_item.summary_notification_status.in_(
+                            ["pending", "failed"]
+                        ),
+                        candidate_item.summary_notification_status.is_(None),
+                        and_(
+                            candidate_item.summary_notification_status == "delivering",
+                            or_(
+                                candidate_item.summary_notification_claimed_at.is_(None),
+                                candidate_item.summary_notification_claimed_at
+                                <= lease_cutoff,
+                            ),
+                        ),
+                    )
+                )
+                .filter(
+                    ~exists(
+                        select(blocking_item.id).where(
+                            blocking_item.raw_message_id
+                            == candidate_item.raw_message_id,
+                            blocking_item.retired_at.is_(None),
+                            ~blocking_item.status.in_(sorted(FINISH_STATUSES)),
+                        )
+                    )
+                )
+                .distinct()
+                .order_by(candidate_item.raw_message_id.asc())
+                .limit(max(1, int(limit)))
+                .all()
+            )
+        ]
+
+    delivered = 0
+    for raw_message_id in raw_message_ids:
+        if await deliver_message_instruction_summary_notification(
+            session_factory,
+            config=config,
+            raw_message_id=raw_message_id,
+            claimed_at=now,
+        ):
+            delivered += 1
+            if delivered >= max(1, int(limit)):
+                break
+    return delivered
 
 
 async def deliver_pending_position_attribution_incidents(

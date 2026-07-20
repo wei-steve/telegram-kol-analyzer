@@ -2986,6 +2986,75 @@ def test_message_recognition_api_runs_auto_trade_executor_after_recognition(tmp_
     }
 
 
+def test_message_recognition_api_delivers_completed_instruction_summary(
+    tmp_path,
+    monkeypatch,
+):
+    app = create_web_app(
+        database_path=tmp_path / "manual-summary.db",
+        ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
+    )
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="system-token",
+        chat_id="system-chat",
+    )
+    with app.state.session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=2002,
+            sender_name="VIP room",
+            text="ETH long",
+        )
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    result = MessageRecognitionResult(
+        raw_message_id=raw_message_id,
+        status="是策略",
+        parse_source="mimo_authoritative",
+    )
+    app.state.authoritative_processor = lambda _message_id: SimpleNamespace(
+        recognition=result,
+        assessment=SimpleNamespace(
+            agreement_status="pending",
+            semantic_review_status="pending",
+            differences=[],
+            mimo=SimpleNamespace(model="mimo-v2.5"),
+        ),
+        automation={
+            "status": "completed",
+            "items": [
+                {
+                    "item_id": 9,
+                    "sequence": 0,
+                    "instruction_kind": "entry",
+                    "strategy_instance_id": "deepcoin:88:2002:ETH:long",
+                    "status": "submitted",
+                }
+            ],
+        },
+    )
+    deliveries: list[dict] = []
+
+    async def fake_deliver(**kwargs):
+        deliveries.append(kwargs)
+        return True
+
+    monkeypatch.setattr(
+        "telegram_kol_research.web_app."
+        "_deliver_authoritative_instruction_summary",
+        fake_deliver,
+    )
+
+    response = TestClient(app).post(f"/api/messages/{raw_message_id}/recognize")
+
+    assert response.status_code == 200
+    assert len(deliveries) == 1
+    assert deliveries[0]["raw_message_id"] == raw_message_id
+    assert deliveries[0]["chat_title"] == "VIP room"
+
+
 def test_message_recognition_api_reports_pending_without_scheduling_review(
     tmp_path, monkeypatch
 ):

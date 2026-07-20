@@ -130,6 +130,28 @@ class MessageInstructionItem(Base):
     )
     result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retired_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    summary_notification_claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+    summary_notification_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="pending",
+    )
+    summary_notification_claim_token: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    summary_notification_error: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    summary_notified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=utc_now, nullable=False
     )

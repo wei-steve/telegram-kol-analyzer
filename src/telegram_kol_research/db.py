@@ -60,6 +60,31 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "recognition_generation": "ALTER TABLE signal_candidates ADD COLUMN recognition_generation VARCHAR(64)",
         "review_note": "ALTER TABLE signal_candidates ADD COLUMN review_note TEXT",
     },
+    "message_instruction_items": {
+        "retired_at": (
+            "ALTER TABLE message_instruction_items ADD COLUMN retired_at DATETIME"
+        ),
+        "summary_notification_claimed_at": (
+            "ALTER TABLE message_instruction_items "
+            "ADD COLUMN summary_notification_claimed_at DATETIME"
+        ),
+        "summary_notification_status": (
+            "ALTER TABLE message_instruction_items "
+            "ADD COLUMN summary_notification_status VARCHAR(32) "
+            "NOT NULL DEFAULT 'pending'"
+        ),
+        "summary_notification_claim_token": (
+            "ALTER TABLE message_instruction_items "
+            "ADD COLUMN summary_notification_claim_token VARCHAR(64)"
+        ),
+        "summary_notification_error": (
+            "ALTER TABLE message_instruction_items "
+            "ADD COLUMN summary_notification_error TEXT"
+        ),
+        "summary_notified_at": (
+            "ALTER TABLE message_instruction_items ADD COLUMN summary_notified_at DATETIME"
+        ),
+    },
     "trade_ideas": {
         "source_id": "ALTER TABLE trade_ideas ADD COLUMN source_id INTEGER",
     },

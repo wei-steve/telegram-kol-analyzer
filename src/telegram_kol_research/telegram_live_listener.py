@@ -24,6 +24,8 @@ from telegram_kol_research.recognition_experiments import run_mimo_direct_for_me
 from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
 from telegram_kol_research.strategy_alerts import process_strategy_alert_for_record
 from telegram_kol_research.system_operator_bot import (
+    deliver_message_instruction_summary_notification,
+    deliver_pending_message_instruction_summaries,
     send_ai_recognition_conflict_review,
     system_operator_bot_enabled,
 )
@@ -56,6 +58,32 @@ _EXTERNAL_MARKET_TERMS = (
     "美光", "MU", "INTEL", "DELL", "NVDA", "英伟达", "美股", "纳斯达克",
     "A股", "三星", "海力士",
 )
+
+
+async def _deliver_authoritative_instruction_summary(
+    *,
+    processing_result: Any,
+    session_factory,
+    raw_message_id: int,
+    chat_title: str | None,
+    system_operator_bot_config: Any | None,
+    claimed_at=None,
+) -> bool:
+    automation = getattr(processing_result, "automation", None)
+    if (
+        not isinstance(automation, dict)
+        or not isinstance(automation.get("items"), list)
+        or not automation["items"]
+        or not system_operator_bot_enabled(system_operator_bot_config)
+    ):
+        return False
+    return await deliver_message_instruction_summary_notification(
+        session_factory,
+        config=system_operator_bot_config,
+        raw_message_id=raw_message_id,
+        chat_title=chat_title,
+        claimed_at=claimed_at,
+    )
 
 
 async def persist_live_message_event(
@@ -171,6 +199,13 @@ async def persist_live_message_event(
                         retry_processor=authoritative_processor,
                         retry_delay_seconds=authoritative_failure_retry_delay_seconds,
                     )
+                await _deliver_authoritative_instruction_summary(
+                    processing_result=processing_result,
+                    session_factory=session_factory,
+                    raw_message_id=raw_message.id,
+                    chat_title=chat_title,
+                    system_operator_bot_config=system_operator_bot_config,
+                )
             else:
                 recog_result = await asyncio.to_thread(
                     recognize_message_now,
@@ -584,6 +619,11 @@ async def run_reconcile_once(
     """Fetch a recent overlap window and persist only messages newer than the history checkpoint."""
 
     repair_history_checkpoints(session_factory)
+    if system_operator_bot_enabled(system_operator_bot_config):
+        await deliver_pending_message_instruction_summaries(
+            session_factory,
+            config=system_operator_bot_config,
+        )
     dialogs = await discover_dialogs_fn(client)
     matched_dialogs = filter_target_dialogs(dialogs, target_titles)
 
@@ -694,6 +734,13 @@ async def run_reconcile_once(
                         retry_processor=authoritative_processor,
                         retry_delay_seconds=authoritative_failure_retry_delay_seconds,
                     )
+                await _deliver_authoritative_instruction_summary(
+                    processing_result=processing_result,
+                    session_factory=session_factory,
+                    raw_message_id=raw_message.id,
+                    chat_title=str(dialog.get("title") or ""),
+                    system_operator_bot_config=system_operator_bot_config,
+                )
             with session_factory() as session:
                 inserted_candidates += max(
                     0,

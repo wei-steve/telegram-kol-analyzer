@@ -30,6 +30,7 @@ from telegram_kol_research.models import (
 from telegram_kol_research.message_instruction_items import (
     claim_next_message_instruction_item,
     finish_message_instruction_item,
+    has_message_instruction_items,
     list_message_instruction_item_results,
 )
 from telegram_kol_research.price_normalization import extract_normalized_prices
@@ -66,7 +67,7 @@ def auto_process_message_trade_signal(
 ) -> dict[str, Any]:
     """Execute projected items, or use the legacy single-candidate path."""
 
-    if list_message_instruction_item_results(
+    if has_message_instruction_items(
         session_factory,
         raw_message_id=raw_message_id,
     ):

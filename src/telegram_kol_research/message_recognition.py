@@ -1001,6 +1001,7 @@ def _apply_lifecycle_event_decision(
     *,
     parse_source: str = "lifecycle_ai",
     authoritative_generation: str | None = None,
+    applied_candidate_ids: set[int] | None = None,
 ) -> bool:
     event_type = str(decision.get("event_type") or "none").strip()
     try:
@@ -1055,13 +1056,14 @@ def _apply_lifecycle_event_decision(
         target.exit_reason = None
         target.exited_at = None
         target.updated_at = utc_now()
-        _upsert_entry_confirmation_candidate(
+        candidate = _upsert_entry_confirmation_candidate(
             session,
             raw_message=raw_message,
             lifecycle=target,
             entry_price=entry_price,
             parse_source=parse_source,
         )
+        _remember_applied_candidate(session, candidate, applied_candidate_ids)
         return True
 
     if event_type == "cancel_entry" and target.lifecycle_status == "pending_entry":
@@ -1070,12 +1072,13 @@ def _apply_lifecycle_event_decision(
         target.exited_at = event_at
         target.exit_signal_message_id = raw_message.message_id
         target.updated_at = utc_now()
-        _upsert_close_signal_candidate(
+        candidate = _upsert_close_signal_candidate(
             session,
             raw_message=raw_message,
             lifecycle=target,
             parse_source=parse_source,
         )
+        _remember_applied_candidate(session, candidate, applied_candidate_ids)
         return True
 
     if event_type == "exit_position" and (
@@ -1092,7 +1095,7 @@ def _apply_lifecycle_event_decision(
                 exit_message_id=raw_message.message_id,
                 reason=str(decision.get("reason") or "").strip() or None,
             )
-            _upsert_close_signal_candidate(
+            candidate = _upsert_close_signal_candidate(
                 session,
                 raw_message=raw_message,
                 lifecycle=target,
@@ -1101,6 +1104,7 @@ def _apply_lifecycle_event_decision(
                 management_fraction=management_fraction,
                 recognition_generation=authoritative_generation,
             )
+            _remember_applied_candidate(session, candidate, applied_candidate_ids)
             return True
         target.lifecycle_status = "exited"
         target.exit_reason = "kol_signal"
@@ -1110,7 +1114,7 @@ def _apply_lifecycle_event_decision(
             target.exit_price_actual = exit_price
         target.exit_signal_message_id = raw_message.message_id
         target.updated_at = utc_now()
-        _upsert_close_signal_candidate(
+        candidate = _upsert_close_signal_candidate(
             session,
             raw_message=raw_message,
             lifecycle=target,
@@ -1119,6 +1123,7 @@ def _apply_lifecycle_event_decision(
             management_fraction=management_fraction,
             recognition_generation=authoritative_generation,
         )
+        _remember_applied_candidate(session, candidate, applied_candidate_ids)
         return True
 
     if event_type == "position_update" and target.lifecycle_status == "entered":
@@ -1152,7 +1157,7 @@ def _apply_lifecycle_event_decision(
         requested_stop_loss = (
             explicit_stop_loss if explicit_stop_loss is not None else protective_stop
         )
-        _upsert_management_signal_candidate(
+        candidate = _upsert_management_signal_candidate(
             session,
             raw_message=raw_message,
             lifecycle=target,
@@ -1163,9 +1168,21 @@ def _apply_lifecycle_event_decision(
             requested_stop_loss=requested_stop_loss,
             requested_take_profit=explicit_take_profit,
         )
+        _remember_applied_candidate(session, candidate, applied_candidate_ids)
         return True
 
     return False
+
+
+def _remember_applied_candidate(
+    session,
+    candidate: SignalCandidate,
+    applied_candidate_ids: set[int] | None,
+) -> None:
+    if applied_candidate_ids is None:
+        return
+    session.flush()
+    applied_candidate_ids.add(candidate.id)
 
 
 def normalize_management_intent(
@@ -1809,15 +1826,21 @@ def apply_authoritative_mimo_payload(
         raw_message = session.get(RawMessage, raw_message_id)
         if raw_message is None:
             raise LookupError("raw message not found")
-        # A re-recognition must never leave a prior MiMo candidate executable.
-        # Current application below promotes only the independently actionable
-        # candidate roles back to the authoritative parse source.
+        # Supersede only unlinked rows. Any candidate referenced by a durable
+        # instruction remains an immutable execution snapshot and is retired
+        # through its item when the new authority no longer accepts it.
+        item_linked_candidate_ids = (
+            session.query(MessageInstructionItem.signal_candidate_id)
+            .filter(MessageInstructionItem.raw_message_id == raw_message_id)
+        )
         (
             session.query(SignalCandidate)
             .filter(SignalCandidate.raw_message_id == raw_message_id)
             .filter(SignalCandidate.parse_source == "mimo_authoritative")
+            .filter(~SignalCandidate.id.in_(item_linked_candidate_ids))
             .update({SignalCandidate.parse_source: "mimo_superseded"})
         )
+        accepted_candidate_ids: set[int] = set()
         if error_message or not payload:
             result = MessageRecognitionResult(
                 raw_message_id=raw_message_id,
@@ -1830,6 +1853,7 @@ def apply_authoritative_mimo_payload(
             _project_authoritative_instruction_items(
                 session,
                 raw_message_id=raw_message_id,
+                accepted_candidate_ids=accepted_candidate_ids,
             )
             session.commit()
             return result
@@ -1848,6 +1872,7 @@ def apply_authoritative_mimo_payload(
                 lifecycle_event,
                 parse_source="mimo_authoritative",
                 authoritative_generation=authoritative_generation,
+                applied_candidate_ids=accepted_candidate_ids,
             )
 
         result = _result_from_ai_payload(
@@ -1882,7 +1907,15 @@ def apply_authoritative_mimo_payload(
                 )
                 _upsert_recognition(session, result, engine=model)
             else:
-                _persist_ai_result(session, raw_message, result, engine=model)
+                entry_candidate = _persist_ai_result(
+                    session,
+                    raw_message,
+                    result,
+                    engine=model,
+                )
+                if entry_candidate is not None:
+                    session.flush()
+                    accepted_candidate_ids.add(entry_candidate.id)
                 entry_applied = True
         elif lifecycle_applied:
             result = MessageRecognitionResult(
@@ -1910,6 +1943,7 @@ def apply_authoritative_mimo_payload(
         _project_authoritative_instruction_items(
             session,
             raw_message_id=raw_message_id,
+            accepted_candidate_ids=accepted_candidate_ids,
         )
         session.commit()
         return result
@@ -1942,27 +1976,15 @@ def _project_authoritative_instruction_items(
     session,
     *,
     raw_message_id: int,
+    accepted_candidate_ids: set[int],
 ) -> None:
     """Project only candidates accepted by the latest authoritative pass."""
 
     session.flush()
-    accepted_candidate_ids = {
-        candidate_id
-        for (candidate_id,) in (
-            session.query(SignalCandidate.id)
-            .filter(SignalCandidate.raw_message_id == raw_message_id)
-            .filter(SignalCandidate.parse_source == "mimo_authoritative")
-            .filter(
-                SignalCandidate.event_type.in_(
-                    ["close_signal", "position_update", "entry_signal"]
-                )
-            )
-            .all()
-        )
-    }
     projected_items = create_message_instruction_items_in_session(
         session,
         raw_message_id=raw_message_id,
+        candidate_ids=accepted_candidate_ids,
     )
     accepted_items = [
         item
@@ -1974,7 +1996,7 @@ def _project_authoritative_instruction_items(
     obsolete_pending_items = (
         session.query(MessageInstructionItem)
         .filter(MessageInstructionItem.raw_message_id == raw_message_id)
-        .filter(MessageInstructionItem.status == "pending")
+        .filter(MessageInstructionItem.retired_at.is_(None))
         .filter(
             ~MessageInstructionItem.signal_candidate_id.in_(accepted_candidate_ids)
             if accepted_candidate_ids
@@ -1983,7 +2005,7 @@ def _project_authoritative_instruction_items(
         .all()
     )
     for item in obsolete_pending_items:
-        session.delete(item)
+        item.retired_at = utc_now()
     session.flush()
 
 
@@ -1993,7 +2015,7 @@ def _persist_ai_result(
     result: MessageRecognitionResult,
     *,
     engine: str,
-) -> None:
+) -> SignalCandidate | None:
     payload = result.ai_payload or {}
     parse_source = result.parse_source or "ai"
     if result.status == "是策略":
@@ -2009,6 +2031,7 @@ def _persist_ai_result(
     else:
         _apply_lifecycle_transition_signal_if_matched(session, raw_message, raw_message.text or "")
     _upsert_recognition(session, result, engine=engine)
+    return candidate if result.status == "是策略" else None
 
 
 def _upsert_entry_signal_candidate(
@@ -2020,12 +2043,31 @@ def _upsert_entry_signal_candidate(
     parse_source: str,
 ) -> SignalCandidate:
     normalized_strategy = _normalize_ai_strategy(strategy)
-    candidate = (
+    desired = {
+        "symbol": _string_or_none(normalized_strategy.get("symbol")),
+        "side": _string_or_none(normalized_strategy.get("side")),
+        "event_type": "entry_signal",
+        "target_lifecycle_id": None,
+        "management_action": None,
+        "management_fraction": None,
+        "entry_text": _string_or_none(normalized_strategy.get("entry")),
+        "stop_loss_text": _string_or_none(normalized_strategy.get("stop_loss")),
+        "take_profit_text": _string_or_none(normalized_strategy.get("take_profit")),
+        "leverage_text": _string_or_none(normalized_strategy.get("leverage")),
+        "confidence": max(0.0, min(confidence, 1.0)),
+        "parse_source": parse_source,
+    }
+    candidates = (
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == raw_message.id)
         .filter(SignalCandidate.event_type == "entry_signal")
         .order_by(SignalCandidate.id.asc())
-        .first()
+        .all()
+    )
+    candidate, editable = _candidate_for_semantic_upsert(
+        session,
+        candidates=candidates,
+        desired=desired,
     )
     if candidate is None:
         candidate = SignalCandidate(
@@ -2035,20 +2077,61 @@ def _upsert_entry_signal_candidate(
             review_status="pending",
         )
         session.add(candidate)
-    candidate.symbol = _string_or_none(normalized_strategy.get("symbol"))
-    candidate.side = _string_or_none(normalized_strategy.get("side"))
-    candidate.event_type = "entry_signal"
-    candidate.target_lifecycle_id = None
-    candidate.management_action = None
-    candidate.management_fraction = None
-    candidate.recognition_generation = None
-    candidate.entry_text = _string_or_none(normalized_strategy.get("entry"))
-    candidate.stop_loss_text = _string_or_none(normalized_strategy.get("stop_loss"))
-    candidate.take_profit_text = _string_or_none(normalized_strategy.get("take_profit"))
-    candidate.leverage_text = _string_or_none(normalized_strategy.get("leverage"))
-    candidate.confidence = max(0.0, min(confidence, 1.0))
-    candidate.parse_source = parse_source
+        editable = True
+    if editable:
+        for field, value in desired.items():
+            setattr(candidate, field, value)
+        candidate.recognition_generation = None
     return candidate
+
+
+def _candidate_for_semantic_upsert(
+    session,
+    *,
+    candidates: list[SignalCandidate],
+    desired: dict[str, Any],
+    immutable_version_fields: set[str] | None = None,
+) -> tuple[SignalCandidate | None, bool]:
+    """Reuse immutable durable candidates only when execution semantics match."""
+
+    linked_items = {
+        item.signal_candidate_id: item
+        for item in (
+            session.query(MessageInstructionItem)
+            .filter(
+                MessageInstructionItem.signal_candidate_id.in_(
+                    [candidate.id for candidate in candidates]
+                )
+            )
+            .all()
+        )
+    } if candidates else {}
+    ordered_candidates = sorted(
+        candidates,
+        key=lambda candidate: (
+            linked_items.get(candidate.id) is None
+            or linked_items[candidate.id].retired_at is not None,
+            candidate.id,
+        ),
+    )
+    for candidate in ordered_candidates:
+        if all(getattr(candidate, field) == value for field, value in desired.items()):
+            return candidate, candidate.id not in linked_items
+    version_fields = immutable_version_fields or set()
+    if version_fields:
+        for candidate in ordered_candidates:
+            item = linked_items.get(candidate.id)
+            if item is None or item.status == "pending":
+                continue
+            if all(
+                field in version_fields or getattr(candidate, field) == value
+                for field, value in desired.items()
+            ):
+                return candidate, False
+    for candidate in ordered_candidates:
+        if candidate.id not in linked_items:
+            return candidate, True
+    return None, True
 
 
 def _upsert_ai_signal_candidate(
@@ -2932,12 +3015,32 @@ def _upsert_close_signal_candidate(
     management_fraction: float | None = None,
     recognition_generation: str | None = None,
 ) -> SignalCandidate:
-    candidate = (
+    desired = {
+        "symbol": lifecycle.symbol,
+        "side": lifecycle.side,
+        "event_type": "close_signal",
+        "target_lifecycle_id": lifecycle.id,
+        "management_action": management_action,
+        "management_fraction": management_fraction,
+        "entry_text": None,
+        "stop_loss_text": None,
+        "take_profit_text": None,
+        "leverage_text": None,
+        "parse_source": parse_source,
+        "recognition_generation": recognition_generation,
+    }
+    candidates = (
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == raw_message.id)
         .filter(SignalCandidate.event_type.in_(["close_signal", "position_update"]))
         .order_by(SignalCandidate.id.asc())
-        .first()
+        .all()
+    )
+    candidate, editable = _candidate_for_semantic_upsert(
+        session,
+        candidates=candidates,
+        desired=desired,
+        immutable_version_fields={"recognition_generation"},
     )
     if candidate is None:
         candidate = SignalCandidate(
@@ -2947,15 +3050,11 @@ def _upsert_close_signal_candidate(
             review_status="pending",
         )
         session.add(candidate)
-    candidate.symbol = lifecycle.symbol
-    candidate.side = lifecycle.side
-    candidate.event_type = "close_signal"
-    candidate.target_lifecycle_id = lifecycle.id
-    candidate.management_action = management_action
-    candidate.management_fraction = management_fraction
-    candidate.recognition_generation = recognition_generation
-    candidate.confidence = max(candidate.confidence or 0.0, 0.85)
-    candidate.parse_source = parse_source
+        editable = True
+    if editable:
+        for field, value in desired.items():
+            setattr(candidate, field, value)
+        candidate.confidence = max(candidate.confidence or 0.0, 0.85)
     return candidate
 
 
@@ -2967,12 +3066,30 @@ def _upsert_entry_confirmation_candidate(
     entry_price: float | None,
     parse_source: str = "entry_confirm_heuristic",
 ) -> SignalCandidate:
-    candidate = (
+    desired = {
+        "symbol": lifecycle.symbol,
+        "side": lifecycle.side,
+        "event_type": "entry_signal",
+        "target_lifecycle_id": None,
+        "management_action": None,
+        "management_fraction": None,
+        "entry_text": _format_number(entry_price) if entry_price is not None else None,
+        "stop_loss_text": _format_number(lifecycle.stop_loss),
+        "take_profit_text": lifecycle.take_profit,
+        "leverage_text": None,
+        "parse_source": parse_source,
+    }
+    candidates = (
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == raw_message.id)
         .filter(SignalCandidate.event_type == "entry_signal")
         .order_by(SignalCandidate.id.asc())
-        .first()
+        .all()
+    )
+    candidate, editable = _candidate_for_semantic_upsert(
+        session,
+        candidates=candidates,
+        desired=desired,
     )
     if candidate is None:
         candidate = SignalCandidate(
@@ -2982,18 +3099,12 @@ def _upsert_entry_confirmation_candidate(
             review_status="pending",
         )
         session.add(candidate)
-    candidate.symbol = lifecycle.symbol
-    candidate.side = lifecycle.side
-    candidate.event_type = "entry_signal"
-    candidate.target_lifecycle_id = None
-    candidate.management_action = None
-    candidate.management_fraction = None
-    candidate.recognition_generation = None
-    candidate.entry_text = _format_number(entry_price) if entry_price is not None else None
-    candidate.stop_loss_text = _format_number(lifecycle.stop_loss)
-    candidate.take_profit_text = lifecycle.take_profit
-    candidate.confidence = max(candidate.confidence or 0.0, 0.85)
-    candidate.parse_source = parse_source
+        editable = True
+    if editable:
+        for field, value in desired.items():
+            setattr(candidate, field, value)
+        candidate.recognition_generation = None
+        candidate.confidence = max(candidate.confidence or 0.0, 0.85)
     return candidate
 
 
@@ -3009,12 +3120,36 @@ def _upsert_management_signal_candidate(
     requested_stop_loss: float | None = None,
     requested_take_profit: str | None = None,
 ) -> SignalCandidate:
-    candidate = (
+    desired = {
+        "symbol": lifecycle.symbol,
+        "side": lifecycle.side,
+        "event_type": "position_update",
+        "target_lifecycle_id": lifecycle.id,
+        "management_action": management_action,
+        "management_fraction": management_fraction,
+        "entry_text": None,
+        "stop_loss_text": (
+            _format_number(requested_stop_loss)
+            if requested_stop_loss is not None
+            else _format_number(lifecycle.stop_loss)
+        ),
+        "take_profit_text": requested_take_profit or lifecycle.take_profit,
+        "leverage_text": None,
+        "parse_source": parse_source,
+        "recognition_generation": recognition_generation,
+    }
+    candidates = (
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == raw_message.id)
         .filter(SignalCandidate.event_type.in_(["close_signal", "position_update"]))
         .order_by(SignalCandidate.id.asc())
-        .first()
+        .all()
+    )
+    candidate, editable = _candidate_for_semantic_upsert(
+        session,
+        candidates=candidates,
+        desired=desired,
+        immutable_version_fields={"recognition_generation"},
     )
     if candidate is None:
         candidate = SignalCandidate(
@@ -3024,22 +3159,11 @@ def _upsert_management_signal_candidate(
             review_status="pending",
         )
         session.add(candidate)
-    candidate.symbol = lifecycle.symbol
-    candidate.side = lifecycle.side
-    candidate.event_type = "position_update"
-    candidate.target_lifecycle_id = lifecycle.id
-    candidate.management_action = management_action
-    candidate.management_fraction = management_fraction
-    candidate.recognition_generation = recognition_generation
-    candidate.entry_text = None
-    candidate.stop_loss_text = (
-        _format_number(requested_stop_loss)
-        if requested_stop_loss is not None
-        else _format_number(lifecycle.stop_loss)
-    )
-    candidate.take_profit_text = requested_take_profit or lifecycle.take_profit
-    candidate.confidence = max(candidate.confidence or 0.0, 0.85)
-    candidate.parse_source = parse_source
+        editable = True
+    if editable:
+        for field, value in desired.items():
+            setattr(candidate, field, value)
+        candidate.confidence = max(candidate.confidence or 0.0, 0.85)
     return candidate
 
 

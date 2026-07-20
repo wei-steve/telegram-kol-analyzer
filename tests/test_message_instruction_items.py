@@ -3,7 +3,7 @@ import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import event
@@ -12,9 +12,12 @@ from sqlalchemy.sql.dml import Update
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_instruction_items import (
+    claim_message_instruction_summary,
     claim_next_message_instruction_item,
     create_message_instruction_items_in_session,
     finish_message_instruction_item,
+    finish_message_instruction_summary_delivery,
+    list_message_instruction_item_results,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -276,6 +279,27 @@ def test_claim_never_returns_unknown_item(tmp_path):
     )
 
 
+def test_claim_never_returns_retired_pending_item(tmp_path):
+    session_factory = create_session_factory(tmp_path / "retired-pending.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session,
+            raw_message_id=raw_id,
+        )
+        items[0].retired_at = NOW
+        session.commit()
+
+    claimed = claim_next_message_instruction_item(
+        session_factory,
+        raw_message_id=raw_id,
+        now=NOW,
+    )
+
+    assert claimed is not None
+    assert claimed.instruction_kind == "entry"
+
+
 def test_unknown_management_is_not_reclaimed_and_does_not_block_entry(tmp_path):
     session_factory = create_session_factory(tmp_path / "unknown-management.db")
     raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
@@ -365,6 +389,154 @@ def test_finish_rejects_invalid_or_unclaimed_transitions(tmp_path):
         )
 
 
+def test_public_results_include_persisted_sequence_and_strategy_identity(tmp_path):
+    session_factory = create_session_factory(tmp_path / "public-results.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        create_message_instruction_items_in_session(session, raw_message_id=raw_id)
+        session.commit()
+
+    results = list_message_instruction_item_results(
+        session_factory,
+        raw_message_id=raw_id,
+    )
+
+    assert [item["sequence"] for item in results] == [0, 1]
+    assert [item["strategy_instance_id"] for item in results] == [
+        "deepcoin:100:20:BTC:short",
+        "deepcoin:100:55:ETH:long",
+    ]
+
+
+def test_terminal_message_summary_is_claimed_exactly_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "summary-claim.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session,
+            raw_message_id=raw_id,
+        )
+        for item in items:
+            item.status = "succeeded"
+            item.result_json = json.dumps({"status": "completed"})
+        session.commit()
+
+    first = claim_message_instruction_summary(
+        session_factory,
+        raw_message_id=raw_id,
+        claimed_at=NOW,
+        chat_title="VIP room",
+    )
+    second = claim_message_instruction_summary(
+        session_factory,
+        raw_message_id=raw_id,
+        claimed_at=NOW,
+        chat_title="VIP room",
+    )
+
+    assert first is not None
+    assert first["chat_title"] == "VIP room"
+    assert first["chat_id"] == 100
+    assert first["message_id"] == 55
+    assert [item["sequence"] for item in first["items"]] == [0, 1]
+    assert second is None
+    finish_message_instruction_summary_delivery(
+        session_factory,
+        claim_token=first["notification_claim_token"],
+        item_ids=first["notification_item_ids"],
+        delivered=True,
+        completed_at=NOW,
+    )
+
+    with session_factory() as session:
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw_id,
+                symbol="SOL",
+                side="long",
+                event_type="entry_signal",
+            )
+        )
+        session.flush()
+        items = create_message_instruction_items_in_session(
+            session,
+            raw_message_id=raw_id,
+        )
+        items[-1].status = "succeeded"
+        items[-1].result_json = json.dumps({"status": "completed"})
+        session.commit()
+
+    changed = claim_message_instruction_summary(
+        session_factory,
+        raw_message_id=raw_id,
+        claimed_at=NOW,
+    )
+    repeated = claim_message_instruction_summary(
+        session_factory,
+        raw_message_id=raw_id,
+        claimed_at=NOW,
+    )
+
+    assert changed is not None
+    assert len(changed["items"]) == 3
+    assert repeated is None
+    finish_message_instruction_summary_delivery(
+        session_factory,
+        claim_token=changed["notification_claim_token"],
+        item_ids=changed["notification_item_ids"],
+        delivered=True,
+        completed_at=NOW,
+    )
+
+
+def test_expired_summary_delivery_claim_can_be_recovered(tmp_path):
+    session_factory = create_session_factory(tmp_path / "summary-lease.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session,
+            raw_message_id=raw_id,
+        )
+        for item in items:
+            item.status = "succeeded"
+            item.result_json = json.dumps({"status": "completed"})
+        session.commit()
+
+    first = claim_message_instruction_summary(
+        session_factory,
+        raw_message_id=raw_id,
+        claimed_at=NOW,
+    )
+    assert first is not None
+
+    recovered = claim_message_instruction_summary(
+        session_factory,
+        raw_message_id=raw_id,
+        claimed_at=NOW + timedelta(minutes=6),
+    )
+
+    assert recovered is not None
+    assert recovered["notification_claim_token"] != first["notification_claim_token"]
+
+
+def test_in_progress_message_summary_cannot_be_claimed(tmp_path):
+    session_factory = create_session_factory(tmp_path / "summary-in-progress.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session,
+            raw_message_id=raw_id,
+        )
+        items[0].status = "succeeded"
+        session.commit()
+
+    assert claim_message_instruction_summary(
+        session_factory,
+        raw_message_id=raw_id,
+        claimed_at=NOW,
+    ) is None
+
+
 def test_database_bootstrap_migrates_instruction_item_indexes(tmp_path):
     database_path = tmp_path / "migration.db"
     create_session_factory(database_path)
@@ -394,6 +566,12 @@ def test_database_bootstrap_migrates_instruction_item_indexes(tmp_path):
         "status",
         "result_json",
         "error_json",
+        "retired_at",
+        "summary_notification_claimed_at",
+        "summary_notification_status",
+        "summary_notification_claim_token",
+        "summary_notification_error",
+        "summary_notified_at",
     } <= columns
     assert {
         "uq_message_instruction_items_message_candidate",

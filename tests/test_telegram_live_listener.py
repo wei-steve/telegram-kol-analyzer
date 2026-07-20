@@ -358,6 +358,79 @@ def test_authoritative_live_path_returns_without_starting_semantic_review(
     asyncio.run(scenario())
 
 
+def test_authoritative_live_path_delivers_instruction_summary_once_after_completion(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "instruction-summary.db")
+    broker = LiveUpdateBroker()
+    deliveries: list[dict] = []
+
+    async def fake_deliver(*args, **kwargs):
+        kwargs["session_factory"] = args[0]
+        deliveries.append(kwargs)
+        return True
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener."
+        "deliver_message_instruction_summary_notification",
+        fake_deliver,
+        raising=False,
+    )
+
+    def authoritative_processor(raw_message_id):
+        return SimpleNamespace(
+            assessment=SimpleNamespace(
+                agreement_status="pending",
+                differences=[],
+                mimo=SimpleNamespace(
+                    status="是策略",
+                    payload={},
+                    model="mimo-v2.5",
+                    error_message=None,
+                ),
+                deepseek_payload=None,
+            ),
+            recognition=MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="是策略",
+                parse_source="mimo_authoritative",
+            ),
+            automation={
+                "status": "completed",
+                "items": [
+                    {
+                        "item_id": 1,
+                        "sequence": 0,
+                        "instruction_kind": "entry",
+                        "strategy_instance_id": "deepcoin:123:42:BTC:long",
+                        "status": "submitted",
+                    }
+                ],
+            },
+        )
+
+    asyncio.run(
+        persist_live_message_event(
+            event=_FakeEvent(),
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            chat_title="VIP BTC Room",
+            ai_recognition_config=AiRecognitionConfig(),
+            authoritative_processor=authoritative_processor,
+            system_operator_bot_config=SystemOperatorBotConfig(
+                bot_token="system-token",
+                chat_id="system-chat",
+            ),
+        )
+    )
+
+    assert len(deliveries) == 1
+    assert deliveries[0]["raw_message_id"] > 0
+    assert deliveries[0]["chat_title"] == "VIP BTC Room"
+
+
 def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
     tmp_path,
     monkeypatch,

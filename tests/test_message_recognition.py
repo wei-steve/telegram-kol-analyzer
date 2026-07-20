@@ -464,7 +464,11 @@ def test_authoritative_rerecognition_retires_superseded_pending_item(tmp_path):
     )
 
     with session_factory() as session:
-        items = session.query(MessageInstructionItem).all()
+        items = (
+            session.query(MessageInstructionItem)
+            .filter(MessageInstructionItem.retired_at.is_(None))
+            .all()
+        )
         management_candidate = session.get(SignalCandidate, management_candidate_id)
         entry_candidate = session.get(SignalCandidate, entry_candidate_id)
 
@@ -474,8 +478,145 @@ def test_authoritative_rerecognition_retires_superseded_pending_item(tmp_path):
     ] == [
         (entry_candidate_id, "entry", 0),
     ]
-    assert management_candidate.parse_source == "mimo_superseded"
+    assert management_candidate.parse_source == "mimo_authoritative"
     assert entry_candidate.parse_source == "mimo_authoritative"
+
+
+def test_authoritative_rerecognition_never_mutates_item_linked_candidate_semantics(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "immutable-candidate.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9001,
+            text="new authoritative interpretation",
+        )
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    first_payload = {
+        "recognition_result": "是策略",
+        "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+        "strategy": {
+            "symbol": "ETH",
+            "side": "long",
+            "entry": "1680",
+            "stop_loss": "1650",
+            "take_profit": "1730",
+            "leverage": "5x",
+        },
+        "confidence": 0.94,
+    }
+    apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload=first_payload,
+        model="mimo-v2.5",
+        authoritative_generation="generation-1",
+    )
+    with session_factory() as session:
+        old_candidate = session.query(SignalCandidate).one()
+        old_item = session.query(MessageInstructionItem).one()
+        old_item.status = "submitted"
+        old_item.result_json = '{"status":"submitted"}'
+        old_candidate_id = old_candidate.id
+        old_item_id = old_item.id
+        old_semantics = (
+            old_candidate.symbol,
+            old_candidate.side,
+            old_candidate.entry_text,
+            old_candidate.stop_loss_text,
+            old_candidate.take_profit_text,
+            old_candidate.leverage_text,
+            old_candidate.confidence,
+        )
+        session.commit()
+
+    changed_payload = {
+        "recognition_result": "是策略",
+        "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+        "strategy": {
+            "symbol": "BTC",
+            "side": "short",
+            "entry": "68100",
+            "stop_loss": "68800",
+            "take_profit": "67000",
+            "leverage": "10x",
+        },
+        "confidence": 0.97,
+    }
+    apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload=changed_payload,
+        model="mimo-v2.5",
+        authoritative_generation="generation-2",
+    )
+
+    with session_factory() as session:
+        old_candidate = session.get(SignalCandidate, old_candidate_id)
+        old_item = session.get(MessageInstructionItem, old_item_id)
+        active_item = (
+            session.query(MessageInstructionItem)
+            .filter(MessageInstructionItem.retired_at.is_(None))
+            .one()
+        )
+        new_candidate = session.get(
+            SignalCandidate,
+            active_item.signal_candidate_id,
+        )
+
+    assert old_candidate is not None
+    assert (
+        old_candidate.symbol,
+        old_candidate.side,
+        old_candidate.entry_text,
+        old_candidate.stop_loss_text,
+        old_candidate.take_profit_text,
+        old_candidate.leverage_text,
+        old_candidate.confidence,
+    ) == old_semantics
+    assert old_item is not None and old_item.retired_at is not None
+    assert active_item.id != old_item_id
+    assert new_candidate is not None
+    assert (new_candidate.symbol, new_candidate.side) == ("BTC", "short")
+
+
+def test_identical_authoritative_rerecognition_reuses_durable_identity(tmp_path):
+    session_factory = create_session_factory(tmp_path / "stable-candidate.db")
+    with session_factory() as session:
+        raw_message = RawMessage(chat_id=88, message_id=9002, text="ETH long")
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    payload = {
+        "recognition_result": "是策略",
+        "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+        "strategy": {
+            "symbol": "ETH",
+            "side": "long",
+            "entry": "1680",
+            "stop_loss": "1650",
+            "take_profit": "1730",
+        },
+        "confidence": 0.94,
+    }
+    for generation in ("generation-1", "generation-2"):
+        apply_authoritative_mimo_payload(
+            session_factory,
+            raw_message_id=raw_message_id,
+            payload=payload,
+            model="mimo-v2.5",
+            authoritative_generation=generation,
+        )
+
+    with session_factory() as session:
+        assert session.query(SignalCandidate).count() == 1
+        assert session.query(MessageInstructionItem).count() == 1
+        assert session.query(MessageInstructionItem).one().retired_at is None
 
 
 def test_entry_upsert_tolerates_duplicate_role_rows_without_overwriting_management(
