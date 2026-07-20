@@ -1693,6 +1693,18 @@ def _attach_exchange_order_bindings(
             .order_by(ExecutionBinding.updated_at.desc(), ExecutionBinding.id.desc())
             .all()
         )
+        leg_rows = (
+            session.query(ExecutionOrderLeg, ExecutionBinding)
+            .join(
+                ExecutionBinding,
+                ExecutionBinding.id == ExecutionOrderLeg.execution_binding_id,
+            )
+            .filter(ExecutionOrderLeg.venue == "deepcoin")
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .filter(ExecutionOrderLeg.attribution_status == "verified")
+            .filter(ExecutionOrderLeg.pos_id.in_(wanted_ids))
+            .all()
+        )
     ledger_by_order_id: dict[str, tuple[PositionProtectionLedger, ExecutionBinding, ExecutionOrderLeg]] = {}
     for ledger, binding, leg in ledger_rows:
         order_id = str(ledger.order_id or "")
@@ -1707,6 +1719,22 @@ def _attach_exchange_order_bindings(
         for binding_id in binding_ids:
             if binding_id in wanted_ids and binding_id not in bindings_by_order_id:
                 bindings_by_order_id[binding_id] = binding
+    legs_by_pos_id: dict[str, tuple[ExecutionOrderLeg, ExecutionBinding] | None] = {}
+    for leg, binding in leg_rows:
+        pos_id = str(leg.pos_id or "")
+        if not pos_id:
+            continue
+        attribution = _persisted_position_attribution(
+            leg=leg,
+            binding=binding,
+            group_label_by_chat_id=group_label_by_chat_id,
+        )
+        if not attribution or attribution.get("state") != "bound":
+            continue
+        if pos_id in legs_by_pos_id:
+            legs_by_pos_id[pos_id] = None
+        else:
+            legs_by_pos_id[pos_id] = (leg, binding)
     for row in rows:
         ledger_match = ledger_by_order_id.get(str(row.get("order_id") or ""))
         if ledger_match is not None:
@@ -1729,6 +1757,25 @@ def _attach_exchange_order_bindings(
         if binding is None:
             binding = bindings_by_order_id.get(str(row.get("client_order_id") or ""))
         if binding is None:
+            leg_match = None
+            if not _is_tpsl_exchange_order(row):
+                leg_match = legs_by_pos_id.get(str(row.get("order_id") or ""))
+                if leg_match is None:
+                    leg_match = legs_by_pos_id.get(str(row.get("client_order_id") or ""))
+            if leg_match is None:
+                continue
+            leg, binding = leg_match
+            row["chat_id"] = binding.chat_id
+            row["message_id"] = binding.message_id
+            row["group_label"] = group_label_by_chat_id.get(binding.chat_id, str(binding.chat_id))
+            row["symbol"] = binding.symbol or row.get("symbol")
+            row["side"] = binding.side or row.get("side")
+            row["execution_status"] = binding.status
+            row["persisted_attribution"] = _persisted_position_attribution(
+                leg=leg,
+                binding=binding,
+                group_label_by_chat_id=group_label_by_chat_id,
+            )
             continue
         row["chat_id"] = binding.chat_id
         row["message_id"] = binding.message_id

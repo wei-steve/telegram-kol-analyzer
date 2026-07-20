@@ -1866,6 +1866,144 @@ def test_exchange_current_order_uses_execution_binding_attribution(tmp_path):
     assert "Charlie Group" in response.text
 
 
+def test_exchange_history_order_uses_verified_entry_leg_pos_id_before_candidates(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        wrong_raw = RawMessage(
+            chat_id=211,
+            message_id=21,
+            posted_at=datetime(2026, 7, 20, 8, 0, tzinfo=UTC),
+            sender_name="wrong candidate",
+            text="ETH short entry 1816-1888 SL 1918 TP 1796/1768",
+        )
+        session.add(wrong_raw)
+        session.flush()
+        wrong_candidate = SignalCandidate(
+            raw_message_id=wrong_raw.id,
+            symbol="ETH",
+            side="short",
+            event_type="entry_signal",
+            entry_text="1816-1888",
+            stop_loss_text="1918",
+            take_profit_text="1796/1768",
+            parse_source="mimo_authoritative",
+            confidence=0.95,
+        )
+        session.add(wrong_candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=wrong_candidate.id,
+                chat_id=211,
+                message_id=21,
+                symbol="ETH",
+                side="short",
+                lifecycle_status="exited",
+                signal_at=datetime(2026, 7, 20, 8, 0, tzinfo=UTC),
+                entry_range_low=1816,
+                entry_range_high=1888,
+                stop_loss=1918,
+                take_profit="1796/1768",
+            )
+        )
+        binding = ExecutionBinding(
+            kol_id="group:212",
+            chat_id=212,
+            message_id=22,
+            symbol="ETH",
+            side="short",
+            venue="deepcoin",
+            order_id="trigger-parent-order",
+            client_order_id="client-leg-1",
+            pos_id="history-fill-order",
+            status="active",
+            strategy_instance_id="deepcoin:212:22:ETH:short",
+        )
+        session.add(binding)
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=1,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id="trigger-parent-order",
+                client_order_id="client-leg-1",
+                pos_id="history-fill-order",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="active",
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                chat_id=212,
+                message_id=22,
+                symbol="ETH",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 20, 8, 5, tzinfo=UTC),
+                entered_at=datetime(2026, 7, 20, 8, 13, tzinfo=UTC),
+                entry_range_low=1883,
+                entry_range_high=1893,
+                stop_loss=1900,
+                take_profit="1860/1840/1810",
+                execution_binding_id=binding.id,
+            )
+        )
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "history-fill-order",
+                    "posSide": "short",
+                    "side": "sell",
+                    "ordType": "limit",
+                    "state": "filled",
+                    "px": "1888",
+                    "sz": "6.2",
+                }
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+    client = TestClient(
+        create_web_app(
+            database_path=database_path,
+            group_config=GroupConfig(
+                groups=[
+                    TargetGroupConfig(chat_title="Wrong Candidate", chat_id=211),
+                    TargetGroupConfig(chat_title="Verified Leg Group", chat_id=212),
+                ]
+            ),
+            deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        )
+    )
+    response = client.get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "order history-fill-order" in response.text
+    assert "已验证归属" in response.text
+    assert "Verified Leg Group" in response.text
+    assert "entry leg #1" in response.text
+    assert "可能归属" not in response.text
+
+
 def test_exchange_current_tpsl_order_uses_protection_ledger_attribution(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
