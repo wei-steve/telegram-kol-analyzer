@@ -703,7 +703,12 @@ def _row_matching_expected_purpose(
     return unique[0] if len(unique) == 1 else None
 
 
-def _row_matches_expected(row: dict[str, Any], expected: dict[str, str | None]) -> bool:
+def _row_matches_expected(
+    row: dict[str, Any],
+    expected: dict[str, str | None],
+    *,
+    allow_generic_trigger_price: bool = True,
+) -> bool:
     expected_price = expected.get("trigger_price")
     if expected_price is None:
         return False
@@ -714,7 +719,7 @@ def _row_matches_expected(row: dict[str, Any], expected: dict[str, str | None]) 
         else ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
     )
     price = _first_nonzero_text(row, *keys)
-    if price is None:
+    if price is None and allow_generic_trigger_price:
         price = _first_nonzero_text(row, "triggerPx", "triggerPrice")
     return bool(price and _same_numeric_text(price, expected_price))
 
@@ -727,7 +732,11 @@ def _row_matches_trigger_entry_expected_protection(
     if not required.issubset(expected_by_purpose):
         return False
     return all(
-        _row_matches_expected(row, expected_by_purpose[purpose])
+        _row_matches_expected(
+            row,
+            expected_by_purpose[purpose],
+            allow_generic_trigger_price=False,
+        )
         for purpose in sorted(required)
     )
 

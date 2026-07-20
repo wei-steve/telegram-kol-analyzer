@@ -392,6 +392,57 @@ def test_adoption_refuses_pending_row_with_contradictory_position_id(tmp_path):
     assert result.refusal.reason == "trigger_entry_tpsl_missing"
 
 
+def test_adoption_refuses_generic_trigger_price_when_tp_and_sl_prices_are_equal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_entry_fill(
+        session_factory,
+        binding_id=152,
+        legs=[
+            {
+                "leg_id": 289,
+                "leg_index": 1,
+                "order_id": "entry-1",
+                "client_order_id": "entry-client-1",
+                "pos_id": "pos-1",
+                "size": "4.4",
+                "entry_price": "1883.0",
+            }
+        ],
+    )
+    pending_row = _pending_tpsl_row(
+        "tpsl-1",
+        purpose="combined",
+        price="1860",
+        stop_price="1860",
+        ctime="2026-07-20T00:11:13Z",
+        inst_id="ETH-USDT-SWAP",
+        side="short",
+        size="4.4",
+    )
+    pending_row.pop("tpTriggerPx")
+    pending_row.pop("slTriggerPx")
+    pending_row["triggerPx"] = "1860"
+
+    with session_factory() as session:
+        entry_leg = session.get(ExecutionOrderLeg, 289)
+        entry_event = session.query(ExecutionEvent).one()
+        request = json.loads(entry_event.request_json)
+        request["tpTriggerPx"] = 1860.0
+        request["slTriggerPx"] = 1860.0
+        entry_event.request_json = json.dumps(request)
+        result = plan_verified_trigger_entry_protection_adoption(
+            session,
+            entry_leg=entry_leg,
+            event=entry_event,
+            pending_tpsl_rows=[pending_row],
+            existing_order_ids=set(),
+        )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_entry_tpsl_missing"
+
+
 def test_adoption_refuses_partial_size_pending_row(tmp_path):
     result = _plan_trigger_entry_adoption(tmp_path, pending_row={"sz": "2.2"})
 
