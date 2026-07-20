@@ -2,6 +2,8 @@ import json
 import hashlib
 from datetime import UTC, datetime
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_protection_ledger_repair import (
     apply_entry_protection_ledger_repair_plan,
@@ -433,7 +435,12 @@ def test_intent_adoption_plans_one_new_exact_trigger_entry_protection(tmp_path):
 
 
 def test_intent_adoption_refuses_candidate_present_in_pre_submit_baseline(tmp_path):
-    result = _plan_intent_adoption(tmp_path, baseline='[{"ord_id":"tpsl-new"}]')
+    result = _plan_intent_adoption(tmp_path, baseline=json.dumps([{
+        "ord_id": "tpsl-new", "instrument": "ETH-USDT-SWAP", "side": "short",
+        "trigger_order_type": "TPSL", "size": "4.4",
+        "take_profit_trigger_price": "1860", "stop_loss_trigger_price": "1900",
+        "exchange_created_at": "2026-07-20T00:11:13Z", "exchange_updated_at": "2026-07-20T00:11:13Z",
+    }], sort_keys=True, separators=(",", ":")))
 
     assert result.action is None
     assert result.refusal is not None
@@ -534,6 +541,68 @@ def test_intent_adoption_defers_when_current_intent_already_adopted_without_ledg
     assert result.deferred.reason == "trigger_protection_already_adopted"
 
 
+def test_intent_adoption_normalizes_aware_history_range_to_utc_naive(tmp_path):
+    history = _pending_tpsl_row(
+        "tpsl-history", purpose="combined", price="1860", stop_price="1900",
+        ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4",
+    )
+    history.update({"posId": "pos-1", "parentOrdId": "entry-1"})
+    result = _plan_intent_adoption(
+        tmp_path, pending_rows=[], history_rows=[history],
+        history_time_range_start=datetime(2026, 7, 20, 0, 11, tzinfo=UTC),
+        history_time_range_end=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),
+    )
+
+    assert result.action is not None
+
+
+def test_intent_adoption_refuses_invalid_history_range_without_raising(tmp_path):
+    history = _pending_tpsl_row(
+        "tpsl-history", purpose="combined", price="1860", stop_price="1900",
+        ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4",
+    )
+    history.update({"posId": "pos-1", "parentOrdId": "entry-1"})
+    result = _plan_intent_adoption(
+        tmp_path, pending_rows=[], history_rows=[history],
+        history_time_range_start="invalid", history_time_range_end=datetime(2026, 7, 20, 0, 12),
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_history_unproven"
+
+
+@pytest.mark.parametrize("baseline", ["[123]", "{}", '{"orders":["bad"]}'])
+def test_intent_adoption_refuses_malformed_baseline_schema(tmp_path, baseline):
+    result = _plan_intent_adoption(tmp_path, baseline=baseline)
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_baseline_invalid"
+
+
+def test_intent_adoption_fingerprint_ignores_persisted_internal_metadata(tmp_path):
+    result = _plan_intent_adoption(
+        tmp_path,
+        request_update={"merged_from_leg_indices": [0, 1]},
+        fingerprint_without_internal_metadata=True,
+    )
+
+    assert result.action is not None
+
+
+def test_intent_adoption_dedupes_same_order_from_pending_and_history(tmp_path):
+    history = _pending_tpsl_row(
+        "tpsl-new", purpose="combined", price="1860", stop_price="1900",
+        ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4",
+    )
+    history["posId"] = "pos-1"
+    result = _plan_intent_adoption(tmp_path, history_rows=[history])
+
+    assert result.action is not None
+    assert result.action.evidence["source"] == "pending"
+
+
 def test_intent_adoption_accepts_history_only_with_parent_proof_and_explicit_range(tmp_path):
     row = _pending_tpsl_row(
         "tpsl-history", purpose="combined", price="1860", stop_price="1900",
@@ -607,6 +676,7 @@ def _plan_intent_adoption(
     tmp_path, *, baseline="[]", pending_rows=None, history_rows=None, pending_update=None,
     existing_ledger_rows=None, history_time_range_start=None, history_time_range_end=None,
     planner_session=None, existing_intents=None, request_update=None, adopted_order_id=None,
+    fingerprint_without_internal_metadata=False,
 ):
     session_factory = create_session_factory(tmp_path / "intent-adoption.db")
     _seed_trigger_entry_fill(session_factory, binding_id=152, legs=[{
@@ -624,6 +694,8 @@ def _plan_intent_adoption(
         leg.request_json = json.dumps(request)
         event.request_json = json.dumps(request)
         payload = dict(request)
+        if fingerprint_without_internal_metadata:
+            payload.pop("merged_from_leg_indices", None)
         payload["tpTriggerPx"] = request.get("tpTriggerPx")
         payload["slTriggerPx"] = request.get("slTriggerPx")
         intent = TriggerProtectionIntent(

@@ -658,9 +658,16 @@ def plan_trigger_protection_intent_adoption(
     if baseline_ids is None:
         return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_baseline_invalid")
     candidates: list[tuple[dict[str, Any], str]] = []
+    pending_order_ids = {
+        _row_order_id(row)
+        for row in pending_tpsl_rows
+        if isinstance(row, dict) and _row_order_id(row)
+    }
     for source, rows in (("pending", pending_tpsl_rows), ("history", history_tpsl_rows)):
         for row in rows:
             if not isinstance(row, dict) or not _row_order_id(row):
+                continue
+            if source == "history" and _row_order_id(row) in pending_order_ids:
                 continue
             if (
                 _row_matches_instrument_side(row, instrument_id=instrument_id, side=side)
@@ -784,7 +791,11 @@ def _intent_refusal(
 def _trigger_protection_fingerprint(request: Any) -> str:
     if not isinstance(request, dict):
         return ""
-    payload = dict(request)
+    payload = {
+        key: value
+        for key, value in request.items()
+        if key not in {"merged_from_leg_indices"}
+    }
     payload["tpTriggerPx"] = request.get("tpTriggerPx")
     payload["slTriggerPx"] = request.get("slTriggerPx")
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -794,10 +805,24 @@ def _baseline_order_ids(value: str | None) -> set[str] | None:
     parsed = _loads_json(value)
     if not isinstance(parsed, (list, dict)):
         return None
-    rows = parsed if isinstance(parsed, list) else parsed.get("orders", [])
+    if isinstance(parsed, dict) and set(parsed) != {"orders"}:
+        return None
+    rows = parsed if isinstance(parsed, list) else parsed.get("orders")
     if not isinstance(rows, list):
         return None
-    return {str(row.get("ord_id") or row.get("ordId") or row.get("orderId") or "").strip() for row in rows if isinstance(row, dict)} - {""}
+    order_ids: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {
+            "ord_id", "instrument", "side", "trigger_order_type", "size",
+            "take_profit_trigger_price", "stop_loss_trigger_price", "exchange_created_at",
+            "exchange_updated_at",
+        }:
+            return None
+        order_id = str(row.get("ord_id") or "").strip()
+        if not order_id:
+            return None
+        order_ids.add(order_id)
+    return order_ids
 
 
 def _row_matches_expected_protection_set(row: dict[str, Any], expected_rows: list[dict[str, str | None]]) -> bool:
@@ -843,7 +868,11 @@ def _canonical_row_pos_id(row: dict[str, Any]) -> str | None:
 def _history_row_is_proven_in_range(
     row: dict[str, Any], *, parent_order_id: str, start: datetime | None, end: datetime | None
 ) -> bool:
-    if start is None or end is None or end < start:
+    if not isinstance(start, datetime) or not isinstance(end, datetime):
+        return False
+    start = _coerce_utc_naive(start)
+    end = _coerce_utc_naive(end)
+    if end < start:
         return False
     row_time = _row_time(row)
     if row_time is None or not (start <= row_time <= end):
