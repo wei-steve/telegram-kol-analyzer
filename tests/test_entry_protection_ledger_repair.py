@@ -5,6 +5,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_protection_ledger_repair import (
     apply_entry_protection_ledger_repair_plan,
     build_entry_protection_ledger_repair_plan,
+    plan_verified_trigger_entry_protection_adoption,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -328,6 +329,88 @@ def test_entry_protection_repair_skips_already_repaired_trigger_entry(tmp_path):
     assert followup_plan.refusals == ()
 
 
+def test_adoption_plans_one_exact_trigger_entry_protection_without_session_write(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_entry_fill(
+        session_factory,
+        binding_id=152,
+        legs=[
+            {
+                "leg_id": 289,
+                "leg_index": 1,
+                "order_id": "entry-1",
+                "client_order_id": "entry-client-1",
+                "pos_id": "pos-1",
+                "size": "4.4",
+                "entry_price": "1883.0",
+            }
+        ],
+    )
+    pending_rows = [
+        _pending_tpsl_row(
+            "tpsl-1",
+            purpose="combined",
+            price="1860",
+            stop_price="1900",
+            ctime="2026-07-20T00:11:13Z",
+            inst_id="ETH-USDT-SWAP",
+            side="short",
+            size="4.4",
+        )
+    ]
+
+    with session_factory() as session:
+        entry_leg = session.get(ExecutionOrderLeg, 289)
+        entry_event = session.query(ExecutionEvent).one()
+        result = plan_verified_trigger_entry_protection_adoption(
+            session,
+            entry_leg=entry_leg,
+            event=entry_event,
+            pending_tpsl_rows=pending_rows,
+            existing_order_ids=set(),
+        )
+        assert result.action is not None
+        assert result.action.pos_id == "pos-1"
+        assert result.action.order_id == "tpsl-1"
+        assert result.refusal is None
+        assert session.query(PositionProtectionLedger).count() == 0
+
+
+def test_adoption_refuses_pending_row_without_order_id(tmp_path):
+    result = _plan_trigger_entry_adoption(tmp_path, pending_row={"ordId": ""})
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_entry_tpsl_missing"
+
+
+def test_adoption_refuses_pending_row_with_contradictory_position_id(tmp_path):
+    result = _plan_trigger_entry_adoption(tmp_path, pending_row={"posId": "other-pos"})
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_entry_tpsl_missing"
+
+
+def test_adoption_refuses_partial_size_pending_row(tmp_path):
+    result = _plan_trigger_entry_adoption(tmp_path, pending_row={"sz": "2.2"})
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_entry_tpsl_missing"
+
+
+def test_adoption_is_noop_for_already_verified_ledger_order(tmp_path):
+    result = _plan_trigger_entry_adoption(
+        tmp_path,
+        pending_row={},
+        existing_order_ids={"tpsl-1"},
+    )
+
+    assert result.action is None
+    assert result.refusal is None
+
+
 def test_trigger_entry_repair_refuses_duplicate_expected_protection_shape(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_entry_fill(
@@ -511,6 +594,44 @@ def _seed_trigger_entry_fill(session_factory, *, binding_id, legs):
                 )
             )
         session.commit()
+
+
+def _plan_trigger_entry_adoption(tmp_path, *, pending_row, existing_order_ids=None):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_entry_fill(
+        session_factory,
+        binding_id=152,
+        legs=[
+            {
+                "leg_id": 289,
+                "leg_index": 1,
+                "order_id": "entry-1",
+                "client_order_id": "entry-client-1",
+                "pos_id": "pos-1",
+                "size": "4.4",
+                "entry_price": "1883.0",
+            }
+        ],
+    )
+    row = _pending_tpsl_row(
+        "tpsl-1",
+        purpose="combined",
+        price="1860",
+        stop_price="1900",
+        ctime="2026-07-20T00:11:13Z",
+        inst_id="ETH-USDT-SWAP",
+        side="short",
+        size="4.4",
+    )
+    row.update(pending_row)
+    with session_factory() as session:
+        return plan_verified_trigger_entry_protection_adoption(
+            session,
+            entry_leg=session.get(ExecutionOrderLeg, 289),
+            event=session.query(ExecutionEvent).one(),
+            pending_tpsl_rows=[row],
+            existing_order_ids=existing_order_ids or set(),
+        )
 
 
 def _pending_tpsl_row(

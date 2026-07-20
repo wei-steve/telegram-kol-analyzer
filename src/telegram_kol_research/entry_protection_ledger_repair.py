@@ -43,6 +43,18 @@ class EntryProtectionLedgerRepairRefusal:
 
 
 @dataclass(frozen=True, slots=True)
+class EntryProtectionLedgerRepairAdoptionResult:
+    """The single, pure outcome of evaluating a trigger-entry TPSL snapshot."""
+
+    action: EntryProtectionLedgerRepairAction | None = None
+    refusal: EntryProtectionLedgerRepairRefusal | None = None
+
+    def __post_init__(self) -> None:
+        if self.action is not None and self.refusal is not None:
+            raise ValueError("adoption result cannot contain both action and refusal")
+
+
+@dataclass(frozen=True, slots=True)
 class EntryProtectionLedgerRepairPlan:
     created_at: datetime
     actions: tuple[EntryProtectionLedgerRepairAction, ...]
@@ -354,10 +366,8 @@ def _plan_trigger_entry_repair(
 ) -> tuple[list[EntryProtectionLedgerRepairAction], EntryProtectionLedgerRepairRefusal | None]:
     binding_id = int(event.execution_binding_id or 0)
     request = _loads_json(event.request_json)
-    expected_rows = _expected_protection_rows(request)
     instrument_id = _request_instrument_id(request) or _event_instrument_id(event)
-    side = _request_side(request) or str(event.side or "").lower()
-    if not binding_id or not expected_rows or not instrument_id or not side:
+    if not binding_id or not instrument_id:
         return [], _refusal(event, "missing_trigger_entry_identity")
     leg = _verified_trigger_entry_leg(
         session,
@@ -365,71 +375,120 @@ def _plan_trigger_entry_repair(
         order_id=str(event.order_id or ""),
         client_order_id=str(event.client_order_id or ""),
     )
-    if leg is None or not str(leg.pos_id or ""):
+    if leg is None:
         return [], _refusal(event, "verified_trigger_entry_leg_missing")
-    existing_leg_protection = (
-        session.query(PositionProtectionLedger.id)
-        .filter(PositionProtectionLedger.venue == "deepcoin")
-        .filter(PositionProtectionLedger.execution_order_leg_id == int(leg.id))
-        .filter(PositionProtectionLedger.status == "verified")
-        .first()
-    )
-    if existing_leg_protection is not None:
-        return [], None
     pending_rows = pending_cache.setdefault(
         instrument_id,
         _safe_pending_tpsl_rows(deepcoin_client, inst_id=instrument_id),
     )
+    result = plan_verified_trigger_entry_protection_adoption(
+        session,
+        entry_leg=leg,
+        event=event,
+        pending_tpsl_rows=pending_rows,
+        existing_order_ids=existing_order_ids,
+    )
+    return ([result.action] if result.action is not None else []), result.refusal
+
+
+def plan_verified_trigger_entry_protection_adoption(
+    session,
+    *,
+    entry_leg: ExecutionOrderLeg,
+    event: ExecutionEvent,
+    pending_tpsl_rows: list[dict[str, Any]],
+    existing_order_ids: set[str],
+) -> EntryProtectionLedgerRepairAdoptionResult:
+    """Purely match one verified trigger entry to one pending TPSL order.
+
+    ``session`` is deliberately accepted for call-site consistency but is not
+    read or written; callers must supply the verified leg and pending snapshot.
+    """
+
+    del session
+    binding_id = int(event.execution_binding_id or 0)
+    pos_id = str(entry_leg.pos_id or "").strip()
+    request = _loads_json(event.request_json)
+    expected_rows = _expected_protection_rows(request)
+    instrument_id = _request_instrument_id(request) or _event_instrument_id(event)
+    side = _request_side(request) or str(event.side or "").lower()
+    if (
+        not binding_id
+        or binding_id != int(entry_leg.execution_binding_id or 0)
+        or event.action != "create_trigger_entry"
+        or event.venue != "deepcoin"
+        or entry_leg.venue != "deepcoin"
+        or entry_leg.purpose != "entry"
+        or entry_leg.order_kind != "trigger_limit"
+        or entry_leg.attribution_status != "verified"
+        or entry_leg.status != "active"
+        or not pos_id
+        or not expected_rows
+        or not instrument_id
+        or not side
+        or not _same_nonempty_text(event.order_id, entry_leg.order_id)
+        or not _same_nonempty_text(event.client_order_id, entry_leg.client_order_id)
+    ):
+        return EntryProtectionLedgerRepairAdoptionResult(
+            refusal=_refusal(event, "missing_trigger_entry_identity")
+        )
+
     candidates = [
         row
-        for row in pending_rows
-        if _row_order_id(row)
-        and _row_order_id(row) not in existing_order_ids
+        for row in pending_tpsl_rows
+        if isinstance(row, dict)
+        and _row_order_id(row)
         and _row_matches_exchange_identity(
-            row, instrument_id=instrument_id, side=side, pos_id=str(leg.pos_id)
+            row, instrument_id=instrument_id, side=side, pos_id=pos_id
         )
         and _row_matches_trigger_entry_expected_protection(row, expected_rows)
         and _same_size_text(_row_size_text(row), _request_size_text(request))
     ]
     unique_order_ids = sorted({_row_order_id(row) for row in candidates if _row_order_id(row)})
     if len(unique_order_ids) != 1:
-        return [], EntryProtectionLedgerRepairRefusal(
-            event_id=int(event.id) if event.id is not None else None,
+        return EntryProtectionLedgerRepairAdoptionResult(
+            refusal=EntryProtectionLedgerRepairRefusal(
+                event_id=int(event.id) if event.id is not None else None,
+                binding_id=binding_id,
+                pos_id=pos_id,
+                reason=(
+                    "trigger_entry_tpsl_not_unique"
+                    if unique_order_ids
+                    else "trigger_entry_tpsl_missing"
+                ),
+                evidence={
+                    "candidate_order_ids": unique_order_ids,
+                    "trigger_entry_order_id": event.order_id,
+                    "size_text": _request_size_text(request),
+                },
+            )
+        )
+    order_id = unique_order_ids[0]
+    if order_id in existing_order_ids:
+        return EntryProtectionLedgerRepairAdoptionResult()
+    row = next(row for row in candidates if _row_order_id(row) == order_id)
+    return EntryProtectionLedgerRepairAdoptionResult(
+        action=EntryProtectionLedgerRepairAction(
+            event_id=int(event.id),
             binding_id=binding_id,
-            pos_id=str(leg.pos_id),
-            reason=(
-                "trigger_entry_tpsl_not_unique"
-                if unique_order_ids
-                else "trigger_entry_tpsl_missing"
-            ),
+            leg_id=int(entry_leg.id),
+            strategy_instance_id=entry_leg.strategy_instance_id,
+            pos_id=pos_id,
+            instrument_id=instrument_id,
+            side=side,
+            order_id=order_id,
+            purpose="combined",
+            trigger_price=None,
+            size_text=_row_size_text(row) or _request_size_text(request),
             evidence={
-                "candidate_order_ids": unique_order_ids,
+                "match": "trigger_entry_unique_expected_protection_shape",
+                "execution_event_id": int(event.id),
                 "trigger_entry_order_id": event.order_id,
-                "size_text": _request_size_text(request),
+                "take_profit": _expected_price(expected_rows, "take_profit"),
+                "stop_loss": _expected_price(expected_rows, "stop_loss"),
             },
         )
-    row = next(row for row in candidates if _row_order_id(row) == unique_order_ids[0])
-    action = EntryProtectionLedgerRepairAction(
-        event_id=int(event.id),
-        binding_id=binding_id,
-        leg_id=int(leg.id),
-        strategy_instance_id=leg.strategy_instance_id,
-        pos_id=str(leg.pos_id),
-        instrument_id=instrument_id,
-        side=side,
-        order_id=unique_order_ids[0],
-        purpose="combined",
-        trigger_price=None,
-        size_text=_row_size_text(row) or _request_size_text(request),
-        evidence={
-            "match": "trigger_entry_unique_expected_protection_shape",
-            "execution_event_id": int(event.id),
-            "trigger_entry_order_id": event.order_id,
-            "take_profit": _expected_price(expected_rows, "take_profit"),
-            "stop_loss": _expected_price(expected_rows, "stop_loss"),
-        },
     )
-    return [action], None
 
 
 def _verified_entry_leg(session, *, binding_id: int, pos_id: str) -> ExecutionOrderLeg | None:
@@ -676,6 +735,12 @@ def _same_size_text(left: str | None, right: str | None) -> bool:
     if not left or not right:
         return False
     return _same_numeric_text(left, right)
+
+
+def _same_nonempty_text(left: Any, right: Any) -> bool:
+    clean_left = str(left or "").strip()
+    clean_right = str(right or "").strip()
+    return bool(clean_left and clean_left == clean_right)
 
 
 def _row_time_within(
