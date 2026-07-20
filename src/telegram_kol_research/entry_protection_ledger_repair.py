@@ -367,6 +367,15 @@ def _plan_trigger_entry_repair(
     )
     if leg is None or not str(leg.pos_id or ""):
         return [], _refusal(event, "verified_trigger_entry_leg_missing")
+    existing_leg_protection = (
+        session.query(PositionProtectionLedger.id)
+        .filter(PositionProtectionLedger.venue == "deepcoin")
+        .filter(PositionProtectionLedger.execution_order_leg_id == int(leg.id))
+        .filter(PositionProtectionLedger.status == "verified")
+        .first()
+    )
+    if existing_leg_protection is not None:
+        return [], None
     pending_rows = pending_cache.setdefault(
         instrument_id,
         _safe_pending_tpsl_rows(deepcoin_client, inst_id=instrument_id),

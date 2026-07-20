@@ -271,6 +271,62 @@ def test_entry_protection_repair_matches_filled_trigger_entry_protection(tmp_pat
     }
 
 
+def test_entry_protection_repair_skips_already_repaired_trigger_entry(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_entry_fill(
+        session_factory,
+        binding_id=152,
+        legs=[
+            {
+                "leg_id": 289,
+                "leg_index": 1,
+                "order_id": "1001124198560580",
+                "client_order_id": "TKSQ3347E1",
+                "pos_id": "1001124219349221",
+                "size": "4.4",
+                "entry_price": "1883.0",
+            }
+        ],
+    )
+    client = FakeDeepcoinClient(
+        [
+            _pending_tpsl_row(
+                "1001124219349220",
+                purpose="combined",
+                price="1860",
+                stop_price="1900",
+                ctime="2026-07-20T00:11:13Z",
+                inst_id="ETH-USDT-SWAP",
+                side="short",
+                size="4.4",
+            )
+        ]
+    )
+    initial_plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 20, 2, 0, tzinfo=UTC),
+        binding_id=152,
+        include_trigger_entries=True,
+    )
+    apply_entry_protection_ledger_repair_plan(
+        session_factory,
+        initial_plan,
+        expected_fingerprint=initial_plan.fingerprint,
+    )
+
+    followup_plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 20, 2, 1, tzinfo=UTC),
+        binding_id=152,
+        include_trigger_entries=True,
+    )
+
+    assert followup_plan.actions == ()
+    assert followup_plan.refusals == ()
+
+
 def test_entry_protection_repair_refuses_ambiguous_trigger_entry_tpsl(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_entry_fill(
