@@ -17,10 +17,14 @@ from telegram_kol_research.message_recognition import (
     apply_authoritative_mimo_payload,
     recognize_message_now,
 )
+from telegram_kol_research.message_instruction_items import (
+    create_message_instruction_items_in_session,
+)
 from telegram_kol_research.models import (
     AiPromptInvocation,
     ExecutionBinding,
     MediaAsset,
+    MessageInstructionItem,
     MessageRecognition,
     RawMessage,
     SignalCandidate,
@@ -296,10 +300,317 @@ def test_authoritative_position_update_persists_target_lifecycle_and_generation(
     assert result.parse_source == "mimo_authoritative"
     with session_factory() as session:
         candidate = session.query(SignalCandidate).one()
+        item = session.query(MessageInstructionItem).one()
         assert candidate.target_lifecycle_id == lifecycle_id
         assert candidate.management_action == "partial_take_profit"
         assert candidate.management_fraction == pytest.approx(0.3)
         assert candidate.recognition_generation == "generation-claimed-42"
+        assert item.signal_candidate_id == candidate.id
+        assert item.instruction_kind == "management"
+        assert item.sequence == 0
+
+
+def test_dual_candidate_recognition_preserves_entry_and_management_items(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        old_lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=2124,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 19, 3, 6, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 19, 3, 7, tzinfo=UTC),
+            entry_price_actual=1705,
+            stop_loss=1740,
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=2131,
+            posted_at=datetime(2026, 6, 19, 10, 12, tzinfo=UTC),
+            text="ETH 旧空单先分批止盈30%，同时新多单 1680 入场，止损 1650，止盈 1730。",
+        )
+        session.add_all([old_lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        old_lifecycle_id = old_lifecycle.id
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "是策略",
+            "reason": "包含旧策略仓位管理和独立新策略",
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "target_lifecycle_id": old_lifecycle_id,
+                "symbol": "ETH",
+                "side": "short",
+                "management_action": "partial_take_profit",
+                "management_fraction": 0.3,
+                "confidence": 0.96,
+                "reason": "旧空单分批止盈30%",
+            },
+            "strategy": {
+                "symbol": "ETH",
+                "side": "long",
+                "entry": "1680",
+                "stop_loss": "1650",
+                "take_profit": "1730",
+                "order_type": "market",
+            },
+            "confidence": 0.94,
+        },
+        model="mimo-v2.5",
+        authoritative_generation="generation-dual-1",
+    )
+
+    assert result.status == "是策略"
+    with session_factory() as session:
+        candidates = (
+            session.query(SignalCandidate)
+            .filter_by(raw_message_id=raw_message_id)
+            .order_by(SignalCandidate.id)
+            .all()
+        )
+        items = (
+            session.query(MessageInstructionItem)
+            .filter_by(raw_message_id=raw_message_id)
+            .order_by(MessageInstructionItem.sequence)
+            .all()
+        )
+
+    assert {(row.event_type, row.target_lifecycle_id) for row in candidates} == {
+        ("position_update", old_lifecycle_id),
+        ("entry_signal", None),
+    }
+    assert [(item.instruction_kind, item.sequence) for item in items] == [
+        ("management", 0),
+        ("entry", 1),
+    ]
+
+
+def test_authoritative_rerecognition_retires_superseded_pending_item(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        old_lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=2124,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 19, 3, 6, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 19, 3, 7, tzinfo=UTC),
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=2131,
+            posted_at=datetime(2026, 6, 19, 10, 12, tzinfo=UTC),
+            text="ETH 新多单 1680 入场，止损 1650，止盈 1730。",
+        )
+        session.add_all([old_lifecycle, raw_message])
+        session.flush()
+        management_candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="ETH",
+            side="short",
+            event_type="position_update",
+            target_lifecycle_id=old_lifecycle.id,
+            management_action="partial_take_profit",
+            parse_source="mimo_authoritative",
+            confidence=0.96,
+        )
+        entry_candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="ETH",
+            side="long",
+            event_type="entry_signal",
+            entry_text="1680",
+            stop_loss_text="1650",
+            take_profit_text="1730",
+            parse_source="mimo_authoritative",
+            confidence=0.94,
+        )
+        session.add_all([management_candidate, entry_candidate])
+        session.flush()
+        create_message_instruction_items_in_session(
+            session,
+            raw_message_id=raw_message.id,
+        )
+        session.commit()
+        raw_message_id = raw_message.id
+        management_candidate_id = management_candidate.id
+        entry_candidate_id = entry_candidate.id
+
+    apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "是策略",
+            "reason": "只包含新策略",
+            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+            "strategy": {
+                "symbol": "ETH",
+                "side": "long",
+                "entry": "1680",
+                "stop_loss": "1650",
+                "take_profit": "1730",
+                "order_type": "market",
+            },
+            "confidence": 0.94,
+        },
+        model="mimo-v2.5",
+        authoritative_generation="generation-entry-only-2",
+    )
+
+    with session_factory() as session:
+        items = session.query(MessageInstructionItem).all()
+        management_candidate = session.get(SignalCandidate, management_candidate_id)
+        entry_candidate = session.get(SignalCandidate, entry_candidate_id)
+
+    assert [
+        (item.signal_candidate_id, item.instruction_kind, item.sequence)
+        for item in items
+    ] == [
+        (entry_candidate_id, "entry", 0),
+    ]
+    assert management_candidate.parse_source == "mimo_superseded"
+    assert entry_candidate.parse_source == "mimo_authoritative"
+
+
+def test_entry_upsert_tolerates_duplicate_role_rows_without_overwriting_management(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(chat_id=88, message_id=2131, text="ETH 新多单")
+        session.add(raw_message)
+        session.flush()
+        first_entry = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="ETH",
+            side="long",
+            event_type="entry_signal",
+            parse_source="mimo_superseded",
+            confidence=0.8,
+        )
+        duplicate_entry = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="ETH",
+            side="long",
+            event_type="entry_signal",
+            parse_source="mimo_superseded",
+            confidence=0.7,
+        )
+        management = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="ETH",
+            side="short",
+            event_type="position_update",
+            management_action="partial_take_profit",
+            parse_source="mimo_authoritative",
+            confidence=0.96,
+        )
+        session.add_all([first_entry, duplicate_entry, management])
+        session.flush()
+
+        candidate = _upsert_ai_signal_candidate(
+            session,
+            raw_message,
+            strategy={
+                "symbol": "ETH",
+                "side": "long",
+                "entry": "1680",
+                "stop_loss": "1650",
+                "take_profit": "1730",
+            },
+            confidence=0.94,
+            parse_source="mimo_authoritative",
+        )
+
+        assert candidate.id == first_entry.id
+        assert candidate.entry_text == "1680"
+        assert duplicate_entry.parse_source == "mimo_superseded"
+        assert management.event_type == "position_update"
+        assert management.management_action == "partial_take_profit"
+
+
+def test_partial_dual_acceptance_keeps_management_actionable(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=7000,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 20, 8, 30, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 20, 8, 31, tzinfo=UTC),
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=7001,
+            posted_at=datetime(2026, 7, 20, 9, 30, tzinfo=UTC),
+            text=(
+                "BTC 旧空单分批止盈30%，同时新空单进场 1840-1860，"
+                "止损 1905，止盈 1780/1720"
+            ),
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        lifecycle_id = lifecycle.id
+        raw_message_id = raw_message.id
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "是策略",
+            "reason": "旧仓位管理可执行，新策略价格尺度异常",
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "target_lifecycle_id": lifecycle_id,
+                "symbol": "BTC",
+                "side": "short",
+                "management_action": "partial_take_profit",
+                "management_fraction": 0.3,
+                "confidence": 0.96,
+                "reason": "BTC 旧空单分批止盈30%",
+            },
+            "strategy": {
+                "symbol": "BTC",
+                "side": "short",
+                "entry": "1840-1860",
+                "stop_loss": "1905",
+                "take_profit": "1780/1720",
+                "order_type": "limit",
+            },
+            "confidence": 0.92,
+        },
+        model="mimo-v2.5",
+        authoritative_generation="generation-partial-dual-1",
+    )
+
+    with session_factory() as session:
+        candidates = session.query(SignalCandidate).all()
+        items = session.query(MessageInstructionItem).all()
+
+    assert result.status == "非策略"
+    assert "symbol_price_scale_conflict" in (result.reason or "")
+    assert [(item.instruction_kind, item.sequence) for item in items] == [
+        ("management", 0),
+    ]
+    assert any(
+        candidate.event_type == "position_update"
+        and candidate.parse_source == "mimo_authoritative"
+        for candidate in candidates
+    )
+    assert any(
+        candidate.event_type == "entry_signal"
+        and candidate.parse_source == "mimo_symbol_review"
+        and candidate.review_status == "needs_review"
+        for candidate in candidates
+    )
 
 
 def test_recognize_message_now_persists_text_strategy_candidate(tmp_path):

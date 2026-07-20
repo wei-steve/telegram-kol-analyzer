@@ -22,6 +22,7 @@ from telegram_kol_research.ai_recognition_config import (
 from telegram_kol_research.models import (
     ExecutionBinding,
     MediaAsset,
+    MessageInstructionItem,
     MessageRecognition,
     RawMessage,
     SignalCandidate,
@@ -32,6 +33,9 @@ from telegram_kol_research.models import (
 from telegram_kol_research.lifecycle_exit_intents import (
     has_live_execution_binding,
     record_lifecycle_exit_intent,
+)
+from telegram_kol_research.message_instruction_items import (
+    create_message_instruction_items_in_session,
 )
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 from telegram_kol_research.recognition_profiles import BITCOIN_JUNZHANG_PROFILE
@@ -428,6 +432,7 @@ def _upsert_signal_candidate(session, raw_message: RawMessage, parsed) -> Signal
     candidate = (
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == raw_message.id)
+        .filter(SignalCandidate.event_type == "entry_signal")
         .order_by(SignalCandidate.id.asc())
         .first()
     )
@@ -443,6 +448,10 @@ def _upsert_signal_candidate(session, raw_message: RawMessage, parsed) -> Signal
     candidate.symbol = parsed.symbol
     candidate.side = parsed.side
     candidate.event_type = parsed.event_type
+    candidate.target_lifecycle_id = None
+    candidate.management_action = None
+    candidate.management_fraction = None
+    candidate.recognition_generation = None
     candidate.entry_text = _format_entry_range(parsed.entry_range)
     candidate.stop_loss_text = _format_number(parsed.stop_loss)
     candidate.take_profit_text = " / ".join(
@@ -1801,8 +1810,8 @@ def apply_authoritative_mimo_payload(
         if raw_message is None:
             raise LookupError("raw message not found")
         # A re-recognition must never leave a prior MiMo candidate executable.
-        # Current application below promotes at most one candidate back to the
-        # authoritative parse source.
+        # Current application below promotes only the independently actionable
+        # candidate roles back to the authoritative parse source.
         (
             session.query(SignalCandidate)
             .filter(SignalCandidate.raw_message_id == raw_message_id)
@@ -1818,6 +1827,10 @@ def apply_authoritative_mimo_payload(
                 parse_source="mimo_authoritative",
             )
             _upsert_recognition(session, result, engine=model)
+            _project_authoritative_instruction_items(
+                session,
+                raw_message_id=raw_message_id,
+            )
             session.commit()
             return result
 
@@ -1827,38 +1840,22 @@ def apply_authoritative_mimo_payload(
             else {"event_type": "none", "confidence": 0.0}
         )
         event_type = str(lifecycle_event.get("event_type") or "none")
+        lifecycle_applied = False
         if event_type != "none":
-            applied = _apply_lifecycle_event_decision(
+            lifecycle_applied = _apply_lifecycle_event_decision(
                 session,
                 raw_message,
                 lifecycle_event,
                 parse_source="mimo_authoritative",
                 authoritative_generation=authoritative_generation,
             )
-            result = MessageRecognitionResult(
-                raw_message_id=raw_message_id,
-                status=str(payload.get("recognition_result") or "非策略"),
-                reason=str(lifecycle_event.get("reason") or payload.get("reason") or "").strip() or None,
-                ai_payload=payload,
-                parse_source="mimo_authoritative",
-            )
-            if not applied:
-                result = MessageRecognitionResult(
-                    raw_message_id=raw_message_id,
-                    status="识别失败",
-                    reason="MiMo lifecycle event could not be applied safely",
-                    ai_payload=payload,
-                    parse_source="mimo_authoritative",
-                )
-            _upsert_recognition(session, result, engine=model)
-            session.commit()
-            return result
 
         result = _result_from_ai_payload(
             raw_message_id=raw_message_id,
             payload=payload,
             parse_source="mimo_authoritative",
         )
+        entry_applied = False
         if result.status == "是策略":
             conflict = _detect_strategy_symbol_price_scale_conflict(
                 payload.get("strategy") if isinstance(payload.get("strategy"), dict) else {},
@@ -1878,7 +1875,7 @@ def apply_authoritative_mimo_payload(
                 review_candidate.review_note = conflict.reason
                 result = MessageRecognitionResult(
                     raw_message_id=raw_message_id,
-                    status="识别失败",
+                    status="非策略" if lifecycle_applied else "识别失败",
                     reason=conflict.reason,
                     ai_payload=payload,
                     parse_source="mimo_authoritative",
@@ -1886,8 +1883,34 @@ def apply_authoritative_mimo_payload(
                 _upsert_recognition(session, result, engine=model)
             else:
                 _persist_ai_result(session, raw_message, result, engine=model)
+                entry_applied = True
+        elif lifecycle_applied:
+            result = MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status=str(payload.get("recognition_result") or "非策略"),
+                reason=str(
+                    lifecycle_event.get("reason") or payload.get("reason") or ""
+                ).strip()
+                or None,
+                ai_payload=payload,
+                parse_source="mimo_authoritative",
+            )
+            _upsert_recognition(session, result, engine=model)
+        elif event_type != "none":
+            result = MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="识别失败",
+                reason="MiMo lifecycle event could not be applied safely",
+                ai_payload=payload,
+                parse_source="mimo_authoritative",
+            )
+            _upsert_recognition(session, result, engine=model)
         else:
             _upsert_recognition(session, result, engine=model)
+        _project_authoritative_instruction_items(
+            session,
+            raw_message_id=raw_message_id,
+        )
         session.commit()
         return result
 
@@ -1915,6 +1938,55 @@ def _format_ai_strategy_summary(strategy: dict[str, Any]) -> str | None:
     return "；".join(parts) if parts else None
 
 
+def _project_authoritative_instruction_items(
+    session,
+    *,
+    raw_message_id: int,
+) -> None:
+    """Project only candidates accepted by the latest authoritative pass."""
+
+    session.flush()
+    accepted_candidate_ids = {
+        candidate_id
+        for (candidate_id,) in (
+            session.query(SignalCandidate.id)
+            .filter(SignalCandidate.raw_message_id == raw_message_id)
+            .filter(SignalCandidate.parse_source == "mimo_authoritative")
+            .filter(
+                SignalCandidate.event_type.in_(
+                    ["close_signal", "position_update", "entry_signal"]
+                )
+            )
+            .all()
+        )
+    }
+    projected_items = create_message_instruction_items_in_session(
+        session,
+        raw_message_id=raw_message_id,
+    )
+    accepted_items = [
+        item
+        for item in projected_items
+        if item.signal_candidate_id in accepted_candidate_ids
+    ]
+    for sequence, item in enumerate(accepted_items):
+        item.sequence = sequence
+    obsolete_pending_items = (
+        session.query(MessageInstructionItem)
+        .filter(MessageInstructionItem.raw_message_id == raw_message_id)
+        .filter(MessageInstructionItem.status == "pending")
+        .filter(
+            ~MessageInstructionItem.signal_candidate_id.in_(accepted_candidate_ids)
+            if accepted_candidate_ids
+            else True
+        )
+        .all()
+    )
+    for item in obsolete_pending_items:
+        session.delete(item)
+    session.flush()
+
+
 def _persist_ai_result(
     session,
     raw_message: RawMessage,
@@ -1926,7 +1998,7 @@ def _persist_ai_result(
     parse_source = result.parse_source or "ai"
     if result.status == "是策略":
         strategy = payload.get("strategy") if isinstance(payload.get("strategy"), dict) else {}
-        candidate = _upsert_ai_signal_candidate(
+        candidate = _upsert_entry_signal_candidate(
             session,
             raw_message,
             strategy=strategy,
@@ -1939,7 +2011,7 @@ def _persist_ai_result(
     _upsert_recognition(session, result, engine=engine)
 
 
-def _upsert_ai_signal_candidate(
+def _upsert_entry_signal_candidate(
     session,
     raw_message: RawMessage,
     *,
@@ -1951,6 +2023,7 @@ def _upsert_ai_signal_candidate(
     candidate = (
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == raw_message.id)
+        .filter(SignalCandidate.event_type == "entry_signal")
         .order_by(SignalCandidate.id.asc())
         .first()
     )
@@ -1965,6 +2038,10 @@ def _upsert_ai_signal_candidate(
     candidate.symbol = _string_or_none(normalized_strategy.get("symbol"))
     candidate.side = _string_or_none(normalized_strategy.get("side"))
     candidate.event_type = "entry_signal"
+    candidate.target_lifecycle_id = None
+    candidate.management_action = None
+    candidate.management_fraction = None
+    candidate.recognition_generation = None
     candidate.entry_text = _string_or_none(normalized_strategy.get("entry"))
     candidate.stop_loss_text = _string_or_none(normalized_strategy.get("stop_loss"))
     candidate.take_profit_text = _string_or_none(normalized_strategy.get("take_profit"))
@@ -1972,6 +2049,25 @@ def _upsert_ai_signal_candidate(
     candidate.confidence = max(0.0, min(confidence, 1.0))
     candidate.parse_source = parse_source
     return candidate
+
+
+def _upsert_ai_signal_candidate(
+    session,
+    raw_message: RawMessage,
+    *,
+    strategy: dict[str, Any],
+    confidence: float,
+    parse_source: str,
+) -> SignalCandidate:
+    """Compatibility wrapper for the entry-role candidate upsert."""
+
+    return _upsert_entry_signal_candidate(
+        session,
+        raw_message,
+        strategy=strategy,
+        confidence=confidence,
+        parse_source=parse_source,
+    )
 
 
 def _normalize_ai_strategy(strategy: dict[str, Any]) -> dict[str, str | None]:
@@ -2839,6 +2935,7 @@ def _upsert_close_signal_candidate(
     candidate = (
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == raw_message.id)
+        .filter(SignalCandidate.event_type.in_(["close_signal", "position_update"]))
         .order_by(SignalCandidate.id.asc())
         .first()
     )
@@ -2873,6 +2970,7 @@ def _upsert_entry_confirmation_candidate(
     candidate = (
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == raw_message.id)
+        .filter(SignalCandidate.event_type == "entry_signal")
         .order_by(SignalCandidate.id.asc())
         .first()
     )
@@ -2887,6 +2985,10 @@ def _upsert_entry_confirmation_candidate(
     candidate.symbol = lifecycle.symbol
     candidate.side = lifecycle.side
     candidate.event_type = "entry_signal"
+    candidate.target_lifecycle_id = None
+    candidate.management_action = None
+    candidate.management_fraction = None
+    candidate.recognition_generation = None
     candidate.entry_text = _format_number(entry_price) if entry_price is not None else None
     candidate.stop_loss_text = _format_number(lifecycle.stop_loss)
     candidate.take_profit_text = lifecycle.take_profit
@@ -2910,6 +3012,7 @@ def _upsert_management_signal_candidate(
     candidate = (
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == raw_message.id)
+        .filter(SignalCandidate.event_type.in_(["close_signal", "position_update"]))
         .order_by(SignalCandidate.id.asc())
         .first()
     )
