@@ -245,6 +245,155 @@ def test_transition_is_idempotent_and_updates_recovery_fields(tmp_path):
         assert intent.next_attempt_at.replace(tzinfo=UTC) == NOW
 
 
+def test_identity_claims_strip_surrounding_whitespace_and_reject_blank_values(tmp_path):
+    session_factory = create_session_factory(tmp_path / "intents.db")
+    leg_id = _leg(session_factory)
+    with session_factory() as session:
+        intent = create_or_get_trigger_protection_intent(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=leg_id,
+            request_fingerprint="d" * 64,
+            pre_submit_tpsl_baseline_json="{}",
+            correlation_id="corr-identities",
+        )
+        record_trigger_protection_parent(session, intent, parent_trigger_order_id=" parent-1 ")
+        transition_trigger_protection_intent(
+            session,
+            intent,
+            recovery_state="adopted",
+            adopted_order_id=" adopted-1 ",
+        )
+        assert intent.parent_trigger_order_id == "parent-1"
+        assert intent.adopted_order_id == "adopted-1"
+        with pytest.raises(ValueError, match="nonempty"):
+            record_trigger_protection_parent(session, intent, parent_trigger_order_id=" \t ")
+        with pytest.raises(ValueError, match="nonempty"):
+            transition_trigger_protection_intent(
+                session,
+                intent,
+                recovery_state="adopted",
+                adopted_order_id=" \n ",
+            )
+
+
+def test_transition_rejects_unknown_state_and_negative_retries(tmp_path):
+    session_factory = create_session_factory(tmp_path / "intents.db")
+    leg_id = _leg(session_factory)
+    with session_factory() as session:
+        intent = create_or_get_trigger_protection_intent(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=leg_id,
+            request_fingerprint="e" * 64,
+            pre_submit_tpsl_baseline_json="{}",
+            correlation_id="corr-transition",
+        )
+        with pytest.raises(ValueError, match="recovery state"):
+            transition_trigger_protection_intent(
+                session, intent, recovery_state="invented"
+            )
+        with pytest.raises(ValueError, match="retry attempts"):
+            transition_trigger_protection_intent(
+                session, intent, recovery_state="retrying", retry_attempts=-1
+            )
+
+
+def test_create_or_get_recovers_from_competing_committed_intent(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "intents.db")
+    leg_id = _leg(session_factory)
+    import telegram_kol_research.trigger_protection_intents as intents_module
+
+    original_flush = intents_module.Session.flush
+    competing_done = False
+
+    def competing_flush(session, *args, **kwargs):
+        nonlocal competing_done
+        if not competing_done:
+            competing_done = True
+            with session_factory() as competing:
+                competing.add(
+                    intents_module.TriggerProtectionIntent(
+                        venue="deepcoin",
+                        execution_binding_id=1,
+                        execution_order_leg_id=leg_id,
+                        request_fingerprint="f" * 64,
+                        pre_submit_tpsl_baseline_json="{}",
+                        correlation_id="corr-race",
+                    )
+                )
+                competing.commit()
+        return original_flush(session, *args, **kwargs)
+
+    monkeypatch.setattr(intents_module.Session, "flush", competing_flush)
+    with session_factory() as session:
+        recovered = create_or_get_trigger_protection_intent(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=leg_id,
+            request_fingerprint="f" * 64,
+            pre_submit_tpsl_baseline_json="{}",
+            correlation_id="corr-race",
+        )
+        assert recovered.execution_order_leg_id == leg_id
+        assert session.is_active
+
+
+def test_parent_claim_recovers_from_competing_committed_owner(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "intents.db")
+    first_leg_id = _leg(session_factory, leg_index=0)
+    second_leg_id = _leg(session_factory, leg_index=1)
+    with session_factory() as session:
+        first = create_or_get_trigger_protection_intent(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=first_leg_id,
+            request_fingerprint="1" * 64,
+            pre_submit_tpsl_baseline_json="{}",
+            correlation_id="corr-first-race",
+        )
+        second = create_or_get_trigger_protection_intent(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=second_leg_id,
+            request_fingerprint="2" * 64,
+            pre_submit_tpsl_baseline_json="{}",
+            correlation_id="corr-second-race",
+        )
+        session.commit()
+        first_id, second_id = first.id, second.id
+
+    import telegram_kol_research.trigger_protection_intents as intents_module
+
+    original_execute = intents_module.Session.execute
+    competing_done = False
+
+    def competing_execute(session, statement, *args, **kwargs):
+        nonlocal competing_done
+        if not competing_done:
+            competing_done = True
+            with session_factory() as competing:
+                competing_intent = competing.get(
+                    intents_module.TriggerProtectionIntent, second_id
+                )
+                record_trigger_protection_parent(
+                    competing,
+                    competing_intent,
+                    parent_trigger_order_id="parent-race",
+                )
+                competing.commit()
+        return original_execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(intents_module.Session, "execute", competing_execute)
+    with session_factory() as session:
+        first = session.get(intents_module.TriggerProtectionIntent, first_id)
+        with pytest.raises(ValueError, match="already owned"):
+            record_trigger_protection_parent(
+                session, first, parent_trigger_order_id="parent-race"
+            )
+        assert session.is_active
+
+
 def test_init_db_adds_trigger_protection_intent_table_and_indexes_to_old_sqlite_db(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'legacy.db'}", future=True)
     ExecutionBinding.__table__.create(engine)
