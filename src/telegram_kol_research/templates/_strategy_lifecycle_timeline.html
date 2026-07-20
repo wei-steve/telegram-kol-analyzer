@@ -5,6 +5,7 @@
       <div class="position-lifecycle-event position-lifecycle-event--{{ event.kind }}">
         <div class="position-lifecycle-row">
           <strong>{{ event.label }}</strong>
+          {% if event.kind in ('protection_adopted', 'protection_adoption_refused') %}<code>{{ event.kind }}</code>{% endif %}
           {% if event.message_id %}<code>#{{ event.message_id }}</code>{% endif %}
           {% if event.at_display %}<time>{{ event.at_display }}</time>{% endif %}
           {% if event.transition %}<code>{{ event.transition }}</code>{% endif %}

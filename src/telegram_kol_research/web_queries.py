@@ -11,11 +11,14 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionOrderLeg,
     ExecutionEvent,
     MediaAsset,
     MessageRecognition,
     RawMessage,
     RecognitionDecision,
+    PositionAttributionAudit,
+    PositionProtectionLedger,
     RecognitionExperiment,
     SignalCandidate,
     StrategyLifecycle,
@@ -34,6 +37,14 @@ STRATEGY_TIME_DISPLAY_FIELDS = (
     "latest_event_at",
 )
 MAX_MEDIA_ASSETS_PER_MESSAGE = 3
+
+
+def _safe_json_dict(value: str | None) -> dict[str, object]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def load_home_event_rows(
@@ -1181,7 +1192,7 @@ def _build_lifecycle_event_timeline(
     from telegram_kol_research.models import RawMessage, SignalCandidate, utc_now
 
     events: list[dict[str, object]] = []
-    seen: set[tuple[str, int | None]] = set()
+    seen: set[tuple[str, str | int | None]] = set()
 
     def add_event(
         *,
@@ -1192,8 +1203,9 @@ def _build_lifecycle_event_timeline(
         text: str | None = None,
         detail: str | None = None,
         transition: str | None = None,
+        event_key: str | int | None = None,
     ) -> None:
-        key = (kind, int(message_id) if message_id is not None else None)
+        key = (kind, event_key if event_key is not None else message_id)
         if key in seen:
             return
         seen.add(key)
@@ -1244,6 +1256,65 @@ def _build_lifecycle_event_timeline(
             ),
             transition="pending_entry → entered",
         )
+
+    binding_id = getattr(lifecycle, "execution_binding_id", None)
+    if binding_id is not None:
+        entry_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.execution_binding_id == binding_id,
+                ExecutionOrderLeg.purpose == "entry",
+                ExecutionOrderLeg.attribution_status == "verified",
+                ExecutionOrderLeg.pos_id.is_not(None),
+                ExecutionOrderLeg.pos_id != "",
+            )
+            .all()
+        )
+        entry_pos_ids = {int(row.id): str(row.pos_id) for row in entry_legs}
+        if entry_pos_ids:
+            adopted_rows = (
+                session.query(PositionProtectionLedger)
+                .filter(
+                    PositionProtectionLedger.execution_order_leg_id.in_(entry_pos_ids),
+                    PositionProtectionLedger.evidence_source
+                    == "reconciliation_trigger_entry_adoption",
+                )
+                .order_by(PositionProtectionLedger.created_at, PositionProtectionLedger.id)
+                .all()
+            )
+            for row in adopted_rows:
+                if entry_pos_ids.get(int(row.execution_order_leg_id)) != str(row.pos_id):
+                    continue
+                add_event(
+                    kind="protection_adopted",
+                    label="保护单归属已验证",
+                    at=row.created_at,
+                    detail=f"已验证保护单 #{row.order_id}",
+                    event_key=int(row.id),
+                )
+            refusal_rows = (
+                session.query(PositionAttributionAudit)
+                .filter(
+                    PositionAttributionAudit.execution_order_leg_id.in_(entry_pos_ids),
+                    PositionAttributionAudit.event_type == "protection_adoption_refused",
+                )
+                .order_by(PositionAttributionAudit.created_at, PositionAttributionAudit.id)
+                .all()
+            )
+            for row in refusal_rows:
+                if entry_pos_ids.get(int(row.execution_order_leg_id)) != str(
+                    row.pos_id or ""
+                ):
+                    continue
+                raw_evidence = _safe_json_dict(row.evidence_json)
+                reason_code = str(raw_evidence.get("reason") or "unknown")
+                add_event(
+                    kind="protection_adoption_refused",
+                    label="保护单归属未验证",
+                    at=row.created_at,
+                    detail=f"拒绝原因：{reason_code}",
+                    event_key=int(row.id),
+                )
 
     start_at = lifecycle.signal_at
     end_at = lifecycle.exited_at or utc_now()

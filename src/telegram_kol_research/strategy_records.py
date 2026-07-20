@@ -21,6 +21,8 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     MediaAsset,
     MessageRecognition,
+    PositionAttributionAudit,
+    PositionProtectionLedger,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -86,7 +88,9 @@ _TIMELINE_KIND_RANK = MappingProxyType(
         "order": 3,
         "fill": 4,
         "execution": 5,
-        "management": 6,
+        "protection_adopted": 6,
+        "protection_adoption_refused": 7,
+        "management": 8,
     }
 )
 _MESSAGE_ROLE_RANK = MappingProxyType({"entry": 0, "management": 1, "exit": 2})
@@ -233,6 +237,30 @@ def load_strategy_record_detail(
             )
             .all()
             if management_batch_ids
+            else []
+        )
+        entry_leg_ids = {int(row.id) for row in order_legs if row.purpose == "entry"}
+        protection_ledger_rows = (
+            session.query(PositionProtectionLedger)
+            .filter(
+                PositionProtectionLedger.execution_order_leg_id.in_(entry_leg_ids),
+                PositionProtectionLedger.evidence_source
+                == "reconciliation_trigger_entry_adoption",
+            )
+            .order_by(PositionProtectionLedger.created_at, PositionProtectionLedger.id)
+            .all()
+            if entry_leg_ids
+            else []
+        )
+        protection_refusal_rows = (
+            session.query(PositionAttributionAudit)
+            .filter(
+                PositionAttributionAudit.execution_order_leg_id.in_(entry_leg_ids),
+                PositionAttributionAudit.event_type == "protection_adoption_refused",
+            )
+            .order_by(PositionAttributionAudit.created_at, PositionAttributionAudit.id)
+            .all()
+            if entry_leg_ids
             else []
         )
 
@@ -525,6 +553,43 @@ def load_strategy_record_detail(
                 status=str(execution_event.status),
             )
         )
+    protection_adoption = _protection_adoption_detail(
+        order_legs=order_legs,
+        ledger_rows=protection_ledger_rows,
+        refusal_rows=protection_refusal_rows,
+    )
+    for row in protection_adoption["adopted_rows"]:
+        timeline.append(
+            _detail_timeline_item(
+                kind="protection_adopted",
+                timestamp=row.created_at,
+                database_id=int(row.id),
+                event_id=f"protection_adopted:{int(row.id)}",
+                source={
+                    "table": "position_protection_ledger",
+                    "id": int(row.id),
+                    "execution_order_leg_id": int(row.execution_order_leg_id),
+                    "order_id": str(row.order_id),
+                },
+                status="保护单归属已验证",
+            )
+        )
+    for row, refusal_code in protection_adoption["refusal_rows"]:
+        timeline.append(
+            _detail_timeline_item(
+                kind="protection_adoption_refused",
+                timestamp=row.created_at,
+                database_id=int(row.id),
+                event_id=f"protection_adoption_refused:{int(row.id)}",
+                source={
+                    "table": "position_attribution_audits",
+                    "id": int(row.id),
+                    "execution_order_leg_id": int(row.execution_order_leg_id),
+                    "reason_code": refusal_code,
+                },
+                status="保护单归属未验证",
+            )
+        )
     for batch in management_batches:
         timeline.append(
             _detail_timeline_item(
@@ -627,6 +692,12 @@ def load_strategy_record_detail(
             "position_ids_authoritative": any(
                 row.purpose == "entry" for row in order_legs
             ),
+            "protection_adoption": {
+                "state": protection_adoption["state"],
+                "order_ids": protection_adoption["order_ids"],
+                "evidence_sources": protection_adoption["evidence_sources"],
+                "refusal_codes": protection_adoption["refusal_codes"],
+            },
             "events": [_execution_event_detail(row) for row in execution_events],
             "management_batches": [
                 _management_batch_detail(
@@ -668,6 +739,46 @@ def load_strategy_record_detail(
             "recognition_decisions": role_recognition_evidence,
             "missing": missing,
         },
+    }
+
+
+def _protection_adoption_detail(
+    *,
+    order_legs: list[ExecutionOrderLeg],
+    ledger_rows: list[PositionProtectionLedger],
+    refusal_rows: list[PositionAttributionAudit],
+) -> dict[str, object]:
+    """Project only exact trigger-entry ownership evidence already in the DB."""
+
+    verified_entry_pos_ids = {
+        int(leg.id): str(leg.pos_id)
+        for leg in order_legs
+        if leg.purpose == "entry"
+        and str(leg.attribution_status or "") == "verified"
+        and str(leg.pos_id or "").strip()
+    }
+    adopted_rows = [
+        row
+        for row in ledger_rows
+        if verified_entry_pos_ids.get(int(row.execution_order_leg_id)) == str(row.pos_id)
+    ]
+    parsed_refusals: list[tuple[PositionAttributionAudit, str]] = []
+    for row in refusal_rows:
+        if int(row.execution_order_leg_id or 0) not in verified_entry_pos_ids:
+            continue
+        evidence = _safe_json_value(row.evidence_json)
+        reason = evidence.get("reason") if isinstance(evidence, dict) else None
+        if isinstance(reason, str) and reason.strip():
+            parsed_refusals.append((row, reason.strip()))
+    order_ids = sorted({str(row.order_id) for row in adopted_rows})
+    refusal_codes = sorted({reason for _row, reason in parsed_refusals})
+    return {
+        "state": "adopted" if order_ids else "refused" if refusal_codes else "unverified",
+        "order_ids": order_ids,
+        "evidence_sources": sorted({str(row.evidence_source) for row in adopted_rows}),
+        "refusal_codes": refusal_codes,
+        "adopted_rows": adopted_rows,
+        "refusal_rows": parsed_refusals,
     }
 
 

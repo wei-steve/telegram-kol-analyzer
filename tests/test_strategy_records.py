@@ -8,6 +8,8 @@ from telegram_kol_research.models import (
     ExecutionEvent,
     ExecutionOrderLeg,
     MediaAsset,
+    PositionAttributionAudit,
+    PositionProtectionLedger,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -214,6 +216,100 @@ def test_load_strategy_record_detail_returns_none_for_unknown_lifecycle(tmp_path
         lifecycle_id=999,
         group_labels_by_chat_id={},
     ) is None
+
+
+def test_strategy_detail_shows_exact_adopted_trigger_protection_order_only(tmp_path):
+    session_factory = create_session_factory(tmp_path / "adopted-protection.db")
+    with session_factory() as session:
+        binding, lifecycle, leg = _seed_trigger_entry_strategy(session)
+        session.add_all(
+            [
+                PositionProtectionLedger(
+                    venue="deepcoin",
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    pos_id="pos-adopted",
+                    instrument_id="BTC-USDT-SWAP",
+                    side="long",
+                    order_id="tpsl-exact-1",
+                    purpose="combined",
+                    status="verified",
+                    evidence_source="reconciliation_trigger_entry_adoption",
+                    evidence_json='{"match":"trigger_entry_unique_expected_protection_shape"}',
+                    created_at=NOW,
+                    updated_at=NOW,
+                ),
+                PositionProtectionLedger(
+                    venue="deepcoin",
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    pos_id="pos-other",
+                    instrument_id="BTC-USDT-SWAP",
+                    side="long",
+                    order_id="tpsl-other-position",
+                    purpose="combined",
+                    status="verified",
+                    evidence_source="reconciliation_trigger_entry_adoption",
+                    evidence_json="{}",
+                    created_at=NOW,
+                    updated_at=NOW,
+                ),
+            ]
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    detail = load_strategy_record_detail(
+        session_factory, lifecycle_id=lifecycle_id, group_labels_by_chat_id={}
+    )
+
+    assert detail["execution"]["protection_adoption"] == {
+        "state": "adopted",
+        "order_ids": ["tpsl-exact-1"],
+        "evidence_sources": ["reconciliation_trigger_entry_adoption"],
+        "refusal_codes": [],
+    }
+    assert "tpsl-other-position" not in str(detail["execution"]["protection_adoption"])
+
+
+def test_strategy_detail_marks_ambiguous_trigger_protection_refusal_actionable(tmp_path):
+    session_factory = create_session_factory(tmp_path / "refused-protection.db")
+    with session_factory() as session:
+        binding, lifecycle, leg = _seed_trigger_entry_strategy(session)
+        session.add(
+            PositionAttributionAudit(
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                venue="deepcoin",
+                pos_id="pos-adopted",
+                event_type="protection_adoption_refused",
+                prior_state="verified",
+                new_state="protection_adoption_refused",
+                fingerprint="a" * 64,
+                evidence_json='{"reason":"trigger_entry_tpsl_not_unique","candidate_order_ids":["one","two"]}',
+                created_at=NOW,
+            )
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    detail = load_strategy_record_detail(
+        session_factory, lifecycle_id=lifecycle_id, group_labels_by_chat_id={}
+    )
+
+    assert detail["execution"]["protection_adoption"] == {
+        "state": "refused",
+        "order_ids": [],
+        "evidence_sources": [],
+        "refusal_codes": ["trigger_entry_tpsl_not_unique"],
+    }
+    assert any(
+        item["kind"] == "protection_adoption_refused"
+        and item["status"] == "保护单归属未验证"
+        for item in detail["timeline"]
+    )
 
 
 def test_load_strategy_record_detail_marks_missing_evidence_explicitly(tmp_path):
@@ -621,6 +717,49 @@ def _exchange_position(
             "reasons": reasons or [],
         },
     }
+
+
+def _seed_trigger_entry_strategy(session):
+    binding = _binding(
+        chat_id=88,
+        message_id=808,
+        symbol="BTCUSDT",
+        strategy_instance_id="trigger-protection-strategy",
+        status="active",
+    )
+    binding.pos_id = "pos-adopted"
+    session.add(binding)
+    session.flush()
+    lifecycle = StrategyLifecycle(
+        chat_id=88,
+        message_id=808,
+        symbol="BTCUSDT",
+        side="long",
+        lifecycle_status="entered",
+        signal_at=NOW,
+        entered_at=NOW,
+        stop_loss=60_000,
+        execution_binding_id=binding.id,
+        updated_at=NOW,
+    )
+    leg = ExecutionOrderLeg(
+        execution_binding_id=binding.id,
+        strategy_instance_id=binding.strategy_instance_id,
+        leg_index=0,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="trigger-entry-1",
+        client_order_id="trigger-client-1",
+        pos_id="pos-adopted",
+        venue="deepcoin",
+        attribution_status="verified",
+        status="active",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    session.add_all([lifecycle, leg])
+    session.flush()
+    return binding, lifecycle, leg
 
 
 def test_exchange_enrichment_confirms_one_uniquely_bound_position():
