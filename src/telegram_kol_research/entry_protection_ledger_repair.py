@@ -390,7 +390,6 @@ def _plan_trigger_entry_repair(
         )
         and _row_matches_trigger_entry_expected_protection(row, expected_rows)
         and _same_size_text(_row_size_text(row), _request_size_text(request))
-        and _row_time(row) is not None
     ]
     unique_order_ids = sorted({_row_order_id(row) for row in candidates if _row_order_id(row)})
     if len(unique_order_ids) != 1:
@@ -410,7 +409,6 @@ def _plan_trigger_entry_repair(
             },
         )
     row = next(row for row in candidates if _row_order_id(row) == unique_order_ids[0])
-    row_time = _row_time(row)
     action = EntryProtectionLedgerRepairAction(
         event_id=int(event.id),
         binding_id=binding_id,
@@ -424,10 +422,9 @@ def _plan_trigger_entry_repair(
         trigger_price=None,
         size_text=_row_size_text(row) or _request_size_text(request),
         evidence={
-            "match": "trigger_entry_unique_size_time_tpsl",
+            "match": "trigger_entry_unique_expected_protection_shape",
             "execution_event_id": int(event.id),
             "trigger_entry_order_id": event.order_id,
-            "exchange_order_created_at": row_time.isoformat() if row_time else None,
             "take_profit": _expected_price(expected_rows, "take_profit"),
             "stop_loss": _expected_price(expected_rows, "stop_loss"),
         },

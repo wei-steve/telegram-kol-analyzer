@@ -199,7 +199,7 @@ def test_entry_protection_repair_refuses_unverified_entry_leg(tmp_path):
     assert plan.refusals[0].reason == "verified_entry_leg_missing"
 
 
-def test_entry_protection_repair_matches_filled_trigger_entry_protection(tmp_path):
+def test_trigger_entry_repair_matches_unique_expected_protection_shape(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_entry_fill(
         session_factory,
@@ -267,8 +267,9 @@ def test_entry_protection_repair_matches_filled_trigger_entry_protection(tmp_pat
         (290, "1001124219426041", "1001124219426042", "combined", None, "6.2"),
     ]
     assert {row.evidence["match"] for row in plan.actions} == {
-        "trigger_entry_unique_size_time_tpsl"
+        "trigger_entry_unique_expected_protection_shape"
     }
+    assert all("exchange_order_created_at" not in row.evidence for row in plan.actions)
 
 
 def test_entry_protection_repair_skips_already_repaired_trigger_entry(tmp_path):
@@ -327,7 +328,7 @@ def test_entry_protection_repair_skips_already_repaired_trigger_entry(tmp_path):
     assert followup_plan.refusals == ()
 
 
-def test_entry_protection_repair_refuses_ambiguous_trigger_entry_tpsl(tmp_path):
+def test_trigger_entry_repair_refuses_duplicate_expected_protection_shape(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_entry_fill(
         session_factory,
