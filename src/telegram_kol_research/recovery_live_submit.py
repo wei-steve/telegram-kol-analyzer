@@ -49,19 +49,61 @@ class RecoveryLiveSubmitError(RuntimeError):
     """Raised when a live recovery order cannot be submitted safely."""
 
 
-_TRIGGER_PROTECTION_LOCKS: dict[tuple[str, str, str], RLock] = {}
+_TRIGGER_PROTECTION_LOCKS: dict[tuple[str, str, str, str], RLock] = {}
 _TRIGGER_PROTECTION_LOCKS_GUARD = RLock()
 
 
 @contextmanager
-def _trigger_protection_submission_lock(*, venue: str, inst_id: str, side: str):
+def _trigger_protection_submission_lock(
+    *,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    venue: str,
+    inst_id: str,
+    side: str,
+):
     """Serialize one account/instrument/side trigger-protection handoff."""
 
-    key = (venue.lower(), inst_id.upper(), side.lower())
+    key = _trigger_protection_lock_key(
+        deepcoin_client=deepcoin_client,
+        venue=venue,
+        inst_id=inst_id,
+        side=side,
+    )
     with _TRIGGER_PROTECTION_LOCKS_GUARD:
         lock = _TRIGGER_PROTECTION_LOCKS.setdefault(key, RLock())
     with lock:
         yield
+
+
+def _trigger_protection_lock_key(
+    *,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    venue: str,
+    inst_id: str,
+    side: str,
+) -> tuple[str, str, str, str]:
+    """Return a non-secret account-scoped lock key for trigger ownership."""
+
+    return (
+        venue.lower(),
+        _trigger_protection_account_identity(deepcoin_client),
+        inst_id.upper(),
+        side.lower(),
+    )
+
+
+def _trigger_protection_account_identity(deepcoin_client: DeepcoinTradingClientProtocol) -> str:
+    account_id = getattr(deepcoin_client, "account_id", None)
+    if isinstance(account_id, str) and account_id.strip():
+        raw_identity = f"account:{account_id.strip()}"
+    else:
+        credentials = getattr(deepcoin_client, "_credentials", None)
+        api_key = getattr(credentials, "api_key", None)
+        if isinstance(api_key, str) and api_key:
+            raw_identity = f"api-key:{api_key}"
+        else:
+            raw_identity = f"client-instance:{id(deepcoin_client)}"
+    return hashlib.sha256(raw_identity.encode("utf-8")).hexdigest()
 
 
 def submit_recovery_order_live(
@@ -358,32 +400,25 @@ def _submit_recovery_signal_direct(
                 warnings.append("position_protection_failed_after_entry_submitted")
         elif order_type == "limit":
             order_payload = build_deepcoin_trigger_order_payload(draft, leg)
-            protection_intent = None
-            if _has_embedded_trigger_protection(order_payload):
-                protection_intent = _prepare_trigger_protection_intent(
-                    session_factory,
-                    trade_signal=trade_signal,
-                    draft=draft,
-                    leg=leg,
-                    leg_index=index,
-                    binding_context={
-                        "kol_id": kol_id,
-                        "symbol": symbol_key,
-                        "side": side_key,
-                        "source": source,
-                    },
-                    order_payload=order_payload,
-                )
             try:
-                if protection_intent is None:
-                    response = deepcoin_client.trigger_order(order_payload)
-                else:
+                if _has_embedded_trigger_protection(order_payload):
                     response = _submit_trigger_with_protection_intent(
                         session_factory,
                         deepcoin_client=deepcoin_client,
+                        trade_signal=trade_signal,
+                        draft=draft,
+                        leg=leg,
+                        leg_index=index,
+                        binding_context={
+                            "kol_id": kol_id,
+                            "symbol": symbol_key,
+                            "side": side_key,
+                            "source": source,
+                        },
                         order_payload=order_payload,
-                        execution_order_leg_id=protection_intent,
                     )
+                else:
+                    response = deepcoin_client.trigger_order(order_payload)
             except DeepcoinClientError:
                 raise
             except RecoveryLiveSubmitError:
@@ -588,8 +623,12 @@ def _submit_trigger_with_protection_intent(
     session_factory: sessionmaker,
     *,
     deepcoin_client: DeepcoinTradingClientProtocol,
+    trade_signal: TradeSignalRecord,
+    draft: dict[str, Any],
+    leg: dict[str, Any],
+    leg_index: int,
+    binding_context: dict[str, Any],
     order_payload: dict[str, Any],
-    execution_order_leg_id: int,
 ) -> dict[str, Any]:
     """Snapshot, persist intent, submit parent, and bind its returned identity."""
 
@@ -597,10 +636,24 @@ def _submit_trigger_with_protection_intent(
     side = str(order_payload.get("posSide") or order_payload.get("side") or "").lower()
     if not inst_id or not side:
         raise RecoveryLiveSubmitError("missing_trigger_protection_identity")
-    with _trigger_protection_submission_lock(venue="deepcoin", inst_id=inst_id, side=side):
+    with _trigger_protection_submission_lock(
+        deepcoin_client=deepcoin_client,
+        venue="deepcoin",
+        inst_id=inst_id,
+        side=side,
+    ):
         baseline_json = _normalized_pending_tpsl_baseline(
             deepcoin_client,
             inst_id=inst_id,
+        )
+        execution_order_leg_id = _prepare_trigger_protection_intent(
+            session_factory,
+            trade_signal=trade_signal,
+            draft=draft,
+            leg=leg,
+            leg_index=leg_index,
+            binding_context=binding_context,
+            order_payload=order_payload,
         )
         request_fingerprint = hashlib.sha256(
             json.dumps(order_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -701,10 +754,11 @@ def _optional_snapshot_text(row: dict[str, Any], *keys: str) -> str | None:
 def _normalized_trigger_order_id(response: Any) -> str:
     if not isinstance(response, dict):
         raise DeepcoinClientError("Deepcoin trigger order response missing order id")
-    order_id = _extract_order_id(response)
-    if not order_id or not order_id.strip():
-        raise DeepcoinClientError("Deepcoin trigger order response missing order id")
-    return order_id.strip()
+    for payload in _response_payloads(response):
+        order_id = payload.get("ordId")
+        if isinstance(order_id, str) and order_id and order_id == order_id.strip():
+            return order_id
+    raise DeepcoinClientError("Deepcoin trigger order response missing order id")
 
 
 def _persisted_order_request(

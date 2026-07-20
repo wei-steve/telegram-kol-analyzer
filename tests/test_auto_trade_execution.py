@@ -10,6 +10,8 @@ from telegram_kol_research.auto_trade_execution import _extract_partial_close_fr
 from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
 from telegram_kol_research.auto_trade_execution import disabled_management_message_needs_no_client
 from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
+from telegram_kol_research.deepcoin_client import DeepcoinClientError
+from telegram_kol_research.deepcoin_client import DeepcoinCredentials
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord, ExecutionOrderLegRecord, upsert_execution_binding, upsert_execution_order_leg
 from telegram_kol_research.db import create_session_factory
@@ -19,6 +21,7 @@ from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
 from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageInstructionItem, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
+from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
@@ -1282,6 +1285,62 @@ def test_trigger_limit_entry_defers_when_tpsl_snapshot_is_malformed(tmp_path):
     with session_factory() as session:
         assert session.query(TriggerProtectionIntent).count() == 0
         assert session.query(TradeSignal).one().status == "failed"
+        assert session.query(ExecutionBinding).count() == 0
+        assert session.query(ExecutionOrderLeg).count() == 0
+
+
+def test_trigger_limit_entry_rejects_alias_parent_id_without_persisting_it(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True, "default_max_loss_usdt": 20, "allowed_symbols": ["BTC"]},
+    )
+
+    class _AliasParentClient(_FakeDeepcoinClient):
+        def trigger_order(self, order_payload):
+            self.trigger_orders.append(order_payload)
+            return {"code": "0", "data": {"orderId": "alias-parent"}}
+
+    with pytest.raises(DeepcoinClientError, match="missing order id"):
+        auto_process_message_trade_signal(
+            session_factory,
+            raw_message_id=raw_message_id,
+            group_config=_group_config(),
+            deepcoin_client=_AliasParentClient(),
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=datetime(2026, 7, 20, 8, 1, tzinfo=UTC),
+        )
+
+    with session_factory() as session:
+        assert session.query(TriggerProtectionIntent).one().parent_trigger_order_id is None
+
+
+def test_trigger_protection_lock_key_separates_distinct_account_identities():
+    class _AccountClient:
+        def __init__(self, api_key):
+            self._credentials = DeepcoinCredentials(
+                api_key=api_key,
+                api_secret="secret",
+                passphrase="passphrase",
+            )
+
+    first = _trigger_protection_lock_key(
+        deepcoin_client=_AccountClient("account-a"),
+        venue="deepcoin",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+    )
+    second = _trigger_protection_lock_key(
+        deepcoin_client=_AccountClient("account-b"),
+        venue="deepcoin",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+    )
+
+    assert first != second
+    assert first[0] == second[0] == "deepcoin"
+    assert first[2:] == second[2:] == ("BTC-USDT-SWAP", "long")
 
 
 def test_auto_process_range_entry_uses_half_market_half_midpoint_limit_when_near_edge(tmp_path):
