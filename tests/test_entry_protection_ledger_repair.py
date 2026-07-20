@@ -411,6 +411,75 @@ def test_adoption_is_noop_for_already_verified_ledger_order(tmp_path):
     assert result.refusal is None
 
 
+def test_trigger_entry_repair_is_noop_when_leg_already_has_verified_protection(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_entry_fill(
+        session_factory,
+        binding_id=152,
+        legs=[
+            {
+                "leg_id": 289,
+                "leg_index": 1,
+                "order_id": "entry-1",
+                "client_order_id": "entry-client-1",
+                "pos_id": "pos-1",
+                "size": "4.4",
+                "entry_price": "1883.0",
+            }
+        ],
+    )
+    with session_factory() as session:
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=152,
+                execution_order_leg_id=289,
+                strategy_instance_id="deepcoin:-1002370796392:3347:ETH:short",
+                pos_id="pos-1",
+                instrument_id="ETH-USDT-SWAP",
+                side="short",
+                order_id="previous-tpsl-id",
+                purpose="combined",
+                status="verified",
+                evidence_source="entry_protection_event_repair",
+            )
+        )
+        session.commit()
+
+    plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=FakeDeepcoinClient(
+            [
+                _pending_tpsl_row(
+                    "new-candidate-tpsl-id",
+                    purpose="combined",
+                    price="1860",
+                    stop_price="1900",
+                    ctime="2026-07-20T00:11:13Z",
+                    inst_id="ETH-USDT-SWAP",
+                    side="short",
+                    size="4.4",
+                )
+            ]
+        ),
+        include_trigger_entries=True,
+    )
+
+    assert plan.actions == ()
+    assert plan.refusals == ()
+
+
+def test_adoption_refuses_when_any_populated_position_alias_contradicts_verified_leg(tmp_path):
+    result = _plan_trigger_entry_adoption(
+        tmp_path,
+        pending_row={"closePosId": "pos-1", "positionId": "other-pos"},
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_entry_tpsl_missing"
+
+
 def test_trigger_entry_repair_refuses_duplicate_expected_protection_shape(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_entry_fill(

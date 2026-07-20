@@ -377,6 +377,14 @@ def _plan_trigger_entry_repair(
     )
     if leg is None:
         return [], _refusal(event, "verified_trigger_entry_leg_missing")
+    if (
+        session.query(PositionProtectionLedger.id)
+        .filter(PositionProtectionLedger.execution_order_leg_id == int(leg.id))
+        .filter(PositionProtectionLedger.status == "verified")
+        .first()
+        is not None
+    ):
+        return [], None
     pending_rows = pending_cache.setdefault(
         instrument_id,
         _safe_pending_tpsl_rows(deepcoin_client, inst_id=instrument_id),
@@ -668,10 +676,19 @@ def _row_matches_exchange_identity(
         return False
     if str(row.get("posSide") or row.get("side") or "").lower() != side.lower():
         return False
-    row_pos_id = _first_nonzero_text(
-        row, "closePosId", "close_pos_id", "closePositionId", "posId", "pos_id", "positionId"
-    )
-    return row_pos_id in (None, pos_id)
+    position_ids = [
+        str(row[key]).strip()
+        for key in (
+            "closePosId",
+            "close_pos_id",
+            "closePositionId",
+            "posId",
+            "pos_id",
+            "positionId",
+        )
+        if str(row.get(key) or "").strip()
+    ]
+    return all(row_pos_id == pos_id for row_pos_id in position_ids)
 
 
 def _row_matching_expected_purpose(
