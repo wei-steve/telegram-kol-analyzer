@@ -1509,7 +1509,12 @@ def _derive_binding_from_entry_legs(
         binding.pos_id = _join_unique_ids(verified_live_pos_ids)
         binding.status = "active"
         binding.last_exchange_status = "position_ownership_verified"
-        _attach_binding_to_lifecycle(session, binding, recovered_at)
+        _attach_binding_to_lifecycle(
+            session,
+            binding,
+            recovered_at,
+            clear_expiry_review=not has_pending and not has_unavailable and not has_conflict,
+        )
     elif all_terminal:
         binding.pos_id = None
         binding.status = "closed"
@@ -2478,18 +2483,31 @@ def _submitted_orders_from_binding_payload(row: ExecutionBinding) -> list[dict[s
     return [item for item in submitted_orders if isinstance(item, dict)]
 
 
-def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: datetime) -> bool:
+def _attach_binding_to_lifecycle(
+    session,
+    row: ExecutionBinding,
+    updated_at: datetime,
+    *,
+    clear_expiry_review: bool = False,
+) -> bool:
     from telegram_kol_research.models import StrategyLifecycle
 
     lifecycle = (
         session.query(StrategyLifecycle)
-        .filter(StrategyLifecycle.chat_id == row.chat_id)
-        .filter(StrategyLifecycle.message_id == row.message_id)
-        .filter(StrategyLifecycle.symbol == row.symbol)
-        .filter(StrategyLifecycle.side == row.side)
+        .filter(StrategyLifecycle.execution_binding_id == row.id)
         .order_by(StrategyLifecycle.id.desc())
         .first()
     )
+    if lifecycle is None:
+        lifecycle = (
+            session.query(StrategyLifecycle)
+            .filter(StrategyLifecycle.chat_id == row.chat_id)
+            .filter(StrategyLifecycle.message_id == row.message_id)
+            .filter(StrategyLifecycle.symbol == row.symbol)
+            .filter(StrategyLifecycle.side == row.side)
+            .order_by(StrategyLifecycle.id.desc())
+            .first()
+        )
     if lifecycle is None:
         return True
     if row.status != "active" and _is_stale_unentered_lifecycle(lifecycle, updated_at):
@@ -2525,6 +2543,8 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
         lifecycle.exited_at = None
         if lifecycle.entered_at is None:
             lifecycle.entered_at = updated_at
+    if row.status == "active" and clear_expiry_review:
+        _clear_resolved_expiry_review(lifecycle)
     elif row.status == "open" and lifecycle.lifecycle_status in {
         "exited",
         "expired",
@@ -2540,6 +2560,16 @@ def _attach_binding_to_lifecycle(session, row: ExecutionBinding, updated_at: dat
     _refresh_lifecycle_prices_from_binding_payload(lifecycle, row)
     lifecycle.updated_at = updated_at
     return True
+
+
+def _clear_resolved_expiry_review(lifecycle) -> None:
+    if str(getattr(lifecycle, "management_action", "") or "") not in {
+        "expiry_review_requested",
+        "expiry_review_continued",
+    }:
+        return
+    lifecycle.management_action = None
+    lifecycle.management_note = None
 
 
 def _binding_has_unresolved_entry_leg(session, row: ExecutionBinding) -> bool:

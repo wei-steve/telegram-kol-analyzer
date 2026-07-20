@@ -1953,6 +1953,8 @@ def test_reconcile_links_delayed_live_position_through_trigger_child_order_histo
                 signal_at=datetime(2026, 7, 18, 20, 15, 52),
                 entered_at=datetime(2026, 7, 20, 0, 10),
                 execution_binding_id=binding_id,
+                management_action="expiry_review_requested",
+                management_note="上次人工选择继续等待后又超过 3 小时",
             )
         )
         session.commit()
@@ -2027,12 +2029,15 @@ def test_reconcile_links_delayed_live_position_through_trigger_child_order_histo
     with session_factory() as session:
         binding = session.get(ExecutionBinding, binding_id)
         leg = session.query(ExecutionOrderLeg).one()
+        lifecycle = session.query(StrategyLifecycle).one()
 
     assert binding.pos_id == "1001124219349221"
     assert binding.last_exchange_status == "position_ownership_verified"
     assert leg.pos_id == "1001124219349221"
     assert leg.status == "active"
     assert leg.attribution_status == "verified"
+    assert lifecycle.management_action is None
+    assert lifecycle.management_note is None
 
 
 def test_reconcile_does_not_link_trigger_child_when_order_history_is_ambiguous(
