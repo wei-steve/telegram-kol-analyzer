@@ -312,6 +312,44 @@ def test_strategy_detail_marks_ambiguous_trigger_protection_refusal_actionable(t
     )
 
 
+def test_strategy_detail_ignores_stale_trigger_protection_refusal_for_old_position(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "stale-refused-protection.db")
+    with session_factory() as session:
+        binding, lifecycle, leg = _seed_trigger_entry_strategy(session)
+        session.add(
+            PositionAttributionAudit(
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                venue="deepcoin",
+                pos_id="pos-old",
+                event_type="protection_adoption_refused",
+                prior_state="verified",
+                new_state="protection_adoption_refused",
+                fingerprint="b" * 64,
+                evidence_json='{"reason":"trigger_entry_tpsl_not_unique"}',
+                created_at=NOW,
+            )
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    detail = load_strategy_record_detail(
+        session_factory, lifecycle_id=lifecycle_id, group_labels_by_chat_id={}
+    )
+
+    assert detail["execution"]["protection_adoption"] == {
+        "state": "unverified",
+        "order_ids": [],
+        "evidence_sources": [],
+        "refusal_codes": [],
+    }
+    assert not any(
+        item["kind"] == "protection_adoption_refused" for item in detail["timeline"]
+    )
+
+
 def test_load_strategy_record_detail_marks_missing_evidence_explicitly(tmp_path):
     session_factory = create_session_factory(tmp_path / "partial-detail.db")
     with session_factory() as session:

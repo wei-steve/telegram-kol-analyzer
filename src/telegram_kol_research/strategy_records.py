@@ -764,7 +764,9 @@ def _protection_adoption_detail(
     ]
     parsed_refusals: list[tuple[PositionAttributionAudit, str]] = []
     for row in refusal_rows:
-        if int(row.execution_order_leg_id or 0) not in verified_entry_pos_ids:
+        if verified_entry_pos_ids.get(int(row.execution_order_leg_id or 0)) != str(
+            row.pos_id or ""
+        ):
             continue
         evidence = _safe_json_value(row.evidence_json)
         reason = evidence.get("reason") if isinstance(evidence, dict) else None
