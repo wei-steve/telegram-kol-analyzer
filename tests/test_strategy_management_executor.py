@@ -909,6 +909,63 @@ def test_full_close_rejects_unsnapshotted_eligible_deferred_entry_before_any_can
     ]
 
 
+def test_full_close_identity_drift_cap_keeps_unsnapshotted_pending_leg_identifiers(
+    tmp_path,
+):
+    """Live pending entries remain actionable when stale snapshot drift exceeds the cap."""
+
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "identity-drift-cap.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    deferred_ids, _ = _configure_deferred_full_exit(session_factory, batch)
+    stale_snapshot_leg_ids = list(range(10_000, 10_021))
+    with session_factory() as session:
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored_batch.target_snapshot_json)
+        snapshot["identity"]["deferred_entry_leg_ids"] = stale_snapshot_leg_ids
+        stored_batch.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+    client = _FakeClient(session_factory)
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert client.cancel_trigger_calls == []
+    assert client.cancel_order_calls == []
+    assert client.calls == []
+    diagnostics = list_execution_events(
+        session_factory,
+        execution_binding_id=batch.execution_binding_id,
+        action="strategy_management_deferred_entry_cancel_diagnostic",
+    )
+    assert len(diagnostics) == 20
+    diagnostics_by_leg_id = {
+        event.after["execution_order_leg_id"]: event.after for event in diagnostics
+    }
+    assert diagnostics_by_leg_id[deferred_ids[0]] == {
+        "execution_order_leg_id": deferred_ids[0],
+        "order_id": "deferred-order-1",
+        "client_order_id": "deferred-client-1",
+        "identity_state": "unsnapshotted_pending",
+        "live_match_source": "not_checked",
+        "match_type": "identity",
+        "status": "unresolved",
+        "reason": "unsnapshotted_pending_entry_leg",
+    }
+    assert sum(
+        event.after.get("omitted_identity_drift_count", 0)
+        for event in diagnostics
+    ) == 2
+
+
 @pytest.mark.parametrize("drift", ["deleted", "reassigned"])
 def test_full_close_persists_snapshot_deferred_entry_identity_drift(
     tmp_path, drift,

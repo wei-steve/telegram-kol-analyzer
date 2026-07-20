@@ -1534,14 +1534,14 @@ def _deferred_entry_identity_diagnostics(
     snapshot_rows_by_id: dict[int, ExecutionOrderLeg],
     current_deferred_entries: list[ExecutionOrderLeg],
 ) -> list[dict[str, Any]]:
-    """Describe only bounded identifiers needed to resolve exact-set drift."""
+    """Describe bounded exact-set drift, prioritising live pending entries."""
 
-    diagnostics: list[dict[str, Any]] = []
+    snapshot_diagnostics: list[dict[str, Any]] = []
     current_deferred_ids = {int(entry.id) for entry in current_deferred_entries}
     for leg_id in snapshot_leg_ids:
         entry = snapshot_rows_by_id.get(leg_id)
         if entry is None:
-            diagnostics.append(
+            snapshot_diagnostics.append(
                 _deferred_identity_diagnostic(
                     leg_id=leg_id,
                     identity_state="snapshot_leg_missing",
@@ -1554,7 +1554,7 @@ def _deferred_entry_identity_diagnostics(
             or entry.strategy_instance_id != batch.strategy_instance_id
             or entry.purpose != "entry"
         ):
-            diagnostics.append(
+            snapshot_diagnostics.append(
                 _deferred_identity_diagnostic(
                     leg_id=leg_id,
                     identity_state="snapshot_leg_reassigned",
@@ -1563,7 +1563,7 @@ def _deferred_entry_identity_diagnostics(
             )
             continue
         if leg_id not in current_deferred_ids:
-            diagnostics.append(
+            snapshot_diagnostics.append(
                 _deferred_identity_diagnostic(
                     leg_id=leg_id,
                     identity_state="snapshot_leg_state_drift",
@@ -1573,7 +1573,7 @@ def _deferred_entry_identity_diagnostics(
                 )
             )
     snapshot_ids = set(snapshot_leg_ids)
-    diagnostics.extend(
+    pending_diagnostics = [
         _deferred_identity_diagnostic(
             leg_id=int(entry.id),
             identity_state="unsnapshotted_pending",
@@ -1583,8 +1583,15 @@ def _deferred_entry_identity_diagnostics(
         )
         for entry in sorted(current_deferred_entries, key=lambda item: int(item.id))
         if int(entry.id) not in snapshot_ids
-    )
-    return diagnostics[:20]
+    ]
+    diagnostics = [*pending_diagnostics, *snapshot_diagnostics]
+    capped_diagnostics = diagnostics[:20]
+    if len(diagnostics) > len(capped_diagnostics):
+        capped_diagnostics[-1] = {
+            **capped_diagnostics[-1],
+            "omitted_identity_drift_count": len(diagnostics) - len(capped_diagnostics),
+        }
+    return capped_diagnostics
 
 
 def _deferred_identity_diagnostic(
