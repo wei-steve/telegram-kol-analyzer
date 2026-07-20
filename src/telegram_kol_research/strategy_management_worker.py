@@ -210,10 +210,15 @@ def run_strategy_management_worker_tick(
                     batch_id=batch.id,
                     snapshot=current_snapshot,
                 )
-            except ManagementBatchExecutionError:
-                _freeze_restart_snapshot_failure(
-                    session_factory, batch_id=batch.id, frozen_at=now
-                )
+            except ManagementBatchExecutionError as exc:
+                if _is_deferred_entry_set_failure(batch, exc):
+                    _persist_deferred_entry_cancel_preflight_failure(
+                        session_factory, batch_id=batch.id, failed_at=now
+                    )
+                else:
+                    _freeze_restart_snapshot_failure(
+                        session_factory, batch_id=batch.id, frozen_at=now
+                    )
                 counts["recovered"] += 1
                 continue
             except Exception:
@@ -229,11 +234,16 @@ def run_strategy_management_worker_tick(
                 executed_at=now,
             )
             counts["recovered"] += 1
-        except ManagementBatchExecutionError:
+        except ManagementBatchExecutionError as exc:
             counts["failed"] += 1
-            _persist_deterministic_pre_submit_failure(
-                session_factory, batch_id=batch.id, failed_at=now
-            )
+            if _is_deferred_entry_set_failure(batch, exc):
+                _persist_deferred_entry_cancel_preflight_failure(
+                    session_factory, batch_id=batch.id, failed_at=now
+                )
+            else:
+                _persist_deterministic_pre_submit_failure(
+                    session_factory, batch_id=batch.id, failed_at=now
+                )
             logger.exception("strategy management batch %s failed", batch.id)
         except Exception:
             counts["failed"] += 1
@@ -324,6 +334,28 @@ def _persist_deterministic_pre_submit_failure(
         new_status="blocked",
         transitioned_at=failed_at,
         reason_code="management_pre_submit_validation_failed",
+    )
+
+
+def _persist_deferred_entry_cancel_preflight_failure(
+    session_factory, *, batch_id: int, failed_at: datetime
+) -> bool:
+    return transition_batch(
+        session_factory,
+        int(batch_id),
+        expected_statuses={"executing"},
+        new_status="recovery_required",
+        transitioned_at=failed_at,
+        reason_code="deferred_entry_cancel_preflight_failed",
+    )
+
+
+def _is_deferred_entry_set_failure(
+    batch: ManagementBatchRecord, exc: ManagementBatchExecutionError
+) -> bool:
+    return bool(
+        batch.effective_action in {"full_close", "full_exit"}
+        and str(exc) == "batch_entry_set_not_exact"
     )
 
 

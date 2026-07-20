@@ -507,6 +507,53 @@ def test_full_close_reconciliation_accepts_only_snapshotted_management_cancelled
     assert stored.status == "succeeded"
 
 
+def test_full_close_reconciliation_freezes_cancelled_deferred_entries_without_close_reservation(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(
+        sf,
+        action="full_close",
+        sizes=("2",),
+        preflight=("2",),
+        initial_status="planned",
+    )
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        deferred = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=2,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="deferred-entry",
+            venue="deepcoin",
+            attribution_status="unassigned",
+            status="cancelled",
+            terminal_reason="management_full_close_cancelled_unfilled_entry_leg",
+            last_verified_at=NOW,
+        )
+        session.add(deferred)
+        session.flush()
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored_batch.target_snapshot_json)
+        snapshot["identity"]["deferred_entry_leg_ids"] = [deferred.id]
+        stored_batch.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+    result = _reconcile_management(
+        sf,
+        positions=[_position("pos-1", "2")],
+        orders=[],
+    )
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.frozen == 1
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "management_close_not_reserved_after_deferred_cancel"
+    assert stored.legs[0].status == "planned"
+
+
 def test_full_close_reconciliation_rejects_snapshotted_deferred_entry_still_pending(
     tmp_path,
 ):

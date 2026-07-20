@@ -228,6 +228,12 @@ def format_position_attribution_incident_message(payload: dict[str, Any]) -> str
 MANAGEMENT_ALERT_STATES = frozenset(
     {"blocked", "partial_failed", "submit_unknown", "recovery_required"}
 )
+_MANAGEMENT_TELEGRAM_MAX_CHARS = 3900
+_DEFERRED_CANCEL_EVENT_ACTIONS = frozenset({
+    "strategy_management_cancel_deferred_trigger_entry",
+    "strategy_management_cancel_deferred_regular_entry",
+    "strategy_management_deferred_entry_cancel_diagnostic",
+})
 _SENSITIVE_MARKERS = (
     "dc-access", "api-key", "api_key", "authorization", "passphrase",
     "secret", "signing", "raw_header", "raw_payload", "raw_response",
@@ -281,6 +287,15 @@ def format_strategy_management_notification(payload: dict[str, Any]) -> str:
                 f"订单: {entry.get('order_id') or '-'} "
                 f"客户订单: {entry.get('client_order_id') or '-'}"
             )
+            diagnostic = entry.get("cancellation_diagnostic")
+            if isinstance(diagnostic, dict):
+                lines.append(
+                    "  撤单诊断: "
+                    f"live={diagnostic.get('live_match_source') or '-'} "
+                    f"type={diagnostic.get('match_type') or '-'} "
+                    f"status={diagnostic.get('status') or '-'} "
+                    f"reason={diagnostic.get('reason') or '-'}"
+                )
         if not deferred_entry_legs:
             lines.append("- -")
     legs = payload.get("legs") if isinstance(payload.get("legs"), list) else []
@@ -299,6 +314,34 @@ def format_strategy_management_notification(payload: dict[str, Any]) -> str:
     if not legs:
         lines.append("- -")
     return "\n".join(lines)
+
+
+def split_strategy_management_notification(
+    payload: dict[str, Any], *, max_chars: int = _MANAGEMENT_TELEGRAM_MAX_CHARS
+) -> list[str]:
+    """Return deterministic line-bounded Telegram messages below 4096 chars."""
+
+    limit = max(1, min(int(max_chars), 4095))
+    text = format_strategy_management_notification(payload)
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = line if not current else f"{current}\n{line}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current = line
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _safe_management_text(value: Any, *, limit: int = 300) -> str:
@@ -351,7 +394,7 @@ def canonical_management_error_summary(value: Any) -> dict[str, str]:
 
 def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[str, Any]:
     from telegram_kol_research.models import (
-        ExecutionOrderLeg, RawMessage, StrategyManagementLeg,
+        ExecutionEvent, ExecutionOrderLeg, RawMessage, StrategyManagementLeg,
     )
 
     raw = session.get(RawMessage, batch.raw_message_id)
@@ -381,6 +424,21 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
             }
         )
     deferred_entry_legs = []
+    cancellation_diagnostics: dict[int, dict[str, str]] = {}
+    for event in (
+        session.query(ExecutionEvent)
+        .filter(
+            ExecutionEvent.execution_binding_id == batch.execution_binding_id,
+            ExecutionEvent.source_message_id == batch.raw_message_id,
+            ExecutionEvent.action.in_(_DEFERRED_CANCEL_EVENT_ACTIONS),
+        )
+        .order_by(ExecutionEvent.id.desc())
+        .limit(100)
+    ):
+        diagnostic = _canonical_deferred_cancel_diagnostic(event.after_json)
+        leg_id = diagnostic.pop("execution_order_leg_id", None)
+        if isinstance(leg_id, int) and leg_id not in cancellation_diagnostics:
+            cancellation_diagnostics[leg_id] = diagnostic
     snapshot = _decode_mapping(batch.target_snapshot_json)
     identity = snapshot.get("identity")
     deferred_entry_leg_ids = (
@@ -407,6 +465,26 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
                     "client_order_id": _safe_management_text(
                         entry.client_order_id, limit=120
                     ),
+                    "cancellation_diagnostic": cancellation_diagnostics.get(
+                        int(entry.id),
+                        {
+                            "live_match_source": "unknown",
+                            "match_type": (
+                                "trigger"
+                                if "trigger" in str(entry.order_kind or "").lower()
+                                else "regular"
+                            ),
+                            "status": (
+                                "resolved"
+                                if str(entry.status or "").lower() == "cancelled"
+                                else "unresolved"
+                            ),
+                            "reason": _safe_management_text(
+                                entry.terminal_reason or batch.reason_code,
+                                limit=80,
+                            ),
+                        },
+                    ),
                 }
             )
     return {
@@ -428,6 +506,24 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
         "reason": _safe_management_text(batch.reason_code, limit=240),
         "deferred_entry_legs": deferred_entry_legs,
         "legs": legs,
+    }
+
+
+def _canonical_deferred_cancel_diagnostic(value: Any) -> dict[str, Any]:
+    decoded = _decode_value(value)
+    if not isinstance(decoded, dict):
+        return {}
+    leg_id = decoded.get("execution_order_leg_id")
+    if type(leg_id) is not int or leg_id <= 0:
+        return {}
+    return {
+        "execution_order_leg_id": leg_id,
+        "live_match_source": _safe_management_text(
+            decoded.get("live_match_source"), limit=40
+        ),
+        "match_type": _safe_management_text(decoded.get("match_type"), limit=24),
+        "status": _safe_management_text(decoded.get("status"), limit=32),
+        "reason": _safe_management_text(decoded.get("reason"), limit=80),
     }
 
 
@@ -576,10 +672,8 @@ async def deliver_strategy_management_notifications(
                 group_labels.get(payload["source_chat_id"]), limit=120
             )
         try:
-            await send_system_operator_bot_message(
-                config=config,
-                text=format_strategy_management_notification(payload),
-            )
+            for message in split_strategy_management_notification(payload):
+                await send_system_operator_bot_message(config=config, text=message)
         except Exception as exc:
             with session_factory() as session:
                 session.execute(

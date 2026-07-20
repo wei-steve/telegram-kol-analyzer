@@ -313,6 +313,96 @@ def test_ready_claim_with_deterministic_pre_submit_failure_is_persistently_block
     assert stored.reason_code == "management_pre_submit_validation_failed"
 
 
+def test_full_exit_deferred_set_validation_failure_uses_cancellation_recovery_path(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "deferred-recovery.db")
+    row = StrategyManagementBatch(
+        idempotency_fingerprint="d" * 64,
+        raw_message_id=1,
+        recognition_decision_id=1,
+        recognition_generation="g1",
+        target_lifecycle_id=1,
+        strategy_instance_id="deepcoin:100:10:BTC:short",
+        execution_binding_id=1,
+        intent="full_take_profit",
+        effective_action="full_exit",
+        partial_round_before=0,
+        status="ready",
+        target_fingerprint="e" * 64,
+        target_snapshot_json='{"identity":{"deferred_entry_leg_ids":[]}}',
+        planned_at=NOW,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    with session_factory() as session:
+        session.add(row)
+        session.commit()
+        batch_id = row.id
+
+    result = run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        restart_validator=lambda *_args, **_kwargs: None,
+        snapshot_loader=lambda *_args, **_kwargs: object(),
+        executor=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ManagementBatchExecutionError("batch_entry_set_not_exact")
+        ),
+        processed_at=NOW,
+    )
+
+    stored = load_management_batch(session_factory, batch_id)
+    assert result.failed == 1
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "deferred_entry_cancel_preflight_failed"
+
+
+def test_full_exit_restart_validator_deferred_set_failure_uses_cancellation_recovery_path(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "deferred-restart-recovery.db")
+    row = StrategyManagementBatch(
+        idempotency_fingerprint="f" * 64,
+        raw_message_id=1,
+        recognition_decision_id=1,
+        recognition_generation="g1",
+        target_lifecycle_id=1,
+        strategy_instance_id="deepcoin:100:10:BTC:short",
+        execution_binding_id=1,
+        intent="full_take_profit",
+        effective_action="full_exit",
+        partial_round_before=0,
+        status="executing",
+        target_fingerprint="g" * 64,
+        target_snapshot_json='{"identity":{"deferred_entry_leg_ids":[2]}}',
+        planned_at=NOW,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    with session_factory() as session:
+        session.add(row)
+        session.commit()
+        batch_id = row.id
+
+    result = run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        snapshot_loader=lambda *_args, **_kwargs: object(),
+        restart_validator=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ManagementBatchExecutionError("batch_entry_set_not_exact")
+        ),
+        executor=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unsafe restart must stay frozen")
+        ),
+        processed_at=NOW,
+    )
+
+    stored = load_management_batch(session_factory, batch_id)
+    assert result.recovered == 1
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "deferred_entry_cancel_preflight_failed"
+
+
 def test_old_reconciling_backlog_does_not_starve_later_ready_strategy(tmp_path):
     session_factory = create_session_factory(tmp_path / "fair.db")
     with session_factory() as session:

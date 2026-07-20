@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -69,6 +70,24 @@ class ManagementBatchExecutionError(RuntimeError):
     """Raised when a batch cannot be submitted without guessing its state."""
 
 
+class DeferredEntryCancellationError(ManagementBatchExecutionError):
+    """Carry bounded per-leg diagnostics across a fail-closed preflight."""
+
+    def __init__(self, reason: str, diagnostics: list[dict[str, Any]]):
+        super().__init__(reason)
+        self.diagnostics = diagnostics
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredExchangeMatch:
+    entry: ExecutionOrderLeg
+    cancel_type: str
+    source: str
+    order: dict[str, Any]
+    order_id: str | None
+    client_order_id: str | None
+
+
 def build_management_client_order_id(*, batch_id: int, leg_id: int) -> str:
     """Return a stable Deepcoin-safe close ID derived only from durable IDs."""
 
@@ -123,9 +142,9 @@ def execute_management_batch(
     if batch.status != "executing":
         raise ManagementBatchExecutionError(f"batch_not_executable:{batch.status}")
     binding = _load_exact_binding(session_factory, batch)
-    _require_exact_entry_legs(session_factory, batch)
     if batch.effective_action in {"full_close", "full_exit"}:
         try:
+            _require_exact_entry_legs(session_factory, batch)
             _cancel_deferred_entry_legs(
                 session_factory,
                 batch=batch,
@@ -149,6 +168,8 @@ def execute_management_batch(
                 load_management_batch(session_factory, batch.id),
                 reason="deferred_entry_cancel_preflight_failed",
             )
+    else:
+        _require_exact_entry_legs(session_factory, batch)
     try:
         _require_fresh_close_write_boundary(
             session_factory,
@@ -1552,25 +1573,34 @@ def _stored_text(value: Any) -> str | None:
     return text or None
 
 
-def _exchange_order_matches_entry_leg(
+def _exchange_order_ownership(
     order: dict[str, Any], entry: ExecutionOrderLeg
-) -> bool:
-    order_ids = {
+) -> tuple[str | None, str | None, str | None]:
+    order_ids = [
         str(value)
         for key in ("ordId", "orderId", "id")
         if (value := order.get(key)) not in (None, "")
-    }
-    client_order_ids = {
+    ]
+    client_order_ids = [
         str(value)
         for key in ("clOrdId", "clientOrderId")
         if (value := order.get(key)) not in (None, "")
-    }
+    ]
     stored_order_id = _stored_text(entry.order_id)
     stored_client_order_id = _stored_text(entry.client_order_id)
-    return bool(
-        (stored_order_id and stored_order_id in order_ids)
-        or (stored_client_order_id and stored_client_order_id in client_order_ids)
+    order_match = stored_order_id if stored_order_id in order_ids else None
+    client_match = (
+        stored_client_order_id if stored_client_order_id in client_order_ids else None
     )
+    if not order_match and not client_match:
+        return None, None, None
+    if len(set(order_ids)) > 1:
+        return None, None, "exchange_order_id_alias_conflict"
+    if len(set(client_order_ids)) > 1:
+        return None, None, "exchange_client_order_id_alias_conflict"
+    # Return only IDs whose exact alias value established ownership. Merely
+    # present secondary identifiers must not enter a cancellation request.
+    return order_match, client_match, None
 
 
 def _match_exact_deferred_exchange_orders(
@@ -1578,7 +1608,7 @@ def _match_exact_deferred_exchange_orders(
     deferred_entries: list[ExecutionOrderLeg],
     binding: ExecutionBinding,
     deepcoin_client: DeepcoinTradingClientProtocol,
-) -> list[tuple[ExecutionOrderLeg, str, dict[str, Any]]]:
+) -> list[_DeferredExchangeMatch]:
     """Match each snapshotted leg to exactly one live exchange order."""
 
     if not deferred_entries:
@@ -1596,26 +1626,156 @@ def _match_exact_deferred_exchange_orders(
         if isinstance(order, dict)
     ]
     matched_row_keys: set[tuple[str, int]] = set()
-    exact_matches: list[tuple[ExecutionOrderLeg, str, dict[str, Any]]] = []
+    exact_matches: list[_DeferredExchangeMatch] = []
+    diagnostics: list[dict[str, Any]] = []
     for entry in deferred_entries:
-        matches = [
-            (cancel_type, index, order)
-            for cancel_type, index, order in exchange_rows
-            if _exchange_order_matches_entry_leg(order, entry)
-        ]
-        if len(matches) != 1:
-            raise ManagementBatchExecutionError(
-                "deferred_entry_cancel_exchange_state_drift"
+        matches = []
+        conflicts = []
+        for cancel_type, index, order in exchange_rows:
+            order_id, client_order_id, conflict = _exchange_order_ownership(
+                order, entry
             )
-        cancel_type, index, order = matches[0]
+            if conflict:
+                conflicts.append((cancel_type, index, conflict))
+            elif order_id or client_order_id:
+                matches.append(
+                    (cancel_type, index, order, order_id, client_order_id)
+                )
+        if conflicts:
+            cancel_type, _, reason = conflicts[0]
+            diagnostics.append(
+                _deferred_cancel_diagnostic(
+                    entry,
+                    source=_deferred_cancel_source(cancel_type),
+                    match_type=cancel_type,
+                    status="unresolved",
+                    reason=reason,
+                )
+            )
+            continue
+        if len(matches) != 1:
+            diagnostics.append(
+                _deferred_cancel_diagnostic(
+                    entry,
+                    source=(
+                        _deferred_cancel_source(matches[0][0]) if matches else "none"
+                    ),
+                    match_type=matches[0][0] if matches else "unknown",
+                    status="unresolved",
+                    reason=(
+                        "exchange_order_match_ambiguous"
+                        if matches else "exchange_order_not_found"
+                    ),
+                )
+            )
+            continue
+        cancel_type, index, order, order_id, client_order_id = matches[0]
         row_key = (cancel_type, index)
         if row_key in matched_row_keys:
-            raise ManagementBatchExecutionError(
-                "deferred_entry_cancel_exchange_state_drift"
+            diagnostics.append(
+                _deferred_cancel_diagnostic(
+                    entry,
+                    source=_deferred_cancel_source(cancel_type),
+                    match_type=cancel_type,
+                    status="unresolved",
+                    reason="exchange_order_match_reused",
+                )
             )
+            continue
         matched_row_keys.add(row_key)
-        exact_matches.append((entry, cancel_type, order))
+        exact_matches.append(
+            _DeferredExchangeMatch(
+                entry=entry,
+                cancel_type=cancel_type,
+                source=_deferred_cancel_source(cancel_type),
+                order=order,
+                order_id=order_id,
+                client_order_id=client_order_id,
+            )
+        )
+    if diagnostics:
+        diagnosed_entry_ids = {
+            int(diagnostic["execution_order_leg_id"])
+            for diagnostic in diagnostics
+        }
+        exact_matches_by_entry_id = {
+            int(match.entry.id): match for match in exact_matches
+        }
+        diagnostics.extend(
+            _deferred_cancel_diagnostic(
+                entry,
+                source=(
+                    exact_matches_by_entry_id[int(entry.id)].source
+                    if int(entry.id) in exact_matches_by_entry_id else "none"
+                ),
+                match_type=(
+                    exact_matches_by_entry_id[int(entry.id)].cancel_type
+                    if int(entry.id) in exact_matches_by_entry_id else "unknown"
+                ),
+                status="not_attempted",
+                reason="preflight_failed_for_batch",
+            )
+            for entry in deferred_entries
+            if int(entry.id) not in diagnosed_entry_ids
+        )
+        raise DeferredEntryCancellationError(
+            "deferred_entry_cancel_exchange_state_drift", diagnostics
+        )
     return exact_matches
+
+
+def _deferred_cancel_source(cancel_type: str) -> str:
+    return "pending_trigger_orders" if cancel_type == "trigger" else "open_orders"
+
+
+def _deferred_cancel_diagnostic(
+    entry: ExecutionOrderLeg,
+    *,
+    source: str,
+    match_type: str,
+    status: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "execution_order_leg_id": int(entry.id),
+        "live_match_source": source,
+        "match_type": match_type,
+        "status": status,
+        "reason": reason,
+    }
+
+
+def _persist_deferred_cancel_diagnostics(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+    binding: ExecutionBinding,
+    diagnostics: list[dict[str, Any]],
+    created_at: datetime,
+) -> None:
+    with session_factory() as session:
+        for diagnostic in diagnostics[:20]:
+            record_execution_event(
+                session_factory,
+                ExecutionEventRecord(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=batch.strategy_instance_id,
+                    venue="deepcoin",
+                    action="strategy_management_deferred_entry_cancel_diagnostic",
+                    status="failed",
+                    kol_id=binding.kol_id,
+                    chat_id=binding.chat_id,
+                    message_id=binding.message_id,
+                    source_message_id=batch.raw_message_id,
+                    symbol=binding.symbol,
+                    side=binding.side,
+                    reason=str(diagnostic.get("reason") or "preflight_failed")[:255],
+                    after=diagnostic,
+                    created_at=created_at,
+                ),
+                session=session,
+            )
+        session.commit()
 
 
 def _cancel_deferred_entry_legs(
@@ -1631,11 +1791,21 @@ def _cancel_deferred_entry_legs(
     deferred_entries = _load_exact_deferred_entry_legs(
         session_factory, batch=batch
     )
-    exact_matches = _match_exact_deferred_exchange_orders(
-        deferred_entries=deferred_entries,
-        binding=binding,
-        deepcoin_client=deepcoin_client,
-    )
+    try:
+        exact_matches = _match_exact_deferred_exchange_orders(
+            deferred_entries=deferred_entries,
+            binding=binding,
+            deepcoin_client=deepcoin_client,
+        )
+    except DeferredEntryCancellationError as exc:
+        _persist_deferred_cancel_diagnostics(
+            session_factory,
+            batch=batch,
+            binding=binding,
+            diagnostics=exc.diagnostics,
+            created_at=cancelled_at,
+        )
+        raise
     with session_factory() as session:
         if any(
             not _deferred_entry_still_matches_snapshot(
@@ -1649,25 +1819,55 @@ def _cancel_deferred_entry_legs(
                 "deferred_entry_cancel_leg_not_pending"
             )
     inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
-    for detached_entry, cancel_type, exchange_order in exact_matches:
-        order_id = _first_text(exchange_order, "ordId", "orderId", "id")
-        client_order_id = _first_text(
-            exchange_order, "clOrdId", "clientOrderId"
-        )
+    for match_index, match in enumerate(exact_matches):
+        detached_entry = match.entry
+        cancel_type = match.cancel_type
+        exchange_order = match.order
+        order_id = match.order_id
+        client_order_id = match.client_order_id
         cancel_payload: dict[str, Any] = {"instId": inst_id}
         if order_id:
             cancel_payload["ordId"] = order_id
         if client_order_id:
             cancel_payload["clOrdId"] = client_order_id
-        if cancel_type == "trigger":
-            response = deepcoin_client.cancel_trigger_order(cancel_payload)
-            action = "strategy_management_cancel_deferred_trigger_entry"
-        else:
-            cancel_payload["mrgPosition"] = normalize_deepcoin_position_mode(
-                binding.position_mode
+        try:
+            if cancel_type == "trigger":
+                response = deepcoin_client.cancel_trigger_order(cancel_payload)
+                action = "strategy_management_cancel_deferred_trigger_entry"
+            else:
+                cancel_payload["mrgPosition"] = normalize_deepcoin_position_mode(
+                    binding.position_mode
+                )
+                response = deepcoin_client.cancel_order(cancel_payload)
+                action = "strategy_management_cancel_deferred_regular_entry"
+        except Exception as exc:
+            diagnostics = [
+                _deferred_cancel_diagnostic(
+                    detached_entry,
+                    source=match.source,
+                    match_type=cancel_type,
+                    status="unresolved",
+                    reason=f"cancel_{type(exc).__name__}"[:80],
+                )
+            ]
+            diagnostics.extend(
+                _deferred_cancel_diagnostic(
+                    remaining.entry,
+                    source=remaining.source,
+                    match_type=remaining.cancel_type,
+                    status="not_attempted",
+                    reason="earlier_cancel_failed",
+                )
+                for remaining in exact_matches[match_index + 1 :]
             )
-            response = deepcoin_client.cancel_order(cancel_payload)
-            action = "strategy_management_cancel_deferred_regular_entry"
+            _persist_deferred_cancel_diagnostics(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                diagnostics=diagnostics,
+                created_at=cancelled_at,
+            )
+            raise
 
         with session_factory() as session:
             entry = session.get(ExecutionOrderLeg, detached_entry.id)
@@ -1702,6 +1902,13 @@ def _cancel_deferred_entry_legs(
                     client_order_id=client_order_id,
                     reason="management_full_close_cancelled_unfilled_entry_leg",
                     before=exchange_order,
+                    after=_deferred_cancel_diagnostic(
+                        detached_entry,
+                        source=match.source,
+                        match_type=cancel_type,
+                        status="resolved",
+                        reason="exchange_cancel_confirmed",
+                    ),
                     request=cancel_payload,
                     response=response,
                     created_at=cancelled_at,

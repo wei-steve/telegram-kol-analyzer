@@ -114,6 +114,26 @@ def reconcile_strategy_management_batches(
                 counts["frozen"] += 1
                 continue
 
+            deferred_leg_ids = _snapshot_deferred_entry_leg_ids(batch)
+            if (
+                batch.effective_action in {"full_close", "full_exit"}
+                and deferred_leg_ids
+                and all(str(leg.status or "") == "planned" for leg in legs)
+            ):
+                # Deferred cancellations are durable exchange writes. If no
+                # close leg was subsequently reserved, a crash occurred in the
+                # unsafe gap between those phases. Reconciliation is read-only:
+                # it must never invent submission evidence for planned legs.
+                _freeze_batch(
+                    session,
+                    batch,
+                    status="recovery_required",
+                    reason="management_close_not_reserved_after_deferred_cancel",
+                    now=now,
+                )
+                counts["frozen"] += 1
+                continue
+
             binding = session.get(ExecutionBinding, batch.execution_binding_id)
             expected_instrument = normalize_deepcoin_swap_instrument(binding.symbol)
 

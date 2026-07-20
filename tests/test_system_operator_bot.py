@@ -81,7 +81,8 @@ def test_management_notification_formatter_covers_every_alert_state(state):
 def test_deferred_entry_cancel_recovery_notification_names_blocked_order(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import (
-        ExecutionBinding, ExecutionOrderLeg, RawMessage, StrategyManagementBatch,
+        ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, RawMessage,
+        StrategyManagementBatch,
     )
 
     sf = create_session_factory(tmp_path / "deferred-entry-cancel-alert.db")
@@ -113,6 +114,24 @@ def test_deferred_entry_cancel_recovery_notification_names_blocked_order(tmp_pat
             planned_at=NOW,
         )
         session.add(batch); session.flush()
+        session.add(ExecutionEvent(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            venue="deepcoin",
+            action="strategy_management_deferred_entry_cancel_diagnostic",
+            status="failed",
+            source_message_id=raw.id,
+            reason="exchange_order_id_alias_conflict",
+            after_json=json.dumps({
+                "execution_order_leg_id": entry.id,
+                "live_match_source": "pending_trigger_orders",
+                "match_type": "trigger",
+                "status": "unresolved",
+                "reason": "exchange_order_id_alias_conflict",
+            }),
+            created_at=NOW,
+        ))
+        session.flush()
         payload = operator_bot_module._management_payload_for_batch(session, batch)
 
     text = operator_bot_module.format_strategy_management_notification(payload)
@@ -123,7 +142,66 @@ def test_deferred_entry_cancel_recovery_notification_names_blocked_order(tmp_pat
     assert f"腿: {entry.id}" in text
     assert f"订单: {entry.order_id}" in text
     assert f"客户订单: {entry.client_order_id}" in text
+    assert "live=pending_trigger_orders" in text
+    assert "type=trigger" in text
+    assert "status=unresolved" in text
+    assert "reason=exchange_order_id_alias_conflict" in text
     assert "请勿启用替代策略" in text
+
+
+def test_management_notification_splits_maximum_identifiers_below_telegram_limit():
+    max_id = 9_223_372_036_854_775_807
+    payload = {
+        "notification_id": max_id,
+        "batch_id": max_id,
+        "state": "recovery_required",
+        "mode": "live",
+        "source_chat_id": -max_id,
+        "source_message_id": max_id,
+        "raw_message_id": max_id,
+        "lifecycle_id": max_id,
+        "strategy_instance_id": "s" * 255,
+        "execution_binding_id": max_id,
+        "intent": "full_exit",
+        "effective_action": "full_exit",
+        "reason": "deferred_entry_cancel_preflight_failed",
+        "deferred_entry_legs": [
+            {
+                "execution_order_leg_id": max_id - index,
+                "order_id": f"order-{index}-" + "o" * 120,
+                "client_order_id": f"client-{index}-" + "c" * 120,
+                "cancellation_diagnostic": {
+                    "live_match_source": "pending_trigger_orders",
+                    "match_type": "trigger",
+                    "status": "unresolved",
+                    "reason": "exchange_order_id_alias_conflict",
+                },
+            }
+            for index in range(20)
+        ],
+        "legs": [
+            {
+                "leg_id": max_id - index,
+                "execution_order_leg_id": max_id - index,
+                "pos_id": "p" * 120,
+                "leg_index": index,
+                "status": "submit_unknown",
+                "planned_close_size": "9" * 64,
+                "client_order_id": "c" * 120,
+                "exchange_order_id": "o" * 120,
+                "error_summary": {"reason": "management_close_order_not_found"},
+            }
+            for index in range(20)
+        ],
+    }
+
+    first = operator_bot_module.split_strategy_management_notification(payload)
+    second = operator_bot_module.split_strategy_management_notification(payload)
+
+    assert first == second
+    assert len(first) > 1
+    assert all(0 < len(chunk) < 4096 for chunk in first)
+    assert "\n".join(first) == operator_bot_module.format_strategy_management_notification(payload)
 
 
 def test_management_notification_dedup_retry_and_concurrent_claim(tmp_path, monkeypatch):
