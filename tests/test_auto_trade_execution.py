@@ -1192,7 +1192,7 @@ def test_auto_process_message_trade_signal_records_entry_protection_ledger(tmp_p
     assert {row.evidence_source for row in rows} == {"entry_protection_response"}
 
 
-def test_auto_process_message_trade_signal_does_not_ledger_price_only_tpsl(tmp_path):
+def test_auto_process_message_trade_signal_records_response_anchored_sibling_tpsl(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_message_id = _persist_candidate(
         session_factory,
@@ -1229,9 +1229,81 @@ def test_auto_process_message_trade_signal_does_not_ledger_price_only_tpsl(tmp_p
         for row in fake_client.trigger_pending:
             row.pop("posId", None)
             row.pop("closePosId", None)
+            row["cTime"] = "2026-07-18T07:47:01Z"
+            row["uTime"] = "2026-07-18T07:47:01Z"
         return response
 
     fake_client.set_position_sltp = set_position_sltp_without_position_identity
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 18, 7, 47, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    with session_factory() as session:
+        rows = (
+            session.query(PositionProtectionLedger)
+            .order_by(PositionProtectionLedger.order_id.asc())
+            .all()
+        )
+    assert [(row.order_id, row.pos_id, row.purpose, row.trigger_price) for row in rows] == [
+        ("sltp-1", "pos-1", "stop_loss", "1788.0"),
+        ("sltp-2", "pos-1", "take_profit", "1955.0"),
+    ]
+    assert {json.loads(row.evidence_json)["match"] for row in rows} == {
+        "response_anchored_order",
+        "response_anchored_sibling_tpsl",
+    }
+
+
+def test_auto_process_message_trade_signal_does_not_ledger_price_only_tpsl(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="ETH 现价开多 SL 1788 TP 1955",
+        entry_text="现价入场",
+        stop_loss_text="1788",
+        take_profit_text="1955",
+        symbol="ETH",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _SequencedProtectionDeepcoinClient()
+    fake_client.ticker_prices["ETH-USDT-SWAP"] = 1844.0
+    fake_client.positions = [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "long",
+            "pos": "2.6",
+            "mrgPosition": "split",
+            "mgnMode": "cross",
+        }
+    ]
+    original_set_position_sltp = fake_client.set_position_sltp
+
+    def set_position_sltp_without_anchor(payload):
+        response = original_set_position_sltp(payload)
+        for row in fake_client.trigger_pending:
+            row.pop("posId", None)
+            row.pop("closePosId", None)
+            row["cTime"] = "2026-07-18T07:47:01Z"
+            row["uTime"] = "2026-07-18T07:47:01Z"
+        response["data"].pop("ordId", None)
+        return response
+
+    fake_client.set_position_sltp = set_position_sltp_without_anchor
 
     result = auto_process_message_trade_signal(
         session_factory,

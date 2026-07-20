@@ -605,6 +605,7 @@ def _record_entry_protection_ledger_rows(
                 inst_id=inst_id,
                 side=side,
                 pos_id=pos_id,
+                seen_at=seen_at,
             )
             for row in rows:
                 upsert_protection_ledger_row(
@@ -636,6 +637,7 @@ def _entry_protection_ledger_rows(
     inst_id: str,
     side: str,
     pos_id: str,
+    seen_at: datetime | None = None,
 ) -> list[dict[str, str | None]]:
     expected_rows = _expected_protection_rows(protection_request)
     if not expected_rows:
@@ -651,6 +653,18 @@ def _entry_protection_ledger_rows(
         return [combined_row]
     response_order_ids = _protection_response_order_ids(protection_response)
     response_ids_align_with_rows = len(response_order_ids) == len(expected_rows)
+    if response_order_ids and not response_ids_align_with_rows:
+        anchored_rows = _response_anchored_entry_protection_rows(
+            expected_rows=expected_rows,
+            response_order_ids=response_order_ids,
+            pending_tpsl_rows=pending_tpsl_rows,
+            inst_id=inst_id,
+            side=side,
+            pos_id=pos_id,
+            seen_at=seen_at,
+        )
+        if anchored_rows:
+            return anchored_rows
     resolved: list[dict[str, str | None]] = []
     used_order_ids: set[str] = set()
     for index, expected in enumerate(expected_rows):
@@ -679,6 +693,104 @@ def _entry_protection_ledger_rows(
                 **expected,
                 "order_id": order_id,
                 "evidence_match": evidence_match,
+            }
+        )
+    return resolved
+
+
+def _response_anchored_entry_protection_rows(
+    *,
+    expected_rows: list[dict[str, str | None]],
+    response_order_ids: list[str],
+    pending_tpsl_rows: list[dict[str, Any]],
+    inst_id: str,
+    side: str,
+    pos_id: str,
+    seen_at: datetime | None,
+) -> list[dict[str, str | None]]:
+    pending_by_order_id = {
+        order_id: row
+        for row in pending_tpsl_rows
+        if (order_id := _first_nonzero_text(
+            row, "ordId", "orderId", "order_id", "algoId", "triggerOrderId", "id"
+        ))
+        and _pending_tpsl_row_matches_exchange_identity(
+            row, inst_id=inst_id, side=side, pos_id=pos_id
+        )
+    }
+    returned_rows = [
+        (order_id, pending_by_order_id.get(order_id)) for order_id in response_order_ids
+    ]
+    if any(row is None for _, row in returned_rows):
+        return []
+    anchor_times = [
+        _pending_tpsl_row_time(row) for _, row in returned_rows if row is not None
+    ]
+    if not anchor_times or any(value is None for value in anchor_times):
+        return []
+    event_time = _coerce_utc_naive(seen_at) if seen_at is not None else None
+    if event_time is not None and any(
+        abs((value - event_time).total_seconds()) > 120
+        for value in anchor_times
+        if value is not None
+    ):
+        return []
+
+    expected_by_purpose = {str(row["purpose"]): row for row in expected_rows}
+    resolved: list[dict[str, str | None]] = []
+    matched_purposes: set[str] = set()
+    returned_order_id_set = {order_id for order_id, _ in returned_rows}
+    for order_id, row in returned_rows:
+        if row is None:
+            continue
+        purpose = _pending_tpsl_row_matching_expected_purpose(row, expected_rows)
+        if purpose is None:
+            return []
+        matched_purposes.add(purpose)
+        resolved.append(
+            {
+                **expected_by_purpose[purpose],
+                "order_id": order_id,
+                "evidence_match": "response_anchored_order",
+            }
+        )
+
+    for purpose, expected in expected_by_purpose.items():
+        if purpose in matched_purposes:
+            continue
+        candidates = [
+            row
+            for row in pending_tpsl_rows
+            if _first_nonzero_text(
+                row, "ordId", "orderId", "order_id", "algoId", "triggerOrderId", "id"
+            )
+            not in returned_order_id_set
+            and _pending_tpsl_row_matches_exchange_identity(
+                row, inst_id=inst_id, side=side, pos_id=pos_id
+            )
+            and _pending_tpsl_row_matches_expected(row, expected)
+            and _pending_tpsl_row_time_within(row, anchor_times, seconds=3)
+            and (
+                event_time is None
+                or _pending_tpsl_row_time_within(row, [event_time], seconds=120)
+            )
+        ]
+        unique_order_ids = sorted(
+            {
+                order_id
+                for row in candidates
+                if (order_id := _first_nonzero_text(
+                    row, "ordId", "orderId", "order_id", "algoId", "triggerOrderId", "id"
+                ))
+            }
+        )
+        if len(unique_order_ids) != 1:
+            return []
+        resolved.append(
+            {
+                **expected,
+                "order_id": unique_order_ids[0],
+                "evidence_match": "response_anchored_sibling_tpsl",
             }
         )
     return resolved
@@ -842,6 +954,93 @@ def _pending_tpsl_row_matches_identity(
         row, "closePosId", "close_pos_id", "closePositionId", "posId", "pos_id", "positionId"
     )
     return row_pos_id == str(pos_id)
+
+
+def _pending_tpsl_row_matches_exchange_identity(
+    row: dict[str, Any], *, inst_id: str, side: str, pos_id: str
+) -> bool:
+    if str(row.get("triggerOrderType") or "TPSL").upper() != "TPSL":
+        return False
+    if str(row.get("instId") or "").upper() != inst_id.upper():
+        return False
+    if str(row.get("posSide") or row.get("side") or "").lower() != side.lower():
+        return False
+    row_pos_id = _first_nonzero_text(
+        row, "closePosId", "close_pos_id", "closePositionId", "posId", "pos_id", "positionId"
+    )
+    return row_pos_id in (None, str(pos_id))
+
+
+def _pending_tpsl_row_matching_expected_purpose(
+    row: dict[str, Any], expected_rows: list[dict[str, str | None]]
+) -> str | None:
+    matches = [
+        str(expected["purpose"])
+        for expected in expected_rows
+        if _pending_tpsl_row_matches_expected(row, expected)
+    ]
+    unique = sorted(set(matches))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _pending_tpsl_row_matches_expected(
+    row: dict[str, Any], expected: dict[str, str | None]
+) -> bool:
+    expected_price = expected.get("trigger_price")
+    if expected_price is None:
+        return False
+    purpose = str(expected.get("purpose") or "")
+    keys = (
+        ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+        if purpose == "stop_loss"
+        else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
+    )
+    row_price = _first_nonzero_text(row, *keys)
+    if row_price is None:
+        row_price = _first_nonzero_text(row, "triggerPx", "triggerPrice")
+    return bool(row_price and _same_numeric_text(row_price, expected_price))
+
+
+def _pending_tpsl_row_time_within(
+    row: dict[str, Any], anchors: list[datetime | None], *, seconds: int
+) -> bool:
+    row_time = _pending_tpsl_row_time(row)
+    if row_time is None:
+        return False
+    return any(
+        anchor is not None and abs((row_time - anchor).total_seconds()) <= seconds
+        for anchor in anchors
+    )
+
+
+def _pending_tpsl_row_time(row: dict[str, Any]) -> datetime | None:
+    for key in ("cTime", "uTime", "createdAt", "created_at", "createdTime"):
+        value = row.get(key)
+        parsed = _parse_deepcoin_datetime(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_deepcoin_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    try:
+        if text.isdigit():
+            numeric = int(text)
+            if numeric > 10_000_000_000:
+                return datetime.fromtimestamp(numeric / 1000, UTC).replace(tzinfo=None)
+            return datetime.fromtimestamp(numeric, UTC).replace(tzinfo=None)
+        return _coerce_utc_naive(datetime.fromisoformat(text.replace("Z", "+00:00")))
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _coerce_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
 
 
 def _same_numeric_text(left: str, right: str) -> bool:

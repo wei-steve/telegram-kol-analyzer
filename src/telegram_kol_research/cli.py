@@ -1995,6 +1995,7 @@ def repair_entry_protection_ledger(
     binding_id: int | None = typer.Option(None, "--binding-id"),
     event_id: int | None = typer.Option(None, "--event-id"),
     pos_id: str | None = typer.Option(None, "--pos-id"),
+    include_trigger_entries: bool = typer.Option(False, "--include-trigger-entries"),
 ) -> None:
     """Dry-run or repair historical entry-protection TPSL ledger rows."""
 
@@ -2007,6 +2008,7 @@ def repair_entry_protection_ledger(
         binding_id=binding_id,
         event_id=event_id,
         pos_id=pos_id,
+        include_trigger_entries=include_trigger_entries,
     )
     typer.echo(
         json.dumps(

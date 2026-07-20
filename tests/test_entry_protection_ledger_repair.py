@@ -199,6 +199,132 @@ def test_entry_protection_repair_refuses_unverified_entry_leg(tmp_path):
     assert plan.refusals[0].reason == "verified_entry_leg_missing"
 
 
+def test_entry_protection_repair_matches_filled_trigger_entry_protection(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_entry_fill(
+        session_factory,
+        binding_id=152,
+        legs=[
+            {
+                "leg_id": 289,
+                "leg_index": 1,
+                "order_id": "1001124198560580",
+                "client_order_id": "TKSQ3347E1",
+                "pos_id": "1001124219349221",
+                "size": "4.4",
+                "entry_price": "1883.0",
+            },
+            {
+                "leg_id": 290,
+                "leg_index": 2,
+                "order_id": "1001124198560598",
+                "client_order_id": "TKSQ3347E2",
+                "pos_id": "1001124219426042",
+                "size": "6.2",
+                "entry_price": "1888.0",
+            },
+        ],
+    )
+    client = FakeDeepcoinClient(
+        [
+            _pending_tpsl_row(
+                "1001124219349220",
+                purpose="combined",
+                price="1860",
+                stop_price="1900",
+                ctime="2026-07-20T00:11:13Z",
+                inst_id="ETH-USDT-SWAP",
+                side="short",
+                size="4.4",
+            ),
+            _pending_tpsl_row(
+                "1001124219426041",
+                purpose="combined",
+                price="1860",
+                stop_price="1900",
+                ctime="2026-07-20T00:13:14Z",
+                inst_id="ETH-USDT-SWAP",
+                side="short",
+                size="6.2",
+            ),
+        ]
+    )
+
+    plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 20, 2, 0, tzinfo=UTC),
+        binding_id=152,
+        include_trigger_entries=True,
+    )
+
+    assert plan.refusals == ()
+    assert [
+        (row.leg_id, row.order_id, row.pos_id, row.purpose, row.trigger_price, row.size_text)
+        for row in plan.actions
+    ] == [
+        (289, "1001124219349220", "1001124219349221", "combined", None, "4.4"),
+        (290, "1001124219426041", "1001124219426042", "combined", None, "6.2"),
+    ]
+    assert {row.evidence["match"] for row in plan.actions} == {
+        "trigger_entry_unique_size_time_tpsl"
+    }
+
+
+def test_entry_protection_repair_refuses_ambiguous_trigger_entry_tpsl(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_entry_fill(
+        session_factory,
+        binding_id=152,
+        legs=[
+            {
+                "leg_id": 289,
+                "leg_index": 1,
+                "order_id": "1001124198560580",
+                "client_order_id": "TKSQ3347E1",
+                "pos_id": "1001124219349221",
+                "size": "4.4",
+                "entry_price": "1883.0",
+            }
+        ],
+    )
+    client = FakeDeepcoinClient(
+        [
+            _pending_tpsl_row(
+                "tpsl-a",
+                purpose="combined",
+                price="1860",
+                stop_price="1900",
+                ctime="2026-07-20T00:11:13Z",
+                inst_id="ETH-USDT-SWAP",
+                side="short",
+                size="4.4",
+            ),
+            _pending_tpsl_row(
+                "tpsl-b",
+                purpose="combined",
+                price="1860",
+                stop_price="1900",
+                ctime="2026-07-20T00:11:13Z",
+                inst_id="ETH-USDT-SWAP",
+                side="short",
+                size="4.4",
+            ),
+        ]
+    )
+
+    plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 20, 2, 0, tzinfo=UTC),
+        binding_id=152,
+        include_trigger_entries=True,
+    )
+
+    assert plan.actions == ()
+    assert plan.refusals[0].reason == "trigger_entry_tpsl_not_unique"
+
+
 def _seed_entry_protection_event(
     session_factory,
     *,
@@ -261,18 +387,100 @@ def _seed_entry_protection_event(
         leg_id_holder.append(leg.id)
 
 
-def _pending_tpsl_row(order_id, *, purpose, price, ctime):
+def _seed_trigger_entry_fill(session_factory, *, binding_id, legs):
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            id=binding_id,
+            strategy_instance_id="deepcoin:-1002370796392:3347:ETH:short",
+            kol_id="group:-1002370796392",
+            chat_id=-1002370796392,
+            message_id=3347,
+            symbol="ETH",
+            side="short",
+            venue="deepcoin",
+            pos_id=",".join(str(leg["pos_id"]) for leg in legs),
+            status="active",
+        )
+        session.add(binding)
+        for leg in legs:
+            request = {
+                "clOrdId": leg["client_order_id"],
+                "instId": "ETH-USDT-SWAP",
+                "orderType": "limit",
+                "posSide": "short",
+                "price": leg["entry_price"],
+                "side": "sell",
+                "slOrdPx": -1,
+                "slTriggerPx": 1900.0,
+                "sz": leg["size"],
+                "tdMode": "cross",
+                "tpOrdPx": -1,
+                "tpTriggerPx": 1860.0,
+                "triggerPrice": leg["entry_price"],
+            }
+            session.add(
+                ExecutionOrderLeg(
+                    id=leg["leg_id"],
+                    execution_binding_id=binding_id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=leg["leg_index"],
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id=leg["order_id"],
+                    client_order_id=leg["client_order_id"],
+                    pos_id=leg["pos_id"],
+                    venue="deepcoin",
+                    attribution_status="verified",
+                    status="active",
+                    request_json=json.dumps(request),
+                )
+            )
+            session.add(
+                ExecutionEvent(
+                    execution_binding_id=binding_id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    venue="deepcoin",
+                    action="create_trigger_entry",
+                    status="submitted",
+                    symbol="ETH",
+                    side="short",
+                    order_id=leg["order_id"],
+                    client_order_id=leg["client_order_id"],
+                    reason="live_signal_auto_trade",
+                    request_json=json.dumps(request),
+                    response_json=json.dumps({"data": {"ordId": leg["order_id"]}}),
+                    after_json=json.dumps({"stop_loss": 1900.0, "take_profit": 1860.0}),
+                    created_at=datetime(2026, 7, 18, 20, 16, 21),
+                )
+            )
+        session.commit()
+
+
+def _pending_tpsl_row(
+    order_id,
+    *,
+    purpose,
+    price,
+    ctime,
+    stop_price=None,
+    inst_id="ETH-USDT-SWAP",
+    side="long",
+    size="0",
+):
     row = {
         "ordId": order_id,
-        "instId": "ETH-USDT-SWAP",
-        "posSide": "long",
+        "instId": inst_id,
+        "posSide": side,
         "triggerOrderType": "TPSL",
-        "sz": "0",
+        "sz": size,
         "cTime": ctime,
         "uTime": ctime,
     }
     if purpose == "take_profit":
         row["tpTriggerPx"] = price
-    else:
+    elif purpose == "stop_loss":
         row["slTriggerPx"] = price
+    else:
+        row["tpTriggerPx"] = price
+        row["slTriggerPx"] = stop_price
     return row
