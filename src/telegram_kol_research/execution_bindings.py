@@ -23,6 +23,7 @@ from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionAttributionAudit
 from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.position_attribution import (
     ATTRIBUTION_POLICY_VERSION,
     FillEvidence,
@@ -107,6 +108,8 @@ class ExecutionReconciliationResult:
     stale: int = 0
     updated: int = 0
     protection_adopted: int = 0
+    protection_adoption_deferred: int = 0
+    protection_adoption_conflicting: int = 0
     protection_adoption_refused: int = 0
     protection_snapshot_unavailable: int = 0
 
@@ -497,6 +500,9 @@ def _apply_reconcile_snapshot(
             result.protection_snapshot_unavailable = _trigger_protection_exposure_count(
                 session, legs=legs
             )
+            _retry_saved_trigger_protection_intents_for_unavailable_snapshot(
+                session, legs=legs, snapshot=snapshot, recovered_at=recovered_at, result=result
+            )
             for leg in legs:
                 if int(leg.execution_binding_id) in manual_terminal_binding_ids:
                     continue
@@ -726,6 +732,10 @@ def _adopt_verified_trigger_entry_protection(
         upsert_entry_protection_ledger_action,
     )
 
+    intent_leg_ids = _reconcile_saved_trigger_protection_intents(
+        session, legs=legs, snapshot=snapshot, recovered_at=recovered_at, result=result
+    )
+
     eligible_legs = [
         leg
         for leg in legs
@@ -736,6 +746,7 @@ def _adopt_verified_trigger_entry_protection(
         and str(leg.status or "").lower() == "active"
         and bool(str(leg.pos_id or "").strip())
         and _request_has_combined_trigger_protection(leg.request_json)
+        and int(leg.id) not in intent_leg_ids
     ]
     if not eligible_legs:
         return
@@ -865,6 +876,159 @@ def _adopt_verified_trigger_entry_protection(
             )
 
 
+_TRIGGER_PROTECTION_RETRY_LIMIT = 5
+
+
+def _retry_saved_trigger_protection_intents_for_unavailable_snapshot(
+    session, *, legs, snapshot, recovered_at, result
+) -> None:
+    """Back off persisted, already-attributed intents when TPSL reads fail."""
+    from telegram_kol_research.entry_protection_ledger_repair import EntryProtectionLedgerRepairRefusal
+    from telegram_kol_research.trigger_protection_intents import transition_trigger_protection_intent
+
+    sources = sorted(key for key in snapshot.errors if key == "pending_trigger_orders"
+                     or key.startswith("pending_trigger_orders:") or key == "trigger_history"
+                     or key.startswith("trigger_history:"))
+    if not sources:
+        return
+    legs_by_id = {int(leg.id): leg for leg in legs}
+    intents = session.query(TriggerProtectionIntent).filter(
+        TriggerProtectionIntent.venue == "deepcoin",
+        TriggerProtectionIntent.recovery_state.in_(("pending", "retrying")),
+    ).all()
+    for intent in intents:
+        leg = legs_by_id.get(int(intent.execution_order_leg_id))
+        if leg is None or not _trigger_intent_due(intent, recovered_at):
+            continue
+        if not (str(leg.pos_id or "").strip() and str(leg.attribution_status or "") == "verified"):
+            continue
+        _record_protection_adoption_refusal(session, leg=leg, refusal=EntryProtectionLedgerRepairRefusal(
+            event_id=None, binding_id=int(leg.execution_binding_id), pos_id=str(leg.pos_id),
+            reason="trigger_protection_snapshot_unavailable", evidence={"snapshot_sources": sources},
+        ), created_at=recovered_at)
+        _schedule_trigger_intent_retry(session, intent, recovered_at, transition_trigger_protection_intent)
+
+
+def _reconcile_saved_trigger_protection_intents(
+    session, *, legs, snapshot, recovered_at, result
+) -> set[int]:
+    """Apply saved trigger intents using only this bounded, read-only snapshot."""
+    from telegram_kol_research.entry_protection_ledger_repair import (
+        EntryProtectionLedgerRepairRefusal,
+        plan_trigger_protection_intent_adoption,
+        upsert_entry_protection_ledger_action,
+    )
+    from telegram_kol_research.trigger_protection_intents import (
+        transition_trigger_protection_intent,
+    )
+
+    legs_by_id = {int(leg.id): leg for leg in legs}
+    intents = (
+        session.query(TriggerProtectionIntent)
+        .filter(TriggerProtectionIntent.venue == "deepcoin")
+        .filter(TriggerProtectionIntent.recovery_state.in_(("pending", "retrying")))
+        .order_by(TriggerProtectionIntent.id.asc()).all()
+    )
+    handled = {int(intent.execution_order_leg_id) for intent in intents if int(intent.execution_order_leg_id) in legs_by_id}
+    eligible = [
+        (intent, legs_by_id[int(intent.execution_order_leg_id)]) for intent in intents
+        if int(intent.execution_order_leg_id) in legs_by_id
+        and int(intent.execution_binding_id) == int(legs_by_id[int(intent.execution_order_leg_id)].execution_binding_id)
+        and str(legs_by_id[int(intent.execution_order_leg_id)].purpose or "") == "entry"
+        and str(legs_by_id[int(intent.execution_order_leg_id)].order_kind or "") == "trigger_limit"
+        and str(legs_by_id[int(intent.execution_order_leg_id)].attribution_status or "") == "verified"
+        and str(legs_by_id[int(intent.execution_order_leg_id)].status or "").lower() == "active"
+        and bool(str(legs_by_id[int(intent.execution_order_leg_id)].pos_id or "").strip())
+    ]
+    errors = sorted(
+        key for key in snapshot.errors
+        if key == "pending_trigger_orders" or key.startswith("pending_trigger_orders:")
+        or key == "trigger_history" or key.startswith("trigger_history:")
+    )
+    if errors:
+        for intent, leg in eligible:
+            if not _trigger_intent_due(intent, recovered_at):
+                continue
+            result.protection_snapshot_unavailable += 1
+            _record_protection_adoption_refusal(session, leg=leg, refusal=EntryProtectionLedgerRepairRefusal(
+                event_id=None, binding_id=int(leg.execution_binding_id), pos_id=str(leg.pos_id),
+                reason="trigger_protection_snapshot_unavailable", evidence={"snapshot_sources": errors},
+            ), created_at=recovered_at)
+            _schedule_trigger_intent_retry(session, intent, recovered_at, transition_trigger_protection_intent)
+        return handled
+
+    existing_ledger_rows = session.query(PositionProtectionLedger).all()
+    all_intents = session.query(TriggerProtectionIntent).filter(TriggerProtectionIntent.venue == "deepcoin").all()
+    events = session.query(ExecutionEvent).filter(
+        ExecutionEvent.venue == "deepcoin", ExecutionEvent.action == "create_trigger_entry"
+    ).order_by(ExecutionEvent.id.asc()).all()
+    for intent, leg in eligible:
+        if not _trigger_intent_due(intent, recovered_at):
+            continue
+        parent_events = [event for event in events if int(event.execution_binding_id or 0) == int(leg.execution_binding_id)
+                         and _same_present_text(event.order_id, leg.order_id)
+                         and _same_present_text(event.client_order_id, leg.client_order_id)]
+        if len(parent_events) != 1:
+            _refuse_trigger_intent(session, leg, intent, EntryProtectionLedgerRepairRefusal(
+                event_id=None, binding_id=int(leg.execution_binding_id), pos_id=str(leg.pos_id),
+                reason="trigger_protection_parent_event_not_unique", evidence={"candidate_event_count": len(parent_events)},
+            ), recovered_at, result, transition_trigger_protection_intent)
+            continue
+        parent = parent_events[0]
+        adoption = plan_trigger_protection_intent_adoption(
+            session, entry_leg=leg, intent=intent, parent_event=parent,
+            pending_tpsl_rows=snapshot.pending_trigger_orders,
+            history_tpsl_rows=snapshot.trigger_history,
+            existing_ledger_rows=existing_ledger_rows, existing_intents=all_intents,
+            history_time_range_start=parent.created_at, history_time_range_end=recovered_at,
+        )
+        if adoption.action is not None:
+            row = upsert_entry_protection_ledger_action(session, adoption.action,
+                evidence_source="reconciliation_trigger_protection_intent", seen_at=recovered_at)
+            if row is not None:
+                transition_trigger_protection_intent(session, intent, recovery_state="adopted", adopted_order_id=adoption.action.order_id)
+                existing_ledger_rows.append(row)
+                result.protection_adopted += 1
+        elif adoption.deferred is not None:
+            result.protection_adoption_deferred += 1
+            _record_protection_adoption_refusal(session, leg=leg, refusal=EntryProtectionLedgerRepairRefusal(
+                event_id=int(parent.id), binding_id=int(leg.execution_binding_id), pos_id=str(leg.pos_id),
+                reason=adoption.deferred.reason, evidence=adoption.deferred.evidence,
+            ), created_at=recovered_at)
+            _schedule_trigger_intent_retry(session, intent, recovered_at, transition_trigger_protection_intent)
+        elif adoption.refusal is not None:
+            _refuse_trigger_intent(session, leg, intent, adoption.refusal, recovered_at, result, transition_trigger_protection_intent)
+    return handled
+
+
+def _trigger_intent_due(intent, now: datetime) -> bool:
+    when = intent.next_attempt_at
+    if when is None:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return when <= now
+
+
+def _schedule_trigger_intent_retry(session, intent, now, transition) -> None:
+    attempts = min(int(intent.retry_attempts or 0) + 1, _TRIGGER_PROTECTION_RETRY_LIMIT)
+    if attempts >= _TRIGGER_PROTECTION_RETRY_LIMIT:
+        transition(session, intent, recovery_state="failed", retry_attempts=attempts)
+    else:
+        transition(session, intent, recovery_state="retrying", retry_attempts=attempts,
+                   next_attempt_at=now + timedelta(minutes=min(5 * 2 ** (attempts - 1), 60)))
+
+
+def _refuse_trigger_intent(session, leg, intent, refusal, now, result, transition) -> None:
+    result.protection_adoption_refused += 1
+    if "conflict" in str(refusal.reason) or "owned" in str(refusal.reason):
+        result.protection_adoption_conflicting += 1
+    _record_protection_adoption_refusal(session, leg=leg, refusal=refusal, created_at=now)
+    _schedule_trigger_intent_retry(session, intent, now, transition)
+
+
 def _record_protection_adoption_refusal(
     session,
     *,
@@ -937,6 +1101,11 @@ def _bounded_protection_refusal_evidence(refusal: Any) -> dict[str, Any]:
             )
         except (TypeError, ValueError):
             pass
+    snapshot_sources = raw.get("snapshot_sources")
+    if isinstance(snapshot_sources, list):
+        evidence["snapshot_sources"] = sorted(
+            {str(item)[:128] for item in snapshot_sources if str(item or "").strip()}
+        )[:20]
     return evidence
 
 

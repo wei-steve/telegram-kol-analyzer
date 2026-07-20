@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from datetime import datetime
@@ -32,6 +33,7 @@ from telegram_kol_research.models import (
     PositionAttributionAudit,
     PositionProtectionLedger,
     StrategyLifecycle,
+    TriggerProtectionIntent,
 )
 from telegram_kol_research.position_attribution import FillEvidence
 
@@ -152,10 +154,27 @@ def _seed_trigger_protection_adoption(session_factory):
     return binding_id
 
 
+def _save_trigger_protection_intent(session_factory):
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).one()
+        request = json.loads(leg.request_json)
+        session.add(TriggerProtectionIntent(
+            venue="deepcoin", execution_binding_id=leg.execution_binding_id,
+            execution_order_leg_id=leg.id,
+            request_fingerprint=hashlib.sha256(json.dumps(
+                request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
+            pre_submit_tpsl_baseline_json="[]", correlation_id="intent-1",
+            parent_trigger_order_id="entry-1",
+        ))
+        session.commit()
+
+
 class _ProtectionAdoptionReconciliationClient:
-    def __init__(self, pending_rows=None, *, pending_error=None):
+    def __init__(self, pending_rows=None, *, history_rows=None, pending_error=None):
         self.pending_rows = list(pending_rows or [])
         self.pending_error = pending_error
+        self.history_rows = list(history_rows or [])
         self.pending_calls = 0
 
     def list_positions(self):
@@ -199,7 +218,7 @@ class _ProtectionAdoptionReconciliationClient:
         return []
 
     def list_trigger_order_history(self, *, inst_id=None):
-        return []
+        return self.history_rows
 
 
 def _pending_combined_tpsl(order_id):
@@ -240,6 +259,119 @@ def test_reconcile_protection_adoption_records_unique_exact_trigger_entry_tpsl(t
     assert result.protection_adoption_refused == 0
     assert result.protection_snapshot_unavailable == 0
     assert client.pending_calls == 1
+
+
+def test_reconcile_adopts_saved_trigger_protection_intent_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([_pending_combined_tpsl("tpsl-1")]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+    duplicate = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([_pending_combined_tpsl("tpsl-1")]),
+        recovered_at=datetime(2026, 7, 20, 8, 10),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        rows = session.query(PositionProtectionLedger).all()
+    assert intent.recovery_state == "adopted"
+    assert intent.adopted_order_id == "tpsl-1"
+    assert len(rows) == 1
+    assert rows[0].evidence_source == "reconciliation_trigger_protection_intent"
+    assert result.protection_adopted == 1
+    assert duplicate.protection_adopted == 0
+
+
+def test_reconcile_defers_saved_intent_once_and_backs_off_duplicate_delivery(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    client = _ProtectionAdoptionReconciliationClient([])
+    now = datetime(2026, 7, 20, 8, 5)
+
+    first = reconcile_deepcoin_execution_bindings(session_factory, client=client, recovered_at=now)
+    second = reconcile_deepcoin_execution_bindings(session_factory, client=client, recovered_at=now)
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        audits = session.query(PositionAttributionAudit).filter(
+            PositionAttributionAudit.event_type == "protection_adoption_refused"
+        ).all()
+    assert first.protection_adoption_deferred == 1
+    assert second.protection_adoption_deferred == 0
+    assert intent.recovery_state == "retrying"
+    assert intent.retry_attempts == 1
+    assert len(audits) == 1
+
+
+def test_reconcile_saved_intent_counts_position_conflict(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    conflict = _pending_combined_tpsl("tpsl-conflict")
+    conflict["posId"] = "other-pos"
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory, client=_ProtectionAdoptionReconciliationClient([conflict]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        assert session.query(PositionProtectionLedger).count() == 0
+    assert result.protection_adoption_conflicting == 1
+    assert result.protection_adoption_refused == 1
+    assert intent.recovery_state == "retrying"
+
+
+def test_reconcile_saved_intent_adopts_history_only_proven_candidate(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    history = _pending_combined_tpsl("tpsl-history")
+    history.update({"parentOrdId": "entry-1", "cTime": "2026-07-20T08:01:00Z"})
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([], history_rows=[history]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+    assert result.protection_adopted == 1
+    assert intent.adopted_order_id == "tpsl-history"
+
+
+def test_reconcile_saved_intent_records_unavailable_snapshot_and_retries(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    reconcile_deepcoin_execution_bindings(
+        session_factory, client=_ProtectionAdoptionReconciliationClient([]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient(pending_error=RuntimeError("unavailable")),
+        recovered_at=datetime(2026, 7, 20, 8, 10),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        audit = session.query(PositionAttributionAudit).filter(
+            PositionAttributionAudit.event_type == "protection_adoption_refused"
+        ).order_by(PositionAttributionAudit.id.desc()).first()
+    assert result.protection_snapshot_unavailable == 1
+    assert intent.recovery_state == "retrying"
+    assert json.loads(audit.evidence_json)["reason"] == "trigger_protection_snapshot_unavailable"
 
 
 def test_reconcile_protection_adoption_refuses_duplicate_exact_candidates(tmp_path):
