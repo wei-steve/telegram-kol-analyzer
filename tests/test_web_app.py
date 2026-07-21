@@ -34,6 +34,7 @@ from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TradeSignal
@@ -1278,6 +1279,143 @@ def test_execution_dashboard_matches_tpsl_one_second_after_position(tmp_path):
     assert "pos-smart-market" in response.text
     assert "止损: 1820" in response.text
     assert "无止损" not in response.text
+
+
+def test_execution_dashboard_uses_exact_ledger_evidence_for_late_managed_stop(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-managed-stop",
+                    "posSide": "short",
+                    "pos": "7",
+                    "avgPx": "65287.5",
+                    "cTime": "10000",
+                    "tpTriggerPx": "63100",
+                    "slTriggerPx": "",
+                }
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [
+                {
+                    "instId": inst_id,
+                    "posSide": "short",
+                    "sz": "0",
+                    "cTime": "24010000",
+                    "triggerOrderType": "TPSL",
+                    "ordId": "late-managed-stop",
+                    "slTriggerPrice": "67200",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+    with app.state.session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="short",
+            status="active",
+            pos_id="pos-managed-stop",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            pos_id="pos-managed-stop",
+            venue="deepcoin",
+            attribution_status="verified",
+            attribution_evidence_json=json.dumps({"policy_version": 2}),
+            status="active",
+        )
+        session.add(leg)
+        session.flush()
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-managed-stop",
+                instrument_id="BTC-USDT-SWAP",
+                side="short",
+                order_id="late-managed-stop",
+                purpose="stop_loss",
+                trigger_price="67200",
+                status="verified",
+                evidence_source="management_tpsl_replacement",
+            )
+        )
+        session.commit()
+
+    response = TestClient(app).get("/execution")
+
+    assert response.status_code == 200
+    assert "止损: 67200" in response.text
+    assert "无止损" not in response.text
+
+
+def test_execution_dashboard_does_not_use_ledger_for_closed_entry_leg(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [{
+                "instId": "BTC-USDT-SWAP", "posId": "pos-closed-leg",
+                "posSide": "short", "pos": "7", "avgPx": "65287.5",
+                "cTime": "10000", "tpTriggerPx": "63100", "slTriggerPx": "",
+            }]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [{
+                "instId": inst_id, "posSide": "short", "sz": "0",
+                "cTime": "24010000", "triggerOrderType": "TPSL",
+                "ordId": "closed-leg-stop", "slTriggerPrice": "67200",
+            }]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+    with app.state.session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:88", chat_id=88, message_id=10, symbol="BTC",
+            side="short", status="active", pos_id="pos-closed-leg",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id, leg_index=1, purpose="entry",
+            order_kind="market", pos_id="pos-closed-leg", venue="deepcoin",
+            attribution_status="verified",
+            attribution_evidence_json=json.dumps({"policy_version": 2}),
+            status="closed",
+        )
+        session.add(leg)
+        session.flush()
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin", execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id, pos_id="pos-closed-leg",
+                instrument_id="BTC-USDT-SWAP", side="short",
+                order_id="closed-leg-stop", purpose="stop_loss",
+                trigger_price="67200", status="verified",
+                evidence_source="management_tpsl_replacement",
+            )
+        )
+        session.commit()
+
+    response = TestClient(app).get("/execution")
+
+    assert response.status_code == 200
+    assert "止损: 67200" not in response.text
+    assert "无止损" in response.text
 
 
 def test_execution_dashboard_renders_ambiguous_stop_truthfully(tmp_path):

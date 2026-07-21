@@ -197,8 +197,16 @@ def match_position_protection(
     *,
     evidence_available: bool = True,
     time_tolerance_ms: int = DEFAULT_PROTECTION_TIME_TOLERANCE_MS,
+    exact_order_position_ids: dict[str, str] | None = None,
 ) -> ProtectionMatchResult:
-    """Match TPSL rows without borrowing strategy-ownership assumptions."""
+    """Match TPSL rows without borrowing strategy-ownership assumptions.
+
+    ``exact_order_position_ids`` is durable ownership evidence recorded when a
+    known position-management operation creates a replacement TPSL order. It
+    is deliberately keyed by the exchange order ID, so it can supplement a
+    later unscoped exchange response without relaxing heuristic matching for
+    any other order.
+    """
 
     parsed_positions = [_parse_position(row) for row in positions]
     parsed_positions = [row for row in parsed_positions if row is not None]
@@ -213,11 +221,28 @@ def match_position_protection(
     exact_rows: dict[str, list[dict[str, Any]]] = {
         row.pos_id: _inline_position_protection_rows(row.raw) for row in parsed_positions
     }
+    exact_order_position_ids = exact_order_position_ids or {}
     unscoped_groups: list[_ProtectionGroup] = []
     for order in tpsl_orders:
         if str(order.get("triggerOrderType") or "TPSL").upper() != "TPSL":
             continue
         if not _row_has_protection(order):
+            continue
+        order_id = _first_text(
+            order,
+            "ordId",
+            "orderId",
+            "order_id",
+            "algoId",
+            "triggerOrderId",
+            "id",
+        )
+        ledger_pos_id = exact_order_position_ids.get(order_id or "")
+        if ledger_pos_id is not None:
+            if ledger_pos_id in positions_by_id:
+                exact_rows[ledger_pos_id].append(order)
+            # A persisted exact owner that is no longer live must not be
+            # re-attributed through the weaker timestamp/size heuristic.
             continue
         pos_id = _first_text(
             order,

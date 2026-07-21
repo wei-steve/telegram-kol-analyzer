@@ -52,6 +52,33 @@ def test_zero_size_tpsl_is_full_position_protection():
     assert result.by_pos_id["pos-zero"].status == "verified"
 
 
+def test_exact_managed_tpsl_evidence_merges_late_stop_with_inline_take_profit():
+    position = _position(
+        "pos-managed",
+        size="7",
+        created_at="10000",
+        tpTriggerPx="63100",
+    )
+    late_stop = _tpsl(
+        created_at="24010000",
+        size="0",
+        ordId="managed-stop",
+        slTriggerPrice="67200",
+    )
+
+    result = match_position_protection(
+        [position],
+        [late_stop],
+        exact_order_position_ids={"managed-stop": "pos-managed"},
+    )
+
+    protection = result.by_pos_id["pos-managed"]
+    assert protection.status == "verified"
+    assert protection.stop_loss == 67200
+    assert protection.take_profits == [63100]
+    assert protection.order_ids == ["managed-stop"]
+
+
 def test_partial_take_profit_sizes_can_cover_one_position():
     result = match_position_protection(
         [_position("pos-split", size="1.5")],

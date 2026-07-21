@@ -844,11 +844,6 @@ def _load_deepcoin_live_position_rows(
         deepcoin_client,
         active_positions,
     )
-    protection_match = match_position_protection(
-        active_positions,
-        tpsl_orders,
-        evidence_available=tpsl_evidence_available,
-    )
 
     with session_factory() as session:
         active_pos_ids = {
@@ -876,6 +871,48 @@ def _load_deepcoin_live_position_rows(
                 else []
             )
         }
+        exact_order_position_ids: dict[str, str] = {}
+        verified_live_leg_ids: set[int] = set()
+        for leg in legs:
+            binding = bindings_by_id.get(int(leg.execution_binding_id))
+            if (
+                leg.id is not None
+                and str(leg.attribution_status or "").lower() == "verified"
+                and str(leg.status or "").lower() == "active"
+                and str(leg.pos_id or "") in active_pos_ids
+                and binding is not None
+                and str(binding.status or "").lower() == "active"
+                and has_authoritative_persisted_position(leg, session=session)
+            ):
+                verified_live_leg_ids.add(int(leg.id))
+        if verified_live_leg_ids:
+            for ledger_row in (
+                session.query(PositionProtectionLedger)
+                .filter(PositionProtectionLedger.venue == "deepcoin")
+                .filter(
+                    PositionProtectionLedger.execution_order_leg_id.in_(
+                        verified_live_leg_ids
+                    )
+                )
+                .filter(PositionProtectionLedger.status == "verified")
+                .all()
+            ):
+                order_id = str(ledger_row.order_id or "").strip()
+                pos_id = str(ledger_row.pos_id or "").strip()
+                leg = legs_by_pos_id.get(pos_id)
+                if (
+                    order_id
+                    and pos_id in active_pos_ids
+                    and leg is not None
+                    and int(leg.id) == int(ledger_row.execution_order_leg_id)
+                ):
+                    exact_order_position_ids[order_id] = pos_id
+        protection_match = match_position_protection(
+            active_positions,
+            tpsl_orders,
+            evidence_available=tpsl_evidence_available,
+            exact_order_position_ids=exact_order_position_ids,
+        )
         lifecycle_candidates_by_binding_id: dict[int, list[StrategyLifecycle]] = {}
         if binding_ids:
             bound_lifecycles = (
