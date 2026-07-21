@@ -43,7 +43,7 @@ from telegram_kol_research.protection_attribution import (
     snapshot_protection_rows,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
-from telegram_kol_research.protection_revisions import activate_protection_revision
+from telegram_kol_research.protection_revisions import record_replacing_protection_revision
 from telegram_kol_research.protection_ledger import list_verified_ledger_rows_for_positions
 from telegram_kol_research.strategy_management_batches import (
     ManagementBatchRecord,
@@ -1532,7 +1532,7 @@ def _record_management_tpsl_ledger_rows(
                 },
                 seen_at=seen_at,
             )
-        activate_protection_revision(
+        record_replacing_protection_revision(
             session,
             venue=binding.venue,
             execution_binding_id=batch.execution_binding_id,

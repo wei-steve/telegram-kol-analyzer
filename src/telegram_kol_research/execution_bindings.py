@@ -28,6 +28,7 @@ from telegram_kol_research.protection_snapshot import (
     observe_pending_tpsl,
     record_pending_tpsl_observation,
 )
+from telegram_kol_research.protection_revisions import confirm_visible_protection_revision
 from telegram_kol_research.position_attribution import (
     ATTRIBUTION_POLICY_VERSION,
     FillEvidence,
@@ -495,6 +496,39 @@ def _deduplicate_exchange_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any
     return result
 
 
+def _confirm_visible_management_protection_revisions(
+    session,
+    *,
+    snapshot: _ReconcileSnapshot,
+    bindings: list[ExecutionBinding],
+) -> None:
+    """Confirm replacement revisions only from complete per-instrument reads."""
+
+    observations_by_instrument = {
+        str(item.get("instrument_id") or "").upper(): item
+        for item in snapshot.pending_tpsl_observations
+    }
+    order_ids_by_instrument: dict[str, set[str]] = {}
+    for row in snapshot.pending_trigger_orders:
+        instrument_id = str(row.get("instId") or row.get("instrument_id") or "").upper()
+        order_id = _first_string(row, "ordId", "orderId", "order_id")
+        if instrument_id and order_id:
+            order_ids_by_instrument.setdefault(instrument_id, set()).add(order_id)
+    for binding in bindings:
+        instrument_id = f"{str(binding.symbol).upper()}-USDT-SWAP"
+        observation = observations_by_instrument.get(instrument_id)
+        if observation is None or not bool(observation.get("complete")):
+            continue
+        if not binding.pos_id:
+            continue
+        confirm_visible_protection_revision(
+            session,
+            venue=binding.venue,
+            pos_id=str(binding.pos_id),
+            visible_order_ids=order_ids_by_instrument.get(instrument_id, set()),
+        )
+
+
 def _apply_reconcile_snapshot(
     session_factory: sessionmaker,
     *,
@@ -529,6 +563,9 @@ def _apply_reconcile_snapshot(
             .all()
         )
         bindings_by_id = {int(binding.id): binding for binding in bindings}
+        _confirm_visible_management_protection_revisions(
+            session, snapshot=snapshot, bindings=bindings
+        )
         manual_terminal_binding_ids = _manual_terminal_binding_ids(
             session, bindings=bindings
         )
