@@ -817,6 +817,7 @@ class TriggerProtectionStopRescue(Base):
     reason_code: Mapped[Optional[str]] = mapped_column(String(96), nullable=True)
     request_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     exchange_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     planned_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     reserved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

@@ -166,12 +166,12 @@ def execute_trigger_protection_stop_rescue(
     except DeepcoinDefiniteRejection as exc:
         return _complete_trigger_protection_rescue_failure(
             session_factory, rescue_id=int(rescue_id), now=now,
-            reason="rescue_submission_rejected", error=str(exc),
+            reason="rescue_submission_rejected", error=exc,
         )
     except Exception as exc:
         return _complete_trigger_protection_rescue_failure(
             session_factory, rescue_id=int(rescue_id), now=now,
-            reason="rescue_submission_outcome_unknown", error=str(exc), unknown=True,
+            reason="rescue_submission_outcome_unknown", error=exc, unknown=True,
         )
     order_id = _extract_order_id(response)
     if not order_id:
@@ -181,21 +181,30 @@ def execute_trigger_protection_stop_rescue(
             response=response,
         )
 
-    # The response, ledger ownership, intent state and execution event are one
-    # local transaction.  Once this succeeds later management can rely on it.
+    # Commit accepted exchange identity before any local ledger/event work.  A
+    # later local failure must never erase the response and invite a duplicate.
+    with session_factory() as session:
+        rescue = session.get(TriggerProtectionStopRescue, int(rescue_id))
+        if rescue is None or rescue.status != "reserved":
+            raise ManagementBatchExecutionError("trigger_protection_rescue_response_persist_conflict")
+        rescue.status = "submitted"
+        rescue.reason_code = "rescue_stop_submitted"
+        rescue.exchange_order_id = order_id
+        rescue.response_json = json.dumps(response, ensure_ascii=False, sort_keys=True)
+        rescue.error_json = None
+        rescue.completed_at = now
+        rescue.updated_at = now
+        session.commit()
+
+    # Ledger ownership and the event follow the authoritative response record.
+    # If either fails, the submitted rescue remains durable and non-retryable.
     with session_factory() as session:
         rescue = session.get(TriggerProtectionStopRescue, int(rescue_id))
         intent = session.get(TriggerProtectionIntent, rescue.trigger_protection_intent_id)
         binding = session.get(ExecutionBinding, rescue.execution_binding_id)
         leg = session.get(ExecutionOrderLeg, rescue.execution_order_leg_id)
-        if rescue.status != "reserved" or intent is None or binding is None or leg is None:
+        if rescue.status != "submitted" or intent is None or binding is None or leg is None:
             raise ManagementBatchExecutionError("trigger_protection_rescue_persistence_conflict")
-        rescue.status = "submitted"
-        rescue.reason_code = "rescue_stop_submitted"
-        rescue.exchange_order_id = order_id
-        rescue.response_json = json.dumps(response, ensure_ascii=False, sort_keys=True)
-        rescue.completed_at = now
-        rescue.updated_at = now
         upsert_protection_ledger_row(
             session,
             venue="deepcoin", execution_binding_id=binding.id,
@@ -228,7 +237,7 @@ def execute_trigger_protection_stop_rescue(
 
 def _complete_trigger_protection_rescue_failure(
     session_factory, *, rescue_id: int, now: datetime, reason: str,
-    error: str, unknown: bool = False, response: Any = None,
+    error: object, unknown: bool = False, response: Any = None,
 ) -> dict[str, Any]:
     with session_factory() as session:
         rescue = session.get(TriggerProtectionStopRescue, rescue_id)
@@ -239,6 +248,11 @@ def _complete_trigger_protection_rescue_failure(
         rescue.response_json = (
             json.dumps(response, ensure_ascii=False, sort_keys=True)
             if isinstance(response, dict) else None
+        )
+        rescue.error_json = json.dumps(
+            {"type": type(error).__name__, "message": str(error)[:512]},
+            ensure_ascii=False,
+            sort_keys=True,
         )
         rescue.completed_at = now
         rescue.updated_at = now

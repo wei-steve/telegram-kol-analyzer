@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_events import ExecutionEventRecord, record_execution_event
 from telegram_kol_research.models import (
@@ -12,6 +14,7 @@ from telegram_kol_research.models import (
     RecognitionDecision,
     StrategyLifecycle,
     TriggerProtectionIntent,
+    TriggerProtectionStopRescue,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 
@@ -186,3 +189,61 @@ def test_rescue_blocks_stale_binding_position_before_any_exchange_write(tmp_path
     assert result.status == "blocked"
     assert result.reason_code == "rescue_binding_position_mismatch"
     assert client.calls == []
+
+
+def test_rescue_keeps_exchange_response_when_later_ledger_write_fails(monkeypatch, tmp_path):
+    import telegram_kol_research.strategy_management_executor as executor
+    from telegram_kol_research.strategy_management_planner import plan_trigger_protection_stop_rescue
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    intent_id = _saved_deferred_intent(session_factory)
+    client = _Client()
+    planned = plan_trigger_protection_stop_rescue(
+        session_factory, intent_id=intent_id, deepcoin_client=client, planned_at=NOW
+    )
+    monkeypatch.setattr(
+        executor, "upsert_protection_ledger_row", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ledger offline"))
+    )
+
+    with pytest.raises(RuntimeError, match="ledger offline"):
+        executor.execute_trigger_protection_stop_rescue(
+            session_factory, rescue_id=planned.rescue_id, deepcoin_client=client, executed_at=NOW
+        )
+
+    with session_factory() as session:
+        rescue = session.get(TriggerProtectionStopRescue, planned.rescue_id)
+        assert rescue.status == "submitted"
+        assert rescue.exchange_order_id == "rescue-sl-1"
+        assert json.loads(rescue.response_json) == {"code": "0", "data": {"ordId": "rescue-sl-1"}}
+    again = executor.execute_trigger_protection_stop_rescue(
+        session_factory, rescue_id=planned.rescue_id, deepcoin_client=client, executed_at=NOW
+    )
+    assert again["order_id"] == "rescue-sl-1"
+    assert len(client.calls) == 1
+
+
+def test_rescue_persists_bounded_failure_diagnostics(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_trigger_protection_stop_rescue
+    from telegram_kol_research.strategy_management_planner import plan_trigger_protection_stop_rescue
+
+    class _FailingClient(_Client):
+        def set_position_sltp(self, payload):
+            self.calls.append(dict(payload))
+            raise RuntimeError("x" * 1000)
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    intent_id = _saved_deferred_intent(session_factory)
+    client = _FailingClient()
+    planned = plan_trigger_protection_stop_rescue(
+        session_factory, intent_id=intent_id, deepcoin_client=client, planned_at=NOW
+    )
+    result = execute_trigger_protection_stop_rescue(
+        session_factory, rescue_id=planned.rescue_id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "submit_unknown"
+    with session_factory() as session:
+        rescue = session.get(TriggerProtectionStopRescue, planned.rescue_id)
+        diagnostics = json.loads(rescue.error_json)
+    assert diagnostics["type"] == "RuntimeError"
+    assert len(diagnostics["message"]) == 512
