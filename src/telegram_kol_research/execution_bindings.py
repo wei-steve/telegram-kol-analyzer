@@ -1731,8 +1731,8 @@ def _trigger_child_order_matches(
     )
     if trigger_side and child_side and trigger_side != child_side:
         return False
-    if not _numbers_equal(_order_row_size(trigger_row), _order_row_size(child_row)):
-        return False
+    # A child may be only partially filled, so its cumulative fill size is
+    # deliberately not comparable to the trigger's requested size here.
     if not _numbers_equal(_order_row_price(trigger_row), _order_row_price(child_row)):
         return False
     trigger_times = _timestamp_ms_values(
