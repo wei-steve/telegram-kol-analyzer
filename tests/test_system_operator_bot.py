@@ -58,6 +58,36 @@ def test_message_instruction_summary_reports_management_failure_and_entry_attemp
     assert "deepcoin:-10088:811:BTC:short" in text
 
 
+def test_message_instruction_summary_keeps_multi_target_management_outcomes_separate():
+    payload = {
+        "message_id": 3366,
+        "chat_id": -10088,
+        "items": [
+            {
+                "sequence": 0,
+                "instruction_kind": "management",
+                "strategy_instance_id": "deepcoin:-10088:3365:BTC:short",
+                "status": "unknown",
+                "reason": "deferred_entry_cancel_preflight_failed",
+            },
+            {
+                "sequence": 1,
+                "instruction_kind": "management",
+                "strategy_instance_id": "deepcoin:-10088:3359:ETH:short",
+                "status": "submitted",
+                "result": {"batch_id": 102},
+            },
+        ],
+    }
+
+    text = operator_bot_module.format_message_instruction_summary(payload)
+
+    assert "#0 仓位管理: unknown" in text
+    assert "#1 仓位管理: submitted" in text
+    assert "deepcoin:-10088:3365:BTC:short" in text
+    assert "deepcoin:-10088:3359:ETH:short" in text
+
+
 def test_message_instruction_summary_sanitizes_persisted_reason_and_splits():
     payload = {
         "items": [
