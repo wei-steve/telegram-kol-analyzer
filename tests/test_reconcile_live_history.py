@@ -289,7 +289,7 @@ def test_reconcile_does_not_recover_old_missing_authoritative_decision(tmp_path)
     assert decision.automation_reason == "authoritative_gap_recovery_expired"
 
 
-def test_reconcile_notifies_operator_for_expired_external_market_gap(tmp_path):
+def test_reconcile_suppresses_operator_notification_for_expired_gap(tmp_path):
     session_factory = create_session_factory(tmp_path / "expired-notification.db")
     with session_factory() as session:
         session.add(
@@ -329,8 +329,61 @@ def test_reconcile_notifies_operator_for_expired_external_market_gap(tmp_path):
 
     asyncio.run(scenario())
 
-    assert len(sent) == 1
-    assert sent[0]["automation"]["reason"] == "authoritative_gap_recovery_expired"
+    assert sent == []
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+    assert decision.authoritative_model == "recovery_guard"
+    assert decision.automation_status == "skipped"
+    assert decision.automation_reason == "authoritative_gap_recovery_expired"
+    assert decision.notification_status == "suppressed_expired_recovery"
+
+
+def test_reconcile_keeps_expired_gap_notification_suppressed_on_second_pass(tmp_path):
+    session_factory = create_session_factory(tmp_path / "expired-notification-repeat.db")
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=9001,
+                message_id=88,
+                text="NVDA 900 附近观察",
+                posted_at=datetime(2026, 4, 10, 9, 0),
+            )
+        )
+        session.commit()
+
+    sent: list[dict] = []
+
+    async def sender(**kwargs):
+        sent.append(kwargs["payload"])
+
+    async def no_messages(client, dialog, limit, media_root="data/media"):
+        return []
+
+    async def scenario():
+        for _ in range(2):
+            await run_reconcile_once(
+                client=_FakeClient(),
+                session_factory=session_factory,
+                broker=None,
+                target_titles={"VIP BTC Room"},
+                authoritative_processor=lambda raw_message_id: None,
+                system_operator_bot_config=SystemOperatorBotConfig(
+                    bot_token="system-token",
+                    chat_id="system-chat",
+                ),
+                system_operator_conflict_sender=sender,
+                discover_dialogs_fn=_fake_discover_dialogs,
+                fetch_dialog_messages_fn=no_messages,
+            )
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert sent == []
+    with session_factory() as session:
+        decisions = session.query(RecognitionDecision).all()
+    assert len(decisions) == 1
+    assert decisions[0].notification_status == "suppressed_expired_recovery"
 
 
 def test_reconcile_continues_after_one_missing_decision_recovery_fails(tmp_path):

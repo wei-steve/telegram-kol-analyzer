@@ -496,25 +496,8 @@ def _record_expired_authoritative_recovery_gap(
         raw_message_id=raw_message.id,
         automation_status="skipped",
         automation_reason=reason,
+        notification_status="suppressed_expired_recovery",
     )
-
-
-def _build_expired_authoritative_recovery_payload(
-    *, raw_message: RawMessage, chat_title: str
-) -> dict[str, Any]:
-    reason = "authoritative_gap_recovery_expired"
-    return {
-        "chat_title": chat_title,
-        "chat_id": raw_message.chat_id,
-        "message_id": raw_message.message_id,
-        "posted_at": raw_message.posted_at,
-        "text": raw_message.text,
-        "agreement_status": "authoritative_failed",
-        "differences": [reason],
-        "deepseek": {"status": "-", "kind": "auxiliary", "reason": "-"},
-        "mimo": {"status": "识别失败", "kind": "authoritative", "reason": reason},
-        "automation": {"status": "skipped", "reason": reason},
-    }
 
 
 def _build_ai_recognition_conflict_payload(
@@ -808,22 +791,10 @@ async def run_reconcile_once(
             )
             recovered_messages += 1
         for raw_message in expired_messages:
-            chat_title = chat_titles_by_id.get(raw_message.chat_id, "")
             _record_expired_authoritative_recovery_gap(
                 session_factory,
                 raw_message=raw_message,
             )
-            if system_operator_bot_enabled(system_operator_bot_config):
-                _schedule_authoritative_notification(
-                    session_factory=session_factory,
-                    raw_message_id=raw_message.id,
-                    sender=system_operator_conflict_sender,
-                    config=system_operator_bot_config,
-                    payload=_build_expired_authoritative_recovery_payload(
-                        raw_message=raw_message,
-                        chat_title=chat_title,
-                    ),
-                )
             expired_recovery_messages += 1
 
     history_checkpoints: dict[int, int] = {}
