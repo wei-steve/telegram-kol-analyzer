@@ -29,6 +29,7 @@ from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.protection_revisions import activate_protection_revision
 from telegram_kol_research.trigger_protection_intents import (
     create_or_get_trigger_protection_intent,
     record_trigger_protection_parent,
@@ -942,6 +943,17 @@ def _record_entry_protection_ledger_rows(
                     evidence_source="entry_protection_response",
                     evidence=_entry_protection_ledger_evidence(row),
                     seen_at=seen_at,
+                )
+            if rows:
+                activate_protection_revision(
+                    session,
+                    venue=str(leg.venue or "deepcoin"),
+                    execution_binding_id=binding_id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id=leg.strategy_instance_id,
+                    pos_id=pos_id,
+                    source="entry_protection",
+                    protection_json={"order_ids": [row["order_id"] for row in rows], "rows": rows},
                 )
         session.commit()
 
