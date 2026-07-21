@@ -120,7 +120,7 @@
             <dt>恢复状态</dt><dd>{{ recovery.recovery_state }} · 尝试 {{ recovery.retry_attempts }}</dd>
             <dt>已采纳 TPSL ID</dt><dd><span class="strategy-identifier">{{ recovery.adopted_tpsl_order_ids | join(' / ') or '-' }}</span></dd>
             <dt>拒绝原因码</dt><dd>{{ recovery.refusal_code or '-' }}</dd>
-            <dt>止损救援状态</dt><dd>{{ recovery.stop_rescue.state }}{% if recovery.stop_rescue.order_id %} · <span class="strategy-identifier">{{ recovery.stop_rescue.order_id }}</span>{% endif %}</dd>
+            <dt>止损救援状态</dt><dd>{{ recovery.stop_rescue.state }}</dd>
           </dl>
         </article>
       {% else %}

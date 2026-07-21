@@ -879,11 +879,6 @@ def _trigger_protection_recovery_detail(
             else None
         )
         rescue_state = str(rescue.status) if rescue_matches_position and rescue else "none"
-        rescue_order_id = (
-            str(rescue.exchange_order_id)
-            if rescue_matches_position and rescue and rescue.exchange_order_id
-            else None
-        )
         adopted_order_ids = (
             [str(intent.adopted_order_id)] if intent.adopted_order_id else []
         )
@@ -898,7 +893,7 @@ def _trigger_protection_recovery_detail(
                 "retry_attempts": int(intent.retry_attempts),
                 "adopted_tpsl_order_ids": adopted_order_ids,
                 "refusal_code": refusal_code,
-                "stop_rescue": {"state": rescue_state, "order_id": rescue_order_id},
+                "stop_rescue": {"state": rescue_state},
             }
         )
     return projected

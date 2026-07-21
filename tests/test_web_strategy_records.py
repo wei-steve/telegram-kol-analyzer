@@ -343,6 +343,7 @@ def test_strategy_record_detail_renders_safe_trigger_recovery_audit_fields(tmp_p
                 pos_id="pos-web-record",
                 status="blocked",
                 reason_code="rescue_opaque_take_profit_present",
+                exchange_order_id="rescue-order-must-not-render",
                 request_json='{"raw":"must-not-render"}',
                 response_json='{"raw":"must-not-render"}',
                 error_json='{"raw":"must-not-render"}',
@@ -365,6 +366,7 @@ def test_strategy_record_detail_renders_safe_trigger_recovery_audit_fields(tmp_p
     ):
         assert visible_value in response.text
     assert "must-not-render" not in response.text
+    assert "rescue-order-must-not-render" not in response.text
 
 
 def test_strategy_record_detail_management_batch_exposes_authoritative_ids_and_leg_statuses(tmp_path):

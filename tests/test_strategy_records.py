@@ -342,6 +342,7 @@ def test_strategy_detail_projects_safe_trigger_protection_recovery_evidence(tmp_
                 pos_id="pos-adopted",
                 status="blocked",
                 reason_code="rescue_opaque_take_profit_present",
+                exchange_order_id="rescue-order-must-not-render",
                 request_json='{"passphrase":"must-not-render"}',
                 response_json='{"raw":"must-not-render"}',
                 error_json='{"message":"must-not-render"}',
@@ -367,7 +368,7 @@ def test_strategy_detail_projects_safe_trigger_protection_recovery_evidence(tmp_
             "retry_attempts": 2,
             "adopted_tpsl_order_ids": ["adopted-tpsl-1"],
             "refusal_code": "rescue_opaque_take_profit_present",
-            "stop_rescue": {"state": "blocked", "order_id": None},
+            "stop_rescue": {"state": "blocked"},
         }
     ]
     recovery_timeline = next(
@@ -388,6 +389,9 @@ def test_strategy_detail_projects_safe_trigger_protection_recovery_evidence(tmp_
         "stop_rescue_state": "blocked",
     }
     assert "must-not-render" not in str(detail["execution"]["trigger_protection_recovery"])
+    assert "rescue-order-must-not-render" not in str(
+        detail["execution"]["trigger_protection_recovery"]
+    )
     assert "must-not-render" not in str(recovery_timeline)
 
 
