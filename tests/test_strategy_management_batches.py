@@ -100,6 +100,40 @@ def test_race_resolved_successor_resolves_parent_before_creating_active_batch(tm
         assert parent_row.reason_code == "deferred_entry_cancel_race_resolved"
 
 
+def test_worker_lists_deferred_entry_cancel_race_parent(tmp_path):
+    repository = _repository()
+    session_factory = create_session_factory(tmp_path / "race-worker.db")
+    parent = repository.create_management_batch(
+        session_factory,
+        idempotency_fingerprint="worker-race-parent",
+        raw_message_id=101,
+        recognition_decision_id=201,
+        recognition_generation="generation-1",
+        target_lifecycle_id=301,
+        strategy_instance_id="strategy-race",
+        execution_binding_id=401,
+        intent="full_exit",
+        effective_action="full_exit",
+        execution_mode="live",
+        requested_fraction=None,
+        effective_fraction=1.0,
+        partial_round_before=0,
+        target_fingerprint="parent-target",
+        target_snapshot={"identity": {"deferred_entry_leg_ids": [1]}},
+        planned_at=datetime(2026, 7, 22, tzinfo=UTC),
+        legs=[],
+    )
+    repository.transition_batch(
+        session_factory,
+        parent.id,
+        expected_statuses={"ready"},
+        new_status="recovery_required",
+        reason_code="deferred_entry_cancel_race_detected",
+    )
+
+    assert [batch.id for batch in repository.list_worker_batches(session_factory)] == [parent.id]
+
+
 def _batch_values(*, fingerprint: str = "batch-fingerprint", strategy: str = "strategy-1"):
     now = datetime(2026, 7, 15, 1, 2, 3, tzinfo=UTC)
     return {

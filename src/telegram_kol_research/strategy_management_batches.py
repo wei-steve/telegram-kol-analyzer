@@ -574,6 +574,20 @@ def list_worker_batches(
 
         executable = load_lane({"ready", "protection_ready"})
         recovery = load_lane(RECOVERABLE_BATCH_STATUSES)
+        recovery += (
+            session.query(StrategyManagementBatch)
+            .filter(StrategyManagementBatch.status == "recovery_required")
+            .filter(
+                StrategyManagementBatch.reason_code
+                == "deferred_entry_cancel_race_detected"
+            )
+            .order_by(
+                StrategyManagementBatch.planned_at.asc(),
+                StrategyManagementBatch.id.asc(),
+            )
+            .limit(limit)
+            .all()
+        )
         temporary_visibility = (
             session.query(StrategyManagementBatch)
             .filter(StrategyManagementBatch.status == "blocked")

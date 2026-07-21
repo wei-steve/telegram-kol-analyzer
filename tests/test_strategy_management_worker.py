@@ -7,13 +7,24 @@ from types import SimpleNamespace
 import pytest
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.execution_bindings import (
+    ExecutionBindingRecord,
+    ExecutionOrderLegRecord,
+    upsert_execution_binding,
+    upsert_execution_order_leg,
+)
 from telegram_kol_research.models import StrategyManagementBatch
+from telegram_kol_research.strategy_management_batches import (
+    create_management_batch,
+    load_management_batch,
+    transition_batch,
+)
 from telegram_kol_research.strategy_management_executor import (
     ManagementBatchExecutionError,
 )
-from telegram_kol_research.strategy_management_batches import load_management_batch
 from telegram_kol_research.strategy_management_worker import (
     StrategyManagementWorkerCursor,
+    _resolve_deferred_entry_cancel_race_successor,
     _advance_temporary_visibility_retry,
     run_strategy_management_worker_tick,
 )
@@ -211,6 +222,219 @@ def test_recovery_required_is_paused_and_other_strategies_are_independent():
     assert executed == [2]
     assert result.executed == 1
     assert result.paused == 1
+
+
+def test_cancel_race_parent_is_reconciled_and_resolved_into_successor():
+    events = []
+    race_parent = _batch(
+        batch_id=71,
+        strategy="deepcoin:100:10:BTC:short",
+        status="recovery_required",
+    )
+    race_parent.reason_code = "deferred_entry_cancel_race_detected"
+
+    result = run_strategy_management_worker_tick(
+        object(),
+        deepcoin_client_factory=lambda: events.append("client") or object(),
+        batch_lister=lambda *_args, **_kwargs: [race_parent],
+        snapshot_loader=lambda *_args, **_kwargs: events.append("snapshot") or object(),
+        binding_reconciler=lambda *_args, **_kwargs: events.append("binding-reconcile"),
+        race_successor_resolver=lambda *_args, **kwargs: (
+            events.append(("resolve", kwargs["batch_id"])), True
+        )[1],
+        processed_at=NOW,
+    )
+
+    assert events == [
+        "client",
+        "snapshot",
+        "binding-reconcile",
+        ("resolve", 71),
+    ]
+    assert result.recovered == 1
+    assert result.paused == 0
+
+
+def test_cancel_race_snapshot_read_failure_leaves_parent_paused():
+    race_parent = _batch(
+        batch_id=72, strategy="deepcoin:100:10:BTC:short", status="recovery_required"
+    )
+    race_parent.reason_code = "deferred_entry_cancel_race_detected"
+    resolver_called = []
+
+    result = run_strategy_management_worker_tick(
+        object(),
+        deepcoin_client_factory=lambda: object(),
+        batch_lister=lambda *_args, **_kwargs: [race_parent],
+        snapshot_loader=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("read failed")),
+        race_successor_resolver=lambda *_args, **_kwargs: resolver_called.append(True),
+        processed_at=NOW,
+    )
+
+    assert result.failed == 1
+    assert resolver_called == []
+
+
+def test_cancel_race_successor_requires_exact_verified_live_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "race-successor.db")
+    strategy = "deepcoin:100:10:BTC:short"
+    binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="mia", chat_id=100, message_id=10, symbol="BTC", side="short",
+            strategy_instance_id=strategy, status="active",
+        ),
+    )
+    entry_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id, strategy_instance_id=strategy, leg_index=0,
+            order_id="trigger-1", pos_id="pos-race", order_kind="trigger_limit",
+            attribution_status="verified", attribution_evidence={"policy_version": 2},
+            status="active",
+        ),
+    )
+    second_entry_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id, strategy_instance_id=strategy, leg_index=1,
+            order_id="trigger-2", pos_id="pos-alpha", order_kind="trigger_limit",
+            attribution_status="verified", attribution_evidence={"policy_version": 2},
+            status="active",
+        ),
+    )
+    parent = create_management_batch(
+        session_factory,
+        idempotency_fingerprint="parent-race-worker",
+        raw_message_id=10, recognition_decision_id=1, recognition_generation="g1",
+        target_lifecycle_id=1, strategy_instance_id=strategy,
+        execution_binding_id=binding_id, intent="full_exit", effective_action="full_exit",
+        execution_mode="live", requested_fraction=None, effective_fraction=1.0,
+        partial_round_before=0, target_fingerprint="parent-target",
+        target_snapshot={
+            "identity": {"deferred_entry_leg_ids": [entry_id, second_entry_id]},
+            "contract_spec": {"quantity_step": 1, "min_quantity": 1},
+        },
+        legs=[], planned_at=NOW,
+    )
+    transition_batch(
+        session_factory, parent.id, expected_statuses={"ready"},
+        new_status="recovery_required", reason_code="deferred_entry_cancel_race_detected",
+        transitioned_at=NOW,
+    )
+    snapshot = SimpleNamespace(positions=[{
+        "instId": "BTC-USDT-SWAP", "posId": "pos-race", "posSide": "short",
+        "pos": "7", "avgPx": "66400", "mgnMode": "cross", "mrgPosition": "split",
+    }, {
+        "instId": "BTC-USDT-SWAP", "posId": "pos-alpha", "posSide": "short",
+        "pos": "3", "avgPx": "66500", "mgnMode": "cross", "mrgPosition": "split",
+    }])
+
+    assert _resolve_deferred_entry_cancel_race_successor(
+        session_factory, batch_id=parent.id, snapshot=snapshot, resolved_at=NOW
+    )
+    successor = load_management_batch(session_factory, parent.id + 1)
+    assert successor.status == "ready"
+    close_sizes = {leg.pos_id: leg.planned_close_size for leg in successor.legs}
+    assert close_sizes == {"pos-race": "7", "pos-alpha": "3"}
+    assert load_management_batch(session_factory, parent.id).status == "resolved"
+
+
+def test_cancel_race_ambiguous_live_position_keeps_parent_for_recovery(tmp_path):
+    session_factory = create_session_factory(tmp_path / "race-ambiguous.db")
+    strategy = "deepcoin:100:10:BTC:short"
+    binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="mia", chat_id=100, message_id=10, symbol="BTC", side="short",
+            strategy_instance_id=strategy, status="active",
+        ),
+    )
+    entry_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id, strategy_instance_id=strategy, leg_index=0,
+            order_id="trigger-1", pos_id="pos-race", order_kind="trigger_limit",
+            attribution_status="verified", attribution_evidence={"policy_version": 2},
+            status="active",
+        ),
+    )
+    parent = create_management_batch(
+        session_factory, idempotency_fingerprint="ambiguous-race", raw_message_id=10,
+        recognition_decision_id=1, recognition_generation="g1", target_lifecycle_id=1,
+        strategy_instance_id=strategy, execution_binding_id=binding_id, intent="full_exit",
+        effective_action="full_exit", execution_mode="live", requested_fraction=None,
+        effective_fraction=1.0, partial_round_before=0, target_fingerprint="parent-target",
+        target_snapshot={
+            "identity": {"deferred_entry_leg_ids": [entry_id]},
+            "contract_spec": {"quantity_step": 1, "min_quantity": 1},
+        }, legs=[], planned_at=NOW,
+    )
+    transition_batch(
+        session_factory, parent.id, expected_statuses={"ready"},
+        new_status="recovery_required", reason_code="deferred_entry_cancel_race_detected",
+        transitioned_at=NOW,
+    )
+    position = {
+        "instId": "BTC-USDT-SWAP", "posId": "pos-race", "posSide": "short",
+        "pos": "7", "avgPx": "66400", "mgnMode": "cross", "mrgPosition": "split",
+    }
+
+    assert not _resolve_deferred_entry_cancel_race_successor(
+        session_factory, batch_id=parent.id,
+        snapshot=SimpleNamespace(positions=[position, dict(position)]), resolved_at=NOW,
+    )
+    assert load_management_batch(session_factory, parent.id).status == "recovery_required"
+
+
+def test_cancel_race_successor_creation_is_idempotent_on_repeat_tick(tmp_path):
+    session_factory = create_session_factory(tmp_path / "race-repeat.db")
+    strategy = "deepcoin:100:10:BTC:short"
+    binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="mia", chat_id=100, message_id=10, symbol="BTC", side="short",
+            strategy_instance_id=strategy, status="active",
+        ),
+    )
+    entry_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id, strategy_instance_id=strategy, leg_index=0,
+            order_id="trigger-1", pos_id="pos-race", order_kind="trigger_limit",
+            attribution_status="verified", attribution_evidence={"policy_version": 2},
+            status="active",
+        ),
+    )
+    parent = create_management_batch(
+        session_factory, idempotency_fingerprint="repeat-race", raw_message_id=10,
+        recognition_decision_id=1, recognition_generation="g1", target_lifecycle_id=1,
+        strategy_instance_id=strategy, execution_binding_id=binding_id, intent="full_exit",
+        effective_action="full_exit", execution_mode="live", requested_fraction=None,
+        effective_fraction=1.0, partial_round_before=0, target_fingerprint="parent-target",
+        target_snapshot={
+            "identity": {"deferred_entry_leg_ids": [entry_id]},
+            "contract_spec": {"quantity_step": 1, "min_quantity": 1},
+        }, legs=[], planned_at=NOW,
+    )
+    transition_batch(
+        session_factory, parent.id, expected_statuses={"ready"},
+        new_status="recovery_required", reason_code="deferred_entry_cancel_race_detected",
+        transitioned_at=NOW,
+    )
+    snapshot = SimpleNamespace(positions=[{
+        "instId": "BTC-USDT-SWAP", "posId": "pos-race", "posSide": "short",
+        "pos": "7", "avgPx": "66400", "mgnMode": "cross", "mrgPosition": "split",
+    }])
+
+    assert _resolve_deferred_entry_cancel_race_successor(
+        session_factory, batch_id=parent.id, snapshot=snapshot, resolved_at=NOW
+    )
+    assert not _resolve_deferred_entry_cancel_race_successor(
+        session_factory, batch_id=parent.id, snapshot=snapshot, resolved_at=NOW
+    )
+    with session_factory() as session:
+        assert session.query(StrategyManagementBatch).count() == 2
 
 
 def test_disabled_or_shadow_mode_never_claims_or_executes_ready_batches():

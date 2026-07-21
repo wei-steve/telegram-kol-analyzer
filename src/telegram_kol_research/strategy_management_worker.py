@@ -10,11 +10,14 @@ from typing import Any, Callable
 
 from telegram_kol_research.execution_bindings import (
     load_deepcoin_execution_reconciliation_snapshot,
+    reconcile_deepcoin_execution_bindings,
 )
 from telegram_kol_research.strategy_management_batches import (
+    ManagementLegCreate,
     ManagementBatchRecord,
     TEMPORARY_VISIBILITY_REASONS,
     claim_worker_batch,
+    create_race_resolved_successor_batch,
     list_worker_batches,
     load_management_batch,
     transition_batch,
@@ -28,7 +31,21 @@ from telegram_kol_research.strategy_management_reconciliation import (
     reconcile_strategy_management_batches,
 )
 from telegram_kol_research.strategy_management_planner import plan_strategy_management_batch
-from telegram_kol_research.models import StrategyManagementBatch
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    StrategyManagementBatch,
+)
+from telegram_kol_research.position_attribution import (
+    PositionAttributionError,
+    canonical_live_position_economics,
+    require_equivalent_live_position_economics,
+    require_verified_position_ownership,
+)
+from telegram_kol_research.strategy_management_sizing import (
+    ManagementSizingError,
+    allocate_close_sizes,
+)
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -77,6 +94,8 @@ def run_strategy_management_worker_tick(
     snapshot_loader: Callable[..., Any] = load_deepcoin_execution_reconciliation_snapshot,
     reconciler: Callable[..., Any] = reconcile_strategy_management_batches,
     executor: Callable[..., Any] = execute_management_batch,
+    binding_reconciler: Callable[..., Any] = reconcile_deepcoin_execution_bindings,
+    race_successor_resolver: Callable[..., bool] | None = None,
     restart_validator: Callable[..., None] = validate_management_restart_snapshot,
     cursor: StrategyManagementWorkerCursor | None = None,
     contract_spec_provider=None,
@@ -122,6 +141,23 @@ def run_strategy_management_worker_tick(
             snapshot = snapshot_loader(session_factory, client=get_client())
         return snapshot
 
+    def resolve_race_successor(*, batch_id: int, current_snapshot: Any) -> bool:
+        if race_successor_resolver is None:
+            return _resolve_deferred_entry_cancel_race_successor(
+                session_factory,
+                batch_id=batch_id,
+                snapshot=current_snapshot,
+                resolved_at=now,
+            )
+        return bool(
+            race_successor_resolver(
+                session_factory,
+                batch_id=batch_id,
+                snapshot=current_snapshot,
+                resolved_at=now,
+            )
+        )
+
     for batch in batches:
         try:
             if batch.status == "blocked" and batch.reason_code in TEMPORARY_VISIBILITY_REASONS:
@@ -138,6 +174,20 @@ def run_strategy_management_worker_tick(
                 )
                 if result.status == "blocked" and result.reason_code in TEMPORARY_VISIBILITY_REASONS:
                     _advance_temporary_visibility_retry(session_factory, batch_id=batch.id, now=now)
+                counts["recovered"] += 1
+                continue
+            if (
+                batch.status == "recovery_required"
+                and batch.reason_code == "deferred_entry_cancel_race_detected"
+            ):
+                current_snapshot = get_snapshot()
+                binding_reconciler(
+                    session_factory,
+                    client=get_client(),
+                    recovered_at=now,
+                    snapshot=current_snapshot,
+                )
+                resolve_race_successor(batch_id=batch.id, current_snapshot=current_snapshot)
                 counts["recovered"] += 1
                 continue
             if batch.status in _PAUSED_STATUSES:
@@ -420,3 +470,136 @@ def _freeze_restart_snapshot_failure(
         reason_code="management_restart_snapshot_validation_failed",
     ):
         raise RuntimeError("management_restart_snapshot_freeze_conflict")
+
+
+def _resolve_deferred_entry_cancel_race_successor(
+    session_factory, *, batch_id: int, snapshot: Any, resolved_at: datetime
+) -> bool:
+    """Atomically replace a proven cancellation race with an exact close batch."""
+
+    try:
+        parent = load_management_batch(session_factory, int(batch_id))
+        if (
+            parent.status != "recovery_required"
+            or parent.reason_code != "deferred_entry_cancel_race_detected"
+            or not isinstance(parent.target_snapshot, dict)
+        ):
+            return False
+        identity = parent.target_snapshot.get("identity")
+        contract_spec = parent.target_snapshot.get("contract_spec")
+        if not isinstance(identity, dict) or not isinstance(contract_spec, dict):
+            return False
+        deferred_ids = {
+            int(value)
+            for value in identity.get("deferred_entry_leg_ids", [])
+            if isinstance(value, int) or (isinstance(value, str) and value.isdigit())
+        }
+        expected_leg_ids = deferred_ids | {
+            int(leg.execution_order_leg_id) for leg in parent.legs
+        }
+        if not deferred_ids or not expected_leg_ids:
+            return False
+        quantity_step = str(contract_spec["quantity_step"])
+        min_quantity = str(contract_spec["min_quantity"])
+        with session_factory() as session:
+            binding = session.get(ExecutionBinding, parent.execution_binding_id)
+            if (
+                binding is None
+                or binding.strategy_instance_id != parent.strategy_instance_id
+                or str(binding.venue or "").lower() != "deepcoin"
+            ):
+                return False
+            entries = (
+                session.query(ExecutionOrderLeg)
+                .filter(ExecutionOrderLeg.execution_binding_id == binding.id)
+                .filter(ExecutionOrderLeg.purpose == "entry")
+                .all()
+            )
+            if {int(entry.id) for entry in entries} != expected_leg_ids:
+                return False
+            entries_by_id = {int(entry.id): entry for entry in entries}
+            ordered_entries = [entries_by_id[leg_id] for leg_id in sorted(expected_leg_ids)]
+            for entry in ordered_entries:
+                if (
+                    entry.strategy_instance_id != parent.strategy_instance_id
+                    or str(entry.status or "").lower() != "active"
+                    or entry.terminal_reason is not None
+                    or not str(entry.pos_id or "")
+                ):
+                    return False
+                owner = require_verified_position_ownership(
+                    session, venue="deepcoin", pos_id=str(entry.pos_id)
+                )
+                if int(owner.id) != int(entry.id):
+                    return False
+                require_equivalent_live_position_economics(
+                    owner, live_positions=snapshot.positions, session=session
+                )
+            economics = canonical_live_position_economics(
+                snapshot.positions,
+                target_pos_ids=[str(entry.pos_id) for entry in ordered_entries],
+                instrument_id=f"{str(binding.symbol).upper()}-USDT-SWAP",
+                side=str(binding.side),
+            )
+        close_sizes = allocate_close_sizes(
+            (position["size"] for position in economics),
+            fraction=1.0,
+            quantity_step=quantity_step,
+            min_quantity=min_quantity,
+        )
+    except (KeyError, TypeError, ValueError, PositionAttributionError, ManagementSizingError):
+        return False
+    except Exception:
+        logger.exception("deferred entry cancel race resolution failed for batch %s", batch_id)
+        return False
+
+    positions_by_id = {position["pos_id"]: position for position in economics}
+    close_sizes_by_pos_id = {
+        position["pos_id"]: close_size
+        for position, close_size in zip(economics, close_sizes)
+    }
+    successor_snapshot = {
+        "execution_mode": parent.execution_mode,
+        "identity": {
+            "target_lifecycle_id": parent.target_lifecycle_id,
+            "execution_binding_id": parent.execution_binding_id,
+            "strategy_instance_id": parent.strategy_instance_id,
+            "manageable_entry_leg_ids": [int(entry.id) for entry in ordered_entries],
+            "deferred_entry_leg_ids": [],
+        },
+        "positions": [
+            {**positions_by_id[str(entry.pos_id)], "execution_order_leg_id": int(entry.id)}
+            for entry in ordered_entries
+        ],
+        "deferred_entry_legs": [],
+        "contract_spec": contract_spec,
+        "protection": {},
+    }
+    legs = [
+        ManagementLegCreate(
+            execution_order_leg_id=int(entry.id),
+            pos_id=str(entry.pos_id),
+            leg_index=index,
+            preflight_size=positions_by_id[str(entry.pos_id)]["size"],
+            planned_close_size=close_sizes_by_pos_id[str(entry.pos_id)],
+            avg_entry_price=positions_by_id[str(entry.pos_id)]["avg_entry_price"],
+            quantity_step=quantity_step,
+            last_exchange_snapshot=positions_by_id[str(entry.pos_id)],
+        )
+        for index, entry in enumerate(ordered_entries)
+    ]
+    try:
+        create_race_resolved_successor_batch(
+            session_factory,
+            parent_batch_id=parent.id,
+            resolved_position_ids=[str(entry.pos_id) for entry in ordered_entries],
+            target_snapshot=successor_snapshot,
+            legs=legs,
+            planned_at=resolved_at,
+        )
+    except Exception:
+        try:
+            return load_management_batch(session_factory, parent.id).status == "resolved"
+        except LookupError:
+            return False
+    return True
