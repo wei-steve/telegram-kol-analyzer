@@ -2886,6 +2886,132 @@ body {
   font-size: 0.88rem;
 }
 
+.message-decision-card {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-left: 4px solid #64748b;
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(15, 23, 42, 0.58);
+  color: #e5e7eb;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.message-decision-card.is-auto-executable {
+  border-left-color: #22c55e;
+  background: rgba(20, 83, 45, 0.16);
+}
+
+.message-decision-card.is-manual-review {
+  border-left-color: #f59e0b;
+  background: rgba(120, 53, 15, 0.13);
+}
+
+.message-decision-card.is-blocked {
+  border-left-color: #ef4444;
+  background: rgba(127, 29, 29, 0.18);
+}
+
+.message-decision-card-final,
+.message-decision-card-summary,
+.message-decision-card-facts,
+.message-model-analysis {
+  display: grid;
+  gap: 6px;
+}
+
+.message-decision-card-state {
+  color: #f8fafc;
+  font-size: 1rem;
+  font-weight: 800;
+}
+
+.message-decision-card.is-manual-review .message-decision-card-state { color: #fbbf24; }
+.message-decision-card.is-blocked .message-decision-card-state { color: #fca5a5; }
+.message-decision-card.is-auto-executable .message-decision-card-state { color: #86efac; }
+
+.message-decision-card-summary {
+  color: #cbd5e1;
+}
+
+.message-decision-card-summary strong { color: #f8fafc; }
+.message-decision-card.is-manual-review .message-decision-card-summary strong { color: #fde68a; }
+.message-decision-card.is-blocked .message-decision-card-summary strong { color: #fecaca; }
+
+.message-decision-card-facts {
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+  padding-top: 8px;
+  color: #cbd5e1;
+  font-size: 0.80rem;
+}
+
+.message-decision-card-facts > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: baseline;
+}
+
+.message-decision-card-facts strong { color: #94a3b8; }
+.message-decision-card-inherited { color: #94a3b8; }
+.message-decision-card-facts small { color: #94a3b8; }
+
+.message-model-analysis {
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+  padding-top: 8px;
+  color: #cbd5e1;
+  font-size: 0.78rem;
+}
+
+.message-model-analysis summary {
+  cursor: pointer;
+  color: #94a3b8;
+  font-weight: 700;
+}
+
+.message-model-analysis summary:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+.message-model-analysis-row {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  padding-top: 6px;
+}
+
+.message-model-analysis-row strong { color: #e2e8f0; }
+.message-model-analysis-row span { color: #bae6fd; font-weight: 700; }
+.message-model-analysis-row small { color: #94a3b8; }
+
+.message-model-analysis-agreement {
+  padding-top: 6px;
+  color: #94a3b8;
+  font-weight: 700;
+}
+
+.message-model-analysis-agreement.is-agreed { color: #86efac; }
+.message-model-analysis-agreement.is-critical { color: #fca5a5; }
+.message-model-analysis-agreement.is-normal,
+.message-model-analysis-agreement.is-context { color: #fde68a; }
+
+@media (max-width: 760px) {
+  .message-decision-card {
+    padding: 10px;
+  }
+
+  .message-model-analysis-row {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+}
+
 .message-ai-insights {
   margin-top: 8px;
   border-left: 3px solid rgba(148, 163, 184, 0.38);
