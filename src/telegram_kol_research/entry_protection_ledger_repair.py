@@ -629,6 +629,16 @@ def plan_trigger_protection_intent_adoption(
     instrument_id = _request_instrument_id(request)
     side = _request_side(request)
     expected_parent = str(intent.parent_trigger_order_id or "").strip()
+    if {str(row.get("purpose") or "") for row in expected_rows} != {
+        "take_profit",
+        "stop_loss",
+    }:
+        return _intent_refusal(
+            parent_event,
+            binding_id,
+            pos_id,
+            "trigger_protection_candidate_protection_conflict",
+        )
     if (
         not binding_id
         or int(intent.execution_binding_id or 0) != binding_id

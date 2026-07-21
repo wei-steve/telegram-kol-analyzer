@@ -24,6 +24,7 @@ from telegram_kol_research.execution_bindings import upsert_execution_binding
 from telegram_kol_research.execution_bindings import upsert_execution_order_leg
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
+from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TriggerProtectionIntent
@@ -687,6 +688,31 @@ def _submit_trigger_with_protection_intent(
                 session,
                 intent,
                 parent_trigger_order_id=parent_order_id,
+            )
+            entry_leg = session.get(ExecutionOrderLeg, execution_order_leg_id)
+            if entry_leg is None:  # pragma: no cover - durable leg was just used for the intent
+                raise RecoveryLiveSubmitError("trigger_protection_entry_leg_missing")
+            record_execution_event(
+                session_factory,
+                ExecutionEventRecord(
+                    action="create_trigger_entry",
+                    reason="live_signal_auto_trade",
+                    after=_extract_tpsl_snapshot(_persisted_order_request(order_payload, leg)),
+                    request=_persisted_order_request(order_payload, leg),
+                    response=response,
+                    execution_binding_id=entry_leg.execution_binding_id,
+                    trade_signal_id=trade_signal.id,
+                    strategy_instance_id=entry_leg.strategy_instance_id,
+                    kol_id=str(binding_context["kol_id"]),
+                    chat_id=int(binding_context["source"].get("chat_id") or trade_signal.chat_id),
+                    message_id=int(binding_context["source"].get("message_id") or trade_signal.message_id),
+                    source_message_id=trade_signal.message_id,
+                    symbol=str(binding_context["symbol"]),
+                    side=str(binding_context["side"]),
+                    order_id=parent_order_id,
+                    client_order_id=str(leg.get("client_order_id") or order_payload.get("clOrdId") or "") or None,
+                ),
+                session=session,
             )
             session.commit()
         return response
@@ -1493,6 +1519,12 @@ def _record_submitted_order_events(
         else:
             request = order.get("request") if isinstance(order.get("request"), dict) else {}
             action = "create_limit_entry" if execution_type == "limit" else "create_trigger_entry"
+            if action == "create_trigger_entry" and _trigger_parent_event_exists(
+                session_factory,
+                execution_binding_id=binding_id,
+                order_id=base["order_id"],
+            ):
+                continue
             record_execution_event(
                 session_factory,
                 ExecutionEventRecord(
@@ -1504,6 +1536,25 @@ def _record_submitted_order_events(
                     **base,
                 ),
             )
+
+
+def _trigger_parent_event_exists(
+    session_factory: sessionmaker,
+    *,
+    execution_binding_id: int,
+    order_id: str | None,
+) -> bool:
+    if not order_id:
+        return False
+    with session_factory() as session:
+        return (
+            session.query(ExecutionEvent.id)
+            .filter(ExecutionEvent.execution_binding_id == execution_binding_id)
+            .filter(ExecutionEvent.action == "create_trigger_entry")
+            .filter(ExecutionEvent.order_id == order_id)
+            .first()
+            is not None
+        )
 
 
 def _extract_tpsl_snapshot(payload: dict[str, Any]) -> dict[str, Any]:

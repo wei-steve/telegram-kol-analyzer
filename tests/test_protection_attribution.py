@@ -109,7 +109,6 @@ def test_protection_snapshot_preserves_every_ordered_row_and_execution_semantics
             slOrdPx="-1",
         ),
     ]
-
     assert snapshot_protection_rows(rows) == [
         {
             "order_id": "tp-1",
@@ -140,6 +139,26 @@ def test_protection_snapshot_preserves_every_ordered_row_and_execution_semantics
         },
     ]
 
+
+def test_protection_snapshot_does_not_classify_zero_stop_side_as_combined():
+    assert snapshot_protection_rows([
+        _tpsl(
+            ordId="tp-only",
+            size="1",
+            tpTriggerPx="1900",
+            slTriggerPx="0",
+            tpTriggerPxType="mark",
+            tpOrdPx="-1",
+        )
+    ]) == [{
+        "order_id": "tp-only",
+        "purpose": "take_profit",
+        "trigger_price": "1900",
+        "size": "1",
+        "full_position": False,
+        "trigger_type": "mark",
+        "order_price": "-1",
+    }]
 
 def test_nearby_positions_keep_each_target_with_its_nearest_stop_group():
     result = match_position_protection(

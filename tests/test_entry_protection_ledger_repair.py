@@ -672,6 +672,18 @@ def test_intent_adoption_planner_cannot_access_session_for_client_or_writes(tmp_
     assert result.action is not None
 
 
+def test_intent_adoption_refuses_one_sided_attached_protection(tmp_path):
+    result = _plan_intent_adoption(
+        tmp_path,
+        request_update={"slTriggerPx": "0"},
+        pending_update={"slTriggerPx": "0"},
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_protection_conflict"
+
+
 def _plan_intent_adoption(
     tmp_path, *, baseline="[]", pending_rows=None, history_rows=None, pending_update=None,
     existing_ledger_rows=None, history_time_range_start=None, history_time_range_end=None,

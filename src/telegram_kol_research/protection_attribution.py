@@ -55,7 +55,7 @@ def snapshot_protection_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
         sl_price = _first_text(
             row, "slTriggerPx", "slTriggerPrice", "stopLossPrice"
         )
-        if tp_price is not None and sl_price is not None:
+        if _nonzero_text(tp_price) is not None and _nonzero_text(sl_price) is not None:
             snapshots.append(
                 {
                     "order_id": order_id,
@@ -75,12 +75,12 @@ def snapshot_protection_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
                 }
             )
             continue
-        if tp_price is not None:
+        if _nonzero_text(tp_price) is not None:
             purpose = "take_profit"
             trigger_price = tp_price
             trigger_type = _first_text(row, "tpTriggerPxType") or "last"
             order_price = _first_text(row, "tpOrdPx") or "-1"
-        elif sl_price is not None:
+        elif _nonzero_text(sl_price) is not None:
             purpose = "stop_loss"
             trigger_price = sl_price
             trigger_type = _first_text(row, "slTriggerPxType") or "last"
@@ -99,6 +99,12 @@ def snapshot_protection_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
             }
         )
     return snapshots
+
+
+def _nonzero_text(value: str | None) -> str | None:
+    if value in (None, "", "0", 0):
+        return None
+    return value
 
 
 @dataclass(frozen=True, slots=True)

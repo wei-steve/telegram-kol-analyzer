@@ -8,6 +8,7 @@ from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, RawMessage, SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle, TradeSignal
+from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
@@ -1139,6 +1140,47 @@ def test_limit_submit_uses_trigger_order_with_embedded_protection(tmp_path):
     assert binding.order_id == "trigger-1,trigger-2"
     assert binding.last_exchange_status == "submitted"
     assert lifecycle.execution_binding_id == binding.id
+
+
+def test_trigger_parent_event_is_durable_before_later_submission_bookkeeping_crashes(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.recovery_live_submit as submitter
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    _persist_lifecycle(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    fake_client = _OrderProtectionFailingDeepcoinClient()
+    monkeypatch.setattr(
+        submitter,
+        "_record_submitted_order_events",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("crash after parent submit")),
+    )
+
+    with pytest.raises(RuntimeError, match="crash after parent submit"):
+        submit_recovery_order_live(
+            session_factory,
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="long",
+            deepcoin_client=fake_client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=datetime(2026, 6, 12, 21, 0, tzinfo=UTC),
+        )
+
+    with session_factory() as session:
+        intents = session.query(TriggerProtectionIntent).all()
+        parent_events = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "create_trigger_entry")
+            .order_by(ExecutionEvent.order_id.asc())
+            .all()
+        )
+    assert [intent.parent_trigger_order_id for intent in intents] == ["trigger-1", "trigger-2"]
+    assert [event.order_id for event in parent_events] == ["trigger-1", "trigger-2"]
+    assert all(event.request_json for event in parent_events)
 
 
 def test_market_submit_uses_filled_position_id_even_when_different_from_order_id(tmp_path):
