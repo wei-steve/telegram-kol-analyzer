@@ -733,6 +733,35 @@ class PositionProtectionLedger(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class PositionProtectionRevision(Base):
+    """Append-only effective-protection history for one exact exchange position."""
+
+    __tablename__ = "position_protection_revisions"
+    __table_args__ = (
+        Index("ix_protection_revision_position", "venue", "pos_id", "created_at"),
+        Index(
+            "uq_protection_revision_active_position",
+            "venue",
+            "pos_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    execution_binding_id: Mapped[int] = mapped_column(ForeignKey("execution_bindings.id"), nullable=False)
+    execution_order_leg_id: Mapped[int] = mapped_column(ForeignKey("execution_order_legs.id"), nullable=False)
+    strategy_instance_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    previous_revision_id: Mapped[Optional[int]] = mapped_column(ForeignKey("position_protection_revisions.id"), nullable=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="planned")
+    protection_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class TriggerProtectionIntent(Base):
     """Durable recovery record for a trigger-protection submission."""
 
