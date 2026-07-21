@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.models import PositionProtectionRevision, utc_now
 
@@ -132,3 +133,28 @@ def confirm_visible_protection_revision(
         replacement.updated_at = now
         return True
     return False
+
+
+def expire_unconfirmed_protection_revisions(
+    session, *, now: datetime | None = None
+) -> list[int]:
+    """Terminalize replacements not confirmed within the five-minute window."""
+
+    reference = now or utc_now()
+    if reference.tzinfo is not None:
+        reference = reference.astimezone(UTC).replace(tzinfo=None)
+    expired_ids: list[int] = []
+    for revision in (
+        session.query(PositionProtectionRevision)
+        .filter(PositionProtectionRevision.status == "replacing")
+        .all()
+    ):
+        created = revision.created_at
+        if created.tzinfo is not None:
+            created = created.astimezone(UTC).replace(tzinfo=None)
+        if reference < created + timedelta(minutes=5):
+            continue
+        revision.status = "visibility_expired"
+        revision.updated_at = reference
+        expired_ids.append(int(revision.id))
+    return expired_ids

@@ -28,7 +28,10 @@ from telegram_kol_research.protection_snapshot import (
     observe_pending_tpsl,
     record_pending_tpsl_observation,
 )
-from telegram_kol_research.protection_revisions import confirm_visible_protection_revision
+from telegram_kol_research.protection_revisions import (
+    confirm_visible_protection_revision,
+    expire_unconfirmed_protection_revisions,
+)
 from telegram_kol_research.position_attribution import (
     ATTRIBUTION_POLICY_VERSION,
     FillEvidence,
@@ -563,6 +566,7 @@ def _apply_reconcile_snapshot(
             .all()
         )
         bindings_by_id = {int(binding.id): binding for binding in bindings}
+        expire_unconfirmed_protection_revisions(session, now=recovered_at)
         _confirm_visible_management_protection_revisions(
             session, snapshot=snapshot, bindings=bindings
         )
