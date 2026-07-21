@@ -98,6 +98,7 @@ DEFAULT_LIFECYCLE_EVENT_PROMPT = """
   "stop_loss": null,
   "take_profit": null,
   "management_action": null,
+  "targets": [],
   "confidence": 0.0,
   "reason": "一句话说明判断依据"
 }
@@ -112,7 +113,7 @@ DEFAULT_LIFECYCLE_EVENT_PROMPT = """
 - 临时入场、临时离场、部分止盈、调整止盈价、调整止损价都属于生命周期事件，不要当成新的 strategy。
 - none：普通聊天、行情观点、广告、复盘、联系方式、无法确定目标策略、或只是识别新策略但不改变已有策略。
 - 必须优先依据当前消息，不要把上下文里的旧消息当成当前动作。
-- 如果能明确对应活跃策略，请输出 target_lifecycle_id。
+- 如果只对应一个活跃策略，请输出 target_lifecycle_id。若当前消息明确列出多个独立标的且每个都能唯一对应活跃策略，请在 targets 中逐项输出 target_lifecycle_id、symbol、side；不要猜测或重复目标。
 - 如果不能唯一对应，event_type 必须为 none 或 confidence 低于 0.7。
 - confidence 低于 0.7 时，系统不会执行状态变更。
 """.strip()

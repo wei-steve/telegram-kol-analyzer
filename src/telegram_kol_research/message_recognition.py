@@ -1003,6 +1003,22 @@ def _apply_lifecycle_event_decision(
     authoritative_generation: str | None = None,
     applied_candidate_ids: set[int] | None = None,
 ) -> bool:
+    target_decisions = _expand_lifecycle_event_targets(decision)
+    if target_decisions is None:
+        return False
+    if len(target_decisions) != 1 or target_decisions[0] is not decision:
+        applied = False
+        for target_decision in target_decisions:
+            applied = _apply_lifecycle_event_decision(
+                session,
+                raw_message,
+                target_decision,
+                parse_source=parse_source,
+                authoritative_generation=authoritative_generation,
+                applied_candidate_ids=applied_candidate_ids,
+            ) or applied
+        return applied
+
     event_type = str(decision.get("event_type") or "none").strip()
     try:
         confidence = float(decision.get("confidence") or 0.0)
@@ -1042,7 +1058,11 @@ def _apply_lifecycle_event_decision(
     if target is None:
         return False
     explicit_symbol = _extract_exit_symbol(raw_message.text or "")
-    if explicit_symbol is not None and target.symbol != explicit_symbol:
+    if (
+        not decision.get("_explicit_multi_target")
+        and explicit_symbol is not None
+        and target.symbol != explicit_symbol
+    ):
         return False
 
     event_at = raw_message.posted_at or utc_now()
@@ -1533,6 +1553,41 @@ def _resolve_lifecycle_event_target(
     if len(matches) == 1:
         return matches[0]
     return None
+
+
+def _expand_lifecycle_event_targets(
+    decision: dict[str, Any],
+) -> list[dict[str, Any]] | None:
+    """Normalize an optional explicit multi-target lifecycle decision.
+
+    Multiple targets are safe only when every target supplies its own immutable
+    lifecycle identity.  A legacy single-target decision remains unchanged.
+    """
+
+    raw_targets = decision.get("targets")
+    if raw_targets is None:
+        return [decision]
+    if not isinstance(raw_targets, list) or not raw_targets:
+        return None
+
+    targets: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    base = {
+        key: value for key, value in decision.items() if key != "targets"
+    }
+    base["_explicit_multi_target"] = True
+    for raw_target in raw_targets:
+        if not isinstance(raw_target, dict):
+            return None
+        target_id = _int_or_none(raw_target.get("target_lifecycle_id"))
+        if target_id is None or target_id in seen_ids:
+            return None
+        seen_ids.add(target_id)
+        target = dict(base)
+        target.update(raw_target)
+        target["target_lifecycle_id"] = target_id
+        targets.append(target)
+    return targets
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -3033,6 +3088,7 @@ def _upsert_close_signal_candidate(
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == raw_message.id)
         .filter(SignalCandidate.event_type.in_(["close_signal", "position_update"]))
+        .filter(SignalCandidate.target_lifecycle_id == lifecycle.id)
         .order_by(SignalCandidate.id.asc())
         .all()
     )
@@ -3142,6 +3198,7 @@ def _upsert_management_signal_candidate(
         session.query(SignalCandidate)
         .filter(SignalCandidate.raw_message_id == raw_message.id)
         .filter(SignalCandidate.event_type.in_(["close_signal", "position_update"]))
+        .filter(SignalCandidate.target_lifecycle_id == lifecycle.id)
         .order_by(SignalCandidate.id.asc())
         .all()
     )

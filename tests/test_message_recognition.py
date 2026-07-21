@@ -310,6 +310,86 @@ def test_authoritative_position_update_persists_target_lifecycle_and_generation(
         assert item.sequence == 0
 
 
+def test_authoritative_multi_target_partial_take_profit_persists_one_candidate_per_strategy(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        btc = StrategyLifecycle(
+            chat_id=88,
+            message_id=3365,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 21, 12, 30, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 21, 12, 32, tzinfo=UTC),
+        )
+        eth = StrategyLifecycle(
+            chat_id=88,
+            message_id=3359,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 20, 19, 19, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 20, 19, 20, tzinfo=UTC),
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=3366,
+            posted_at=datetime(2026, 7, 21, 18, 5, tzinfo=UTC),
+            text="BTC和ETH的单子可以先止盈一半",
+        )
+        session.add_all([btc, eth, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        btc_id = btc.id
+        eth_id = eth.id
+
+    apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "management_action": "partial_take_profit",
+                "management_fraction": 0.5,
+                "confidence": 0.95,
+                "reason": "BTC 和 ETH 均止盈一半",
+                "targets": [
+                    {"target_lifecycle_id": btc_id, "symbol": "BTC", "side": "short"},
+                    {"target_lifecycle_id": eth_id, "symbol": "ETH", "side": "short"},
+                ],
+            },
+        },
+        model="mimo-v2.5",
+        authoritative_generation="multi-target-3366",
+    )
+
+    with session_factory() as session:
+        candidates = (
+            session.query(SignalCandidate)
+            .filter_by(raw_message_id=raw_message_id)
+            .order_by(SignalCandidate.target_lifecycle_id)
+            .all()
+        )
+        items = (
+            session.query(MessageInstructionItem)
+            .filter_by(raw_message_id=raw_message_id)
+            .order_by(MessageInstructionItem.sequence)
+            .all()
+        )
+
+    assert {
+        (candidate.target_lifecycle_id, candidate.symbol, candidate.side, candidate.management_fraction)
+        for candidate in candidates
+    } == {
+        (btc_id, "BTC", "short", 0.5),
+        (eth_id, "ETH", "short", 0.5),
+    }
+    assert [item.instruction_kind for item in items] == ["management", "management"]
+
+
 def test_dual_candidate_recognition_preserves_entry_and_management_items(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
