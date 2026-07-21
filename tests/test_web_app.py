@@ -4268,10 +4268,7 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
         "limit",
     ]
     assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
-    assert [payload["tpTriggerPx"] for payload in fake_client.trigger_payloads] == [
-        69000.0,
-        69000.0,
-    ]
+    assert all(not any(key.startswith("tp") for key in payload) for payload in fake_client.trigger_payloads)
     assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
 
 

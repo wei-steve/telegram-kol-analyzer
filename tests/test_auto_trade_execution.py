@@ -1189,10 +1189,7 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     assert len(fake_client.trigger_orders) == 2
     assert fake_client.trigger_orders[0]["orderType"] == "limit"
     assert fake_client.trigger_orders[0]["triggerPrice"] == "68200.0"
-    assert [order["tpTriggerPx"] for order in fake_client.trigger_orders] == [
-        69000.0,
-        69000.0,
-    ]
+    assert all(not any(key.startswith("tp") for key in order) for order in fake_client.trigger_orders)
     assert fake_client.trigger_orders[0]["slTriggerPx"] == 67500.0
     assert fake_client.protections == []
     with session_factory() as session:
@@ -1992,10 +1989,7 @@ def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_
     ]
     assert fake_client.protections == []
     assert fake_client.trigger_orders[0]["slTriggerPx"] == 57800.0
-    assert [order["tpTriggerPx"] for order in fake_client.trigger_orders] == [
-        60000.0,
-        60000.0,
-    ]
+    assert all(not any(key.startswith("tp") for key in order) for order in fake_client.trigger_orders)
 
 
 def test_auto_process_message_trade_signal_skips_lifecycle_entry_confirmation(tmp_path):
