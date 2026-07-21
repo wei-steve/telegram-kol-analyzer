@@ -81,6 +81,7 @@ RETRYABLE_PREFLIGHT_BLOCK_REASONS = frozenset(
         "target_live_position_mode_unavailable",
         "target_position_snapshot_unavailable",
         "target_protection_evidence_unavailable",
+        "target_protection_snapshot_incomplete",
         "protection_missing_cancellable_order_id",
     }
 )
@@ -374,6 +375,18 @@ def _plan_strategy_management_batch_locked(
         intent in PROTECTION_INTENTS
         and effective_action_name not in {"full_close", "full_exit"}
     ):
+        if not _pending_tpsl_snapshot_complete(
+            reconciliation_snapshot, instrument_id=instrument_id
+        ):
+            return _persist_blocked(
+                session_factory,
+                identity=identity,
+                raw_message_id=raw_message_id,
+                intent=intent,
+                reason_code="target_protection_snapshot_incomplete",
+                planned_at=now,
+                execution_mode=execution_mode,
+            )
         try:
             tpsl_orders = list(reconciliation_snapshot.pending_trigger_orders)
         except Exception:
@@ -1166,9 +1179,9 @@ def _persist_blocked(
             target_snapshot=target_snapshot,
             planned_at=planned_at,
             legs=[],
-            visibility_first_failed_at=(planned_at if reason_code == "protection_missing_cancellable_order_id" else None),
-            visibility_retry_attempts=(1 if reason_code == "protection_missing_cancellable_order_id" else 0),
-            visibility_next_attempt_at=(planned_at + timedelta(seconds=5) if reason_code == "protection_missing_cancellable_order_id" else None),
+            visibility_first_failed_at=(planned_at if reason_code in _TEMPORARY_PROTECTION_VISIBILITY_REASONS else None),
+            visibility_retry_attempts=(1 if reason_code in _TEMPORARY_PROTECTION_VISIBILITY_REASONS else 0),
+            visibility_next_attempt_at=(planned_at + timedelta(seconds=5) if reason_code in _TEMPORARY_PROTECTION_VISIBILITY_REASONS else None),
         )
     return ManagementPlanningResult(
         status="blocked",
@@ -1187,7 +1200,7 @@ def _retryable_preflight_blocked_batch(
         return False
     if batch.reason_code not in RETRYABLE_PREFLIGHT_BLOCK_REASONS:
         return False
-    if batch.reason_code == "protection_missing_cancellable_order_id":
+    if batch.reason_code in _TEMPORARY_PROTECTION_VISIBILITY_REASONS:
         reference = now or datetime.now(UTC)
         if reference > batch.planned_at + TEMPORARY_PROTECTION_VISIBILITY_WINDOW:
             return False
@@ -1198,6 +1211,26 @@ def _retryable_preflight_blocked_batch(
         return False
     positions = snapshot.get("positions")
     return positions == [] or positions is None
+
+
+_TEMPORARY_PROTECTION_VISIBILITY_REASONS = frozenset(
+    {
+        "protection_missing_cancellable_order_id",
+        "target_protection_snapshot_incomplete",
+    }
+)
+
+
+def _pending_tpsl_snapshot_complete(snapshot, *, instrument_id: str) -> bool:
+    """Fail closed if this instrument's pending-TPSL response was incomplete."""
+
+    observations = getattr(snapshot, "pending_tpsl_observations", ())
+    normalized_instrument = str(instrument_id).upper()
+    for observation in reversed(list(observations)):
+        if str(observation.get("instrument_id") or "").upper() != normalized_instrument:
+            continue
+        return bool(observation.get("complete"))
+    return True
 
 
 def _replace_retryable_preflight_blocked_batch_in_session(

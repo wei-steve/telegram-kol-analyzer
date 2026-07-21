@@ -968,6 +968,37 @@ def test_ledger_backed_protection_requires_current_order_id(monkeypatch, tmp_pat
     assert result.reason_code == "protection_missing_cancellable_order_id"
 
 
+def test_incomplete_pending_tpsl_snapshot_blocks_without_planning_legs(monkeypatch, tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory, intent="adjust_stop_loss"
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    class PaginatedPendingClient(_ReadOnlyDeepcoin):
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {"code": "0", "data": [], "nextCursor": "unknown"}
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=PaginatedPendingClient([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "target_protection_snapshot_incomplete"
+    assert result.batch is not None
+    assert result.batch.legs == ()
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, result.batch.id)
+        assert batch.visibility_next_attempt_at == (
+            PLANNED_AT + timedelta(seconds=5)
+        ).replace(tzinfo=None)
+
+
 def test_missing_ledger_order_replans_when_it_becomes_visible_within_five_minutes(monkeypatch, tmp_path):
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "research.db")

@@ -13,6 +13,7 @@ from telegram_kol_research.execution_bindings import (
 )
 from telegram_kol_research.strategy_management_batches import (
     ManagementBatchRecord,
+    TEMPORARY_VISIBILITY_REASONS,
     claim_worker_batch,
     list_worker_batches,
     load_management_batch,
@@ -123,7 +124,7 @@ def run_strategy_management_worker_tick(
 
     for batch in batches:
         try:
-            if batch.status == "blocked" and batch.reason_code == "protection_missing_cancellable_order_id":
+            if batch.status == "blocked" and batch.reason_code in TEMPORARY_VISIBILITY_REASONS:
                 if contract_spec_provider is None:
                     counts["skipped"] += 1
                     continue
@@ -135,7 +136,7 @@ def run_strategy_management_worker_tick(
                     planned_at=now,
                     execution_mode=batch.execution_mode,
                 )
-                if result.status == "blocked" and result.reason_code == "protection_missing_cancellable_order_id":
+                if result.status == "blocked" and result.reason_code in TEMPORARY_VISIBILITY_REASONS:
                     _advance_temporary_visibility_retry(session_factory, batch_id=batch.id, now=now)
                 counts["recovered"] += 1
                 continue
@@ -276,7 +277,7 @@ def _advance_temporary_visibility_retry(session_factory, *, batch_id: int, now: 
     delays = (5, 15, 30, 60, 120)
     with session_factory() as session:
         batch = session.get(StrategyManagementBatch, int(batch_id))
-        if batch is None or batch.status != "blocked" or batch.reason_code != "protection_missing_cancellable_order_id":
+        if batch is None or batch.status != "blocked" or batch.reason_code not in TEMPORARY_VISIBILITY_REASONS:
             return
         first = batch.visibility_first_failed_at or batch.planned_at
         if now >= first + timedelta(minutes=5):

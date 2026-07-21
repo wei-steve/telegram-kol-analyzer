@@ -23,7 +23,12 @@ from telegram_kol_research.models import StrategyManagementLeg
 RECOVERABLE_BATCH_STATUSES = frozenset(
     {"executing", "reserved", "submitted", "submit_unknown", "reconciling"}
 )
-TEMPORARY_VISIBILITY_REASON = "protection_missing_cancellable_order_id"
+TEMPORARY_VISIBILITY_REASONS = frozenset(
+    {
+        "protection_missing_cancellable_order_id",
+        "target_protection_snapshot_incomplete",
+    }
+)
 UNSET = object()
 
 
@@ -484,7 +489,7 @@ def list_worker_batches(
         temporary_visibility = (
             session.query(StrategyManagementBatch)
             .filter(StrategyManagementBatch.status == "blocked")
-            .filter(StrategyManagementBatch.reason_code == TEMPORARY_VISIBILITY_REASON)
+            .filter(StrategyManagementBatch.reason_code.in_(TEMPORARY_VISIBILITY_REASONS))
             .filter(StrategyManagementBatch.visibility_next_attempt_at <= datetime.now(UTC))
             .order_by(StrategyManagementBatch.planned_at.asc(), StrategyManagementBatch.id.asc())
             .limit(limit)
