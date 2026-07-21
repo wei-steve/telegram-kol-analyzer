@@ -280,8 +280,13 @@ def _advance_temporary_visibility_retry(session_factory, *, batch_id: int, now: 
         if batch is None or batch.status != "blocked" or batch.reason_code not in TEMPORARY_VISIBILITY_REASONS:
             return
         first = batch.visibility_first_failed_at or batch.planned_at
+        if first.tzinfo is None:
+            first = first.replace(tzinfo=UTC)
         if now >= first + timedelta(minutes=5):
             batch.visibility_next_attempt_at = None
+            batch.reason_code = "protection_visibility_retry_expired"
+            batch.notification_state = "pending"
+            batch.notification_fingerprint = None
             batch.updated_at = now
             session.commit()
             return

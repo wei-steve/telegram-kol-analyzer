@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +14,7 @@ from telegram_kol_research.strategy_management_executor import (
 from telegram_kol_research.strategy_management_batches import load_management_batch
 from telegram_kol_research.strategy_management_worker import (
     StrategyManagementWorkerCursor,
+    _advance_temporary_visibility_retry,
     run_strategy_management_worker_tick,
 )
 
@@ -30,6 +31,47 @@ def _batch(*, batch_id: int, strategy: str, status: str, action="partial_close",
         reason_code=None,
         legs=tuple(legs),
     )
+
+
+def test_visibility_retry_expiry_becomes_actionable_terminal_block(tmp_path):
+    session_factory = create_session_factory(tmp_path / "visibility-expiry.db")
+    with session_factory() as session:
+        batch = StrategyManagementBatch(
+            idempotency_fingerprint="v" * 64,
+            raw_message_id=1,
+            recognition_decision_id=1,
+            recognition_generation="g1",
+            target_lifecycle_id=1,
+            strategy_instance_id="deepcoin:100:10:BTC:short",
+            execution_binding_id=1,
+            intent="adjust_stop_loss",
+            effective_action="adjust_stop_loss",
+            partial_round_before=0,
+            status="blocked",
+            reason_code="target_protection_snapshot_incomplete",
+            target_fingerprint="b" * 64,
+            target_snapshot_json="{}",
+            planned_at=NOW,
+            visibility_first_failed_at=NOW,
+            visibility_retry_attempts=5,
+            visibility_next_attempt_at=NOW + timedelta(seconds=120),
+            notification_state="sent",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(batch)
+        session.commit()
+        batch_id = batch.id
+
+    _advance_temporary_visibility_retry(
+        session_factory, batch_id=batch_id, now=NOW + timedelta(minutes=5)
+    )
+
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        assert batch.reason_code == "protection_visibility_retry_expired"
+        assert batch.visibility_next_attempt_at is None
+        assert batch.notification_state == "pending"
 
 
 def test_worker_claims_ready_batch_once_across_racing_ticks(tmp_path):
