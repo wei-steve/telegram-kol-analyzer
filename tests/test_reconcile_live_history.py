@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -8,8 +9,10 @@ from telegram_kol_research.message_instruction_items import (
 from telegram_kol_research.models import (
     MediaAsset,
     RawMessage,
+    RecognitionDecision,
     SignalCandidate,
     SyncCheckpoint,
+    utc_now,
 )
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_live_listener import run_live_listener, run_reconcile_once
@@ -108,6 +111,21 @@ def test_reconcile_processes_each_new_message_authoritatively_exactly_once(tmp_p
 
     def authoritative_processor(raw_message_id):
         processed.append(raw_message_id)
+        with session_factory() as session:
+            session.add(
+                RecognitionDecision(
+                    raw_message_id=raw_message_id,
+                    input_kind="text",
+                    authoritative_model="mimo-v2.5",
+                    authoritative_status="非策略",
+                    authoritative_payload_json="{}",
+                    agreement_status="agreed",
+                    differences_json="[]",
+                    prompt_versions_json="{}",
+                    comparison_status="completed",
+                )
+            )
+            session.commit()
         return SimpleNamespace(
             recognition=SimpleNamespace(status="非策略"),
             assessment=SimpleNamespace(
@@ -156,6 +174,283 @@ def test_reconcile_processes_each_new_message_authoritatively_exactly_once(tmp_p
             for raw_message_id in processed
         }
     assert processed_message_ids == {77, 78}
+
+
+def test_reconcile_recovers_persisted_message_without_authoritative_decision(tmp_path):
+    session_factory = create_session_factory(tmp_path / "recovery-gap.db")
+    with session_factory() as session:
+        now = utc_now()
+        raw_message = RawMessage(
+            chat_id=9001,
+            message_id=88,
+            text="BTC 空单出局",
+            posted_at=now,
+        )
+        session.add(raw_message)
+        session.add(
+            SyncCheckpoint(
+                chat_id=9001,
+                sync_kind="history",
+                last_message_id=88,
+                last_message_at=now,
+            )
+        )
+        session.commit()
+        raw_message_id = raw_message.id
+
+    processed: list[int] = []
+
+    def authoritative_processor(raw_message_id):
+        processed.append(raw_message_id)
+        with session_factory() as session:
+            session.add(
+                RecognitionDecision(
+                    raw_message_id=raw_message_id,
+                    input_kind="text",
+                    authoritative_model="mimo-v2.5",
+                    authoritative_status="非策略",
+                    authoritative_payload_json="{}",
+                    agreement_status="agreed",
+                    differences_json="[]",
+                    prompt_versions_json="{}",
+                    comparison_status="completed",
+                )
+            )
+            session.commit()
+        return SimpleNamespace(
+            recognition=SimpleNamespace(status="非策略"),
+            assessment=SimpleNamespace(
+                agreement_status="agreed",
+                differences=[],
+                mimo=SimpleNamespace(
+                    model="mimo-v2.5",
+                    status="非策略",
+                    payload={},
+                    error_message=None,
+                ),
+                deepseek_payload=None,
+            ),
+            automation={"status": "skipped", "reason": "mimo_no_action"},
+        )
+
+    async def no_messages(client, dialog, limit, media_root="data/media"):
+        return []
+
+    for _ in range(2):
+        __import__("asyncio").run(
+            run_reconcile_once(
+                client=_FakeClient(),
+                session_factory=session_factory,
+                broker=None,
+                target_titles={"VIP BTC Room"},
+                authoritative_processor=authoritative_processor,
+                discover_dialogs_fn=_fake_discover_dialogs,
+                fetch_dialog_messages_fn=no_messages,
+            )
+        )
+
+    assert processed == [raw_message_id]
+
+
+def test_reconcile_does_not_recover_old_missing_authoritative_decision(tmp_path):
+    session_factory = create_session_factory(tmp_path / "old-recovery-gap.db")
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=9001,
+                message_id=88,
+                text="stale BTC entry",
+                posted_at=datetime(2026, 4, 10, 9, 0),
+            )
+        )
+        session.commit()
+
+    processed: list[int] = []
+
+    async def no_messages(client, dialog, limit, media_root="data/media"):
+        return []
+
+    __import__("asyncio").run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            authoritative_processor=processed.append,
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=no_messages,
+        )
+    )
+
+    assert processed == []
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+    assert decision.authoritative_model == "recovery_guard"
+    assert decision.automation_reason == "authoritative_gap_recovery_expired"
+
+
+def test_reconcile_notifies_operator_for_expired_external_market_gap(tmp_path):
+    session_factory = create_session_factory(tmp_path / "expired-notification.db")
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=9001,
+                message_id=88,
+                text="NVDA 900 附近观察",
+                posted_at=datetime(2026, 4, 10, 9, 0),
+            )
+        )
+        session.commit()
+
+    sent: list[dict] = []
+
+    async def sender(**kwargs):
+        sent.append(kwargs["payload"])
+
+    async def no_messages(client, dialog, limit, media_root="data/media"):
+        return []
+
+    async def scenario():
+        await run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            authoritative_processor=lambda raw_message_id: None,
+            system_operator_bot_config=SystemOperatorBotConfig(
+                bot_token="system-token",
+                chat_id="system-chat",
+            ),
+            system_operator_conflict_sender=sender,
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=no_messages,
+        )
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert len(sent) == 1
+    assert sent[0]["automation"]["reason"] == "authoritative_gap_recovery_expired"
+
+
+def test_reconcile_continues_after_one_missing_decision_recovery_fails(tmp_path):
+    session_factory = create_session_factory(tmp_path / "recovery-failure.db")
+    with session_factory() as session:
+        now = utc_now()
+        session.add_all(
+            [
+                RawMessage(
+                    chat_id=9001,
+                    message_id=88,
+                    text="first",
+                    posted_at=now,
+                ),
+                RawMessage(
+                    chat_id=9001,
+                    message_id=89,
+                    text="second",
+                    posted_at=now,
+                ),
+            ]
+        )
+        session.commit()
+        raw_message_ids = [
+            row.id
+            for row in session.query(RawMessage).order_by(RawMessage.message_id).all()
+        ]
+
+    processed: list[int] = []
+
+    def authoritative_processor(raw_message_id):
+        processed.append(raw_message_id)
+        if raw_message_id == raw_message_ids[0]:
+            raise RuntimeError("temporary recognition failure")
+        with session_factory() as session:
+            session.add(
+                RecognitionDecision(
+                    raw_message_id=raw_message_id,
+                    input_kind="text",
+                    authoritative_model="mimo-v2.5",
+                    authoritative_status="非策略",
+                    authoritative_payload_json="{}",
+                    agreement_status="agreed",
+                    differences_json="[]",
+                    prompt_versions_json="{}",
+                    comparison_status="completed",
+                )
+            )
+            session.commit()
+        return SimpleNamespace(
+            recognition=SimpleNamespace(status="非策略"),
+            assessment=SimpleNamespace(
+                agreement_status="agreed",
+                differences=[],
+                mimo=SimpleNamespace(
+                    model="mimo-v2.5",
+                    status="非策略",
+                    payload={},
+                    error_message=None,
+                ),
+                deepseek_payload=None,
+            ),
+            automation={"status": "skipped", "reason": "mimo_no_action"},
+        )
+
+    async def no_messages(client, dialog, limit, media_root="data/media"):
+        return []
+
+    __import__("asyncio").run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            authoritative_processor=authoritative_processor,
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=no_messages,
+        )
+    )
+
+    assert processed == raw_message_ids
+
+
+def test_live_listener_waits_for_shared_telegram_operation_lock(monkeypatch):
+    client = _FakeListenerClient()
+    processed: list[object] = []
+
+    async def fake_persist_live_message_event(**kwargs):
+        processed.append(kwargs["event"])
+        return {}
+
+    class Event:
+        message = object()
+
+        async def get_chat(self):
+            return SimpleNamespace(title="VIP BTC Room")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.persist_live_message_event",
+        fake_persist_live_message_event,
+    )
+
+    async def scenario():
+        operation_lock = asyncio.Lock()
+        await run_live_listener(
+            client=client,
+            session_factory=None,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            operation_lock=operation_lock,
+        )
+        handler, _ = client.handlers[0]
+        await operation_lock.acquire()
+        task = asyncio.create_task(handler(Event()))
+        await asyncio.sleep(0)
+        assert processed == []
+        operation_lock.release()
+        await task
+
+    asyncio.run(scenario())
 
 
 def test_reconcile_delivers_completed_instruction_summaries(tmp_path, monkeypatch):

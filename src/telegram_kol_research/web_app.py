@@ -2585,6 +2585,7 @@ def create_web_app(
                     auto_trade_executor=app.state.auto_trade_executor,
                     authoritative_processor=app.state.authoritative_processor,
                     system_operator_bot_config=app.state.system_operator_bot_config,
+                    operation_lock=app.state.telegram_operation_lock,
                 )
                 app.state.reconcile_task = asyncio.create_task(
                     _run_reconcile_after_startup_delay(
@@ -2811,6 +2812,7 @@ def create_web_app(
                 auto_trade_executor=app.state.auto_trade_executor,
                 authoritative_processor=app.state.authoritative_processor,
                 system_operator_bot_config=app.state.system_operator_bot_config,
+                operation_lock=app.state.telegram_operation_lock,
             )
         reconcile_task = app.state.reconcile_task
         if reconcile_task is None or reconcile_task.done():

@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from sqlalchemy import or_
 from sqlalchemy import tuple_
 
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig, load_ai_recognition_config
@@ -17,11 +19,22 @@ from telegram_kol_research.message_recognition import (
     recognize_message_now,
     recognize_records_with_ai_config,
 )
-from telegram_kol_research.models import MediaAsset, RawMessage, SignalCandidate
+from telegram_kol_research.models import (
+    MediaAsset,
+    MessageRecognition,
+    RawMessage,
+    RecognitionDecision,
+    SignalCandidate,
+    utc_now,
+)
 from telegram_kol_research.raw_ingest import normalize_message_payload, persist_normalized_messages
 from telegram_kol_research.raw_ingest import repair_history_checkpoints
 from telegram_kol_research.recognition_experiments import run_mimo_direct_for_message
 from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
+from telegram_kol_research.recognition_decisions import (
+    RecognitionDecisionRecord,
+    save_terminal_authoritative_decision,
+)
 from telegram_kol_research.strategy_alerts import process_strategy_alert_for_record
 from telegram_kol_research.system_operator_bot import (
     deliver_message_instruction_summary_notification,
@@ -42,6 +55,7 @@ from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidate
 
 logger = logging.getLogger(__name__)
 AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS = 60.0
+AUTHORITATIVE_GAP_RECOVERY_MAX_AGE = timedelta(minutes=15)
 
 _CRYPTO_FAILURE_TERMS = (
     "BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "ADA", "SUI", "ZEC",
@@ -428,6 +442,81 @@ def _is_low_value_external_market_failure(text: str) -> bool:
     return not has_crypto_marker and not has_position_marker
 
 
+def _record_expired_authoritative_recovery_gap(
+    session_factory,
+    *,
+    raw_message: RawMessage,
+) -> None:
+    """Persist a visible, non-executing terminal result for a stale gap."""
+
+    reason = "authoritative_gap_recovery_expired"
+    summary = (
+        "消息未在 15 分钟内完成权威识别；为防止执行过期信号，未自动交易。"
+    )
+    save_terminal_authoritative_decision(
+        session_factory,
+        RecognitionDecisionRecord(
+            raw_message_id=raw_message.id,
+            input_kind="recovery_guard",
+            authoritative_model="recovery_guard",
+            authoritative_status="识别失败",
+            authoritative_payload={"reason": reason, "summary": summary},
+            auxiliary_model=None,
+            auxiliary_status=None,
+            auxiliary_payload=None,
+            agreement_status="authoritative_failed",
+            differences=[reason],
+            prompt_versions={},
+        ),
+    )
+    with session_factory() as session:
+        recognition = (
+            session.query(MessageRecognition)
+            .filter(MessageRecognition.raw_message_id == raw_message.id)
+            .one_or_none()
+        )
+        if recognition is None:
+            session.add(
+                MessageRecognition(
+                    raw_message_id=raw_message.id,
+                    status="识别失败",
+                    reason=summary,
+                    summary=summary,
+                    engine="recovery_guard",
+                )
+            )
+        else:
+            recognition.status = "识别失败"
+            recognition.reason = summary
+            recognition.summary = summary
+            recognition.engine = "recovery_guard"
+        session.commit()
+    update_recognition_execution_outcome(
+        session_factory,
+        raw_message_id=raw_message.id,
+        automation_status="skipped",
+        automation_reason=reason,
+    )
+
+
+def _build_expired_authoritative_recovery_payload(
+    *, raw_message: RawMessage, chat_title: str
+) -> dict[str, Any]:
+    reason = "authoritative_gap_recovery_expired"
+    return {
+        "chat_title": chat_title,
+        "chat_id": raw_message.chat_id,
+        "message_id": raw_message.message_id,
+        "posted_at": raw_message.posted_at,
+        "text": raw_message.text,
+        "agreement_status": "authoritative_failed",
+        "differences": [reason],
+        "deepseek": {"status": "-", "kind": "auxiliary", "reason": "-"},
+        "mimo": {"status": "识别失败", "kind": "authoritative", "reason": reason},
+        "automation": {"status": "skipped", "reason": reason},
+    }
+
+
 def _build_ai_recognition_conflict_payload(
     *,
     raw_message: RawMessage,
@@ -496,6 +585,7 @@ async def run_live_listener(
     auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
     system_operator_bot_config: Any | None = None,
+    operation_lock: Any | None = None,
 ) -> None:
     """Attach Telethon new-message handlers and keep the client alive."""
 
@@ -511,21 +601,26 @@ async def run_live_listener(
         title = getattr(chat, "title", None)
         if target_titles and title not in target_titles:
             return
-        await persist_live_message_event(
-            event=event,
-            session_factory=session_factory,
-            broker=broker,
-            media_root=media_root,
-            chat_title=title,
-            strategy_alert_config=strategy_alert_config,
-            strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
-            ai_recognition_config=ai_recognition_config,
-            ai_recognition_config_path=ai_recognition_config_path,
-            lifecycle_monitor=lifecycle_monitor,
-            auto_trade_executor=auto_trade_executor,
-            authoritative_processor=authoritative_processor,
-            system_operator_bot_config=system_operator_bot_config,
-        )
+        persist_kwargs = {
+            "event": event,
+            "session_factory": session_factory,
+            "broker": broker,
+            "media_root": media_root,
+            "chat_title": title,
+            "strategy_alert_config": strategy_alert_config,
+            "strategy_alert_enabled_for_title": strategy_alert_enabled_for_title,
+            "ai_recognition_config": ai_recognition_config,
+            "ai_recognition_config_path": ai_recognition_config_path,
+            "lifecycle_monitor": lifecycle_monitor,
+            "auto_trade_executor": auto_trade_executor,
+            "authoritative_processor": authoritative_processor,
+            "system_operator_bot_config": system_operator_bot_config,
+        }
+        if operation_lock is None:
+            await persist_live_message_event(**persist_kwargs)
+        else:
+            async with operation_lock:
+                await persist_live_message_event(**persist_kwargs)
 
     add_event_handler = getattr(client, "add_event_handler", None)
     if not callable(add_event_handler):
@@ -557,6 +652,7 @@ def launch_live_listener_task(
     auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
     system_operator_bot_config: Any | None = None,
+    operation_lock: Any | None = None,
 ) -> asyncio.Task[None]:
     """Schedule the realtime listener in the current event loop."""
 
@@ -576,6 +672,7 @@ def launch_live_listener_task(
             "auto_trade_executor": auto_trade_executor,
             "authoritative_processor": authoritative_processor,
             "system_operator_bot_config": system_operator_bot_config,
+            "operation_lock": operation_lock,
         },
     )
     return asyncio.create_task(runner(**kwargs))
@@ -626,6 +723,108 @@ async def run_reconcile_once(
         )
     dialogs = await discover_dialogs_fn(client)
     matched_dialogs = filter_target_dialogs(dialogs, target_titles)
+
+    recovered_messages = 0
+    expired_recovery_messages = 0
+    if authoritative_processor is not None:
+        chat_titles_by_id = {
+            int(dialog["id"]): str(dialog.get("title") or "")
+            for dialog in matched_dialogs
+            if dialog.get("id") is not None
+        }
+        recovery_cutoff = utc_now() - AUTHORITATIVE_GAP_RECOVERY_MAX_AGE
+        with session_factory() as session:
+            missing_decision_query = (
+                session.query(RawMessage)
+                .outerjoin(
+                    RecognitionDecision,
+                    RecognitionDecision.raw_message_id == RawMessage.id,
+                )
+                .filter(RawMessage.chat_id.in_(chat_titles_by_id))
+                .filter(RecognitionDecision.id.is_(None))
+            )
+            missing_decision_messages = (
+                missing_decision_query.filter(
+                    RawMessage.posted_at >= recovery_cutoff
+                )
+                .order_by(
+                    RawMessage.posted_at.asc(),
+                    RawMessage.message_id.asc(),
+                    RawMessage.id.asc(),
+                )
+                .limit(message_limit)
+                .all()
+            )
+            expired_messages = (
+                missing_decision_query.filter(
+                    or_(
+                        RawMessage.posted_at < recovery_cutoff,
+                        RawMessage.posted_at.is_(None),
+                    )
+                )
+                .order_by(
+                    RawMessage.posted_at.asc(),
+                    RawMessage.message_id.asc(),
+                    RawMessage.id.asc(),
+                )
+                .limit(message_limit)
+                .all()
+            )
+        for raw_message in missing_decision_messages:
+            try:
+                processing_result = await asyncio.to_thread(
+                    authoritative_processor,
+                    raw_message.id,
+                )
+            except Exception:
+                logger.exception(
+                    "authoritative recognition recovery failed: raw_message_id=%s",
+                    raw_message.id,
+                )
+                continue
+            notification_payload = _build_authoritative_notification_payload(
+                raw_message=raw_message,
+                chat_title=chat_titles_by_id.get(raw_message.chat_id, ""),
+                processing_result=processing_result,
+            )
+            if notification_payload is not None and system_operator_bot_enabled(
+                system_operator_bot_config
+            ):
+                _handle_authoritative_failure_notification(
+                    session_factory=session_factory,
+                    raw_message_id=raw_message.id,
+                    sender=system_operator_conflict_sender,
+                    config=system_operator_bot_config,
+                    payload=notification_payload,
+                    retry_processor=authoritative_processor,
+                    retry_delay_seconds=authoritative_failure_retry_delay_seconds,
+                )
+            await _deliver_authoritative_instruction_summary(
+                processing_result=processing_result,
+                session_factory=session_factory,
+                raw_message_id=raw_message.id,
+                chat_title=chat_titles_by_id.get(raw_message.chat_id, ""),
+                system_operator_bot_config=system_operator_bot_config,
+            )
+            recovered_messages += 1
+        for raw_message in expired_messages:
+            chat_title = chat_titles_by_id.get(raw_message.chat_id, "")
+            _record_expired_authoritative_recovery_gap(
+                session_factory,
+                raw_message=raw_message,
+            )
+            if system_operator_bot_enabled(system_operator_bot_config):
+                _schedule_authoritative_notification(
+                    session_factory=session_factory,
+                    raw_message_id=raw_message.id,
+                    sender=system_operator_conflict_sender,
+                    config=system_operator_bot_config,
+                    payload=_build_expired_authoritative_recovery_payload(
+                        raw_message=raw_message,
+                        chat_title=chat_title,
+                    ),
+                )
+            expired_recovery_messages += 1
 
     history_checkpoints: dict[int, int] = {}
     with session_factory() as session:
@@ -779,6 +978,8 @@ async def run_reconcile_once(
         "inserted_messages": inserted_messages,
         "inserted_candidates": inserted_candidates,
         "inserted_trade_ideas": inserted_trade_ideas,
+        "recovered_messages": recovered_messages,
+        "expired_recovery_messages": expired_recovery_messages,
     }
 
 
