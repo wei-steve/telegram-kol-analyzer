@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any
 
@@ -81,8 +81,10 @@ RETRYABLE_PREFLIGHT_BLOCK_REASONS = frozenset(
         "target_live_position_mode_unavailable",
         "target_position_snapshot_unavailable",
         "target_protection_evidence_unavailable",
+        "protection_missing_cancellable_order_id",
     }
 )
+TEMPORARY_PROTECTION_VISIBILITY_WINDOW = timedelta(minutes=5)
 
 
 class ManagementTargetChangedError(RuntimeError):
@@ -243,7 +245,7 @@ def _plan_strategy_management_batch_locked(
         session_factory, idempotency_fingerprint=idempotency_fingerprint
     )
     retry_blocked_batch_id = (
-        existing.id if _retryable_preflight_blocked_batch(existing) else None
+        existing.id if _retryable_preflight_blocked_batch(existing, now=now) else None
     )
     if existing is not None and retry_blocked_batch_id is None:
         return ManagementPlanningResult(
@@ -1173,13 +1175,19 @@ def _persist_blocked(
     )
 
 
-def _retryable_preflight_blocked_batch(batch: ManagementBatchRecord | None) -> bool:
+def _retryable_preflight_blocked_batch(
+    batch: ManagementBatchRecord | None, *, now: datetime | None = None
+) -> bool:
     if batch is None:
         return False
     if batch.status != "blocked":
         return False
     if batch.reason_code not in RETRYABLE_PREFLIGHT_BLOCK_REASONS:
         return False
+    if batch.reason_code == "protection_missing_cancellable_order_id":
+        reference = now or datetime.now(UTC)
+        if reference > batch.planned_at + TEMPORARY_PROTECTION_VISIBILITY_WINDOW:
+            return False
     if batch.legs:
         return False
     snapshot = batch.target_snapshot if isinstance(batch.target_snapshot, dict) else {}
