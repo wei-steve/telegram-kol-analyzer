@@ -1,5 +1,6 @@
 from telegram_kol_research.protection_attribution import (
     match_position_protection,
+    normalize_protection_snapshot_rows,
     snapshot_protection_rows,
 )
 
@@ -159,6 +160,62 @@ def test_protection_snapshot_does_not_classify_zero_stop_side_as_combined():
         "trigger_type": "mark",
         "order_price": "-1",
     }]
+
+
+def test_normalize_protection_snapshots_converts_legacy_zero_combined_sides():
+    assert normalize_protection_snapshot_rows([
+        {
+            "order_id": "tp-only",
+            "purpose": "combined",
+            "take_profit": {
+                "trigger_price": "1900",
+                "trigger_type": "mark",
+                "order_price": "-1",
+            },
+            "stop_loss": {
+                "trigger_price": "0.0",
+                "trigger_type": "last",
+                "order_price": "-1",
+            },
+            "size": "1",
+            "full_position": False,
+        },
+        {
+            "order_id": "sl-only",
+            "purpose": "combined",
+            "take_profit": {
+                "trigger_price": "0",
+                "trigger_type": "last",
+                "order_price": "-1",
+            },
+            "stop_loss": {
+                "trigger_price": "1820",
+                "trigger_type": "index",
+                "order_price": "-1",
+            },
+            "size": "0",
+            "full_position": True,
+        },
+    ]) == [
+        {
+            "order_id": "tp-only",
+            "purpose": "take_profit",
+            "trigger_price": "1900",
+            "size": "1",
+            "full_position": False,
+            "trigger_type": "mark",
+            "order_price": "-1",
+        },
+        {
+            "order_id": "sl-only",
+            "purpose": "stop_loss",
+            "trigger_price": "1820",
+            "size": "0",
+            "full_position": True,
+            "trigger_type": "index",
+            "order_price": "-1",
+        },
+    ]
 
 def test_nearby_positions_keep_each_target_with_its_nearest_stop_group():
     result = match_position_protection(

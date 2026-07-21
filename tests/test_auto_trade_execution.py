@@ -1465,12 +1465,12 @@ def test_auto_process_range_entry_uses_half_market_half_midpoint_limit_when_near
     assert binding.symbol == "ETH"
     assert binding.order_id == "order-1,trigger-1"
     assert [event.action for event in events] == [
+        "create_trigger_entry",
         "open_market_position",
         "set_position_tpsl",
         "set_position_tpsl",
         "set_position_tpsl",
         "set_position_tpsl",
-        "create_trigger_entry",
     ]
 
 

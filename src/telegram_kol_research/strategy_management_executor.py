@@ -39,6 +39,7 @@ from telegram_kol_research.position_authority_lock import (
 )
 from telegram_kol_research.protection_attribution import (
     match_position_protection,
+    normalize_protection_snapshot_rows,
     snapshot_protection_rows,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
@@ -1228,7 +1229,9 @@ def _preflight_exact_protection_rows(
                 pending=pending,
                 ledger_rows=ledger_rows_by_pos_id.get(str(leg.pos_id), []),
             )
-        expected_rows = expected.get("row_snapshots") or []
+        expected_rows = normalize_protection_snapshot_rows(
+            expected.get("row_snapshots") or []
+        )
         current_ids = [row.get("order_id") for row in current_rows]
         if (
             not _protection_rows_match_expected_snapshot(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from math import isclose
 from typing import Any
 
@@ -101,10 +102,75 @@ def snapshot_protection_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
     return snapshots
 
 
-def _nonzero_text(value: str | None) -> str | None:
-    if value in (None, "", "0", 0):
+def normalize_protection_snapshot_rows(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Canonicalize persisted protection snapshots from before zero-side filtering.
+
+    Older snapshots represented a TPSL row with a disabled zero-valued side as
+    ``combined``.  Current exchange snapshots omit that disabled side, so use
+    the same canonical representation when comparing durable preflight state.
+    """
+
+    normalized: list[dict[str, Any]] = []
+    for source in rows:
+        row = dict(source)
+        take_profit = row.get("take_profit")
+        stop_loss = row.get("stop_loss")
+        if (
+            row.get("purpose") != "combined"
+            or not isinstance(take_profit, dict)
+            or not isinstance(stop_loss, dict)
+        ):
+            normalized.append(row)
+            continue
+        take_profit = dict(take_profit)
+        stop_loss = dict(stop_loss)
+        active_take_profit = _nonzero_text(take_profit.get("trigger_price"))
+        active_stop_loss = _nonzero_text(stop_loss.get("trigger_price"))
+        if active_take_profit is not None and active_stop_loss is not None:
+            row["take_profit"] = take_profit
+            row["stop_loss"] = stop_loss
+            normalized.append(row)
+            continue
+        if active_take_profit is not None:
+            normalized.append(
+                _single_side_snapshot(row, purpose="take_profit", side=take_profit)
+            )
+            continue
+        if active_stop_loss is not None:
+            normalized.append(
+                _single_side_snapshot(row, purpose="stop_loss", side=stop_loss)
+            )
+            continue
+        normalized.append(row)
+    return normalized
+
+
+def _single_side_snapshot(
+    row: dict[str, Any], *, purpose: str, side: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "order_id": row.get("order_id"),
+        "purpose": purpose,
+        "trigger_price": side.get("trigger_price"),
+        "size": row.get("size"),
+        "full_position": row.get("full_position"),
+        "trigger_type": side.get("trigger_type") or "last",
+        "order_price": side.get("order_price") or "-1",
+    }
+
+
+def _nonzero_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
         return None
-    return value
+    try:
+        if Decimal(text) == 0:
+            return None
+    except InvalidOperation:
+        pass
+    return text
 
 
 @dataclass(frozen=True, slots=True)
