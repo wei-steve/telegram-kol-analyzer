@@ -787,6 +787,9 @@ def _apply_reconcile_snapshot(
             recovered_at=recovered_at,
             result=result,
         )
+        _ready_verified_trigger_take_profit_convergences(
+            session, legs=legs, recovered_at=recovered_at
+        )
 
         for binding in bindings:
             binding.strategy_instance_id = binding.strategy_instance_id or build_strategy_instance_id(
@@ -819,6 +822,33 @@ def _apply_reconcile_snapshot(
         result.updated = len(bindings)
         session.commit()
     return result
+
+
+def _ready_verified_trigger_take_profit_convergences(
+    session,
+    *,
+    legs: list[ExecutionOrderLeg],
+    recovered_at: datetime,
+) -> None:
+    """Release only exact, newly verified trigger legs to TP convergence."""
+
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+    from telegram_kol_research.trigger_take_profit_convergence import (
+        mark_trigger_take_profit_convergence_ready,
+    )
+
+    leg_ids = [int(leg.id) for leg in legs if leg.id is not None]
+    if not leg_ids:
+        return
+    rows = (
+        session.query(TriggerTakeProfitConvergence)
+        .filter(TriggerTakeProfitConvergence.execution_order_leg_id.in_(leg_ids))
+        .filter(TriggerTakeProfitConvergence.status.in_(("waiting_position", "ready")))
+        .order_by(TriggerTakeProfitConvergence.id.asc())
+        .all()
+    )
+    for row in rows:
+        mark_trigger_take_profit_convergence_ready(session, row, ready_at=recovered_at)
 
 
 def _adopt_verified_trigger_entry_protection(

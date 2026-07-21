@@ -34,6 +34,9 @@ from telegram_kol_research.trigger_protection_intents import (
     create_or_get_trigger_protection_intent,
     record_trigger_protection_parent,
 )
+from telegram_kol_research.trigger_take_profit_convergence import (
+    create_or_get_trigger_take_profit_convergence,
+)
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.trade_signals import TradeSignalRecord
 from telegram_kol_research.trade_signals import MANUAL_MANAGEMENT_SOURCE_TYPES
@@ -668,6 +671,14 @@ def _submit_trigger_with_protection_intent(
                 pre_submit_tpsl_baseline_json=baseline_json,
                 correlation_id=correlation_id,
             )
+            take_profit_legs = draft.get("take_profit_legs")
+            if isinstance(take_profit_legs, list) and len(take_profit_legs) > 1:
+                create_or_get_trigger_take_profit_convergence(
+                    session,
+                    venue="deepcoin",
+                    execution_order_leg_id=execution_order_leg_id,
+                    desired_take_profits=take_profit_legs,
+                )
             session.commit()
         try:
             response = deepcoin_client.trigger_order(order_payload)
