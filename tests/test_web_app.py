@@ -4050,6 +4050,9 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
         def list_positions(self, *, inst_id=None):
             return []
 
+        def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
         def get_ticker_price(self, *, inst_id):
             return 68100.0
 
@@ -4161,6 +4164,9 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
             return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
 
         def list_positions(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
             return []
 
         def get_ticker_price(self, *, inst_id):

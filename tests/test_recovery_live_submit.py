@@ -77,6 +77,9 @@ class _FakeDeepcoinClient:
     def list_positions(self, *, inst_id=None):
         return self.positions
 
+    def list_trigger_orders_pending(self, *, inst_id):
+        return []
+
     def get_ticker_price(self, *, inst_id):
         return 68100.0
 
