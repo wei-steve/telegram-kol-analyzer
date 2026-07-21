@@ -185,6 +185,28 @@ def test_deepcoin_business_error_checks_nested_scode():
         raise AssertionError("expected nested sCode failure")
 
 
+def test_pending_trigger_read_exposes_raw_response_for_completeness_audit():
+    http_client = _CapturingHttpClient(
+        {"code": "0", "data": [{"ordId": "tp-1"}], "nextCursor": "next-page"}
+    )
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        timestamp_factory=lambda: "2026-07-15T09:00:00.000Z",
+    )
+
+    response = client.read_trigger_orders_pending(inst_id="BTC-USDT-SWAP")
+
+    assert response == {
+        "code": "0",
+        "data": [{"ordId": "tp-1"}],
+        "nextCursor": "next-page",
+    }
+    assert http_client.requests[0]["request_path"].startswith(
+        "/deepcoin/trade/trigger-orders-pending?"
+    )
+
+
 def test_cancel_position_sltp_uses_official_contract_and_shared_write_limiter():
     clock = _FakeMonotonicClock(0.0)
     http_client = _CapturingHttpClient(

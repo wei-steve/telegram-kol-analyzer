@@ -115,6 +115,9 @@ class DeepcoinTradingClientProtocol(Protocol):
     def list_trigger_orders_pending(self, *, inst_id: str) -> list[dict[str, Any]]:
         """Return pending trigger / TPSL orders for one instrument."""
 
+    def read_trigger_orders_pending(self, *, inst_id: str) -> dict[str, Any]:
+        """Return the raw pending-trigger response for completeness auditing."""
+
     def list_trigger_order_history(self, *, inst_id: str) -> list[dict[str, Any]]:
         """Return historical trigger / TPSL orders for one instrument."""
 
@@ -366,14 +369,19 @@ class DeepcoinRestClient:
         )
 
     def list_trigger_orders_pending(self, *, inst_id: str) -> list[dict[str, Any]]:
-        payload = self._request(
+        return _require_list_data(
+            self.read_trigger_orders_pending(inst_id=inst_id),
+            endpoint=DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH,
+        )
+
+    def read_trigger_orders_pending(self, *, inst_id: str) -> dict[str, Any]:
+        return self._request(
             "GET",
             _path_with_query(
                 DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH,
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        return _require_list_data(payload, endpoint=DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH)
 
     def list_trigger_order_history(self, *, inst_id: str) -> list[dict[str, Any]]:
         payload = self._request(
