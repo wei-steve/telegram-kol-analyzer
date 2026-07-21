@@ -150,6 +150,94 @@ def test_fengge_exit_applies_mimo_while_execution_gate_is_pending(tmp_path, monk
         assert lifecycle.management_action == "exit_requested"
 
 
+def test_mimo_cancel_entry_for_entered_strategy_creates_full_exit_candidate(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        entry = RawMessage(chat_id=9001, message_id=101, text="BTC short limit")
+        cancel = RawMessage(
+            chat_id=9001,
+            message_id=102,
+            text="限价单先取消，等我后续信号！",
+            posted_at=datetime(2026, 7, 22, 3, 0, tzinfo=UTC),
+        )
+        session.add_all([entry, cancel])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=9001,
+            message_id=101,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 22, 1, 0, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 22, 2, 0, tzinfo=UTC),
+        )
+        session.add(lifecycle)
+        session.flush()
+        binding = ExecutionBinding(
+            kol_id="group:9001",
+            chat_id=9001,
+            message_id=101,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            pos_id="pos-entered",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        session.commit()
+        cancel_raw_message_id = cancel.id
+        lifecycle_id = lifecycle.id
+
+    payload = {
+        "recognition_result": "非策略",
+        "reason": "取消之前的限价空单",
+        "strategy": {},
+        "lifecycle_event": {
+            "event_type": "cancel_entry",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "BTC",
+            "side": "short",
+            "confidence": 0.95,
+            "reason": "明确取消前一条限价策略",
+        },
+    }
+    assessment = AuthoritativeAssessment(
+        raw_message_id=cancel_raw_message_id,
+        mimo=MimoAuthoritativeResult(
+            raw_message_id=cancel_raw_message_id,
+            payload=payload,
+            input_kind="text",
+            model="mimo-v2.5",
+            status="非策略",
+            prompt_versions={},
+        ),
+        deepseek_payload=None,
+        agreement_status="pending",
+        differences=[],
+        authoritative_generation="generation-1",
+    )
+
+    result = apply_authoritative_assessment(session_factory, assessment)
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        item = session.query(MessageInstructionItem).one()
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert candidate.event_type == "close_signal"
+    assert candidate.management_action == "full_exit"
+    assert candidate.target_lifecycle_id == lifecycle_id
+    assert candidate.recognition_generation == "generation-1"
+    assert item.signal_candidate_id == candidate.id
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.management_action == "exit_requested"
+
+
 def test_mimo_failure_never_applies_deepseek_action(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

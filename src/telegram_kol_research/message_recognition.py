@@ -1101,6 +1101,33 @@ def _apply_lifecycle_event_decision(
         _remember_applied_candidate(session, candidate, applied_candidate_ids)
         return True
 
+    if event_type == "cancel_entry" and (
+        target.lifecycle_status == "entered"
+        or (
+            target.lifecycle_status == "expired"
+            and _lifecycle_has_live_execution_binding(session, target)
+        )
+    ):
+        if not _lifecycle_has_live_execution_binding(session, target):
+            return False
+        record_lifecycle_exit_intent(
+            session,
+            target,
+            exit_message_id=raw_message.message_id,
+            reason=str(decision.get("reason") or "").strip() or None,
+        )
+        candidate = _upsert_close_signal_candidate(
+            session,
+            raw_message=raw_message,
+            lifecycle=target,
+            parse_source=parse_source,
+            management_action="full_exit",
+            management_fraction=None,
+            recognition_generation=authoritative_generation,
+        )
+        _remember_applied_candidate(session, candidate, applied_candidate_ids)
+        return True
+
     if event_type == "exit_position" and (
         target.lifecycle_status == "entered"
         or (
