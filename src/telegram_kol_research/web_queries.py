@@ -479,6 +479,8 @@ def _serialize_raw_messages(
             if selected_candidate is not None
             else []
         )
+        decision = decisions_by_msg_id.get(raw_message.id)
+        semantic_review = _serialize_semantic_review(decision)
         rows.append(
             {
                 "raw_message_id": raw_message.id,
@@ -499,12 +501,14 @@ def _serialize_raw_messages(
                     candidate=selected_candidate,
                     media_assets=media_assets,
                 ),
-                "semantic_review": _serialize_semantic_review(
-                    decisions_by_msg_id.get(raw_message.id)
-                ),
+                "semantic_review": semantic_review,
                 "execution_outcome": _serialize_execution_outcome(
-                    decisions_by_msg_id.get(raw_message.id),
+                    decision,
                     management_batch_by_msg_id.get(raw_message.id),
+                ),
+                "decision_card": _build_message_decision_card(
+                    decision=decision,
+                    semantic_review=semantic_review,
                 ),
                 "recognition_comparison": _build_recognition_comparison(
                     recognition=rec_by_msg_id.get(raw_message.id),
@@ -691,6 +695,116 @@ def _serialize_semantic_review(
         "reason": reason,
         "conflict_types": conflict_types,
         "model": decision.comparison_model,
+    }
+
+
+def _build_message_decision_card(
+    *,
+    decision: RecognitionDecision | None,
+    semantic_review: dict[str, object | None] | None,
+) -> dict[str, object] | None:
+    if decision is None:
+        return None
+
+    try:
+        payload = json.loads(decision.authoritative_payload_json)
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    lifecycle_event = payload.get("lifecycle_event")
+    lifecycle_event = lifecycle_event if isinstance(lifecycle_event, dict) else {}
+
+    event_type = str(lifecycle_event.get("event_type") or "")
+    management_action = str(lifecycle_event.get("management_action") or "")
+    stop_loss = lifecycle_event.get("stop_loss")
+    is_stop_management = event_type == "position_update" and (
+        "stop" in management_action or management_action == "risk_update"
+    )
+    missing_stop_price = is_stop_management and stop_loss in (None, "")
+
+    if missing_stop_price:
+        state = "manual_review"
+        state_label = "需人工确认"
+        recommended_action = "不执行"
+        blocker = "未提供新的止损价格"
+    elif decision.authoritative_status in {"识别失败", "failed", "failure", "error"}:
+        state = "fetch_failed"
+        state_label = "获取失败"
+        recommended_action = "重新识别"
+        blocker = None
+    elif event_type:
+        state = "manual_review"
+        state_label = "需人工确认"
+        recommended_action = "等待安全校验"
+        blocker = None
+    else:
+        state = "record_only"
+        state_label = "仅记录"
+        recommended_action = "不执行"
+        blocker = None
+
+    facts: list[dict[str, str]] = []
+    symbol = lifecycle_event.get("symbol")
+    if isinstance(symbol, str) and symbol.strip():
+        facts.append({"label": "标的", "value": symbol.strip().upper()})
+    side = lifecycle_event.get("side")
+    side_label = {"long": "多", "short": "空"}.get(str(side or "").lower())
+    if side_label:
+        facts.append({"label": "方向", "value": side_label})
+
+    primary_reason = payload.get("reason")
+    primary_reason = primary_reason.strip() if isinstance(primary_reason, str) else None
+    primary_conclusion = _candidate_event_status(event_type) if event_type else decision.authoritative_status
+    review_reason = (
+        semantic_review.get("reason") if semantic_review is not None else None
+    )
+    review_reason = review_reason if isinstance(review_reason, str) else None
+    review_label = (
+        semantic_review.get("label") if semantic_review is not None else "待复核"
+    )
+    review_label = review_label if isinstance(review_label, str) else "待复核"
+    review_tone = (
+        semantic_review.get("severity") if semantic_review is not None else "pending"
+    )
+    review_tone = review_tone if isinstance(review_tone, str) else "pending"
+    if review_reason and "无实质分歧" in review_reason:
+        review_label = "一致"
+        review_tone = "agreed"
+
+    execution = _serialize_execution_outcome(decision, None) or {
+        "state": "not_executed",
+        "label": "未发送交易所请求",
+        "detail": None,
+    }
+    if execution["state"] == "not_executed":
+        execution = {
+            "state": "not_executed",
+            "label": "未发送交易所请求",
+            "detail": None,
+        }
+
+    return {
+        "state": state,
+        "state_label": state_label,
+        "recommended_action": recommended_action,
+        "blocker": blocker,
+        "message_facts": facts,
+        "inherited_context": [],
+        "primary_analysis": {
+            "label": "主分析 · MiMo",
+            "conclusion": primary_conclusion,
+            "reason": primary_reason,
+        },
+        "secondary_review": {
+            "label": "辅助复核 · DeepSeek",
+            "conclusion": review_label,
+            "reason": review_reason,
+        },
+        "agreement": {
+            "label": f"{review_label} · {'不自动执行' if recommended_action == '不执行' else recommended_action}",
+            "tone": review_tone,
+        },
+        "execution": execution,
     }
 
 

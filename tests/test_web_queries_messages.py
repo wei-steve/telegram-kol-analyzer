@@ -384,6 +384,86 @@ def test_load_group_messages_defensively_serializes_malformed_semantic_review_js
     }
 
 
+def test_load_group_messages_builds_manual_review_decision_card_from_authoritative_mimo(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=9,
+            message_id=1,
+            text="调整一下止损防止插针。",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json=json.dumps(
+                    {
+                        "reason": "识别到调整止损意图，未提供新的止损价格。",
+                        "lifecycle_event": {
+                            "event_type": "position_update",
+                            "management_action": "move_stop_to_protect",
+                            "symbol": "BTC",
+                            "side": "short",
+                            "stop_loss": None,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                agreement_status="agreed",
+                differences_json="[]",
+                comparison_status="completed",
+                disagreement_severity="none",
+                comparison_model="deepseek-v4-flash",
+                comparison_payload_json=json.dumps(
+                    {
+                        "reason": "同意不可自动执行，建议补充价格后再处理。",
+                        "conflict_types": [],
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        session.commit()
+
+    card = load_group_messages(session_factory, chat_id=9, limit=10)[0][
+        "decision_card"
+    ]
+
+    assert card == {
+        "state": "manual_review",
+        "state_label": "需人工确认",
+        "recommended_action": "不执行",
+        "blocker": "未提供新的止损价格",
+        "message_facts": [
+            {"label": "标的", "value": "BTC"},
+            {"label": "方向", "value": "空"},
+        ],
+        "inherited_context": [],
+        "primary_analysis": {
+            "label": "主分析 · MiMo",
+            "conclusion": "仓位管理",
+            "reason": "识别到调整止损意图，未提供新的止损价格。",
+        },
+        "secondary_review": {
+            "label": "辅助复核 · DeepSeek",
+            "conclusion": "一致",
+            "reason": "同意不可自动执行，建议补充价格后再处理。",
+        },
+        "agreement": {"label": "一致 · 不自动执行", "tone": "agreed"},
+        "execution": {
+            "state": "not_executed",
+            "label": "未发送交易所请求",
+            "detail": None,
+        },
+    }
+
+
 def test_load_group_messages_labels_context_only_target_disagreement(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
