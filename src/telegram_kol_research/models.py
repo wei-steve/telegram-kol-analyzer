@@ -878,6 +878,88 @@ class TriggerProtectionStopRescue(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class TriggerTakeProfitConvergence(Base):
+    """One durable staged-TP convergence request for a trigger entry leg.
+
+    The immutable desired plan is recorded before the parent trigger order is
+    submitted.  A later worker may act only after reconciliation proves the
+    exact split-position identity for this specific entry leg.
+    """
+
+    __tablename__ = "trigger_take_profit_convergences"
+    __table_args__ = (
+        UniqueConstraint(
+            "venue",
+            "execution_order_leg_id",
+            name="uq_trigger_take_profit_convergences_venue_leg",
+        ),
+        Index(
+            "ix_trigger_take_profit_convergences_status",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    desired_take_profits_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="waiting_position")
+    reason_code: Mapped[Optional[str]] = mapped_column(String(96), nullable=True)
+    pos_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    request_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reserved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class PositionTakeProfitOrder(Base):
+    """Permanent audit record for one take-profit order owned by an entry leg."""
+
+    __tablename__ = "position_take_profit_orders"
+    __table_args__ = (
+        UniqueConstraint("venue", "order_id", name="uq_position_take_profit_orders_venue_order"),
+        Index(
+            "ix_position_take_profit_orders_leg_status",
+            "execution_order_leg_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    trigger_take_profit_convergence_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("trigger_take_profit_convergences.id"), nullable=True, index=True
+    )
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    order_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    trigger_price: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_text: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    evidence_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cancel_request_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cancel_response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    cancel_requested_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    cancelled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class ExecutionEvent(Base):
     __tablename__ = "execution_events"
     __table_args__ = (
