@@ -1389,6 +1389,8 @@ def _prepare_trigger_protection_stop_rescue(session, *, intent, deepcoin_client)
     ):
         return "rescue_position_not_verified"
     pos_id = str(leg.pos_id)
+    if not _binding_has_exact_pos_id(binding.pos_id, pos_id):
+        return "rescue_binding_position_mismatch"
     ledger_rows = list_verified_ledger_rows_for_positions(session, [pos_id])
     if any(
         int(row.execution_binding_id) == int(binding.id)
@@ -1467,6 +1469,16 @@ def _positive_live_size(value: Any) -> bool:
         return float(str(value)) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _binding_has_exact_pos_id(binding_pos_id: object, target_pos_id: str) -> bool:
+    """Require an exact persisted binding membership before live rescue checks."""
+
+    return str(target_pos_id) in {
+        value.strip()
+        for value in str(binding_pos_id or "").split(",")
+        if value.strip()
+    }
 
 
 def _rescue_intent_is_deferred_or_ambiguous(session, intent) -> bool:

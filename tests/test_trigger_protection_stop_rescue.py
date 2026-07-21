@@ -165,3 +165,24 @@ def test_rescue_blocks_opaque_take_profit_without_exchange_write(tmp_path):
     assert result.status == "blocked"
     assert result.reason_code == "rescue_opaque_take_profit_present"
     assert client.calls == []
+
+
+def test_rescue_blocks_stale_binding_position_before_any_exchange_write(tmp_path):
+    from telegram_kol_research.strategy_management_planner import plan_trigger_protection_stop_rescue
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    intent_id = _saved_deferred_intent(session_factory)
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        binding = session.get(ExecutionBinding, intent.execution_binding_id)
+        binding.pos_id = "pos-stale"
+        session.commit()
+    client = _Client()
+
+    result = plan_trigger_protection_stop_rescue(
+        session_factory, intent_id=intent_id, deepcoin_client=client, planned_at=NOW
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "rescue_binding_position_mismatch"
+    assert client.calls == []
