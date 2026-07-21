@@ -504,6 +504,7 @@ def _confirm_visible_management_protection_revisions(
     *,
     snapshot: _ReconcileSnapshot,
     bindings: list[ExecutionBinding],
+    entry_legs: list[ExecutionOrderLeg],
 ) -> None:
     """Confirm replacement revisions only from complete per-instrument reads."""
 
@@ -511,24 +512,31 @@ def _confirm_visible_management_protection_revisions(
         str(item.get("instrument_id") or "").upper(): item
         for item in snapshot.pending_tpsl_observations
     }
-    order_ids_by_instrument: dict[str, set[str]] = {}
+    order_ids_by_instrument_and_pos: dict[tuple[str, str], set[str]] = {}
     for row in snapshot.pending_trigger_orders:
         instrument_id = str(row.get("instId") or row.get("instrument_id") or "").upper()
+        pos_id = _first_string(row, "posId", "pos_id")
         order_id = _first_string(row, "ordId", "orderId", "order_id")
-        if instrument_id and order_id:
-            order_ids_by_instrument.setdefault(instrument_id, set()).add(order_id)
-    for binding in bindings:
+        if instrument_id and pos_id and order_id:
+            order_ids_by_instrument_and_pos.setdefault((instrument_id, pos_id), set()).add(order_id)
+    bindings_by_id = {int(binding.id): binding for binding in bindings}
+    for leg in entry_legs:
+        if str(leg.attribution_status or "") != "verified" or not leg.pos_id:
+            continue
+        binding = bindings_by_id.get(int(leg.execution_binding_id))
+        if binding is None:
+            continue
         instrument_id = f"{str(binding.symbol).upper()}-USDT-SWAP"
         observation = observations_by_instrument.get(instrument_id)
         if observation is None or not bool(observation.get("complete")):
             continue
-        if not binding.pos_id:
-            continue
         confirm_visible_protection_revision(
             session,
             venue=binding.venue,
-            pos_id=str(binding.pos_id),
-            visible_order_ids=order_ids_by_instrument.get(instrument_id, set()),
+            pos_id=str(leg.pos_id),
+            visible_order_ids=order_ids_by_instrument_and_pos.get(
+                (instrument_id, str(leg.pos_id)), set()
+            ),
         )
 
 
@@ -568,7 +576,7 @@ def _apply_reconcile_snapshot(
         bindings_by_id = {int(binding.id): binding for binding in bindings}
         expire_unconfirmed_protection_revisions(session, now=recovered_at)
         _confirm_visible_management_protection_revisions(
-            session, snapshot=snapshot, bindings=bindings
+            session, snapshot=snapshot, bindings=bindings, entry_legs=legs
         )
         manual_terminal_binding_ids = _manual_terminal_binding_ids(
             session, bindings=bindings
