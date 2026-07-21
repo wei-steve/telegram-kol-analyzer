@@ -47,6 +47,58 @@ def test_group_messages_route_returns_partial_for_selected_group(tmp_path):
     assert "group 77" not in response.text
 
 
+def test_group_messages_route_renders_decision_card_before_model_analysis(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=7,
+            text="调整一下止损防止插针。",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json=(
+                    '{"reason":"识别到调整止损意图，未提供新的止损价格。",'
+                    '"lifecycle_event":{"event_type":"position_update",'
+                    '"management_action":"move_stop_to_protect",'
+                    '"symbol":"BTC","side":"short","stop_loss":null}}'
+                ),
+                agreement_status="agreed",
+                differences_json="[]",
+                comparison_status="completed",
+                disagreement_severity="none",
+                comparison_model="deepseek-v4-flash",
+                comparison_payload_json=(
+                    '{"reason":"同意不可自动执行，建议补充价格后再处理。",'
+                    '"conflict_types":[]}'
+                ),
+            )
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    response = client.get("/groups/88/messages")
+
+    assert response.status_code == 200
+    assert 'class="message-decision-card is-manual-review"' in response.text
+    assert "需人工确认" in response.text
+    assert "建议动作：<strong>不执行</strong>" in response.text
+    assert "未提供新的止损价格" in response.text
+    assert "本消息新增：" in response.text
+    assert "主分析 · MiMo" in response.text
+    assert "辅助复核 · DeepSeek" in response.text
+    assert "结论一致 · 不自动执行" in response.text
+    assert "未发送交易所请求" in response.text
+    assert response.text.index("需人工确认") < response.text.index("主分析 · MiMo")
+
+
 def test_groups_route_returns_latest_activity_sorted_partial(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
