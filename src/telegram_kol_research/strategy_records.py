@@ -66,6 +66,8 @@ ATTENTION_LABELS = MappingProxyType(
         "management_execution_drift": ("critical", "仓位管理与交易所结果漂移"),
         "position_missing": ("critical", "本地实盘绑定在交易所快照中缺失"),
         "binding_without_lifecycle": ("critical", "实盘绑定缺少策略生命周期"),
+        "take_profit_convergence_unknown": ("critical", "分段止盈提交结果未知"),
+        "take_profit_convergence_conflicted": ("warning", "分段止盈需人工复核"),
     }
 )
 
@@ -1694,6 +1696,13 @@ def load_strategy_record_summaries(
             if management_raw_message_ids
             else []
         )
+        take_profit_convergences = (
+            session.query(TriggerTakeProfitConvergence)
+            .filter(TriggerTakeProfitConvergence.execution_binding_id.in_(binding_ids))
+            .all()
+            if binding_ids
+            else []
+        )
 
     events_by_binding_id, events_by_strategy_instance_id = _index_events(events)
     batches_by_lifecycle_id: dict[int, list[StrategyManagementBatch]] = defaultdict(list)
@@ -1705,6 +1714,9 @@ def load_strategy_record_summaries(
     management_message_id_by_raw_id = {
         int(row.id): int(row.message_id) for row in management_raw_messages
     }
+    take_profit_convergences_by_binding_id: dict[int, list[TriggerTakeProfitConvergence]] = defaultdict(list)
+    for convergence in take_profit_convergences:
+        take_profit_convergences_by_binding_id[int(convergence.execution_binding_id)].append(convergence)
     entry_leg_binding_ids = {int(leg.execution_binding_id) for leg in entry_legs}
     pos_ids_by_binding_id: dict[int, list[str]] = defaultdict(list)
     for leg in entry_legs:
@@ -1741,6 +1753,7 @@ def load_strategy_record_summaries(
             binding=binding,
             events=lifecycle_events,
             management_batches=batches,
+            take_profit_convergences=take_profit_convergences_by_binding_id.get(int(binding.id), []) if binding else [],
         )
         attention = min(
             attention_reasons,
@@ -2475,16 +2488,25 @@ def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
         func.lower(StrategyManagementBatch.status) == "blocked",
         StrategyManagementBatch.reason_code.in_(ACTIONABLE_MANAGEMENT_BLOCK_REASONS),
     )
+    take_profit_unknown = exists().where(
+        TriggerTakeProfitConvergence.execution_binding_id == ExecutionBinding.id,
+        TriggerTakeProfitConvergence.status == "submit_unknown",
+    )
+    take_profit_conflicted = exists().where(
+        TriggerTakeProfitConvergence.execution_binding_id == ExecutionBinding.id,
+        TriggerTakeProfitConvergence.status.in_(("conflicted", "blocked")),
+    )
     critical = or_(
         recognition_evidence_missing,
         recognition_failed,
         entered_without_binding,
         missing_stop,
         execution_failed,
+        take_profit_unknown,
     )
     severity_expression = case(
         (critical, 0),
-        (or_(management_unconfirmed, management_blocked), 1),
+        (or_(management_unconfirmed, management_blocked, take_profit_conflicted), 1),
         (recognition_disagreement, 2),
         else_=3,
     )
@@ -2516,6 +2538,8 @@ def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
                 critical,
                 management_unconfirmed,
                 management_blocked,
+                take_profit_unknown,
+                take_profit_conflicted,
                 recognition_disagreement,
             )
         )
@@ -2569,6 +2593,7 @@ def _attention_reasons(
     binding: ExecutionBinding | None,
     events: list[ExecutionEvent],
     management_batches: list[StrategyManagementBatch],
+    take_profit_convergences: list[TriggerTakeProfitConvergence] = (),
 ) -> list[dict[str, str]]:
     codes: list[str] = []
     if (
@@ -2611,6 +2636,10 @@ def _attention_reasons(
         for batch in management_batches
     ):
         codes.append("management_blocked")
+    if any(str(row.status) == "submit_unknown" for row in take_profit_convergences):
+        codes.append("take_profit_convergence_unknown")
+    elif any(str(row.status) in {"conflicted", "blocked"} for row in take_profit_convergences):
+        codes.append("take_profit_convergence_conflicted")
 
     return [
         {"severity": ATTENTION_LABELS[code][0], "code": code, "label": ATTENTION_LABELS[code][1]}

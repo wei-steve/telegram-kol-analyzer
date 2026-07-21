@@ -228,15 +228,28 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
         return "convergence_exact_live_position_not_verified"
     size = _positive_decimal(matches[0].get("pos"))
     assert size is not None
-    has_stop = (
+    stop_rows = (
         session.query(PositionProtectionLedger)
         .filter(PositionProtectionLedger.execution_binding_id == binding.id)
         .filter(PositionProtectionLedger.execution_order_leg_id == leg.id)
         .filter(PositionProtectionLedger.pos_id == pos_id)
         .filter(PositionProtectionLedger.status == "verified")
         .filter(PositionProtectionLedger.purpose.in_(("stop_loss", "combined")))
-        .count()
-        > 0
+        .all()
+    )
+    pending_stops = {
+        str(row.get("ordId") or row.get("orderId") or ""): str(
+            row.get("slTriggerPx") or row.get("slTriggerPrice") or row.get("closeSLTriggerPrice") or ""
+        )
+        for row in pending if isinstance(row, dict)
+        and str(row.get("instId") or "").upper() == inst_id
+        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
+        and _present(row, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+    }
+    has_stop = any(
+        str(row.order_id) in pending_stops
+        and (row.trigger_price is None or _same_numeric(str(row.trigger_price), pending_stops[str(row.order_id)]))
+        for row in stop_rows
     )
     if not has_stop:
         return "convergence_verified_stop_missing"
@@ -337,3 +350,10 @@ def _split_ids(value: object) -> set[str]:
 
 def _present(row: dict, *keys: str) -> bool:
     return any(row.get(key) not in (None, "", 0, "0") for key in keys)
+
+
+def _same_numeric(left: str, right: str) -> bool:
+    try:
+        return Decimal(left) == Decimal(right)
+    except (InvalidOperation, ValueError):
+        return False

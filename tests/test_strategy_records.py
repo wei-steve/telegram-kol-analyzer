@@ -2635,4 +2635,4 @@ def test_loader_query_count_does_not_scale_with_strategy_count(tmp_path):
     finally:
         event.remove(engine, "before_cursor_execute", count_selects)
 
-    assert baseline_count == expanded_count == 9
+    assert baseline_count == expanded_count == 10

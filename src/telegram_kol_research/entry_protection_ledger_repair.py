@@ -629,10 +629,8 @@ def plan_trigger_protection_intent_adoption(
     instrument_id = _request_instrument_id(request)
     side = _request_side(request)
     expected_parent = str(intent.parent_trigger_order_id or "").strip()
-    if {str(row.get("purpose") or "") for row in expected_rows} != {
-        "take_profit",
-        "stop_loss",
-    }:
+    expected_purposes = {str(row.get("purpose") or "") for row in expected_rows}
+    if expected_purposes not in ({"take_profit", "stop_loss"}, {"stop_loss"}):
         return _intent_refusal(
             parent_event,
             binding_id,
@@ -774,8 +772,10 @@ def plan_trigger_protection_intent_adoption(
         action=EntryProtectionLedgerRepairAction(
             event_id=int(parent_event.id), binding_id=binding_id, leg_id=int(entry_leg.id),
             strategy_instance_id=entry_leg.strategy_instance_id, pos_id=pos_id,
-            instrument_id=instrument_id, side=side, order_id=order_id, purpose="combined",
-            trigger_price=None, size_text=_row_size_text(row) or _request_size_text(request),
+            instrument_id=instrument_id, side=side, order_id=order_id,
+            purpose="stop_loss" if expected_purposes == {"stop_loss"} else "combined",
+            trigger_price=(expected_rows[0].get("trigger_price") if expected_purposes == {"stop_loss"} else None),
+            size_text=_row_size_text(row) or _request_size_text(request),
             evidence={
                 "match": "trigger_protection_intent_post_baseline",
                 "intent_id": int(intent.id) if intent.id is not None else None,

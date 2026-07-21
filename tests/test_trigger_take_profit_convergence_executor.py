@@ -10,7 +10,10 @@ class _Client:
     def __init__(self):
         self.cancel_calls = []
         self.submit_calls = []
-        self.pending = []
+        self.pending = [{
+            "instId": "BTC-USDT-SWAP", "posId": "pos-10", "ordId": "sl-1",
+            "slTriggerPx": "67200", "sz": "10",
+        }]
 
     def list_positions(self, *, inst_id=None):
         return [{
@@ -119,7 +122,7 @@ def test_plan_replaces_only_exact_leg_take_profits(tmp_path):
         },
         {
             "instType": "SWAP", "instId": "BTC-USDT-SWAP", "posId": "pos-10",
-            "posSide": "short", "mrgPosition": "split", "tdMode": "cross", 
+            "posSide": "short", "mrgPosition": "split", "tdMode": "cross",
             "tpTriggerPx": "63100", "tpTriggerPxType": "last", "tpOrdPx": "-1", "sz": "2",
         },
     )
@@ -135,10 +138,10 @@ def test_initial_take_profit_plan_blocks_when_a_take_profit_is_already_present(t
     session_factory = create_session_factory(tmp_path / "research.db")
     convergence_id = _ready_convergence(session_factory)
     client = _Client()
-    client.pending = [{
+    client.pending.append({
         "instId": "BTC-USDT-SWAP", "posId": "pos-10", "ordId": "tp-old-1",
         "tpTriggerPx": "64500", "sz": "10",
-    }]
+    })
 
     plan = plan_trigger_take_profit_convergence(
         session_factory, convergence_id=convergence_id, deepcoin_client=client, planned_at=NOW

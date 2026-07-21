@@ -740,7 +740,11 @@ def _apply_reconcile_snapshot(
                 recovered_at=recovered_at,
                 pos_id=pos_id,
             )
-            leg.status = "active"
+            # A trigger child can expose a split position before its requested
+            # quantity is fully filled.  Preserve that state so TP convergence
+            # cannot allocate only the transient partial size.
+            if str(leg.status or "").lower() != "partially_filled":
+                leg.status = "active"
             leg.terminal_reason = None
 
         for leg in legs:
