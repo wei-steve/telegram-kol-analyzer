@@ -154,6 +154,9 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
             "ALTER TABLE strategy_management_batches "
             "ADD COLUMN execution_mode VARCHAR(16) NOT NULL DEFAULT 'disabled'"
         ),
+        "visibility_first_failed_at": "ALTER TABLE strategy_management_batches ADD COLUMN visibility_first_failed_at DATETIME",
+        "visibility_retry_attempts": "ALTER TABLE strategy_management_batches ADD COLUMN visibility_retry_attempts INTEGER NOT NULL DEFAULT 0",
+        "visibility_next_attempt_at": "ALTER TABLE strategy_management_batches ADD COLUMN visibility_next_attempt_at DATETIME",
     },
     "strategy_management_notifications": {
         "claimed_at": (
