@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from typing import Iterable
 
@@ -23,6 +24,8 @@ from telegram_kol_research.models import (
     SignalCandidate,
     StrategyLifecycle,
     StrategyManagementBatch,
+    TriggerProtectionIntent,
+    TriggerProtectionStopRescue,
     utc_now,
 )
 from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
@@ -1315,6 +1318,58 @@ def _build_lifecycle_event_timeline(
                     detail=f"拒绝原因：{reason_code}",
                     event_key=int(row.id),
                 )
+            intents = (
+                session.query(TriggerProtectionIntent)
+                .filter(
+                    TriggerProtectionIntent.execution_order_leg_id.in_(entry_pos_ids)
+                )
+                .order_by(TriggerProtectionIntent.created_at, TriggerProtectionIntent.id)
+                .all()
+            )
+            intent_ids = {int(intent.id) for intent in intents}
+            rescues_by_intent = {
+                int(rescue.trigger_protection_intent_id): rescue
+                for rescue in (
+                    session.query(TriggerProtectionStopRescue)
+                    .filter(
+                        TriggerProtectionStopRescue.trigger_protection_intent_id.in_(
+                            intent_ids
+                        )
+                    )
+                    .all()
+                    if intent_ids
+                    else []
+                )
+            }
+            for intent in intents:
+                pos_id = entry_pos_ids.get(int(intent.execution_order_leg_id))
+                if pos_id is None:
+                    continue
+                rescue = rescues_by_intent.get(int(intent.id))
+                rescue_matches_position = rescue is not None and str(rescue.pos_id) == pos_id
+                refusal_code = (
+                    _bounded_reason_code(rescue.reason_code)
+                    if rescue_matches_position and rescue is not None
+                    else None
+                )
+                rescue_state = (
+                    str(rescue.status) if rescue_matches_position and rescue else "none"
+                )
+                adopted_ids = [str(intent.adopted_order_id)] if intent.adopted_order_id else []
+                detail = (
+                    f"parent_order_id={intent.parent_trigger_order_id or '-'} · "
+                    f"pos_id={pos_id} · state={intent.recovery_state} · "
+                    f"attempts={int(intent.retry_attempts)} · "
+                    f"adopted_tpsl_ids={','.join(adopted_ids) or '-'} · "
+                    f"refusal={refusal_code or '-'} · stop_rescue={rescue_state}"
+                )
+                add_event(
+                    kind="trigger_protection_recovery",
+                    label="触发单保护恢复",
+                    at=intent.updated_at or intent.created_at,
+                    detail=detail,
+                    event_key=int(intent.id),
+                )
 
     start_at = lifecycle.signal_at
     end_at = lifecycle.exited_at or utc_now()
@@ -1402,6 +1457,15 @@ def _format_candidate_event_detail(candidate) -> str | None:
     if candidate.take_profit_text:
         parts.append(f"TP {candidate.take_profit_text}")
     return " / ".join(parts) or None
+
+
+def _bounded_reason_code(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    code = value.strip()
+    if not code or len(code) > 96 or not re.fullmatch(r"[a-z0-9_:-]+", code):
+        return "unknown"
+    return code
 
 
 def load_lifecycle_counts(

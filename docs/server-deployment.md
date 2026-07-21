@@ -220,6 +220,32 @@ After the read-only audit, inspect one newly created trigger-entry lifecycle
 through `message -> entry leg -> posId -> ledger ordId -> management preflight`.
 Never use a live management message as a test fixture.
 
+### Trigger-protection recovery rollout and stop-rescue probe
+
+Keep the following gates separate on the production server:
+
+1. **Read-only audit first.** Run the audit above for one reviewed trigger
+   entry and inspect the strategy detail's recovery fields: parent trigger
+   order ID, exact `pos_id`, recovery attempts/state, adopted TPSL ID, refusal
+   code, and stop-rescue state. Do not enable any write while a field is
+   missing, stale, conflicting, or refused.
+2. **Strict adoption second.** Only after the audit identifies a single exact
+   post-baseline TPSL candidate may the operator run the documented `--apply`
+   command with the fingerprint from that exact dry run. Re-open the detail
+   page and confirm the adopted TPSL ID before proceeding. This is not a
+   permission to adopt by symbol, side, price, group, message, or time.
+3. **A separate tiny guarded live probe enables stop rescue.** Use one newly
+   created trigger-entry position only, with one exact verified `posId` and a
+   reviewed stop-rescue plan. Submit at most that one stop-only rescue, then
+   immediately verify its exchange/ledger order ID and recovery state. Do not
+   combine this probe with historical repair or a live management message.
+
+It is forbidden to auto-cancel a legacy opaque take-profit order. Such an
+order blocks the rescue probe: it is not proof of strategy ownership, and
+must not be cancelled, replaced, or adopted through a heuristic. Leave it
+read-only unless an operator separately establishes exact ownership and
+approves a manual operation.
+
 ### Repair Deepcoin position attribution
 
 Keep automation fail closed while repairing ownership. Back up SQLite before

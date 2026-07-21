@@ -207,6 +207,36 @@ Local screenshots or deterministic tests are not substitutes for this server
 gate. As of 2026-07-17 the gate is pending because the managed local environment
 blocks port binding and local `file:` navigation; do not describe it as passed.
 
+### Trigger-entry protection recovery rollout
+
+The strategy detail's `触发单保护恢复` section is an audit projection only. It
+shows the parent trigger order ID, exact verified `pos_id`, recovery state and
+attempt count, adopted TPSL order IDs, a bounded refusal code, and stop-rescue
+state. It intentionally never renders Telegram message text, credentials, or
+raw request/response payloads.
+
+Use the rollout in this strict order:
+
+1. Perform a read-only audit first. Inspect the exact trigger-entry leg,
+   parent trigger order ID, and exact `pos_id` with a fresh exchange snapshot.
+   A missing, ambiguous, or stale observation is a refusal; do not turn it
+   into a write by guessing from symbol, side, price, group, or time.
+2. Enable strict TPSL adoption only after the audit result identifies exactly
+   one post-baseline TPSL order for that exact verified position and its
+   displayed fingerprint has been reviewed. Confirm the adopted TPSL ID in the
+   strategy detail before considering the lifecycle recovered.
+3. Enable stop rescue only with one separate, tiny guarded live probe: one
+   newly created trigger entry, one exact position, and one stop-only rescue
+   candidate. Review the planned rescue and its refusal code first; stop after
+   that single probe and verify the resulting ledger/order ID before widening
+   scope.
+
+Never automatically cancel a legacy opaque take-profit order. An opaque TP is
+a blocking condition for stop rescue, not evidence that it belongs to the
+current strategy. Do not cancel, replace, or infer ownership of it from a
+symbol/side/time match. Keep the case read-only until an operator has exact
+ownership evidence and has separately approved any manual action.
+
 ## Per-group automatic-entry position cap
 
 `max_concurrent_positions` is the cap for one exact Telegram `chat_id`, not an

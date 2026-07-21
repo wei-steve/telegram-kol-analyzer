@@ -16,6 +16,8 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
+    TriggerProtectionIntent,
+    TriggerProtectionStopRescue,
 )
 from telegram_kol_research.strategy_records import (
     enrich_strategy_records_with_exchange,
@@ -310,6 +312,83 @@ def test_strategy_detail_marks_ambiguous_trigger_protection_refusal_actionable(t
         and item["status"] == "保护单归属未验证"
         for item in detail["timeline"]
     )
+
+
+def test_strategy_detail_projects_safe_trigger_protection_recovery_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "trigger-recovery-detail.db")
+    with session_factory() as session:
+        binding, lifecycle, leg = _seed_trigger_entry_strategy(session)
+        intent = TriggerProtectionIntent(
+            venue="deepcoin",
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            request_fingerprint="a" * 64,
+            pre_submit_tpsl_baseline_json='{"request":"must-not-render"}',
+            correlation_id="recovery-detail-1",
+            parent_trigger_order_id="parent-trigger-1",
+            recovery_state="retry_scheduled",
+            retry_attempts=2,
+            adopted_order_id="adopted-tpsl-1",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(intent)
+        session.flush()
+        session.add(
+            TriggerProtectionStopRescue(
+                trigger_protection_intent_id=intent.id,
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-adopted",
+                status="blocked",
+                reason_code="rescue_opaque_take_profit_present",
+                request_json='{"passphrase":"must-not-render"}',
+                response_json='{"raw":"must-not-render"}',
+                error_json='{"message":"must-not-render"}',
+                planned_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+        leg_id = int(leg.id)
+
+    detail = load_strategy_record_detail(
+        session_factory, lifecycle_id=lifecycle_id, group_labels_by_chat_id={}
+    )
+
+    assert detail["execution"]["trigger_protection_recovery"] == [
+        {
+            "intent_id": 1,
+            "parent_order_id": "parent-trigger-1",
+            "pos_id": "pos-adopted",
+            "recovery_state": "retry_scheduled",
+            "retry_attempts": 2,
+            "adopted_tpsl_order_ids": ["adopted-tpsl-1"],
+            "refusal_code": "rescue_opaque_take_profit_present",
+            "stop_rescue": {"state": "blocked", "order_id": None},
+        }
+    ]
+    recovery_timeline = next(
+        item
+        for item in detail["timeline"]
+        if item["kind"] == "trigger_protection_recovery"
+    )
+    assert recovery_timeline["source"] == {
+        "table": "trigger_protection_intents",
+        "id": 1,
+        "execution_order_leg_id": leg_id,
+        "parent_order_id": "parent-trigger-1",
+        "pos_id": "pos-adopted",
+        "recovery_state": "retry_scheduled",
+        "retry_attempts": 2,
+        "adopted_tpsl_order_ids": ["adopted-tpsl-1"],
+        "refusal_code": "rescue_opaque_take_profit_present",
+        "stop_rescue_state": "blocked",
+    }
+    assert "must-not-render" not in str(detail["execution"]["trigger_protection_recovery"])
+    assert "must-not-render" not in str(recovery_timeline)
 
 
 def test_strategy_detail_ignores_stale_trigger_protection_refusal_for_old_position(

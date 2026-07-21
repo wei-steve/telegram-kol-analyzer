@@ -15,6 +15,8 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
+    TriggerProtectionIntent,
+    TriggerProtectionStopRescue,
 )
 from telegram_kol_research.web_app import create_web_app
 
@@ -312,6 +314,57 @@ def test_strategy_record_detail_is_semantic_read_only_and_escapes_evidence(tmp_p
         assert evidence in response.text
     assert "must-not-render" not in response.text
     assert "[REDACTED]" in response.text
+
+
+def test_strategy_record_detail_renders_safe_trigger_recovery_audit_fields(tmp_path):
+    client, lifecycle_id = _client(tmp_path)
+    with client.app.state.session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        leg = session.query(ExecutionOrderLeg).one()
+        intent = TriggerProtectionIntent(
+            venue="deepcoin",
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            request_fingerprint="c" * 64,
+            pre_submit_tpsl_baseline_json='{"raw":"must-not-render"}',
+            correlation_id="web-recovery-1",
+            parent_trigger_order_id="parent-trigger-web-1",
+            recovery_state="retry_scheduled",
+            retry_attempts=4,
+            adopted_order_id="adopted-tpsl-web-1",
+        )
+        session.add(intent)
+        session.flush()
+        session.add(
+            TriggerProtectionStopRescue(
+                trigger_protection_intent_id=intent.id,
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-web-record",
+                status="blocked",
+                reason_code="rescue_opaque_take_profit_present",
+                request_json='{"raw":"must-not-render"}',
+                response_json='{"raw":"must-not-render"}',
+                error_json='{"raw":"must-not-render"}',
+            )
+        )
+        session.commit()
+
+    response = client.get(f"/strategy-records/{lifecycle_id}")
+
+    assert response.status_code == 200
+    assert 'data-trigger-protection-recovery-id="1"' in response.text
+    for visible_value in (
+        "parent-trigger-web-1",
+        "pos-web-record",
+        "retry_scheduled",
+        "4",
+        "adopted-tpsl-web-1",
+        "rescue_opaque_take_profit_present",
+        "blocked",
+    ):
+        assert visible_value in response.text
+    assert "must-not-render" not in response.text
 
 
 def test_strategy_record_detail_management_batch_exposes_authoritative_ids_and_leg_statuses(tmp_path):

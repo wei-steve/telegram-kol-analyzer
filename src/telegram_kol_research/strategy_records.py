@@ -29,6 +29,8 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
+    TriggerProtectionIntent,
+    TriggerProtectionStopRescue,
 )
 
 
@@ -91,6 +93,7 @@ _TIMELINE_KIND_RANK = MappingProxyType(
         "protection_adopted": 6,
         "protection_adoption_refused": 7,
         "management": 8,
+        "trigger_protection_recovery": 9,
     }
 )
 _MESSAGE_ROLE_RANK = MappingProxyType({"entry": 0, "management": 1, "exit": 2})
@@ -261,6 +264,32 @@ def load_strategy_record_detail(
             .order_by(PositionAttributionAudit.created_at, PositionAttributionAudit.id)
             .all()
             if entry_leg_ids
+            else []
+        )
+        trigger_protection_intents = (
+            session.query(TriggerProtectionIntent)
+            .filter(TriggerProtectionIntent.execution_order_leg_id.in_(entry_leg_ids))
+            .order_by(TriggerProtectionIntent.created_at, TriggerProtectionIntent.id)
+            .all()
+            if entry_leg_ids
+            else []
+        )
+        trigger_protection_intent_ids = {
+            int(row.id) for row in trigger_protection_intents
+        }
+        trigger_protection_stop_rescues = (
+            session.query(TriggerProtectionStopRescue)
+            .filter(
+                TriggerProtectionStopRescue.trigger_protection_intent_id.in_(
+                    trigger_protection_intent_ids
+                )
+            )
+            .order_by(
+                TriggerProtectionStopRescue.planned_at,
+                TriggerProtectionStopRescue.id,
+            )
+            .all()
+            if trigger_protection_intent_ids
             else []
         )
 
@@ -558,6 +587,11 @@ def load_strategy_record_detail(
         ledger_rows=protection_ledger_rows,
         refusal_rows=protection_refusal_rows,
     )
+    trigger_protection_recovery = _trigger_protection_recovery_detail(
+        intents=trigger_protection_intents,
+        rescues=trigger_protection_stop_rescues,
+        order_legs=order_legs,
+    )
     for row in protection_adoption["adopted_rows"]:
         timeline.append(
             _detail_timeline_item(
@@ -588,6 +622,28 @@ def load_strategy_record_detail(
                     "reason_code": refusal_code,
                 },
                 status="保护单归属未验证",
+            )
+        )
+    for row in trigger_protection_recovery:
+        timeline.append(
+            _detail_timeline_item(
+                kind="trigger_protection_recovery",
+                timestamp=row["timestamp"],
+                database_id=int(row["intent_id"]),
+                event_id=f"trigger_protection_recovery:{int(row['intent_id'])}",
+                source={
+                    "table": "trigger_protection_intents",
+                    "id": int(row["intent_id"]),
+                    "execution_order_leg_id": int(row["execution_order_leg_id"]),
+                    "parent_order_id": row["parent_order_id"],
+                    "pos_id": row["pos_id"],
+                    "recovery_state": row["recovery_state"],
+                    "retry_attempts": row["retry_attempts"],
+                    "adopted_tpsl_order_ids": row["adopted_tpsl_order_ids"],
+                    "refusal_code": row["refusal_code"],
+                    "stop_rescue_state": row["stop_rescue"]["state"],
+                },
+                status=str(row["recovery_state"]),
             )
         )
     for batch in management_batches:
@@ -698,6 +754,14 @@ def load_strategy_record_detail(
                 "evidence_sources": protection_adoption["evidence_sources"],
                 "refusal_codes": protection_adoption["refusal_codes"],
             },
+            "trigger_protection_recovery": [
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key not in {"timestamp", "execution_order_leg_id"}
+                }
+                for row in trigger_protection_recovery
+            ],
             "events": [_execution_event_detail(row) for row in execution_events],
             "management_batches": [
                 _management_batch_detail(
@@ -782,6 +846,71 @@ def _protection_adoption_detail(
         "adopted_rows": adopted_rows,
         "refusal_rows": parsed_refusals,
     }
+
+
+def _trigger_protection_recovery_detail(
+    *,
+    intents: list[TriggerProtectionIntent],
+    rescues: list[TriggerProtectionStopRescue],
+    order_legs: list[ExecutionOrderLeg],
+) -> list[dict[str, object]]:
+    """Project recovery state without exposing payloads or message content."""
+
+    exact_pos_ids = {
+        int(leg.id): str(leg.pos_id)
+        for leg in order_legs
+        if leg.purpose == "entry"
+        and str(leg.attribution_status or "") == "verified"
+        and str(leg.pos_id or "").strip()
+    }
+    rescues_by_intent = {
+        int(rescue.trigger_protection_intent_id): rescue for rescue in rescues
+    }
+    projected: list[dict[str, object]] = []
+    for intent in intents:
+        pos_id = exact_pos_ids.get(int(intent.execution_order_leg_id))
+        if pos_id is None:
+            continue
+        rescue = rescues_by_intent.get(int(intent.id))
+        rescue_matches_position = rescue is not None and str(rescue.pos_id) == pos_id
+        refusal_code = (
+            _bounded_reason_code(rescue.reason_code)
+            if rescue_matches_position and rescue is not None
+            else None
+        )
+        rescue_state = str(rescue.status) if rescue_matches_position and rescue else "none"
+        rescue_order_id = (
+            str(rescue.exchange_order_id)
+            if rescue_matches_position and rescue and rescue.exchange_order_id
+            else None
+        )
+        adopted_order_ids = (
+            [str(intent.adopted_order_id)] if intent.adopted_order_id else []
+        )
+        projected.append(
+            {
+                "intent_id": int(intent.id),
+                "execution_order_leg_id": int(intent.execution_order_leg_id),
+                "timestamp": intent.updated_at or intent.created_at,
+                "parent_order_id": intent.parent_trigger_order_id,
+                "pos_id": pos_id,
+                "recovery_state": str(intent.recovery_state),
+                "retry_attempts": int(intent.retry_attempts),
+                "adopted_tpsl_order_ids": adopted_order_ids,
+                "refusal_code": refusal_code,
+                "stop_rescue": {"state": rescue_state, "order_id": rescue_order_id},
+            }
+        )
+    return projected
+
+
+def _bounded_reason_code(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    code = value.strip()
+    if not code or len(code) > 96 or not re.fullmatch(r"[a-z0-9_:-]+", code):
+        return "unknown"
+    return code
 
 
 def _detail_timeline_item(
