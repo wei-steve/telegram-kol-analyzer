@@ -43,6 +43,11 @@ REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES = frozenset(
 
 
 SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
+    "trigger_protection_stop_rescues": {
+        "error_json": (
+            "ALTER TABLE trigger_protection_stop_rescues ADD COLUMN error_json TEXT"
+        ),
+    },
     "raw_messages": {
         "sender_name": "ALTER TABLE raw_messages ADD COLUMN sender_name VARCHAR(255)",
         "archived_target_group": "ALTER TABLE raw_messages ADD COLUMN archived_target_group BOOLEAN NOT NULL DEFAULT 0",

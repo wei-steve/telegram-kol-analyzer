@@ -4,8 +4,9 @@ import json
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import create_engine, inspect, text
 
-from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.db import create_session_factory, init_db
 from telegram_kol_research.execution_events import ExecutionEventRecord, record_execution_event
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -247,3 +248,39 @@ def test_rescue_persists_bounded_failure_diagnostics(tmp_path):
         diagnostics = json.loads(rescue.error_json)
     assert diagnostics["type"] == "RuntimeError"
     assert len(diagnostics["message"]) == 512
+
+
+def test_init_db_adds_rescue_error_json_to_prior_sqlite_schema(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy-rescue.db'}", future=True)
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE trigger_protection_stop_rescues (
+                id INTEGER PRIMARY KEY,
+                trigger_protection_intent_id INTEGER NOT NULL,
+                execution_binding_id INTEGER NOT NULL,
+                execution_order_leg_id INTEGER NOT NULL,
+                pos_id VARCHAR(255) NOT NULL,
+                status VARCHAR(32) NOT NULL,
+                reason_code VARCHAR(96),
+                request_json TEXT,
+                response_json TEXT,
+                exchange_order_id VARCHAR(255),
+                planned_at DATETIME NOT NULL,
+                reserved_at DATETIME,
+                completed_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+        """))
+
+    init_db(engine)
+
+    assert "error_json" in {column["name"] for column in inspect(engine).get_columns("trigger_protection_stop_rescues")}
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO trigger_protection_stop_rescues (
+                id, trigger_protection_intent_id, execution_binding_id, execution_order_leg_id,
+                pos_id, status, planned_at, created_at, updated_at, error_json
+            ) VALUES (1, 1, 1, 1, 'pos-1', 'submit_unknown', :now, :now, :now, :error)
+        """), {"now": NOW, "error": '{"type":"RuntimeError"}'})
+        assert connection.execute(text("SELECT error_json FROM trigger_protection_stop_rescues WHERE id = 1")).scalar_one() == '{"type":"RuntimeError"}'
