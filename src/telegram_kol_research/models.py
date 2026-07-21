@@ -590,7 +590,9 @@ class StrategyManagementBatch(Base):
     notification_state: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     notification_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     visibility_first_failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    visibility_retry_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    visibility_retry_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     visibility_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
