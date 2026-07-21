@@ -66,6 +66,7 @@ PARTIAL_INTENTS = frozenset({"partial_take_profit", "partial_then_break_even"})
 PROTECTION_INTENTS = frozenset(
     {"adjust_stop_loss", "move_stop_to_break_even", "partial_then_break_even"}
 )
+PROTECTION_EVIDENCE_INTENTS = PROTECTION_INTENTS | frozenset({"partial_take_profit"})
 SUPPORTED_INTENTS = frozenset(
     {"partial_take_profit", "full_exit", *PROTECTION_INTENTS}
 )
@@ -372,7 +373,7 @@ def _plan_strategy_management_batch_locked(
 
     protection_by_pos_id: dict[str, dict[str, Any]] = {}
     if (
-        intent in PROTECTION_INTENTS
+        intent in PROTECTION_EVIDENCE_INTENTS
         and effective_action_name not in {"full_close", "full_exit"}
     ):
         if not _pending_tpsl_snapshot_complete(

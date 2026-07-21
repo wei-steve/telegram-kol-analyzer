@@ -436,7 +436,9 @@ def test_management_candidate_strategy_fields_must_match_target(monkeypatch, tmp
     _disable_reconciliation(monkeypatch, planner)
     result = planner.plan_strategy_management_batch(
         session_factory, raw_message_id=raw_id,
-        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        deepcoin_client=_ReadOnlyDeepcoin([_position()], tpsl_orders=[
+            {"instId": "BTC-USDT-SWAP", "posSide": "short", "triggerOrderType": "TPSL", "slTriggerPx": "63000", "sz": "0", "ordId": "sl-partial", "cTime": "1721000000000"}
+        ]),
         contract_spec_provider=_ContractSpecs(), planned_at=PLANNED_AT,
     )
     assert result.status == "blocked"
@@ -522,7 +524,9 @@ def test_two_active_bindings_for_strategy_blocks_whole_batch(monkeypatch, tmp_pa
     result = planner.plan_strategy_management_batch(
         session_factory,
         raw_message_id=raw_id,
-        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        deepcoin_client=_ReadOnlyDeepcoin([_position()], tpsl_orders=[
+            {"instId": "BTC-USDT-SWAP", "posSide": "short", "triggerOrderType": "TPSL", "slTriggerPx": "63000", "sz": "0", "ordId": "sl-partial", "cTime": "1721000000000"},
+        ]),
         contract_spec_provider=_ContractSpecs(),
         planned_at=PLANNED_AT,
     )
@@ -999,6 +1003,28 @@ def test_incomplete_pending_tpsl_snapshot_blocks_without_planning_legs(monkeypat
         ).replace(tzinfo=None)
 
 
+def test_incomplete_pending_tpsl_snapshot_blocks_partial_take_profit(monkeypatch, tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "partial-incomplete.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory, intent="partial_take_profit"
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    class PaginatedPendingClient(_ReadOnlyDeepcoin):
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {"code": "0", "data": [], "nextCursor": "unknown"}
+
+    result = planner.plan_strategy_management_batch(
+        session_factory, raw_message_id=raw_id,
+        deepcoin_client=PaginatedPendingClient([_position()]),
+        contract_spec_provider=_ContractSpecs(), planned_at=PLANNED_AT,
+    )
+    assert result.status == "blocked"
+    assert result.reason_code == "target_protection_snapshot_incomplete"
+    assert result.batch is not None and result.batch.legs == ()
+
+
 def test_missing_ledger_order_replans_when_it_becomes_visible_within_five_minutes(monkeypatch, tmp_path):
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "research.db")
@@ -1282,7 +1308,9 @@ def test_unqualified_first_partial_plan_defaults_to_half(
     result = planner.plan_strategy_management_batch(
         session_factory,
         raw_message_id=raw_id,
-        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        deepcoin_client=_ReadOnlyDeepcoin([_position()], tpsl_orders=[
+            {"instId": "BTC-USDT-SWAP", "posSide": "short", "triggerOrderType": "TPSL", "slTriggerPx": "63000", "sz": "0", "ordId": "sl-partial", "cTime": "1721000000000"},
+        ]),
         contract_spec_provider=_ContractSpecs(),
         planned_at=PLANNED_AT,
     )
@@ -1319,7 +1347,11 @@ def test_partial_plan_accepts_legacy_comma_separated_binding_pos_ids(
             [
                 _position("pos-b", size="10", avg_px="62000"),
                 _position("pos-c", size="8", avg_px="62100"),
-            ]
+            ],
+            tpsl_orders=[
+                {"instId": "BTC-USDT-SWAP", "posId": "pos-b", "posSide": "short", "triggerOrderType": "TPSL", "slTriggerPx": "63000", "sz": "0", "ordId": "sl-pos-b", "cTime": "1721000000000"},
+                {"instId": "BTC-USDT-SWAP", "posId": "pos-c", "posSide": "short", "triggerOrderType": "TPSL", "slTriggerPx": "63000", "sz": "0", "ordId": "sl-pos-c", "cTime": "1721000000000"},
+            ],
         ),
         contract_spec_provider=_ContractSpecs(),
         planned_at=PLANNED_AT,
