@@ -24,6 +24,10 @@ from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionAttributionAudit
 from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import TriggerProtectionIntent
+from telegram_kol_research.protection_snapshot import (
+    observe_pending_tpsl,
+    record_pending_tpsl_observation,
+)
 from telegram_kol_research.position_attribution import (
     ATTRIBUTION_POLICY_VERSION,
     FillEvidence,
@@ -131,6 +135,7 @@ class _ReconcileSnapshot:
     order_history: list[dict[str, Any]] = field(default_factory=list)
     trade_fills: list[dict[str, Any]] = field(default_factory=list)
     trigger_history: list[dict[str, Any]] = field(default_factory=list)
+    pending_tpsl_observations: list[dict[str, Any]] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
 
 
@@ -323,7 +328,10 @@ def load_deepcoin_execution_reconciliation_snapshot(
             .all()
             if str(symbol or "").strip()
         }
-    return _load_reconcile_snapshot(client, instruments=instruments)
+    snapshot = _load_reconcile_snapshot(client, instruments=instruments)
+    for observation in snapshot.pending_tpsl_observations:
+        record_pending_tpsl_observation(session_factory, observation=observation)
+    return snapshot
 
 
 def _load_reconcile_snapshot(
@@ -338,12 +346,12 @@ def _load_reconcile_snapshot(
     snapshot.open_orders = _read_snapshot_rows(
         client, method_name="list_open_orders", source="open_orders", errors=snapshot.errors
     )
-    snapshot.pending_trigger_orders = _read_instrument_snapshot_rows(
+    snapshot.pending_trigger_orders = _read_pending_trigger_snapshot_rows(
         client,
-        method_name="list_trigger_orders_pending",
         source="pending_trigger_orders",
         instruments=instruments,
         errors=snapshot.errors,
+        observations=snapshot.pending_tpsl_observations,
     )
     snapshot.order_history = _read_instrument_snapshot_rows(
         client,
@@ -424,6 +432,54 @@ def _read_instrument_snapshot_rows(
             result.extend(rows)
         if called_without_instrument:
             break
+    return _deduplicate_exchange_rows(result)
+
+
+def _read_pending_trigger_snapshot_rows(
+    client: DeepcoinReadOnlyClient,
+    *,
+    source: str,
+    instruments: set[str],
+    errors: dict[str, str],
+    observations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Read pending TPSL rows while retaining response-completeness evidence."""
+
+    raw_reader = getattr(client, "read_trigger_orders_pending", None)
+    list_reader = getattr(client, "list_trigger_orders_pending", None)
+    result: list[dict[str, Any]] = []
+    for instrument_id in sorted(instruments):
+        try:
+            if raw_reader is not None:
+                response = raw_reader(inst_id=instrument_id)
+                if not isinstance(response, dict):
+                    raise ValueError("invalid raw pending trigger response schema")
+            elif list_reader is not None:
+                rows = list_reader(inst_id=instrument_id)
+                response = {"data": rows}
+            else:
+                continue
+        except Exception as exc:
+            errors[f"{source}:{instrument_id}"] = str(exc)
+            observations.append(
+                {
+                    "instrument_id": instrument_id,
+                    "complete": False,
+                    "reason": "pending_tpsl_read_error",
+                    "order_ids": [],
+                }
+            )
+            continue
+        observation = observe_pending_tpsl(
+            instrument_id=instrument_id,
+            response=response,
+        )
+        observations.append(observation)
+        rows = response.get("data")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            errors[f"{source}:{instrument_id}"] = "invalid list response schema"
+            continue
+        result.extend(rows)
     return _deduplicate_exchange_rows(result)
 
 

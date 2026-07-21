@@ -32,6 +32,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     PositionAttributionAudit,
     PositionProtectionLedger,
+    PendingTpslSnapshotObservation,
     StrategyLifecycle,
     TriggerProtectionIntent,
 )
@@ -220,6 +221,34 @@ class _ProtectionAdoptionReconciliationClient:
 
     def list_trigger_order_history(self, *, inst_id=None):
         return self.history_rows
+
+
+def test_reconcile_persists_raw_pending_tpsl_completeness_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "pending-tpsl-audit.db")
+    _seed_trigger_protection_adoption(session_factory)
+
+    class RawResponseClient(_ProtectionAdoptionReconciliationClient):
+        def read_trigger_orders_pending(self, *, inst_id):
+            assert inst_id == "ETH-USDT-SWAP"
+            return {
+                "code": "0",
+                "data": [{"ordId": "tp-raw"}],
+                "nextCursor": "unhandled-page",
+            }
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=RawResponseClient(),
+        recovered_at=datetime(2026, 7, 20, 9, 0),
+    )
+
+    with session_factory() as session:
+        observation = session.query(PendingTpslSnapshotObservation).one()
+    assert observation.instrument_id == "ETH-USDT-SWAP"
+    assert observation.response_count == 1
+    assert observation.order_ids_json == '["tp-raw"]'
+    assert observation.complete is False
+    assert observation.reason == "pagination_metadata_unsupported"
 
 
 def _pending_combined_tpsl(order_id):
