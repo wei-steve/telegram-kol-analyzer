@@ -129,6 +129,9 @@ def create_management_batch(
     status: str = "ready",
     reason_code: str | None = None,
     notification_state: str | None = "pending",
+    visibility_first_failed_at: datetime | None = None,
+    visibility_retry_attempts: int = 0,
+    visibility_next_attempt_at: datetime | None = None,
 ) -> ManagementBatchRecord:
     """Atomically persist one immutable batch target and all of its legs."""
 
@@ -156,6 +159,9 @@ def create_management_batch(
             status=status,
             reason_code=reason_code,
             notification_state=notification_state,
+            visibility_first_failed_at=visibility_first_failed_at,
+            visibility_retry_attempts=visibility_retry_attempts,
+            visibility_next_attempt_at=visibility_next_attempt_at,
         )
         session.commit()
     return load_management_batch(session_factory, batch_id)
@@ -184,6 +190,9 @@ def create_management_batch_in_session(
     status: str = "ready",
     reason_code: str | None = None,
     notification_state: str | None = "pending",
+    visibility_first_failed_at: datetime | None = None,
+    visibility_retry_attempts: int = 0,
+    visibility_next_attempt_at: datetime | None = None,
     validate_current_state: Callable[[Session], None] | None = None,
 ) -> int:
     """Insert a batch in the caller transaction after an immediate state gate."""
@@ -211,6 +220,9 @@ def create_management_batch_in_session(
         target_snapshot_json=_encode_json(target_snapshot) or "{}",
         planned_at=planned_at,
         notification_state=notification_state,
+        visibility_first_failed_at=visibility_first_failed_at,
+        visibility_retry_attempts=visibility_retry_attempts,
+        visibility_next_attempt_at=visibility_next_attempt_at,
         completed_at=(
             planned_at if status in {"succeeded", "blocked", "resolved"} else None
         ),
@@ -473,7 +485,7 @@ def list_worker_batches(
             session.query(StrategyManagementBatch)
             .filter(StrategyManagementBatch.status == "blocked")
             .filter(StrategyManagementBatch.reason_code == TEMPORARY_VISIBILITY_REASON)
-            .filter(StrategyManagementBatch.planned_at >= datetime.now(UTC) - timedelta(minutes=5))
+            .filter(StrategyManagementBatch.visibility_next_attempt_at <= datetime.now(UTC))
             .order_by(StrategyManagementBatch.planned_at.asc(), StrategyManagementBatch.id.asc())
             .limit(limit)
             .all()

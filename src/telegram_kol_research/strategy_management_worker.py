@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 from telegram_kol_research.execution_bindings import (
@@ -27,6 +27,7 @@ from telegram_kol_research.strategy_management_reconciliation import (
     reconcile_strategy_management_batches,
 )
 from telegram_kol_research.strategy_management_planner import plan_strategy_management_batch
+from telegram_kol_research.models import StrategyManagementBatch
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -134,6 +135,8 @@ def run_strategy_management_worker_tick(
                     planned_at=now,
                     execution_mode=batch.execution_mode,
                 )
+                if result.status == "blocked" and result.reason_code == "protection_missing_cancellable_order_id":
+                    _advance_temporary_visibility_retry(session_factory, batch_id=batch.id, now=now)
                 counts["recovered"] += 1
                 continue
             if batch.status in _PAUSED_STATUSES:
@@ -265,6 +268,28 @@ def run_strategy_management_worker_tick(
             counts["failed"] += 1
             logger.exception("strategy management batch %s failed", batch.id)
     return StrategyManagementWorkerResult(**counts)
+
+
+def _advance_temporary_visibility_retry(session_factory, *, batch_id: int, now: datetime) -> None:
+    """Persist bounded backoff; a stopped retry is never converted into a trade."""
+
+    delays = (5, 15, 30, 60, 120)
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, int(batch_id))
+        if batch is None or batch.status != "blocked" or batch.reason_code != "protection_missing_cancellable_order_id":
+            return
+        first = batch.visibility_first_failed_at or batch.planned_at
+        if now >= first + timedelta(minutes=5):
+            batch.visibility_next_attempt_at = None
+            batch.updated_at = now
+            session.commit()
+            return
+        attempts = max(1, int(batch.visibility_retry_attempts or 1)) + 1
+        delay = delays[min(attempts - 1, len(delays) - 1)]
+        batch.visibility_retry_attempts = attempts
+        batch.visibility_next_attempt_at = now + timedelta(seconds=delay)
+        batch.updated_at = now
+        session.commit()
 
 
 async def run_strategy_management_worker_loop(

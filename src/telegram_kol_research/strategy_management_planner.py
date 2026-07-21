@@ -1166,6 +1166,9 @@ def _persist_blocked(
             target_snapshot=target_snapshot,
             planned_at=planned_at,
             legs=[],
+            visibility_first_failed_at=(planned_at if reason_code == "protection_missing_cancellable_order_id" else None),
+            visibility_retry_attempts=(1 if reason_code == "protection_missing_cancellable_order_id" else 0),
+            visibility_next_attempt_at=(planned_at + timedelta(seconds=5) if reason_code == "protection_missing_cancellable_order_id" else None),
         )
     return ManagementPlanningResult(
         status="blocked",
