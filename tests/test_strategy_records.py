@@ -395,6 +395,78 @@ def test_strategy_detail_projects_safe_trigger_protection_recovery_evidence(tmp_
     assert "must-not-render" not in str(recovery_timeline)
 
 
+def test_strategy_detail_fails_closed_on_trigger_recovery_foreign_key_mismatch(tmp_path):
+    session_factory = create_session_factory(tmp_path / "trigger-recovery-fk.db")
+    with session_factory() as session:
+        binding, lifecycle, leg = _seed_trigger_entry_strategy(session)
+        mismatched_intent = TriggerProtectionIntent(
+            venue="deepcoin",
+            execution_binding_id=binding.id + 1,
+            execution_order_leg_id=leg.id,
+            request_fingerprint="d" * 64,
+            pre_submit_tpsl_baseline_json="{}",
+            correlation_id="recovery-fk-mismatch",
+            recovery_state="pending",
+            retry_attempts=0,
+        )
+        session.add(mismatched_intent)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    detail = load_strategy_record_detail(
+        session_factory, lifecycle_id=lifecycle_id, group_labels_by_chat_id={}
+    )
+
+    assert detail["execution"]["trigger_protection_recovery"] == []
+
+
+def test_strategy_detail_ignores_stop_rescue_with_mismatched_foreign_keys(tmp_path):
+    session_factory = create_session_factory(tmp_path / "trigger-rescue-fk.db")
+    with session_factory() as session:
+        binding, lifecycle, leg = _seed_trigger_entry_strategy(session)
+        intent = TriggerProtectionIntent(
+            venue="deepcoin",
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            request_fingerprint="e" * 64,
+            pre_submit_tpsl_baseline_json="{}",
+            correlation_id="rescue-fk-mismatch",
+            recovery_state="pending",
+            retry_attempts=0,
+        )
+        session.add(intent)
+        session.flush()
+        session.add(
+            TriggerProtectionStopRescue(
+                trigger_protection_intent_id=intent.id,
+                execution_binding_id=binding.id + 1,
+                execution_order_leg_id=leg.id + 1,
+                pos_id="pos-adopted",
+                status="submitted",
+                reason_code="rescue_opaque_take_profit_present",
+            )
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    detail = load_strategy_record_detail(
+        session_factory, lifecycle_id=lifecycle_id, group_labels_by_chat_id={}
+    )
+
+    assert detail["execution"]["trigger_protection_recovery"] == [
+        {
+            "intent_id": 1,
+            "parent_order_id": None,
+            "pos_id": "pos-adopted",
+            "recovery_state": "pending",
+            "retry_attempts": 0,
+            "adopted_tpsl_order_ids": [],
+            "refusal_code": None,
+            "stop_rescue": {"state": "none"},
+        }
+    ]
+
+
 def test_strategy_detail_ignores_stale_trigger_protection_refusal_for_old_position(
     tmp_path,
 ):

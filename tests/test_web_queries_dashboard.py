@@ -150,8 +150,8 @@ def test_lifecycle_timeline_projects_safe_trigger_protection_recovery(tmp_path):
         session.add(
             TriggerProtectionStopRescue(
                 trigger_protection_intent_id=intent.id,
-                execution_binding_id=binding.id,
-                execution_order_leg_id=leg.id,
+                execution_binding_id=binding.id + 1,
+                execution_order_leg_id=leg.id + 1,
                 pos_id="pos-exact-1",
                 status="submitted",
                 reason_code="rescue_opaque_take_profit_present",
@@ -166,6 +166,6 @@ def test_lifecycle_timeline_projects_safe_trigger_protection_recovery(tmp_path):
     assert recovery["detail"] == (
         "parent_order_id=parent-1 · pos_id=pos-exact-1 · state=adopted · "
         "attempts=3 · adopted_tpsl_ids=tpsl-adopted-1 · "
-        "refusal=rescue_opaque_take_profit_present · stop_rescue=submitted"
+        "refusal=- · stop_rescue=none"
     )
     assert "must-not-render" not in str(recovery)

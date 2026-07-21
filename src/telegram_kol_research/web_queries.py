@@ -1343,10 +1343,21 @@ def _build_lifecycle_event_timeline(
             }
             for intent in intents:
                 pos_id = entry_pos_ids.get(int(intent.execution_order_leg_id))
-                if pos_id is None:
+                if (
+                    pos_id is None
+                    or int(intent.execution_binding_id) != int(binding_id)
+                ):
                     continue
                 rescue = rescues_by_intent.get(int(intent.id))
-                rescue_matches_position = rescue is not None and str(rescue.pos_id) == pos_id
+                rescue_matches_position = (
+                    rescue is not None
+                    and int(rescue.execution_binding_id) == int(binding_id)
+                    and int(rescue.execution_order_leg_id)
+                    == int(intent.execution_order_leg_id)
+                    and int(rescue.execution_binding_id)
+                    == int(intent.execution_binding_id)
+                    and str(rescue.pos_id) == pos_id
+                )
                 refusal_code = (
                     _bounded_reason_code(rescue.reason_code)
                     if rescue_matches_position and rescue is not None

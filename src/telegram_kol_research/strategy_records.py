@@ -856,8 +856,8 @@ def _trigger_protection_recovery_detail(
 ) -> list[dict[str, object]]:
     """Project recovery state without exposing payloads or message content."""
 
-    exact_pos_ids = {
-        int(leg.id): str(leg.pos_id)
+    exact_legs = {
+        int(leg.id): (int(leg.execution_binding_id), str(leg.pos_id))
         for leg in order_legs
         if leg.purpose == "entry"
         and str(leg.attribution_status or "") == "verified"
@@ -868,11 +868,20 @@ def _trigger_protection_recovery_detail(
     }
     projected: list[dict[str, object]] = []
     for intent in intents:
-        pos_id = exact_pos_ids.get(int(intent.execution_order_leg_id))
-        if pos_id is None:
+        exact_leg = exact_legs.get(int(intent.execution_order_leg_id))
+        if exact_leg is None:
+            continue
+        binding_id, pos_id = exact_leg
+        if int(intent.execution_binding_id) != binding_id:
             continue
         rescue = rescues_by_intent.get(int(intent.id))
-        rescue_matches_position = rescue is not None and str(rescue.pos_id) == pos_id
+        rescue_matches_position = (
+            rescue is not None
+            and int(rescue.execution_binding_id) == binding_id
+            and int(rescue.execution_order_leg_id) == int(intent.execution_order_leg_id)
+            and int(rescue.execution_binding_id) == int(intent.execution_binding_id)
+            and str(rescue.pos_id) == pos_id
+        )
         refusal_code = (
             _bounded_reason_code(rescue.reason_code)
             if rescue_matches_position and rescue is not None
