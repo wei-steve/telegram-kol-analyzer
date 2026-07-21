@@ -154,7 +154,7 @@ def _seed_trigger_protection_adoption(session_factory):
     return binding_id
 
 
-def _save_trigger_protection_intent(session_factory):
+def _save_trigger_protection_intent(session_factory, *, recovery_state="pending"):
     with session_factory() as session:
         leg = session.query(ExecutionOrderLeg).one()
         request = json.loads(leg.request_json)
@@ -166,6 +166,7 @@ def _save_trigger_protection_intent(session_factory):
             ).encode()).hexdigest(),
             pre_submit_tpsl_baseline_json="[]", correlation_id="intent-1",
             parent_trigger_order_id="entry-1",
+            recovery_state=recovery_state,
         ))
         session.commit()
 
@@ -286,6 +287,27 @@ def test_reconcile_adopts_saved_trigger_protection_intent_once(tmp_path):
     assert rows[0].evidence_source == "reconciliation_trigger_protection_intent"
     assert result.protection_adopted == 1
     assert duplicate.protection_adopted == 0
+
+
+@pytest.mark.parametrize("recovery_state", ["failed", "submitting", "resolved"])
+def test_reconcile_never_legacy_adopts_a_saved_terminal_or_inflight_intent(
+    tmp_path, recovery_state
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory, recovery_state=recovery_state)
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([_pending_combined_tpsl("tpsl-1")]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        assert session.query(PositionProtectionLedger).count() == 0
+    assert intent.recovery_state == recovery_state
+    assert result.protection_adopted == 0
 
 
 def test_reconcile_defers_saved_intent_once_and_backs_off_duplicate_delivery(tmp_path):

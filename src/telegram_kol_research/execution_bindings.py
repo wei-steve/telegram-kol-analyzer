@@ -923,13 +923,21 @@ def _reconcile_saved_trigger_protection_intents(
     )
 
     legs_by_id = {int(leg.id): leg for leg in legs}
-    intents = (
+    saved_intents = (
         session.query(TriggerProtectionIntent)
         .filter(TriggerProtectionIntent.venue == "deepcoin")
-        .filter(TriggerProtectionIntent.recovery_state.in_(("pending", "retrying")))
         .order_by(TriggerProtectionIntent.id.asc()).all()
     )
-    handled = {int(intent.execution_order_leg_id) for intent in intents if int(intent.execution_order_leg_id) in legs_by_id}
+    handled = {
+        int(intent.execution_order_leg_id)
+        for intent in saved_intents
+        if int(intent.execution_order_leg_id) in legs_by_id
+    }
+    intents = [
+        intent
+        for intent in saved_intents
+        if intent.recovery_state in {"pending", "retrying"}
+    ]
     eligible = [
         (intent, legs_by_id[int(intent.execution_order_leg_id)]) for intent in intents
         if int(intent.execution_order_leg_id) in legs_by_id
@@ -958,7 +966,7 @@ def _reconcile_saved_trigger_protection_intents(
         return handled
 
     existing_ledger_rows = session.query(PositionProtectionLedger).all()
-    all_intents = session.query(TriggerProtectionIntent).filter(TriggerProtectionIntent.venue == "deepcoin").all()
+    all_intents = saved_intents
     events = session.query(ExecutionEvent).filter(
         ExecutionEvent.venue == "deepcoin", ExecutionEvent.action == "create_trigger_entry"
     ).order_by(ExecutionEvent.id.asc()).all()
