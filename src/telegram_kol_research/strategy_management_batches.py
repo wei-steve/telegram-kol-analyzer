@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -30,6 +31,29 @@ TEMPORARY_VISIBILITY_REASONS = frozenset(
     }
 )
 UNSET = object()
+
+
+def race_resolved_successor_fingerprint(
+    *,
+    parent_batch_id: int,
+    parent_target_fingerprint: str,
+    resolved_position_ids: Sequence[str],
+) -> str:
+    """Return the idempotency key for one evidence-resolved close successor.
+
+    A cancellation race may create a position after the parent batch froze its
+    target.  The successor must never overwrite that immutable parent, yet a
+    worker retry must resolve to the same successor.
+    """
+
+    canonical = {
+        "kind": "cancel_entry_race_successor_v1",
+        "parent_batch_id": int(parent_batch_id),
+        "parent_target_fingerprint": str(parent_target_fingerprint),
+        "resolved_position_ids": sorted({str(value) for value in resolved_position_ids}),
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class ManagementSchemaSafetyError(RuntimeError):

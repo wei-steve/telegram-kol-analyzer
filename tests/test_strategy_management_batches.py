@@ -27,6 +27,30 @@ def _repository():
     return importlib.import_module("telegram_kol_research.strategy_management_batches")
 
 
+def test_race_resolved_successor_fingerprint_is_stable_and_distinct():
+    repository = _repository()
+
+    first = repository.race_resolved_successor_fingerprint(
+        parent_batch_id=42,
+        parent_target_fingerprint="a" * 64,
+        resolved_position_ids=["pos-2", "pos-1"],
+    )
+    reordered = repository.race_resolved_successor_fingerprint(
+        parent_batch_id=42,
+        parent_target_fingerprint="a" * 64,
+        resolved_position_ids=["pos-1", "pos-2"],
+    )
+    different_parent = repository.race_resolved_successor_fingerprint(
+        parent_batch_id=43,
+        parent_target_fingerprint="a" * 64,
+        resolved_position_ids=["pos-1", "pos-2"],
+    )
+
+    assert first == reordered
+    assert first != different_parent
+    assert len(first) == 64
+
+
 def _batch_values(*, fingerprint: str = "batch-fingerprint", strategy: str = "strategy-1"):
     now = datetime(2026, 7, 15, 1, 2, 3, tzinfo=UTC)
     return {
