@@ -11,6 +11,7 @@ from telegram_kol_research.models import (
     PositionAttributionAudit,
     PositionProtectionLedger,
     PositionProtectionRevision,
+    PositionTakeProfitOrder,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -126,6 +127,14 @@ def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
         )
         session.add(order_leg)
         session.flush()
+        session.add(
+            PositionTakeProfitOrder(
+                venue="deepcoin", execution_binding_id=binding.id,
+                execution_order_leg_id=order_leg.id, pos_id="pos-1", order_id="tp-active-1",
+                trigger_price="69000", size_text="1", status="active",
+                created_at=NOW - timedelta(hours=4), updated_at=NOW - timedelta(hours=4),
+            )
+        )
         fill_event = ExecutionEvent(
             execution_binding_id=binding.id,
             strategy_instance_id=binding.strategy_instance_id,
@@ -209,6 +218,12 @@ def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
         "management",
     ]
     assert detail["execution"]["order_legs"][0]["request"]["token"] == "[REDACTED]"
+    take_profit_detail = detail["execution"]["take_profit_orders"]
+    assert take_profit_detail[0]["execution_order_leg_id"] == detail["execution"]["order_legs"][0]["id"]
+    assert take_profit_detail[0]["pos_id"] == "pos-1"
+    assert take_profit_detail[0]["active"][0]["order_id"] == "tp-active-1"
+    assert take_profit_detail[0]["history"] == []
+    assert take_profit_detail[0]["convergence"] is None
 
 
 def test_load_strategy_record_detail_returns_none_for_unknown_lifecycle(tmp_path):

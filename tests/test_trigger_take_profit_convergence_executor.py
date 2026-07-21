@@ -10,6 +10,7 @@ class _Client:
     def __init__(self):
         self.cancel_calls = []
         self.submit_calls = []
+        self.pending = []
 
     def list_positions(self, *, inst_id=None):
         return [{
@@ -18,10 +19,7 @@ class _Client:
         }]
 
     def list_trigger_orders_pending(self, *, inst_id):
-        return [{
-            "instId": "BTC-USDT-SWAP", "posId": "pos-10", "posSide": "short",
-            "ordId": "tp-old-1", "tpTriggerPx": "64500", "sz": "10",
-        }]
+        return list(self.pending)
 
     def cancel_trigger_order(self, payload):
         self.cancel_calls.append(dict(payload))
@@ -32,7 +30,7 @@ class _Client:
         return {"code": "0", "data": {"ordId": f"tp-new-{len(self.submit_calls)}"}}
 
 
-def _ready_convergence(session_factory):
+def _ready_convergence(session_factory, *, existing_take_profit=True):
     from telegram_kol_research.db import create_session_factory  # keep import boundaries explicit
     from telegram_kol_research.execution_bindings import (
         ExecutionBindingRecord,
@@ -82,11 +80,13 @@ def _ready_convergence(session_factory):
             purpose="stop_loss", trigger_price="67200", size_text=None, status="verified",
             evidence_source="test", evidence={}, seen_at=NOW,
         )
-        record_take_profit_order(
-            session, venue="deepcoin", execution_binding_id=binding_id,
-            execution_order_leg_id=leg_id, pos_id="pos-10", order_id="tp-old-1",
-            trigger_price="64500", size_text="10", created_at=NOW,
-        )
+        if existing_take_profit:
+            record_take_profit_order(
+                session, venue="deepcoin", execution_binding_id=binding_id,
+                execution_order_leg_id=leg_id, pos_id="pos-10", order_id="tp-old-1",
+                trigger_price="64500", size_text="10", created_at=NOW,
+                trigger_take_profit_convergence_id=convergence.id,
+            )
         session.commit()
         return convergence.id
 
@@ -98,14 +98,14 @@ def test_plan_replaces_only_exact_leg_take_profits(tmp_path):
     )
 
     session_factory = create_session_factory(tmp_path / "research.db")
-    convergence_id = _ready_convergence(session_factory)
+    convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
 
     plan = plan_trigger_take_profit_convergence(
         session_factory, convergence_id=convergence_id, deepcoin_client=_Client(), planned_at=NOW
     )
 
     assert plan.status == "ready"
-    assert plan.cancel_order_ids == ("tp-old-1",)
+    assert plan.cancel_order_ids == ()
     assert plan.payloads == (
         {
             "instType": "SWAP", "instId": "BTC-USDT-SWAP", "posId": "pos-10",
@@ -126,7 +126,29 @@ def test_plan_replaces_only_exact_leg_take_profits(tmp_path):
     assert all("slTriggerPx" not in payload for payload in plan.payloads)
 
 
-def test_execution_cancels_old_take_profit_before_submitting_replacement(tmp_path):
+def test_initial_take_profit_plan_blocks_when_a_take_profit_is_already_present(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory)
+    client = _Client()
+    client.pending = [{
+        "instId": "BTC-USDT-SWAP", "posId": "pos-10", "ordId": "tp-old-1",
+        "tpTriggerPx": "64500", "sz": "10",
+    }]
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory, convergence_id=convergence_id, deepcoin_client=client, planned_at=NOW
+    )
+
+    assert plan.status == "conflicted"
+    assert plan.reason_code == "convergence_take_profit_already_present"
+
+
+def test_execution_submits_initial_take_profits_without_cancelling_any_order(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import PositionTakeProfitOrder, TriggerTakeProfitConvergence
     from telegram_kol_research.trigger_take_profit_convergence_executor import (
@@ -134,7 +156,7 @@ def test_execution_cancels_old_take_profit_before_submitting_replacement(tmp_pat
     )
 
     session_factory = create_session_factory(tmp_path / "research.db")
-    convergence_id = _ready_convergence(session_factory)
+    convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
     client = _Client()
 
     result = execute_trigger_take_profit_convergence(
@@ -142,16 +164,14 @@ def test_execution_cancels_old_take_profit_before_submitting_replacement(tmp_pat
     )
 
     assert result["status"] == "submitted"
-    assert client.cancel_calls == [{"instId": "BTC-USDT-SWAP", "ordId": "tp-old-1"}]
+    assert client.cancel_calls == []
     assert [payload["sz"] for payload in client.submit_calls] == ["5", "3", "2"]
     assert all("slTriggerPx" not in payload for payload in client.submit_calls)
     with session_factory() as session:
-        old = session.query(PositionTakeProfitOrder).filter_by(order_id="tp-old-1").one()
         new = session.query(PositionTakeProfitOrder).filter(
             PositionTakeProfitOrder.order_id.like("tp-new-%")
         ).order_by(PositionTakeProfitOrder.order_id).all()
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
-    assert old.status == "cancelled"
     assert [row.status for row in new] == ["active", "active", "active"]
     assert convergence.status == "submitted"
 
@@ -168,7 +188,7 @@ def test_unknown_take_profit_submit_is_frozen_without_automatic_retry(tmp_path):
             raise TimeoutError("response lost")
 
     session_factory = create_session_factory(tmp_path / "research.db")
-    convergence_id = _ready_convergence(session_factory)
+    convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
     client = _UnknownClient()
 
     first = execute_trigger_take_profit_convergence(
@@ -181,3 +201,37 @@ def test_unknown_take_profit_submit_is_frozen_without_automatic_retry(tmp_path):
     assert first["status"] == "submit_unknown"
     assert second["status"] == "blocked"
     assert len(client.submit_calls) == 1
+
+
+def test_unexplained_partial_position_change_freezes_submitted_convergence(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory)
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.status = "submitted"
+        session.commit()
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=[{
+                "instId": "BTC-USDT-SWAP", "posId": "pos-10", "posSide": "short",
+                "pos": "8", "mrgPosition": "split",
+            }],
+            pending_orders=[{
+                "instId": "BTC-USDT-SWAP", "posId": "pos-10", "ordId": "tp-old-1",
+                "tpTriggerPx": "64500", "sz": "10",
+            }],
+            trigger_history=[],
+            observed_at=NOW,
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+    assert convergence.status == "conflicted"
+    assert convergence.reason_code == "convergence_partial_position_unexplained"

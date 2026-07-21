@@ -24,6 +24,7 @@ from telegram_kol_research.models import (
     PositionAttributionAudit,
     PositionProtectionLedger,
     PositionProtectionRevision,
+    PositionTakeProfitOrder,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -32,6 +33,7 @@ from telegram_kol_research.models import (
     StrategyManagementLeg,
     TriggerProtectionIntent,
     TriggerProtectionStopRescue,
+    TriggerTakeProfitConvergence,
 )
 
 
@@ -306,6 +308,22 @@ def load_strategy_record_detail(
             )
             .all()
             if trigger_protection_intent_ids
+            else []
+        )
+        take_profit_order_rows = (
+            session.query(PositionTakeProfitOrder)
+            .filter(PositionTakeProfitOrder.execution_order_leg_id.in_(entry_leg_ids))
+            .order_by(PositionTakeProfitOrder.created_at, PositionTakeProfitOrder.id)
+            .all()
+            if entry_leg_ids
+            else []
+        )
+        trigger_take_profit_convergences = (
+            session.query(TriggerTakeProfitConvergence)
+            .filter(TriggerTakeProfitConvergence.execution_order_leg_id.in_(entry_leg_ids))
+            .order_by(TriggerTakeProfitConvergence.created_at, TriggerTakeProfitConvergence.id)
+            .all()
+            if entry_leg_ids
             else []
         )
 
@@ -613,6 +631,11 @@ def load_strategy_record_detail(
         rescues=trigger_protection_stop_rescues,
         order_legs=order_legs,
     )
+    take_profit_orders = _take_profit_order_detail(
+        order_legs=order_legs,
+        rows=take_profit_order_rows,
+        convergences=trigger_take_profit_convergences,
+    )
     for row in protection_adoption["adopted_rows"]:
         timeline.append(
             _detail_timeline_item(
@@ -801,6 +824,7 @@ def load_strategy_record_detail(
                 }
                 for row in trigger_protection_recovery
             ],
+            "take_profit_orders": take_profit_orders,
             "events": [_execution_event_detail(row) for row in execution_events],
             "management_batches": [
                 _management_batch_detail(
@@ -982,6 +1006,65 @@ def _trigger_protection_recovery_detail(
             }
         )
     return projected
+
+
+def _take_profit_order_detail(
+    *,
+    order_legs: list[ExecutionOrderLeg],
+    rows: list[PositionTakeProfitOrder],
+    convergences: list[TriggerTakeProfitConvergence],
+) -> list[dict[str, object]]:
+    """Project active TP orders separately from permanent terminal history."""
+
+    exact_legs = {
+        int(leg.id): str(leg.pos_id)
+        for leg in order_legs
+        if leg.purpose == "entry" and str(leg.pos_id or "").strip()
+    }
+    convergences_by_leg = {
+        int(row.execution_order_leg_id): row for row in convergences
+        if int(row.execution_order_leg_id) in exact_legs
+    }
+    rows_by_leg: dict[int, list[PositionTakeProfitOrder]] = defaultdict(list)
+    for row in rows:
+        if exact_legs.get(int(row.execution_order_leg_id)) != str(row.pos_id):
+            continue
+        rows_by_leg[int(row.execution_order_leg_id)].append(row)
+    result: list[dict[str, object]] = []
+    for leg_id in sorted(set(rows_by_leg) | set(convergences_by_leg)):
+        current = rows_by_leg.get(leg_id, [])
+        active = [row for row in current if str(row.status) == "active"]
+        history = [row for row in current if str(row.status) != "active"]
+        convergence = convergences_by_leg.get(leg_id)
+        result.append(
+            {
+                "execution_order_leg_id": leg_id,
+                "pos_id": exact_legs[leg_id],
+                "active": [_take_profit_order_item(row) for row in active],
+                "history": [_take_profit_order_item(row) for row in history],
+                "convergence": (
+                    {
+                        "status": str(convergence.status),
+                        "reason_code": _bounded_reason_code(convergence.reason_code),
+                    }
+                    if convergence is not None
+                    else None
+                ),
+            }
+        )
+    return result
+
+
+def _take_profit_order_item(row: PositionTakeProfitOrder) -> dict[str, object]:
+    return {
+        "order_id": str(row.order_id),
+        "price": str(row.trigger_price),
+        "size": row.size_text,
+        "status": str(row.status),
+        "created_at": _as_utc(row.created_at),
+        "cancel_requested_at": _as_utc(row.cancel_requested_at),
+        "completed_at": _as_utc(row.completed_at),
+    }
 
 
 def _bounded_reason_code(value: object) -> str | None:

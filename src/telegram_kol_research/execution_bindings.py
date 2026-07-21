@@ -790,6 +790,17 @@ def _apply_reconcile_snapshot(
         _ready_verified_trigger_take_profit_convergences(
             session, legs=legs, recovered_at=recovered_at
         )
+        from telegram_kol_research.position_take_profit_orders import (
+            reconcile_trigger_take_profit_order_history,
+        )
+
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=snapshot.positions,
+            pending_orders=snapshot.pending_trigger_orders,
+            trigger_history=snapshot.trigger_history,
+            observed_at=recovered_at,
+        )
 
         for binding in bindings:
             binding.strategy_instance_id = binding.strategy_instance_id or build_strategy_instance_id(

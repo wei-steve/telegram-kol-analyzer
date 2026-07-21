@@ -19,8 +19,6 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.position_authority_lock import serialized_position_authority_mutation
 from telegram_kol_research.position_take_profit_orders import (
-    record_take_profit_cancel_requested,
-    record_take_profit_cancelled,
     record_take_profit_order,
 )
 
@@ -93,35 +91,6 @@ def execute_trigger_take_profit_convergence(
         convergence.updated_at = now
         session.commit()
 
-    for order_id in plan.cancel_order_ids:
-        with session_factory() as session:
-            row = (
-                session.query(PositionTakeProfitOrder)
-                .filter(PositionTakeProfitOrder.venue == "deepcoin")
-                .filter(PositionTakeProfitOrder.order_id == order_id)
-                .one_or_none()
-            )
-            if row is None or row.status != "active":
-                return _freeze(session_factory, convergence_id, now, "convergence_cancel_identity_drift")
-            request = {"instId": plan.payloads[0]["instId"], "ordId": order_id}
-            record_take_profit_cancel_requested(session, row, request=request, requested_at=now)
-            session.commit()
-        try:
-            response = deepcoin_client.cancel_trigger_order(request)
-        except Exception as exc:
-            return _freeze(session_factory, convergence_id, now, "convergence_cancel_outcome_unknown", error=exc)
-        with session_factory() as session:
-            row = (
-                session.query(PositionTakeProfitOrder)
-                .filter(PositionTakeProfitOrder.venue == "deepcoin")
-                .filter(PositionTakeProfitOrder.order_id == order_id)
-                .one_or_none()
-            )
-            if row is None or row.status != "cancel_requested":
-                return _freeze(session_factory, convergence_id, now, "convergence_cancel_persist_conflict")
-            record_take_profit_cancelled(session, row, response=_response_dict(response), cancelled_at=now)
-            session.commit()
-
     for payload in plan.payloads:
         try:
             response = deepcoin_client.set_position_sltp(dict(payload))
@@ -157,6 +126,39 @@ def execute_trigger_take_profit_convergence(
         convergence.updated_at = now
         session.commit()
     return {"convergence_id": convergence_id, "status": "submitted", "reason": None}
+
+
+def execute_ready_trigger_take_profit_convergences(
+    session_factory: sessionmaker,
+    *,
+    deepcoin_client,
+    processed_at: datetime | None = None,
+    limit: int = 5,
+) -> int:
+    """Run a bounded set of durable ready tasks; terminal tasks are skipped."""
+
+    with session_factory() as session:
+        identifiers = [
+            int(row.id)
+            for row in (
+                session.query(TriggerTakeProfitConvergence.id)
+                .filter(TriggerTakeProfitConvergence.status == "ready")
+                .order_by(TriggerTakeProfitConvergence.created_at, TriggerTakeProfitConvergence.id)
+                .limit(max(0, int(limit)))
+                .all()
+            )
+        ]
+    completed = 0
+    for convergence_id in identifiers:
+        result = execute_trigger_take_profit_convergence(
+            session_factory,
+            convergence_id=convergence_id,
+            deepcoin_client=deepcoin_client,
+            executed_at=processed_at,
+        )
+        if result.get("status") in {"submitted", "conflicted", "submit_unknown"}:
+            completed += 1
+    return completed
 
 
 def _freeze(session_factory, convergence_id: int, now: datetime, reason: str, error: object | None = None):
@@ -255,8 +257,8 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
         and _present(row, "tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
     }
     ledger_ids = {str(row.order_id) for row in active_orders}
-    if pending_ids != ledger_ids:
-        return "convergence_take_profit_ownership_ambiguous"
+    if pending_ids or ledger_ids:
+        return "convergence_take_profit_already_present"
     targets = _targets(convergence.desired_take_profits_json)
     if isinstance(targets, str):
         return targets
@@ -278,7 +280,7 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
     ]
     if not payloads:
         return "convergence_target_size_invalid"
-    return sorted(ledger_ids), payloads
+    return [], payloads
 
 
 def _targets(value: str):

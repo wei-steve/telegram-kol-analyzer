@@ -85,6 +85,29 @@ def test_visibility_retry_expiry_becomes_actionable_terminal_block(tmp_path):
         assert batch.notification_state == "pending"
 
 
+def test_worker_runs_ready_take_profit_convergence_only_when_execution_enabled():
+    calls = []
+
+    def convergence_runner(*_args, **kwargs):
+        calls.append(kwargs["processed_at"])
+        return 1
+
+    enabled = run_strategy_management_worker_tick(
+        object(), deepcoin_client_factory=lambda: object(), max_batches=1,
+        batch_lister=lambda *_args, **_kwargs: [], processed_at=NOW,
+        take_profit_convergence_runner=convergence_runner,
+    )
+    disabled = run_strategy_management_worker_tick(
+        object(), deepcoin_client_factory=lambda: object(), max_batches=1,
+        batch_lister=lambda *_args, **_kwargs: [], processed_at=NOW,
+        allow_execution=False, take_profit_convergence_runner=convergence_runner,
+    )
+
+    assert calls == [NOW]
+    assert enabled.executed == 1
+    assert disabled.executed == 0
+
+
 def test_worker_claims_ready_batch_once_across_racing_ticks(tmp_path):
     session_factory = create_session_factory(tmp_path / "worker.db")
     row = StrategyManagementBatch(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 from sqlalchemy.orm import Session
 
@@ -11,6 +12,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     PositionTakeProfitOrder,
+    TriggerTakeProfitConvergence,
     utc_now,
 )
 
@@ -117,6 +119,76 @@ def record_take_profit_cancelled(
     return row
 
 
+def reconcile_trigger_take_profit_order_history(
+    session: Session,
+    *,
+    positions: list[dict],
+    pending_orders: list[dict],
+    trigger_history: list[dict],
+    observed_at: datetime | None = None,
+) -> None:
+    """Reconcile TP audit records from read-only exchange observations.
+
+    A reduced position is never treated as a TP fill unless a known TP order
+    has a terminal history row.  That rule keeps generic/manual partial exits
+    from silently changing the staged plan.
+    """
+
+    now = observed_at or utc_now()
+    pending_ids = {_order_id(row) for row in pending_orders if isinstance(row, dict)}
+    history_by_id = {
+        order_id: row for row in trigger_history if isinstance(row, dict)
+        if (order_id := _order_id(row)) is not None
+    }
+    active_rows = (
+        session.query(PositionTakeProfitOrder)
+        .filter(PositionTakeProfitOrder.status == "active")
+        .all()
+    )
+    for row in active_rows:
+        history = history_by_id.get(row.order_id)
+        if row.order_id in pending_ids or history is None:
+            continue
+        terminal = _terminal_order_status(history)
+        if terminal is None:
+            continue
+        row.status = terminal
+        row.completed_at = now
+        row.updated_at = now
+
+    convergences = (
+        session.query(TriggerTakeProfitConvergence)
+        .filter(TriggerTakeProfitConvergence.status == "submitted")
+        .all()
+    )
+    for convergence in convergences:
+        if not convergence.pos_id:
+            continue
+        live_size = _live_position_size(
+            positions,
+            pos_id=str(convergence.pos_id),
+            binding_id=int(convergence.execution_binding_id),
+            session=session,
+        )
+        if live_size is None:
+            continue
+        orders = (
+            session.query(PositionTakeProfitOrder)
+            .filter(PositionTakeProfitOrder.trigger_take_profit_convergence_id == convergence.id)
+            .all()
+        )
+        if not orders:
+            continue
+        planned_size = sum((_decimal_or_zero(row.size_text) for row in orders), Decimal("0"))
+        terminal_fills = any(row.status == "filled" for row in orders)
+        if live_size < planned_size and not terminal_fills:
+            convergence.status = "conflicted"
+            convergence.reason_code = "convergence_partial_position_unexplained"
+            convergence.completed_at = now
+            convergence.updated_at = now
+    session.flush()
+
+
 def _require_exact_leg_ownership(
     session: Session,
     *,
@@ -148,3 +220,43 @@ def _required_text(value: object, label: str) -> str:
 
 def _json(value: dict[str, object] | None) -> str | None:
     return json.dumps(value, ensure_ascii=False, sort_keys=True) if value is not None else None
+
+
+def _order_id(row: dict) -> str | None:
+    value = row.get("ordId") or row.get("orderId") or row.get("order_id")
+    return str(value) if value not in (None, "") else None
+
+
+def _terminal_order_status(row: dict) -> str | None:
+    status = str(row.get("state") or row.get("status") or row.get("ordState") or "").lower()
+    if status in {"filled", "success", "executed"}:
+        return "filled"
+    if status in {"cancelled", "canceled"}:
+        return "cancelled"
+    if status in {"expired", "failed", "rejected"}:
+        return "expired"
+    return None
+
+
+def _live_position_size(positions: list[dict], *, pos_id: str, binding_id: int, session: Session) -> Decimal | None:
+    binding = session.get(ExecutionBinding, binding_id)
+    if binding is None:
+        return None
+    inst_id = f"{str(binding.symbol).upper()}-USDT-SWAP"
+    matches = [
+        row for row in positions if isinstance(row, dict)
+        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
+        and str(row.get("instId") or "").upper() == inst_id
+        and str(row.get("posSide") or row.get("pos_side") or "").lower() == str(binding.side).lower()
+        and str(row.get("mrgPosition") or row.get("posMode") or "").lower() == "split"
+        and _decimal_or_zero(row.get("pos")) > 0
+    ]
+    return _decimal_or_zero(matches[0].get("pos")) if len(matches) == 1 else None
+
+
+def _decimal_or_zero(value: object) -> Decimal:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
+    return parsed if parsed.is_finite() else Decimal("0")

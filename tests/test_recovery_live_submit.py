@@ -391,14 +391,17 @@ def test_build_deepcoin_position_sltp_payload_allows_stop_loss_without_take_prof
     }
 
 
-def test_build_deepcoin_trigger_order_payload_embeds_take_profit_and_stop_loss():
+def test_build_deepcoin_trigger_order_payload_is_stop_only_for_staged_take_profit():
     payload = build_deepcoin_trigger_order_payload(
         {
             "instrument_id": "BTC-USDT-SWAP",
             "margin_mode": "cross",
             "position_mode": "split",
             "stop_loss": 67500.0,
-            "take_profit_legs": [{"price": 69000.0, "allocation_pct": 100.0}],
+            "take_profit_legs": [
+                {"price": 69000.0, "allocation_pct": 50.0},
+                {"price": 70000.0, "allocation_pct": 50.0},
+            ],
             "order_legs": [{"position_side": "long"}],
         },
         {
@@ -412,7 +415,7 @@ def test_build_deepcoin_trigger_order_payload_embeds_take_profit_and_stop_loss()
 
     assert payload["orderType"] == "limit"
     assert payload["triggerPrice"] == "68100.0"
-    assert payload["tpTriggerPx"] == 69000.0
+    assert not any(key.startswith("tp") for key in payload)
     assert payload["slTriggerPx"] == 67500.0
     assert payload["mrgPosition"] == "split"
     assert payload["clOrdId"] == "TKFG8248E1"
@@ -568,10 +571,7 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     assert fake_client.trigger_payloads[0]["mrgPosition"] == "split"
     assert fake_client.trigger_payloads[0]["orderType"] == "limit"
     assert fake_client.trigger_payloads[0]["triggerPrice"] == "68200.0"
-    assert [payload["tpTriggerPx"] for payload in fake_client.trigger_payloads] == [
-        69000.0,
-        69000.0,
-    ]
+    assert all(not any(key.startswith("tp") for key in payload) for payload in fake_client.trigger_payloads)
     assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
     assert fake_client.position_protection_payloads == []
     assert result["warnings"] == []
@@ -1104,7 +1104,7 @@ def test_market_submit_failure_invalidates_lifecycle(tmp_path):
     assert lifecycle.exited_at is not None
 
 
-def test_limit_submit_uses_trigger_order_with_embedded_protection(tmp_path):
+def test_limit_submit_uses_stop_only_trigger_protection(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _persist_ready_item(session_factory)
     _persist_lifecycle(session_factory)
@@ -1127,10 +1127,7 @@ def test_limit_submit_uses_trigger_order_with_embedded_protection(tmp_path):
     assert fake_client.payloads == []
     assert fake_client.protection_payloads == []
     assert fake_client.trigger_payloads[0]["orderType"] == "limit"
-    assert [payload["tpTriggerPx"] for payload in fake_client.trigger_payloads] == [
-        69000.0,
-        69000.0,
-    ]
+    assert all(not any(key.startswith("tp") for key in payload) for payload in fake_client.trigger_payloads)
     assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
     assert fake_client.position_protection_payloads == []
     with session_factory() as session:

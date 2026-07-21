@@ -1796,26 +1796,17 @@ def _deepcoin_embedded_sltp_fields(
     draft: dict[str, Any],
     take_profit_leg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    protection = build_deepcoin_position_sltp_payload(draft, pos_id="placeholder")
-    if take_profit_leg is not None:
-        take_profit_price = take_profit_leg.get("price")
-        if not isinstance(take_profit_price, int | float) or take_profit_price <= 0:
-            raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
-        protection["tpTriggerPx"] = str(float(take_profit_price))
-    fields = {
-        "slTriggerPx": float(protection["slTriggerPx"]),
-        "slTriggerPxType": protection["slTriggerPxType"],
+    """Return stop-only trigger protection; TP waits for exact filled ``posId``."""
+
+    del take_profit_leg
+    stop_loss = draft.get("stop_loss")
+    if not isinstance(stop_loss, int | float) or stop_loss <= 0:
+        raise RecoveryLiveSubmitError("missing_stop_loss_for_protection")
+    return {
+        "slTriggerPx": float(stop_loss),
+        "slTriggerPxType": "last",
         "slOrdPx": -1,
     }
-    if "tpTriggerPx" in protection:
-        fields.update(
-            {
-                "tpTriggerPx": float(protection["tpTriggerPx"]),
-                "tpTriggerPxType": protection["tpTriggerPxType"],
-                "tpOrdPx": -1,
-            }
-        )
-    return fields
 
 
 def _first_take_profit_price(draft: dict[str, Any]) -> float | None:

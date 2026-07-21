@@ -27,6 +27,9 @@ from telegram_kol_research.strategy_management_executor import (
     execute_management_batch,
     validate_management_restart_snapshot,
 )
+from telegram_kol_research.trigger_take_profit_convergence_executor import (
+    execute_ready_trigger_take_profit_convergences,
+)
 from telegram_kol_research.strategy_management_reconciliation import (
     reconcile_strategy_management_batches,
 )
@@ -99,6 +102,7 @@ def run_strategy_management_worker_tick(
     restart_validator: Callable[..., None] = validate_management_restart_snapshot,
     cursor: StrategyManagementWorkerCursor | None = None,
     contract_spec_provider=None,
+    take_profit_convergence_runner: Callable[..., int] = execute_ready_trigger_take_profit_convergences,
 ) -> StrategyManagementWorkerResult:
     """Process a bounded amount of work, isolating every durable batch failure."""
 
@@ -140,6 +144,20 @@ def run_strategy_management_worker_tick(
         if snapshot is None:
             snapshot = snapshot_loader(session_factory, client=get_client())
         return snapshot
+
+    if allow_execution:
+        try:
+            counts["executed"] += int(
+                take_profit_convergence_runner(
+                    session_factory,
+                    deepcoin_client=get_client(),
+                    processed_at=now,
+                    limit=limit,
+                )
+                or 0
+            )
+        except Exception:
+            logger.exception("trigger take-profit convergence worker lane failed")
 
     def resolve_race_successor(*, batch_id: int, current_snapshot: Any) -> bool:
         if race_successor_resolver is None:
