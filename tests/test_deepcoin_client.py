@@ -205,6 +205,7 @@ def test_pending_trigger_read_exposes_raw_response_for_completeness_audit():
     assert http_client.requests[0]["request_path"].startswith(
         "/deepcoin/trade/trigger-orders-pending?"
     )
+    assert "limit=100" in http_client.requests[0]["request_path"]
 
 
 def test_cancel_position_sltp_uses_official_contract_and_shared_write_limiter():

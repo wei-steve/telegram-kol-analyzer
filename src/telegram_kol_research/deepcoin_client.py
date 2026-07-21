@@ -379,7 +379,7 @@ class DeepcoinRestClient:
             "GET",
             _path_with_query(
                 DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH,
-                {"instType": "SWAP", "instId": inst_id},
+                {"instType": "SWAP", "instId": inst_id, "limit": 100},
             ),
         )
 
