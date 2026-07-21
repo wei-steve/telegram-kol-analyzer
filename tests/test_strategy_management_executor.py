@@ -534,6 +534,38 @@ def test_close_batch_accepts_verified_entry_subset_with_pending_range_leg(tmp_pa
         assert pending_leg.terminal_reason == "management_full_close_cancelled_unfilled_entry_leg"
 
 
+def test_partial_take_profit_cancels_deferred_range_entry_before_closing_filled_leg(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory, sizes=("1", "2"))
+    deferred_ids, _ = _configure_deferred_full_exit(session_factory, batch)
+    client = _FakeClient(session_factory, [{"code": "0", "data": {"ordId": "close-1"}}])
+    client.trigger_pending = [
+        {"ordId": "deferred-order-1", "clOrdId": "deferred-client-1"}
+    ]
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "reconciling"
+    assert client.cancel_trigger_calls == [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "ordId": "deferred-order-1",
+            "clOrdId": "deferred-client-1",
+        }
+    ]
+    assert [payload["closePosId"] for payload, _status in client.calls] == ["pos-1"]
+    assert client.call_log[0][0] == "cancel_trigger_order"
+    with session_factory() as session:
+        deferred = session.get(ExecutionOrderLeg, deferred_ids[0])
+        assert deferred.status == "cancelled"
+
+
 def test_full_close_does_not_submit_when_deferred_entry_leg_is_not_live(tmp_path):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
 

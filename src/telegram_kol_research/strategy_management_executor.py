@@ -315,42 +315,42 @@ def execute_management_batch(
     if batch.status != "executing":
         raise ManagementBatchExecutionError(f"batch_not_executable:{batch.status}")
     binding = _load_exact_binding(session_factory, batch)
-    if batch.effective_action in {"full_close", "full_exit"}:
-        try:
+    if batch.effective_action not in {"full_close", "full_exit"}:
+        _require_exact_entry_legs(session_factory, batch)
+    try:
+        if batch.effective_action in {"full_close", "full_exit"}:
             _require_exact_entry_legs(session_factory, batch)
-            _cancel_deferred_entry_legs(
+        _cancel_deferred_entry_legs(
+            session_factory,
+            batch=batch,
+            binding=binding,
+            deepcoin_client=deepcoin_client,
+            cancelled_at=now,
+        )
+    except Exception as exc:
+        if isinstance(exc, DeferredEntryIdentityDriftError):
+            _persist_deferred_cancel_diagnostics(
                 session_factory,
                 batch=batch,
                 binding=binding,
-                deepcoin_client=deepcoin_client,
-                cancelled_at=now,
+                diagnostics=exc.diagnostics,
+                created_at=now,
             )
-        except Exception as exc:
-            if isinstance(exc, DeferredEntryIdentityDriftError):
-                _persist_deferred_cancel_diagnostics(
-                    session_factory,
-                    batch=batch,
-                    binding=binding,
-                    diagnostics=exc.diagnostics,
-                    created_at=now,
-                )
-            if not transition_batch(
-                session_factory,
-                batch.id,
-                expected_statuses={"executing"},
-                new_status="recovery_required",
-                transitioned_at=now,
-                reason_code="deferred_entry_cancel_preflight_failed",
-            ):
-                raise ManagementBatchExecutionError(
-                    "management_batch_deferred_cancel_transition_conflict"
-                )
-            return _result(
-                load_management_batch(session_factory, batch.id),
-                reason="deferred_entry_cancel_preflight_failed",
+        if not transition_batch(
+            session_factory,
+            batch.id,
+            expected_statuses={"executing"},
+            new_status="recovery_required",
+            transitioned_at=now,
+            reason_code="deferred_entry_cancel_preflight_failed",
+        ):
+            raise ManagementBatchExecutionError(
+                "management_batch_deferred_cancel_transition_conflict"
             )
-    else:
-        _require_exact_entry_legs(session_factory, batch)
+        return _result(
+            load_management_batch(session_factory, batch.id),
+            reason="deferred_entry_cancel_preflight_failed",
+        )
     try:
         _require_fresh_close_write_boundary(
             session_factory,
