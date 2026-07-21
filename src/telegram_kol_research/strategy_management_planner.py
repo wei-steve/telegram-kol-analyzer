@@ -27,6 +27,10 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
+    TriggerProtectionIntent,
+    TriggerProtectionStopRescue,
+    ExecutionEvent,
+    PositionAttributionAudit,
 )
 from telegram_kol_research.position_attribution import (
     TERMINAL_ENTRY_LEG_STATES,
@@ -103,6 +107,15 @@ class ManagementPlanningResult:
     @property
     def batch_id(self) -> int | None:
         return self.batch.id if self.batch is not None else None
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerProtectionStopRescuePlanningResult:
+    """Result of the explicitly authorized stop-only rescue planner."""
+
+    status: str
+    reason_code: str | None = None
+    rescue_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1299,6 +1312,178 @@ def normalize_requested_management_fraction(
     if not isfinite(fraction) or not 0 < fraction < 1:
         raise ManagementFractionError("management_fraction_invalid")
     return fraction
+
+
+def plan_trigger_protection_stop_rescue(
+    session_factory: sessionmaker,
+    *,
+    intent_id: int,
+    deepcoin_client,
+    planned_at: datetime | None = None,
+) -> TriggerProtectionStopRescuePlanningResult:
+    """Reserve a narrowly-scoped stop-only rescue, or fail closed.
+
+    This is deliberately separate from normal management TPSL adjustment.  It is
+    only available for a saved, unresolved trigger-protection intent whose exact
+    split position has no ledger-owned stop.  No exchange mutation occurs here.
+    """
+
+    now = planned_at or datetime.now(UTC)
+    with position_authority_lock():
+        with session_factory() as session:
+            intent = session.get(TriggerProtectionIntent, int(intent_id))
+            if intent is None:
+                return TriggerProtectionStopRescuePlanningResult("blocked", "rescue_intent_not_found")
+            existing = (
+                session.query(TriggerProtectionStopRescue)
+                .filter(TriggerProtectionStopRescue.trigger_protection_intent_id == intent.id)
+                .one_or_none()
+            )
+            if existing is not None:
+                return TriggerProtectionStopRescuePlanningResult(
+                    existing.status, existing.reason_code, int(existing.id)
+                )
+            prepared = _prepare_trigger_protection_stop_rescue(
+                session, intent=intent, deepcoin_client=deepcoin_client
+            )
+            if isinstance(prepared, str):
+                return TriggerProtectionStopRescuePlanningResult(
+                    "noop" if prepared == "rescue_managed_stop_already_present" else "blocked",
+                    prepared,
+                )
+            leg, payload = prepared
+            rescue = TriggerProtectionStopRescue(
+                trigger_protection_intent_id=int(intent.id),
+                execution_binding_id=int(intent.execution_binding_id),
+                execution_order_leg_id=int(leg.id),
+                pos_id=str(leg.pos_id),
+                status="ready",
+                request_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                planned_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(rescue)
+            session.commit()
+            return TriggerProtectionStopRescuePlanningResult("ready", rescue_id=int(rescue.id))
+
+
+def _prepare_trigger_protection_stop_rescue(session, *, intent, deepcoin_client):
+    """Validate every authorization condition and produce an SL-only payload."""
+
+    if intent.venue != "deepcoin" or not _rescue_intent_is_deferred_or_ambiguous(session, intent):
+        return "rescue_intent_not_deferred"
+    leg = session.get(ExecutionOrderLeg, int(intent.execution_order_leg_id))
+    binding = session.get(ExecutionBinding, int(intent.execution_binding_id))
+    if (
+        leg is None
+        or binding is None
+        or int(leg.execution_binding_id) != int(binding.id)
+        or str(leg.purpose) != "entry"
+        or str(leg.order_kind) != "trigger_limit"
+        or str(leg.status).lower() not in MANAGEABLE_ENTRY_LEG_STATES
+        or str(leg.attribution_status) != "verified"
+        or not str(leg.pos_id or "").strip()
+        or str(binding.status).lower() != "active"
+        or str(binding.position_mode).lower() != "split"
+    ):
+        return "rescue_position_not_verified"
+    pos_id = str(leg.pos_id)
+    ledger_rows = list_verified_ledger_rows_for_positions(session, [pos_id])
+    if any(
+        int(row.execution_binding_id) == int(binding.id)
+        and int(row.execution_order_leg_id) == int(leg.id)
+        and str(row.purpose) in {"stop_loss", "combined"}
+        for row in ledger_rows
+    ):
+        return "rescue_managed_stop_already_present"
+    inst_id = f"{str(binding.symbol).upper()}-USDT-SWAP"
+    try:
+        live_positions = deepcoin_client.list_positions(inst_id=inst_id)
+        pending_tpsl = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
+    except Exception:
+        return "rescue_exchange_preflight_unavailable"
+    positions = [
+        row for row in live_positions
+        if str(row.get("posId") or row.get("pos_id") or "") == pos_id
+        and str(row.get("instId") or "").upper() == inst_id
+        and str(row.get("posSide") or row.get("pos_side") or "").lower() == str(binding.side).lower()
+        and str(row.get("posMode") or row.get("mrgPosition") or "").lower() == "split"
+        and _positive_live_size(row.get("pos"))
+    ]
+    if len(positions) != 1:
+        return "rescue_exact_live_position_not_verified"
+    if any(
+        str(row.get("instId") or "").upper() == inst_id
+        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
+        and _present(row, "tpTriggerPx", "tpTriggerPrice")
+        for row in pending_tpsl
+    ):
+        return "rescue_opaque_take_profit_present"
+    parent_events = (
+        session.query(ExecutionEvent)
+        .filter(ExecutionEvent.execution_binding_id == binding.id)
+        .filter(ExecutionEvent.action == "create_trigger_entry")
+        .filter(ExecutionEvent.order_id == str(intent.parent_trigger_order_id or ""))
+        .all()
+    )
+    if len(parent_events) != 1 or str(leg.order_id or "") != str(intent.parent_trigger_order_id or ""):
+        return "rescue_parent_trigger_evidence_not_unique"
+    request = _json_dict(parent_events[0].request_json)
+    stop_loss = _first_present(request, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+    if stop_loss is None:
+        return "rescue_stop_loss_not_saved"
+    return leg, {
+        "instType": "SWAP", "instId": inst_id, "posId": pos_id,
+        "posSide": str(binding.side).lower(), "mrgPosition": "split",
+        "tdMode": str(binding.margin_mode).lower(), "slTriggerPx": stop_loss,
+        "slTriggerPxType": _first_present(request, "slTriggerPxType") or "last",
+        "slOrdPx": _first_present(request, "slOrdPx", "slOrderPrice") or "-1",
+    }
+
+
+def _json_dict(value: str | None) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _first_present(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, "", 0, "0"):
+            return str(value)
+    return None
+
+
+def _present(payload: dict[str, Any], *keys: str) -> bool:
+    return _first_present(payload, *keys) is not None
+
+
+def _positive_live_size(value: Any) -> bool:
+    try:
+        return float(str(value)) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _rescue_intent_is_deferred_or_ambiguous(session, intent) -> bool:
+    if intent.recovery_state in {"pending", "retrying"}:
+        return True
+    if intent.recovery_state != "failed":
+        return False
+    audits = (
+        session.query(PositionAttributionAudit.evidence_json)
+        .filter(PositionAttributionAudit.execution_order_leg_id == intent.execution_order_leg_id)
+        .filter(PositionAttributionAudit.event_type == "protection_adoption_refused")
+        .all()
+    )
+    return any(
+        any(token in str(evidence or "").lower() for token in ("ambiguous", "not_unique", "deferred"))
+        for (evidence,) in audits
+    )
 
 
 def _unverified_protection_reason(

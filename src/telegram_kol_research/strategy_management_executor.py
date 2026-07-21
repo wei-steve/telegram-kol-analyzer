@@ -30,6 +30,8 @@ from telegram_kol_research.models import (
     RawMessage,
     StrategyLifecycle,
     StrategyManagementBatch,
+    TriggerProtectionIntent,
+    TriggerProtectionStopRescue,
 )
 from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 from telegram_kol_research.position_authority_lock import (
@@ -48,6 +50,7 @@ from telegram_kol_research.strategy_management_batches import (
     transition_batch,
     transition_leg,
 )
+from telegram_kol_research.trigger_protection_intents import transition_trigger_protection_intent
 
 
 DEEPCOIN_CLIENT_ORDER_ID_MAX_LENGTH = 20
@@ -98,6 +101,156 @@ def build_management_client_order_id(*, batch_id: int, leg_id: int) -> str:
     digest = hashlib.sha256(f"management:{batch_id}:{leg_id}".encode()).hexdigest()
     value = f"TM{digest[:18]}".upper()
     return value[:DEEPCOIN_CLIENT_ORDER_ID_MAX_LENGTH]
+
+
+@serialized_position_authority_mutation
+def execute_trigger_protection_stop_rescue(
+    session_factory: sessionmaker,
+    *,
+    rescue_id: int,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    executed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Execute the explicitly planned SL-only rescue exactly once.
+
+    A durable ``reserved`` state is written before the exchange call.  It is
+    intentionally never retried automatically: a process crash at the response
+    boundary must not turn into a duplicate position stop.
+    """
+
+    now = executed_at or datetime.now(UTC)
+    with session_factory() as session:
+        rescue = session.get(TriggerProtectionStopRescue, int(rescue_id))
+        if rescue is None:
+            raise ManagementBatchExecutionError("trigger_protection_rescue_not_found")
+        if rescue.status != "ready":
+            return _trigger_protection_rescue_result(rescue)
+        intent = session.get(TriggerProtectionIntent, rescue.trigger_protection_intent_id)
+        if intent is None:
+            rescue.status = "blocked"
+            rescue.reason_code = "rescue_intent_not_found"
+            rescue.completed_at = now
+            rescue.updated_at = now
+            session.commit()
+            return _trigger_protection_rescue_result(rescue)
+        from telegram_kol_research.strategy_management_planner import (
+            _prepare_trigger_protection_stop_rescue,
+        )
+
+        prepared = _prepare_trigger_protection_stop_rescue(
+            session, intent=intent, deepcoin_client=deepcoin_client
+        )
+        if isinstance(prepared, str):
+            rescue.status = "blocked"
+            rescue.reason_code = prepared
+            rescue.completed_at = now
+            rescue.updated_at = now
+            session.commit()
+            return _trigger_protection_rescue_result(rescue)
+        leg, payload = prepared
+        if str(leg.pos_id) != rescue.pos_id:
+            rescue.status = "blocked"
+            rescue.reason_code = "rescue_position_identity_drift"
+            rescue.completed_at = now
+            rescue.updated_at = now
+            session.commit()
+            return _trigger_protection_rescue_result(rescue)
+        rescue.status = "reserved"
+        rescue.request_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        rescue.reserved_at = now
+        rescue.updated_at = now
+        session.commit()
+
+    try:
+        response = deepcoin_client.set_position_sltp(payload)
+    except DeepcoinDefiniteRejection as exc:
+        return _complete_trigger_protection_rescue_failure(
+            session_factory, rescue_id=int(rescue_id), now=now,
+            reason="rescue_submission_rejected", error=str(exc),
+        )
+    except Exception as exc:
+        return _complete_trigger_protection_rescue_failure(
+            session_factory, rescue_id=int(rescue_id), now=now,
+            reason="rescue_submission_outcome_unknown", error=str(exc), unknown=True,
+        )
+    order_id = _extract_order_id(response)
+    if not order_id:
+        return _complete_trigger_protection_rescue_failure(
+            session_factory, rescue_id=int(rescue_id), now=now,
+            reason="rescue_response_missing_order_id", error="missing ordId", unknown=True,
+            response=response,
+        )
+
+    # The response, ledger ownership, intent state and execution event are one
+    # local transaction.  Once this succeeds later management can rely on it.
+    with session_factory() as session:
+        rescue = session.get(TriggerProtectionStopRescue, int(rescue_id))
+        intent = session.get(TriggerProtectionIntent, rescue.trigger_protection_intent_id)
+        binding = session.get(ExecutionBinding, rescue.execution_binding_id)
+        leg = session.get(ExecutionOrderLeg, rescue.execution_order_leg_id)
+        if rescue.status != "reserved" or intent is None or binding is None or leg is None:
+            raise ManagementBatchExecutionError("trigger_protection_rescue_persistence_conflict")
+        rescue.status = "submitted"
+        rescue.reason_code = "rescue_stop_submitted"
+        rescue.exchange_order_id = order_id
+        rescue.response_json = json.dumps(response, ensure_ascii=False, sort_keys=True)
+        rescue.completed_at = now
+        rescue.updated_at = now
+        upsert_protection_ledger_row(
+            session,
+            venue="deepcoin", execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id, strategy_instance_id=binding.strategy_instance_id,
+            pos_id=rescue.pos_id, instrument_id=f"{binding.symbol.upper()}-USDT-SWAP",
+            side=binding.side, order_id=order_id, purpose="stop_loss",
+            trigger_price=str(payload["slTriggerPx"]), size_text=None, status="verified",
+            evidence_source="trigger_protection_stop_rescue",
+            evidence={"rescue_id": rescue.id, "intent_id": intent.id, "response": response},
+            seen_at=now,
+        )
+        transition_trigger_protection_intent(
+            session, intent, recovery_state="adopted", adopted_order_id=order_id
+        )
+        record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                execution_binding_id=binding.id, strategy_instance_id=binding.strategy_instance_id,
+                kol_id=binding.kol_id, chat_id=binding.chat_id, message_id=binding.message_id,
+                symbol=binding.symbol, side=binding.side, action="trigger_protection_stop_rescue",
+                status="submitted", order_id=order_id, pos_id=rescue.pos_id,
+                reason="deferred_trigger_protection_stop_only", request=payload,
+                response=response, created_at=now,
+            ),
+            session=session,
+        )
+        session.commit()
+        return _trigger_protection_rescue_result(rescue)
+
+
+def _complete_trigger_protection_rescue_failure(
+    session_factory, *, rescue_id: int, now: datetime, reason: str,
+    error: str, unknown: bool = False, response: Any = None,
+) -> dict[str, Any]:
+    with session_factory() as session:
+        rescue = session.get(TriggerProtectionStopRescue, rescue_id)
+        if rescue is None or rescue.status != "reserved":
+            raise ManagementBatchExecutionError("trigger_protection_rescue_state_conflict")
+        rescue.status = "submit_unknown" if unknown else "failed"
+        rescue.reason_code = reason
+        rescue.response_json = (
+            json.dumps(response, ensure_ascii=False, sort_keys=True)
+            if isinstance(response, dict) else None
+        )
+        rescue.completed_at = now
+        rescue.updated_at = now
+        session.commit()
+        return _trigger_protection_rescue_result(rescue)
+
+
+def _trigger_protection_rescue_result(rescue: TriggerProtectionStopRescue) -> dict[str, Any]:
+    return {
+        "rescue_id": int(rescue.id), "status": rescue.status,
+        "reason": rescue.reason_code, "order_id": rescue.exchange_order_id,
+    }
 
 
 @serialized_position_authority_mutation

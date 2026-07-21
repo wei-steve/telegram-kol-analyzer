@@ -790,6 +790,41 @@ class TriggerProtectionIntent(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class TriggerProtectionStopRescue(Base):
+    """One explicit, stop-only rescue attempt for a saved trigger intent."""
+
+    __tablename__ = "trigger_protection_stop_rescues"
+    __table_args__ = (
+        UniqueConstraint(
+            "trigger_protection_intent_id",
+            name="uq_trigger_protection_stop_rescues_intent",
+        ),
+        Index("ix_trigger_protection_stop_rescues_status", "status", "planned_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trigger_protection_intent_id: Mapped[int] = mapped_column(
+        ForeignKey("trigger_protection_intents.id"), nullable=False, index=True
+    )
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ready")
+    reason_code: Mapped[Optional[str]] = mapped_column(String(96), nullable=True)
+    request_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    exchange_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    planned_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    reserved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class ExecutionEvent(Base):
     __tablename__ = "execution_events"
     __table_args__ = (
