@@ -792,7 +792,7 @@ def _apply_reconcile_snapshot(
             result=result,
         )
         _ready_verified_trigger_take_profit_convergences(
-            session, legs=legs, recovered_at=recovered_at
+            session, legs=legs, snapshot=snapshot, recovered_at=recovered_at
         )
         from telegram_kol_research.position_take_profit_orders import (
             reconcile_trigger_take_profit_order_history,
@@ -843,6 +843,7 @@ def _ready_verified_trigger_take_profit_convergences(
     session,
     *,
     legs: list[ExecutionOrderLeg],
+    snapshot: _ReconcileSnapshot,
     recovered_at: datetime,
 ) -> None:
     """Release only exact, newly verified trigger legs to TP convergence."""
@@ -863,7 +864,27 @@ def _ready_verified_trigger_take_profit_convergences(
         .all()
     )
     for row in rows:
+        leg = next((item for item in legs if int(item.id) == int(row.execution_order_leg_id)), None)
+        if leg is None or _trigger_leg_child_fill_incomplete(leg, snapshot=snapshot):
+            continue
         mark_trigger_take_profit_convergence_ready(session, row, ready_at=recovered_at)
+
+
+def _trigger_leg_child_fill_incomplete(leg: ExecutionOrderLeg, *, snapshot: _ReconcileSnapshot) -> bool:
+    """Do not allocate TP from a transient partially-filled trigger child."""
+
+    parent_rows = [
+        row for row in [*snapshot.pending_trigger_orders, *snapshot.trigger_history]
+        if _exchange_row_matches_leg(row, leg)
+    ]
+    for parent in parent_rows:
+        children = [
+            child for child in [*snapshot.open_orders, *snapshot.order_history]
+            if _trigger_child_order_matches(parent, child)
+        ]
+        if any(classify_leg_exchange_state(child) != "filled" for child in children):
+            return True
+    return False
 
 
 def _adopt_verified_trigger_entry_protection(
