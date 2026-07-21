@@ -273,6 +273,7 @@ class _FakeClient:
         self.open_orders = []
         self.cancel_trigger_calls = []
         self.cancel_order_calls = []
+        self.cancel_trigger_outcomes = []
         self.call_log = []
 
     def list_positions(self, *, inst_id=None):
@@ -318,6 +319,11 @@ class _FakeClient:
         request = dict(payload)
         self.cancel_trigger_calls.append(request)
         self.call_log.append(("cancel_trigger_order", request))
+        if self.cancel_trigger_outcomes:
+            outcome = self.cancel_trigger_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
         return {"code": "0", "data": {"ordId": payload.get("ordId")}}
 
     def cancel_order(self, payload):
@@ -881,6 +887,29 @@ def _configure_deferred_full_exit(
         }
         session.commit()
     return deferred_ids, binding_before
+
+
+def test_full_close_marks_definite_deferred_cancel_rejection_as_race_candidate(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory, sizes=("3", "2"), intent="full_exit", effective_action="full_exit"
+    )
+    _configure_deferred_full_exit(session_factory, batch)
+    client = _FakeClient(session_factory)
+    client.trigger_pending = [
+        {"ordId": "deferred-order-1", "clOrdId": "deferred-client-1"}
+    ]
+    client.cancel_trigger_outcomes = [DeepcoinDefiniteRejection("not pending")]
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert result["reason"] == "deferred_entry_cancel_race_detected"
+    assert client.calls == []
 
 
 def test_full_close_rejects_unsnapshotted_eligible_deferred_entry_before_any_cancel(

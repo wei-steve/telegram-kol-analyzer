@@ -342,14 +342,22 @@ def execute_management_batch(
             expected_statuses={"executing"},
             new_status="recovery_required",
             transitioned_at=now,
-            reason_code="deferred_entry_cancel_preflight_failed",
+            reason_code=(
+                "deferred_entry_cancel_race_detected"
+                if isinstance(exc, DeepcoinDefiniteRejection)
+                else "deferred_entry_cancel_preflight_failed"
+            ),
         ):
             raise ManagementBatchExecutionError(
                 "management_batch_deferred_cancel_transition_conflict"
             )
         return _result(
             load_management_batch(session_factory, batch.id),
-            reason="deferred_entry_cancel_preflight_failed",
+            reason=(
+                "deferred_entry_cancel_race_detected"
+                if isinstance(exc, DeepcoinDefiniteRejection)
+                else "deferred_entry_cancel_preflight_failed"
+            ),
         )
     try:
         _require_fresh_close_write_boundary(
