@@ -767,6 +767,24 @@ class PositionProtectionRevision(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class PendingTpslSnapshotObservation(Base):
+    """Append-only completeness evidence for a Deepcoin pending-TPSL read."""
+
+    __tablename__ = "pending_tpsl_snapshot_observations"
+    __table_args__ = (
+        Index("ix_pending_tpsl_snapshot_instrument_time", "venue", "instrument_id", "observed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    instrument_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    response_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    order_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    complete: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(96), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class TriggerProtectionIntent(Base):
     """Durable recovery record for a trigger-protection submission."""
 
