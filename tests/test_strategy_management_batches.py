@@ -51,6 +51,55 @@ def test_race_resolved_successor_fingerprint_is_stable_and_distinct():
     assert len(first) == 64
 
 
+def test_race_resolved_successor_resolves_parent_before_creating_active_batch(tmp_path):
+    repository = _repository()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    parent = repository.create_management_batch(
+        session_factory,
+        idempotency_fingerprint="parent-race",
+        raw_message_id=101,
+        recognition_decision_id=201,
+        recognition_generation="generation-1",
+        target_lifecycle_id=301,
+        strategy_instance_id="strategy-race",
+        execution_binding_id=401,
+        intent="full_exit",
+        effective_action="full_exit",
+        execution_mode="live",
+        requested_fraction=None,
+        effective_fraction=1.0,
+        partial_round_before=0,
+        target_fingerprint="parent-target",
+        target_snapshot={"positions": []},
+        planned_at=datetime(2026, 7, 22, tzinfo=UTC),
+        legs=[],
+    )
+    repository.transition_batch(
+        session_factory,
+        parent.id,
+        expected_statuses={"ready"},
+        new_status="recovery_required",
+        reason_code="deferred_entry_cancel_race_detected",
+    )
+
+    successor = repository.create_race_resolved_successor_batch(
+        session_factory,
+        parent_batch_id=parent.id,
+        resolved_position_ids=["pos-race"],
+        target_snapshot={"positions": [{"pos_id": "pos-race", "size": "1"}]},
+        legs=[],
+    )
+
+    assert successor.status == "ready"
+    assert successor.effective_action == "full_exit"
+    assert successor.idempotency_fingerprint != parent.idempotency_fingerprint
+    assert successor.target_snapshot["race_resolved_successor_of"] == parent.id
+    with session_factory() as session:
+        parent_row = session.get(_management_models()[0], parent.id)
+        assert parent_row.status == "resolved"
+        assert parent_row.reason_code == "deferred_entry_cancel_race_resolved"
+
+
 def _batch_values(*, fingerprint: str = "batch-fingerprint", strategy: str = "strategy-1"):
     now = datetime(2026, 7, 15, 1, 2, 3, tzinfo=UTC)
     return {

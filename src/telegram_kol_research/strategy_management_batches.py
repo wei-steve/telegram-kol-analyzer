@@ -56,6 +56,67 @@ def race_resolved_successor_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def create_race_resolved_successor_batch(
+    session_factory: sessionmaker,
+    *,
+    parent_batch_id: int,
+    resolved_position_ids: Sequence[str],
+    target_snapshot: dict[str, Any],
+    legs: Sequence[ManagementLegCreate],
+    planned_at: datetime | None = None,
+) -> ManagementBatchRecord:
+    """Atomically terminalize one proven race parent and create its successor."""
+
+    now = planned_at or datetime.now(UTC)
+    with session_factory() as session:
+        _require_management_unique_indexes(session)
+        parent = session.get(StrategyManagementBatch, int(parent_batch_id))
+        if (
+            parent is None
+            or parent.status != "recovery_required"
+            or parent.reason_code != "deferred_entry_cancel_race_detected"
+        ):
+            raise ManagementSchemaSafetyError("race_successor_parent_not_ready")
+        parent_snapshot = json.loads(parent.target_snapshot_json or "{}")
+        successor_snapshot = dict(target_snapshot)
+        successor_snapshot["race_resolved_successor_of"] = parent.id
+        successor_fingerprint = race_resolved_successor_fingerprint(
+            parent_batch_id=parent.id,
+            parent_target_fingerprint=parent.target_fingerprint,
+            resolved_position_ids=resolved_position_ids,
+        )
+        parent.status = "resolved"
+        parent.reason_code = "deferred_entry_cancel_race_resolved"
+        parent.completed_at = now
+        parent.updated_at = now
+        target_fingerprint = hashlib.sha256(
+            json.dumps(successor_snapshot, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        successor_id = create_management_batch_in_session(
+            session,
+            idempotency_fingerprint=successor_fingerprint,
+            raw_message_id=parent.raw_message_id,
+            recognition_decision_id=parent.recognition_decision_id,
+            recognition_generation=parent.recognition_generation,
+            target_lifecycle_id=parent.target_lifecycle_id,
+            strategy_instance_id=parent.strategy_instance_id,
+            execution_binding_id=parent.execution_binding_id,
+            intent="full_exit",
+            effective_action="full_exit",
+            execution_mode=parent.execution_mode,
+            requested_fraction=None,
+            effective_fraction=1.0,
+            partial_round_before=parent.partial_round_before,
+            target_fingerprint=target_fingerprint,
+            target_snapshot=successor_snapshot,
+            legs=legs,
+            planned_at=now,
+            status="ready",
+        )
+        session.commit()
+    return load_management_batch(session_factory, successor_id)
+
+
 class ManagementSchemaSafetyError(RuntimeError):
     """Raised when database uniqueness cannot safely serialize mutations."""
 
