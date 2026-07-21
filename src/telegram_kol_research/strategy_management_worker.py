@@ -26,6 +26,7 @@ from telegram_kol_research.strategy_management_executor import (
 from telegram_kol_research.strategy_management_reconciliation import (
     reconcile_strategy_management_batches,
 )
+from telegram_kol_research.strategy_management_planner import plan_strategy_management_batch
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -76,6 +77,7 @@ def run_strategy_management_worker_tick(
     executor: Callable[..., Any] = execute_management_batch,
     restart_validator: Callable[..., None] = validate_management_restart_snapshot,
     cursor: StrategyManagementWorkerCursor | None = None,
+    contract_spec_provider=None,
 ) -> StrategyManagementWorkerResult:
     """Process a bounded amount of work, isolating every durable batch failure."""
 
@@ -120,6 +122,20 @@ def run_strategy_management_worker_tick(
 
     for batch in batches:
         try:
+            if batch.status == "blocked" and batch.reason_code == "protection_missing_cancellable_order_id":
+                if contract_spec_provider is None:
+                    counts["skipped"] += 1
+                    continue
+                result = plan_strategy_management_batch(
+                    session_factory,
+                    raw_message_id=batch.raw_message_id,
+                    deepcoin_client=get_client(),
+                    contract_spec_provider=contract_spec_provider,
+                    planned_at=now,
+                    execution_mode=batch.execution_mode,
+                )
+                counts["recovered"] += 1
+                continue
             if batch.status in _PAUSED_STATUSES:
                 counts["paused"] += 1
                 continue
@@ -258,6 +274,7 @@ async def run_strategy_management_worker_loop(
     interval_seconds: float = 5.0,
     max_batches: int = 10,
     now_provider=None,
+    contract_spec_provider=None,
 ) -> None:
     """Run bounded ticks forever; cancellation is owned by the Web lifespan."""
 
@@ -274,6 +291,7 @@ async def run_strategy_management_worker_loop(
                 processed_at=(
                     now_provider() if now_provider is not None else datetime.now(UTC)
                 ),
+                contract_spec_provider=contract_spec_provider,
             )
         except Exception:
             logger.exception("strategy management worker tick failed")

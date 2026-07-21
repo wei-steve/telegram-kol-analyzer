@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Iterable, Sequence
 
 from sqlalchemy import inspect, update
@@ -23,6 +23,7 @@ from telegram_kol_research.models import StrategyManagementLeg
 RECOVERABLE_BATCH_STATUSES = frozenset(
     {"executing", "reserved", "submitted", "submit_unknown", "reconciling"}
 )
+TEMPORARY_VISIBILITY_REASON = "protection_missing_cancellable_order_id"
 UNSET = object()
 
 
@@ -468,6 +469,16 @@ def list_worker_batches(
 
         executable = load_lane({"ready", "protection_ready"})
         recovery = load_lane(RECOVERABLE_BATCH_STATUSES)
+        temporary_visibility = (
+            session.query(StrategyManagementBatch)
+            .filter(StrategyManagementBatch.status == "blocked")
+            .filter(StrategyManagementBatch.reason_code == TEMPORARY_VISIBILITY_REASON)
+            .filter(StrategyManagementBatch.planned_at >= datetime.now(UTC) - timedelta(minutes=5))
+            .order_by(StrategyManagementBatch.planned_at.asc(), StrategyManagementBatch.id.asc())
+            .limit(limit)
+            .all()
+        )
+        recovery = recovery + temporary_visibility
         lanes = (
             (recovery, executable) if prefer_recovery else (executable, recovery)
         )

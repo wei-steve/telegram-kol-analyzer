@@ -2531,6 +2531,7 @@ def create_web_app(
                     interval_seconds=app.state.strategy_management_worker_interval_seconds,
                     max_batches=app.state.strategy_management_worker_max_batches,
                     now_provider=app.state.now_provider,
+                    contract_spec_provider=app.state.deepcoin_contract_spec_provider,
                 )
             )
             app.state.strategy_management_worker_task.add_done_callback(
