@@ -10,6 +10,7 @@ from telegram_kol_research.models import (
     MediaAsset,
     PositionAttributionAudit,
     PositionProtectionLedger,
+    PositionProtectionRevision,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -274,6 +275,90 @@ def test_strategy_detail_shows_exact_adopted_trigger_protection_order_only(tmp_p
         "refusal_codes": [],
     }
     assert "tpsl-other-position" not in str(detail["execution"]["protection_adoption"])
+
+
+def test_strategy_detail_projects_exact_protection_revision_history(tmp_path):
+    session_factory = create_session_factory(tmp_path / "protection-revisions-detail.db")
+    with session_factory() as session:
+        binding, lifecycle, leg = _seed_trigger_entry_strategy(session)
+        initial = PositionProtectionRevision(
+            venue="deepcoin",
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            pos_id="pos-adopted",
+            source="entry_submit",
+            status="superseded",
+            protection_json='{"take_profit_order_ids":["tp-initial"],"stop_loss_order_ids":["sl-initial"]}',
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(initial)
+        session.flush()
+        session.add_all(
+            [
+                PositionProtectionRevision(
+                    venue="deepcoin",
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    pos_id="pos-adopted",
+                    previous_revision_id=initial.id,
+                    source="management_replace",
+                    status="active",
+                    protection_json='{"take_profit_order_ids":["tp-current"],"stop_loss_order_ids":["sl-current"]}',
+                    created_at=NOW + timedelta(minutes=1),
+                    updated_at=NOW + timedelta(minutes=1),
+                ),
+                PositionProtectionRevision(
+                    venue="deepcoin",
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id="foreign-strategy",
+                    pos_id="pos-foreign",
+                    source="entry_submit",
+                    status="active",
+                    protection_json='{"take_profit_order_ids":["foreign"]}',
+                    created_at=NOW,
+                    updated_at=NOW,
+                ),
+            ]
+        )
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    detail = load_strategy_record_detail(
+        session_factory, lifecycle_id=lifecycle_id, group_labels_by_chat_id={}
+    )
+
+    assert detail is not None
+    assert detail["execution"]["protection_revisions"] == [
+        {
+            "id": 1,
+            "pos_id": "pos-adopted",
+            "previous_revision_id": None,
+            "source": "entry_submit",
+            "status": "superseded",
+            "protection": {
+                "take_profit_order_ids": ["tp-initial"],
+                "stop_loss_order_ids": ["sl-initial"],
+            },
+            "timestamp": NOW,
+        },
+        {
+            "id": 2,
+            "pos_id": "pos-adopted",
+            "previous_revision_id": 1,
+            "source": "management_replace",
+            "status": "active",
+            "protection": {
+                "take_profit_order_ids": ["tp-current"],
+                "stop_loss_order_ids": ["sl-current"],
+            },
+            "timestamp": NOW + timedelta(minutes=1),
+        },
+    ]
+    assert "foreign" not in str(detail["execution"]["protection_revisions"])
 
 
 def test_strategy_detail_marks_ambiguous_trigger_protection_refusal_actionable(tmp_path):

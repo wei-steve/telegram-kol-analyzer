@@ -128,6 +128,28 @@
       {% endfor %}
     </div>
 
+    <div aria-label="保护版本历史">
+      <h3>止盈止损版本历史</h3>
+      {% for revision in record.execution.protection_revisions %}
+        <article data-protection-revision-id="{{ revision.id }}">
+          <dl>
+            <dt>版本 ID</dt><dd><span class="strategy-identifier">{{ revision.id }}</span></dd>
+            <dt>精确 pos_id</dt><dd><span class="strategy-identifier">{{ revision.pos_id }}</span></dd>
+            <dt>前一版本</dt><dd><span class="strategy-identifier">{{ revision.previous_revision_id or '-' }}</span></dd>
+            <dt>来源</dt><dd>{{ revision.source }}</dd>
+            <dt>状态</dt><dd>{{ revision.status }}</dd>
+            <dt>记录时间</dt><dd>{{ revision.timestamp or '时间缺失' }}</dd>
+          </dl>
+          <details>
+            <summary>查看该版本止盈止损订单</summary>
+            <pre>{{ revision.protection | tojson(indent=2) }}</pre>
+          </details>
+        </article>
+      {% else %}
+        <p>暂无已记录的止盈止损版本</p>
+      {% endfor %}
+    </div>
+
     <div aria-label="订单腿证据">
       <h3>订单腿</h3>
       {% for leg in record.execution.order_legs %}

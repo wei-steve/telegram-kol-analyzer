@@ -23,6 +23,7 @@ from telegram_kol_research.models import (
     MessageRecognition,
     PositionAttributionAudit,
     PositionProtectionLedger,
+    PositionProtectionRevision,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -94,6 +95,7 @@ _TIMELINE_KIND_RANK = MappingProxyType(
         "protection_adoption_refused": 7,
         "management": 8,
         "trigger_protection_recovery": 9,
+        "protection_revision": 10,
     }
 )
 _MESSAGE_ROLE_RANK = MappingProxyType({"entry": 0, "management": 1, "exit": 2})
@@ -253,6 +255,20 @@ def load_strategy_record_detail(
             .order_by(PositionProtectionLedger.created_at, PositionProtectionLedger.id)
             .all()
             if entry_leg_ids
+            else []
+        )
+        protection_revisions = (
+            session.query(PositionProtectionRevision)
+            .filter(
+                PositionProtectionRevision.execution_binding_id == binding_id,
+                PositionProtectionRevision.execution_order_leg_id.in_(entry_leg_ids),
+            )
+            .order_by(
+                PositionProtectionRevision.created_at,
+                PositionProtectionRevision.id,
+            )
+            .all()
+            if binding_id is not None and entry_leg_ids
             else []
         )
         protection_refusal_rows = (
@@ -587,6 +603,11 @@ def load_strategy_record_detail(
         ledger_rows=protection_ledger_rows,
         refusal_rows=protection_refusal_rows,
     )
+    protection_revision_history = _protection_revision_detail(
+        revisions=protection_revisions,
+        order_legs=order_legs,
+        binding_id=binding_id,
+    )
     trigger_protection_recovery = _trigger_protection_recovery_detail(
         intents=trigger_protection_intents,
         rescues=trigger_protection_stop_rescues,
@@ -644,6 +665,23 @@ def load_strategy_record_detail(
                     "stop_rescue_state": row["stop_rescue"]["state"],
                 },
                 status=str(row["recovery_state"]),
+            )
+        )
+    for row in protection_revision_history:
+        timeline.append(
+            _detail_timeline_item(
+                kind="protection_revision",
+                timestamp=row["timestamp"],
+                database_id=int(row["id"]),
+                event_id=f"protection_revision:{int(row['id'])}",
+                source={
+                    "table": "position_protection_revisions",
+                    "id": int(row["id"]),
+                    "pos_id": str(row["pos_id"]),
+                    "source": str(row["source"]),
+                    "status": str(row["status"]),
+                },
+                status=str(row["status"]),
             )
         )
     for batch in management_batches:
@@ -754,6 +792,7 @@ def load_strategy_record_detail(
                 "evidence_sources": protection_adoption["evidence_sources"],
                 "refusal_codes": protection_adoption["refusal_codes"],
             },
+            "protection_revisions": protection_revision_history,
             "trigger_protection_recovery": [
                 {
                     key: value
@@ -846,6 +885,43 @@ def _protection_adoption_detail(
         "adopted_rows": adopted_rows,
         "refusal_rows": parsed_refusals,
     }
+
+
+def _protection_revision_detail(
+    *,
+    revisions: list[PositionProtectionRevision],
+    order_legs: list[ExecutionOrderLeg],
+    binding_id: int | None,
+) -> list[dict[str, object]]:
+    """Project only history tied to this strategy's verified entry position."""
+
+    exact_positions_by_leg_id = {
+        int(leg.id): str(leg.pos_id)
+        for leg in order_legs
+        if leg.purpose == "entry"
+        and str(leg.attribution_status or "") == "verified"
+        and str(leg.pos_id or "").strip()
+    }
+    projected: list[dict[str, object]] = []
+    for revision in revisions:
+        if binding_id is None or int(revision.execution_binding_id) != binding_id:
+            continue
+        if exact_positions_by_leg_id.get(int(revision.execution_order_leg_id)) != str(
+            revision.pos_id
+        ):
+            continue
+        projected.append(
+            {
+                "id": int(revision.id),
+                "pos_id": str(revision.pos_id),
+                "previous_revision_id": revision.previous_revision_id,
+                "source": str(revision.source),
+                "status": str(revision.status),
+                "protection": _safe_json_value(revision.protection_json),
+                "timestamp": _as_utc(revision.updated_at or revision.created_at),
+            }
+        )
+    return projected
 
 
 def _trigger_protection_recovery_detail(

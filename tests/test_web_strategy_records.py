@@ -9,6 +9,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    PositionProtectionRevision,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -367,6 +368,60 @@ def test_strategy_record_detail_renders_safe_trigger_recovery_audit_fields(tmp_p
         assert visible_value in response.text
     assert "must-not-render" not in response.text
     assert "rescue-order-must-not-render" not in response.text
+
+
+def test_strategy_record_detail_renders_protection_revision_history(tmp_path):
+    client, lifecycle_id = _client(tmp_path)
+    with client.app.state.session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        leg = session.query(ExecutionOrderLeg).one()
+        session.add_all(
+            [
+                PositionProtectionRevision(
+                    venue="deepcoin",
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    pos_id="pos-web-record",
+                    source="entry_submit",
+                    status="superseded",
+                    protection_json='{"take_profit_order_ids":["tp-initial"],"stop_loss_order_ids":["sl-initial"]}',
+                    created_at=NOW,
+                    updated_at=NOW,
+                ),
+                PositionProtectionRevision(
+                    venue="deepcoin",
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    pos_id="pos-web-record",
+                    previous_revision_id=1,
+                    source="management_replace",
+                    status="active",
+                    protection_json='{"take_profit_order_ids":["tp-current"],"stop_loss_order_ids":["sl-current"]}',
+                    created_at=NOW + timedelta(minutes=1),
+                    updated_at=NOW + timedelta(minutes=1),
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.get(f"/strategy-records/{lifecycle_id}")
+
+    assert response.status_code == 200
+    assert 'data-protection-revision-id="1"' in response.text
+    assert 'data-protection-revision-id="2"' in response.text
+    for visible_value in (
+        "entry_submit",
+        "management_replace",
+        "superseded",
+        "active",
+        "tp-initial",
+        "sl-initial",
+        "tp-current",
+        "sl-current",
+    ):
+        assert visible_value in response.text
 
 
 def test_strategy_record_detail_management_batch_exposes_authoritative_ids_and_leg_statuses(tmp_path):
