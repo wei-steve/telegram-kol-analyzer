@@ -106,6 +106,9 @@ class ManagementBatchRecord:
     completed_at: datetime | None
     notification_state: str | None
     notification_fingerprint: str | None
+    visibility_first_failed_at: datetime | None
+    visibility_retry_attempts: int
+    visibility_next_attempt_at: datetime | None
     created_at: datetime
     updated_at: datetime
     legs: tuple[ManagementLegRecord, ...]
@@ -543,6 +546,9 @@ def _batch_to_record(session, batch: StrategyManagementBatch) -> ManagementBatch
         completed_at=_utc(batch.completed_at),
         notification_state=batch.notification_state,
         notification_fingerprint=batch.notification_fingerprint,
+        visibility_first_failed_at=_utc(batch.visibility_first_failed_at),
+        visibility_retry_attempts=int(batch.visibility_retry_attempts or 0),
+        visibility_next_attempt_at=_utc(batch.visibility_next_attempt_at),
         created_at=_utc(batch.created_at),
         updated_at=_utc(batch.updated_at),
         legs=tuple(_leg_to_record(leg) for leg in legs),

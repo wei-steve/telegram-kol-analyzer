@@ -1202,7 +1202,10 @@ def _retryable_preflight_blocked_batch(
         return False
     if batch.reason_code in _TEMPORARY_PROTECTION_VISIBILITY_REASONS:
         reference = now or datetime.now(UTC)
-        if reference > batch.planned_at + TEMPORARY_PROTECTION_VISIBILITY_WINDOW:
+        first_failure = batch.visibility_first_failed_at or batch.planned_at
+        if first_failure.tzinfo is None:
+            first_failure = first_failure.replace(tzinfo=UTC)
+        if reference >= first_failure + TEMPORARY_PROTECTION_VISIBILITY_WINDOW:
             return False
     if batch.legs:
         return False

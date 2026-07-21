@@ -1021,6 +1021,44 @@ def test_missing_ledger_order_replans_when_it_becomes_visible_within_five_minute
     assert recovered.batch.id == blocked.batch.id
 
 
+def test_visibility_recovery_cannot_become_ready_at_five_minute_deadline(monkeypatch, tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "deadline.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory, intent="adjust_stop_loss"
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=binding_id
+        ).one()
+        upsert_protection_ledger_row(
+            session, venue="deepcoin", execution_binding_id=binding_id,
+            execution_order_leg_id=leg.id, strategy_instance_id=leg.strategy_instance_id,
+            pos_id="pos-b", instrument_id="BTC-USDT-SWAP", side="short",
+            order_id="sl-1", purpose="stop_loss", trigger_price="63000",
+            size_text="0", status="verified", evidence_source="entry", evidence={},
+            seen_at=PLANNED_AT,
+        )
+        session.commit()
+    blocked = planner.plan_strategy_management_batch(
+        session_factory, raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()], tpsl_orders=[]),
+        contract_spec_provider=_ContractSpecs(), planned_at=PLANNED_AT,
+    )
+    deadline = planner.plan_strategy_management_batch(
+        session_factory, raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()], tpsl_orders=[{
+            "instId": "BTC-USDT-SWAP", "posSide": "short", "triggerOrderType": "TPSL",
+            "slTriggerPx": "63000", "sz": "0", "ordId": "sl-1",
+        }]), contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT + timedelta(minutes=5),
+    )
+    assert blocked.status == "blocked"
+    assert deadline.status == "blocked"
+    assert deadline.reason_code == "protection_missing_cancellable_order_id"
+
+
 def test_ledger_backed_protection_requires_matching_price(monkeypatch, tmp_path):
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "research.db")
