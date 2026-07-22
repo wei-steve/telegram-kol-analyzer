@@ -713,6 +713,8 @@ def _build_message_decision_card(
     payload = payload if isinstance(payload, dict) else {}
     lifecycle_event = payload.get("lifecycle_event")
     lifecycle_event = lifecycle_event if isinstance(lifecycle_event, dict) else {}
+    strategy = payload.get("strategy")
+    strategy = strategy if isinstance(strategy, dict) else {}
 
     event_type = str(lifecycle_event.get("event_type") or "")
     management_action = str(lifecycle_event.get("management_action") or "")
@@ -721,6 +723,16 @@ def _build_message_decision_card(
         "stop" in management_action or management_action == "risk_update"
     )
     missing_stop_price = is_stop_management and stop_loss in (None, "")
+    has_complete_strategy = all(
+        strategy.get(field) not in (None, "")
+        for field in ("symbol", "side", "entry", "stop_loss", "take_profit")
+    )
+    is_safely_linked_event = (
+        event_type not in {"", "none"}
+        and lifecycle_event.get("target_lifecycle_id") not in (None, "")
+        and decision.agreement_status == "agreed"
+        and decision.disagreement_severity == "none"
+    )
 
     if missing_stop_price:
         state = "manual_review"
@@ -737,6 +749,16 @@ def _build_message_decision_card(
         state_label = "获取失败"
         recommended_action = "重新识别"
         blocker = None
+    elif has_complete_strategy:
+        state = "strategy_identified"
+        state_label = "策略已识别"
+        recommended_action = "查看执行记录"
+        blocker = None
+    elif is_safely_linked_event:
+        state = "strategy_linked"
+        state_label = "已关联策略"
+        recommended_action = "查看执行记录"
+        blocker = None
     elif event_type:
         state = "manual_review"
         state_label = "需人工确认"
@@ -749,10 +771,10 @@ def _build_message_decision_card(
         blocker = None
 
     facts: list[dict[str, str]] = []
-    symbol = lifecycle_event.get("symbol")
+    symbol = lifecycle_event.get("symbol") or strategy.get("symbol")
     if isinstance(symbol, str) and symbol.strip():
         facts.append({"label": "标的", "value": symbol.strip().upper()})
-    side = lifecycle_event.get("side")
+    side = lifecycle_event.get("side") or strategy.get("side")
     side_label = {"long": "多", "short": "空"}.get(str(side or "").lower())
     if side_label:
         facts.append({"label": "方向", "value": side_label})

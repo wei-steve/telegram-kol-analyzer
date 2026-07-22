@@ -500,6 +500,68 @@ def test_hold_update_decision_card_is_record_only():
     assert card["recommended_action"] == "无需操作"
 
 
+def test_complete_strategy_decision_card_is_identified_strategy():
+    decision = RecognitionDecision(
+        raw_message_id=1,
+        input_kind="text",
+        authoritative_model="mimo-v2.5",
+        authoritative_status="是策略",
+        authoritative_payload_json=json.dumps(
+            {
+                "lifecycle_event": {"event_type": "none"},
+                "strategy": {
+                    "symbol": "ETH",
+                    "side": "long",
+                    "entry": "1930-1910",
+                    "stop_loss": "1890",
+                    "take_profit": "1950-1970-1990",
+                },
+            }
+        ),
+        agreement_status="agreed",
+        differences_json="[]",
+        comparison_status="completed",
+        disagreement_severity="none",
+    )
+
+    card = _build_message_decision_card(decision=decision, semantic_review=None)
+
+    assert card is not None
+    assert card["state"] == "strategy_identified"
+    assert card["state_label"] == "策略已识别"
+    assert card["recommended_action"] == "查看执行记录"
+
+
+def test_agreed_targeted_lifecycle_event_is_linked_strategy():
+    decision = RecognitionDecision(
+        raw_message_id=1,
+        input_kind="text",
+        authoritative_model="mimo-v2.5",
+        authoritative_status="非策略",
+        authoritative_payload_json=json.dumps(
+            {
+                "lifecycle_event": {
+                    "event_type": "entry_confirm",
+                    "symbol": "BTC",
+                    "side": "short",
+                    "target_lifecycle_id": 548,
+                }
+            }
+        ),
+        agreement_status="agreed",
+        differences_json="[]",
+        comparison_status="completed",
+        disagreement_severity="none",
+    )
+
+    card = _build_message_decision_card(decision=decision, semantic_review=None)
+
+    assert card is not None
+    assert card["state"] == "strategy_linked"
+    assert card["state_label"] == "已关联策略"
+    assert card["recommended_action"] == "查看执行记录"
+
+
 def test_load_group_messages_labels_context_only_target_disagreement(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
