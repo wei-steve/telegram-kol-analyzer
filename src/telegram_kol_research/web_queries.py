@@ -613,6 +613,7 @@ def _execution_reason_label(reason: str | None) -> str | None:
         "management_close_pending_exchange_confirmation": "等待交易所仓位快照确认",
         "close_final_preflight_failed": "最终仓位或合约规格校验失败",
         "management_close_result_requires_recovery": "平仓结果需要人工复核",
+        "mimo_authoritative_not_safely_applied": "MiMo 生命周期事件未能安全落地",
     }.get(str(reason or ""))
 
 
@@ -733,6 +734,25 @@ def _build_message_decision_card(
         and decision.agreement_status == "agreed"
         and decision.disagreement_severity == "none"
     )
+    review_reason = (
+        semantic_review.get("reason") if semantic_review is not None else None
+    )
+    review_reason = review_reason if isinstance(review_reason, str) else None
+    review_conflicts = (
+        semantic_review.get("conflict_types") if semantic_review is not None else []
+    )
+    review_conflicts = (
+        {str(item) for item in review_conflicts}
+        if isinstance(review_conflicts, list)
+        else set()
+    )
+    is_execution_guarded_consensus = (
+        event_type not in {"", "none"}
+        and lifecycle_event.get("target_lifecycle_id") not in (None, "")
+        and review_reason is not None
+        and "无实质分歧" in review_reason
+        and review_conflicts <= {"execution_unresolved"}
+    )
 
     if missing_stop_price:
         state = "manual_review"
@@ -744,7 +764,10 @@ def _build_message_decision_card(
         state_label = "仅记录"
         recommended_action = "无需操作"
         blocker = None
-    elif decision.authoritative_status in {"识别失败", "failed", "failure", "error"}:
+    elif (
+        decision.authoritative_status in {"识别失败", "failed", "failure", "error"}
+        and not is_execution_guarded_consensus
+    ):
         state = "fetch_failed"
         state_label = "获取失败"
         recommended_action = "重新识别"
@@ -754,7 +777,7 @@ def _build_message_decision_card(
         state_label = "策略已识别"
         recommended_action = "查看执行记录"
         blocker = None
-    elif is_safely_linked_event:
+    elif is_safely_linked_event or is_execution_guarded_consensus:
         state = "strategy_linked"
         state_label = "已关联策略"
         recommended_action = "查看执行记录"
@@ -782,10 +805,6 @@ def _build_message_decision_card(
     primary_reason = payload.get("reason")
     primary_reason = primary_reason.strip() if isinstance(primary_reason, str) else None
     primary_conclusion = _candidate_event_status(event_type) if event_type else decision.authoritative_status
-    review_reason = (
-        semantic_review.get("reason") if semantic_review is not None else None
-    )
-    review_reason = review_reason if isinstance(review_reason, str) else None
     review_label = (
         semantic_review.get("label") if semantic_review is not None else "待复核"
     )
@@ -806,8 +825,12 @@ def _build_message_decision_card(
     if execution["state"] == "not_executed":
         execution = {
             "state": "not_executed",
-            "label": "未发送交易所请求",
-            "detail": None,
+            "label": (
+                "自动执行未发出"
+                if is_execution_guarded_consensus
+                else "未发送交易所请求"
+            ),
+            "detail": execution["detail"] if is_execution_guarded_consensus else None,
         }
 
     return {

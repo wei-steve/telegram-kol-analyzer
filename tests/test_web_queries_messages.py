@@ -562,6 +562,56 @@ def test_agreed_targeted_lifecycle_event_is_linked_strategy():
     assert card["recommended_action"] == "查看执行记录"
 
 
+def test_semantically_agreed_exit_with_execution_guard_is_linked_strategy():
+    decision = RecognitionDecision(
+        raw_message_id=1,
+        input_kind="text",
+        authoritative_model="mimo-v2.5",
+        authoritative_status="识别失败",
+        authoritative_payload_json=json.dumps(
+            {
+                "reason": "当前消息是在讨论已有空单的仓位管理，建议离场。",
+                "lifecycle_event": {
+                    "event_type": "exit_position",
+                    "symbol": "BTC",
+                    "side": "short",
+                    "target_lifecycle_id": 548,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        agreement_status="disagreed",
+        differences_json="[]",
+        comparison_status="completed",
+        disagreement_severity="critical",
+        automation_status="skipped",
+        automation_reason="mimo_authoritative_not_safely_applied",
+    )
+    semantic_review = {
+        "status": "completed",
+        "severity": "critical",
+        "label": "严重分歧",
+        "reason": "当前消息明确建议平仓已有空单，独立解读为全部退出，与mimo识别的exit_position一致，无实质分歧。",
+        "conflict_types": ["execution_unresolved"],
+        "model": "deepseek-v4-flash",
+    }
+
+    card = _build_message_decision_card(
+        decision=decision, semantic_review=semantic_review
+    )
+
+    assert card is not None
+    assert card["state"] == "strategy_linked"
+    assert card["state_label"] == "已关联策略"
+    assert card["recommended_action"] == "查看执行记录"
+    assert card["agreement"] == {"label": "一致 · 查看执行记录", "tone": "agreed"}
+    assert card["execution"] == {
+        "state": "not_executed",
+        "label": "自动执行未发出",
+        "detail": "MiMo 生命周期事件未能安全落地",
+    }
+
+
 def test_load_group_messages_labels_context_only_target_disagreement(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
