@@ -92,8 +92,12 @@ def test_group_messages_route_renders_decision_card_before_model_analysis(tmp_pa
     assert "建议动作：<strong>不执行</strong>" in response.text
     assert "未提供新的止损价格" in response.text
     assert "本消息新增：" in response.text
+    assert "自动执行记录：" in response.text
     assert "主分析 · MiMo" in response.text
     assert "辅助复核 · DeepSeek" in response.text
+    assert "历史 AI 细节（调试）" in response.text
+    assert "is-decision-card-history" in response.text
+    assert 'data-message-ai-insights\n            open' not in response.text
     assert "结论一致 · 不自动执行" in response.text
     assert "未发送交易所请求" in response.text
     assert response.text.index("需人工确认") < response.text.index("主分析 · MiMo")

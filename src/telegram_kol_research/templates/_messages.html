@@ -209,7 +209,7 @@
                   </div>
                 {% endif %}
                 <div>
-                  <strong>执行状态：</strong>
+                  <strong>自动执行记录：</strong>
                   <span>{{ decision_card.execution.label }}</span>
                   {% if decision_card.execution.detail %}<small>{{ decision_card.execution.detail }}</small>{% endif %}
                 </div>
@@ -233,12 +233,12 @@
             </section>
           {% endif %}
           <details
-            class="message-ai-insights {{ ai_panel_class }}"
+            class="message-ai-insights {{ ai_panel_class }}{% if decision_card %} is-decision-card-history{% endif %}"
             data-message-ai-insights
-            {% if strategy_related or (semantic_review and semantic_review.severity in ['critical', 'context']) %}open{% endif %}
+            {% if not decision_card and (strategy_related or (semantic_review and semantic_review.severity in ['critical', 'context'])) %}open{% endif %}
           >
             <summary class="message-ai-summary">
-              <span class="message-ai-summary-status">AI识别结果：{{ detection.status if detection else '待识别' }}</span>
+              <span class="message-ai-summary-status">{% if decision_card %}历史 AI 细节（调试）{% else %}AI识别结果：{{ detection.status if detection else '待识别' }}{% endif %}</span>
               <span class="message-ai-summary-text">
                 {% if detection and detection.summary %}
                   <strong>{{ detection.summary }}</strong>
@@ -247,8 +247,8 @@
                 {% endif %}
               </span>
               <span class="message-ai-toggle" aria-hidden="true">
-                <span class="message-ai-toggle-collapsed">展开AI分析</span>
-                <span class="message-ai-toggle-open">收起AI分析</span>
+                <span class="message-ai-toggle-collapsed">{% if decision_card %}展开调试信息{% else %}展开AI分析{% endif %}</span>
+                <span class="message-ai-toggle-open">{% if decision_card %}收起调试信息{% else %}收起AI分析{% endif %}</span>
               </span>
             </summary>
             <div class="message-ai-details">
