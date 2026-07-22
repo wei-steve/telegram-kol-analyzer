@@ -12,6 +12,7 @@ from telegram_kol_research.message_recognition import (
     _ensure_lifecycle_record,
     _load_lifecycle_event_context,
     _management_action_for_exit_downgrade,
+    _parse_explicit_exit_signal,
     _result_from_ai_payload,
     _upsert_ai_signal_candidate,
     apply_authoritative_mimo_payload,
@@ -2197,6 +2198,10 @@ def test_local_exit_signal_closes_btc_long_all_out_message(tmp_path):
     assert lifecycle.exit_signal_message_id == 386
     assert candidate.event_type == "close_signal"
     assert candidate.parse_source == "exit_heuristic"
+
+
+def test_remaining_position_all_exit_is_an_explicit_btc_long_exit():
+    assert _parse_explicit_exit_signal("BTC多单余仓全出") == ("BTC", "long")
 
 
 def test_ai_lifecycle_event_confirms_market_entry(tmp_path, monkeypatch):

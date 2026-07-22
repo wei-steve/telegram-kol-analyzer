@@ -1376,6 +1376,8 @@ def _has_full_exit_instruction(text: str) -> bool:
         "平仓",
         "全平",
         "全部平",
+        "全出",
+        "全部出",
         "清仓",
         "离场",
         "临时离场",
@@ -3263,7 +3265,20 @@ def _parse_explicit_exit_signal(text: str) -> tuple[str | None, str | None] | No
 
     lowered = normalized.lower()
     has_exit_term = (
-        any(term in normalized for term in ["平仓", "全平", "全部平", "出局", "离场", "止盈了", "止损了"])
+        any(
+            term in normalized
+            for term in [
+                "平仓",
+                "全平",
+                "全部平",
+                "全出",
+                "全部出",
+                "出局",
+                "离场",
+                "止盈了",
+                "止损了",
+            ]
+        )
         or any(term in lowered for term in ["close", "closed", "exit", "stop out", "stopped out"])
     )
     if not has_exit_term:
