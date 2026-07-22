@@ -1124,7 +1124,7 @@ function bindGroupLinks() {
         markWorkbenchLoaded(activeView, chatId);
         syncSelectedGroupState(chatId, { focus: true });
         if (activeView === 'groups') {
-          loadDesktopStrategyCompanion({ chatId, detailPanel, requestId }).catch(() => {});
+          loadGroupDetailCompanion({ chatId, detailPanel, requestId }).catch(() => {});
         }
         applyGroupPromptToEditor(String(chatId));
         renderConversationHistory();
@@ -1170,8 +1170,8 @@ function getDetailPanelForWorkbenchView(view = null) {
     || document.querySelector('[data-detail-panel]');
 }
 
-async function loadDesktopStrategyCompanion({ chatId, detailPanel, requestId }) {
-  if (!window.matchMedia('(min-width: 761px)').matches || !detailPanel) return;
+async function loadGroupDetailCompanion({ chatId, detailPanel, requestId }) {
+  if (!detailPanel) return;
   const nextContent = await fetchDetailPanel(chatId);
   if (requestId !== groupSwitchRequestId || getSelectedChatId() !== chatId) return;
   detailPanel.innerHTML = '';
@@ -1745,7 +1745,7 @@ async function loadSelectedGroupDestination(view) {
   });
   if (!committed) return false;
   if (view === 'groups') {
-    loadDesktopStrategyCompanion({
+    loadGroupDetailCompanion({
       chatId,
       detailPanel: getDetailPanelForWorkbenchView(view),
       requestId,

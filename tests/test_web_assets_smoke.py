@@ -691,16 +691,16 @@ def test_app_js_does_not_cache_stale_group_destination_as_loaded(tmp_path):
     assert "if (!loaded)" in ensure_block
 
 
-def test_app_js_loads_guarded_desktop_message_companion_from_strategy_view(tmp_path):
+def test_app_js_loads_message_companion_on_any_screen_size(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
     js = client.get("/static/app.js").text
 
-    assert "function loadDesktopStrategyCompanion" in js
-    companion_start = js.index("function loadDesktopStrategyCompanion")
+    assert "function loadGroupDetailCompanion" in js
+    companion_start = js.index("function loadGroupDetailCompanion")
     companion_end = js.index("\nfunction ", companion_start + 1)
     companion_block = js[companion_start:companion_end]
-    assert "matchMedia('(min-width: 761px)')" in companion_block
+    assert "matchMedia('(min-width: 761px)')" not in companion_block
     assert "requestId !== groupSwitchRequestId" in companion_block
     assert "getSelectedChatId() !== chatId" in companion_block
     assert "fetchDetailPanel(chatId)" in companion_block
