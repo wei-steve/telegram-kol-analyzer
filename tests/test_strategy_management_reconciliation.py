@@ -507,6 +507,37 @@ def test_full_close_reconciliation_accepts_only_snapshotted_management_cancelled
     assert stored.status == "succeeded"
 
 
+def test_partial_close_reconciliation_ignores_already_cancelled_unfilled_entry_leg(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, sizes=("1",), preflight=("2",))
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=2,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id="cancelled-unfilled-entry",
+                venue="deepcoin",
+                attribution_status="unassigned",
+                status="cancelled",
+                terminal_reason="operator_cancelled_unfilled_entry_leg",
+                last_verified_at=NOW,
+            )
+        )
+        session.commit()
+
+    result = _reconcile_management(sf, positions=[_position("pos-1", "1")])
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.succeeded == 1
+    assert stored.status == "succeeded"
+
+
 def test_full_close_reconciliation_freezes_cancelled_deferred_entries_without_close_reservation(
     tmp_path,
 ):

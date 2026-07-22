@@ -395,6 +395,12 @@ def _identity_is_exact(session, batch, legs) -> bool:
         row_identity = (int(row.id), str(row.pos_id)) if row.pos_id else None
         if row_identity in managed_identity:
             continue
+        if (
+            batch.effective_action not in {"full_close", "full_exit"}
+            and not row.pos_id
+            and str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+        ):
+            continue
         if int(row.id) in deferred_leg_ids:
             if batch.effective_action in {"full_close", "full_exit"}:
                 if _is_management_cancelled_deferred_entry_leg(row):
