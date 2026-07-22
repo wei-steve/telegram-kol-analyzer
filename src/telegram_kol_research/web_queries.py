@@ -510,6 +510,10 @@ def _serialize_raw_messages(
                     decision=decision,
                     semantic_review=semantic_review,
                 ),
+                "authoritative_model_summary": _build_authoritative_model_summary(
+                    decision=decision,
+                    semantic_review=semantic_review,
+                ),
                 "recognition_comparison": _build_recognition_comparison(
                     recognition=rec_by_msg_id.get(raw_message.id),
                     media_assets=media_assets,
@@ -520,6 +524,71 @@ def _serialize_raw_messages(
         )
 
     return rows
+
+
+def _build_authoritative_model_summary(
+    *,
+    decision: RecognitionDecision | None,
+    semantic_review: dict[str, object | None] | None,
+) -> list[dict[str, str | None]]:
+    """Return the two persisted decision roles for the message detail UI."""
+
+    if decision is None:
+        return []
+
+    authoritative_payload = _parse_json_object(decision.authoritative_payload_json)
+    lifecycle_event = authoritative_payload.get("lifecycle_event")
+    lifecycle_event = lifecycle_event if isinstance(lifecycle_event, dict) else {}
+    event_type = str(lifecycle_event.get("event_type") or "")
+    authoritative_reason = authoritative_payload.get("reason")
+    authoritative_reason = (
+        authoritative_reason.strip()
+        if isinstance(authoritative_reason, str) and authoritative_reason.strip()
+        else None
+    )
+    auxiliary_payload = _parse_json_object(
+        decision.auxiliary_payload_json or decision.comparison_payload_json
+    )
+    auxiliary_reason = auxiliary_payload.get("reason")
+    auxiliary_reason = (
+        auxiliary_reason.strip()
+        if isinstance(auxiliary_reason, str) and auxiliary_reason.strip()
+        else None
+    )
+    review_label = semantic_review.get("label") if semantic_review else None
+    review_label = review_label if isinstance(review_label, str) else None
+
+    rows = [
+        {
+            "label": "MiMo 主分析",
+            "model": decision.authoritative_model,
+            "conclusion": (
+                _candidate_event_status(event_type)
+                if event_type
+                else decision.authoritative_status
+            ),
+            "reason": authoritative_reason,
+        }
+    ]
+    auxiliary_model = decision.auxiliary_model or decision.comparison_model
+    if auxiliary_model:
+        rows.append(
+            {
+                "label": "DeepSeek 辅助复核",
+                "model": auxiliary_model,
+                "conclusion": decision.auxiliary_status or review_label,
+                "reason": auxiliary_reason,
+            }
+        )
+    return rows
+
+
+def _parse_json_object(value: str | None) -> dict[str, object]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _serialize_execution_outcome(

@@ -499,7 +499,7 @@ def test_group_messages_route_labels_lifecycle_event_detection(tmp_path):
     assert "AI识别结果：非策略" not in response.text
 
 
-def test_group_messages_route_shows_recognition_comparison_results(tmp_path):
+def test_group_messages_route_shows_authoritative_model_summary(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
     with session_factory() as session:
@@ -515,24 +515,28 @@ def test_group_messages_route_shows_recognition_comparison_results(tmp_path):
         session.add(
             MessageRecognition(
                 raw_message_id=raw_message.id,
-                status="是策略",
-                reason="DeepSeek detected strategy",
+                status="非策略",
+                reason="MiMo identified an exit event.",
                 summary="BTC long Entry 68000 SL 67000 TP 70000",
-                engine="deepseek-v4-flash",
+                engine="mimo-v2.5",
             )
         )
         session.add(
-            RecognitionExperiment(
+            RecognitionDecision(
                 raw_message_id=raw_message.id,
-                experiment_name="mimo_direct_v1",
-                model="mimo-v2.5",
-                prompt_version="mimo_direct_v1",
                 input_kind="text",
-                status="是策略",
-                reason="MiMo detected strategy",
-                observed_text="BTC long 68000 SL 67000 TP 70000",
-                strategy_json='{"symbol":"BTC","side":"long"}',
-                confidence=0.88,
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json=(
+                    '{"reason":"MiMo identified an exit event.",'
+                    '"lifecycle_event":{"event_type":"exit_position",'
+                    '"symbol":"ETH","side":"long"}}'
+                ),
+                auxiliary_model="deepseek-v4-flash",
+                auxiliary_status="非策略",
+                auxiliary_payload_json='{"reason":"DeepSeek agrees with the exit."}',
+                agreement_status="agreed",
+                differences_json="[]",
             )
         )
         session.commit()
@@ -541,27 +545,29 @@ def test_group_messages_route_shows_recognition_comparison_results(tmp_path):
     response = client.get("/groups/88/messages")
 
     assert response.status_code == 200
-    assert "recognition-comparison" in response.text
-    assert "DeepSeek text" in response.text
-    assert "GLM-OCR image" in response.text
-    assert "MiMo text" in response.text
-    assert "MiMo image" in response.text
+    assert "权威模型结论" in response.text
+    assert "MiMo 主分析" in response.text
+    assert "DeepSeek 辅助复核" in response.text
     assert "deepseek-v4-flash" in response.text
     assert "mimo-v2.5" in response.text
-    assert "MiMo detected strategy" in response.text
-    assert "BTC long 68000 SL 67000 TP 70000" in response.text
+    assert "MiMo identified an exit event." in response.text
+    assert "DeepSeek agrees with the exit." in response.text
+    assert "DeepSeek text" not in response.text
+    assert "GLM-OCR image" not in response.text
+    assert "MiMo text" not in response.text
+    assert "MiMo image" not in response.text
     collapsed_summary = re.search(
         r'<div class="message-collapsed-ai-summary"[^>]*>(.*?)</div>',
         response.text,
         re.S,
     )
     assert collapsed_summary
-    assert "AI识别结果：是策略" in collapsed_summary.group(1)
+    assert "AI识别结果：非策略" in collapsed_summary.group(1)
     assert "BTC long Entry 68000 SL 67000 TP 70000" in collapsed_summary.group(1)
     assert "MiMo detected strategy" not in collapsed_summary.group(1)
 
 
-def test_group_messages_route_hides_empty_mimo_strategy_json(tmp_path):
+def test_group_messages_route_omits_retired_mimo_experiment(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
     empty_strategy_json = (
@@ -598,8 +604,7 @@ def test_group_messages_route_hides_empty_mimo_strategy_json(tmp_path):
     response = client.get("/groups/88/messages")
 
     assert response.status_code == 200
-    assert "MiMo text" in response.text
-    assert "Join the VIP channel." in response.text
+    assert "MiMo text" not in response.text
     assert empty_strategy_json not in response.text
 
 

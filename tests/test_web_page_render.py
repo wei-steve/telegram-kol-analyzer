@@ -2485,7 +2485,10 @@ def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
     assert " open" not in normal_review.group(1).split(">", 1)[0]
     assert "止盈细节不同" in normal_review.group(1)
     assert "non_material_price_detail" in normal_review.group(1)
-    assert "历史实验（非权威）" in response.text
+    assert "权威模型结论" in response.text
+    assert "MiMo 主分析" in response.text
+    assert "DeepSeek 辅助复核" in response.text
+    assert "历史实验（非权威）" not in response.text
     assert "never-render-provider-secret" not in response.text
     assert "never-render-frozen-token" not in response.text
     assert "provider timeout" not in response.text
@@ -2540,7 +2543,7 @@ def test_critical_semantic_review_opens_outer_ai_disclosure_for_non_strategy(tmp
 
     assert response.status_code == 200
     assert re.search(
-        r'<details\s+class="message-ai-insights is-not-strategy"\s+'
+        r'<details\s+class="message-ai-insights is-not-strategy is-decision-card-history"\s+'
         r'data-message-ai-insights\s+open\s*>',
         response.text,
     )

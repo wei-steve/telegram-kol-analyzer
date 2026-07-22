@@ -235,7 +235,7 @@
           <details
             class="message-ai-insights {{ ai_panel_class }}{% if decision_card %} is-decision-card-history{% endif %}"
             data-message-ai-insights
-            {% if not decision_card and (strategy_related or (semantic_review and semantic_review.severity in ['critical', 'context'])) %}open{% endif %}
+            {% if strategy_related or (semantic_review and semantic_review.severity in ['critical', 'context']) %}open{% endif %}
           >
             <summary class="message-ai-summary">
               <span class="message-ai-summary-status">{% if decision_card %}历史 AI 细节（调试）{% else %}AI识别结果：{{ detection.status if detection else '待识别' }}{% endif %}</span>
@@ -309,33 +309,23 @@
                   >AI复核：{{ semantic_review.label }}</div>
                 {% endif %}
               {% endif %}
-              {% if comparison %}
-                <div class="recognition-comparison">
+              {% if message.authoritative_model_summary %}
+                <div class="recognition-comparison authoritative-model-summary">
                   <div class="recognition-comparison-label">
-                    <strong>历史实验（非权威）</strong>
-                    <small>仅供调试参考，不代表当前 AI 复核结论。</small>
+                    <strong>权威模型结论</strong>
+                    <small>用于当前识别与策略执行。</small>
                   </div>
-                  {% for item in [
-                    ('DeepSeek text', comparison.deepseek_text),
-                    ('GLM-OCR image', comparison.glm_ocr_image),
-                    ('MiMo text', comparison.mimo_text),
-                    ('MiMo image', comparison.mimo_image)
-                  ] %}
-                    {% set label = item[0] %}
-                    {% set result = item[1] %}
-                    <div class="recognition-comparison-row {{ result.status_class if result else 'is-pending' }}">
+                  {% for result in message.authoritative_model_summary %}
+                    <div class="recognition-comparison-row is-strategy">
                       <div class="recognition-comparison-head">
-                        <strong>{{ label }}</strong>
-                        <span>{{ result.status if result else 'not run' }}</span>
-                        {% if result and result.engine %}
-                          <small>{{ result.engine }}</small>
+                        <strong>{{ result.label }}</strong>
+                        {% if result.conclusion %}<span>{{ result.conclusion }}</span>{% endif %}
+                        {% if result.model %}
+                          <small>{{ result.model }}</small>
                         {% endif %}
                       </div>
-                      {% if result and result.reason %}
+                      {% if result.reason %}
                         <small class="recognition-comparison-reason">{{ result.reason }}</small>
-                      {% endif %}
-                      {% if result and result.summary %}
-                        <pre>{{ result.summary }}</pre>
                       {% endif %}
                     </div>
                   {% endfor %}
