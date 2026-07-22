@@ -4,13 +4,13 @@
 
 **Goal:** Make a desktop group switch render the strategy summary and message decision cards without a serial wait, while keeping the decision card as the sole default-visible AI conclusion.
 
-**Architecture:** The desktop group switch intentionally prioritizes the active workbench panel before loading the desktop companion panel; an existing regression test protects that behavior. Do not replace it with a `Promise.all` barrier. When a structured decision card exists, retain the legacy raw analysis for diagnostics but keep it closed and label it as historical/debug information so it cannot compete with the current decision.
+**Architecture:** The desktop group switch intentionally prioritizes the active workbench panel before loading the desktop companion panel; an existing regression test protects that behavior. Do not replace it with a `Promise.all` barrier. The group-panel bootstrap must load the restored selected group after it restores its visual selection. When a structured decision card exists, retain the legacy raw analysis for diagnostics but keep it closed and label it as historical/debug information so it cannot compete with the current decision.
 
 **Tech Stack:** FastAPI/Jinja templates, vanilla JavaScript, pytest/TestClient.
 
 ---
 
-### Task 1: Validate the desktop group-switch loading contract
+### Task 1: Restore the selected group after group-panel bootstrap
 
 **Files:**
 - Modify: `tests/test_web_assets_smoke.py`
@@ -18,17 +18,17 @@
 
 **Step 1: Write the failing test**
 
-Review the existing smoke contract, which asserts that the active destination is not blocked on both panels. Record that a concurrency barrier is an invalid fix for the observed delay.
+Assert that `loadGroupsPanel` calls `loadSelectedGroupDestination('groups')` after `syncSelectedGroupState(selectedChatId)`.
 
 **Step 2: Run the focused test and verify it fails**
 
 Run: `uv run pytest tests/test_web_assets_smoke.py -k group_switch -q`
 
-Expected: PASS; the existing protected behavior is intentional.
+Expected: FAIL because the code currently restores only the selected visual state.
 
 **Step 3: Implement the minimal change**
 
-Do not change this code path until browser timing evidence identifies a different fault at the client, rendering, or network boundary.
+After the group list is inserted and the selected group is synchronized, return the result of `loadSelectedGroupDestination('groups')`. Preserve the existing sequential active-destination behavior; it avoids blocking the selected workbench on both panels.
 
 **Step 4: Run the focused test and verify it passes**
 

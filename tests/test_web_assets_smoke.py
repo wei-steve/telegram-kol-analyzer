@@ -140,6 +140,18 @@ def test_app_js_refreshes_sidebar_when_switching_groups(tmp_path):
     assert "refreshGroupList().catch(() => {" in response.text
 
 
+def test_app_js_loads_restored_group_destination_after_groups_panel_bootstraps(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+    panel_slice = js[
+        js.index("async function loadGroupsPanel"):
+        js.index("async function loadMorePanel")
+    ]
+
+    assert "syncSelectedGroupState(selectedChatId);" in panel_slice
+    assert "await loadSelectedGroupDestination('groups');" in panel_slice
+
+
 def test_app_js_ignores_zero_sidebar_regression_from_partial_refresh(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

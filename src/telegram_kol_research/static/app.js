@@ -1643,7 +1643,10 @@ async function loadGroupsPanel() {
     && document.querySelector(`[data-group-link][data-chat-id="${requestedChatId}"]`);
   const selectedLink = requestedExists || document.querySelector('[data-group-link]');
   const selectedChatId = Number(selectedLink?.dataset.chatId || 0);
-  if (selectedChatId) syncSelectedGroupState(selectedChatId);
+  if (selectedChatId) {
+    syncSelectedGroupState(selectedChatId);
+    return await loadSelectedGroupDestination('groups');
+  }
   return true;
 }
 
