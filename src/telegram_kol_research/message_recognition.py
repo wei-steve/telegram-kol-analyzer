@@ -1062,6 +1062,7 @@ def _apply_lifecycle_event_decision(
         not decision.get("_explicit_multi_target")
         and explicit_symbol is not None
         and target.symbol != explicit_symbol
+        and not _text_mentions_exit_symbol(raw_message.text or "", target.symbol)
     ):
         return False
 
@@ -3414,6 +3415,22 @@ def _extract_exit_symbol(text: str) -> str | None:
         elif alias in text:
             return symbol
     return None
+
+
+def _text_mentions_exit_symbol(text: str, expected_symbol: str) -> bool:
+    for alias, symbol in EXIT_SYMBOL_ALIASES.items():
+        if symbol != expected_symbol:
+            continue
+        if alias.isascii():
+            if re.search(
+                rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])",
+                text,
+                flags=re.IGNORECASE,
+            ):
+                return True
+        elif alias in text:
+            return True
+    return False
 
 
 def _extract_exit_side(text: str) -> str | None:

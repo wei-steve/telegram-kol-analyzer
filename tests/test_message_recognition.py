@@ -310,6 +310,65 @@ def test_authoritative_position_update_persists_target_lifecycle_and_generation(
         assert item.sequence == 0
 
 
+def test_authoritative_position_update_accepts_explicit_eth_target_after_btc_comment(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3359,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 20, 19, 19, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 21, 5, 48, tzinfo=UTC),
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=3360,
+            posted_at=datetime(2026, 7, 21, 6, 56, tzinfo=UTC),
+            text=(
+                "比特币可能突破了，ETH不知道会不会被拉着往上，所以ETH这单1940的"
+                "用小仓位来做吧，平一半。比特币咱们会在6.7万空，ETH1950突破的话，"
+                "就是2050空"
+            ),
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "target_lifecycle_id": lifecycle_id,
+                "symbol": "ETH",
+                "side": "short",
+                "management_action": "partial_take_profit",
+                "confidence": 0.9,
+                "reason": "ETH 1940 空单平一半。",
+            },
+        },
+        model="mimo-v2.5",
+        authoritative_generation="mixed-symbol-management",
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        item = session.query(MessageInstructionItem).one()
+        assert candidate.target_lifecycle_id == lifecycle_id
+        assert candidate.symbol == "ETH"
+        assert candidate.management_action == "partial_take_profit"
+        assert candidate.management_fraction == pytest.approx(0.5)
+        assert item.instruction_kind == "management"
+
+
 def test_authoritative_prudent_exit_accepts_empty_targets_for_single_lifecycle(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
