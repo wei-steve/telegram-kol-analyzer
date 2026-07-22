@@ -549,6 +549,111 @@ def test_authoritative_multi_target_partial_take_profit_persists_one_candidate_p
     assert [item.instruction_kind for item in items] == ["management", "management"]
 
 
+def test_authoritative_low_confidence_group_exit_fans_out_to_same_chat_btc_and_eth(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        btc = StrategyLifecycle(
+            chat_id=88,
+            message_id=4001,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 22, 1, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 22, 1, 1, tzinfo=UTC),
+        )
+        eth = StrategyLifecycle(
+            chat_id=88,
+            message_id=4002,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 22, 1, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 22, 1, 1, tzinfo=UTC),
+        )
+        elsewhere = StrategyLifecycle(
+            chat_id=99,
+            message_id=4003,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 22, 1, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 22, 1, 1, tzinfo=UTC),
+        )
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=4004,
+            posted_at=datetime(2026, 7, 22, 6, 16, tzinfo=UTC),
+            text="空单解套的人就可以先平加仓或者平仓等新机会",
+        )
+        session.add_all([btc, eth, elsewhere, raw_message])
+        session.flush()
+        for lifecycle, pos_id in ((btc, "btc-short"), (eth, "eth-short")):
+            binding = ExecutionBinding(
+                kol_id=f"group:{lifecycle.chat_id}",
+                chat_id=lifecycle.chat_id,
+                message_id=lifecycle.message_id,
+                symbol=lifecycle.symbol,
+                side=lifecycle.side,
+                venue="deepcoin",
+                pos_id=pos_id,
+                status="active",
+            )
+            session.add(binding)
+            session.flush()
+            lifecycle.execution_binding_id = binding.id
+        session.commit()
+        raw_message_id = raw_message.id
+        btc_id = btc.id
+        eth_id = eth.id
+
+    apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+        },
+        model="mimo-v2.5",
+        authoritative_generation="low-confidence-group-exit",
+    )
+
+    with session_factory() as session:
+        candidates = (
+            session.query(SignalCandidate)
+            .filter_by(raw_message_id=raw_message_id)
+            .order_by(SignalCandidate.target_lifecycle_id)
+            .all()
+        )
+
+    assert {
+        (
+            candidate.target_lifecycle_id,
+            candidate.symbol,
+            candidate.side,
+            candidate.management_action,
+            candidate.management_fraction,
+        )
+        for candidate in candidates
+    } == {
+        (btc_id, "BTC", "short", "partial_take_profit", 0.5),
+        (eth_id, "ETH", "short", "partial_take_profit", 0.5),
+    }
+
+
+def test_low_confidence_group_exit_scope_requires_direction_and_honors_symbol():
+    assert message_recognition_module._low_confidence_group_exit_scope(
+        "BTC 空单求稳可以先平仓"
+    ) == ("short", {"BTC"})
+    assert message_recognition_module._low_confidence_group_exit_scope(
+        "求稳可以先平仓"
+    ) is None
+    assert message_recognition_module._low_confidence_group_exit_scope(
+        "BTC 空单继续持有"
+    ) is None
+
+
 def test_dual_candidate_recognition_preserves_entry_and_management_items(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

@@ -1622,6 +1622,75 @@ def _expand_lifecycle_event_targets(
     return targets
 
 
+def _apply_low_confidence_group_exit_if_matched(
+    session,
+    raw_message: RawMessage,
+    *,
+    parse_source: str,
+    authoritative_generation: str | None,
+    applied_candidate_ids: set[int] | None,
+) -> bool:
+    """Apply the operator-approved cautious-exit policy without broad matching."""
+
+    scope = _low_confidence_group_exit_scope(raw_message.text or "")
+    if scope is None or _looks_like_trading_education_content(raw_message.text or ""):
+        return False
+    side, symbols = scope
+    query = session.query(StrategyLifecycle).filter(
+        StrategyLifecycle.chat_id == raw_message.chat_id,
+        StrategyLifecycle.lifecycle_status.in_(["entered", "holding"]),
+        StrategyLifecycle.side == side,
+        StrategyLifecycle.symbol.in_(sorted(symbols or {"BTC", "ETH"})),
+    )
+    if raw_message.posted_at is not None:
+        query = query.filter(StrategyLifecycle.signal_at <= raw_message.posted_at)
+    targets = [
+        lifecycle
+        for lifecycle in query.order_by(StrategyLifecycle.id.asc()).all()
+        if _lifecycle_has_live_execution_binding(session, lifecycle)
+    ]
+    applied = False
+    for lifecycle in targets:
+        applied = _apply_lifecycle_event_decision(
+            session,
+            raw_message,
+            {
+                "event_type": "position_update",
+                "target_lifecycle_id": lifecycle.id,
+                "symbol": lifecycle.symbol,
+                "side": lifecycle.side,
+                "management_action": "partial_take_profit",
+                "management_fraction": 0.5,
+                "confidence": 0.85,
+                "reason": "低信心可选离场：每条已验证仓位腿部分平仓 50%。",
+                "_explicit_multi_target": len(targets) > 1,
+            },
+            parse_source=parse_source,
+            authoritative_generation=authoritative_generation,
+            applied_candidate_ids=applied_candidate_ids,
+        ) or applied
+    return applied
+
+
+def _low_confidence_group_exit_scope(text: str) -> tuple[str, set[str] | None] | None:
+    """Return explicit side and BTC/ETH scope for cautious optional exits."""
+
+    normalized = " ".join(str(text or "").split())
+    side = _extract_exit_side(normalized)
+    if side is None:
+        return None
+    has_exit = any(term in normalized.lower() for term in ("平仓", "离场", "出局", "平加仓", "close", "exit"))
+    has_caution = any(term in normalized for term in ("求稳", "可以先", "解套", "有把握", "小亏"))
+    if not has_exit or not has_caution:
+        return None
+    symbols = {
+        symbol
+        for symbol in {"BTC", "ETH"}
+        if _text_mentions_exit_symbol(normalized, symbol)
+    }
+    return side, symbols or None
+
+
 def _int_or_none(value: Any) -> int | None:
     if value in (None, ""):
         return None
@@ -1958,6 +2027,14 @@ def apply_authoritative_mimo_payload(
                 raw_message,
                 lifecycle_event,
                 parse_source="mimo_authoritative",
+                authoritative_generation=authoritative_generation,
+                applied_candidate_ids=accepted_candidate_ids,
+            )
+        else:
+            lifecycle_applied = _apply_low_confidence_group_exit_if_matched(
+                session,
+                raw_message,
+                parse_source="low_confidence_group_exit",
                 authoritative_generation=authoritative_generation,
                 applied_candidate_ids=accepted_candidate_ids,
             )
