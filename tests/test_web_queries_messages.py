@@ -12,7 +12,11 @@ from telegram_kol_research.models import (
     RecognitionDecision,
     StrategyManagementBatch,
 )
-from telegram_kol_research.web_queries import load_group_messages, load_messages_in_time_window
+from telegram_kol_research.web_queries import (
+    _build_message_decision_card,
+    load_group_messages,
+    load_messages_in_time_window,
+)
 from telegram_kol_research.web_queries import _serialize_execution_outcome
 
 
@@ -462,6 +466,38 @@ def test_load_group_messages_builds_manual_review_decision_card_from_authoritati
             "detail": None,
         },
     }
+
+
+def test_hold_update_decision_card_is_record_only():
+    decision = RecognitionDecision(
+        raw_message_id=1,
+        input_kind="text",
+        authoritative_model="mimo-v2.5",
+        authoritative_status="非策略",
+        authoritative_payload_json=json.dumps(
+            {
+                "reason": "消息是现有空单的持仓状态更新，不是新开仓。",
+                "lifecycle_event": {
+                    "event_type": "position_update",
+                    "management_action": "hold_update",
+                    "symbol": "BTC",
+                    "side": "short",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        agreement_status="agreed",
+        differences_json="[]",
+        comparison_status="completed",
+        disagreement_severity="none",
+    )
+
+    card = _build_message_decision_card(decision=decision, semantic_review=None)
+
+    assert card is not None
+    assert card["state"] == "record_only"
+    assert card["state_label"] == "仅记录"
+    assert card["recommended_action"] == "无需操作"
 
 
 def test_load_group_messages_labels_context_only_target_disagreement(tmp_path):

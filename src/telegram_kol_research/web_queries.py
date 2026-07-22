@@ -727,6 +727,11 @@ def _build_message_decision_card(
         state_label = "需人工确认"
         recommended_action = "不执行"
         blocker = "未提供新的止损价格"
+    elif event_type == "position_update" and management_action == "hold_update":
+        state = "record_only"
+        state_label = "仅记录"
+        recommended_action = "无需操作"
+        blocker = None
     elif decision.authoritative_status in {"识别失败", "failed", "failure", "error"}:
         state = "fetch_failed"
         state_label = "获取失败"
