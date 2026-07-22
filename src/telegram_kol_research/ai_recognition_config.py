@@ -98,7 +98,6 @@ DEFAULT_LIFECYCLE_EVENT_PROMPT = """
   "stop_loss": null,
   "take_profit": null,
   "management_action": null,
-  "targets": [],
   "confidence": 0.0,
   "reason": "一句话说明判断依据"
 }
@@ -106,14 +105,14 @@ DEFAULT_LIFECYCLE_EVENT_PROMPT = """
 判定规则：
 - entry_confirm：当前消息是在通知之前 pending_entry 策略现在/现价/市价/直接入场，或明确说已经进场。
 - cancel_entry：当前消息是在取消之前 pending_entry 限价挂单或等待入场策略，例如取消限价、撤单、取消挂单、等后续信号。
-- exit_position：当前消息是在关闭已 entered 策略，例如平仓、全平、离场、临时离场、止盈了、止损了、先出来、保本出局、成本附近保本出局、保本走、成本走、breakeven exit。
+- exit_position：当前消息是在关闭已 entered 策略，例如平仓、全平、离场、临时离场、止盈了、止损了、先出来、保本出局、成本附近保本出局、保本走、成本走、求稳可走、稳健者可走、breakeven exit。仅当当前消息能唯一对应一条已 entered 策略时，求稳可走/稳健者可走才是全平指令。
 - position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、分批止盈30%、第一止盈位/第一个止盈位、按比例止盈、减仓一半、减仓30%、持仓收益达到100%后分批止盈、移动止损至成本价、止损移动到成本价、带保护、保护止损、上移止损、推保护、继续持有。“回成本了，注意保护成本，平加仓”表示减仓一半并将止损移至成本价，management_action 应输出 partial_take_profit, move_stop_to_protect。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
 - “第一止盈位 60950 移动止损至成本价”这类表达只是部分止盈并把止损推到成本保护，不是全量平仓/离场；必须判定为 position_update，不能判定为 exit_position。
 - 如果当前消息明确调整止损价，请输出 stop_loss；明确调整止盈价或止盈计划，请输出 take_profit；只是“推保护/带保护/保本”但没有新价格时，management_action 输出 move_stop_to_protect。
 - 临时入场、临时离场、部分止盈、调整止盈价、调整止损价都属于生命周期事件，不要当成新的 strategy。
 - none：普通聊天、行情观点、广告、复盘、联系方式、无法确定目标策略、或只是识别新策略但不改变已有策略。
 - 必须优先依据当前消息，不要把上下文里的旧消息当成当前动作。
-- 如果只对应一个活跃策略，请输出 target_lifecycle_id。若当前消息明确列出多个独立标的且每个都能唯一对应活跃策略，请在 targets 中逐项输出 target_lifecycle_id、symbol、side；不要猜测或重复目标。
+- 如果只对应一个活跃策略，只输出 target_lifecycle_id，不要输出 targets。若当前消息明确列出多个独立标的且每个都能唯一对应活跃策略，请在非空 targets 中逐项输出 target_lifecycle_id、symbol、side；不要猜测或重复目标。
 - 如果不能唯一对应，event_type 必须为 none 或 confidence 低于 0.7。
 - confidence 低于 0.7 时，系统不会执行状态变更。
 """.strip()

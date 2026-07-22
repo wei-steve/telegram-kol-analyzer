@@ -38,13 +38,13 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
 【生命周期事件与仓位管理】
 - entry_confirm：此前 pending_entry 策略现在/现价/市价/直接入场，或明确已经进场。
 - cancel_entry：取消此前 pending_entry 挂单或等待入场策略，例如取消限价、撤单、不进了、等后续信号。
-- exit_position：关闭已 entered 策略，例如平仓、全平、清仓、出局、离场、临时离场、止盈了、止损了、先出来、保本走、成本走、breakeven exit。
+- exit_position：关闭已 entered 策略，例如平仓、全平、清仓、出局、离场、临时离场、止盈了、止损了、先出来、保本走、成本走、求稳可走、稳健者可走、breakeven exit。求稳可走/稳健者可走仅在当前消息能唯一对应一条已 entered 策略时表示全平。
 - position_update：管理已 entered 策略但没有完全离场，例如提前止盈一半、第一止盈位、分批止盈30%、减仓一半、推保护、移动止损、调整止盈止损、继续持有。
 - “第一止盈点来了”、“已到第一目标”且对应已有持仓时，属于仓位管理 position_update，不是新开仓。
 - “第一止盈位 60950，移动止损至成本价”属于 position_update，不能判为完整退出。
 - “回成本了，注意保护成本，平加仓”表示减仓并把止损移动到成本保护，management_action 输出 partial_take_profit, move_stop_to_protect。
 - 无法唯一对应目标策略时，event_type 输出 none 或置信度低于 0.7。
-- 能明确对应时输出 target_lifecycle_id；必须优先依据当前消息，不能把旧上下文当成当前动作。
+- 单一策略能明确对应时只输出 target_lifecycle_id，不要输出 targets；多个独立策略均能明确对应时，才输出包含每个唯一 lifecycle ID 的非空 targets。必须优先依据当前消息，不能把旧上下文当成当前动作。
 
 【价格与字段归一化】
 - symbol 输出大写币种简称；side 只能是 long 或 short。
