@@ -1594,6 +1594,8 @@ def _expand_lifecycle_event_targets(
     raw_targets = decision.get("targets")
     if raw_targets is None:
         return [decision]
+    if raw_targets == [] and _int_or_none(decision.get("target_lifecycle_id")) is not None:
+        return [decision]
     if not isinstance(raw_targets, list) or not raw_targets:
         return None
 
