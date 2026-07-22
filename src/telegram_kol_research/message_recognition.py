@@ -1679,7 +1679,10 @@ def _low_confidence_group_exit_scope(text: str) -> tuple[str, set[str] | None] |
     side = _extract_exit_side(normalized)
     if side is None:
         return None
-    has_exit = any(term in normalized.lower() for term in ("平仓", "离场", "出局", "平加仓", "close", "exit"))
+    has_exit = any(
+        term in normalized.lower()
+        for term in ("平仓", "离场", "出局", "平加仓", "可走", "先走", "close", "exit")
+    )
     has_caution = any(term in normalized for term in ("求稳", "可以先", "解套", "有把握", "小亏"))
     if not has_exit or not has_caution:
         return None

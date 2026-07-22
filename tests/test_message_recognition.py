@@ -665,6 +665,9 @@ def test_low_confidence_group_exit_scope_requires_direction_and_honors_symbol():
         "BTC 空单求稳可以先平仓"
     ) == ("short", {"BTC"})
     assert message_recognition_module._low_confidence_group_exit_scope(
+        "BTC 空单求稳可走"
+    ) == ("short", {"BTC"})
+    assert message_recognition_module._low_confidence_group_exit_scope(
         "求稳可以先平仓"
     ) is None
     assert message_recognition_module._low_confidence_group_exit_scope(
