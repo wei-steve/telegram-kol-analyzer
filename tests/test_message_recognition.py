@@ -581,13 +581,31 @@ def test_authoritative_low_confidence_group_exit_fans_out_to_same_chat_btc_and_e
             signal_at=datetime(2026, 7, 22, 1, tzinfo=UTC),
             entered_at=datetime(2026, 7, 22, 1, 1, tzinfo=UTC),
         )
+        unbound = StrategyLifecycle(
+            chat_id=88,
+            message_id=4005,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 22, 1, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 22, 1, 1, tzinfo=UTC),
+        )
+        exited = StrategyLifecycle(
+            chat_id=88,
+            message_id=4006,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="exited",
+            signal_at=datetime(2026, 7, 22, 1, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 22, 1, 1, tzinfo=UTC),
+        )
         raw_message = RawMessage(
             chat_id=88,
             message_id=4004,
             posted_at=datetime(2026, 7, 22, 6, 16, tzinfo=UTC),
             text="空单解套的人就可以先平加仓或者平仓等新机会",
         )
-        session.add_all([btc, eth, elsewhere, raw_message])
+        session.add_all([btc, eth, elsewhere, unbound, exited, raw_message])
         session.flush()
         for lifecycle, pos_id in ((btc, "btc-short"), (eth, "eth-short")):
             binding = ExecutionBinding(
