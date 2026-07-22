@@ -30,6 +30,7 @@ from telegram_kol_research.models import (
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
+    TradingSetting,
     TradeIdea,
 )
 
@@ -606,6 +607,12 @@ def test_authoritative_low_confidence_group_exit_fans_out_to_same_chat_btc_and_e
             text="空单解套的人就可以先平加仓或者平仓等新机会",
         )
         session.add_all([btc, eth, elsewhere, unbound, exited, raw_message])
+        session.add(
+            TradingSetting(
+                key="low_confidence_group_exit_cutoff",
+                value_json='{"min_raw_message_id": 0}',
+            )
+        )
         session.flush()
         for lifecycle, pos_id in ((btc, "btc-short"), (eth, "eth-short")):
             binding = ExecutionBinding(

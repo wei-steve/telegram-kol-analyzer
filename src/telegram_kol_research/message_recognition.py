@@ -27,6 +27,7 @@ from telegram_kol_research.models import (
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
+    TradingSetting,
     TradeIdea,
     utc_now,
 )
@@ -90,6 +91,7 @@ DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS = 72
 BITCOIN_JUNZHANG_CHAT_ID = BITCOIN_JUNZHANG_PROFILE.chat_id
 BITCOIN_JUNZHANG_PARSE_SOURCE = BITCOIN_JUNZHANG_PROFILE.parse_source
 LOW_CONFIDENCE_GROUP_EXIT_GENERATION = "low_confidence_group_exit:v1"
+LOW_CONFIDENCE_GROUP_EXIT_CUTOFF_KEY = "low_confidence_group_exit_cutoff"
 
 ENTRY_TERMS = [
     "建仓",
@@ -1634,7 +1636,11 @@ def _apply_low_confidence_group_exit_if_matched(
     """Apply the operator-approved cautious-exit policy without broad matching."""
 
     scope = _low_confidence_group_exit_scope(raw_message.text or "")
-    if scope is None or _looks_like_trading_education_content(raw_message.text or ""):
+    if (
+        scope is None
+        or not _low_confidence_group_exit_is_enabled(session, raw_message)
+        or _looks_like_trading_education_content(raw_message.text or "")
+    ):
         return False
     side, symbols = scope
     query = session.query(StrategyLifecycle).filter(
@@ -1671,6 +1677,22 @@ def _apply_low_confidence_group_exit_if_matched(
             applied_candidate_ids=applied_candidate_ids,
         ) or applied
     return applied
+
+
+def _low_confidence_group_exit_is_enabled(session, raw_message: RawMessage) -> bool:
+    row = session.query(TradingSetting).filter(
+        TradingSetting.key == LOW_CONFIDENCE_GROUP_EXIT_CUTOFF_KEY
+    ).one_or_none()
+    if row is None:
+        return False
+    try:
+        payload = json.loads(row.value_json)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    cutoff = _int_or_none(payload.get("min_raw_message_id"))
+    return cutoff is not None and raw_message.id > cutoff
 
 
 def _low_confidence_group_exit_scope(text: str) -> tuple[str, set[str] | None] | None:
