@@ -140,6 +140,7 @@ from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
     canonical_management_error_summary,
     deliver_pending_position_attribution_incidents,
+    load_notification_bot_config,
     load_system_operator_bot_config,
     send_ai_recognition_conflict_review,
     send_pending_entry_expiry_review,
@@ -363,7 +364,7 @@ def _log_background_task_result(task_name: str):
 
 
 def _build_semantic_review_notifier(app: FastAPI):
-    config = app.state.system_operator_bot_config
+    config = app.state.notification_bot_config
     if not isinstance(config, SystemOperatorBotConfig):
         return None
 
@@ -2556,7 +2557,7 @@ def create_web_app(
                     deepcoin_client_factory=app.state.deepcoin_client_factory,
                     interval_seconds=app.state.deepcoin_reconcile_interval_seconds,
                     now_provider=app.state.now_provider,
-                    system_operator_bot_config=app.state.system_operator_bot_config,
+                    system_operator_bot_config=app.state.notification_bot_config,
                 )
             )
             app.state.strategy_management_worker_task = asyncio.create_task(
@@ -2582,17 +2583,18 @@ def create_web_app(
                         group_config=app.state.group_config,
                     )
                 )
-            if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
+            if isinstance(app.state.notification_bot_config, SystemOperatorBotConfig):
                 app.state.strategy_management_notification_task = asyncio.create_task(
                     run_strategy_management_notification_loop(
                         session_factory=app.state.session_factory,
-                        config=app.state.system_operator_bot_config,
+                        config=app.state.notification_bot_config,
                         group_labels=_group_label_by_chat_id(app.state.group_config),
                     )
                 )
                 app.state.strategy_management_notification_task.add_done_callback(
                     _log_background_task_result("strategy_management_notification_task")
                 )
+            if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
                 app.state.system_operator_bot_command_task = asyncio.create_task(
                     run_system_operator_bot_command_loop(
                         config=app.state.system_operator_bot_config,
@@ -2621,7 +2623,7 @@ def create_web_app(
                     lifecycle_monitor=app.state.lifecycle_monitor,
                     auto_trade_executor=app.state.auto_trade_executor,
                     authoritative_processor=app.state.authoritative_processor,
-                    system_operator_bot_config=app.state.system_operator_bot_config,
+                    system_operator_bot_config=app.state.notification_bot_config,
                     operation_lock=app.state.telegram_operation_lock,
                 )
                 app.state.reconcile_task = asyncio.create_task(
@@ -2637,7 +2639,7 @@ def create_web_app(
                         strategy_alert_config=app.state.strategy_alert_config,
                         strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
                         authoritative_processor=app.state.authoritative_processor,
-                        system_operator_bot_config=app.state.system_operator_bot_config,
+                        system_operator_bot_config=app.state.notification_bot_config,
                         startup_delay_seconds=app.state.reconcile_startup_delay_seconds,
                     )
                 )
@@ -2733,6 +2735,12 @@ def create_web_app(
     app.state.system_operator_bot_config = (
         loaded_system_operator_bot_config
         if system_operator_bot_enabled(loaded_system_operator_bot_config)
+        else None
+    )
+    loaded_notification_bot_config = load_notification_bot_config()
+    app.state.notification_bot_config = (
+        loaded_notification_bot_config
+        if system_operator_bot_enabled(loaded_notification_bot_config)
         else None
     )
     app.state.chat_requester = request_grounded_chat_answer
@@ -2848,7 +2856,7 @@ def create_web_app(
                 lifecycle_monitor=app.state.lifecycle_monitor,
                 auto_trade_executor=app.state.auto_trade_executor,
                 authoritative_processor=app.state.authoritative_processor,
-                system_operator_bot_config=app.state.system_operator_bot_config,
+                system_operator_bot_config=app.state.notification_bot_config,
                 operation_lock=app.state.telegram_operation_lock,
             )
         reconcile_task = app.state.reconcile_task
@@ -2866,7 +2874,7 @@ def create_web_app(
                     strategy_alert_config=app.state.strategy_alert_config,
                     strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
                     authoritative_processor=app.state.authoritative_processor,
-                    system_operator_bot_config=app.state.system_operator_bot_config,
+                    system_operator_bot_config=app.state.notification_bot_config,
                     startup_delay_seconds=0,
                 )
             )
@@ -4052,10 +4060,10 @@ def create_web_app(
                 client=client,
                 synced_at=app.state.now_provider(),
             )
-            if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
+            if isinstance(app.state.notification_bot_config, SystemOperatorBotConfig):
                 await deliver_pending_position_attribution_incidents(
                     app.state.session_factory,
-                    config=app.state.system_operator_bot_config,
+                    config=app.state.notification_bot_config,
                     delivered_at=app.state.now_provider(),
                 )
         except DeepcoinClientError as exc:
@@ -4303,13 +4311,13 @@ def create_web_app(
                     )
             if (
                 conflict_payload is not None
-                and system_operator_bot_enabled(app.state.system_operator_bot_config)
+                and system_operator_bot_enabled(app.state.notification_bot_config)
             ):
                 notification_scheduled = _handle_authoritative_failure_notification(
                     session_factory=app.state.session_factory,
                     raw_message_id=raw_message_id,
                     sender=send_ai_recognition_conflict_review,
-                    config=app.state.system_operator_bot_config,
+                    config=app.state.notification_bot_config,
                     payload=conflict_payload,
                 )
             else:
@@ -4319,7 +4327,7 @@ def create_web_app(
                 session_factory=app.state.session_factory,
                 raw_message_id=raw_message_id,
                 chat_title=raw_message.sender_name,
-                system_operator_bot_config=app.state.system_operator_bot_config,
+                system_operator_bot_config=app.state.notification_bot_config,
                 claimed_at=app.state.now_provider(),
             )
         except LookupError as exc:
@@ -4923,7 +4931,7 @@ def create_web_app(
                             "strategy_alert_config": app.state.strategy_alert_config,
                             "strategy_alert_enabled_for_title": app.state.strategy_alert_enabled_for_title,
                             "authoritative_processor": app.state.authoritative_processor,
-                            "system_operator_bot_config": app.state.system_operator_bot_config,
+                            "system_operator_bot_config": app.state.notification_bot_config,
                         },
                     )
                     return await asyncio.wait_for(

@@ -89,7 +89,7 @@ from telegram_kol_research.strategy_alerts import (
     strategy_alerts_enabled,
 )
 from telegram_kol_research.system_operator_bot import (
-    load_system_operator_bot_config,
+    load_notification_bot_config,
     send_ai_recognition_conflict_review,
     system_operator_bot_enabled,
 )
@@ -1332,7 +1332,7 @@ def _run_parse_mode(
             raw_message_ids=raw_message_ids,
             ai_recognition_config_path=ai_recognition_config_path,
             media_root=media_root,
-            system_operator_bot_config=load_system_operator_bot_config(),
+            system_operator_bot_config=load_notification_bot_config(),
         )
     )
     trade_stats = persist_trade_ideas_from_candidates(session_factory)
@@ -1438,7 +1438,7 @@ async def _run_telegram_sync(
             raw_message_ids=raw_message_ids,
             ai_recognition_config_path=ai_recognition_config_path,
             media_root=media_root,
-            system_operator_bot_config=load_system_operator_bot_config(),
+            system_operator_bot_config=load_notification_bot_config(),
         )
         trade_stats = persist_trade_ideas_from_candidates(session_factory)
         inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
@@ -2527,7 +2527,7 @@ def alerts(
             client = create_telegram_client(auth_config)
             session_factory = create_session_factory(database_path)
             broker = LiveUpdateBroker()
-            system_operator_bot_config = load_system_operator_bot_config()
+            system_operator_bot_config = load_notification_bot_config()
 
             def authoritative_processor(raw_message_id: int):
                 return process_authoritative_message(

@@ -19,6 +19,7 @@ from telegram_kol_research.system_operator_bot import (
     format_pending_entry_expiry_review_message,
     format_position_attribution_incident_message,
     deliver_pending_position_attribution_incidents,
+    load_notification_bot_config,
     load_system_operator_bot_config,
     send_semantic_disagreement_notification,
     system_operator_bot_enabled,
@@ -812,6 +813,22 @@ def test_load_system_operator_bot_config_uses_dedicated_env_vars():
     assert config.chat_id == "987654"
     assert config.timeout_seconds == 12
     assert system_operator_bot_enabled(config)
+
+
+def test_load_notification_bot_config_uses_separate_env_vars():
+    config = load_notification_bot_config(
+        {
+            "TELEGRAM_KOL_NOTIFICATION_BOT_TOKEN": "notification-token",
+            "TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID": "987654",
+            "TELEGRAM_KOL_NOTIFICATION_BOT_TIMEOUT_SECONDS": "12",
+            "TELEGRAM_KOL_SYSTEM_BOT_TOKEN": "decision-token",
+        },
+        env_file_paths=[],
+    )
+
+    assert config.bot_token == "notification-token"
+    assert config.chat_id == "987654"
+    assert config.timeout_seconds == 12
 
 
 def test_load_system_operator_bot_config_explicit_empty_paths_reads_no_checkout_env(

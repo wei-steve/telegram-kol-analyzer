@@ -39,6 +39,9 @@ class SystemOperatorBotConfig:
     timeout_seconds: float = 10.0
 
 
+NotificationBotConfig = SystemOperatorBotConfig
+
+
 def load_system_operator_bot_config(
     environ: dict[str, str] | None = None,
     env_file_paths: list[str | os.PathLike[str]] | None = None,
@@ -60,6 +63,30 @@ def load_system_operator_bot_config(
         bot_token=env.get("TELEGRAM_KOL_SYSTEM_BOT_TOKEN", ""),
         chat_id=env.get("TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID", ""),
         timeout_seconds=float(env.get("TELEGRAM_KOL_SYSTEM_BOT_TIMEOUT_SECONDS", "10")),
+    )
+
+
+def load_notification_bot_config(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | os.PathLike[str]] | None = None,
+) -> NotificationBotConfig:
+    paths = (
+        [
+            ".env",
+            "config/telegram.env",
+            "config/system_operator_bot.env",
+        ]
+        if env_file_paths is None
+        else env_file_paths
+    )
+    env = dict(_load_env_file_values(paths) if paths else {})
+    env.update(environ or os.environ)
+    return NotificationBotConfig(
+        bot_token=env.get("TELEGRAM_KOL_NOTIFICATION_BOT_TOKEN", ""),
+        chat_id=env.get("TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID", ""),
+        timeout_seconds=float(
+            env.get("TELEGRAM_KOL_NOTIFICATION_BOT_TIMEOUT_SECONDS", "10")
+        ),
     )
 
 

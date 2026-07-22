@@ -313,6 +313,10 @@ def test_semantic_review_worker_lifespan_starts_once_without_telegram_and_stops_
         bot_token="system-token",
         chat_id="system-chat",
     )
+    app.state.notification_bot_config = SystemOperatorBotConfig(
+        bot_token="notification-token",
+        chat_id="system-chat",
+    )
     broker_type = type(app.state.live_update_broker)
     original_close = broker_type.close
 
@@ -531,7 +535,7 @@ def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypa
         database_path=tmp_path / "research.db",
         semantic_review_runner=fake_semantic_review_runner,
     )
-    app.state.system_operator_bot_config = bot_config
+    app.state.notification_bot_config = bot_config
 
     with TestClient(app):
         assert started.wait(timeout=1)
@@ -3132,7 +3136,7 @@ def test_message_recognition_api_delivers_completed_instruction_summary(
         database_path=tmp_path / "manual-summary.db",
         ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
     )
-    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+    app.state.notification_bot_config = SystemOperatorBotConfig(
         bot_token="system-token",
         chat_id="system-chat",
     )
@@ -3277,7 +3281,7 @@ def test_message_recognition_api_suppresses_low_value_authoritative_failure(
         database_path=tmp_path / "research.db",
         ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
     )
-    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+    app.state.notification_bot_config = SystemOperatorBotConfig(
         bot_token="system-token",
         chat_id="system-chat",
     )

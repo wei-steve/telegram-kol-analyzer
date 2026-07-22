@@ -560,6 +560,69 @@ def test_authoritative_mimo_failure_suppresses_obvious_external_stock_noise(
     assert audit[0]["automation_reason"] == "mimo_authoritative_failed"
 
 
+def test_authoritative_mimo_failure_suppresses_empty_input_noise(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    broker = LiveUpdateBroker()
+    sent: list[dict] = []
+    audit: list[dict] = []
+
+    def authoritative_processor(raw_message_id):
+        return SimpleNamespace(
+            assessment=SimpleNamespace(
+                agreement_status="authoritative_failed",
+                differences=[],
+                mimo=SimpleNamespace(
+                    status="识别失败",
+                    payload={},
+                    model="mimo-v2.5",
+                    error_message="message has no readable text or image",
+                ),
+                deepseek_payload=None,
+            ),
+            recognition=MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="识别失败",
+                reason="message has no readable text or image",
+                parse_source="mimo_authoritative",
+            ),
+            automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
+        )
+
+    async def sender(**kwargs):
+        sent.append(kwargs)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
+        lambda *args, **kwargs: audit.append(kwargs),
+    )
+
+    asyncio.run(
+        persist_live_message_event(
+            event=_FakeEvent(text=""),
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            chat_title="比特币军长-11分组",
+            ai_recognition_config=AiRecognitionConfig(),
+            authoritative_processor=authoritative_processor,
+            system_operator_bot_config=SystemOperatorBotConfig(
+                bot_token="system-token",
+                chat_id="system-chat",
+            ),
+            system_operator_conflict_sender=sender,
+        )
+    )
+
+    assert sent == []
+    assert [row["notification_status"] for row in audit] == [
+        "suppressed_empty_input"
+    ]
+    assert audit[0]["automation_reason"] == "mimo_authoritative_failed"
+
+
 def test_authoritative_mimo_failure_still_alerts_position_management_text(
     tmp_path,
     monkeypatch,

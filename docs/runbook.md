@@ -320,7 +320,7 @@ state file was repaired; a genuine change to that anomaly still notifies
 immediately.
 
 Provision the monitor-only root credential file once. It may contain only the
-system-operator bot token, chat ID, and optional timeout; never put a Deepcoin,
+notification-bot token, chat ID, and optional timeout; never put a Deepcoin,
 Telegram-session, database, or application credential in this file:
 
 ```bash
@@ -329,9 +329,20 @@ sudoedit /etc/telegram-kol-monitor.credentials
 ```
 
 ```text
-TELEGRAM_KOL_SYSTEM_BOT_TOKEN=<operator-bot-token>
-TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID=<operator-chat-id>
+TELEGRAM_KOL_NOTIFICATION_BOT_TOKEN=<notification-bot-token>
+TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID=<notification-chat-id>
+TELEGRAM_KOL_NOTIFICATION_BOT_TIMEOUT_SECONDS=10
 ```
+
+The application uses two separate Bot roles. Keep
+`TELEGRAM_KOL_SYSTEM_BOT_TOKEN` and `TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID` for the
+existing decision Bot: it alone receives pending-entry expiry reviews and their
+interactive **continue waiting / cancel / keep** buttons. Configure
+`TELEGRAM_KOL_NOTIFICATION_BOT_TOKEN` with the informational third Bot and set
+`TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID` to the same chat ID when both Bots
+deliver to one operator group. AI-recognition, position-attribution,
+strategy-management, instruction-summary, and production-monitor notices use
+the notification Bot. Never commit either token.
 
 For every install or upgrade, explicitly stop and disable the monitor first.
 The install-only helper fails before changing users, files, or systemd state if

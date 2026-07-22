@@ -376,7 +376,7 @@ def _handle_authoritative_failure_notification(
     if payload is None:
         return False
     notification_status = _classify_authoritative_failure_notification(payload)
-    if notification_status == "suppressed_low_value":
+    if notification_status.startswith("suppressed_"):
         update_recognition_execution_outcome(
             session_factory,
             raw_message_id=raw_message_id,
@@ -423,6 +423,9 @@ def _schedule_authoritative_failure_retry(
 def _classify_authoritative_failure_notification(payload: dict[str, Any]) -> str:
     if str(payload.get("agreement_status") or "") != "authoritative_failed":
         return "scheduled"
+    mimo = payload.get("mimo") if isinstance(payload.get("mimo"), dict) else {}
+    if str(mimo.get("reason") or "").strip() == "message has no readable text or image":
+        return "suppressed_empty_input"
     if _is_low_value_external_market_failure(str(payload.get("text") or "")):
         return "suppressed_low_value"
     return "scheduled"

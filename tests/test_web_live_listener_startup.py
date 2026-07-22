@@ -51,6 +51,10 @@ def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
         bot_token="system-token",
         chat_id="system-chat",
     )
+    app.state.notification_bot_config = SystemOperatorBotConfig(
+        bot_token="notification-token",
+        chat_id="system-chat",
+    )
 
     with TestClient(app) as client:
         response = client.get("/")
@@ -62,7 +66,7 @@ def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
             {"Demo Group"},
             str((tmp_path / "media").resolve()),
             app.state.strategy_alert_config,
-            app.state.system_operator_bot_config,
+            app.state.notification_bot_config,
         )
     ]
     assert reconcile_calls == [
