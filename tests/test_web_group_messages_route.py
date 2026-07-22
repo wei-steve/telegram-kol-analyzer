@@ -499,6 +499,56 @@ def test_group_messages_route_labels_lifecycle_event_detection(tmp_path):
     assert "AI识别结果：非策略" not in response.text
 
 
+def test_group_messages_route_shows_low_confidence_exit_targets(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=4070,
+            sender_name="大镖客·Andy",
+            text="空单解套的人就可以先平加仓或者平仓等新机会",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add_all(
+            [
+                SignalCandidate(
+                    raw_message_id=raw_message.id,
+                    symbol="BTC",
+                    side="short",
+                    event_type="position_update",
+                    target_lifecycle_id=101,
+                    management_action="partial_take_profit",
+                    management_fraction=0.5,
+                    parse_source="low_confidence_group_exit",
+                    confidence=0.85,
+                ),
+                SignalCandidate(
+                    raw_message_id=raw_message.id,
+                    symbol="ETH",
+                    side="short",
+                    event_type="position_update",
+                    target_lifecycle_id=102,
+                    management_action="partial_take_profit",
+                    management_fraction=0.5,
+                    parse_source="low_confidence_group_exit",
+                    confidence=0.85,
+                ),
+            ]
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/88/messages"
+    )
+
+    assert response.status_code == 200
+    assert "低信心离场：每条腿平 50%" in response.text
+    assert "BTC 空 · 策略 #101" in response.text
+    assert "ETH 空 · 策略 #102" in response.text
+
+
 def test_group_messages_route_shows_authoritative_model_summary(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

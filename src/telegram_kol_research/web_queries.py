@@ -448,7 +448,9 @@ def _serialize_raw_messages(
         .all()
     )
     cand_by_msg_id: dict[int, SignalCandidate] = {}
+    candidates_by_msg_id: dict[int, list[SignalCandidate]] = {}
     for c in all_candidates:
+        candidates_by_msg_id.setdefault(c.raw_message_id, []).append(c)
         if c.raw_message_id not in cand_by_msg_id:
             cand_by_msg_id[c.raw_message_id] = c
 
@@ -496,6 +498,9 @@ def _serialize_raw_messages(
                 "strategy_lifecycle_id": (
                     lifecycle_ids[0] if len(lifecycle_ids) == 1 else None
                 ),
+                "low_confidence_exit_targets": _serialize_low_confidence_exit_targets(
+                    candidates_by_msg_id.get(raw_message.id, [])
+                ),
                 "strategy_detection": _build_strategy_detection(
                     recognition=rec_by_msg_id.get(raw_message.id),
                     candidate=selected_candidate,
@@ -524,6 +529,30 @@ def _serialize_raw_messages(
         )
 
     return rows
+
+
+def _serialize_low_confidence_exit_targets(
+    candidates: list[SignalCandidate],
+) -> list[dict[str, object]]:
+    targets = [
+        candidate
+        for candidate in candidates
+        if candidate.parse_source == "low_confidence_group_exit"
+        and candidate.management_action == "partial_take_profit"
+        and candidate.management_fraction == 0.5
+        and candidate.target_lifecycle_id is not None
+    ]
+    return [
+        {
+            "symbol": str(candidate.symbol or "").upper(),
+            "side": "空" if candidate.side == "short" else "多",
+            "lifecycle_id": int(candidate.target_lifecycle_id),
+        }
+        for candidate in sorted(
+            targets,
+            key=lambda candidate: (str(candidate.symbol or ""), int(candidate.target_lifecycle_id or 0)),
+        )
+    ]
 
 
 def _build_authoritative_model_summary(

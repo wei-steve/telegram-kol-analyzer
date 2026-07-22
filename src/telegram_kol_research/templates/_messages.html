@@ -85,6 +85,7 @@
       {% set semantic_review = message.semantic_review %}
       {% set execution_outcome = message.execution_outcome %}
       {% set decision_card = message.decision_card %}
+      {% set low_confidence_exit_targets = message.low_confidence_exit_targets %}
       {% set ai_panel_class = detection.status_class if detection else 'is-pending' %}
       {% set strategy_related = ai_panel_class == 'is-strategy' %}
       {% if comparison %}
@@ -176,6 +177,16 @@
                   {% endif %}
                 </div>
               {% endfor %}
+            </div>
+          {% endif %}
+          {% if low_confidence_exit_targets %}
+            <div class="message-execution-outcome is-waiting" role="status">
+              <strong>低信心离场：每条腿平 50%</strong>
+              <small>
+                {% for target in low_confidence_exit_targets %}
+                  {{ target.symbol }} {{ target.side }} · 策略 #{{ target.lifecycle_id }}{% if not loop.last %}；{% endif %}
+                {% endfor %}
+              </small>
             </div>
           {% endif %}
           {% if decision_card %}
