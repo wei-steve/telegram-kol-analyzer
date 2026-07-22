@@ -310,6 +310,105 @@ def test_authoritative_position_update_persists_target_lifecycle_and_generation(
         assert item.sequence == 0
 
 
+def test_authoritative_prudent_exit_accepts_empty_targets_for_single_lifecycle(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=2132,
+            posted_at=datetime(2026, 7, 22, 3, 15, tzinfo=UTC),
+            text="空单综合成本65800，当前66000附近，求稳可走",
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=2124,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 21, 1, 45, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 21, 1, 46, tzinfo=UTC),
+        )
+        session.add_all([raw_message, lifecycle])
+        session.flush()
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=2124,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            pos_id="pos-prudent-exit",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {
+                "event_type": "exit_position",
+                "target_lifecycle_id": lifecycle_id,
+                "symbol": "BTC",
+                "side": "short",
+                "targets": [],
+                "confidence": 0.9,
+                "reason": "当前空单求稳可走",
+            },
+        },
+        model="mimo-v2.5",
+        authoritative_generation="prudent-exit-2132",
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        item = session.query(MessageInstructionItem).one()
+    assert candidate.event_type == "close_signal"
+    assert candidate.target_lifecycle_id == lifecycle_id
+    assert candidate.management_action == "full_exit"
+    assert item.instruction_kind == "management"
+
+
+def test_authoritative_empty_targets_without_single_lifecycle_stays_fail_closed(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=2133,
+            text="求稳可走",
+        )
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {
+                "event_type": "exit_position",
+                "targets": [],
+                "confidence": 0.9,
+                "reason": "没有可验证的唯一策略目标",
+            },
+        },
+        model="mimo-v2.5",
+    )
+
+    assert result.status == "识别失败"
+    with session_factory() as session:
+        assert session.query(SignalCandidate).count() == 0
+        assert session.query(MessageInstructionItem).count() == 0
+
+
 def test_authoritative_multi_target_partial_take_profit_persists_one_candidate_per_strategy(
     tmp_path,
 ):
