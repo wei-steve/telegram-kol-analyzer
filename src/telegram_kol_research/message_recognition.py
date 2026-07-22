@@ -89,6 +89,7 @@ EXIT_SYMBOL_ALIASES = {
 DUPLICATE_ACTIVE_STRATEGY_WINDOW_HOURS = 72
 BITCOIN_JUNZHANG_CHAT_ID = BITCOIN_JUNZHANG_PROFILE.chat_id
 BITCOIN_JUNZHANG_PARSE_SOURCE = BITCOIN_JUNZHANG_PROFILE.parse_source
+LOW_CONFIDENCE_GROUP_EXIT_GENERATION = "low_confidence_group_exit:v1"
 
 ENTRY_TERMS = [
     "建仓",
@@ -1666,7 +1667,7 @@ def _apply_low_confidence_group_exit_if_matched(
                 "_explicit_multi_target": len(targets) > 1,
             },
             parse_source=parse_source,
-            authoritative_generation=authoritative_generation,
+            authoritative_generation=LOW_CONFIDENCE_GROUP_EXIT_GENERATION,
             applied_candidate_ids=applied_candidate_ids,
         ) or applied
     return applied
@@ -2023,21 +2024,19 @@ def apply_authoritative_mimo_payload(
             else {"event_type": "none", "confidence": 0.0}
         )
         event_type = str(lifecycle_event.get("event_type") or "none")
-        lifecycle_applied = False
-        if event_type != "none":
+        lifecycle_applied = _apply_low_confidence_group_exit_if_matched(
+            session,
+            raw_message,
+            parse_source="low_confidence_group_exit",
+            authoritative_generation=authoritative_generation,
+            applied_candidate_ids=accepted_candidate_ids,
+        )
+        if not lifecycle_applied and event_type != "none":
             lifecycle_applied = _apply_lifecycle_event_decision(
                 session,
                 raw_message,
                 lifecycle_event,
                 parse_source="mimo_authoritative",
-                authoritative_generation=authoritative_generation,
-                applied_candidate_ids=accepted_candidate_ids,
-            )
-        else:
-            lifecycle_applied = _apply_low_confidence_group_exit_if_matched(
-                session,
-                raw_message,
-                parse_source="low_confidence_group_exit",
                 authoritative_generation=authoritative_generation,
                 applied_candidate_ids=accepted_candidate_ids,
             )

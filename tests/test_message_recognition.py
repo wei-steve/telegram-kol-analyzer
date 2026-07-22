@@ -631,7 +631,13 @@ def test_authoritative_low_confidence_group_exit_fans_out_to_same_chat_btc_and_e
         raw_message_id=raw_message_id,
         payload={
             "recognition_result": "非策略",
-            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+            "lifecycle_event": {
+                "event_type": "exit_position",
+                "target_lifecycle_id": btc_id,
+                "symbol": "BTC",
+                "side": "short",
+                "confidence": 0.95,
+            },
         },
         model="mimo-v2.5",
         authoritative_generation="low-confidence-group-exit",
