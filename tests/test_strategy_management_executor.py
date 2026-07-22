@@ -572,6 +572,33 @@ def test_partial_take_profit_cancels_deferred_range_entry_before_closing_filled_
         assert deferred.status == "cancelled"
 
 
+def test_partial_take_profit_allows_already_cancelled_unfilled_entry_leg(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        _require_exact_entry_legs,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory, sizes=("1", "2"))
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        binding.pos_id = "pos-1"
+        cancelled_entry = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=batch.execution_binding_id,
+            pos_id="pos-2",
+        ).one()
+        cancelled_entry.pos_id = None
+        cancelled_entry.status = "cancelled"
+        cancelled_entry.attribution_status = "unassigned"
+        cancelled_entry.terminal_reason = "operator_cancelled_unfilled_entry_leg"
+        session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch.id,
+            pos_id="pos-2",
+        ).delete()
+        session.commit()
+
+    _require_exact_entry_legs(session_factory, load_management_batch(session_factory, batch.id))
+
+
 def test_full_close_does_not_submit_when_deferred_entry_leg_is_not_live(tmp_path):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
 

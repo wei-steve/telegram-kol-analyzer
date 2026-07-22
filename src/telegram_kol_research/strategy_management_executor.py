@@ -1690,6 +1690,8 @@ def _require_exact_entry_legs(
                     raise ManagementBatchExecutionError("batch_entry_set_not_exact")
                 current_identity.add(identity)
                 continue
+            if status in TERMINAL_ENTRY_LEG_STATES:
+                continue
             if _is_deferred_pending_entry_leg(entry):
                 current_deferred_ids.add(int(entry.id))
                 continue
