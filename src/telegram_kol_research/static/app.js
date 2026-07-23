@@ -11,6 +11,7 @@ let recoveryRefreshPromise = null;
 const STRATEGY_RECORD_FILTER_KEY = 'telegram-workbench:strategy-filter';
 const STRATEGY_RECORD_GROUP_KEY = 'telegram-workbench:strategy-group';
 const STRATEGY_RECORD_SCROLL_KEY = 'telegram-workbench:strategy-scroll';
+const EXCHANGE_POSITION_VIEW_KEY = 'telegram-workbench:exchange-position-view';
 let strategyRecordRequestId = 0;
 let strategyRecordHasPendingChanges = false;
 let lastSuccessfulStrategyRecordAt = null;
@@ -2081,17 +2082,49 @@ function bindExchangePositionTabs() {
     viewButtons.forEach((button) => {
       button.addEventListener('click', () => {
         const mode = button.dataset.exchangeViewMode || 'list';
-        viewButtons.forEach((item) => {
-          const isActive = item === button;
-          item.classList.toggle('is-active', isActive);
-          item.setAttribute('aria-selected', isActive ? 'true' : 'false');
-        });
-        viewPanels.forEach((panel) => {
-          panel.classList.toggle('is-active', panel.dataset.exchangeViewPanel === mode);
-        });
+        setExchangePositionView(root, mode);
+        saveExchangePositionView(mode);
       });
     });
+    restoreExchangePositionView(root);
   });
+}
+
+function exchangePositionViewMode() {
+  try {
+    return window.localStorage.getItem(EXCHANGE_POSITION_VIEW_KEY) === 'grouped'
+      ? 'grouped'
+      : 'list';
+  } catch {
+    return 'list';
+  }
+}
+
+function saveExchangePositionView(mode) {
+  try {
+    window.localStorage.setItem(
+      EXCHANGE_POSITION_VIEW_KEY,
+      mode === 'grouped' ? 'grouped' : 'list',
+    );
+  } catch {
+    // Keep the active in-memory DOM state when browser storage is unavailable.
+  }
+}
+
+function setExchangePositionView(root, mode) {
+  const selectedMode = mode === 'grouped' ? 'grouped' : 'list';
+  root.querySelectorAll('[data-exchange-view-mode]').forEach((button) => {
+    const isActive = button.dataset.exchangeViewMode === selectedMode;
+    button.classList.toggle('is-active', isActive);
+    button.setAttribute('aria-selected', isActive ? 'true' : 'false');
+  });
+  root.querySelectorAll('[data-exchange-view-panel]').forEach((panel) => {
+    panel.classList.toggle('is-active', panel.dataset.exchangeViewPanel === selectedMode);
+  });
+}
+
+function restoreExchangePositionView(root) {
+  setExchangePositionView(root, exchangePositionViewMode());
 }
 
 function initTradingSymbolSelector(form) {

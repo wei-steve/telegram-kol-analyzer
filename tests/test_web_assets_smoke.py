@@ -90,6 +90,17 @@ def test_app_js_polls_for_updates_even_when_sse_stays_quiet(tmp_path):
     assert "startPollingUpdates();" in response.text
 
 
+def test_app_js_restores_exchange_position_view_after_partial_reload(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    js = client.get("/static/app.js").text
+
+    assert "const EXCHANGE_POSITION_VIEW_KEY" in js
+    assert "function restoreExchangePositionView(root)" in js
+    assert "restoreExchangePositionView(root);" in js
+    assert "saveExchangePositionView(mode);" in js
+
+
 def test_app_js_defaults_message_panel_to_latest_messages_at_top(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
