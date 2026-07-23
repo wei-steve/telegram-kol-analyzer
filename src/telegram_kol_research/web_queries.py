@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Iterable
 
 from sqlalchemy import func, or_
@@ -2411,6 +2411,115 @@ def list_exited_strategies(
             r.get("exited_at") is not None,
             r.get("exited_at") or r.get("entered_at") or "",
             tuple(r.get("history_sort_key") or (0, 0)),
+        ),
+        reverse=True,
+    )
+    return results[:limit]
+
+
+def _deepcoin_history_close_time(history_metrics: dict[str, object]) -> datetime | None:
+    """Return the exchange close/update timestamp stored with a position row."""
+    for field in ("uTime", "closeTime", "cTime"):
+        value = history_metrics.get(field)
+        try:
+            milliseconds = int(float(value))
+        except (TypeError, ValueError):
+            continue
+        if milliseconds > 0:
+            return utc_naive_to_local(datetime.fromtimestamp(milliseconds / 1000, tz=UTC))
+    return None
+
+
+def _has_complete_deepcoin_history_metrics(
+    binding: ExecutionBinding,
+) -> tuple[dict[str, object], dict[str, object]] | None:
+    """Return verified DeepCoin metrics only when they prove a closed position."""
+    payload = _safe_json_dict(binding.payload_json)
+    history_metrics = payload.get("history_metrics")
+    if not isinstance(history_metrics, dict):
+        return None
+    try:
+        values = {
+            field: float(history_metrics[field])
+            for field in ("avgPx", "closeAvgPx", "pnl", "pos", "closePos")
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        values["avgPx"] <= 0
+        or values["closeAvgPx"] <= 0
+        or values["pos"] <= 0
+        or values["closePos"] <= 0
+    ):
+        return None
+    metrics = _backfill_closed_binding_metrics(binding)
+    if metrics.get("history_metric_source") != "deepcoin_position_history":
+        return None
+    return history_metrics, metrics
+
+
+def list_verified_deepcoin_history_positions(
+    session_factory, *, chat_id: int | None = None, limit: int = 50
+) -> list[dict[str, object]]:
+    """Return only complete, exchange-verified DeepCoin closed positions.
+
+    Strategy status is deliberately not a criterion: a closed strategy can be
+    an expired or cancelled conditional order.  A record must have both the
+    cached official position metrics and an exact entry-leg position id.
+    """
+    with session_factory() as session:
+        query = session.query(ExecutionBinding).filter(ExecutionBinding.venue == "deepcoin")
+        if chat_id is not None:
+            query = query.filter(ExecutionBinding.chat_id == chat_id)
+        bindings = query.all()
+        entry_pos_ids = {
+            int(binding_id): sorted(
+                {
+                    str(pos_id)
+                    for (pos_id,) in session.query(ExecutionOrderLeg.pos_id)
+                    .filter(ExecutionOrderLeg.execution_binding_id == binding_id)
+                    .filter(ExecutionOrderLeg.purpose == "entry")
+                    .filter(ExecutionOrderLeg.pos_id.is_not(None))
+                    .filter(ExecutionOrderLeg.pos_id != "")
+                    .all()
+                }
+            )
+            for binding_id in [binding.id for binding in bindings]
+        }
+
+    results: list[dict[str, object]] = []
+    for binding in bindings:
+        verified = _has_complete_deepcoin_history_metrics(binding)
+        pos_ids = entry_pos_ids.get(int(binding.id), [])
+        if verified is None or not pos_ids:
+            continue
+        history_metrics, metrics = verified
+        closed_at = _deepcoin_history_close_time(history_metrics) or utc_naive_to_local(
+            binding.updated_at
+        )
+        row: dict[str, object] = {
+            "history_sort_id": f"binding:{binding.id}",
+            "history_sort_key": (str(pos_ids[0]), int(binding.id)),
+            "execution_binding_id": binding.id,
+            "chat_id": binding.chat_id,
+            "message_id": binding.message_id,
+            "symbol": binding.symbol,
+            "side": binding.side,
+            "source": "execution_binding",
+            "lifecycle_status": "exited",
+            "exit_reason": "closed",
+            "entered_at": utc_naive_to_local(binding.created_at),
+            "exited_at": closed_at,
+            "sender_name": binding.kol_id,
+            "pos_ids": pos_ids,
+        }
+        row.update(metrics)
+        results.append(_add_strategy_time_display_fields(row))
+
+    results.sort(
+        key=lambda row: (
+            row.get("exited_at") or "",
+            tuple(row.get("history_sort_key") or ("", 0)),
         ),
         reverse=True,
     )

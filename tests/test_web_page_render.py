@@ -24,6 +24,7 @@ from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.web_queries import list_exited_strategies
+from telegram_kol_research.web_queries import list_verified_deepcoin_history_positions
 
 
 def test_history_position_time_order_prefers_closed_time_and_uses_stable_id(tmp_path):
@@ -79,15 +80,15 @@ def test_history_position_time_order_prefers_closed_time_and_uses_stable_id(tmp_
             )
         session.commit()
 
-    response = TestClient(create_web_app(database_path=database_path)).get("/positions-panel")
+    rows = list_exited_strategies(session_factory, limit=10)
 
-    assert response.status_code == 200
-    latest = response.text.index('data-history-position-id="lifecycle:2"')
-    tie_second = response.text.index('data-history-position-id="lifecycle:5"')
-    tie_first = response.text.index('data-history-position-id="lifecycle:4"')
-    early = response.text.index('data-history-position-id="lifecycle:1"')
-    fallback = response.text.index('data-history-position-id="lifecycle:3"')
-    assert latest < tie_second < tie_first < early < fallback
+    assert [row["history_sort_id"] for row in rows] == [
+        "lifecycle:2",
+        "lifecycle:5",
+        "lifecycle:4",
+        "lifecycle:1",
+        "lifecycle:3",
+    ]
 
 
 def test_deepcoin_history_position_layout_uses_app_information_hierarchy(tmp_path):
@@ -141,13 +142,9 @@ def test_deepcoin_history_position_layout_uses_app_information_hierarchy(tmp_pat
 
     assert response.status_code == 200
     assert 'data-exchange-history-panel' in response.text
-    assert 'data-deepcoin-history-position' in response.text
-    assert 'data-history-position-id="lifecycle:1"' in response.text
-    assert 'data-deepcoin-history-attribution' in response.text
-    assert "开仓均价" in response.text
-    assert "平仓均价" in response.text
-    assert "开仓时间" in response.text
-    assert "最后平仓时间" in response.text
+    assert 'data-deepcoin-history-position' not in response.text
+    assert 'data-history-position-id="lifecycle:1"' not in response.text
+    assert "暂无历史仓位" in response.text
 
 
 def test_complete_history_metrics_keep_missing_actual_values_visible(tmp_path):
@@ -204,10 +201,7 @@ def test_complete_history_metrics_keep_missing_actual_values_visible(tmp_path):
         re.DOTALL,
     )
 
-    assert card is not None
-    for label in ("开仓均价", "平仓均价", "已实现盈亏", "最大持仓量", "已平仓量"):
-        assert label in card.group(1)
-    assert card.group(1).count('class="deepcoin-history-metric-missing">--') == 4
+    assert card is None
 
 
 def test_history_position_handles_legacy_binding_without_metrics(tmp_path):
@@ -239,8 +233,7 @@ def test_history_position_handles_legacy_binding_without_metrics(tmp_path):
     )
 
     assert response.status_code == 200
-    assert card is not None
-    assert card.group(1).count('class="deepcoin-history-metric-missing">--') == 5
+    assert card is None
 
 
 def test_binding_payload_backfill_restores_entry_price_and_contract_quantity(tmp_path):
@@ -287,10 +280,7 @@ def test_binding_payload_backfill_restores_entry_price_and_contract_quantity(tmp
     assert row["position_size_text"] == "0.016 BTC"
     assert row["history_metric_source"] == "saved_order_payload"
     assert response.status_code == 200
-    assert card is not None
-    assert "58987.5" in card.group(1)
-    assert card.group(1).count("0.016 BTC") == 2
-    assert "已保存下单数据回填" in card.group(1)
+    assert card is None
 
 
 def test_binding_payload_history_metrics_prefer_verified_deepcoin_values(tmp_path):
@@ -335,6 +325,138 @@ def test_binding_payload_history_metrics_prefer_verified_deepcoin_values(tmp_pat
     assert row["realized_pnl"] == -7.1288
     assert row["position_size_text"] == "0.007 BTC"
     assert row["history_metric_source"] == "deepcoin_position_history"
+
+
+def test_verified_deepcoin_history_excludes_unfilled_and_keeps_complete_position(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        unfilled = ExecutionBinding(
+            kol_id="unfilled",
+            chat_id=100,
+            message_id=1,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="closed",
+            payload_json=json.dumps(
+                {
+                    "draft": {
+                        "contract_spec": {"contract_value": 0.001},
+                        "order_legs": [{"price": 60000, "quantity": 1}],
+                    },
+                    "history_metrics": {"avgPx": "60000"},
+                }
+            ),
+        )
+        verified = ExecutionBinding(
+            kol_id="verified",
+            chat_id=100,
+            message_id=2,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            status="closed",
+            payload_json=json.dumps(
+                {
+                    "draft": {
+                        "contract_spec": {"contract_value": 0.001},
+                        "order_legs": [{"price": 65000, "quantity": 1}],
+                    },
+                    "history_metrics": {
+                        "avgPx": "65000",
+                        "closeAvgPx": "64000",
+                        "pnl": "11",
+                        "pos": "2",
+                        "closePos": "2",
+                    }
+                }
+            ),
+        )
+        session.add_all([unfilled, verified])
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=verified.id,
+                strategy_instance_id="verified-history",
+                leg_index=0,
+                purpose="entry",
+                order_kind="market",
+                pos_id="real-pos-1",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="closed",
+            )
+        )
+        session.commit()
+
+    rows = list_verified_deepcoin_history_positions(session_factory, limit=10)
+
+    assert [row["execution_binding_id"] for row in rows] == [2]
+    assert rows[0]["entry_price_actual"] == 65000.0
+    assert rows[0]["exit_price_actual"] == 64000.0
+    assert rows[0]["realized_pnl"] == 11.0
+    assert rows[0]["position_size_text"] == "0.002 BTC"
+
+    response = TestClient(create_web_app(database_path=database_path)).get("/positions-panel")
+
+    assert 'data-history-position-id="binding:2"' in response.text
+    assert 'data-history-position-id="binding:1"' not in response.text
+
+
+def test_verified_deepcoin_history_orders_by_deepcoin_close_time(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        for message_id, pos_id, close_time in (
+            (1, "position-early", "1784851200000"),
+            (2, "position-late", "1784937600000"),
+        ):
+            binding = ExecutionBinding(
+                kol_id=f"binding-{message_id}",
+                chat_id=100,
+                message_id=message_id,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                status="closed",
+                payload_json=json.dumps(
+                    {
+                        "draft": {
+                            "contract_spec": {"contract_value": 0.001},
+                            "order_legs": [{"price": 65000, "quantity": 1}],
+                        },
+                        "history_metrics": {
+                            "avgPx": "65000",
+                            "closeAvgPx": "66000",
+                            "pnl": "1",
+                            "pos": "1",
+                            "closePos": "1",
+                            "uTime": close_time,
+                        },
+                    }
+                ),
+            )
+            session.add(binding)
+            session.flush()
+            session.add(
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=f"history-{message_id}",
+                    leg_index=0,
+                    purpose="entry",
+                    order_kind="market",
+                    pos_id=pos_id,
+                    venue="deepcoin",
+                    attribution_status="verified",
+                    status="closed",
+                )
+            )
+        session.commit()
+
+    rows = list_verified_deepcoin_history_positions(session_factory, limit=10)
+
+    assert [row["message_id"] for row in rows] == [2, 1]
 
 
 def test_history_position_time_tie_uses_source_independent_stable_identifier(tmp_path):

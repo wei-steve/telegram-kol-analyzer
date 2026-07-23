@@ -163,6 +163,7 @@ from telegram_kol_research.web_queries import (
     load_lifecycle_counts,
     load_lifecycle_counts_by_chat_id,
     list_exited_strategies,
+    list_verified_deepcoin_history_positions,
     list_holding_strategies,
     mark_strategy_lifecycle_manual_close,
     list_pending_strategies,
@@ -3092,7 +3093,7 @@ def create_web_app(
             chat_id=None,
             limit=200,
         )
-        exited_positions = list_exited_strategies(
+        exited_positions = list_verified_deepcoin_history_positions(
             app.state.session_factory,
             chat_id=None,
             limit=50,
