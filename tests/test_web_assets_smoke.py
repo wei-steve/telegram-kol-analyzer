@@ -24,6 +24,8 @@ def test_deepcoin_history_assets_are_scoped_to_the_history_panel(tmp_path):
     assert ".deepcoin-history-position" in css
     assert "background: #ffffff;" in css
     assert ".deepcoin-history-times dd" in css
+    assert ".deepcoin-history-metric-missing" in css
+    assert ".deepcoin-history-pnl-negative" in css
     assert "[data-exchange-history-panel].is-active .exchange-group-header" in css
     assert ".exchange-position-card" in css
 

@@ -1283,6 +1283,16 @@ body {
   color: #10b981;
 }
 
+.deepcoin-history-primary-metrics .deepcoin-history-pnl-negative {
+  color: #ef4444;
+}
+
+.deepcoin-history-primary-metrics .deepcoin-history-metric-missing,
+.deepcoin-history-secondary-metrics .deepcoin-history-metric-missing {
+  color: #9ca3af;
+  font-weight: 500;
+}
+
 .deepcoin-history-times {
   display: grid;
   gap: 8px;

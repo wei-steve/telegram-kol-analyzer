@@ -150,6 +150,66 @@ def test_deepcoin_history_position_layout_uses_app_information_hierarchy(tmp_pat
     assert "最后平仓时间" in response.text
 
 
+def test_complete_history_metrics_keep_missing_actual_values_visible(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    opened_at = datetime(2026, 7, 22, 8, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 22, 9, 0, tzinfo=UTC)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=1,
+            posted_at=opened_at,
+            sender_name="alice",
+            text="BTC long Entry 66000 SL 65000 TP 68000",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            entry_text="66000",
+            stop_loss_text="65000",
+            take_profit_text="68000",
+            parse_source="text_ai",
+            confidence=0.9,
+            review_status="pending",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=100,
+                message_id=1,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="exited",
+                exit_reason="kol_signal",
+                signal_at=opened_at,
+                entered_at=opened_at,
+                exited_at=closed_at,
+                entry_price_actual=66000,
+            )
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get("/positions-panel")
+    card = re.search(
+        r'<article class="deepcoin-history-position" data-deepcoin-history-position '
+        r'data-history-position-id="lifecycle:1">(.*?)</article>',
+        response.text,
+        re.DOTALL,
+    )
+
+    assert card is not None
+    for label in ("开仓均价", "平仓均价", "已实现盈亏", "最大持仓量", "已平仓量"):
+        assert label in card.group(1)
+    assert card.group(1).count('class="deepcoin-history-metric-missing">--') == 4
+
+
 def test_history_position_time_tie_uses_source_independent_stable_identifier(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
