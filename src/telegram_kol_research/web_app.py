@@ -1412,6 +1412,9 @@ def _exchange_item_attribution(
     group_label_by_chat_id: dict[int, str],
     default_order_role: str | None,
 ) -> dict[str, Any]:
+    persisted = item.get("persisted_attribution")
+    if isinstance(persisted, dict):
+        return persisted
     bound = _bound_exchange_attribution(
         item,
         group_label_by_chat_id=group_label_by_chat_id,
