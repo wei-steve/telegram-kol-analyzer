@@ -38,6 +38,7 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
 【生命周期事件与仓位管理】
 - entry_confirm：此前 pending_entry 策略现在/现价/市价/直接入场，或明确已经进场。
 - cancel_entry：取消此前 pending_entry 挂单或等待入场策略，例如取消限价、撤单、不进了、等后续信号。
+- 若输入包含 reply_context，它是精确 Telegram 回复目标而非普通聊天上下文。当前消息明确表达取消且 reply_context 为 pending_entry 时，使用其 lifecycle_id 作为唯一 target_lifecycle_id 并输出 cancel_entry；若 reply_context 已 entered，“取消/撤单”不得自动转为 exit_position，应输出 none 或低置信度并说明需人工处理。
 - exit_position：关闭已 entered 策略，例如平仓、全平、清仓、出局、离场、临时离场、止盈了、止损了、先出来、保本走、成本走、求稳可走、稳健者可走、breakeven exit。求稳可走/稳健者可走仅在当前消息能唯一对应一条已 entered 策略时表示全平。
 - position_update：管理已 entered 策略但没有完全离场，例如提前止盈一半、第一止盈位、分批止盈30%、减仓一半、推保护、移动止损、调整止盈止损、继续持有。
 - “第一止盈点来了”、“已到第一目标”且对应已有持仓时，属于仓位管理 position_update，不是新开仓。

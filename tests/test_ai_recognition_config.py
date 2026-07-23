@@ -34,9 +34,13 @@ def test_default_trading_templates_have_strict_boundaries():
     assert "MiMo" not in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
 
     assert "求稳可走" in DEFAULT_LIFECYCLE_EVENT_PROMPT
+    assert "reply_context" in DEFAULT_LIFECYCLE_EVENT_PROMPT
+    assert "精确 Telegram 回复目标" in DEFAULT_LIFECYCLE_EVENT_PROMPT
+    assert "不得自动转为 exit_position" in DEFAULT_LIFECYCLE_EVENT_PROMPT
     assert '"targets": []' not in DEFAULT_LIFECYCLE_EVENT_PROMPT
     assert "只输出 target_lifecycle_id，不要输出 targets" in DEFAULT_LIFECYCLE_EVENT_PROMPT
     assert "非空 targets" in DEFAULT_LIFECYCLE_EVENT_PROMPT
+    assert "reply_context" in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
 
     assert "图片模糊" in DEFAULT_MIMO_VISION_PROMPT
     assert "交易所截图" in DEFAULT_MIMO_VISION_PROMPT

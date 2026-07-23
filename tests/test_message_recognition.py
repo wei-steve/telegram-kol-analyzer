@@ -2071,6 +2071,123 @@ def test_ai_lifecycle_event_cancels_pending_order(tmp_path, monkeypatch):
     assert candidate.parse_source == "lifecycle_ai"
 
 
+def test_lifecycle_event_context_includes_exact_replied_pending_strategy(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=4004,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 21, 8, 50, tzinfo=UTC),
+            entry_range_low=65500,
+            entry_range_high=65800,
+        )
+        original = RawMessage(
+            chat_id=88,
+            message_id=4004,
+            posted_at=datetime(2026, 7, 21, 8, 50, tzinfo=UTC),
+            text="BTC 多单，65500-65800 挂单",
+        )
+        reply = RawMessage(
+            chat_id=88,
+            message_id=4007,
+            posted_at=datetime(2026, 7, 21, 15, 15, tzinfo=UTC),
+            reply_to_message_id=4004,
+            text="这笔也取消，我们明日再战！",
+        )
+        session.add_all([lifecycle, original, reply])
+        session.commit()
+
+        context = _load_lifecycle_event_context(session, reply)
+
+    assert context["reply_context"] == {
+        "message_id": 4004,
+        "lifecycle_id": lifecycle.id,
+        "lifecycle_status": "pending_entry",
+        "symbol": "BTC",
+        "side": "long",
+        "entry_range": "65500-65800",
+        "original_text": "BTC 多单，65500-65800 挂单",
+    }
+
+
+def test_ai_lifecycle_event_cancels_replied_pending_strategy(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=4004,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 21, 8, 50, tzinfo=UTC),
+        )
+        session.add_all(
+            [
+                lifecycle,
+                RawMessage(
+                    chat_id=88,
+                    message_id=4004,
+                    posted_at=datetime(2026, 7, 21, 8, 50, tzinfo=UTC),
+                    text="BTC 多单挂单",
+                ),
+                RawMessage(
+                    chat_id=88,
+                    message_id=4007,
+                    posted_at=datetime(2026, 7, 21, 15, 15, tzinfo=UTC),
+                    reply_to_message_id=4004,
+                    text="这笔也取消，我们明日再战！",
+                ),
+            ]
+        )
+        session.commit()
+        raw_message_id = session.query(RawMessage.id).filter_by(message_id=4007).scalar()
+        lifecycle_id = lifecycle.id
+
+    seen_requests = []
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "cancel_entry",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "BTC",
+            "side": "long",
+            "confidence": 0.92,
+            "reason": "回复的 BTC 挂单策略已取消",
+        },
+        seen_requests=seen_requests,
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.parse_source == "lifecycle_ai"
+    request = seen_requests[0]["messages"][1]["content"]
+    assert '"reply_to_message_id": 4004' in request
+    assert f'"lifecycle_id": {lifecycle_id}' in request
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        candidate = session.query(SignalCandidate).one()
+
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "cancelled"
+    assert candidate.target_lifecycle_id == lifecycle_id
+    assert candidate.event_type == "close_signal"
+
+
 def test_configured_ai_falls_back_to_local_cancel_for_unentered_btc_orders(
     tmp_path,
     monkeypatch,

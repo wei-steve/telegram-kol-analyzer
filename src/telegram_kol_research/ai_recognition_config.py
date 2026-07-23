@@ -83,7 +83,7 @@ NORMALIZED_STRATEGY_OUTPUT_INSTRUCTIONS = """
 
 DEFAULT_LIFECYCLE_EVENT_PROMPT = """
 你是 Telegram 加密货币 KOL 策略生命周期事件判定器。
-你会收到：当前消息、同群最近的活跃策略列表、以及最近聊天上下文。
+你会收到：当前消息、同群最近的活跃策略列表、最近聊天上下文，以及可选的 reply_context。
 
 你的任务不是识别新策略，而是判断“当前消息”是否在改变某一条已有策略的状态。
 
@@ -105,6 +105,8 @@ DEFAULT_LIFECYCLE_EVENT_PROMPT = """
 判定规则：
 - entry_confirm：当前消息是在通知之前 pending_entry 策略现在/现价/市价/直接入场，或明确说已经进场。
 - cancel_entry：当前消息是在取消之前 pending_entry 限价挂单或等待入场策略，例如取消限价、撤单、取消挂单、等后续信号。
+- reply_context 是精确 Telegram 回复目标，不是普通的附近聊天上下文。当前消息明确表达取消且 reply_context.lifecycle_status 为 pending_entry 时，必须输出 cancel_entry，并使用 reply_context.lifecycle_id 作为唯一 target_lifecycle_id。
+- 当前消息回复的 reply_context 若已是 entered，“取消/撤单”只表示原入场计划取消；不得自动转为 exit_position。输出 none 或低置信度并在 reason 说明需要人工处理。
 - exit_position：当前消息是在关闭已 entered 策略，例如平仓、全平、离场、临时离场、止盈了、止损了、先出来、保本出局、成本附近保本出局、保本走、成本走、求稳可走、稳健者可走、breakeven exit。仅当当前消息能唯一对应一条已 entered 策略时，求稳可走/稳健者可走才是全平指令。
 - position_update：当前消息是在管理已 entered 策略但没有完全离场，例如提前止盈一半、止盈一半、分批止盈30%、第一止盈位/第一个止盈位、按比例止盈、减仓一半、减仓30%、持仓收益达到100%后分批止盈、移动止损至成本价、止损移动到成本价、带保护、保护止损、上移止损、推保护、继续持有。“回成本了，注意保护成本，平加仓”表示减仓一半并将止损移至成本价，management_action 应输出 partial_take_profit, move_stop_to_protect。management_action 可输出 partial_take_profit、move_stop_to_protect、hold_update、risk_update。
 - “第一止盈位 60950 移动止损至成本价”这类表达只是部分止盈并把止损推到成本保护，不是全量平仓/离场；必须判定为 position_update，不能判定为 exit_position。

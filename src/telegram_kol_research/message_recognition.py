@@ -922,9 +922,37 @@ def _load_lifecycle_event_context(session, raw_message: RawMessage) -> dict[str,
         }
         for item in reversed(recent_messages)
     ]
+    reply_context: dict[str, Any] | None = None
+    if raw_message.reply_to_message_id is not None:
+        replied_message = (
+            session.query(RawMessage)
+            .filter(RawMessage.chat_id == raw_message.chat_id)
+            .filter(RawMessage.message_id == raw_message.reply_to_message_id)
+            .one_or_none()
+        )
+        replied_lifecycle = (
+            session.query(StrategyLifecycle)
+            .filter(StrategyLifecycle.chat_id == raw_message.chat_id)
+            .filter(StrategyLifecycle.message_id == raw_message.reply_to_message_id)
+            .one_or_none()
+        )
+        if replied_message is not None and replied_lifecycle is not None:
+            reply_context = {
+                "message_id": replied_message.message_id,
+                "lifecycle_id": replied_lifecycle.id,
+                "lifecycle_status": replied_lifecycle.lifecycle_status,
+                "symbol": replied_lifecycle.symbol,
+                "side": replied_lifecycle.side,
+                "entry_range": _format_lifecycle_range(
+                    replied_lifecycle.entry_range_low,
+                    replied_lifecycle.entry_range_high,
+                ),
+                "original_text": _compact_context_text(replied_message.text),
+            }
     return {
         "active_strategies": active_strategies,
         "recent_messages": recent_context,
+        "reply_context": reply_context,
     }
 
 
@@ -969,6 +997,7 @@ def _call_lifecycle_event_ai(
                         "current_message": {
                             "chat_id": raw_message.chat_id,
                             "message_id": raw_message.message_id,
+                            "reply_to_message_id": raw_message.reply_to_message_id,
                             "posted_at": str(raw_message.posted_at) if raw_message.posted_at else None,
                             "sender": raw_message.sender_name,
                             "text": raw_message.text or "",
