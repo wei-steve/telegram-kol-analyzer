@@ -15,6 +15,10 @@ def test_deepcoin_history_assets_are_scoped_to_the_history_panel(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
     css = client.get("/static/app.css").text
+    history_css = css[
+        css.index("/* DeepCoin historical-position treatment"):
+        css.index(".exchange-position-actions")
+    ]
 
     assert ".exchange-tab.is-active::after" in css
     assert "background: #3b82f6;" in css
@@ -22,7 +26,9 @@ def test_deepcoin_history_assets_are_scoped_to_the_history_panel(tmp_path):
     assert "[data-exchange-history-panel]" in css
     assert ".exchange-tab-strip:has(~ .exchange-tab-panels [data-exchange-history-panel].is-active)" in css
     assert ".deepcoin-history-position" in css
-    assert "background: #ffffff;" in css
+    assert "background: var(--surface-panel);" in history_css
+    assert "color: var(--color-text);" in history_css
+    assert "#ffffff" not in history_css
     assert ".deepcoin-history-times dd" in css
     assert ".deepcoin-history-metric-missing" in css
     assert ".deepcoin-history-pnl-negative" in css

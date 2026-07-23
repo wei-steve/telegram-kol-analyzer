@@ -1167,47 +1167,47 @@ body {
 
 /* DeepCoin historical-position treatment: active only on the history tab. */
 .exchange-positions-panel:has([data-exchange-history-panel].is-active) {
-  background: #ffffff;
-  color: #111827;
+  background: var(--surface-panel);
+  color: var(--color-text);
 }
 
 .exchange-positions-panel:has([data-exchange-history-panel].is-active) .panel-heading h2,
 .exchange-positions-panel:has([data-exchange-history-panel].is-active) .ai-helper-text,
 .exchange-positions-panel:has([data-exchange-history-panel].is-active) .exchange-tab.is-active {
-  color: #111827;
+  color: var(--color-text);
 }
 
 .exchange-positions-panel:has([data-exchange-history-panel].is-active) .exchange-tab:hover {
-  color: #374151;
+  color: #e2e8f0;
 }
 
 [data-exchange-history-panel].is-active {
   max-width: 980px;
   margin: 0 auto;
-  color: #111827;
+  color: var(--color-text);
 }
 
 [data-exchange-history-panel].is-active .exchange-card-list {
   gap: 0;
   padding-bottom: 28px;
-  background: #ffffff;
+  background: var(--surface-panel);
 }
 
 [data-exchange-history-panel].is-active .exchange-group-list {
   gap: 0;
   padding-bottom: 28px;
-  background: #ffffff;
+  background: var(--surface-panel);
 }
 
 [data-exchange-history-panel].is-active .exchange-group-header {
-  border-color: #edf0f3;
+  border-color: var(--color-border);
   border-radius: 0;
-  background: #ffffff;
-  color: #111827;
+  background: var(--surface-panel);
+  color: var(--color-text);
 }
 
 [data-exchange-history-panel].is-active .exchange-group-header strong {
-  color: #111827;
+  color: var(--color-text);
 }
 
 .deepcoin-history-position {
@@ -1215,9 +1215,9 @@ body {
   gap: 14px;
   padding: 24px 28px;
   border: 0;
-  border-bottom: 1px solid #edf0f3;
-  background: #ffffff;
-  color: #111827;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--surface-panel);
+  color: var(--color-text);
 }
 
 .deepcoin-history-position-head {
@@ -1273,7 +1273,7 @@ body {
 .deepcoin-history-primary-metrics dd,
 .deepcoin-history-secondary-metrics dd {
   margin: 4px 0 0;
-  color: #111827;
+  color: var(--color-text);
   font-size: 1.08rem;
   font-weight: 700;
   overflow-wrap: anywhere;
@@ -1308,7 +1308,7 @@ body {
 
 .deepcoin-history-times dd {
   margin: 0;
-  color: #111827;
+  color: var(--color-text);
   font-size: 0.94rem;
   font-variant-numeric: tabular-nums;
   text-align: right;
@@ -1319,13 +1319,13 @@ body {
 }
 
 .deepcoin-history-attribution .exchange-attribution {
-  color: #6b7280;
+  color: var(--color-muted);
 }
 
 .deepcoin-history-attribution .exchange-attribution span,
 .deepcoin-history-attribution .exchange-attribution code,
 .deepcoin-history-attribution .exchange-attribution small {
-  background: #f3f4f6;
+  background: var(--surface-raised);
 }
 
 .exchange-position-actions {
