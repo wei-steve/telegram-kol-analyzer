@@ -1170,6 +1170,11 @@ def _load_exchange_position_snapshot(
         key=lambda row: (row.get("exited_at") or datetime.min.replace(tzinfo=UTC), row["history_sort_id"]),
         reverse=True,
     )[:order_limit]
+    _attach_exchange_history_position_bindings(
+        session_factory,
+        snapshot["position_history"],
+        group_label_by_chat_id=group_label_by_chat_id,
+    )
     return snapshot
 
 
@@ -1222,6 +1227,46 @@ def _annotate_exchange_snapshot_attribution(
     return snapshot
 
 
+def _attach_exchange_history_position_bindings(
+    session_factory,
+    rows: list[dict[str, Any]],
+    *,
+    group_label_by_chat_id: dict[int, str],
+) -> None:
+    """Attach exact local ownership to historical rows by DeepCoin split posId."""
+    pos_ids = {str(row.get("pos_id") or "") for row in rows if row.get("pos_id")}
+    if not pos_ids:
+        return
+    with session_factory() as session:
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.venue == "deepcoin")
+            .filter(ExecutionOrderLeg.pos_id.in_(pos_ids))
+            .order_by(ExecutionOrderLeg.id.desc())
+            .all()
+        )
+        bindings = {
+            int(binding.id): binding
+            for binding in session.query(ExecutionBinding)
+            .filter(ExecutionBinding.id.in_({int(leg.execution_binding_id) for leg in legs}))
+            .all()
+        } if legs else {}
+        by_pos_id = {str(leg.pos_id): leg for leg in legs if leg.pos_id}
+        for row in rows:
+            leg = by_pos_id.get(str(row.get("pos_id") or ""))
+            if leg is None:
+                continue
+            binding = bindings.get(int(leg.execution_binding_id))
+            attribution = _persisted_position_attribution(
+                leg=leg,
+                binding=binding,
+                group_label_by_chat_id=group_label_by_chat_id,
+                allow_terminal_leg=True,
+            )
+            if attribution is not None:
+                row["persisted_attribution"] = attribution
+
+
 def _order_item_attribution(
     item: dict[str, Any],
     *,
@@ -1259,6 +1304,7 @@ def _persisted_position_attribution(
     leg: ExecutionOrderLeg | None,
     binding: ExecutionBinding | None,
     group_label_by_chat_id: dict[int, str],
+    allow_terminal_leg: bool = False,
 ) -> dict[str, Any] | None:
     if leg is None:
         return None
@@ -1289,7 +1335,7 @@ def _persisted_position_attribution(
     verified = (
         state == "verified"
         and binding is not None
-        and str(leg.status or "").lower() not in terminal_leg_states
+        and (allow_terminal_leg or str(leg.status or "").lower() not in terminal_leg_states)
         and equivalent_authoritative
     )
     chat_id = binding.chat_id if binding is not None else None
