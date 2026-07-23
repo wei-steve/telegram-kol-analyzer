@@ -210,6 +210,39 @@ def test_complete_history_metrics_keep_missing_actual_values_visible(tmp_path):
     assert card.group(1).count('class="deepcoin-history-metric-missing">--') == 4
 
 
+def test_history_position_handles_legacy_binding_without_metrics(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    closed_at = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                kol_id="legacy-binding",
+                chat_id=100,
+                message_id=1,
+                symbol="BTC",
+                side="short",
+                venue="deepcoin",
+                status="closed",
+                created_at=closed_at,
+                updated_at=closed_at,
+            )
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get("/positions-panel")
+    card = re.search(
+        r'<article class="deepcoin-history-position" data-deepcoin-history-position '
+        r'data-history-position-id="binding:1">(.*?)</article>',
+        response.text,
+        re.DOTALL,
+    )
+
+    assert response.status_code == 200
+    assert card is not None
+    assert card.group(1).count('class="deepcoin-history-metric-missing">--') == 5
+
+
 def test_history_position_time_tie_uses_source_independent_stable_identifier(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
