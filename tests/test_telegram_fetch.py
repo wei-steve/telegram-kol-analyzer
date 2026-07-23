@@ -126,6 +126,34 @@ def test_fetch_dialog_messages_reuses_existing_media_file_without_redownload(tmp
     assert existing.read_bytes() == b"already-downloaded"
 
 
+def test_fetch_dialog_messages_redownloads_a_zero_byte_existing_media_file(tmp_path):
+    media_root = tmp_path / "downloaded-media"
+    existing = media_root / "9001" / "77.jpg"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"")
+
+    class DownloadingClient(_FakeClient):
+        def __init__(self):
+            self.download_calls = 0
+
+        async def download_media(self, media, file):
+            self.download_calls += 1
+            output_path = Path(file).with_suffix(".jpg")
+            output_path.write_bytes(b"recovered-image")
+            return str(output_path)
+
+    client = DownloadingClient()
+    dialog = {"id": 9001, "title": "VIP BTC Room", "archived": True}
+
+    payloads = asyncio.run(
+        fetch_dialog_messages(client, dialog, limit=10, media_root=media_root)
+    )
+
+    assert payloads[0]["media"]["path"] == "9001/77.jpg"
+    assert client.download_calls == 1
+    assert existing.read_bytes() == b"recovered-image"
+
+
 def test_fetch_dialog_messages_skips_video_download(tmp_path):
     class VideoMedia:
         pass

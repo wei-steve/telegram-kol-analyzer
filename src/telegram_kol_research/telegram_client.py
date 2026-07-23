@@ -348,6 +348,7 @@ def _find_existing_media_file(target_dir: Path, message_id: Any) -> Path | None:
         for path in target_dir.iterdir()
         if path.is_file()
         and (path.stem == prefix or path.name.startswith(f"{prefix}."))
+        and path.stat().st_size > 0
     )
     return matches[0] if matches else None
 
