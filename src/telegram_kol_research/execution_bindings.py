@@ -1138,6 +1138,11 @@ def _reconcile_saved_trigger_protection_intents(
 
     existing_ledger_rows = session.query(PositionProtectionLedger).all()
     all_intents = saved_intents
+    intent_requests = {
+        int(intent.id): _safe_json_object(legs_by_id[int(intent.execution_order_leg_id)].request_json)
+        for intent in saved_intents
+        if intent.id is not None and int(intent.execution_order_leg_id) in legs_by_id
+    }
     events = session.query(ExecutionEvent).filter(
         ExecutionEvent.venue == "deepcoin", ExecutionEvent.action == "create_trigger_entry"
     ).order_by(ExecutionEvent.id.asc()).all()
@@ -1159,6 +1164,7 @@ def _reconcile_saved_trigger_protection_intents(
             pending_tpsl_rows=snapshot.pending_trigger_orders,
             history_tpsl_rows=snapshot.trigger_history,
             existing_ledger_rows=existing_ledger_rows, existing_intents=all_intents,
+            existing_intent_requests=intent_requests,
             history_time_range_start=parent.created_at, history_time_range_end=recovered_at,
         )
         if adoption.action is not None:

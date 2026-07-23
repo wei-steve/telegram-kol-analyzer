@@ -611,6 +611,7 @@ def plan_trigger_protection_intent_adoption(
     history_tpsl_rows: list[dict[str, Any]],
     existing_ledger_rows: list[PositionProtectionLedger],
     existing_intents: list[TriggerProtectionIntent],
+    existing_intent_requests: dict[int, dict[str, Any]] | None = None,
     history_time_range_start: datetime | None = None,
     history_time_range_end: datetime | None = None,
 ) -> TriggerProtectionIntentAdoptionResult:
@@ -692,18 +693,32 @@ def plan_trigger_protection_intent_adoption(
                 if not _row_matches_expected_protection_set(row, expected_rows):
                     continue
                 if candidate_pos_id is None:
-                    return _intent_refusal(
-                        parent_event, binding_id, pos_id,
-                        "trigger_protection_candidate_position_invalid", [_row_order_id(row)],
-                    )
+                    if not (
+                        source == "pending"
+                        and expected_purposes == {"stop_loss"}
+                        and not _row_position_ids(row)
+                    ):
+                        return _intent_refusal(
+                            parent_event, binding_id, pos_id,
+                            "trigger_protection_candidate_position_invalid", [_row_order_id(row)],
+                        )
                 if candidate_pos_id != pos_id:
-                    return _intent_refusal(
-                        parent_event, binding_id, pos_id,
-                        "trigger_protection_candidate_position_conflict", [_row_order_id(row)],
-                    )
+                    if candidate_pos_id is not None:
+                        return _intent_refusal(
+                            parent_event, binding_id, pos_id,
+                            "trigger_protection_candidate_position_conflict", [_row_order_id(row)],
+                        )
             if (
                 _row_matches_instrument_side(row, instrument_id=instrument_id, side=side)
-                and _canonical_row_pos_id(row) == pos_id
+                and (
+                    _canonical_row_pos_id(row) == pos_id
+                    or (
+                        source == "pending"
+                        and expected_purposes == {"stop_loss"}
+                        and _canonical_row_pos_id(row) is None
+                        and not _row_position_ids(row)
+                    )
+                )
                 and _row_matches_expected_protection_set(row, expected_rows)
                 and _same_size_text(_row_size_text(row), _request_size_text(request))
             ):
@@ -723,6 +738,27 @@ def plan_trigger_protection_intent_adoption(
     row, source = candidates[0]
     order_id = _row_order_id(row)
     assert order_id is not None
+    anonymous_stop_key = _anonymous_stop_request_key(request)
+    if not _row_position_ids(row) and any(
+        not (
+            other_intent is intent
+            or (intent.id is not None and other_intent.id == intent.id)
+        )
+        and str(other_intent.recovery_state or "") in {"pending", "retrying", "submitting"}
+        and anonymous_stop_key is not None
+        and existing_intent_requests is not None
+        and _anonymous_stop_request_key(
+            existing_intent_requests.get(int(other_intent.id or 0), {})
+        ) == anonymous_stop_key
+        for other_intent in existing_intents
+    ):
+        return _intent_refusal(
+            parent_event,
+            binding_id,
+            pos_id,
+            "trigger_protection_candidate_not_unique",
+            [order_id],
+        )
     if source == "history" and not _history_row_is_proven_in_range(
         row,
         parent_order_id=expected_parent,
@@ -777,7 +813,11 @@ def plan_trigger_protection_intent_adoption(
             trigger_price=(expected_rows[0].get("trigger_price") if expected_purposes == {"stop_loss"} else None),
             size_text=_row_size_text(row) or _request_size_text(request),
             evidence={
-                "match": "trigger_protection_intent_post_baseline",
+                "match": (
+                    "trigger_protection_intent_stop_only_missing_pos_id"
+                    if not _row_position_ids(row)
+                    else "trigger_protection_intent_post_baseline"
+                ),
                 "intent_id": int(intent.id) if intent.id is not None else None,
                 "parent_trigger_order_id": expected_parent,
                 "source": source,
@@ -867,12 +907,29 @@ def _row_matches_instrument_side(row: dict[str, Any], *, instrument_id: str, sid
 
 
 def _canonical_row_pos_id(row: dict[str, Any]) -> str | None:
-    position_ids = {
+    position_ids = _row_position_ids(row)
+    return next(iter(position_ids)) if len(position_ids) == 1 else None
+
+
+def _row_position_ids(row: dict[str, Any]) -> set[str]:
+    return {
         str(row.get(key) or "").strip()
         for key in ("closePosId", "close_pos_id", "closePositionId", "posId", "pos_id", "positionId")
         if str(row.get(key) or "").strip()
     }
-    return next(iter(position_ids)) if len(position_ids) == 1 else None
+
+
+def _anonymous_stop_request_key(request: dict[str, Any]) -> tuple[str, str, str, str] | None:
+    expected = _expected_protection_rows(request)
+    if {str(row.get("purpose") or "") for row in expected} != {"stop_loss"}:
+        return None
+    stop = str(expected[0].get("trigger_price") or "")
+    instrument = _request_instrument_id(request)
+    side = _request_side(request)
+    size = _request_size_text(request)
+    if not instrument or not side or not size or not stop:
+        return None
+    return instrument.upper(), side.lower(), size, stop
 
 
 def _history_row_is_proven_in_range(

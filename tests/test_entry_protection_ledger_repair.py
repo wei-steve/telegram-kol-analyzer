@@ -480,6 +480,65 @@ def test_intent_adoption_requires_one_explicit_returned_position_id(tmp_path):
     assert result.refusal.reason == "trigger_protection_candidate_position_invalid"
 
 
+def test_intent_adoption_accepts_unique_stop_only_candidate_without_position_id(tmp_path):
+    result = _plan_intent_adoption(
+        tmp_path,
+        request_update={"tpTriggerPx": None},
+        pending_update={"posId": "", "tpTriggerPx": None, "slTriggerPx": "1900"},
+    )
+
+    assert result.refusal is None
+    assert result.action is not None
+    assert result.action.purpose == "stop_loss"
+    assert result.action.order_id == "tpsl-new"
+    assert result.action.evidence["match"] == (
+        "trigger_protection_intent_stop_only_missing_pos_id"
+    )
+
+
+def test_intent_adoption_refuses_conflicting_position_aliases_for_anonymous_stop(tmp_path):
+    result = _plan_intent_adoption(
+        tmp_path,
+        request_update={"tpTriggerPx": None},
+        pending_update={
+            "posId": "other-pos",
+            "closePosId": "pos-1",
+            "tpTriggerPx": None,
+            "slTriggerPx": "1900",
+        },
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_position_invalid"
+
+
+def test_intent_adoption_refuses_anonymous_stop_with_same_pending_intent_fingerprint(
+    tmp_path,
+):
+    other_intent = TriggerProtectionIntent(
+        id=777,
+        venue="deepcoin",
+        execution_binding_id=999,
+        execution_order_leg_id=998,
+        request_fingerprint="different-fingerprint",
+        pre_submit_tpsl_baseline_json="[]",
+        correlation_id="other",
+        recovery_state="pending",
+    )
+    result = _plan_intent_adoption(
+        tmp_path,
+        request_update={"tpTriggerPx": None},
+        pending_update={"posId": "", "tpTriggerPx": None, "slTriggerPx": "1900"},
+        existing_intents=[other_intent],
+        existing_intent_requests="same_as_current",
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_not_unique"
+
+
 def test_intent_adoption_requires_absent_unrequested_protection_side(tmp_path):
     result = _plan_intent_adoption(
         tmp_path,
@@ -688,7 +747,8 @@ def _plan_intent_adoption(
     tmp_path, *, baseline="[]", pending_rows=None, history_rows=None, pending_update=None,
     existing_ledger_rows=None, history_time_range_start=None, history_time_range_end=None,
     planner_session=None, existing_intents=None, request_update=None, adopted_order_id=None,
-    fingerprint_without_internal_metadata=False,
+    fingerprint_without_internal_metadata=False, match_existing_intent_fingerprint=False,
+    existing_intent_requests=None,
 ):
     session_factory = create_session_factory(tmp_path / "intent-adoption.db")
     _seed_trigger_entry_fill(session_factory, binding_id=152, legs=[{
@@ -716,12 +776,21 @@ def _plan_intent_adoption(
             pre_submit_tpsl_baseline_json=baseline, correlation_id="intent-289", parent_trigger_order_id="entry-1",
             adopted_order_id=adopted_order_id,
         )
+        if match_existing_intent_fingerprint:
+            for other_intent in existing_intents or []:
+                other_intent.request_fingerprint = intent.request_fingerprint
+        if existing_intent_requests == "same_as_current":
+            existing_intent_requests = {
+                int(other_intent.id): dict(request)
+                for other_intent in existing_intents or []
+            }
         return plan_trigger_protection_intent_adoption(
             session if planner_session is None else planner_session,
             entry_leg=leg, intent=intent, parent_event=event,
             pending_tpsl_rows=[row] if pending_rows is None else pending_rows,
             history_tpsl_rows=history_rows or [], existing_ledger_rows=existing_ledger_rows or [],
             existing_intents=[intent] if existing_intents is None else [intent, *existing_intents],
+            existing_intent_requests=existing_intent_requests,
             history_time_range_start=history_time_range_start,
             history_time_range_end=history_time_range_end,
         )

@@ -54,6 +54,7 @@ from telegram_kol_research.strategy_management_batches import (
     create_management_batch,
     create_management_batch_in_session,
     load_management_batch,
+    resolve_restored_protection_failure_for_full_exit_in_session,
 )
 from telegram_kol_research.strategy_management_sizing import (
     ManagementSizingError,
@@ -562,6 +563,23 @@ def _plan_strategy_management_batch_locked(
     ]
     try:
         with session_factory() as session:
+            if intent == "full_exit":
+                predecessor_state = (
+                    resolve_restored_protection_failure_for_full_exit_in_session(
+                        session,
+                        strategy_instance_id=str(binding.strategy_instance_id),
+                        target_lifecycle_id=lifecycle.id,
+                        execution_binding_id=binding.id,
+                        resolved_at=now,
+                    )
+                )
+                if predecessor_state == "blocked":
+                    session.rollback()
+                    return ManagementPlanningResult(
+                        status="blocked",
+                        reason_code="prior_management_batch_unresolved",
+                        target_lifecycle_id=lifecycle.id,
+                    )
             if retry_blocked_batch_id is None:
                 batch_id = create_management_batch_in_session(
                     session,

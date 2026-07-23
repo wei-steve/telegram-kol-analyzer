@@ -1463,6 +1463,10 @@ def _persist_prior_partial_batch(
     status,
     reconciled,
     leg_statuses=("confirmed",),
+    intent="partial_take_profit",
+    effective_action="partial_close",
+    reason_code=None,
+    protection_evidence=False,
 ):
     with session_factory() as session:
         decision = (
@@ -1484,12 +1488,13 @@ def _persist_prior_partial_batch(
             target_lifecycle_id=lifecycle_id,
             strategy_instance_id="deepcoin:100:20:BTC:short",
             execution_binding_id=binding_id,
-            intent="partial_take_profit",
-            effective_action="partial_close",
+            intent=intent,
+            effective_action=effective_action,
             requested_fraction=None,
             effective_fraction=0.5,
             partial_round_before=0,
             status=status,
+            reason_code=reason_code,
             target_fingerprint="f" * 64,
             target_snapshot_json="{}",
             planned_at=PLANNED_AT,
@@ -1510,6 +1515,9 @@ def _persist_prior_partial_batch(
                     preflight_size="10",
                     planned_close_size="5",
                     quantity_step="1",
+                    old_tpsl_json=("{\"order_ids\":[\"old\"]}" if protection_evidence else None),
+                    planned_tpsl_json=("{\"intent\":\"move_stop_to_break_even\"}" if protection_evidence else None),
+                    last_error=("{\"stage\":\"replace_protection\",\"restore_error\":null}" if protection_evidence else None),
                 )
             )
         session.commit()
@@ -1635,6 +1643,142 @@ def test_unconfirmed_prior_partial_freezes_without_advancing_round(
     assert result.status == "blocked"
     assert result.reason_code == "prior_partial_batch_unresolved"
     assert result.batch is None
+
+
+def test_full_exit_resolves_fully_restored_protection_failure_before_successor(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    predecessor_id = _persist_prior_partial_batch(
+        session_factory,
+        raw_id=raw_id,
+        lifecycle_id=lifecycle_id,
+        binding_id=binding_id,
+        status="partial_failed",
+        reconciled=False,
+        leg_statuses=("restored",),
+        intent="move_stop_to_break_even",
+        effective_action="move_stop_to_break_even",
+        reason_code="protection_replacement_failed_and_restored",
+        protection_evidence=True,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.effective_action == "full_exit"
+    with session_factory() as session:
+        assert session.get(StrategyManagementBatch, predecessor_id).status == "resolved"
+
+
+def test_full_exit_keeps_partial_failure_lock_when_a_leg_is_not_restored(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    _persist_prior_partial_batch(
+        session_factory,
+        raw_id=raw_id,
+        lifecycle_id=lifecycle_id,
+        binding_id=binding_id,
+        status="partial_failed",
+        reconciled=False,
+        leg_statuses=("planned",),
+        intent="move_stop_to_break_even",
+        effective_action="move_stop_to_break_even",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "prior_management_batch_unresolved"
+
+
+def test_full_exit_keeps_restored_failure_locked_without_protection_evidence(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    _persist_prior_partial_batch(
+        session_factory,
+        raw_id=raw_id,
+        lifecycle_id=lifecycle_id,
+        binding_id=binding_id,
+        status="partial_failed",
+        reconciled=False,
+        leg_statuses=("restored",),
+        intent="move_stop_to_break_even",
+        effective_action="move_stop_to_break_even",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "prior_management_batch_unresolved"
+
+
+def test_full_exit_keeps_partial_then_break_even_failure_locked_even_if_restored(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    _persist_prior_partial_batch(
+        session_factory,
+        raw_id=raw_id,
+        lifecycle_id=lifecycle_id,
+        binding_id=binding_id,
+        status="partial_failed",
+        reconciled=False,
+        leg_statuses=("restored",),
+        intent="partial_then_break_even",
+        effective_action="partial_then_break_even",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "prior_partial_batch_unresolved"
 
 
 def test_duplicate_partial_message_returns_same_batch_without_advancing_round(

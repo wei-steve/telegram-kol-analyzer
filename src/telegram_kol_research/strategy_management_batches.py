@@ -33,6 +33,81 @@ TEMPORARY_VISIBILITY_REASONS = frozenset(
 UNSET = object()
 
 
+def resolve_restored_protection_failure_for_full_exit_in_session(
+    session: Session,
+    *,
+    strategy_instance_id: str,
+    target_lifecycle_id: int,
+    execution_binding_id: int,
+    resolved_at: datetime,
+) -> str:
+    """Release only a fully restored protection failure for a later full exit.
+
+    The active-strategy index intentionally retains ``partial_failed`` batches.
+    A protection-only predecessor is the one exception: it may be terminalized
+    only when every exact position leg confirms that its original protection
+    was restored.  Any other active predecessor remains a hard stop.
+    """
+
+    _require_management_unique_indexes(session)
+    active = (
+        session.query(StrategyManagementBatch)
+        .filter(StrategyManagementBatch.strategy_instance_id == strategy_instance_id)
+        .filter(StrategyManagementBatch.status.not_in(("succeeded", "blocked", "resolved")))
+        .order_by(StrategyManagementBatch.id.asc())
+        .all()
+    )
+    if not active:
+        return "clear"
+    if len(active) != 1:
+        return "blocked"
+    batch = active[0]
+    if (
+        batch.status != "partial_failed"
+        or batch.reason_code != "protection_replacement_failed_and_restored"
+        or batch.target_lifecycle_id != target_lifecycle_id
+        or batch.execution_binding_id != execution_binding_id
+        or batch.intent not in {"adjust_stop_loss", "move_stop_to_break_even"}
+        or batch.effective_action not in {"adjust_stop_loss", "move_stop_to_break_even"}
+    ):
+        return "blocked"
+    legs = (
+        session.query(StrategyManagementLeg)
+        .filter(StrategyManagementLeg.management_batch_id == batch.id)
+        .order_by(StrategyManagementLeg.leg_index.asc(), StrategyManagementLeg.id.asc())
+        .all()
+    )
+    if not legs or any(
+        leg.status != "restored" or not _has_restored_protection_evidence(leg)
+        for leg in legs
+    ):
+        return "blocked"
+    batch.status = "resolved"
+    batch.reason_code = "superseded_by_full_exit_after_protection_restored"
+    batch.completed_at = resolved_at
+    batch.updated_at = resolved_at
+    session.flush()
+    return "resolved"
+
+
+def _has_restored_protection_evidence(leg: StrategyManagementLeg) -> bool:
+    try:
+        old_tpsl = json.loads(leg.old_tpsl_json or "")
+        planned_tpsl = json.loads(leg.planned_tpsl_json or "")
+        error = json.loads(leg.last_error or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(old_tpsl, dict)
+        and bool(old_tpsl)
+        and isinstance(planned_tpsl, dict)
+        and bool(planned_tpsl)
+        and isinstance(error, dict)
+        and error.get("stage") == "replace_protection"
+        and error.get("restore_error") is None
+    )
+
+
 def race_resolved_successor_fingerprint(
     *,
     parent_batch_id: int,
