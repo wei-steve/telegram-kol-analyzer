@@ -2,6 +2,7 @@ import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+from PIL import Image
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
@@ -15,11 +16,26 @@ from telegram_kol_research.models import (
     utc_now,
 )
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
-from telegram_kol_research.telegram_live_listener import run_live_listener, run_reconcile_once
+from telegram_kol_research.telegram_live_listener import (
+    _is_usable_downloaded_media_path,
+    run_live_listener,
+    run_reconcile_once,
+)
 
 
 class _FakeClient:
     pass
+
+
+def test_media_replay_accepts_usable_legacy_windows_style_path(tmp_path):
+    image_path = tmp_path / "media" / "9001" / "77.jpg"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (1, 1)).save(image_path, format="JPEG")
+
+    assert _is_usable_downloaded_media_path(
+        "data\\media\\9001\\77.jpg",
+        media_root=tmp_path / "media",
+    )
 
 
 class _FakeListenerClient:

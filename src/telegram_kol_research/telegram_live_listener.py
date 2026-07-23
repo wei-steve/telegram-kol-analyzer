@@ -19,6 +19,7 @@ from telegram_kol_research.message_recognition import (
     recognize_message_now,
     recognize_records_with_ai_config,
 )
+from telegram_kol_research.media_retention import resolve_media_path
 from telegram_kol_research.models import (
     MediaAsset,
     MessageRecognition,
@@ -686,9 +687,9 @@ def _is_usable_downloaded_media_path(
 ) -> bool:
     if not local_path:
         return False
-    candidate = Path(local_path)
-    if not candidate.is_absolute():
-        candidate = media_root / candidate
+    candidate = resolve_media_path(local_path, media_root=media_root)
+    if candidate is None:
+        return False
     return is_usable_image_file(candidate)
 
 
