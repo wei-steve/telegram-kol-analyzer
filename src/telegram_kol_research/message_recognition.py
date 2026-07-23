@@ -1090,6 +1090,27 @@ def _apply_lifecycle_event_decision(
     target = _resolve_lifecycle_event_target(session, raw_message, decision)
     if target is None:
         return False
+    reply_target = _resolve_reply_lifecycle_target(session, raw_message)
+    if event_type == "cancel_entry" and reply_target is not None:
+        if reply_target.id != target.id:
+            _record_reply_cancel_manual_review(
+                session,
+                raw_message=raw_message,
+                lifecycle=reply_target,
+                reason="reply_cancel_target_mismatch",
+            )
+            return True
+        if reply_target.lifecycle_status == "entered" or (
+            reply_target.lifecycle_status == "expired"
+            and _lifecycle_has_live_execution_binding(session, reply_target)
+        ):
+            _record_reply_cancel_manual_review(
+                session,
+                raw_message=raw_message,
+                lifecycle=reply_target,
+                reason="manual_review_required",
+            )
+            return True
     explicit_symbol = _extract_exit_symbol(raw_message.text or "")
     if (
         not decision.get("_explicit_multi_target")
@@ -1142,39 +1163,6 @@ def _apply_lifecycle_event_decision(
             and _lifecycle_has_live_execution_binding(session, target)
         )
     ):
-        if raw_message.reply_to_message_id == target.message_id:
-            binding = (
-                session.get(ExecutionBinding, target.execution_binding_id)
-                if target.execution_binding_id is not None
-                else None
-            )
-            target.management_signal_message_id = raw_message.message_id
-            target.management_action = "cancel_entry_after_entry_review"
-            target.management_note = (
-                "Reply cancellation arrived after entry; automatic close blocked "
-                "and manual review is required."
-            )
-            target.updated_at = utc_now()
-            session.add(
-                ExecutionEvent(
-                    execution_binding_id=target.execution_binding_id,
-                    strategy_instance_id=(
-                        binding.strategy_instance_id if binding is not None else None
-                    ),
-                    venue="deepcoin",
-                    action="reply_cancel_after_entry",
-                    status="blocked",
-                    kol_id=binding.kol_id if binding is not None else None,
-                    chat_id=target.chat_id,
-                    message_id=target.message_id,
-                    source_message_id=raw_message.message_id,
-                    symbol=target.symbol,
-                    side=target.side,
-                    pos_id=binding.pos_id if binding is not None else None,
-                    reason="manual_review_required",
-                )
-            )
-            return True
         if not _lifecycle_has_live_execution_binding(session, target):
             return False
         record_lifecycle_exit_intent(
@@ -1649,6 +1637,57 @@ def _resolve_lifecycle_event_target(
     if len(matches) == 1:
         return matches[0]
     return None
+
+
+def _resolve_reply_lifecycle_target(
+    session, raw_message: RawMessage
+) -> StrategyLifecycle | None:
+    if raw_message.reply_to_message_id is None:
+        return None
+    return (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.chat_id == raw_message.chat_id)
+        .filter(StrategyLifecycle.message_id == raw_message.reply_to_message_id)
+        .one_or_none()
+    )
+
+
+def _record_reply_cancel_manual_review(
+    session,
+    *,
+    raw_message: RawMessage,
+    lifecycle: StrategyLifecycle,
+    reason: str,
+) -> None:
+    binding = (
+        session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        if lifecycle.execution_binding_id is not None
+        else None
+    )
+    lifecycle.management_signal_message_id = raw_message.message_id
+    lifecycle.management_action = "cancel_entry_after_entry_review"
+    lifecycle.management_note = (
+        "Reply cancellation could not safely cancel an entered strategy; "
+        "manual review is required."
+    )
+    lifecycle.updated_at = utc_now()
+    session.add(
+        ExecutionEvent(
+            execution_binding_id=lifecycle.execution_binding_id,
+            strategy_instance_id=(binding.strategy_instance_id if binding is not None else None),
+            venue="deepcoin",
+            action="reply_cancel_after_entry",
+            status="blocked",
+            kol_id=binding.kol_id if binding is not None else None,
+            chat_id=lifecycle.chat_id,
+            message_id=lifecycle.message_id,
+            source_message_id=raw_message.message_id,
+            symbol=lifecycle.symbol,
+            side=lifecycle.side,
+            pos_id=binding.pos_id if binding is not None else None,
+            reason=reason,
+        )
+    )
 
 
 def _expand_lifecycle_event_targets(

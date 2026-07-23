@@ -2248,6 +2248,78 @@ def test_replied_cancel_after_entry_is_blocked_without_full_exit_candidate(tmp_p
     ]
 
 
+def test_replied_cancel_after_entry_blocks_mismatched_ai_exit_target(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        replied_binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:88:4004:BTC:long",
+            kol_id="group:88",
+            chat_id=88,
+            message_id=4004,
+            symbol="BTC",
+            side="long",
+            status="active",
+            pos_id="pos-replied",
+        )
+        other_binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:88:4003:BTC:long",
+            kol_id="group:88",
+            chat_id=88,
+            message_id=4003,
+            symbol="BTC",
+            side="long",
+            status="active",
+            pos_id="pos-other",
+        )
+        session.add_all([replied_binding, other_binding])
+        session.flush()
+        replied_lifecycle = StrategyLifecycle(
+            chat_id=88, message_id=4004, symbol="BTC", side="long",
+            lifecycle_status="entered", signal_at=datetime(2026, 7, 21, 8, 50, tzinfo=UTC),
+            execution_binding_id=replied_binding.id,
+        )
+        other_lifecycle = StrategyLifecycle(
+            chat_id=88, message_id=4003, symbol="BTC", side="long",
+            lifecycle_status="entered", signal_at=datetime(2026, 7, 21, 8, 40, tzinfo=UTC),
+            execution_binding_id=other_binding.id,
+        )
+        reply = RawMessage(
+            chat_id=88, message_id=4007, reply_to_message_id=4004,
+            text="这笔也取消，我们明日再战！",
+        )
+        session.add_all([
+            replied_lifecycle,
+            other_lifecycle,
+            RawMessage(chat_id=88, message_id=4004, text="BTC 多单挂单"),
+            RawMessage(chat_id=88, message_id=4003, text="另一笔 BTC 多单"),
+            reply,
+        ])
+        session.flush()
+
+        applied = _apply_lifecycle_event_decision(
+            session,
+            reply,
+            {
+                "event_type": "cancel_entry",
+                "target_lifecycle_id": other_lifecycle.id,
+                "symbol": "BTC",
+                "side": "long",
+                "confidence": 0.92,
+                "reason": "模型错误选择另一条策略",
+            },
+        )
+        session.commit()
+
+        candidates = session.query(SignalCandidate).all()
+        events = session.query(ExecutionEvent).all()
+
+    assert applied is True
+    assert candidates == []
+    assert [(event.action, event.pos_id) for event in events] == [
+        ("reply_cancel_after_entry", "pos-replied")
+    ]
+
+
 def test_configured_ai_falls_back_to_local_cancel_for_unentered_btc_orders(
     tmp_path,
     monkeypatch,
