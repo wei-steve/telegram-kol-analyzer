@@ -24,6 +24,7 @@ from telegram_kol_research.message_instruction_items import (
 from telegram_kol_research.models import (
     AiPromptInvocation,
     ExecutionBinding,
+    ExecutionEvent,
     MediaAsset,
     MessageInstructionItem,
     MessageRecognition,
@@ -2186,6 +2187,65 @@ def test_ai_lifecycle_event_cancels_replied_pending_strategy(tmp_path, monkeypat
     assert lifecycle.exit_reason == "cancelled"
     assert candidate.target_lifecycle_id == lifecycle_id
     assert candidate.event_type == "close_signal"
+
+
+def test_replied_cancel_after_entry_is_blocked_without_full_exit_candidate(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:88:4004:BTC:long",
+            kol_id="group:88",
+            chat_id=88,
+            message_id=4004,
+            symbol="BTC",
+            side="long",
+            status="active",
+            pos_id="pos-4004",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=4004,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 21, 8, 50, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 22, 6, 26, tzinfo=UTC),
+            execution_binding_id=binding.id,
+        )
+        original = RawMessage(chat_id=88, message_id=4004, text="BTC 多单挂单")
+        reply = RawMessage(
+            chat_id=88,
+            message_id=4007,
+            reply_to_message_id=4004,
+            text="这笔也取消，我们明日再战！",
+        )
+        session.add_all([lifecycle, original, reply])
+        session.flush()
+
+        applied = _apply_lifecycle_event_decision(
+            session,
+            reply,
+            {
+                "event_type": "cancel_entry",
+                "target_lifecycle_id": lifecycle.id,
+                "symbol": "BTC",
+                "side": "long",
+                "confidence": 0.92,
+                "reason": "回复策略后要求取消挂单",
+            },
+        )
+        session.commit()
+
+        candidates = session.query(SignalCandidate).all()
+        events = session.query(ExecutionEvent).all()
+
+    assert applied is True
+    assert candidates == []
+    assert [(event.action, event.status, event.reason) for event in events] == [
+        ("reply_cancel_after_entry", "blocked", "manual_review_required")
+    ]
 
 
 def test_configured_ai_falls_back_to_local_cancel_for_unentered_btc_orders(

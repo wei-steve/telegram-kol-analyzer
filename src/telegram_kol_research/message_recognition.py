@@ -21,6 +21,7 @@ from telegram_kol_research.ai_recognition_config import (
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionEvent,
     MediaAsset,
     MessageInstructionItem,
     MessageRecognition,
@@ -1141,6 +1142,39 @@ def _apply_lifecycle_event_decision(
             and _lifecycle_has_live_execution_binding(session, target)
         )
     ):
+        if raw_message.reply_to_message_id == target.message_id:
+            binding = (
+                session.get(ExecutionBinding, target.execution_binding_id)
+                if target.execution_binding_id is not None
+                else None
+            )
+            target.management_signal_message_id = raw_message.message_id
+            target.management_action = "cancel_entry_after_entry_review"
+            target.management_note = (
+                "Reply cancellation arrived after entry; automatic close blocked "
+                "and manual review is required."
+            )
+            target.updated_at = utc_now()
+            session.add(
+                ExecutionEvent(
+                    execution_binding_id=target.execution_binding_id,
+                    strategy_instance_id=(
+                        binding.strategy_instance_id if binding is not None else None
+                    ),
+                    venue="deepcoin",
+                    action="reply_cancel_after_entry",
+                    status="blocked",
+                    kol_id=binding.kol_id if binding is not None else None,
+                    chat_id=target.chat_id,
+                    message_id=target.message_id,
+                    source_message_id=raw_message.message_id,
+                    symbol=target.symbol,
+                    side=target.side,
+                    pos_id=binding.pos_id if binding is not None else None,
+                    reason="manual_review_required",
+                )
+            )
+            return True
         if not _lifecycle_has_live_execution_binding(session, target):
             return False
         record_lifecycle_exit_intent(
