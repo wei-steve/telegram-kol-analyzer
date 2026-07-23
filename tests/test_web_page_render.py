@@ -293,6 +293,50 @@ def test_binding_payload_backfill_restores_entry_price_and_contract_quantity(tmp
     assert "已保存下单数据回填" in card.group(1)
 
 
+def test_binding_payload_history_metrics_prefer_verified_deepcoin_values(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    closed_at = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                kol_id="legacy-binding",
+                chat_id=100,
+                message_id=1,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                status="closed",
+                payload_json=json.dumps(
+                    {
+                        "draft": {
+                            "contract_spec": {"contract_value": 0.001},
+                            "order_legs": [{"price": 59100, "quantity": 7}],
+                        },
+                        "history_metrics": {
+                            "avgPx": "58818.4",
+                            "closeAvgPx": "57800",
+                            "pnl": "-7.1288",
+                            "pos": "7",
+                            "closePos": "7",
+                        },
+                    }
+                ),
+                created_at=closed_at,
+                updated_at=closed_at,
+            )
+        )
+        session.commit()
+
+    row = list_exited_strategies(session_factory, limit=10)[0]
+
+    assert row["entry_price_actual"] == 58818.4
+    assert row["exit_price_actual"] == 57800.0
+    assert row["realized_pnl"] == -7.1288
+    assert row["position_size_text"] == "0.007 BTC"
+    assert row["history_metric_source"] == "deepcoin_position_history"
+
+
 def test_history_position_time_tie_uses_source_independent_stable_identifier(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

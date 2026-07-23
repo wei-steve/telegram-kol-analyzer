@@ -150,7 +150,8 @@
       {% if item.entered_at_display %}<div><dt>开仓时间</dt><dd>{{ item.entered_at_display }}</dd></div>{% endif %}
       {% if item.exited_at_display %}<div><dt>最后平仓时间</dt><dd>{{ item.exited_at_display }}</dd></div>{% endif %}
     </dl>
-    {% if item.get('history_metric_source') == 'saved_order_payload' %}<div class="deepcoin-history-attribution">已保存下单数据回填</div>{% endif %}
+    {% if item.get('history_metric_source') == 'deepcoin_position_history' %}<div class="deepcoin-history-attribution">DeepCoin 历史仓位数据</div>
+    {% elif item.get('history_metric_source') == 'saved_order_payload' %}<div class="deepcoin-history-attribution">已保存下单数据回填</div>{% endif %}
     {% if attr %}<div class="deepcoin-history-attribution" data-deepcoin-history-attribution>{{ exchange_attribution(item) }}</div>{% endif %}
   </article>
 {%- endmacro %}

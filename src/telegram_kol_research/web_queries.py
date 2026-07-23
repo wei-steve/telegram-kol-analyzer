@@ -1291,11 +1291,41 @@ def _backfill_closed_binding_metrics(binding: ExecutionBinding) -> dict[str, obj
     base_quantity = total_contracts * contract_value
     base_symbol = _base_symbol(binding.symbol)
     suffix = f" {base_symbol}" if base_symbol else ""
-    return {
+    fallback = {
         "entry_price_actual": weighted_notional / total_contracts,
         "position_size_text": f"{base_quantity:.6g}{suffix}",
         "history_metric_source": "saved_order_payload",
     }
+    history_metrics = payload.get("history_metrics")
+    if not isinstance(history_metrics, dict):
+        return fallback
+
+    def number(name: str) -> float | None:
+        try:
+            return float(history_metrics.get(name))
+        except (TypeError, ValueError):
+            return None
+
+    entry_price = number("avgPx")
+    exit_price = number("closeAvgPx")
+    realized_pnl = number("pnl")
+    opened_contracts = number("pos")
+    closed_contracts = number("closePos")
+    actual_contracts = max(
+        value for value in (opened_contracts, closed_contracts) if value is not None
+    ) if opened_contracts is not None or closed_contracts is not None else None
+    if entry_price is None or entry_price <= 0 or actual_contracts is None or actual_contracts <= 0:
+        return fallback
+    verified = {
+        "entry_price_actual": entry_price,
+        "position_size_text": f"{actual_contracts * contract_value:.6g}{suffix}",
+        "history_metric_source": "deepcoin_position_history",
+    }
+    if exit_price is not None and exit_price > 0:
+        verified["exit_price_actual"] = exit_price
+    if realized_pnl is not None:
+        verified["realized_pnl"] = realized_pnl
+    return verified
 
 
 def _message_excerpt(text: str | None, *, limit: int = 96) -> str | None:
