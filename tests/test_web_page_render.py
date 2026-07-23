@@ -23,6 +23,7 @@ from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.web_app import create_web_app
+from telegram_kol_research.web_queries import list_exited_strategies
 
 
 def test_history_position_time_order_prefers_closed_time_and_uses_stable_id(tmp_path):
@@ -147,6 +148,85 @@ def test_deepcoin_history_position_layout_uses_app_information_hierarchy(tmp_pat
     assert "平仓均价" in response.text
     assert "开仓时间" in response.text
     assert "最后平仓时间" in response.text
+
+
+def test_history_position_time_tie_uses_source_independent_stable_identifier(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    shared_closed_at = datetime(2026, 7, 22, 9, 0, tzinfo=UTC)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=1,
+            posted_at=shared_closed_at,
+            sender_name="alice",
+            text="BTC long Entry 100 SL 90 TP 110",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            entry_text="100",
+            stop_loss_text="90",
+            take_profit_text="110",
+            parse_source="text_ai",
+            confidence=0.9,
+            review_status="pending",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=100,
+                message_id=1,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="exited",
+                exit_reason="take_profit",
+                signal_at=shared_closed_at,
+                entered_at=shared_closed_at,
+                exited_at=shared_closed_at,
+            )
+        )
+        session.add_all(
+            [
+                ExecutionBinding(
+                    kol_id="binding-one",
+                    chat_id=200,
+                    message_id=1,
+                    symbol="ETH",
+                    side="long",
+                    venue="deepcoin",
+                    status="closed",
+                    created_at=shared_closed_at,
+                    updated_at=shared_closed_at,
+                ),
+                ExecutionBinding(
+                    kol_id="binding-two",
+                    chat_id=201,
+                    message_id=1,
+                    symbol="SOL",
+                    side="short",
+                    venue="deepcoin",
+                    status="closed",
+                    created_at=shared_closed_at,
+                    updated_at=shared_closed_at,
+                ),
+            ]
+        )
+        session.commit()
+
+    rows = list_exited_strategies(session_factory, limit=10)
+
+    assert [row["history_sort_id"] for row in rows] == [
+        "binding:2",
+        "binding:1",
+        "lifecycle:1",
+    ]
 
 
 def test_dashboard_renders_versioned_prompt_center_without_api_keys(tmp_path):

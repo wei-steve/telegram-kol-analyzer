@@ -17,11 +17,14 @@ def test_deepcoin_history_assets_are_scoped_to_the_history_panel(tmp_path):
     css = client.get("/static/app.css").text
 
     assert ".exchange-tab.is-active::after" in css
+    assert "background: #3b82f6;" in css
     assert "background: #f97316;" in css
     assert "[data-exchange-history-panel]" in css
+    assert ".exchange-tab-strip:has(~ .exchange-tab-panels [data-exchange-history-panel].is-active)" in css
     assert ".deepcoin-history-position" in css
     assert "background: #ffffff;" in css
     assert ".deepcoin-history-times dd" in css
+    assert "[data-exchange-history-panel].is-active .exchange-group-header" in css
     assert ".exchange-position-card" in css
 
 

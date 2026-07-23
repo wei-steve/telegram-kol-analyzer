@@ -2179,7 +2179,7 @@ def list_exited_strategies(
                 seen_signal_keys.add(key)
             row: dict[str, object] = {
                 "history_sort_id": f"lifecycle:{lc.id}",
-                "history_sort_key": lc.id,
+                "history_sort_key": (lc.id, 2),
                 "lifecycle_id": lc.id,
                 "chat_id": lc.chat_id,
                 "message_id": lc.message_id,
@@ -2256,7 +2256,7 @@ def list_exited_strategies(
                 seen_signal_keys.add(key)
             row = {
                 "history_sort_id": f"binding:{eb.id}",
-                "history_sort_key": eb.id,
+                "history_sort_key": (eb.id, 3),
                 "chat_id": eb.chat_id,
                 "message_id": eb.message_id,
                 "symbol": eb.symbol,
@@ -2306,7 +2306,7 @@ def list_exited_strategies(
                 seen_signal_keys.add(key)
             row = {
                 "history_sort_id": f"trade-idea:{ti.id}",
-                "history_sort_key": ti.id,
+                "history_sort_key": (ti.id, 1),
                 "chat_id": ti.chat_id,
                 "symbol": ti.symbol or "?",
                 "side": ti.side or "?",
@@ -2331,7 +2331,7 @@ def list_exited_strategies(
         key=lambda r: (
             r.get("exited_at") is not None,
             r.get("exited_at") or r.get("entered_at") or "",
-            int(r.get("history_sort_key") or 0),
+            tuple(r.get("history_sort_key") or (0, 0)),
         ),
         reverse=True,
     )

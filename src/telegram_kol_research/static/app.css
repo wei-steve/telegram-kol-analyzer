@@ -1080,6 +1080,10 @@ body {
 }
 
 .exchange-tab.is-active::after {
+  background: #3b82f6;
+}
+
+.exchange-tab-strip:has(~ .exchange-tab-panels [data-exchange-history-panel].is-active) .exchange-tab.is-active::after {
   background: #f97316;
 }
 
@@ -1193,6 +1197,17 @@ body {
   gap: 0;
   padding-bottom: 28px;
   background: #ffffff;
+}
+
+[data-exchange-history-panel].is-active .exchange-group-header {
+  border-color: #edf0f3;
+  border-radius: 0;
+  background: #ffffff;
+  color: #111827;
+}
+
+[data-exchange-history-panel].is-active .exchange-group-header strong {
+  color: #111827;
 }
 
 .deepcoin-history-position {
