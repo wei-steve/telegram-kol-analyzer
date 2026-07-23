@@ -679,6 +679,41 @@ def test_run_reconcile_once_limits_media_downloads_to_new_messages(tmp_path):
     assert captured["media_download_message_ids"] == set()
 
 
+def test_run_reconcile_once_retries_zero_byte_media_within_overlap(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    media_root = tmp_path / "media"
+    zero_byte_path = media_root / "9001" / "77.jpg"
+    zero_byte_path.parent.mkdir(parents=True)
+    zero_byte_path.write_bytes(b"")
+    with session_factory() as session:
+        message = RawMessage(chat_id=9001, message_id=77, text="cached image")
+        session.add(message)
+        session.flush()
+        session.add(MediaAsset(raw_message_id=message.id, kind="photo", local_path="9001/77.jpg"))
+        session.add(SyncCheckpoint(chat_id=9001, sync_kind="history", last_message_id=77))
+        session.commit()
+
+    captured = {}
+
+    async def fake_fetch_dialog_messages(client, dialog, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    __import__("asyncio").run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            media_root=media_root,
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=fake_fetch_dialog_messages,
+        )
+    )
+
+    assert captured["media_download_message_ids"] == {77}
+
+
 def test_run_reconcile_once_does_not_expand_window_for_old_missing_media(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

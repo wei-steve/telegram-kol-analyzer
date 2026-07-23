@@ -4,10 +4,33 @@ from __future__ import annotations
 
 import os
 import asyncio
+import logging
+import uuid
 from inspect import isawaitable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
+
+
+def is_usable_image_file(path: str | Path | None) -> bool:
+    """Return whether *path* is a non-empty image Pillow can verify."""
+
+    if path is None:
+        return False
+    candidate = Path(path)
+    try:
+        if not candidate.is_file() or candidate.stat().st_size <= 0:
+            return False
+        from PIL import Image
+
+        with Image.open(candidate) as image:
+            image.verify()
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 @dataclass(slots=True)
@@ -327,16 +350,35 @@ async def _download_media_if_present(
     existing_path = _find_existing_media_file(target_dir, message_id)
     if existing_path is not None:
         return _relative_media_path(existing_path, media_root)
+    temporary_target = target_dir / f".download-{message_id}-{uuid.uuid4().hex}"
     try:
         output_path = await asyncio.wait_for(
-            download_media(media, file=str(target_dir / f"{message_id}")),
+            download_media(media, file=str(temporary_target)),
             timeout=timeout_seconds,
         )
-    except TimeoutError:
+    except (TimeoutError, OSError) as exc:
+        logger.warning("Telegram media download failed for %s/%s: %s", dialog_id, message_id, exc)
+        _remove_temporary_media_files(temporary_target)
         return None
     if output_path in (None, ""):
+        _remove_temporary_media_files(temporary_target)
         return None
-    return _relative_media_path(Path(output_path), media_root)
+    downloaded_path = Path(output_path)
+    if (
+        not _path_is_within(downloaded_path, target_dir)
+        or not downloaded_path.name.startswith(temporary_target.name)
+        or not is_usable_image_file(downloaded_path)
+    ):
+        _remove_temporary_media_files(temporary_target)
+        return None
+    canonical_path = target_dir / f"{message_id}{downloaded_path.suffix.lower()}"
+    try:
+        downloaded_path.replace(canonical_path)
+    except OSError as exc:
+        logger.warning("Telegram media promotion failed for %s/%s: %s", dialog_id, message_id, exc)
+        _remove_temporary_media_files(temporary_target)
+        return None
+    return _relative_media_path(canonical_path, media_root)
 
 
 def _find_existing_media_file(target_dir: Path, message_id: Any) -> Path | None:
@@ -348,9 +390,23 @@ def _find_existing_media_file(target_dir: Path, message_id: Any) -> Path | None:
         for path in target_dir.iterdir()
         if path.is_file()
         and (path.stem == prefix or path.name.startswith(f"{prefix}."))
-        and path.stat().st_size > 0
+        and is_usable_image_file(path)
     )
     return matches[0] if matches else None
+
+
+def _remove_temporary_media_files(temporary_target: Path) -> None:
+    for path in temporary_target.parent.glob(f"{temporary_target.name}*"):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+
+
+def _path_is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def _relative_media_path(path: Path, media_root: Path) -> str:

@@ -48,6 +48,7 @@ from telegram_kol_research.telegram_client import (
     discover_dialogs,
     fetch_dialog_messages,
     filter_target_dialogs,
+    is_usable_image_file,
     maybe_await,
 )
 from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidates
@@ -678,6 +679,19 @@ def _filter_callable_kwargs(callback: Callable[..., Any], kwargs: dict[str, Any]
     }
 
 
+def _is_usable_downloaded_media_path(
+    local_path: str | None,
+    *,
+    media_root: Path,
+) -> bool:
+    if not local_path:
+        return False
+    candidate = Path(local_path)
+    if not candidate.is_absolute():
+        candidate = media_root / candidate
+    return is_usable_image_file(candidate)
+
+
 async def run_reconcile_once(
     *,
     client: Any,
@@ -825,17 +839,24 @@ async def run_reconcile_once(
         # ── Also re-fetch messages whose media download failed earlier ──
         dialog_id = int(dialog.get("id") or 0)
         with session_factory() as session:
-            orphan_rows = (
-                session.query(RawMessage.message_id)
+            media_rows = (
+                session.query(RawMessage.message_id, MediaAsset.local_path)
                 .join(MediaAsset, MediaAsset.raw_message_id == RawMessage.id)
                 .filter(
                     RawMessage.chat_id == dialog_id,
                     RawMessage.message_id > replay_floor,
-                    MediaAsset.local_path.is_(None),
                 )
                 .all()
             )
-        orphan_msg_ids = {row.message_id for row in orphan_rows}
+        resolved_media_root = Path(media_root)
+        orphan_msg_ids = {
+            row.message_id
+            for row in media_rows
+            if not _is_usable_downloaded_media_path(
+                row.local_path,
+                media_root=resolved_media_root,
+            )
+        }
         fetch_kwargs = _filter_callable_kwargs(
             fetch_dialog_messages_fn,
             {
