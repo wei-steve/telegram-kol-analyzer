@@ -121,6 +121,7 @@
   {% set exit_price_actual = item.get('exit_price_actual') %}
   {% set realized_pnl = item.get('realized_pnl') %}
   {% set position_size_text = item.get('position_size_text') %}
+  {% set closed_size_text = item.get('closed_size_text') or position_size_text %}
   <article class="deepcoin-history-position" data-deepcoin-history-position data-history-position-id="{{ item.history_sort_id }}">
     <header class="deepcoin-history-position-head">
       <div>
@@ -144,7 +145,7 @@
     </dl>
     <dl class="deepcoin-history-secondary-metrics">
       <div><dt>平仓均价</dt><dd{% if exit_price_actual is none %} class="deepcoin-history-metric-missing"{% endif %}>{% if exit_price_actual is not none %}{{ "%g"|format(exit_price_actual) }}{% else %}--{% endif %}</dd></div>
-      <div><dt>已平仓量</dt><dd{% if not position_size_text %} class="deepcoin-history-metric-missing"{% endif %}>{{ position_size_text or '--' }}</dd></div>
+      <div><dt>已平仓量</dt><dd{% if not closed_size_text %} class="deepcoin-history-metric-missing"{% endif %}>{{ closed_size_text or '--' }}</dd></div>
     </dl>
     <dl class="deepcoin-history-times">
       {% if item.entered_at_display %}<div><dt>开仓时间</dt><dd>{{ item.entered_at_display }}</dd></div>{% endif %}

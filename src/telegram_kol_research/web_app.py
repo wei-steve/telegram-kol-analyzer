@@ -1080,6 +1080,7 @@ def _load_exchange_position_snapshot(
     group_label_by_chat_id: dict[int, str],
     pending_entry_signals: list[dict[str, Any]],
     trading_settings,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     order_limit: int = 100,
 ) -> dict[str, Any]:
     """Load the exchange-style dashboard snapshot from Deepcoin read APIs."""
@@ -1121,12 +1122,16 @@ def _load_exchange_position_snapshot(
     )
     raw_trigger_orders: list[dict[str, Any]] = []
     raw_trigger_history: list[dict[str, Any]] = []
+    raw_position_history: list[dict[str, Any]] = []
     for inst_id in sorted(instruments):
         raw_trigger_orders.extend(
             _safe_deepcoin_list(client, "list_trigger_orders_pending", inst_id=inst_id)
         )
         raw_trigger_history.extend(
             _safe_deepcoin_list(client, "list_trigger_order_history", inst_id=inst_id)
+        )
+        raw_position_history.extend(
+            _safe_deepcoin_list(client, "list_position_history", inst_id=inst_id)
         )
 
     snapshot["open_orders"] = _dedupe_exchange_rows(
@@ -1151,6 +1156,20 @@ def _load_exchange_position_snapshot(
         [*snapshot["open_orders"], *snapshot["order_history"]],
         group_label_by_chat_id=group_label_by_chat_id,
     )
+    snapshot["position_history"] = sorted(
+        (
+            _exchange_position_history_row(
+                position,
+                contract_spec_provider=contract_spec_provider,
+            )
+            for position in raw_position_history
+            if _float_or_none(position.get("avgPx")) is not None
+            and _float_or_none(position.get("closeAvgPx")) is not None
+            and _float_or_none(position.get("closePos")) not in (None, 0.0)
+        ),
+        key=lambda row: (row.get("exited_at") or datetime.min.replace(tzinfo=UTC), row["history_sort_id"]),
+        reverse=True,
+    )[:order_limit]
     return snapshot
 
 
@@ -1676,6 +1695,48 @@ def _exchange_order_row(order: dict[str, Any], *, source: str) -> dict[str, Any]
         "updated_at": _format_deepcoin_timestamp(
             _first_position_string(order, "uTime", "updatedAt", "updateTime")
         ),
+    }
+
+
+def _exchange_position_history_row(
+    position: dict[str, Any], *, contract_spec_provider: DeepcoinContractSpecProvider | None
+) -> dict[str, Any]:
+    inst_id = _exchange_inst_id(position)
+    symbol = _symbol_from_deepcoin_inst_id(inst_id)
+    spec = contract_spec_provider.get_contract_spec(inst_id) if contract_spec_provider else None
+
+    def quantity(field: str) -> str | None:
+        contracts = _float_or_none(position.get(field))
+        if contracts is None or contracts <= 0:
+            return None
+        if spec is not None:
+            return f"{contracts * spec.contract_value:g} {symbol}"
+        return f"{contracts:g} contracts {inst_id}"
+
+    def exchange_time(field: str):
+        value = _float_or_none(position.get(field))
+        if value is None or value <= 0:
+            return None
+        return datetime.fromtimestamp(value / 1000, tz=UTC).astimezone(DEFAULT_LOCAL_TIMEZONE)
+
+    return {
+        "history_sort_id": f"deepcoin-position:{position.get('posId')}",
+        "history_sort_key": (str(position.get("posId") or ""), 0),
+        "pos_id": _first_position_string(position, "posId"),
+        "inst_id": inst_id,
+        "symbol": symbol,
+        "side": _normalize_deepcoin_position_side(position.get("posSide")),
+        "source": "deepcoin_position_history",
+        "history_metric_source": "deepcoin_position_history",
+        "lifecycle_status": "exited",
+        "exit_reason": "closed",
+        "entry_price_actual": _float_or_none(position.get("avgPx")),
+        "exit_price_actual": _float_or_none(position.get("closeAvgPx")),
+        "realized_pnl": _float_or_none(position.get("pnl")),
+        "position_size_text": quantity("pos"),
+        "closed_size_text": quantity("closePos"),
+        "entered_at": exchange_time("cTime"),
+        "exited_at": exchange_time("uTime"),
     }
 
 
@@ -3105,8 +3166,8 @@ def create_web_app(
             group_label_by_chat_id=group_label_by_chat_id,
             pending_entry_signals=pending_entry_signals,
             trading_settings=load_trading_settings(app.state.session_factory),
+            contract_spec_provider=app.state.deepcoin_contract_spec_provider,
         )
-        exchange_snapshot["position_history"] = exited_positions
         exchange_snapshot = _annotate_exchange_snapshot_attribution(
             exchange_snapshot,
             holding_positions=holding_positions,

@@ -99,7 +99,7 @@ class DeepcoinTradingClientProtocol(Protocol):
         self,
         *,
         inst_id: str,
-        pos_id: str,
+        pos_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return historical records for one exact split position."""
 
@@ -292,7 +292,7 @@ class DeepcoinRestClient:
         self,
         *,
         inst_id: str,
-        pos_id: str,
+        pos_id: str | None = None,
     ) -> list[dict[str, Any]]:
         self._pace_position_history_request()
         payload = self._request(

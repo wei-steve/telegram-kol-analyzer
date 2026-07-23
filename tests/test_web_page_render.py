@@ -398,10 +398,6 @@ def test_verified_deepcoin_history_excludes_unfilled_and_keeps_complete_position
     assert rows[0]["realized_pnl"] == 11.0
     assert rows[0]["position_size_text"] == "0.002 BTC"
 
-    response = TestClient(create_web_app(database_path=database_path)).get("/positions-panel")
-
-    assert 'data-history-position-id="binding:2"' in response.text
-    assert 'data-history-position-id="binding:1"' not in response.text
 
 
 def test_verified_deepcoin_history_orders_by_deepcoin_close_time(tmp_path):
