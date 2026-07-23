@@ -1250,6 +1250,54 @@ def _format_position_size_text(
     return f"{quantity:.6g}{suffix}（止损{risk_usdt:g}U）"
 
 
+def _backfill_closed_binding_metrics(binding: ExecutionBinding) -> dict[str, object]:
+    """Recover submitted entry price and size from a legacy binding payload.
+
+    These are submitted-order values, not exchange fill values.  The caller
+    exposes their provenance so the UI never presents them as verified fills.
+    """
+    payload = _safe_json_dict(binding.payload_json)
+    draft = payload.get("draft")
+    if not isinstance(draft, dict):
+        return {}
+    contract_spec = draft.get("contract_spec")
+    order_legs = draft.get("order_legs")
+    if not isinstance(contract_spec, dict) or not isinstance(order_legs, list):
+        return {}
+    try:
+        contract_value = float(contract_spec.get("contract_value"))
+    except (TypeError, ValueError):
+        return {}
+    if contract_value <= 0:
+        return {}
+
+    total_contracts = 0.0
+    weighted_notional = 0.0
+    for leg in order_legs:
+        if not isinstance(leg, dict):
+            continue
+        try:
+            price = float(leg.get("price"))
+            quantity = float(leg.get("quantity"))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or quantity <= 0:
+            continue
+        total_contracts += quantity
+        weighted_notional += price * quantity
+    if total_contracts <= 0:
+        return {}
+
+    base_quantity = total_contracts * contract_value
+    base_symbol = _base_symbol(binding.symbol)
+    suffix = f" {base_symbol}" if base_symbol else ""
+    return {
+        "entry_price_actual": weighted_notional / total_contracts,
+        "position_size_text": f"{base_quantity:.6g}{suffix}",
+        "history_metric_source": "saved_order_payload",
+    }
+
+
 def _message_excerpt(text: str | None, *, limit: int = 96) -> str | None:
     if not text:
         return None
@@ -2268,6 +2316,7 @@ def list_exited_strategies(
                 "exited_at": utc_naive_to_local(eb.updated_at),
                 "sender_name": eb.kol_id,
             }
+            row.update(_backfill_closed_binding_metrics(eb))
             results.append(_add_strategy_time_display_fields(row))
 
         # ── 3. TradeIdea (closed) ──

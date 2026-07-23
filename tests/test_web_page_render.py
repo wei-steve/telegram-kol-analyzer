@@ -243,6 +243,56 @@ def test_history_position_handles_legacy_binding_without_metrics(tmp_path):
     assert card.group(1).count('class="deepcoin-history-metric-missing">--') == 5
 
 
+def test_binding_payload_backfill_restores_entry_price_and_contract_quantity(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    closed_at = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                kol_id="legacy-binding",
+                chat_id=100,
+                message_id=1,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                status="closed",
+                payload_json=json.dumps(
+                    {
+                        "draft": {
+                            "contract_spec": {"contract_value": 0.001},
+                            "order_legs": [
+                                {"price": 59100, "quantity": 7},
+                                {"price": 58900, "quantity": 9},
+                            ],
+                        }
+                    }
+                ),
+                created_at=closed_at,
+                updated_at=closed_at,
+            )
+        )
+        session.commit()
+
+    row = list_exited_strategies(session_factory, limit=10)[0]
+    response = TestClient(create_web_app(database_path=database_path)).get("/positions-panel")
+    card = re.search(
+        r'<article class="deepcoin-history-position" data-deepcoin-history-position '
+        r'data-history-position-id="binding:1">(.*?)</article>',
+        response.text,
+        re.DOTALL,
+    )
+
+    assert row["entry_price_actual"] == 58987.5
+    assert row["position_size_text"] == "0.016 BTC"
+    assert row["history_metric_source"] == "saved_order_payload"
+    assert response.status_code == 200
+    assert card is not None
+    assert "58987.5" in card.group(1)
+    assert card.group(1).count("0.016 BTC") == 2
+    assert "已保存下单数据回填" in card.group(1)
+
+
 def test_history_position_time_tie_uses_source_independent_stable_identifier(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
