@@ -25,6 +25,130 @@ from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.web_app import create_web_app
 
 
+def test_history_position_time_order_prefers_closed_time_and_uses_stable_id(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    records = [
+        ("EARLY", datetime(2026, 7, 22, 8, 0, tzinfo=UTC), datetime(2026, 7, 22, 9, 0, tzinfo=UTC)),
+        ("LATEST", datetime(2026, 7, 22, 10, 0, tzinfo=UTC), datetime(2026, 7, 22, 12, 0, tzinfo=UTC)),
+        ("FALLBACK", datetime(2026, 7, 22, 13, 0, tzinfo=UTC), None),
+        ("TIE_FIRST", datetime(2026, 7, 22, 7, 0, tzinfo=UTC), datetime(2026, 7, 22, 11, 0, tzinfo=UTC)),
+        ("TIE_SECOND", datetime(2026, 7, 22, 7, 30, tzinfo=UTC), datetime(2026, 7, 22, 11, 0, tzinfo=UTC)),
+    ]
+    with session_factory() as session:
+        for message_id, (symbol, entered_at, exited_at) in enumerate(records, start=1):
+            raw_message = RawMessage(
+                chat_id=100,
+                message_id=message_id,
+                posted_at=entered_at,
+                sender_name="alice",
+                text=f"{symbol} long Entry 100 SL 90 TP 110",
+            )
+            session.add(raw_message)
+            session.flush()
+            candidate = SignalCandidate(
+                raw_message_id=raw_message.id,
+                symbol=symbol,
+                side="long",
+                event_type="entry_signal",
+                entry_text="100",
+                stop_loss_text="90",
+                take_profit_text="110",
+                parse_source="text_ai",
+                confidence=0.9,
+                review_status="pending",
+            )
+            session.add(candidate)
+            session.flush()
+            session.add(
+                StrategyLifecycle(
+                    signal_candidate_id=candidate.id,
+                    chat_id=100,
+                    message_id=message_id,
+                    symbol=symbol,
+                    side="long",
+                    lifecycle_status="exited",
+                    exit_reason="take_profit",
+                    signal_at=entered_at,
+                    entered_at=entered_at,
+                    exited_at=exited_at,
+                    entry_price_actual=100,
+                    exit_price_actual=110,
+                )
+            )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get("/positions-panel")
+
+    assert response.status_code == 200
+    latest = response.text.index('data-history-position-id="lifecycle:2"')
+    tie_second = response.text.index('data-history-position-id="lifecycle:5"')
+    tie_first = response.text.index('data-history-position-id="lifecycle:4"')
+    early = response.text.index('data-history-position-id="lifecycle:1"')
+    fallback = response.text.index('data-history-position-id="lifecycle:3"')
+    assert latest < tie_second < tie_first < early < fallback
+
+
+def test_deepcoin_history_position_layout_uses_app_information_hierarchy(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    opened_at = datetime(2026, 7, 22, 8, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 22, 9, 0, tzinfo=UTC)
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=100,
+            message_id=1,
+            posted_at=opened_at,
+            sender_name="alice",
+            text="BTC short Entry 66000 SL 67000 TP 65000",
+        )
+        session.add(raw_message)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw_message.id,
+            symbol="BTC",
+            side="short",
+            event_type="entry_signal",
+            entry_text="66000",
+            stop_loss_text="67000",
+            take_profit_text="65000",
+            parse_source="text_ai",
+            confidence=0.9,
+            review_status="pending",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                signal_candidate_id=candidate.id,
+                chat_id=100,
+                message_id=1,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="exited",
+                exit_reason="take_profit",
+                signal_at=opened_at,
+                entered_at=opened_at,
+                exited_at=closed_at,
+                entry_price_actual=66000,
+                exit_price_actual=65000,
+            )
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert 'data-exchange-history-panel' in response.text
+    assert 'data-deepcoin-history-position' in response.text
+    assert 'data-history-position-id="lifecycle:1"' in response.text
+    assert 'data-deepcoin-history-attribution' in response.text
+    assert "开仓均价" in response.text
+    assert "平仓均价" in response.text
+    assert "开仓时间" in response.text
+    assert "最后平仓时间" in response.text
+
+
 def test_dashboard_renders_versioned_prompt_center_without_api_keys(tmp_path):
     config_path = tmp_path / "ai.yaml"
     config_path.write_text(

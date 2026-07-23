@@ -116,13 +116,14 @@
 {%- endmacro %}
 
 {% macro history_position_card(item) -%}
-  <article class="exchange-position-card exchange-position-card--history">
-    <div class="exchange-card-head">
+  {% set attr = item.attribution if item.attribution is defined else none %}
+  <article class="deepcoin-history-position" data-deepcoin-history-position data-history-position-id="{{ item.history_sort_id }}">
+    <header class="deepcoin-history-position-head">
       <div>
         <strong>{{ item.symbol }}</strong>
         {{ side_badge(item.side) }}
       </div>
-      <code>
+      <span class="deepcoin-history-exit-reason">
         {% if item.exit_reason == 'stop_loss' %}止损平仓
         {% elif item.exit_reason == 'take_profit' %}止盈平仓
         {% elif item.exit_reason == 'kol_signal' %}KOL 信号平仓
@@ -130,17 +131,23 @@
         {% elif item.lifecycle_status == 'expired' %}过期
         {% else %}{{ item.exit_reason or item.lifecycle_status or '历史仓位' }}
         {% endif %}
-      </code>
-    </div>
-    {{ exchange_attribution(item) }}
-    <dl class="exchange-metric-grid">
+      </span>
+    </header>
+    <dl class="deepcoin-history-primary-metrics">
       {% if item.entry_text %}<div><dt>开仓均价</dt><dd>{{ item.entry_text }}</dd></div>
       {% elif item.entry_price_actual %}<div><dt>开仓均价</dt><dd>{{ "%g"|format(item.entry_price_actual) }}</dd></div>{% endif %}
+      {% if item.realized_pnl is defined and item.realized_pnl is not none %}<div><dt>已实现盈亏</dt><dd class="deepcoin-history-pnl">{{ "%g"|format(item.realized_pnl) }}</dd></div>{% endif %}
+      {% if item.position_size_text %}<div><dt>最大持仓量</dt><dd>{{ item.position_size_text }}</dd></div>{% endif %}
+    </dl>
+    <dl class="deepcoin-history-secondary-metrics">
       {% if item.exit_price_actual %}<div><dt>平仓均价</dt><dd>{{ "%g"|format(item.exit_price_actual) }}</dd></div>{% endif %}
-      {% if item.position_size_text %}<div><dt>数量</dt><dd>{{ item.position_size_text }}</dd></div>{% endif %}
+      {% if item.position_size_text %}<div><dt>已平仓量</dt><dd>{{ item.position_size_text }}</dd></div>{% endif %}
+    </dl>
+    <dl class="deepcoin-history-times">
       {% if item.entered_at_display %}<div><dt>开仓时间</dt><dd>{{ item.entered_at_display }}</dd></div>{% endif %}
       {% if item.exited_at_display %}<div><dt>最后平仓时间</dt><dd>{{ item.exited_at_display }}</dd></div>{% endif %}
     </dl>
+    {% if attr %}<div class="deepcoin-history-attribution" data-deepcoin-history-attribution>{{ exchange_attribution(item) }}</div>{% endif %}
   </article>
 {%- endmacro %}
 
@@ -239,7 +246,7 @@
       </div>
     </section>
 
-    <section class="exchange-tab-panel" data-exchange-position-panel="position-history">
+    <section class="exchange-tab-panel" data-exchange-position-panel="position-history" data-exchange-history-panel>
       <div class="exchange-view-panel is-active" data-exchange-view-panel="list">
         {{ card_list(exchange_snapshot.position_history | list, '暂无历史仓位', 'history-position') }}
       </div>

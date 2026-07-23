@@ -2178,6 +2178,8 @@ def list_exited_strategies(
             if key is not None:
                 seen_signal_keys.add(key)
             row: dict[str, object] = {
+                "history_sort_id": f"lifecycle:{lc.id}",
+                "history_sort_key": lc.id,
                 "lifecycle_id": lc.id,
                 "chat_id": lc.chat_id,
                 "message_id": lc.message_id,
@@ -2253,6 +2255,8 @@ def list_exited_strategies(
             if key is not None:
                 seen_signal_keys.add(key)
             row = {
+                "history_sort_id": f"binding:{eb.id}",
+                "history_sort_key": eb.id,
                 "chat_id": eb.chat_id,
                 "message_id": eb.message_id,
                 "symbol": eb.symbol,
@@ -2301,6 +2305,8 @@ def list_exited_strategies(
             if key is not None:
                 seen_signal_keys.add(key)
             row = {
+                "history_sort_id": f"trade-idea:{ti.id}",
+                "history_sort_key": ti.id,
                 "chat_id": ti.chat_id,
                 "symbol": ti.symbol or "?",
                 "side": ti.side or "?",
@@ -2322,7 +2328,11 @@ def list_exited_strategies(
             results.append(_add_strategy_time_display_fields(row))
 
     results.sort(
-        key=lambda r: str(r.get("exited_at") or r.get("entered_at") or ""),
+        key=lambda r: (
+            r.get("exited_at") is not None,
+            r.get("exited_at") or r.get("entered_at") or "",
+            int(r.get("history_sort_key") or 0),
+        ),
         reverse=True,
     )
     return results[:limit]

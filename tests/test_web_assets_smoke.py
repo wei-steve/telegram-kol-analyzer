@@ -11,6 +11,20 @@ def test_static_assets_are_served(tmp_path):
     assert response.status_code == 200
 
 
+def test_deepcoin_history_assets_are_scoped_to_the_history_panel(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    css = client.get("/static/app.css").text
+
+    assert ".exchange-tab.is-active::after" in css
+    assert "background: #f97316;" in css
+    assert "[data-exchange-history-panel]" in css
+    assert ".deepcoin-history-position" in css
+    assert "background: #ffffff;" in css
+    assert ".deepcoin-history-times dd" in css
+    assert ".exchange-position-card" in css
+
+
 def test_management_batch_assets_only_load_read_only_api(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
     js = client.get("/static/app.js").text

@@ -1080,7 +1080,7 @@ body {
 }
 
 .exchange-tab.is-active::after {
-  background: #3b82f6;
+  background: #f97316;
 }
 
 .exchange-view-switch {
@@ -1159,6 +1159,148 @@ body {
 .exchange-position-card--history {
   border-color: rgba(148, 163, 184, 0.12);
   background: rgba(15, 23, 42, 0.58);
+}
+
+/* DeepCoin historical-position treatment: active only on the history tab. */
+.exchange-positions-panel:has([data-exchange-history-panel].is-active) {
+  background: #ffffff;
+  color: #111827;
+}
+
+.exchange-positions-panel:has([data-exchange-history-panel].is-active) .panel-heading h2,
+.exchange-positions-panel:has([data-exchange-history-panel].is-active) .ai-helper-text,
+.exchange-positions-panel:has([data-exchange-history-panel].is-active) .exchange-tab.is-active {
+  color: #111827;
+}
+
+.exchange-positions-panel:has([data-exchange-history-panel].is-active) .exchange-tab:hover {
+  color: #374151;
+}
+
+[data-exchange-history-panel].is-active {
+  max-width: 980px;
+  margin: 0 auto;
+  color: #111827;
+}
+
+[data-exchange-history-panel].is-active .exchange-card-list {
+  gap: 0;
+  padding-bottom: 28px;
+  background: #ffffff;
+}
+
+[data-exchange-history-panel].is-active .exchange-group-list {
+  gap: 0;
+  padding-bottom: 28px;
+  background: #ffffff;
+}
+
+.deepcoin-history-position {
+  display: grid;
+  gap: 14px;
+  padding: 24px 28px;
+  border: 0;
+  border-bottom: 1px solid #edf0f3;
+  background: #ffffff;
+  color: #111827;
+}
+
+.deepcoin-history-position-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.deepcoin-history-position-head > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.deepcoin-history-position-head strong {
+  font-size: 1.35rem;
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+
+.deepcoin-history-exit-reason {
+  color: #9ca3af;
+  font-size: 0.92rem;
+  white-space: nowrap;
+}
+
+.deepcoin-history-primary-metrics,
+.deepcoin-history-secondary-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  margin: 0;
+}
+
+.deepcoin-history-secondary-metrics {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.deepcoin-history-primary-metrics div,
+.deepcoin-history-secondary-metrics div {
+  min-width: 0;
+}
+
+.deepcoin-history-primary-metrics dt,
+.deepcoin-history-secondary-metrics dt,
+.deepcoin-history-times dt {
+  color: #9ca3af;
+  font-size: 0.86rem;
+  line-height: 1.35;
+}
+
+.deepcoin-history-primary-metrics dd,
+.deepcoin-history-secondary-metrics dd {
+  margin: 4px 0 0;
+  color: #111827;
+  font-size: 1.08rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.deepcoin-history-primary-metrics .deepcoin-history-pnl {
+  color: #10b981;
+}
+
+.deepcoin-history-times {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.deepcoin-history-times div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: baseline;
+}
+
+.deepcoin-history-times dd {
+  margin: 0;
+  color: #111827;
+  font-size: 0.94rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.deepcoin-history-attribution {
+  padding-top: 2px;
+}
+
+.deepcoin-history-attribution .exchange-attribution {
+  color: #6b7280;
+}
+
+.deepcoin-history-attribution .exchange-attribution span,
+.deepcoin-history-attribution .exchange-attribution code,
+.deepcoin-history-attribution .exchange-attribution small {
+  background: #f3f4f6;
 }
 
 .exchange-position-actions {
@@ -3851,6 +3993,37 @@ pre { white-space: pre-wrap; }
   .dashboard-tab-panel [data-dashboard-tab="main"] {
     min-width: 48px;
     white-space: nowrap;
+  }
+
+  [data-exchange-history-panel].is-active {
+    max-width: none;
+  }
+
+  .deepcoin-history-position {
+    gap: 12px;
+    padding: 20px 16px;
+  }
+
+  .deepcoin-history-position-head strong {
+    font-size: 1.18rem;
+  }
+
+  .deepcoin-history-primary-metrics,
+  .deepcoin-history-secondary-metrics {
+    gap: 12px;
+  }
+
+  .deepcoin-history-primary-metrics dd,
+  .deepcoin-history-secondary-metrics dd {
+    font-size: 0.96rem;
+  }
+
+  .deepcoin-history-times div {
+    gap: 12px;
+  }
+
+  .deepcoin-history-times dd {
+    font-size: 0.82rem;
   }
 }
 
