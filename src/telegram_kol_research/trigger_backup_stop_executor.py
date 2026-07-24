@@ -121,7 +121,6 @@ def _eligible_candidates(session) -> list[tuple[int, int, str]]:
             session.query(PositionBackupStopOrder.id)
             .filter(PositionBackupStopOrder.venue == "deepcoin")
             .filter(PositionBackupStopOrder.pos_id == pos_id)
-            .filter(PositionBackupStopOrder.status.in_(("submitting", "active", "unknown_exchange_outcome")))
             .first()
         )
         if existing is None:

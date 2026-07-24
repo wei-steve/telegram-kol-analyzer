@@ -312,6 +312,10 @@ def test_reconcile_submits_one_exact_backup_stop_only_when_explicitly_enabled(tm
 
         def trigger_order(self, payload):
             self.trigger_payloads.append(payload)
+            self.pending_rows.append({
+                "ordId": "backup-1", "instId": "ETH-USDT-SWAP", "closePosId": "pos-1",
+                "posSide": "short", "triggerPx": payload["triggerPx"],
+            })
             return {"code": "0", "data": [{"ordId": "backup-1", "sCode": "0"}]}
 
     client = BackupStopClient()
