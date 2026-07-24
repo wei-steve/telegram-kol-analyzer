@@ -40,6 +40,7 @@ def build_backup_stop_trigger_payload(
     primary_stop: str | float | Decimal,
     backup_stop: str | float | Decimal,
     liquidation_price: str | float | Decimal,
+    size: str | float | Decimal,
     client_order_id: str,
 ) -> dict[str, str]:
     """Build one conditional market close bound to exactly one split position."""
@@ -56,6 +57,7 @@ def build_backup_stop_trigger_payload(
     primary = _positive_decimal(primary_stop, label="primary stop")
     backup = _positive_decimal(backup_stop, label="backup stop")
     liquidation = _positive_decimal(liquidation_price, label="liquidation price")
+    close_size = _positive_decimal(size, label="close size")
     if normalized_side == "long":
         if backup >= primary:
             raise BackupStopError("backup stop must be on the long risk side of primary stop")
@@ -69,17 +71,18 @@ def build_backup_stop_trigger_payload(
             raise BackupStopError("backup stop must remain safely before short liquidation")
         close_side = "buy"
     return {
-        "instType": "SWAP",
         "instId": normalized_instrument,
+        "productGroup": "Swap",
         "side": close_side,
         "posSide": normalized_side,
         "mrgPosition": "split",
         "tdMode": normalized_margin,
         "closePosId": normalized_pos_id,
-        "ordType": "market",
-        "triggerPx": _decimal_text(backup),
+        "orderType": "market",
+        "sz": _decimal_text(close_size),
+        "triggerPrice": _decimal_text(backup),
         "triggerPxType": "last",
-        "ordPx": "-1",
+        "price": "-1",
         "clOrdId": normalized_client_id,
     }
 

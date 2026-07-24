@@ -30,6 +30,7 @@ def test_calculate_backup_stop_price_rejects_invalid_values_and_wrong_risk_side(
             primary_stop="1919",
             backup_stop="1920",
             liquidation_price="1800",
+            size="2.5",
             client_order_id="TKBACKUP1",
         )
 
@@ -44,6 +45,7 @@ def test_build_backup_stop_trigger_payload_requires_safe_liquidation_boundary():
             primary_stop="1919",
             backup_stop="1909.4",
             liquidation_price="1910",
+            size="2.5",
             client_order_id="TKBACKUP1",
         )
 
@@ -57,21 +59,23 @@ def test_build_backup_stop_trigger_payload_closes_only_the_exact_split_position_
         primary_stop="1919",
         backup_stop="1928.6",
         liquidation_price="2000",
+        size="2.5",
         client_order_id="TKBACKUP1",
     )
 
     assert payload == {
-        "instType": "SWAP",
         "instId": "ETH-USDT-SWAP",
+        "productGroup": "Swap",
         "side": "buy",
         "posSide": "short",
         "mrgPosition": "split",
         "tdMode": "cross",
         "closePosId": "pos-1",
-        "ordType": "market",
-        "triggerPx": "1928.6",
+        "orderType": "market",
+        "sz": "2.5",
+        "triggerPrice": "1928.6",
         "triggerPxType": "last",
-        "ordPx": "-1",
+        "price": "-1",
         "clOrdId": "TKBACKUP1",
     }
 

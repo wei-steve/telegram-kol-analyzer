@@ -4163,6 +4163,7 @@ def create_web_app(
                     app.state.session_factory,
                     client=client,
                     recovered_at=app.state.now_provider(),
+                    contract_spec_provider=app.state.deepcoin_contract_spec_provider,
                 )
                 if hasattr(client, "list_open_orders")
                 else None
@@ -5341,6 +5342,7 @@ async def run_deepcoin_execution_reconcile_loop(
                     session_factory,
                     client=client,
                     recovered_at=synced_at,
+                    contract_spec_provider=app.state.deepcoin_contract_spec_provider,
                 )
                 if system_operator_bot_enabled(system_operator_bot_config):
                     await deliver_pending_position_attribution_incidents(

@@ -293,7 +293,7 @@ def reconcile_deepcoin_execution_bindings(
     client: DeepcoinReadOnlyClient,
     recovered_at: datetime | None = None,
     snapshot: _ReconcileSnapshot | None = None,
-    backup_stop_submission_enabled: bool = False,
+    backup_stop_submission_enabled: bool = True,
     contract_spec_provider: Any | None = None,
 ) -> ExecutionReconciliationResult:
     """Reconcile one coherent exchange snapshot through global leg attribution."""

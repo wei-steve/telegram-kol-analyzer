@@ -295,7 +295,7 @@ def test_reconcile_protection_adoption_records_unique_exact_trigger_entry_tpsl(t
     assert client.pending_calls == 1
 
 
-def test_reconcile_submits_one_exact_backup_stop_only_when_explicitly_enabled(tmp_path):
+def test_reconcile_submits_one_exact_backup_stop_by_default_when_contract_specs_are_available(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_protection_adoption(session_factory)
 
@@ -314,7 +314,7 @@ def test_reconcile_submits_one_exact_backup_stop_only_when_explicitly_enabled(tm
             self.trigger_payloads.append(payload)
             self.pending_rows.append({
                 "ordId": "backup-1", "instId": "ETH-USDT-SWAP", "closePosId": "pos-1",
-                "posSide": "short", "triggerPx": payload["triggerPx"],
+                "posSide": "short", "triggerPx": payload["triggerPrice"],
             })
             return {"code": "0", "data": [{"ordId": "backup-1", "sCode": "0"}]}
 
@@ -328,17 +328,17 @@ def test_reconcile_submits_one_exact_backup_stop_only_when_explicitly_enabled(tm
 
     reconcile_deepcoin_execution_bindings(
         session_factory, client=client, recovered_at=datetime(2026, 7, 20, 8, 5),
-        backup_stop_submission_enabled=True, contract_spec_provider=provider,
+        contract_spec_provider=provider,
     )
     reconcile_deepcoin_execution_bindings(
         session_factory, client=client, recovered_at=datetime(2026, 7, 20, 8, 6),
-        backup_stop_submission_enabled=True, contract_spec_provider=provider,
+        contract_spec_provider=provider,
     )
 
     assert len(client.trigger_payloads) == 1
     assert client.trigger_payloads[0]["closePosId"] == "pos-1"
     assert client.trigger_payloads[0]["side"] == "buy"
-    assert client.trigger_payloads[0]["triggerPx"] == "1909.5"
+    assert client.trigger_payloads[0]["triggerPrice"] == "1909.5"
     with session_factory() as session:
         row = session.query(PositionBackupStopOrder).one()
         assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")

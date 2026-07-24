@@ -175,7 +175,7 @@ def _prepare_submission(session, *, binding_id, leg_id, pos_id, client, contract
         payload = build_backup_stop_trigger_payload(
             instrument_id=instrument_id, side=binding.side, margin_mode=binding.margin_mode,
             pos_id=pos_id, primary_stop=primary_stop, backup_stop=backup_price,
-            liquidation_price=liquidation,
+            liquidation_price=liquidation, size=position.get("pos") or position.get("size"),
             client_order_id=build_client_order_id(
                 strategy_instance_id=str(binding.strategy_instance_id), leg_index=int(leg.leg_index),
                 purpose="backup_stop",
