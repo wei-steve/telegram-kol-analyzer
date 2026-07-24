@@ -2670,6 +2670,7 @@ def create_web_app(
                     interval_seconds=app.state.deepcoin_reconcile_interval_seconds,
                     now_provider=app.state.now_provider,
                     system_operator_bot_config=app.state.notification_bot_config,
+                    contract_spec_provider=app.state.deepcoin_contract_spec_provider,
                 )
             )
             app.state.strategy_management_worker_task = asyncio.create_task(
@@ -5332,6 +5333,7 @@ async def run_deepcoin_execution_reconcile_loop(
     interval_seconds: int = 30,
     now_provider=None,
     system_operator_bot_config: SystemOperatorBotConfig | None = None,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
 ) -> None:
     while True:
         try:
@@ -5342,7 +5344,7 @@ async def run_deepcoin_execution_reconcile_loop(
                     session_factory,
                     client=client,
                     recovered_at=synced_at,
-                    contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                    contract_spec_provider=contract_spec_provider,
                 )
                 if system_operator_bot_enabled(system_operator_bot_config):
                     await deliver_pending_position_attribution_incidents(
