@@ -52,6 +52,15 @@ def test_exact_length_custom_five_stage_allocation_overrides_default():
     assert [leg.allocation_pct for leg in plan.legs] == ["30", "25", "20", "15", "10"]
 
 
+def test_comma_separated_custom_allocation_is_supported():
+    plan = build_take_profit_plan(
+        prices=[1, 2, 3, 4], side="long",
+        configured_allocations="40,20,20,20",
+    )
+
+    assert [leg.allocation_pct for leg in plan.legs] == ["40", "20", "20", "20"]
+
+
 @pytest.mark.parametrize("prices", [
     [1, 1], [1, 0], [1, 2, 3, 4, 5, 6],
 ])

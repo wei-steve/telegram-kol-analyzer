@@ -308,21 +308,24 @@ def _parse_symbol_max_loss_usdt(value: Any) -> dict[str, float]:
 
 
 def _parse_allocations(value: Any, fallback: list[float]) -> list[float]:
-    if isinstance(value, str):
+    if value is None:
+        raw_items = fallback
+    elif isinstance(value, str):
         raw_items = value.replace("/", ",").replace("-", ",").split(",")
     elif isinstance(value, list):
         raw_items = value
     else:
-        raw_items = fallback
+        raise ValueError("take_profit_allocations must be a comma-separated list or array")
+    if not 1 <= len(raw_items) <= 5:
+        raise ValueError("take_profit_allocations must contain one through five positive values")
     allocations: list[float] = []
     for item in raw_items:
         try:
             parsed = float(item)
         except (TypeError, ValueError):
-            continue
-        if parsed > 0:
-            allocations.append(parsed)
-    if not allocations:
-        return fallback.copy()
+            raise ValueError("take_profit_allocations must contain positive numbers") from None
+        if parsed <= 0:
+            raise ValueError("take_profit_allocations must contain positive numbers")
+        allocations.append(parsed)
     total = sum(allocations)
     return [round(item * 100 / total, 8) for item in allocations]

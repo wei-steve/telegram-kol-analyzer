@@ -354,7 +354,7 @@
               <option value="eager" {% if trading_settings.entry_range_order_style == 'eager' %}selected{% endif %}>积极：中点 + 更易成交边界</option>
             </select>
           </label>
-          <label>多止盈分配比例 %<input name="take_profit_allocations" value="{{ trading_settings.take_profit_allocations|join(',') }}" /></label>
+          <label>多止盈分配比例 %（1–5 档；档数匹配时覆盖默认，4/5 档默认 TP1 40%、其余均分）<input name="take_profit_allocations" value="{{ trading_settings.take_profit_allocations|join(',') }}" /></label>
           <label class="trading-toggle-row">
             <input type="checkbox" name="move_stop_to_breakeven_after_tp1" {% if trading_settings.move_stop_to_breakeven_after_tp1 %}checked{% endif %} />
             <span>TP1 成交后移动止损到成本价</span>

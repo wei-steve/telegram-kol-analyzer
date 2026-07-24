@@ -160,6 +160,35 @@ def test_build_deepcoin_order_draft_uses_equal_allocations_for_two_take_profits(
     assert [leg["allocation_pct"] for leg in draft["take_profit_legs"]] == [50.0, 50.0]
 
 
+def test_build_deepcoin_order_draft_preserves_four_long_take_profit_targets():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(take_profit="69000-70000-71000-72000")
+    )
+
+    assert [leg["price"] for leg in draft["take_profit_legs"]] == [
+        69000.0, 70000.0, 71000.0, 72000.0,
+    ]
+    assert [leg["allocation_pct"] for leg in draft["take_profit_legs"]] == [
+        40.0, 20.0, 20.0, 20.0,
+    ]
+
+
+def test_build_deepcoin_order_draft_preserves_five_short_take_profit_targets():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            open_side="sell", position_side="short",
+            take_profit="64200-65250-64750-65150-63800",
+        )
+    )
+
+    assert [leg["price"] for leg in draft["take_profit_legs"]] == [
+        65250.0, 65150.0, 64750.0, 64200.0, 63800.0,
+    ]
+    assert [leg["allocation_pct"] for leg in draft["take_profit_legs"]] == [
+        40.0, 15.0, 15.0, 15.0, 15.0,
+    ]
+
+
 def test_build_deepcoin_order_draft_eager_long_uses_adjusted_range_endpoints():
     draft = build_deepcoin_order_draft(
         _payload_preview(

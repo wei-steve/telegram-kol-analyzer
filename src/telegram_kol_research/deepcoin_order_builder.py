@@ -14,6 +14,8 @@ from telegram_kol_research.execution_bindings import build_client_order_id
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
 from telegram_kol_research.kol_codes import resolve_kol_code
 from telegram_kol_research.price_normalization import extract_normalized_prices
+from telegram_kol_research.take_profit_plan import TakeProfitPlanError
+from telegram_kol_research.take_profit_plan import build_take_profit_plan
 
 
 class DeepcoinOrderDraftError(ValueError):
@@ -88,17 +90,23 @@ def build_deepcoin_order_draft(
     market_entry_deviation_pct = _parse_optional_float(
         payload_preview.get("max_market_entry_deviation_pct")
     )
-    take_profit_prices = _order_take_profit_prices(
-        position_side=position_side,
-        prices=_parse_take_profit_prices(
-            payload_preview.get("take_profit"),
-            symbol=symbol,
-        ),
+    parsed_take_profit_prices = _parse_take_profit_prices(
+        payload_preview.get("take_profit"), symbol=symbol,
     )
-    take_profit_allocations = _normalize_take_profit_allocations(
-        payload_preview.get("take_profit_allocations"),
-        len(take_profit_prices),
-    )
+    if parsed_take_profit_prices:
+        try:
+            take_profit_plan = build_take_profit_plan(
+                prices=parsed_take_profit_prices,
+                side=position_side,
+                configured_allocations=payload_preview.get("take_profit_allocations"),
+            )
+        except TakeProfitPlanError as exc:
+            raise DeepcoinOrderDraftError(str(exc)) from exc
+        take_profit_legs = _take_profit_legs(
+            plan=take_profit_plan, contract_spec=contract_spec,
+        )
+    else:
+        take_profit_legs = []
     hybrid_market_price = (
         _hybrid_market_entry_price(
             position_side=position_side,
@@ -279,11 +287,7 @@ def build_deepcoin_order_draft(
             if stop_loss is not None
             else None
         ),
-        "take_profit_legs": _take_profit_legs(
-            prices=take_profit_prices,
-            allocations=take_profit_allocations,
-            contract_spec=contract_spec,
-        ),
+        "take_profit_legs": take_profit_legs,
         "risk_budget_usdt": risk_budget,
         "source": source_payload,
         "notes": [
@@ -348,39 +352,6 @@ def _parse_take_profit_prices(value: Any, *, symbol: str | None = None) -> list[
     if value in (None, ""):
         return []
     return extract_normalized_prices(value, symbol=symbol)
-
-
-def _order_take_profit_prices(*, position_side: str, prices: list[float]) -> list[float]:
-    reverse = position_side.lower() == "short"
-    return sorted((float(price) for price in prices if float(price) > 0), reverse=reverse)[:3]
-
-
-def _normalize_take_profit_allocations(value: Any, count: int) -> list[float]:
-    if count <= 0:
-        return []
-    if count == 1:
-        return [100.0]
-    raw_items: list[Any]
-    if isinstance(value, str):
-        raw_items = value.replace("/", ",").replace("-", ",").split(",")
-    elif isinstance(value, list):
-        raw_items = value
-    else:
-        raw_items = [40, 30, 30] if count == 3 else []
-    allocations: list[float] = []
-    for item in raw_items[:count]:
-        try:
-            parsed = float(item)
-        except (TypeError, ValueError):
-            continue
-        if parsed > 0:
-            allocations.append(parsed)
-    if count == 2 and allocations == [40.0, 30.0]:
-        allocations = []
-    if len(allocations) < count:
-        allocations = [100 / count for _ in range(count)]
-    total = sum(allocations)
-    return [round(item * 100 / total, 8) for item in allocations[:count]]
 
 
 def _range_entry_leg_prices(
@@ -620,13 +591,13 @@ def _estimated_stop_loss_usdt(
 
 def _take_profit_legs(
     *,
-    prices: list[float],
-    allocations: list[float],
+    plan,
     contract_spec: DeepcoinContractSpec | None,
 ) -> list[dict[str, Any]]:
     legs: list[dict[str, Any]] = []
-    for index, price in enumerate(prices):
-        allocation = allocations[index] if index < len(allocations) else 100 / len(prices)
+    for index, take_profit_leg in enumerate(plan.legs):
+        price = float(take_profit_leg.price)
+        allocation = float(take_profit_leg.allocation_pct)
         legs.append(
             {
                 "index": index + 1,

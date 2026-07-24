@@ -142,6 +142,25 @@ def test_save_trading_settings_normalizes_user_input(tmp_path):
     assert reloaded.allow_vision_auto_trade is True
 
 
+@pytest.mark.parametrize("value, expected", [
+    ("40,20,20,20", [40.0, 20.0, 20.0, 20.0]),
+    ("40,15,15,15,15", [40.0, 15.0, 15.0, 15.0, 15.0]),
+])
+def test_trading_settings_preserves_four_and_five_stage_allocations(tmp_path, value, expected):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    saved = save_trading_settings(session_factory, {"take_profit_allocations": value})
+
+    assert saved.take_profit_allocations == expected
+    assert load_trading_settings(session_factory).take_profit_allocations == expected
+
+
+@pytest.mark.parametrize("value", ["", "40,0,30", "20,20,20,20,20,20"])
+def test_trading_settings_rejects_invalid_take_profit_allocation_shape(value):
+    with pytest.raises(ValueError, match="take_profit_allocations"):
+        trading_settings_from_payload({"take_profit_allocations": value})
+
+
 def test_apply_trading_settings_to_group_config_preserves_sender_overrides():
     config = GroupConfig(
         groups=[

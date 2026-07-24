@@ -72,7 +72,12 @@ def _prices(values: Iterable[object]) -> tuple[Decimal, ...]:
 
 
 def _allocations(values: Iterable[object] | None, count: int) -> tuple[Decimal, ...]:
-    configured = tuple(_positive(value, "take-profit allocation") for value in (values or ()))
+    raw_values = (
+        values.replace("/", ",").replace("-", ",").split(",")
+        if isinstance(values, str)
+        else (values or ())
+    )
+    configured = tuple(_positive(value, "take-profit allocation") for value in raw_values)
     if len(configured) == count and sum(configured) == Decimal("100"):
         return configured
     if count == 1:
