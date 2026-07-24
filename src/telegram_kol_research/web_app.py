@@ -140,6 +140,7 @@ from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
     canonical_management_error_summary,
     deliver_pending_position_attribution_incidents,
+    deliver_pending_position_protection_incidents,
     load_notification_bot_config,
     load_system_operator_bot_config,
     send_ai_recognition_conflict_review,
@@ -4177,6 +4178,11 @@ def create_web_app(
                     config=app.state.notification_bot_config,
                     delivered_at=app.state.now_provider(),
                 )
+                await deliver_pending_position_protection_incidents(
+                    app.state.session_factory,
+                    config=app.state.notification_bot_config,
+                    delivered_at=app.state.now_provider(),
+                )
         except DeepcoinClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:
@@ -5340,6 +5346,10 @@ async def run_deepcoin_execution_reconcile_loop(
                     await deliver_pending_position_attribution_incidents(
                         session_factory,
                         config=system_operator_bot_config,
+                        delivered_at=synced_at,
+                    )
+                    await deliver_pending_position_protection_incidents(
+                        session_factory, config=system_operator_bot_config,
                         delivered_at=synced_at,
                     )
             sync_manual_closed_deepcoin_positions(

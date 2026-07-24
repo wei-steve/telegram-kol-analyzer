@@ -263,6 +263,19 @@ def format_position_attribution_incident_message(payload: dict[str, Any]) -> str
     )
 
 
+def format_position_protection_incident_message(payload: dict[str, Any]) -> str:
+    """Format a high-priority, non-actionable stop-protection incident."""
+
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    exchange = evidence.get("exchange") if isinstance(evidence.get("exchange"), dict) else {}
+    return "\n".join([
+        "【止损保护严重异常】",
+        f"交易所: {payload.get('venue') or 'deepcoin'}",
+        f"仓位ID: {payload.get('pos_id') or '-'}",
+        f"类型: {payload.get('incident_type') or '-'}",
+        f"交易所错误: {exchange.get('errorCode') or '-'} {exchange.get('errorMsg') or ''}".strip(),
+        "处理状态: 自动管理已冻结；系统不会补单、撤单或平仓，请人工决定。",
+    ])
 MANAGEMENT_ALERT_STATES = frozenset(
     {"blocked", "partial_failed", "submit_unknown", "recovery_required"}
 )
@@ -1163,6 +1176,61 @@ async def deliver_pending_position_attribution_incidents(
                 row.notification_status = "delivered"
                 row.notification_error = None
                 row.notified_at = now
+                session.commit()
+                delivered += 1
+    return delivered
+
+
+async def deliver_pending_position_protection_incidents(
+    session_factory,
+    *,
+    config: SystemOperatorBotConfig,
+    delivered_at: datetime | None = None,
+    limit: int = 20,
+) -> int:
+    """Deliver each fingerprinted protection incident once, without trade I/O."""
+
+    from telegram_kol_research.models import PositionProtectionIncident
+
+    now = delivered_at or datetime.now(UTC)
+    with session_factory() as session:
+        ids = [int(item[0]) for item in session.query(PositionProtectionIncident.id)
+               .filter(PositionProtectionIncident.delivery_status == "pending")
+               .order_by(PositionProtectionIncident.id.asc()).limit(max(1, int(limit))).all()]
+    delivered = 0
+    for incident_id in ids:
+        with session_factory() as session:
+            claimed = session.query(PositionProtectionIncident).filter(
+                PositionProtectionIncident.id == incident_id,
+                PositionProtectionIncident.delivery_status == "pending",
+            ).update({PositionProtectionIncident.delivery_status: "delivering"}, synchronize_session=False)
+            session.commit()
+            if claimed != 1:
+                continue
+            row = session.get(PositionProtectionIncident, incident_id)
+            try:
+                evidence = json.loads(row.evidence_json or "{}") if row else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                evidence = {}
+        try:
+            await send_system_operator_bot_message(
+                config=config,
+                text=format_position_protection_incident_message({
+                    "venue": row.venue, "pos_id": row.pos_id,
+                    "incident_type": row.incident_type, "evidence": evidence,
+                }),
+            )
+        except Exception as exc:
+            with session_factory() as session:
+                row = session.get(PositionProtectionIncident, incident_id)
+                if row is not None:
+                    row.delivery_status, row.delivery_error = "failed", str(exc)
+                    session.commit()
+            continue
+        with session_factory() as session:
+            row = session.get(PositionProtectionIncident, incident_id)
+            if row is not None:
+                row.delivery_status, row.delivery_error, row.notified_at = "delivered", None, now
                 session.commit()
                 delivered += 1
     return delivered
