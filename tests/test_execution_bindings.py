@@ -316,7 +316,7 @@ def test_reconcile_submits_one_exact_backup_stop_by_default_when_contract_specs_
                 "ordId": "backup-1", "instId": "ETH-USDT-SWAP", "closePosId": "pos-1",
                 "posSide": "short", "triggerPx": payload["triggerPrice"],
             })
-            return {"code": "0", "data": [{"ordId": "backup-1", "sCode": "0"}]}
+            return {"code": "0", "data": "backup-1"}
 
     client = BackupStopClient()
     provider = StaticDeepcoinContractSpecProvider({

@@ -196,8 +196,12 @@ def _prepare_submission(session, *, binding_id, leg_id, pos_id, client, contract
 
 
 def _response_order_id(response: Any) -> str | None:
-    rows = response.get("data") if isinstance(response, dict) else None
-    for row in rows if isinstance(rows, list) else [response]:
+    data = response.get("data") if isinstance(response, dict) else None
+    if isinstance(data, str) and data.strip():
+        return data.strip()
+
+    rows = data if isinstance(data, list) else [data, response]
+    for row in rows:
         if isinstance(row, dict):
             value = row.get("ordId") or row.get("orderId") or row.get("id")
             if value:
