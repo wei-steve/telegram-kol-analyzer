@@ -570,7 +570,7 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
     assert fake_client.trigger_payloads[0]["mrgPosition"] == "split"
     assert fake_client.trigger_payloads[0]["orderType"] == "limit"
-    assert fake_client.trigger_payloads[0]["triggerPrice"] == "68200.0"
+    assert fake_client.trigger_payloads[0]["triggerPrice"] == "68302.3"
     assert all(not any(key.startswith("tp") for key in payload) for payload in fake_client.trigger_payloads)
     assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
     assert fake_client.position_protection_payloads == []

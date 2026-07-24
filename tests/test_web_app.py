@@ -3918,7 +3918,7 @@ def test_recovery_execution_queue_api_returns_payload_preview_only(tmp_path):
     assert response.json()["items"][0]["payload_preview"]["contract"] == "BTC-USDT"
     assert response.json()["items"][0]["deepcoin_order_draft"]["instrument_id"] == "BTC-USDT-SWAP"
     assert response.json()["items"][0]["deepcoin_order_draft"]["blocking_reason_codes"] == ["contract_size_unverified"]
-    assert response.json()["items"][0]["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 0.071429
+    assert response.json()["items"][0]["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 0.062321
     assert response.json()["items"][0]["contract_spec_status"] == {
         "code": "missing",
         "label": "缺少规格校验",
@@ -4020,7 +4020,7 @@ def test_recovery_execution_queue_api_applies_configured_contract_specs(tmp_path
         "quantity_unit": "contracts",
     }
     assert draft["blocking_reason_codes"] == []
-    assert draft["order_legs"][0]["quantity"] == 71.0
+    assert draft["order_legs"][0]["quantity"] == 62.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
 
 
@@ -4384,4 +4384,5 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
     assert process_response.json()["result"]["signal_id"] == signal.id
     assert fake_client.payloads == []
     assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
-    assert fake_client.trigger_payloads[0]["tpTriggerPx"] == 69000.0
+    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
+    assert "tpTriggerPx" not in fake_client.trigger_payloads[0]

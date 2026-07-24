@@ -33,7 +33,7 @@ class _Client:
         return {"code": "0", "data": {"ordId": f"tp-new-{len(self.submit_calls)}"}}
 
 
-def _ready_convergence(session_factory, *, existing_take_profit=True):
+def _ready_convergence(session_factory, *, existing_take_profit=True, desired_take_profits=None):
     from telegram_kol_research.db import create_session_factory  # keep import boundaries explicit
     from telegram_kol_research.execution_bindings import (
         ExecutionBindingRecord,
@@ -69,11 +69,12 @@ def _ready_convergence(session_factory, *, existing_take_profit=True):
         leg.attribution_status = "verified"
         convergence = create_or_get_trigger_take_profit_convergence(
             session, venue="deepcoin", execution_order_leg_id=leg_id,
-            desired_take_profits=[
+            desired_take_profits=desired_take_profits or [
                 {"price": "64500", "allocation_pct": "50"},
                 {"price": "63800", "allocation_pct": "30"},
                 {"price": "63100", "allocation_pct": "20"},
-            ], created_at=NOW,
+            ],
+            created_at=NOW,
         )
         mark_trigger_take_profit_convergence_ready(session, convergence, ready_at=NOW)
         upsert_protection_ledger_row(
@@ -127,6 +128,74 @@ def test_plan_replaces_only_exact_leg_take_profits(tmp_path):
         },
     )
     assert all("slTriggerPx" not in payload for payload in plan.payloads)
+
+
+def test_plan_accepts_parent_intent_stop_when_pending_row_omits_position_id(tmp_path):
+    import json
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import ExecutionOrderLeg, PositionProtectionLedger
+    from telegram_kol_research.trigger_protection_intents import (
+        create_or_get_trigger_protection_intent,
+        record_trigger_protection_parent,
+        transition_trigger_protection_intent,
+    )
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).one()
+        stop = session.query(PositionProtectionLedger).one()
+        intent = create_or_get_trigger_protection_intent(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=leg.id,
+            request_fingerprint="a" * 64,
+            pre_submit_tpsl_baseline_json="[]",
+            correlation_id="test-parent-intent",
+        )
+        record_trigger_protection_parent(session, intent, parent_trigger_order_id="parent-1")
+        transition_trigger_protection_intent(
+            session, intent, recovery_state="adopted", adopted_order_id="sl-1"
+        )
+        stop.evidence_source = "reconciliation_trigger_protection_intent"
+        stop.evidence_json = json.dumps({"parent_trigger_order_id": "parent-1"})
+        session.commit()
+
+    client = _Client()
+    client.pending = [{
+        "instId": "BTC-USDT-SWAP", "ordId": "sl-1", "slTriggerPx": "67200", "sz": "10",
+    }]
+    plan = plan_trigger_take_profit_convergence(
+        session_factory, convergence_id=convergence_id, deepcoin_client=client, planned_at=NOW
+    )
+
+    assert plan.status == "ready"
+
+
+def test_plan_allocates_a_single_take_profit_to_the_full_position(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[{"price": "67300", "allocation_pct": "100"}],
+    )
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory, convergence_id=convergence_id, deepcoin_client=_Client(), planned_at=NOW
+    )
+
+    assert plan.status == "ready"
+    assert plan.payloads[0]["tpTriggerPx"] == "67300"
+    assert plan.payloads[0]["sz"] == "10"
 
 
 def test_initial_take_profit_plan_blocks_when_a_take_profit_is_already_present(tmp_path):

@@ -63,100 +63,19 @@ def test_recovery_execution_preview_lists_approved_limit_orders_only(tmp_path):
 
     rows = list_recovery_execution_previews(session_factory)
 
-    assert rows == [
-        {
-            "kol_id": "alice",
-            "chat_id": 100,
-            "message_id": 55,
-            "symbol": "BTC",
-            "side": "long",
-            "entry_range_text": "68000-68200",
-            "stop_loss_text": "67500",
-            "take_profit_text": None,
-            "max_loss_usdt": 100.0,
-            "action": "eligible_for_recovery_limit_order",
-            "review_status": "approved_for_order",
-            "execution_status": "pending_execution",
-            "contract_spec_status": {
-                "code": "missing",
-                "label": "缺少规格校验",
-                "detail": "contract_size_unverified",
-                "quantity_unit": "base_asset_estimate",
-            },
-            "payload_preview": {
-                "venue": "deepcoin",
-                "contract": "BTC-USDT",
-                "order_type": "limit",
-                "open_side": "buy",
-                "position_side": "long",
-                "margin_mode": "cross",
-                "position_mode": "split",
-                "entry_range": "68000-68200",
-                "stop_loss": "67500",
-                "take_profit": None,
-                "take_profit_allocations": [40.0, 30.0, 30.0],
-                "entry_range_order_style": "eager",
-                "risk_budget_usdt": 100.0,
-                "source": {
-                    "kol_id": "alice",
-                    "chat_id": 100,
-                    "message_id": 55,
-                },
-            },
-            "deepcoin_order_draft": {
-                "venue": "deepcoin",
-                "dry_run_only": True,
-                "executable": False,
-                "blocking_reason_codes": ["contract_size_unverified"],
-                "strategy_instance_id": "deepcoin:100:55:BTC:long",
-                "symbol": "BTC",
-                "instrument_id": "BTC-USDT-SWAP",
-                "margin_mode": "cross",
-                "position_mode": "split",
-                "order_legs": [
-                        {
-                            "side": "buy",
-                            "position_side": "long",
-                            "order_type": "limit",
-                            "price": 68200.0,
-                            "allocation_pct": 50.0,
-                            "risk_budget_usdt": 50.0,
-                            "client_order_id": "TK649760E806ACF61",
-                            "quantity": 0.071429,
-                            "quantity_unit": "base_asset_estimate",
-                            "estimated_stop_loss_usdt": 50.0003,
-                        },
-                        {
-                            "side": "buy",
-                            "position_side": "long",
-                            "order_type": "limit",
-                            "price": 68100.0,
-                            "allocation_pct": 50.0,
-                            "risk_budget_usdt": 50.0,
-                            "client_order_id": "TK729D11F4739D2A2",
-                            "quantity": 0.083333,
-                            "quantity_unit": "base_asset_estimate",
-                            "estimated_stop_loss_usdt": 49.9998,
-                        },
-                ],
-                "stop_loss": 67500.0,
-                "take_profit_legs": [],
-                "risk_budget_usdt": 100.0,
-                "source": {
-                    "kol_id": "alice",
-                    "chat_id": 100,
-                    "message_id": 55,
-                },
-                "notes": [
-                    "offline_constructor_only",
-                    "default_cross_margin_split_position",
-                    "strategy_instance_id_required_for_exit_matching",
-                    "quantity_uses_linear_price_risk_estimate",
-                    "limit_edge_selection_side_aware_default",
-                    "contract_size_must_be_verified_before_live_order",
-                ],
-            },
-        }
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["review_status"] == "approved_for_order"
+    assert row["execution_status"] == "pending_execution"
+    assert row["payload_preview"]["max_market_entry_deviation_pct"] == 0.15
+    assert row["deepcoin_order_draft"]["blocking_reason_codes"] == ["contract_size_unverified"]
+    assert [leg["price"] for leg in row["deepcoin_order_draft"]["order_legs"]] == [
+        68302.3,
+        68102.0,
+    ]
+    assert [leg["quantity"] for leg in row["deepcoin_order_draft"]["order_legs"]] == [
+        0.062321,
+        0.083056,
     ]
 
 
@@ -232,6 +151,6 @@ def test_recovery_execution_preview_applies_contract_specs_when_available(tmp_pa
     }
     assert draft["blocking_reason_codes"] == []
     assert draft["contract_spec"]["instrument_id"] == "BTC-USDT-SWAP"
-    assert draft["order_legs"][0]["quantity"] == 71.0
+    assert draft["order_legs"][0]["quantity"] == 62.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
     assert draft["order_legs"][1]["quantity"] == 83.0

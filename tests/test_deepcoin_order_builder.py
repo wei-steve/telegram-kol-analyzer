@@ -39,7 +39,7 @@ def _btc_contract_spec():
     )
 
 
-def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoint():
+def test_build_deepcoin_order_draft_splits_long_limit_order_into_range_endpoints():
     draft = build_deepcoin_order_draft(_payload_preview())
 
     assert draft == {
@@ -57,13 +57,13 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
                 "side": "buy",
                 "position_side": "long",
                 "order_type": "limit",
-                "price": 68100.0,
+                "price": 68200.0,
                 "allocation_pct": 50.0,
                 "risk_budget_usdt": 50.0,
                 "client_order_id": "TK649760E806ACF61",
-                "quantity": 0.083333,
+                "quantity": 0.071429,
                 "quantity_unit": "base_asset_estimate",
-                "estimated_stop_loss_usdt": 49.9998,
+                "estimated_stop_loss_usdt": 50.0003,
             },
             {
                 "side": "buy",
@@ -116,7 +116,7 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_edge_and_midpoi
     }
 
 
-def test_build_deepcoin_order_draft_uses_upper_edge_for_conservative_short_limit_orders():
+def test_build_deepcoin_order_draft_uses_low_then_high_for_short_limit_orders():
     draft = build_deepcoin_order_draft(
         _payload_preview(
             open_side="sell",
@@ -125,7 +125,7 @@ def test_build_deepcoin_order_draft_uses_upper_edge_for_conservative_short_limit
         )
     )
 
-    assert draft["order_legs"][0]["price"] == 68100.0
+    assert draft["order_legs"][0]["price"] == 68000.0
     assert draft["order_legs"][1]["price"] == 68200.0
     assert draft["order_legs"][0]["side"] == "sell"
     assert draft["order_legs"][0]["position_side"] == "short"
@@ -160,23 +160,24 @@ def test_build_deepcoin_order_draft_uses_equal_allocations_for_two_take_profits(
     assert [leg["allocation_pct"] for leg in draft["take_profit_legs"]] == [50.0, 50.0]
 
 
-def test_build_deepcoin_order_draft_eager_long_uses_upper_edge_then_midpoint():
+def test_build_deepcoin_order_draft_eager_long_uses_adjusted_range_endpoints():
     draft = build_deepcoin_order_draft(
         _payload_preview(
             entry_range="59800-57800",
             stop_loss="57000",
             take_profit="61000-62300-63800",
             entry_range_order_style="eager",
+            max_market_entry_deviation_pct=0.15,
         ),
         contract_spec=_btc_contract_spec(),
     )
 
-    assert [leg["price"] for leg in draft["order_legs"]] == [59800.0, 58800.0]
+    assert [leg["price"] for leg in draft["order_legs"]] == [59889.7, 57886.7]
     assert [leg["order_type"] for leg in draft["order_legs"]] == ["limit", "limit"]
     assert [leg["position_side"] for leg in draft["order_legs"]] == ["long", "long"]
 
 
-def test_build_deepcoin_order_draft_eager_short_uses_lower_edge_then_midpoint():
+def test_build_deepcoin_order_draft_eager_short_uses_adjusted_range_endpoints():
     draft = build_deepcoin_order_draft(
         _payload_preview(
             open_side="sell",
@@ -185,11 +186,12 @@ def test_build_deepcoin_order_draft_eager_short_uses_lower_edge_then_midpoint():
             stop_loss="60600",
             take_profit="57000-56000",
             entry_range_order_style="eager",
+            max_market_entry_deviation_pct=0.15,
         ),
         contract_spec=_btc_contract_spec(),
     )
 
-    assert [leg["price"] for leg in draft["order_legs"]] == [57800.0, 58800.0]
+    assert [leg["price"] for leg in draft["order_legs"]] == [57713.3, 59710.3]
     assert [leg["order_type"] for leg in draft["order_legs"]] == ["limit", "limit"]
     assert [leg["position_side"] for leg in draft["order_legs"]] == ["short", "short"]
 
@@ -237,7 +239,7 @@ def test_build_true_range_limit_entry_retains_two_configured_style_legs():
         contract_spec=_btc_contract_spec(),
     )
 
-    assert [leg["price"] for leg in draft["order_legs"]] == [63700.0, 63500.0]
+    assert [leg["price"] for leg in draft["order_legs"]] == [63700.0, 63300.0]
     assert [leg["order_type"] for leg in draft["order_legs"]] == ["limit", "limit"]
     assert [leg["allocation_pct"] for leg in draft["order_legs"]] == [50.0, 50.0]
 
@@ -248,14 +250,14 @@ def test_build_one_tick_conservative_range_retains_two_distinct_normalized_legs(
         contract_spec=_btc_contract_spec(),
     )
 
-    assert [leg["price"] for leg in draft["order_legs"]] == [63700.0, 63700.1]
+    assert [leg["price"] for leg in draft["order_legs"]] == [63700.1, 63700.0]
     assert [leg["allocation_pct"] for leg in draft["order_legs"]] == [50.0, 50.0]
 
 
 def test_build_range_coalesces_equivalent_normalized_entry_legs(monkeypatch):
     monkeypatch.setattr(
         deepcoin_order_builder,
-        "_entry_leg_prices",
+        "_range_entry_leg_prices",
         lambda **_kwargs: (63700.0, 63700.0),
     )
 
@@ -362,10 +364,10 @@ def test_build_deepcoin_order_draft_hybrid_range_entry_near_upper_edge():
     assert draft["order_legs"][0]["quantity"] == 2.5
     assert draft["order_legs"][0]["estimated_stop_loss_usdt"] == 10.0
     assert draft["order_legs"][1]["order_type"] == "limit"
-    assert draft["order_legs"][1]["price"] == 1575.0
+    assert draft["order_legs"][1]["price"] == 1567.34
     assert draft["order_legs"][1]["risk_budget_usdt"] == 10.0
-    assert draft["order_legs"][1]["quantity"] == 3.3
-    assert draft["order_legs"][1]["estimated_stop_loss_usdt"] == 9.9
+    assert draft["order_legs"][1]["quantity"] == 4.4
+    assert draft["order_legs"][1]["estimated_stop_loss_usdt"] == 9.8296
     assert "range_entry_hybrid_market_half_limit_half" in draft["notes"]
 
 
@@ -443,10 +445,10 @@ def test_build_deepcoin_order_draft_converts_base_estimate_with_contract_spec():
         "min_quantity": 1.0,
         "price_tick": 0.1,
     }
-    assert draft["order_legs"][0]["price"] == 68100.0
-    assert draft["order_legs"][0]["quantity"] == 83.0
+    assert draft["order_legs"][0]["price"] == 68200.1
+    assert draft["order_legs"][0]["quantity"] == 71.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
-    assert draft["order_legs"][0]["base_asset_estimate"] == 0.083333
+    assert draft["order_legs"][0]["base_asset_estimate"] == 0.071418
     assert draft["order_legs"][1]["price"] == 68000.0
 
 
@@ -461,9 +463,9 @@ def test_build_deepcoin_order_draft_expands_btc_wan_shorthand_prices():
         contract_spec=_btc_contract_spec(),
     )
 
-    assert [leg["price"] for leg in draft["order_legs"]] == [59100.0, 58900.0]
+    assert [leg["price"] for leg in draft["order_legs"]] == [59300.0, 58900.0]
     assert [leg["risk_budget_usdt"] for leg in draft["order_legs"]] == [10.0, 10.0]
-    assert [leg["estimated_stop_loss_usdt"] for leg in draft["order_legs"]] == [9.1, 9.9]
+    assert [leg["estimated_stop_loss_usdt"] for leg in draft["order_legs"]] == [9.0, 9.9]
     assert draft["stop_loss"] == 57800.0
     assert [leg["price"] for leg in draft["take_profit_legs"]] == [
         60000.0,
@@ -489,7 +491,7 @@ def test_build_deepcoin_order_draft_blocks_when_contract_quantity_is_below_minim
     assert draft["blocking_reason_codes"] == ["quantity_below_minimum"]
     assert draft["order_legs"][0]["quantity"] == 0.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
-    assert draft["order_legs"][0]["base_asset_estimate"] == 0.083333
+    assert draft["order_legs"][0]["base_asset_estimate"] == 0.071429
 
 
 def test_build_deepcoin_order_draft_rejects_mismatched_contract_spec():

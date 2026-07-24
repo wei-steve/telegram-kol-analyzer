@@ -14,6 +14,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     PositionProtectionLedger,
     PositionTakeProfitOrder,
+    TriggerProtectionIntent,
     TriggerTakeProfitConvergence,
     utc_now,
 )
@@ -237,6 +238,14 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
         .filter(PositionProtectionLedger.purpose.in_(("stop_loss", "combined")))
         .all()
     )
+    pending_stop_prices = {
+        str(row.get("ordId") or row.get("orderId") or ""): str(
+            row.get("slTriggerPx") or row.get("slTriggerPrice") or row.get("closeSLTriggerPrice") or ""
+        )
+        for row in pending if isinstance(row, dict)
+        and str(row.get("instId") or "").upper() == inst_id
+        and _present(row, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+    }
     pending_stops = {
         str(row.get("ordId") or row.get("orderId") or ""): str(
             row.get("slTriggerPx") or row.get("slTriggerPrice") or row.get("closeSLTriggerPrice") or ""
@@ -250,6 +259,11 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
         str(row.order_id) in pending_stops
         and (row.trigger_price is None or _same_numeric(str(row.trigger_price), pending_stops[str(row.order_id)]))
         for row in stop_rows
+    ) or _has_parent_intent_backed_stop(
+        session,
+        leg_id=int(leg.id),
+        stop_rows=stop_rows,
+        pending_stop_prices=pending_stop_prices,
     )
     if not has_stop:
         return "convergence_verified_stop_missing"
@@ -296,12 +310,47 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
     return [], payloads
 
 
+def _has_parent_intent_backed_stop(
+    session,
+    *,
+    leg_id: int,
+    stop_rows: list[PositionProtectionLedger],
+    pending_stop_prices: dict[str, str],
+) -> bool:
+    """Accept a stop adopted from the exact parent trigger when Deepcoin omits posId."""
+
+    intent = (
+        session.query(TriggerProtectionIntent)
+        .filter(TriggerProtectionIntent.execution_order_leg_id == leg_id)
+        .one_or_none()
+    )
+    parent_order_id = str(intent.parent_trigger_order_id or "") if intent is not None else ""
+    if not parent_order_id:
+        return False
+    for row in stop_rows:
+        order_id = str(row.order_id or "")
+        if (
+            str(row.evidence_source) != "reconciliation_trigger_protection_intent"
+            or str(intent.adopted_order_id or "") != order_id
+            or order_id not in pending_stop_prices
+            or (row.trigger_price is not None and not _same_numeric(str(row.trigger_price), pending_stop_prices[order_id]))
+        ):
+            continue
+        try:
+            evidence = json.loads(str(row.evidence_json or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(evidence, dict) and str(evidence.get("parent_trigger_order_id") or "") == parent_order_id:
+            return True
+    return False
+
+
 def _targets(value: str):
     try:
         rows = json.loads(value)
     except (TypeError, json.JSONDecodeError):
         return "convergence_target_plan_invalid"
-    if not isinstance(rows, list) or len(rows) < 2:
+    if not isinstance(rows, list) or not rows:
         return "convergence_target_plan_invalid"
     targets: list[tuple[str, Decimal]] = []
     total = Decimal("0")

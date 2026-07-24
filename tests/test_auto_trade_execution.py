@@ -1188,7 +1188,7 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     assert fake_client.orders == []
     assert len(fake_client.trigger_orders) == 2
     assert fake_client.trigger_orders[0]["orderType"] == "limit"
-    assert fake_client.trigger_orders[0]["triggerPrice"] == "68200.0"
+    assert fake_client.trigger_orders[0]["triggerPrice"] == "68206.8"
     assert all(not any(key.startswith("tp") for key in order) for order in fake_client.trigger_orders)
     assert fake_client.trigger_orders[0]["slTriggerPx"] == 67500.0
     assert fake_client.protections == []
@@ -1417,7 +1417,7 @@ def test_sl_only_trigger_entry_snapshots_and_persists_protection_intent(tmp_path
     )
 
 
-def test_auto_process_range_entry_uses_half_market_half_midpoint_limit_when_near_edge(tmp_path):
+def test_auto_process_range_entry_uses_half_market_and_adjusted_opposite_endpoint_when_near_edge(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_message_id = _persist_candidate(
         session_factory,
@@ -1453,8 +1453,8 @@ def test_auto_process_range_entry_uses_half_market_half_midpoint_limit_when_near
     assert fake_client.orders[0]["ordType"] == "market"
     assert fake_client.orders[0]["sz"] == "2.5"
     assert fake_client.trigger_orders[0]["orderType"] == "limit"
-    assert fake_client.trigger_orders[0]["triggerPrice"] == "1575.0"
-    assert [order["sz"] for order in fake_client.trigger_orders] == ["3.3"]
+    assert fake_client.trigger_orders[0]["triggerPrice"] == "1567.34"
+    assert [order["sz"] for order in fake_client.trigger_orders] == ["4.4"]
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
@@ -1984,8 +1984,8 @@ def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_
     assert result["status"] == "submitted"
     assert fake_client.orders == []
     assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
-        "59300.0",
-        "59100.0",
+        "59388.9",
+        "58988.3",
     ]
     assert fake_client.protections == []
     assert fake_client.trigger_orders[0]["slTriggerPx"] == 57800.0

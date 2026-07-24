@@ -672,7 +672,7 @@ def _submit_trigger_with_protection_intent(
                 correlation_id=correlation_id,
             )
             take_profit_legs = draft.get("take_profit_legs")
-            if isinstance(take_profit_legs, list) and len(take_profit_legs) > 1:
+            if isinstance(take_profit_legs, list) and take_profit_legs:
                 create_or_get_trigger_take_profit_convergence(
                     session,
                     venue="deepcoin",

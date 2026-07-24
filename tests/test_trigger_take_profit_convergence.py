@@ -84,6 +84,47 @@ def test_trigger_multi_take_profit_convergence_is_queued_per_exact_entry_leg(tmp
         )
 
 
+def test_trigger_single_take_profit_convergence_is_queued_for_full_position(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.execution_bindings import (
+        ExecutionBindingRecord,
+        ExecutionOrderLegRecord,
+        upsert_execution_binding,
+        upsert_execution_order_leg,
+    )
+    from telegram_kol_research.trigger_take_profit_convergence import (
+        create_or_get_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="kol", chat_id=1, message_id=1, symbol="BTC", side="long",
+            venue="deepcoin", margin_mode="cross", position_mode="split", status="open",
+        ),
+    )
+    entry_leg_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id, leg_index=1, purpose="entry",
+            order_kind="trigger_limit", venue="deepcoin", status="submitting",
+        ),
+    )
+
+    with session_factory() as session:
+        queued = create_or_get_trigger_take_profit_convergence(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=entry_leg_id,
+            desired_take_profits=[{"price": "67300", "allocation_pct": "100"}],
+            created_at=NOW,
+        )
+        session.commit()
+        assert queued.status == "waiting_position"
+        assert queued.desired_take_profits_json == '[{"allocation_pct":"100","price":"67300"}]'
+
+
 def test_convergence_becomes_ready_only_after_its_exact_leg_is_verified(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.execution_bindings import (

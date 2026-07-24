@@ -46,6 +46,7 @@ def list_recovery_execution_previews(
                     candidate_text=candidate_text_by_key.get(key, {}),
                     entry_range_order_style=trading_settings.entry_range_order_style,
                     take_profit_allocations=trading_settings.take_profit_allocations,
+                    max_market_entry_deviation_pct=trading_settings.max_market_entry_deviation_pct,
                 )
             )
         return previews
@@ -76,6 +77,7 @@ def _preview_row(
     candidate_text: dict[str, str],
     entry_range_order_style: str,
     take_profit_allocations: list[float],
+    max_market_entry_deviation_pct: float,
 ) -> dict[str, object]:
     side = row.side.lower()
     contract = _to_deepcoin_contract(row.symbol)
@@ -106,6 +108,7 @@ def _preview_row(
         "take_profit": candidate_text.get("take_profit_text"),
         "take_profit_allocations": take_profit_allocations,
         "entry_range_order_style": entry_range_order_style,
+        "max_market_entry_deviation_pct": max_market_entry_deviation_pct,
         "risk_budget_usdt": row.max_loss_usdt,
         "source": source_payload,
     }

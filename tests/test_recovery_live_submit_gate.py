@@ -100,7 +100,7 @@ def test_recovery_live_submit_gate_returns_would_submit_when_all_checks_pass(tmp
         "order_draft_ready": True,
     }
     assert [leg["quantity"] for leg in result["deepcoin_order_draft"]["order_legs"]] == [
-        71.0,
+        62.0,
         83.0,
     ]
 

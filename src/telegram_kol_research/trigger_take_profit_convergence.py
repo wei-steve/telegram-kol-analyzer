@@ -24,15 +24,12 @@ def create_or_get_trigger_take_profit_convergence(
     desired_take_profits: list[dict[str, object]],
     created_at: datetime | None = None,
 ) -> TriggerTakeProfitConvergence:
-    """Save one immutable multi-target plan per trigger entry leg.
-
-    Single-target entries have no convergence gap and must not create a row.
-    """
+    """Save one immutable take-profit plan per trigger entry leg."""
 
     normalized_venue = _normalized_venue(venue)
     normalized_plan = _normalized_take_profit_plan(desired_take_profits)
-    if len(normalized_plan) < 2:
-        raise ValueError("staged take-profit convergence requires multiple targets")
+    if not normalized_plan:
+        raise ValueError("trigger take-profit convergence requires a target")
     plan_json = json.dumps(normalized_plan, ensure_ascii=False, separators=(",", ":"))
     existing = (
         session.query(TriggerTakeProfitConvergence)

@@ -128,7 +128,13 @@ def build_deepcoin_order_draft(
             ),
         ]
     elif hybrid_market_price is not None:
-        limit_price = _normalize_price((entry_low + entry_high) / 2, contract_spec)
+        _, limit_price = _range_entry_leg_prices(
+            position_side=position_side,
+            low=entry_low,
+            high=entry_high,
+            deviation_pct=market_entry_deviation_pct,
+            contract_spec=contract_spec,
+        )
         order_legs = [
             _order_leg(
                 side=open_side,
@@ -182,11 +188,11 @@ def build_deepcoin_order_draft(
             ),
         ]
     else:
-        first_price, second_price = _entry_leg_prices(
+        first_price, second_price = _range_entry_leg_prices(
             position_side=position_side,
             low=entry_low,
             high=entry_high,
-            style=entry_range_order_style,
+            deviation_pct=market_entry_deviation_pct,
             contract_spec=contract_spec,
         )
         order_legs = [
@@ -377,23 +383,21 @@ def _normalize_take_profit_allocations(value: Any, count: int) -> list[float]:
     return [round(item * 100 / total, 8) for item in allocations[:count]]
 
 
-def _entry_leg_prices(
+def _range_entry_leg_prices(
     *,
     position_side: str,
     low: float,
     high: float,
-    style: str,
+    deviation_pct: float | None,
     contract_spec: DeepcoinContractSpec | None,
 ) -> tuple[float, float]:
-    midpoint = (low + high) / 2
-    if style == "eager":
-        edge = high if position_side == "long" else low
-        first = _normalize_price(edge, contract_spec)
-        second = _normalize_price(midpoint, contract_spec)
+    deviation = max(0.0, float(deviation_pct or 0.0)) / 100
+    if position_side == "long":
+        first = _normalize_price(high * (1 + deviation), contract_spec)
+        second = _normalize_price(low * (1 + deviation), contract_spec)
     else:
-        edge = low if position_side == "long" else high
-        first = _normalize_price(midpoint, contract_spec)
-        second = _normalize_price(edge, contract_spec)
+        first = _normalize_price(low * (1 - deviation), contract_spec)
+        second = _normalize_price(high * (1 - deviation), contract_spec)
     if math.isclose(first, second):
         alternate_endpoint = high if math.isclose(first, low) else low
         second = _normalize_price(alternate_endpoint, contract_spec)
