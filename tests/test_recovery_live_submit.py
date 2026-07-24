@@ -525,6 +525,49 @@ def test_build_deepcoin_position_sltp_payloads_split_multi_take_profit_by_size()
     ]
 
 
+def test_position_sltp_payloads_support_four_stage_btc_take_profits():
+    payloads = build_deepcoin_position_sltp_payloads(
+        {
+            "instrument_id": "BTC-USDT-SWAP", "margin_mode": "cross",
+            "position_mode": "split", "stop_loss": 61800.0,
+            "take_profit_legs": [
+                {"price": 67100.0, "allocation_pct": 40.0},
+                {"price": 68500.0, "allocation_pct": 20.0},
+                {"price": 70300.0, "allocation_pct": 20.0},
+                {"price": 72000.0, "allocation_pct": 20.0},
+            ],
+            "order_legs": [{"position_side": "long"}],
+            "contract_spec": {"quantity_step": 1.0, "min_quantity": 1.0},
+        },
+        pos_id="pos-4", position_size=25.0,
+    )
+
+    assert [payload["sz"] for payload in payloads[1:]] == ["10", "5", "5", "5"]
+    assert [payload["tpTriggerPx"] for payload in payloads[1:]] == [
+        "67100.0", "68500.0", "70300.0", "72000.0",
+    ]
+
+
+def test_position_sltp_payloads_reject_undersized_five_stage_position():
+    with pytest.raises(RecoveryLiveSubmitError, match="minimum"):
+        build_deepcoin_position_sltp_payloads(
+            {
+                "instrument_id": "ETH-USDT-SWAP", "margin_mode": "cross",
+                "position_mode": "split", "stop_loss": 1800.0,
+                "take_profit_legs": [
+                    {"price": 1900.0, "allocation_pct": 40.0},
+                    {"price": 1920.0, "allocation_pct": 15.0},
+                    {"price": 1940.0, "allocation_pct": 15.0},
+                    {"price": 1960.0, "allocation_pct": 15.0},
+                    {"price": 1980.0, "allocation_pct": 15.0},
+                ],
+                "order_legs": [{"position_side": "long"}],
+                "contract_spec": {"quantity_step": 0.1, "min_quantity": 0.1},
+            },
+            pos_id="pos-too-small", position_size=0.3,
+        )
+
+
 def test_submit_recovery_order_live_blocks_when_auto_trade_is_disabled(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _persist_ready_item(session_factory)

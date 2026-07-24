@@ -48,6 +48,8 @@ from telegram_kol_research.trade_signals import load_trade_signal
 from telegram_kol_research.trade_signals import mark_trade_signal_failed
 from telegram_kol_research.trade_signals import mark_trade_signal_submitted
 from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.take_profit_plan import TakeProfitPlanError
+from telegram_kol_research.take_profit_plan import build_take_profit_plan
 
 
 class RecoveryLiveSubmitError(RuntimeError):
@@ -850,6 +852,16 @@ def _quantity_step_from_draft(draft: dict[str, Any]) -> float:
     if isinstance(contract_spec, dict):
         try:
             return float(contract_spec.get("quantity_step") or 0.000001)
+        except (TypeError, ValueError):
+            pass
+    return 0.000001
+
+
+def _minimum_quantity_from_draft(draft: dict[str, Any]) -> float:
+    contract_spec = draft.get("contract_spec")
+    if isinstance(contract_spec, dict):
+        try:
+            return float(contract_spec.get("min_quantity") or 0.000001)
         except (TypeError, ValueError):
             pass
     return 0.000001
@@ -1743,29 +1755,26 @@ def build_deepcoin_position_sltp_payloads(
                 "slOrdPx": "-1",
             }
         )
-    allocations = [
-        float(item.get("allocation_pct") or 0)
-        for item in take_profit_legs
-        if isinstance(item, dict) and float(item.get("allocation_pct") or 0) > 0
-    ]
-    sizes = _split_quantity_by_allocations(
-        quantity=float(position_size),
-        allocations=allocations,
-        quantity_step=_quantity_step_from_draft(draft),
-    )
-    for take_profit_leg, size in zip(take_profit_legs, sizes):
-        if not isinstance(take_profit_leg, dict) or size <= 0:
-            continue
-        take_profit_price = take_profit_leg.get("price")
-        if not isinstance(take_profit_price, int | float) or take_profit_price <= 0:
-            raise RecoveryLiveSubmitError("invalid_take_profit_for_protection")
+    valid_legs = [item for item in take_profit_legs if isinstance(item, dict)]
+    try:
+        plan = build_take_profit_plan(
+            prices=[item.get("price") for item in valid_legs],
+            side=_position_side_from_draft(draft),
+            configured_allocations=[item.get("allocation_pct") for item in valid_legs],
+            quantity=position_size,
+            quantity_step=_quantity_step_from_draft(draft),
+            minimum_quantity=_minimum_quantity_from_draft(draft),
+        )
+    except TakeProfitPlanError as exc:
+        raise RecoveryLiveSubmitError(str(exc)) from exc
+    for take_profit_leg in plan.legs:
         payloads.append(
             {
                 **base_payload,
-                "tpTriggerPx": str(float(take_profit_price)),
+                "tpTriggerPx": str(float(take_profit_leg.price)),
                 "tpTriggerPxType": "last",
                 "tpOrdPx": "-1",
-                "sz": f"{size:g}",
+                "sz": str(take_profit_leg.quantity),
             }
         )
     if not payloads:
