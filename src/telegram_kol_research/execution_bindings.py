@@ -818,6 +818,18 @@ def _apply_reconcile_snapshot(
             trigger_history=snapshot.trigger_history,
             observed_at=recovered_at,
         )
+        from telegram_kol_research.protection_health import (
+            reconcile_position_protection_health,
+        )
+
+        reconcile_position_protection_health(
+            session,
+            positions=snapshot.positions,
+            pending_orders=snapshot.pending_trigger_orders,
+            trigger_history=snapshot.trigger_history,
+            snapshot_errors=snapshot.errors,
+            observed_at=recovered_at,
+        )
 
         for binding in bindings:
             binding.strategy_instance_id = binding.strategy_instance_id or build_strategy_instance_id(

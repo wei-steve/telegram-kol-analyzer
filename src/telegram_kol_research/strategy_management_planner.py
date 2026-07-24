@@ -20,6 +20,7 @@ from telegram_kol_research.execution_bindings import (
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionProtectionIncident,
     PositionProtectionLedger,
     RawMessage,
     RecognitionDecision,
@@ -100,6 +101,29 @@ class ManagementFractionError(ValueError):
 
 class ManagementPlanningStateChanged(RuntimeError):
     """Raised when local identity changes before the atomic batch insert."""
+
+
+def _protection_incident_requires_recovery(session, *, entry_legs) -> bool:
+    """Freeze management only for an exact leg/position with an open incident."""
+
+    pairs = {
+        (int(leg.id), str(leg.pos_id))
+        for leg in entry_legs
+        if getattr(leg, "id", None) is not None and str(getattr(leg, "pos_id", "") or "")
+    }
+    if not pairs:
+        return False
+    rows = (
+        session.query(
+            PositionProtectionIncident.execution_order_leg_id,
+            PositionProtectionIncident.pos_id,
+        )
+        .filter(PositionProtectionIncident.incident_type.in_((
+            "stop_trigger_failed", "protection_missing", "protection_unknown",
+        )))
+        .all()
+    )
+    return any((int(leg_id), str(pos_id)) in pairs for leg_id, pos_id in rows)
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +305,17 @@ def _plan_strategy_management_batch_locked(
             execution_mode=execution_mode,
         )
     target_entry_legs = entry_leg_plan.target_legs
+    with session_factory() as session:
+        if _protection_incident_requires_recovery(session, entry_legs=target_entry_legs):
+            return _persist_blocked(
+                session_factory,
+                identity=identity,
+                raw_message_id=raw_message_id,
+                intent=intent,
+                reason_code="protection_recovery_required",
+                planned_at=now,
+                execution_mode=execution_mode,
+            )
     target_legs_by_pos_id = _leg_by_pos_id(target_entry_legs)
 
     instrument_id = f"{str(lifecycle.symbol).upper()}-USDT-SWAP"

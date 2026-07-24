@@ -14,6 +14,8 @@ from telegram_kol_research.execution_bindings import (
     upsert_execution_order_leg,
 )
 from telegram_kol_research.models import StrategyManagementBatch
+from telegram_kol_research.models import PositionProtectionIncident
+from telegram_kol_research.strategy_management_planner import _protection_incident_requires_recovery
 from telegram_kol_research.strategy_management_batches import (
     create_management_batch,
     load_management_batch,
@@ -42,6 +44,23 @@ def _batch(*, batch_id: int, strategy: str, status: str, action="partial_close",
         reason_code=None,
         legs=tuple(legs),
     )
+
+
+def test_management_preflight_requires_operator_recovery_for_exact_protection_incident(tmp_path):
+    session_factory = create_session_factory(tmp_path / "incident.db")
+    with session_factory() as session:
+        session.add(PositionProtectionIncident(
+            venue="deepcoin", execution_binding_id=1, execution_order_leg_id=9,
+            pos_id="pos-1", incident_type="stop_trigger_failed", fingerprint="f" * 64,
+            evidence_json="{}", delivery_status="pending",
+        ))
+        session.commit()
+        assert _protection_incident_requires_recovery(
+            session, entry_legs=(SimpleNamespace(id=9, pos_id="pos-1"),)
+        ) is True
+        assert _protection_incident_requires_recovery(
+            session, entry_legs=(SimpleNamespace(id=10, pos_id="pos-1"),)
+        ) is False
 
 
 def test_visibility_retry_expiry_becomes_actionable_terminal_block(tmp_path):

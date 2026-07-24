@@ -39,6 +39,7 @@ from telegram_kol_research.models import (
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_contract_specs import StaticDeepcoinContractSpecProvider
 from telegram_kol_research.models import PositionBackupStopOrder
+from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.position_attribution import FillEvidence
 
 
@@ -338,6 +339,38 @@ def test_reconcile_submits_one_exact_backup_stop_only_when_explicitly_enabled(tm
         row = session.query(PositionBackupStopOrder).one()
         assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")
         assert session.query(ExecutionEvent).filter(ExecutionEvent.action == "create_backup_stop").count() == 1
+
+
+def test_reconcile_marks_triggered_primary_stop_failure_and_deduplicates_exact_incident(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([_pending_combined_tpsl("tpsl-1")]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    failed_history = {
+        **_pending_combined_tpsl("tpsl-1"),
+        "triggerTime": "1784512900000",
+        "errorCode": "203",
+        "errorMsg": "NotEnoughMoneyToClose",
+    }
+    client = _ProtectionAdoptionReconciliationClient([], history_rows=[failed_history])
+    reconcile_deepcoin_execution_bindings(
+        session_factory, client=client, recovered_at=datetime(2026, 7, 20, 8, 6)
+    )
+    reconcile_deepcoin_execution_bindings(
+        session_factory, client=client, recovered_at=datetime(2026, 7, 20, 8, 7)
+    )
+
+    with session_factory() as session:
+        protection = session.query(PositionProtectionLedger).one()
+        incidents = session.query(PositionProtectionIncident).all()
+    assert protection.status == "stop_trigger_failed"
+    assert [(row.pos_id, row.incident_type, row.delivery_status) for row in incidents] == [
+        ("pos-1", "stop_trigger_failed", "pending")
+    ]
 
 
 def test_reconcile_adopts_saved_trigger_protection_intent_once(tmp_path):
