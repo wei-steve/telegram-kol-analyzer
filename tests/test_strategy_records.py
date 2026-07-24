@@ -11,6 +11,8 @@ from telegram_kol_research.models import (
     PositionAttributionAudit,
     PositionProtectionLedger,
     PositionProtectionRevision,
+    PositionBackupStopOrder,
+    PositionProtectionIncident,
     PositionTakeProfitOrder,
     RawMessage,
     RecognitionDecision,
@@ -135,6 +137,20 @@ def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
                 created_at=NOW - timedelta(hours=4), updated_at=NOW - timedelta(hours=4),
             )
         )
+        session.add_all([
+            PositionBackupStopOrder(
+                venue="deepcoin", execution_binding_id=binding.id, execution_order_leg_id=order_leg.id,
+                pos_id="pos-1", instrument_id="BTC-USDT-SWAP", side="long",
+                trigger_price="64675", order_id="backup-stop-1", client_order_id="backup-client-1",
+                status="active", request_json="{}",
+            ),
+            PositionProtectionIncident(
+                venue="deepcoin", execution_binding_id=binding.id, execution_order_leg_id=order_leg.id,
+                pos_id="pos-1", incident_type="stop_trigger_failed", fingerprint="detail-incident",
+                evidence_json='{"exchange":{"errorCode":"203","errorMsg":"NotEnoughMoneyToClose"}}',
+                delivery_status="pending",
+            ),
+        ])
         fill_event = ExecutionEvent(
             execution_binding_id=binding.id,
             strategy_instance_id=binding.strategy_instance_id,
@@ -224,6 +240,13 @@ def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
     assert take_profit_detail[0]["active"][0]["order_id"] == "tp-active-1"
     assert take_profit_detail[0]["history"] == []
     assert take_profit_detail[0]["convergence"] is None
+    assert detail["execution"]["backup_stops"] == [{
+        "pos_id": "pos-1", "order_id": "backup-stop-1", "trigger_price": "64675", "status": "active",
+    }]
+    assert detail["execution"]["protection_incidents"] == [{
+        "pos_id": "pos-1", "incident_type": "stop_trigger_failed", "delivery_status": "pending",
+        "error": "203: NotEnoughMoneyToClose",
+    }]
 
 
 def test_load_strategy_record_detail_returns_none_for_unknown_lifecycle(tmp_path):

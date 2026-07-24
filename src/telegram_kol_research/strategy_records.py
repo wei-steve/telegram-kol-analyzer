@@ -22,6 +22,8 @@ from telegram_kol_research.models import (
     MediaAsset,
     MessageRecognition,
     PositionAttributionAudit,
+    PositionBackupStopOrder,
+    PositionProtectionIncident,
     PositionProtectionLedger,
     PositionProtectionRevision,
     PositionTakeProfitOrder,
@@ -319,6 +321,20 @@ def load_strategy_record_detail(
             .all()
             if entry_leg_ids
             else []
+        )
+        backup_stop_rows = (
+            session.query(PositionBackupStopOrder)
+            .filter(PositionBackupStopOrder.execution_order_leg_id.in_(entry_leg_ids))
+            .order_by(PositionBackupStopOrder.created_at, PositionBackupStopOrder.id)
+            .all()
+            if entry_leg_ids else []
+        )
+        protection_incident_rows = (
+            session.query(PositionProtectionIncident)
+            .filter(PositionProtectionIncident.execution_order_leg_id.in_(entry_leg_ids))
+            .order_by(PositionProtectionIncident.created_at, PositionProtectionIncident.id)
+            .all()
+            if entry_leg_ids else []
         )
         trigger_take_profit_convergences = (
             session.query(TriggerTakeProfitConvergence)
@@ -827,6 +843,10 @@ def load_strategy_record_detail(
                 for row in trigger_protection_recovery
             ],
             "take_profit_orders": take_profit_orders,
+            "backup_stops": [_backup_stop_detail(row) for row in backup_stop_rows],
+            "protection_incidents": [
+                _protection_incident_detail(row) for row in protection_incident_rows
+            ],
             "events": [_execution_event_detail(row) for row in execution_events],
             "management_batches": [
                 _management_batch_detail(
@@ -1055,6 +1075,28 @@ def _take_profit_order_detail(
             }
         )
     return result
+
+
+def _backup_stop_detail(row: PositionBackupStopOrder) -> dict[str, object]:
+    return {
+        "pos_id": str(row.pos_id),
+        "order_id": str(row.order_id) if row.order_id else None,
+        "trigger_price": str(row.trigger_price),
+        "status": str(row.status),
+    }
+
+
+def _protection_incident_detail(row: PositionProtectionIncident) -> dict[str, object]:
+    evidence = _safe_json_value(row.evidence_json)
+    exchange = evidence.get("exchange") if isinstance(evidence, dict) else {}
+    code = str(exchange.get("errorCode") or "") if isinstance(exchange, dict) else ""
+    message = str(exchange.get("errorMsg") or "") if isinstance(exchange, dict) else ""
+    return {
+        "pos_id": str(row.pos_id),
+        "incident_type": str(row.incident_type),
+        "delivery_status": str(row.delivery_status),
+        "error": ": ".join(part for part in (code, message) if part),
+    }
 
 
 def _take_profit_order_item(row: PositionTakeProfitOrder) -> dict[str, object]:
