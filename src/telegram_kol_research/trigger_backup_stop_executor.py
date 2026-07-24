@@ -1,0 +1,224 @@
+"""Opt-in submission of one exact-position trigger backup stop per entry leg."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy.orm import sessionmaker
+
+from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
+from telegram_kol_research.execution_bindings import build_client_order_id
+from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import ExecutionEvent
+from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.models import PositionBackupStopOrder
+from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.trigger_backup_stop import BackupStopError
+from telegram_kol_research.trigger_backup_stop import build_backup_stop_trigger_payload
+from telegram_kol_research.trigger_backup_stop import calculate_backup_stop_price
+
+
+def submit_verified_trigger_backup_stops(
+    session_factory: sessionmaker,
+    *,
+    client: Any,
+    contract_spec_provider: DeepcoinContractSpecProvider,
+    submitted_at: datetime,
+) -> int:
+    """Submit opt-in stops only after a fresh exact live-position read.
+
+    The caller must hold the account-level authority lock.  A durable
+    ``submitting`` row is committed before the exchange request, so an
+    ambiguous network outcome cannot be blindly retried.
+    """
+
+    trigger_order = getattr(client, "trigger_order", None)
+    list_positions = getattr(client, "list_positions", None)
+    if not callable(trigger_order) or not callable(list_positions):
+        return 0
+    with session_factory() as session:
+        candidates = _eligible_candidates(session)
+    submitted = 0
+    for binding_id, leg_id, pos_id in candidates:
+        with session_factory() as session:
+            candidate = _prepare_submission(
+                session,
+                binding_id=binding_id,
+                leg_id=leg_id,
+                pos_id=pos_id,
+                client=client,
+                contract_spec_provider=contract_spec_provider,
+                submitted_at=submitted_at,
+            )
+            if candidate is None:
+                continue
+            row, payload = candidate
+            row_id = int(row.id)
+            session.commit()
+        try:
+            response = trigger_order(payload)
+            order_id = _response_order_id(response)
+            if not order_id:
+                raise RuntimeError("backup stop response missing exchange order id")
+        except Exception as exc:
+            with session_factory() as session:
+                row = session.get(PositionBackupStopOrder, row_id)
+                if row is not None:
+                    row.status = "unknown_exchange_outcome"
+                    row.error_json = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                    row.updated_at = submitted_at
+                    session.commit()
+            continue
+        with session_factory() as session:
+            row = session.get(PositionBackupStopOrder, row_id)
+            if row is None:
+                continue
+            row.order_id = order_id
+            row.status = "active"
+            row.response_json = json.dumps(response, ensure_ascii=False, sort_keys=True)
+            row.submitted_at = submitted_at
+            row.updated_at = submitted_at
+            session.add(ExecutionEvent(
+                execution_binding_id=row.execution_binding_id,
+                strategy_instance_id=_strategy_instance_id(session, row.execution_binding_id),
+                venue=row.venue,
+                action="create_backup_stop",
+                status="submitted",
+                symbol=row.instrument_id.split("-", 1)[0],
+                side=row.side,
+                order_id=order_id,
+                client_order_id=row.client_order_id,
+                pos_id=row.pos_id,
+                request_json=row.request_json,
+                response_json=row.response_json,
+                created_at=submitted_at,
+            ))
+            session.commit()
+            submitted += 1
+    return submitted
+
+
+def _eligible_candidates(session) -> list[tuple[int, int, str]]:
+    rows = (
+        session.query(ExecutionBinding, ExecutionOrderLeg)
+        .join(ExecutionOrderLeg, ExecutionOrderLeg.execution_binding_id == ExecutionBinding.id)
+        .filter(ExecutionBinding.venue == "deepcoin")
+        .filter(ExecutionOrderLeg.purpose == "entry")
+        .filter(ExecutionOrderLeg.order_kind == "trigger_limit")
+        .filter(ExecutionOrderLeg.status == "active")
+        .filter(ExecutionOrderLeg.attribution_status == "verified")
+        .order_by(ExecutionOrderLeg.id.asc())
+        .all()
+    )
+    result = []
+    for binding, leg in rows:
+        pos_id = str(leg.pos_id or "").strip()
+        if not pos_id:
+            continue
+        existing = (
+            session.query(PositionBackupStopOrder.id)
+            .filter(PositionBackupStopOrder.venue == "deepcoin")
+            .filter(PositionBackupStopOrder.pos_id == pos_id)
+            .filter(PositionBackupStopOrder.status.in_(("submitting", "active", "unknown_exchange_outcome")))
+            .first()
+        )
+        if existing is None:
+            result.append((int(binding.id), int(leg.id), pos_id))
+    return result
+
+
+def _prepare_submission(session, *, binding_id, leg_id, pos_id, client, contract_spec_provider, submitted_at):
+    binding = session.get(ExecutionBinding, binding_id)
+    leg = session.get(ExecutionOrderLeg, leg_id)
+    if binding is None or leg is None or str(leg.pos_id or "") != pos_id:
+        return None
+    primary = (
+        session.query(PositionProtectionLedger)
+        .filter(PositionProtectionLedger.execution_binding_id == binding_id)
+        .filter(PositionProtectionLedger.execution_order_leg_id == leg_id)
+        .filter(PositionProtectionLedger.pos_id == pos_id)
+        .filter(PositionProtectionLedger.status == "verified")
+        .filter(PositionProtectionLedger.purpose.in_(("stop_loss", "combined")))
+        .order_by(PositionProtectionLedger.id.asc())
+        .first()
+    )
+    primary_stop = _primary_stop_price(primary)
+    if primary_stop is None:
+        return None
+    instrument_id = f"{str(binding.symbol).upper()}-USDT-SWAP"
+    spec = contract_spec_provider.get_contract_spec(instrument_id)
+    if spec is None:
+        return None
+    try:
+        positions = client.list_positions(inst_id=instrument_id)
+    except TypeError:
+        positions = client.list_positions()
+    exact = [row for row in positions if isinstance(row, dict) and str(row.get("posId") or row.get("pos_id") or "") == pos_id]
+    if len(exact) != 1:
+        return None
+    position = exact[0]
+    if str(position.get("instId") or "").upper() != instrument_id:
+        return None
+    if str(position.get("posSide") or position.get("side") or "").lower() != str(binding.side).lower():
+        return None
+    if str(position.get("mrgPosition") or position.get("posMode") or "split").lower() != "split":
+        return None
+    liquidation = position.get("liqPx") or position.get("liquidationPrice")
+    if liquidation in (None, "", "0"):
+        return None
+    try:
+        backup_price = calculate_backup_stop_price(
+            primary_stop=primary_stop, side=binding.side,
+            price_tick=spec.price_tick,
+        )
+        payload = build_backup_stop_trigger_payload(
+            instrument_id=instrument_id, side=binding.side, margin_mode=binding.margin_mode,
+            pos_id=pos_id, primary_stop=primary_stop, backup_stop=backup_price,
+            liquidation_price=liquidation,
+            client_order_id=build_client_order_id(
+                strategy_instance_id=str(binding.strategy_instance_id), leg_index=int(leg.leg_index),
+                purpose="backup_stop",
+            ),
+        )
+    except BackupStopError:
+        return None
+    row = PositionBackupStopOrder(
+        venue="deepcoin", execution_binding_id=binding_id, execution_order_leg_id=leg_id,
+        pos_id=pos_id, instrument_id=instrument_id, side=str(binding.side).lower(),
+        trigger_price=backup_price, client_order_id=payload["clOrdId"], status="submitting",
+        request_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        created_at=submitted_at, updated_at=submitted_at,
+    )
+    session.add(row)
+    session.flush()
+    return row, payload
+
+
+def _response_order_id(response: Any) -> str | None:
+    rows = response.get("data") if isinstance(response, dict) else None
+    for row in rows if isinstance(rows, list) else [response]:
+        if isinstance(row, dict):
+            value = row.get("ordId") or row.get("orderId") or row.get("id")
+            if value:
+                return str(value)
+    return None
+
+
+def _primary_stop_price(row: PositionProtectionLedger | None) -> str | None:
+    if row is None:
+        return None
+    if str(row.trigger_price or "").strip():
+        return str(row.trigger_price)
+    try:
+        evidence = json.loads(str(row.evidence_json or "{}"))
+    except json.JSONDecodeError:
+        return None
+    value = evidence.get("stop_loss") if isinstance(evidence, dict) else None
+    return str(value) if value not in (None, "") else None
+
+
+def _strategy_instance_id(session, binding_id: int) -> str | None:
+    binding = session.get(ExecutionBinding, binding_id)
+    return str(binding.strategy_instance_id) if binding and binding.strategy_instance_id else None

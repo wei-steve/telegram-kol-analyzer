@@ -293,6 +293,8 @@ def reconcile_deepcoin_execution_bindings(
     client: DeepcoinReadOnlyClient,
     recovered_at: datetime | None = None,
     snapshot: _ReconcileSnapshot | None = None,
+    backup_stop_submission_enabled: bool = False,
+    contract_spec_provider: Any | None = None,
 ) -> ExecutionReconciliationResult:
     """Reconcile one coherent exchange snapshot through global leg attribution."""
 
@@ -305,6 +307,17 @@ def reconcile_deepcoin_execution_bindings(
         result = _apply_reconcile_snapshot(
             session_factory, snapshot=snapshot, recovered_at=now
         )
+        if backup_stop_submission_enabled and contract_spec_provider is not None:
+            from telegram_kol_research.trigger_backup_stop_executor import (
+                submit_verified_trigger_backup_stops,
+            )
+
+            submit_verified_trigger_backup_stops(
+                session_factory,
+                client=client,
+                contract_spec_provider=contract_spec_provider,
+                submitted_at=now,
+            )
         # Reuse the exact snapshot after entry attribution is current. The
         # management reconciler is read-only toward Deepcoin and never retries.
         from telegram_kol_research.strategy_management_reconciliation import (

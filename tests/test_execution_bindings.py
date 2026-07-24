@@ -36,6 +36,9 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     TriggerProtectionIntent,
 )
+from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.deepcoin_contract_specs import StaticDeepcoinContractSpecProvider
+from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.position_attribution import FillEvidence
 
 
@@ -289,6 +292,52 @@ def test_reconcile_protection_adoption_records_unique_exact_trigger_entry_tpsl(t
     assert result.protection_adoption_refused == 0
     assert result.protection_snapshot_unavailable == 0
     assert client.pending_calls == 1
+
+
+def test_reconcile_submits_one_exact_backup_stop_only_when_explicitly_enabled(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+
+    class BackupStopClient(_ProtectionAdoptionReconciliationClient):
+        def __init__(self):
+            super().__init__([_pending_combined_tpsl("tpsl-1")])
+            self.trigger_payloads = []
+
+        def list_positions(self):
+            return [{
+                "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+                "pos": "4.4", "avgPx": "1883", "liqPx": "2000", "mrgPosition": "split",
+            }]
+
+        def trigger_order(self, payload):
+            self.trigger_payloads.append(payload)
+            return {"code": "0", "data": [{"ordId": "backup-1", "sCode": "0"}]}
+
+    client = BackupStopClient()
+    provider = StaticDeepcoinContractSpecProvider({
+        "ETH-USDT-SWAP": DeepcoinContractSpec(
+            instrument_id="ETH-USDT-SWAP", contract_value=0.1, quantity_step=0.1,
+            min_quantity=0.1, price_tick=0.1,
+        )
+    })
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory, client=client, recovered_at=datetime(2026, 7, 20, 8, 5),
+        backup_stop_submission_enabled=True, contract_spec_provider=provider,
+    )
+    reconcile_deepcoin_execution_bindings(
+        session_factory, client=client, recovered_at=datetime(2026, 7, 20, 8, 6),
+        backup_stop_submission_enabled=True, contract_spec_provider=provider,
+    )
+
+    assert len(client.trigger_payloads) == 1
+    assert client.trigger_payloads[0]["closePosId"] == "pos-1"
+    assert client.trigger_payloads[0]["side"] == "buy"
+    assert client.trigger_payloads[0]["triggerPx"] == "1909.5"
+    with session_factory() as session:
+        row = session.query(PositionBackupStopOrder).one()
+        assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")
+        assert session.query(ExecutionEvent).filter(ExecutionEvent.action == "create_backup_stop").count() == 1
 
 
 def test_reconcile_adopts_saved_trigger_protection_intent_once(tmp_path):
