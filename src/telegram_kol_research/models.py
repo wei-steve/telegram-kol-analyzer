@@ -960,6 +960,82 @@ class PositionTakeProfitOrder(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class PositionBackupStopOrder(Base):
+    """Durable ownership of one exact-position conditional backup stop."""
+
+    __tablename__ = "position_backup_stop_orders"
+    __table_args__ = (
+        Index(
+            "uq_position_backup_stop_orders_venue_order",
+            "venue",
+            "order_id",
+            unique=True,
+        ),
+        Index(
+            "uq_position_backup_stop_orders_active_position",
+            "venue",
+            "pos_id",
+            unique=True,
+            sqlite_where=text("status IN ('submitting', 'active', 'unknown_exchange_outcome')"),
+        ),
+        Index("ix_position_backup_stop_orders_leg_status", "execution_order_leg_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    instrument_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    trigger_price: Mapped[str] = mapped_column(String(64), nullable=False)
+    order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    client_order_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="submitting")
+    request_json: Mapped[str] = mapped_column(Text, nullable=False)
+    response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class PositionProtectionIncident(Base):
+    """Fail-closed evidence for an exact position whose protection is unhealthy."""
+
+    __tablename__ = "position_protection_incidents"
+    __table_args__ = (
+        UniqueConstraint(
+            "fingerprint", name="uq_position_protection_incidents_fingerprint"
+        ),
+        Index("ix_position_protection_incidents_position", "venue", "pos_id"),
+        Index("ix_position_protection_incidents_delivery", "delivery_status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    incident_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    delivery_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    delivery_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class ExecutionEvent(Base):
     __tablename__ = "execution_events"
     __table_args__ = (
