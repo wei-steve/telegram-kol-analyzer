@@ -31,6 +31,7 @@ class TradingSettings:
     symbol_max_loss_usdt: dict[str, float] = field(default_factory=dict)
     entry_range_order_style: str = "eager"
     take_profit_allocations: list[float] = field(default_factory=lambda: [40.0, 30.0, 30.0])
+    trigger_backup_stop_buffer_bps: float = 50.0
     move_stop_to_breakeven_after_tp1: bool = True
     allow_vision_auto_trade: bool = True
 
@@ -178,6 +179,10 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         symbol_max_loss_usdt=symbol_max_loss_usdt,
         entry_range_order_style=style,
         take_profit_allocations=take_profit_allocations,
+        trigger_backup_stop_buffer_bps=_positive_float(
+            raw.get("trigger_backup_stop_buffer_bps"),
+            defaults.trigger_backup_stop_buffer_bps,
+        ),
         move_stop_to_breakeven_after_tp1=_boolean_setting(
             raw,
             "move_stop_to_breakeven_after_tp1",
