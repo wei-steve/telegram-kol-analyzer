@@ -12,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionBackupStopOrder,
     PositionProtectionLedger,
     PositionTakeProfitOrder,
     TriggerProtectionIntent,
@@ -51,7 +52,11 @@ def plan_trigger_take_profit_convergence(
             )
         prepared = _prepare_plan(session, convergence=convergence, deepcoin_client=deepcoin_client)
         if isinstance(prepared, str):
-            convergence.status = "conflicted" if prepared.startswith("convergence_") else "blocked"
+            convergence.status = (
+                "waiting_backup_stop"
+                if prepared == "convergence_waiting_backup_stop"
+                else "conflicted" if prepared.startswith("convergence_") else "blocked"
+            )
             convergence.reason_code = prepared
             if planned_at is not None:
                 convergence.updated_at = planned_at
@@ -267,6 +272,16 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
     )
     if not has_stop:
         return "convergence_verified_stop_missing"
+    if not has_verified_exact_backup_stop(
+        session,
+        binding_id=int(binding.id),
+        leg_id=int(leg.id),
+        pos_id=pos_id,
+        inst_id=inst_id,
+        side=str(binding.side).lower(),
+        pending=pending,
+    ):
+        return "convergence_waiting_backup_stop"
     active_orders = (
         session.query(PositionTakeProfitOrder)
         .filter(PositionTakeProfitOrder.execution_binding_id == binding.id)
@@ -308,6 +323,73 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
     if not payloads:
         return "convergence_target_size_invalid"
     return [], payloads
+
+
+def has_verified_exact_backup_stop(
+    session,
+    *,
+    binding_id: int,
+    leg_id: int,
+    pos_id: str,
+    inst_id: str,
+    side: str,
+    pending: list[dict[str, object]],
+) -> bool:
+    """Require persisted exact ownership plus a same-order pending exchange read-back."""
+
+    rows = (
+        session.query(PositionBackupStopOrder)
+        .filter(PositionBackupStopOrder.execution_binding_id == binding_id)
+        .filter(PositionBackupStopOrder.execution_order_leg_id == leg_id)
+        .filter(PositionBackupStopOrder.pos_id == pos_id)
+        .filter(PositionBackupStopOrder.status == "active")
+        .filter(PositionBackupStopOrder.order_id.is_not(None))
+        .order_by(PositionBackupStopOrder.id.asc())
+        .all()
+    )
+    pending_by_order_id = {
+        str(row.get("ordId") or row.get("orderId") or ""): row
+        for row in pending
+        if isinstance(row, dict) and str(row.get("instId") or "").upper() == inst_id
+    }
+    for row in rows:
+        try:
+            request = json.loads(str(row.request_json or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(request, dict):
+            continue
+        if (
+            str(request.get("closePosId") or "") != pos_id
+            or str(request.get("instId") or "").upper() != inst_id
+            or str(request.get("posSide") or "").lower() != side
+            or str(request.get("orderType") or "").lower() != "market"
+        ):
+            continue
+        pending_row = pending_by_order_id.get(str(row.order_id or ""))
+        if pending_row is None:
+            continue
+        exchange_pos_id = str(
+            pending_row.get("closePosId")
+            or pending_row.get("posId")
+            or pending_row.get("pos_id")
+            or ""
+        )
+        if exchange_pos_id and exchange_pos_id != pos_id:
+            continue
+        exchange_order_type = str(pending_row.get("orderType") or "").lower()
+        if exchange_order_type and exchange_order_type != "market":
+            continue
+        exchange_trigger = str(
+            pending_row.get("triggerPrice")
+            or pending_row.get("triggerPx")
+            or pending_row.get("trigger_price")
+            or ""
+        )
+        if exchange_trigger and not _same_numeric(str(row.trigger_price), exchange_trigger):
+            continue
+        return True
+    return False
 
 
 def _has_parent_intent_backed_stop(

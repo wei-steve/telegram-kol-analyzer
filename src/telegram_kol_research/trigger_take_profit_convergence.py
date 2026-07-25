@@ -71,7 +71,7 @@ def mark_trigger_take_profit_convergence_ready(
 ) -> TriggerTakeProfitConvergence:
     """Attach a queue item only to its reconciled, exact live split position."""
 
-    if convergence.status not in {"waiting_position", "ready"}:
+    if convergence.status not in {"waiting_position", "waiting_backup_stop", "ready"}:
         return convergence
     leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
     binding = session.get(ExecutionBinding, convergence.execution_binding_id)

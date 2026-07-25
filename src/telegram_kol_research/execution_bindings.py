@@ -312,12 +312,28 @@ def reconcile_deepcoin_execution_bindings(
                 submit_verified_trigger_backup_stops,
             )
 
-            submit_verified_trigger_backup_stops(
+            submitted_backup_stops = submit_verified_trigger_backup_stops(
                 session_factory,
                 client=client,
                 contract_spec_provider=contract_spec_provider,
                 submitted_at=now,
             )
+            if submitted_backup_stops:
+                snapshot = load_deepcoin_execution_reconciliation_snapshot(
+                    session_factory, client=client
+                )
+                with session_factory() as session:
+                    legs = (
+                        session.query(ExecutionOrderLeg)
+                        .filter(ExecutionOrderLeg.venue == "deepcoin")
+                        .filter(ExecutionOrderLeg.purpose == "entry")
+                        .filter(ExecutionOrderLeg.attribution_status == "verified")
+                        .all()
+                    )
+                    _ready_verified_trigger_take_profit_convergences(
+                        session, legs=legs, snapshot=snapshot, recovered_at=now
+                    )
+                    session.commit()
         # Reuse the exact snapshot after entry attribution is current. The
         # management reconciler is read-only toward Deepcoin and never retries.
         from telegram_kol_research.strategy_management_reconciliation import (
@@ -877,6 +893,9 @@ def _ready_verified_trigger_take_profit_convergences(
     from telegram_kol_research.trigger_take_profit_convergence import (
         mark_trigger_take_profit_convergence_ready,
     )
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        has_verified_exact_backup_stop,
+    )
 
     leg_ids = [int(leg.id) for leg in legs if leg.id is not None]
     if not leg_ids:
@@ -884,13 +903,36 @@ def _ready_verified_trigger_take_profit_convergences(
     rows = (
         session.query(TriggerTakeProfitConvergence)
         .filter(TriggerTakeProfitConvergence.execution_order_leg_id.in_(leg_ids))
-        .filter(TriggerTakeProfitConvergence.status.in_(("waiting_position", "ready")))
+        .filter(
+            TriggerTakeProfitConvergence.status.in_(
+                ("waiting_position", "waiting_backup_stop", "ready")
+            )
+        )
         .order_by(TriggerTakeProfitConvergence.id.asc())
         .all()
     )
     for row in rows:
         leg = next((item for item in legs if int(item.id) == int(row.execution_order_leg_id)), None)
         if leg is None or _trigger_leg_child_fill_incomplete(leg, snapshot=snapshot):
+            continue
+        binding = session.get(ExecutionBinding, row.execution_binding_id)
+        inst_id = f"{str(binding.symbol).upper()}-USDT-SWAP" if binding is not None else ""
+        if (
+            binding is None
+            or not str(row.pos_id or leg.pos_id or "").strip()
+            or not has_verified_exact_backup_stop(
+                session,
+                binding_id=int(binding.id),
+                leg_id=int(leg.id),
+                pos_id=str(row.pos_id or leg.pos_id),
+                inst_id=inst_id,
+                side=str(binding.side).lower(),
+                pending=snapshot.pending_trigger_orders,
+            )
+        ):
+            row.status = "waiting_backup_stop"
+            row.reason_code = "convergence_waiting_backup_stop"
+            row.updated_at = recovered_at
             continue
         mark_trigger_take_profit_convergence_ready(session, row, ready_at=recovered_at)
 

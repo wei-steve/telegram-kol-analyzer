@@ -145,6 +145,18 @@ def run_strategy_management_worker_tick(
             snapshot = snapshot_loader(session_factory, client=get_client())
         return snapshot
 
+    if allow_execution and contract_spec_provider is not None:
+        try:
+            binding_reconciler(
+                session_factory,
+                client=get_client(),
+                recovered_at=now,
+                snapshot=get_snapshot(),
+                contract_spec_provider=contract_spec_provider,
+            )
+        except Exception:
+            logger.exception("backup-stop reconciliation before take-profit lane failed")
+
     if allow_execution:
         try:
             counts["executed"] += int(
