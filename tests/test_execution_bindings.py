@@ -237,7 +237,12 @@ class _BackupStopSubmissionClient:
         self.positions = list(positions)
         self.responses = list(responses or [])
         self.sltp_payloads = []
-        self.pending_rows = []
+        self.pending_rows = [{
+            "ordId": f"primary-{row['posId']}", "instId": row["instId"],
+            "posId": row["posId"], "posSide": row["posSide"],
+            "triggerOrderType": "TPSL", "sz": "0", "slTriggerPx": "1900",
+            "slOrdPx": "-1",
+        } for row in self.positions]
 
     def list_positions(self, *, inst_id=None):
         if inst_id is None:
@@ -396,7 +401,7 @@ def test_reconcile_protection_adoption_records_unique_exact_trigger_entry_tpsl(t
     assert client.pending_calls == 1
 
 
-def test_reconcile_submits_one_exact_backup_stop_by_default_when_contract_specs_are_available(tmp_path):
+def test_reconcile_submits_one_exact_backup_stop_when_explicitly_enabled(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_protection_adoption(session_factory)
 
@@ -430,11 +435,11 @@ def test_reconcile_submits_one_exact_backup_stop_by_default_when_contract_specs_
 
     reconcile_deepcoin_execution_bindings(
         session_factory, client=client, recovered_at=datetime(2026, 7, 20, 8, 5),
-        contract_spec_provider=provider,
+        contract_spec_provider=provider, backup_stop_submission_enabled=True,
     )
     reconcile_deepcoin_execution_bindings(
         session_factory, client=client, recovered_at=datetime(2026, 7, 20, 8, 6),
-        contract_spec_provider=provider,
+        contract_spec_provider=provider, backup_stop_submission_enabled=True,
     )
 
     assert len(client.sltp_payloads) == 1
@@ -445,6 +450,26 @@ def test_reconcile_submits_one_exact_backup_stop_by_default_when_contract_specs_
         row = session.query(PositionBackupStopOrder).one()
         assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")
         assert session.query(ExecutionEvent).filter(ExecutionEvent.action == "create_backup_stop").count() == 1
+
+
+def test_reconcile_keeps_second_stop_submission_disabled_by_default(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+    client = _BackupStopSubmissionClient([{
+        "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+        "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+    }])
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=client,
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+        contract_spec_provider=_backup_stop_provider(),
+    )
+
+    assert client.sltp_payloads == []
+    with session_factory() as session:
+        assert session.query(PositionBackupStopOrder).count() == 0
 
 
 def test_backup_submission_creates_stop_for_verified_market_entry(tmp_path):
@@ -470,6 +495,103 @@ def test_backup_submission_creates_stop_for_verified_market_entry(tmp_path):
     with session_factory() as session:
         row = session.query(PositionBackupStopOrder).one()
     assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")
+
+
+def test_backup_submission_refuses_success_when_native_backup_replaces_primary_stop(tmp_path):
+    """A second SL is only valid when the original native SL still exists."""
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+
+    class ReplacingSltpClient(_BackupStopSubmissionClient):
+        def __init__(self):
+            super().__init__([{
+                "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+                "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+            }])
+            self.pending_rows = [{
+                "ordId": "primary-pos-1", "instId": "ETH-USDT-SWAP", "posId": "pos-1",
+                "posSide": "short", "triggerOrderType": "TPSL", "sz": "0",
+                "slTriggerPx": "1900", "slOrdPx": "-1",
+            }]
+
+        def set_position_sltp(self, payload):
+            self.sltp_payloads.append(payload)
+            # Reproduce the dangerous exchange behavior documented for this
+            # endpoint: the new TPSL replaces the existing primary one.
+            self.pending_rows = [{
+                "ordId": "backup-1", "instId": payload["instId"], "posId": payload["posId"],
+                "posSide": payload["posSide"], "triggerOrderType": "TPSL", "sz": "0",
+                "slTriggerPx": payload["slTriggerPx"], "slOrdPx": payload["slOrdPx"],
+            }]
+            return {"code": "0", "data": "backup-1"}
+
+    submitted = submit_verified_trigger_backup_stops(
+        session_factory,
+        client=ReplacingSltpClient(),
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    assert submitted == 0
+    with session_factory() as session:
+        row = session.query(PositionBackupStopOrder).one()
+        incidents = session.query(PositionProtectionIncident).all()
+    assert row.status == "pending_readback"
+    assert [(incident.pos_id, incident.incident_type) for incident in incidents] == [
+        ("pos-1", "backup_stop_pending_readback")
+    ]
+
+
+def test_backup_submission_does_not_write_without_current_primary_native_tpsl(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+
+    client = _BackupStopSubmissionClient([{
+        "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+        "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+    }])
+    client.pending_rows = []
+
+    assert submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    ) == 0
+    assert client.sltp_payloads == []
+    with session_factory() as session:
+        assert session.query(PositionBackupStopOrder).count() == 0
+
+
+def test_backup_submission_records_pending_readback_when_post_submit_read_fails(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+
+    class PostSubmitReadFailureClient(_BackupStopSubmissionClient):
+        def __init__(self):
+            super().__init__([{
+                "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+                "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+            }])
+            self.pending_reads = 0
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.pending_reads += 1
+            if self.pending_reads > 1:
+                raise RuntimeError("pending endpoint unavailable")
+            return super().list_trigger_orders_pending(inst_id=inst_id)
+
+    client = PostSubmitReadFailureClient()
+    assert submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    ) == 0
+    with session_factory() as session:
+        row = session.query(PositionBackupStopOrder).one()
+    assert row.status == "pending_readback"
 
 
 def test_backup_submission_excludes_manual_bound_position(tmp_path):

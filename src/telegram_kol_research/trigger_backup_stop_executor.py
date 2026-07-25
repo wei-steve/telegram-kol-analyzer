@@ -20,6 +20,7 @@ from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.native_tpsl import NativeTpslExpectation
 from telegram_kol_research.native_tpsl import match_native_tpsl_order
+from telegram_kol_research.native_tpsl import normalize_native_tpsl
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trigger_backup_stop import BackupStopError
@@ -36,6 +37,8 @@ class BackupStopPlan:
     binding_id: int | None = None
     leg_id: int | None = None
     pos_id: str | None = None
+    primary_order_id: str | None = None
+    primary_stop: str | None = None
     payload: dict[str, str] | None = None
     position: dict[str, Any] | None = None
     open_positions: tuple[dict[str, Any], ...] = ()
@@ -136,6 +139,15 @@ def submit_verified_trigger_backup_stops(
             ):
                 raise RuntimeError("live_position_snapshot_not_unique_or_mismatched")
             pending = _read_pending_trigger_orders(client, instrument_id=instrument_id)
+            primary_is_still_verified = _pending_matches_primary(
+                pending,
+                order_id=plan.primary_order_id,
+                trigger_price=plan.primary_stop,
+                position=exact_post_submit[0],
+                open_positions=tuple(
+                    row for row in post_submit_positions if isinstance(row, dict)
+                ),
+            )
             verified_order_id = _pending_matches_backup(
                 pending,
                 order_id=order_id,
@@ -146,8 +158,9 @@ def submit_verified_trigger_backup_stops(
                 ),
             )
         except Exception:
+            primary_is_still_verified = False
             verified_order_id = None
-        if not verified_order_id:
+        if not primary_is_still_verified or not verified_order_id:
             with session_factory() as session:
                 row = session.get(PositionBackupStopOrder, row_id)
                 if row is not None:
@@ -271,6 +284,9 @@ def _plan_submission(
     primary_stop = _primary_stop_price(primary)
     if primary_stop is None:
         return _blocked_plan(binding_id, leg_id, pos_id, "primary_stop_not_verified")
+    primary_order_id = str(primary.order_id or "").strip() if primary is not None else ""
+    if not primary_order_id:
+        return _blocked_plan(binding_id, leg_id, pos_id, "primary_stop_identifier_unavailable")
     instrument_id = f"{str(binding.symbol).upper()}-USDT-SWAP"
     spec = contract_spec_provider.get_contract_spec(instrument_id)
     if spec is None:
@@ -300,6 +316,24 @@ def _plan_submission(
         return _blocked_plan(binding_id, leg_id, pos_id, "live_position_side_mismatch")
     if str(position.get("mrgPosition") or position.get("posMode") or "split").lower() != "split":
         return _blocked_plan(binding_id, leg_id, pos_id, "live_position_mode_not_split")
+    try:
+        pending_before_submit = _read_pending_trigger_orders(client, instrument_id=instrument_id)
+    except Exception:
+        return BackupStopPlan(
+            status="exchange_unavailable",
+            reason_code="primary_stop_readback_unavailable",
+            binding_id=binding_id,
+            leg_id=leg_id,
+            pos_id=pos_id,
+        )
+    if not _pending_matches_primary(
+        pending_before_submit,
+        order_id=primary_order_id,
+        trigger_price=primary_stop,
+        position=position,
+        open_positions=tuple(row for row in positions if isinstance(row, dict)),
+    ):
+        return _blocked_plan(binding_id, leg_id, pos_id, "primary_stop_missing_on_exchange")
     liquidation = position.get("liqPx") or position.get("liquidationPrice")
     if liquidation in (None, "", "0"):
         return _blocked_plan(binding_id, leg_id, pos_id, "liquidation_price_unavailable")
@@ -357,6 +391,8 @@ def _plan_submission(
         )
     return BackupStopPlan(
         status="ready", binding_id=binding_id, leg_id=leg_id, pos_id=pos_id,
+        primary_order_id=primary_order_id,
+        primary_stop=primary_stop,
         payload=payload, position=position,
         open_positions=tuple(row for row in positions if isinstance(row, dict)),
     )
@@ -484,6 +520,39 @@ def _pending_matches_backup(
         open_positions=list(open_positions),
     )
     return match.order.ord_id if match.status == "verified" and match.order is not None else None
+
+
+def _pending_matches_primary(
+    pending: list[dict[str, Any]],
+    *,
+    order_id: str | None,
+    trigger_price: str | None,
+    position: dict[str, Any] | None,
+    open_positions: tuple[dict[str, Any], ...],
+) -> bool:
+    """Verify the pre-existing native stop survived a second-stop submission."""
+
+    if not order_id or not trigger_price or position is None or not open_positions:
+        return False
+    exact = [
+        order
+        for raw in pending
+        if (order := normalize_native_tpsl(raw)) is not None and order.ord_id == order_id
+    ]
+    if len(exact) != 1 or exact[0].size is None:
+        return False
+    match = match_native_tpsl_order(
+        position,
+        pending,
+        NativeTpslExpectation(
+            purpose="stop_loss",
+            trigger_price=trigger_price,
+            size=exact[0].size,
+            ord_id=order_id,
+        ),
+        open_positions=list(open_positions),
+    )
+    return match.status == "verified" and match.order is not None
 
 
 def _live_position_matches_plan(position: dict[str, Any], plan: BackupStopPlan) -> bool:

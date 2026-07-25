@@ -23,7 +23,11 @@ class _Client:
     def __init__(self, *, verify_after_submit=False):
         self.set_position_sltp_payloads = []
         self.verify_after_submit = verify_after_submit
-        self.pending_rows = []
+        self.pending_rows = [{
+            "ordId": "primary-1", "instId": "ETH-USDT-SWAP", "posId": "pos-1",
+            "posSide": "short", "triggerOrderType": "TPSL", "slTriggerPrice": "1900",
+            "sz": "4.4",
+        }]
 
     def list_positions(self, *, inst_id=None):
         return [{
