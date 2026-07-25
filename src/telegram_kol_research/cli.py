@@ -35,6 +35,7 @@ from telegram_kol_research.entry_protection_ledger_repair import (
     build_entry_protection_ledger_repair_plan,
 )
 from telegram_kol_research.backup_stop_repair import (
+    BackupStopRepairPlan,
     apply_backup_stop_repair_plan,
     build_backup_stop_repair_plan,
 )
@@ -2042,6 +2043,18 @@ def repair_entry_protection_ledger(
     typer.echo(f"Applied {result.applied} entry protection ledger repair(s).")
 
 
+def _backup_stop_conflicts_for_target(
+    plan: BackupStopRepairPlan, *, pos_id: str
+) -> tuple[dict[str, str], ...]:
+    """Return only conflicts that block the position selected for an apply."""
+
+    return tuple(
+        conflict
+        for conflict in plan.conflicts
+        if str(conflict.get("pos_id") or "").strip() == pos_id
+    )
+
+
 @app.command("repair-backup-stops")
 def repair_backup_stops(
     database_path: Path = Path("data/research.db"),
@@ -2075,8 +2088,11 @@ def repair_backup_stops(
             err=True,
         )
         raise typer.Exit(code=2)
-    if plan.conflicts:
-        typer.echo("Refusing apply: unresolved backup-stop conflicts remain.", err=True)
+    if _backup_stop_conflicts_for_target(plan, pos_id=clean_pos_id):
+        typer.echo(
+            "Refusing apply: target position has unresolved backup-stop conflicts.",
+            err=True,
+        )
         raise typer.Exit(code=2)
     result = apply_backup_stop_repair_plan(
         session_factory,

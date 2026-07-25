@@ -135,6 +135,28 @@ def test_repair_plan_flags_local_active_backup_missing_from_exchange(tmp_path):
     assert plan.conflicts == ({"pos_id": "pos-1", "reason": "backup_stop_missing_on_exchange"},)
 
 
+def test_targeted_backup_repair_gate_ignores_unrelated_conflicts():
+    from telegram_kol_research.backup_stop_repair import BackupStopRepairPlan
+    from telegram_kol_research.cli import _backup_stop_conflicts_for_target
+
+    plan = BackupStopRepairPlan(
+        created_at=NOW,
+        actions=(),
+        conflicts=(
+            {"pos_id": "blocked-pos", "reason": "primary_stop_not_verified"},
+            {"pos_id": "target-pos", "reason": "backup_exchange_outcome_unknown"},
+        ),
+        database_fingerprint="database",
+        exchange_fingerprint="exchange",
+        fingerprint="plan",
+    )
+
+    assert _backup_stop_conflicts_for_target(plan, pos_id="safe-pos") == ()
+    assert _backup_stop_conflicts_for_target(plan, pos_id="target-pos") == (
+        {"pos_id": "target-pos", "reason": "backup_exchange_outcome_unknown"},
+    )
+
+
 def test_repair_apply_requires_one_position_and_exact_fingerprint(tmp_path):
     from telegram_kol_research.backup_stop_repair import (
         apply_backup_stop_repair_plan,
