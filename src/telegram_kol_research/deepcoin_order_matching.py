@@ -8,9 +8,12 @@ management signals can adjust the intended protection order without guessing.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 from telegram_kol_research.deepcoin_readonly import DeepcoinOrderBinding
+from telegram_kol_research.native_tpsl import native_tpsl_belongs_to_position
+from telegram_kol_research.native_tpsl import normalize_native_tpsl
 
 
 @dataclass(slots=True)
@@ -47,6 +50,41 @@ def extract_pending_protection_orders(
 
     orders: list[DeepcoinProtectionOrder] = []
     for raw in pending_trigger_orders:
+        native_order = normalize_native_tpsl(raw)
+        if native_order:
+            base = {
+                "trigger_order_id": native_order.ord_id,
+                "client_order_id": _first_string(
+                    raw,
+                    "clOrdId",
+                    "clientOrderId",
+                    "client_order_id",
+                ),
+                "inst_id": native_order.inst_id,
+                "pos_side": native_order.pos_side,
+                "size": _normalize_size(native_order.size),
+                "pos_id": native_order.pos_id,
+                "created_time": native_order.created_time,
+            }
+            if native_order.stop_loss_trigger_price is not None:
+                orders.append(
+                    DeepcoinProtectionOrder(
+                        purpose="stop_loss",
+                        trigger_price=float(native_order.stop_loss_trigger_price),
+                        raw=raw,
+                        **base,
+                    )
+                )
+            if native_order.take_profit_trigger_price is not None:
+                orders.append(
+                    DeepcoinProtectionOrder(
+                        purpose="take_profit",
+                        trigger_price=float(native_order.take_profit_trigger_price),
+                        raw=raw,
+                        **base,
+                    )
+                )
+            continue
         if str(raw.get("triggerOrderType") or raw.get("ordType") or "").upper() not in {
             "TPSL",
             "TP",
@@ -114,29 +152,15 @@ def select_position_tpsl_orders(
     with size either matching the position or reported as zero.
     """
 
-    position_key = _position_tpsl_match_key(position)
-    if position_key is None:
-        return []
-    position_pos_id, position_inst_id, position_side, position_size, position_time = position_key
     matches: list[dict[str, Any]] = []
     for order in pending_trigger_orders:
-        if str(order.get("triggerOrderType") or "").upper() != "TPSL":
-            continue
-        order_pos_id = _first_string(order, "posId", "pos_id", "positionId")
-        if position_pos_id and order_pos_id and position_pos_id == order_pos_id:
+        native_order = normalize_native_tpsl(order)
+        if (
+            native_order
+            and not (native_order.pos_id is None and native_order.size == Decimal("0"))
+            and native_tpsl_belongs_to_position(position, native_order)
+        ):
             matches.append(order)
-            continue
-        if str(order.get("instId") or "").upper() != position_inst_id:
-            continue
-        if _normalize_side(str(order.get("posSide") or order.get("side") or "")) != position_side:
-            continue
-        order_time = _first_string(order, "cTime", "uTime", "createdTime", "created_at")
-        if not _tpsl_time_matches_position(order_time, position_time):
-            continue
-        order_size = _normalize_size(order.get("sz") or order.get("size"))
-        if order_size not in {position_size, "0"}:
-            continue
-        matches.append(order)
     return matches
 
 
@@ -344,51 +368,3 @@ def _has_nonzero_size(position: dict[str, Any]) -> bool:
         return abs(float(position.get("pos") or position.get("size") or 0)) > 0
     except (TypeError, ValueError):
         return False
-
-
-def _tpsl_time_matches_position(order_time: str | None, position_time: str) -> bool:
-    if not order_time:
-        return False
-    if order_time == position_time:
-        return True
-    order_ms = _to_int(order_time)
-    position_ms = _to_int(position_time)
-    if order_ms is None or position_ms is None:
-        return False
-    return 0 <= order_ms - position_ms <= 86_400_000
-
-
-def _to_int(value: Any) -> int | None:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def _position_tpsl_match_key(
-    position: dict[str, Any],
-) -> tuple[str | None, str, str, str, str] | None:
-    inst_id = str(position.get("instId") or "").upper()
-    side = _normalize_side(str(position.get("posSide") or position.get("side") or ""))
-    size = _normalize_size(position.get("pos") or position.get("size"))
-    created_time = _latest_time_string(position, "cTime", "uTime", "createdTime", "created_at")
-    if not inst_id or not side or not size or not created_time:
-        return None
-    return (
-        _first_string(position, "posId", "pos_id", "id"),
-        inst_id,
-        side,
-        size,
-        created_time,
-    )
-
-
-def _latest_time_string(payload: dict[str, Any], *keys: str) -> str | None:
-    values = [
-        value
-        for value in (_first_string({key: payload.get(key)}, key) for key in keys)
-        if value is not None
-    ]
-    if not values:
-        return None
-    return max(values, key=lambda item: _to_int(item) or 0)
