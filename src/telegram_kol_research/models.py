@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Optional
+from uuid import uuid4
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -695,6 +696,50 @@ class PositionAttributionAudit(Base):
     notification_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class PositionProtectionLeg(Base):
+    """One planned TP/SL leg, including the period before DeepCoin assigns IDs."""
+
+    __tablename__ = "position_protection_legs"
+    __table_args__ = (
+        UniqueConstraint(
+            "venue",
+            "execution_order_leg_id",
+            "role",
+            "leg_index",
+            name="uq_position_protection_legs_logical_identity",
+        ),
+        Index("ix_position_protection_legs_position", "venue", "pos_id"),
+        Index("ix_position_protection_legs_exchange_order", "venue", "exchange_order_id"),
+        Index("ix_position_protection_legs_status", "status", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    protection_leg_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, default=lambda: str(uuid4()), unique=True, index=True
+    )
+    venue: Mapped[str] = mapped_column(String(64), nullable=False, default="deepcoin")
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    leg_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    planned_trigger_price: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    planned_size: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    parent_entry_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    pos_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    exchange_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="planned")
+    request_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    readback_evidence_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
 class PositionProtectionLedger(Base):
