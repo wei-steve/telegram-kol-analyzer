@@ -4273,7 +4273,7 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(tmp_path):
     ]
     assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
     assert all(not any(key.startswith("tp") for key in payload) for payload in fake_client.trigger_payloads)
-    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
+    assert fake_client.trigger_payloads[0]["slTriggerPx"] == "67500.0"
 
 
 def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
@@ -4384,5 +4384,5 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
     assert process_response.json()["result"]["signal_id"] == signal.id
     assert fake_client.payloads == []
     assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
-    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
+    assert fake_client.trigger_payloads[0]["slTriggerPx"] == "67500.0"
     assert "tpTriggerPx" not in fake_client.trigger_payloads[0]

@@ -15,6 +15,7 @@ from telegram_kol_research.models import (
     TriggerTakeProfitConvergence,
     utc_now,
 )
+from telegram_kol_research.native_tpsl import native_tpsl_take_profit_is_market
 
 
 def record_take_profit_order(
@@ -37,6 +38,12 @@ def record_take_profit_order(
     pos_id = _required_text(pos_id, "position ID")
     order_id = _required_text(order_id, "order ID")
     trigger_price = _required_text(trigger_price, "trigger price")
+    _require_native_tpsl_readback(
+        evidence,
+        order_id=order_id,
+        trigger_price=trigger_price,
+        size_text=size_text,
+    )
     _require_exact_leg_ownership(
         session,
         execution_binding_id=execution_binding_id,
@@ -216,6 +223,37 @@ def _required_text(value: object, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be nonempty")
     return value.strip()
+
+
+def _require_native_tpsl_readback(
+    evidence: dict[str, object] | None,
+    *,
+    order_id: str,
+    trigger_price: str,
+    size_text: str | None,
+) -> None:
+    """Keep REST acknowledgement alone from becoming active TP evidence."""
+
+    if not isinstance(evidence, dict) or evidence.get("source") != "native_tpsl_pending_readback":
+        raise ValueError("take-profit order requires native TPSL pending readback evidence")
+    native = evidence.get("native_tpsl")
+    if not isinstance(native, dict):
+        raise ValueError("take-profit order requires native TPSL pending readback evidence")
+    if (
+        str(native.get("triggerOrderType") or "").upper() != "TPSL"
+        or str(native.get("ordId") or native.get("orderId") or "") != order_id
+        or not native_tpsl_take_profit_is_market(native)
+        or not _same_decimal(native.get("tpTriggerPx") or native.get("tpTriggerPrice"), trigger_price)
+        or not _same_decimal(native.get("sz"), size_text)
+    ):
+        raise ValueError("take-profit order requires native TPSL pending readback evidence")
+
+
+def _same_decimal(left: object, right: object) -> bool:
+    try:
+        return Decimal(str(left)) == Decimal(str(right))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
 
 
 def _json(value: dict[str, object] | None) -> str | None:

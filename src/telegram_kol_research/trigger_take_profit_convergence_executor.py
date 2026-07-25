@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation
 
 from sqlalchemy.orm import sessionmaker
 
@@ -15,13 +15,20 @@ from telegram_kol_research.models import (
     PositionBackupStopOrder,
     PositionProtectionLedger,
     PositionTakeProfitOrder,
-    TriggerProtectionIntent,
     TriggerTakeProfitConvergence,
     utc_now,
 )
 from telegram_kol_research.position_authority_lock import serialized_position_authority_mutation
 from telegram_kol_research.position_take_profit_orders import (
     record_take_profit_order,
+)
+from telegram_kol_research.take_profit_plan import TakeProfitPlanError, build_take_profit_plan
+from telegram_kol_research.native_tpsl import (
+    NativeTpslExpectation,
+    NativeTpslOrder,
+    match_native_tpsl_order,
+    native_tpsl_take_profit_is_market,
+    normalize_native_tpsl,
 )
 
 
@@ -38,6 +45,7 @@ def plan_trigger_take_profit_convergence(
     *,
     convergence_id: int,
     deepcoin_client,
+    contract_spec_provider=None,
     planned_at: datetime | None = None,
 ) -> TriggerTakeProfitConvergencePlan:
     """Produce a TP-only plan or fail closed before any exchange mutation."""
@@ -50,7 +58,16 @@ def plan_trigger_take_profit_convergence(
             return TriggerTakeProfitConvergencePlan(
                 "blocked", convergence.reason_code or "convergence_not_ready"
             )
-        prepared = _prepare_plan(session, convergence=convergence, deepcoin_client=deepcoin_client)
+        prepared = _prepare_plan(
+            session,
+            convergence=convergence,
+            deepcoin_client=deepcoin_client,
+            contract_spec_provider=(
+                contract_spec_provider
+                if contract_spec_provider is not None
+                else getattr(deepcoin_client, "contract_spec_provider", None)
+            ),
+        )
         if isinstance(prepared, str):
             convergence.status = (
                 "waiting_backup_stop"
@@ -74,6 +91,7 @@ def execute_trigger_take_profit_convergence(
     *,
     convergence_id: int,
     deepcoin_client,
+    contract_spec_provider=None,
     executed_at: datetime | None = None,
 ) -> dict[str, object]:
     """Cancel exact-leg TP orders, then create the replacement TP set once."""
@@ -83,6 +101,7 @@ def execute_trigger_take_profit_convergence(
         session_factory,
         convergence_id=convergence_id,
         deepcoin_client=deepcoin_client,
+        contract_spec_provider=contract_spec_provider,
         planned_at=now,
     )
     if plan.status != "ready":
@@ -105,6 +124,38 @@ def execute_trigger_take_profit_convergence(
         order_id = _response_order_id(response)
         if order_id is None:
             return _freeze(session_factory, convergence_id, now, "convergence_submit_unknown", error="missing order ID")
+        try:
+            open_positions = list(deepcoin_client.list_positions())
+            exact_position = _exact_live_position(
+                open_positions,
+                pos_id=str(payload["posId"]),
+                inst_id=str(payload["instId"]),
+                side=str(payload["posSide"]),
+            )
+            pending = list(deepcoin_client.list_trigger_orders_pending(inst_id=str(payload["instId"])))
+            verified = _verified_native_take_profit(
+                position=exact_position,
+                open_positions=open_positions,
+                pending=pending,
+                order_id=order_id,
+                payload=payload,
+            )
+        except Exception as exc:
+            return _freeze(
+                session_factory,
+                convergence_id,
+                now,
+                "convergence_take_profit_pending_readback",
+                error=exc,
+            )
+        if verified is None:
+            return _freeze(
+                session_factory,
+                convergence_id,
+                now,
+                "convergence_take_profit_pending_readback",
+                error="native TPSL take-profit was not verified in pending orders",
+            )
         with session_factory() as session:
             convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
             if convergence is None or convergence.status != "reserved":
@@ -120,7 +171,11 @@ def execute_trigger_take_profit_convergence(
                 trigger_price=str(payload["tpTriggerPx"]),
                 size_text=str(payload["sz"]),
                 created_at=now,
-                evidence={"source": "trigger_take_profit_convergence", "response": _response_dict(response)},
+                evidence={
+                    "source": "native_tpsl_pending_readback",
+                    "response": _response_dict(response),
+                    "native_tpsl": verified.raw,
+                },
             )
             session.commit()
     with session_factory() as session:
@@ -138,6 +193,7 @@ def execute_ready_trigger_take_profit_convergences(
     session_factory: sessionmaker,
     *,
     deepcoin_client,
+    contract_spec_provider=None,
     processed_at: datetime | None = None,
     limit: int = 5,
 ) -> int:
@@ -160,6 +216,7 @@ def execute_ready_trigger_take_profit_convergences(
             session_factory,
             convergence_id=convergence_id,
             deepcoin_client=deepcoin_client,
+            contract_spec_provider=contract_spec_provider,
             executed_at=processed_at,
         )
         if result.get("status") in {"submitted", "conflicted", "submit_unknown"}:
@@ -197,7 +254,7 @@ def _response_order_id(response: object) -> str | None:
     return str(value) if value not in (None, "") else None
 
 
-def _prepare_plan(session, *, convergence, deepcoin_client):
+def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provider):
     if str(convergence.status) != "ready":
         return "convergence_not_ready"
     leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
@@ -243,32 +300,12 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
         .filter(PositionProtectionLedger.purpose.in_(("stop_loss", "combined")))
         .all()
     )
-    pending_stop_prices = {
-        str(row.get("ordId") or row.get("orderId") or ""): str(
-            row.get("slTriggerPx") or row.get("slTriggerPrice") or row.get("closeSLTriggerPrice") or ""
-        )
-        for row in pending if isinstance(row, dict)
-        and str(row.get("instId") or "").upper() == inst_id
-        and _present(row, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
-    }
-    pending_stops = {
-        str(row.get("ordId") or row.get("orderId") or ""): str(
-            row.get("slTriggerPx") or row.get("slTriggerPrice") or row.get("closeSLTriggerPrice") or ""
-        )
-        for row in pending if isinstance(row, dict)
-        and str(row.get("instId") or "").upper() == inst_id
-        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
-        and _present(row, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
-    }
-    has_stop = any(
-        str(row.order_id) in pending_stops
-        and (row.trigger_price is None or _same_numeric(str(row.trigger_price), pending_stops[str(row.order_id)]))
-        for row in stop_rows
-    ) or _has_parent_intent_backed_stop(
-        session,
-        leg_id=int(leg.id),
+    has_stop = _has_verified_native_primary_stop(
         stop_rows=stop_rows,
-        pending_stop_prices=pending_stop_prices,
+        position=matches[0],
+        open_positions=positions,
+        pending=pending,
+        position_size=size,
     )
     if not has_stop:
         return "convergence_verified_stop_missing"
@@ -280,6 +317,8 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
         inst_id=inst_id,
         side=str(binding.side).lower(),
         pending=pending,
+        position=matches[0],
+        open_positions=positions,
     ):
         return "convergence_waiting_backup_stop"
     active_orders = (
@@ -291,20 +330,33 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
         .order_by(PositionTakeProfitOrder.id.asc())
         .all()
     )
-    pending_ids = {
-        str(row.get("ordId") or row.get("orderId") or "")
-        for row in pending if isinstance(row, dict)
-        and str(row.get("instId") or "").upper() == inst_id
-        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
-        and _present(row, "tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
-    }
+    pending_ids = _native_pending_take_profit_ids(
+        position=matches[0],
+        open_positions=positions,
+        pending=pending,
+    )
     ledger_ids = {str(row.order_id) for row in active_orders}
     if pending_ids or ledger_ids:
         return "convergence_take_profit_already_present"
     targets = _targets(convergence.desired_take_profits_json)
     if isinstance(targets, str):
         return targets
-    sizes = _allocate_sizes(size, [allocation for _, allocation in targets])
+    try:
+        spec = (
+            contract_spec_provider.get_contract_spec(inst_id)
+            if contract_spec_provider is not None
+            else None
+        )
+    except Exception:
+        return "convergence_target_contract_spec_unavailable"
+    if spec is None:
+        return "convergence_target_contract_spec_unavailable"
+    sizes = _allocate_sizes(
+        size,
+        [allocation for _, allocation in targets],
+        quantity_step=getattr(spec, "quantity_step", None),
+        minimum_quantity=getattr(spec, "min_quantity", None),
+    )
     if isinstance(sizes, str):
         return sizes
     common = {
@@ -334,6 +386,8 @@ def has_verified_exact_backup_stop(
     inst_id: str,
     side: str,
     pending: list[dict[str, object]],
+    position: dict[str, object],
+    open_positions: list[dict[str, object]],
 ) -> bool:
     """Require persisted exact ownership plus a same-order pending exchange read-back."""
 
@@ -347,11 +401,12 @@ def has_verified_exact_backup_stop(
         .order_by(PositionBackupStopOrder.id.asc())
         .all()
     )
-    pending_by_order_id = {
-        str(row.get("ordId") or row.get("orderId") or ""): row
-        for row in pending
-        if isinstance(row, dict) and str(row.get("instId") or "").upper() == inst_id
-    }
+    if (
+        str(position.get("instId") or "").upper() != inst_id
+        or str(position.get("posId") or position.get("pos_id") or "") != pos_id
+        or str(position.get("posSide") or position.get("side") or "").lower() != side
+    ):
+        return False
     for row in rows:
         try:
             request = json.loads(str(row.request_json or "{}"))
@@ -360,71 +415,179 @@ def has_verified_exact_backup_stop(
         if not isinstance(request, dict):
             continue
         if (
-            str(request.get("closePosId") or "") != pos_id
-            or str(request.get("instId") or "").upper() != inst_id
+            str(request.get("instId") or "").upper() != inst_id
+            or str(request.get("posId") or request.get("closePosId") or "") != pos_id
             or str(request.get("posSide") or "").lower() != side
-            or str(request.get("orderType") or "").lower() != "market"
+            or str(request.get("slOrdPx") or request.get("price") or "") != "-1"
+            or not _present(request, "slTriggerPx", "slTriggerPrice", "triggerPrice")
         ):
             continue
-        pending_row = pending_by_order_id.get(str(row.order_id or ""))
-        if pending_row is None:
-            continue
-        exchange_pos_id = str(
-            pending_row.get("closePosId")
-            or pending_row.get("posId")
-            or pending_row.get("pos_id")
-            or ""
+        match = match_native_tpsl_order(
+            position,
+            [item for item in pending if isinstance(item, dict)],
+            NativeTpslExpectation(
+                purpose="stop_loss", trigger_price=str(row.trigger_price), size="0",
+                ord_id=str(row.order_id),
+            ),
+            open_positions=[item for item in open_positions if isinstance(item, dict)],
         )
-        if exchange_pos_id and exchange_pos_id != pos_id:
-            continue
-        exchange_order_type = str(pending_row.get("orderType") or "").lower()
-        if exchange_order_type and exchange_order_type != "market":
-            continue
-        exchange_trigger = str(
-            pending_row.get("triggerPrice")
-            or pending_row.get("triggerPx")
-            or pending_row.get("trigger_price")
-            or ""
-        )
-        if exchange_trigger and not _same_numeric(str(row.trigger_price), exchange_trigger):
-            continue
-        return True
-    return False
-
-
-def _has_parent_intent_backed_stop(
-    session,
-    *,
-    leg_id: int,
-    stop_rows: list[PositionProtectionLedger],
-    pending_stop_prices: dict[str, str],
-) -> bool:
-    """Accept a stop adopted from the exact parent trigger when Deepcoin omits posId."""
-
-    intent = (
-        session.query(TriggerProtectionIntent)
-        .filter(TriggerProtectionIntent.execution_order_leg_id == leg_id)
-        .one_or_none()
-    )
-    parent_order_id = str(intent.parent_trigger_order_id or "") if intent is not None else ""
-    if not parent_order_id:
-        return False
-    for row in stop_rows:
-        order_id = str(row.order_id or "")
-        if (
-            str(row.evidence_source) != "reconciliation_trigger_protection_intent"
-            or str(intent.adopted_order_id or "") != order_id
-            or order_id not in pending_stop_prices
-            or (row.trigger_price is not None and not _same_numeric(str(row.trigger_price), pending_stop_prices[order_id]))
-        ):
-            continue
-        try:
-            evidence = json.loads(str(row.evidence_json or "{}"))
-        except json.JSONDecodeError:
-            continue
-        if isinstance(evidence, dict) and str(evidence.get("parent_trigger_order_id") or "") == parent_order_id:
+        if match.status == "verified":
             return True
     return False
+
+
+def _has_verified_native_primary_stop(
+    *,
+    stop_rows: list[PositionProtectionLedger],
+    position: dict[str, object],
+    open_positions: list[dict[str, object]],
+    pending: list[dict[str, object]],
+    position_size: Decimal,
+) -> bool:
+    for row in stop_rows:
+        if not row.order_id or row.trigger_price is None:
+            continue
+        match = match_native_tpsl_order(
+            position,
+            [item for item in pending if isinstance(item, dict)],
+            NativeTpslExpectation(
+                purpose="stop_loss",
+                trigger_price=str(row.trigger_price),
+                size=position_size,
+                ord_id=str(row.order_id),
+            ),
+            open_positions=[item for item in open_positions if isinstance(item, dict)],
+        )
+        if match.status == "verified" and match.order is not None and _native_tpsl_is_scoped_to_position(
+            match.order,
+            position=position,
+            open_positions=open_positions,
+        ):
+            return True
+    return False
+
+
+def _verified_native_take_profit(
+    *,
+    position: dict[str, object],
+    open_positions: list[dict[str, object]],
+    pending: list[dict[str, object]],
+    order_id: str,
+    payload: dict[str, str],
+) -> NativeTpslOrder | None:
+    match = match_native_tpsl_order(
+        position,
+        [item for item in pending if isinstance(item, dict)],
+        NativeTpslExpectation(
+            purpose="take_profit",
+            trigger_price=payload["tpTriggerPx"], size=payload["sz"], ord_id=order_id,
+        ),
+        open_positions=[item for item in open_positions if isinstance(item, dict)],
+    )
+    if match.status != "verified" or match.order is None:
+        return None
+    if not native_tpsl_take_profit_is_market(match.order.raw):
+        return None
+    if not _native_tpsl_is_scoped_to_position(
+        match.order,
+        position=position,
+        open_positions=open_positions,
+    ):
+        return None
+    return match.order
+
+
+def _native_pending_take_profit_ids(
+    *,
+    position: dict[str, object],
+    open_positions: list[dict[str, object]],
+    pending: list[dict[str, object]],
+) -> set[str]:
+    ids: set[str] = set()
+    for raw in pending:
+        if not isinstance(raw, dict):
+            continue
+        order = normalize_native_tpsl(raw)
+        if order is None:
+            if (
+                str(raw.get("instId") or "").upper() == str(position.get("instId") or "").upper()
+                and str(raw.get("posId") or raw.get("pos_id") or "")
+                == str(position.get("posId") or position.get("pos_id") or "")
+                and _present(raw, "tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
+            ):
+                ids.add(str(raw.get("ordId") or raw.get("orderId") or "unidentified_pending_take_profit"))
+            continue
+        if order.take_profit_trigger_price is None:
+            continue
+        if _native_tpsl_is_scoped_to_position(order, position=position, open_positions=open_positions):
+            if order.ord_id:
+                ids.add(order.ord_id)
+    return ids
+
+
+def _native_tpsl_is_scoped_to_position(
+    order: NativeTpslOrder,
+    *,
+    position: dict[str, object],
+    open_positions: list[dict[str, object]],
+) -> bool:
+    position_id = str(position.get("posId") or position.get("pos_id") or "")
+    if order.pos_id is not None:
+        return bool(position_id) and order.pos_id == position_id
+    # An unscoped native order is never adopted from an incomplete snapshot.
+    if not open_positions:
+        return False
+    position_time = _position_time(position)
+    if position_time is None or order.created_time is None:
+        return False
+    candidates = [
+        item for item in open_positions
+        if isinstance(item, dict)
+        and str(item.get("instId") or "").upper() == order.inst_id
+        and str(item.get("posSide") or item.get("side") or "").lower() == order.pos_side
+        and _time_is_within_position_window(order.created_time, _position_time(item))
+    ]
+    return len(candidates) == 1 and str(candidates[0].get("posId") or candidates[0].get("pos_id") or "") == position_id
+
+
+def _position_time(position: dict[str, object]) -> str | None:
+    for key in ("cTime", "uTime", "createdTime", "created_at"):
+        value = position.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _time_is_within_position_window(order_time: str, position_time: str | None) -> bool:
+    if position_time is None:
+        return False
+    if order_time == position_time:
+        return True
+    try:
+        return 0 <= int(Decimal(order_time)) - int(Decimal(position_time)) <= 86_400_000
+    except (InvalidOperation, ValueError):
+        return False
+
+
+def _exact_live_position(
+    positions: list[dict[str, object]],
+    *,
+    pos_id: str,
+    inst_id: str,
+    side: str,
+) -> dict[str, object]:
+    matches = [
+        row for row in positions
+        if isinstance(row, dict)
+        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
+        and str(row.get("instId") or "").upper() == inst_id.upper()
+        and str(row.get("posSide") or row.get("side") or "").lower() == side.lower()
+        and str(row.get("mrgPosition") or row.get("posMode") or "").lower() == "split"
+        and _positive_decimal(row.get("pos") or row.get("size")) is not None
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("live_position_snapshot_not_unique_or_mismatched")
+    return matches[0]
 
 
 def _targets(value: str):
@@ -448,19 +611,28 @@ def _targets(value: str):
     return targets if total == Decimal("100") else "convergence_target_plan_invalid"
 
 
-def _allocate_sizes(size: Decimal, allocations: list[Decimal]):
-    sizes: list[Decimal] = []
-    remaining = size
-    for index, allocation in enumerate(allocations):
-        quantity = (
-            remaining if index == len(allocations) - 1
-            else (size * allocation / Decimal("100")).quantize(Decimal("1"), rounding=ROUND_DOWN)
+def _allocate_sizes(
+    size: Decimal,
+    allocations: list[Decimal],
+    *,
+    quantity_step: object,
+    minimum_quantity: object,
+):
+    try:
+        plan = build_take_profit_plan(
+            prices=range(1, len(allocations) + 1),
+            side="long",
+            configured_allocations=allocations,
+            quantity=size,
+            quantity_step=quantity_step,
+            minimum_quantity=minimum_quantity,
         )
-        if quantity <= 0:
-            return "convergence_target_size_invalid"
-        sizes.append(quantity)
-        remaining -= quantity
-    return sizes
+    except TakeProfitPlanError as exc:
+        if "minimum" in str(exc):
+            return "convergence_target_size_below_minimum"
+        return "convergence_target_size_step_unverified"
+    quantities = [Decimal(str(leg.quantity)) for leg in plan.legs]
+    return quantities if all(quantity > 0 for quantity in quantities) else "convergence_target_size_invalid"
 
 
 def _positive_decimal(value: object) -> Decimal | None:
@@ -481,10 +653,3 @@ def _split_ids(value: object) -> set[str]:
 
 def _present(row: dict, *keys: str) -> bool:
     return any(row.get(key) not in (None, "", 0, "0") for key in keys)
-
-
-def _same_numeric(left: str, right: str) -> bool:
-    try:
-        return Decimal(left) == Decimal(right)
-    except (InvalidOperation, ValueError):
-        return False

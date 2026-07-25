@@ -93,6 +93,23 @@ def normalize_native_tpsl(payload: dict[str, Any]) -> NativeTpslOrder | None:
     )
 
 
+def native_tpsl_take_profit_is_market(payload: dict[str, Any]) -> bool:
+    """Return whether every supplied DeepCoin TP execution-price field is market.
+
+    DeepCoin has returned both ``tpOrdPx=-1`` and ``tpPrice=0`` for market
+    TPSL exits.  If either representation is present, a non-market value must
+    fail closed rather than silently turning a protective TP into a limit exit.
+    """
+
+    values = [payload.get(key) for key in ("tpOrdPx", "tpPrice") if payload.get(key) not in (None, "")]
+    if not values:
+        return False
+    return all(
+        (price := _decimal(value)) is not None and price in {Decimal("-1"), Decimal("0")}
+        for value in values
+    )
+
+
 def match_native_tpsl_order(
     position: dict[str, Any],
     orders: list[dict[str, Any]],

@@ -19,7 +19,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageInstructionItem, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageInstructionItem, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
 from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
@@ -1190,7 +1190,7 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     assert fake_client.trigger_orders[0]["orderType"] == "limit"
     assert fake_client.trigger_orders[0]["triggerPrice"] == "68206.8"
     assert all(not any(key.startswith("tp") for key in order) for order in fake_client.trigger_orders)
-    assert fake_client.trigger_orders[0]["slTriggerPx"] == 67500.0
+    assert fake_client.trigger_orders[0]["slTriggerPx"] == "67500.0"
     assert fake_client.protections == []
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
@@ -1465,9 +1465,6 @@ def test_auto_process_range_entry_uses_half_market_and_adjusted_opposite_endpoin
         "create_trigger_entry",
         "open_market_position",
         "set_position_tpsl",
-        "set_position_tpsl",
-        "set_position_tpsl",
-        "set_position_tpsl",
     ]
 
 
@@ -1581,24 +1578,23 @@ def test_auto_process_message_trade_signal_submits_market_order_then_position_sl
     assert fake_client.orders[0]["ordType"] == "market"
     assert fake_client.protections[0]["posId"] == "pos-1"
     assert fake_client.protections[0]["slTriggerPx"] == "67500.0"
-    assert [payload.get("tpTriggerPx") for payload in fake_client.protections] == [
-        None,
-        "69000.0",
-        "70000.0",
-    ]
-    assert [payload.get("sz") for payload in fake_client.protections] == [None, "16", "17"]
+    assert [payload.get("tpTriggerPx") for payload in fake_client.protections] == [None]
+    assert [payload.get("sz") for payload in fake_client.protections] == [None]
     with session_factory() as session:
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
+        convergences = session.query(TriggerTakeProfitConvergence).all()
     assert [event.action for event in events] == [
         "open_market_position",
-        "set_position_tpsl",
-        "set_position_tpsl",
         "set_position_tpsl",
     ]
     assert events[1].pos_id == "pos-1"
     assert '"stop_loss": "67500.0"' in (events[1].after_json or "")
-    assert '"take_profit": "69000.0"' in (events[2].after_json or "")
-    assert '"take_profit": "70000.0"' in (events[3].after_json or "")
+    assert len(convergences) == 1
+    assert convergences[0].status == "waiting_position"
+    assert json.loads(convergences[0].desired_take_profits_json) == [
+        {"allocation_pct": "50", "price": "69000"},
+        {"allocation_pct": "50", "price": "70000"},
+    ]
 
 
 def test_auto_process_message_trade_signal_records_entry_protection_ledger(tmp_path):
@@ -1652,14 +1648,13 @@ def test_auto_process_message_trade_signal_records_entry_protection_ledger(tmp_p
         leg_ids = {leg.id for leg in session.query(ExecutionOrderLeg).all()}
     assert [(row.order_id, row.pos_id, row.purpose, row.trigger_price) for row in rows] == [
         ("sltp-1", "pos-1", "stop_loss", "1788.0"),
-        ("sltp-2", "pos-1", "take_profit", "1955.0"),
     ]
     assert {row.execution_binding_id for row in rows} == binding_ids
     assert {row.execution_order_leg_id for row in rows} == leg_ids
     assert {row.evidence_source for row in rows} == {"entry_protection_response"}
 
 
-def test_auto_process_message_trade_signal_records_response_anchored_sibling_tpsl(tmp_path):
+def test_auto_process_message_trade_signal_records_response_anchored_primary_stop(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_message_id = _persist_candidate(
         session_factory,
@@ -1720,11 +1715,9 @@ def test_auto_process_message_trade_signal_records_response_anchored_sibling_tps
         )
     assert [(row.order_id, row.pos_id, row.purpose, row.trigger_price) for row in rows] == [
         ("sltp-1", "pos-1", "stop_loss", "1788.0"),
-        ("sltp-2", "pos-1", "take_profit", "1955.0"),
     ]
     assert {json.loads(row.evidence_json)["match"] for row in rows} == {
-        "response_anchored_order",
-        "response_anchored_sibling_tpsl",
+        "exchange_returned_order_id",
     }
 
 
@@ -1831,7 +1824,7 @@ def test_auto_process_message_trade_signal_records_combined_entry_protection(tmp
     with session_factory() as session:
         rows = session.query(PositionProtectionLedger).all()
     assert [(row.order_id, row.purpose, row.trigger_price) for row in rows] == [
-        ("combined-sltp-1", "combined", None)
+        ("combined-sltp-1", "stop_loss", "1788.0")
     ]
 
 
@@ -1988,7 +1981,7 @@ def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_
         "58988.3",
     ]
     assert fake_client.protections == []
-    assert fake_client.trigger_orders[0]["slTriggerPx"] == 57800.0
+    assert fake_client.trigger_orders[0]["slTriggerPx"] == "57800.0"
     assert all(not any(key.startswith("tp") for key in order) for order in fake_client.trigger_orders)
 
 

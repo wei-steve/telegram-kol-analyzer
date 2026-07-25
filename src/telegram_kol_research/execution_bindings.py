@@ -915,17 +915,31 @@ def _ready_verified_trigger_take_profit_convergences(
             continue
         binding = session.get(ExecutionBinding, row.execution_binding_id)
         inst_id = f"{str(binding.symbol).upper()}-USDT-SWAP" if binding is not None else ""
+        position_id = str(row.pos_id or leg.pos_id or "")
+        positions = [item for item in snapshot.positions if isinstance(item, dict)]
+        position_matches = [
+            item for item in positions
+            if binding is not None
+            and str(item.get("instId") or "").upper() == inst_id
+            and str(item.get("posId") or item.get("pos_id") or "") == position_id
+            and str(item.get("posSide") or item.get("side") or "").lower()
+            == str(binding.side).lower()
+            and str(item.get("mrgPosition") or item.get("posMode") or "").lower() == "split"
+        ]
         if (
             binding is None
-            or not str(row.pos_id or leg.pos_id or "").strip()
+            or not position_id
+            or len(position_matches) != 1
             or not has_verified_exact_backup_stop(
                 session,
                 binding_id=int(binding.id),
                 leg_id=int(leg.id),
-                pos_id=str(row.pos_id or leg.pos_id),
+                pos_id=position_id,
                 inst_id=inst_id,
                 side=str(binding.side).lower(),
                 pending=snapshot.pending_trigger_orders,
+                position=position_matches[0],
+                open_positions=positions,
             )
         ):
             row.status = "waiting_backup_stop"

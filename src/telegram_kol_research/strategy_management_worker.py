@@ -163,6 +163,7 @@ def run_strategy_management_worker_tick(
                 take_profit_convergence_runner(
                     session_factory,
                     deepcoin_client=get_client(),
+                    contract_spec_provider=contract_spec_provider,
                     processed_at=now,
                     limit=limit,
                 )

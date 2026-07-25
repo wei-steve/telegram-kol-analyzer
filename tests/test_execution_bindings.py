@@ -236,7 +236,7 @@ class _BackupStopSubmissionClient:
     def __init__(self, positions, *, responses=None):
         self.positions = list(positions)
         self.responses = list(responses or [])
-        self.trigger_payloads = []
+        self.sltp_payloads = []
         self.pending_rows = []
 
     def list_positions(self, *, inst_id=None):
@@ -244,15 +244,16 @@ class _BackupStopSubmissionClient:
             return self.positions
         return [row for row in self.positions if row.get("instId") == inst_id]
 
-    def trigger_order(self, payload):
-        self.trigger_payloads.append(payload)
+    def set_position_sltp(self, payload):
+        self.sltp_payloads.append(payload)
         response = self.responses.pop(0) if self.responses else {"code": "0", "data": "backup-1"}
         order_id = response.get("data") if isinstance(response, dict) else None
         if isinstance(order_id, str) and order_id:
             self.pending_rows.append({
                 "ordId": order_id, "instId": payload["instId"],
-                "closePosId": payload["closePosId"], "posSide": payload["posSide"],
-                "orderType": payload["orderType"], "triggerPrice": payload["triggerPrice"],
+                "posId": payload["posId"], "posSide": payload["posSide"],
+                "triggerOrderType": "TPSL", "sz": "0",
+                "slTriggerPx": payload["slTriggerPx"], "slOrdPx": payload["slOrdPx"],
             })
         return response
 
@@ -402,7 +403,7 @@ def test_reconcile_submits_one_exact_backup_stop_by_default_when_contract_specs_
     class BackupStopClient(_ProtectionAdoptionReconciliationClient):
         def __init__(self):
             super().__init__([_pending_combined_tpsl("tpsl-1")])
-            self.trigger_payloads = []
+            self.sltp_payloads = []
 
         def list_positions(self):
             return [{
@@ -410,11 +411,12 @@ def test_reconcile_submits_one_exact_backup_stop_by_default_when_contract_specs_
                 "pos": "4.4", "avgPx": "1883", "liqPx": "2000", "mrgPosition": "split",
             }]
 
-        def trigger_order(self, payload):
-            self.trigger_payloads.append(payload)
+        def set_position_sltp(self, payload):
+            self.sltp_payloads.append(payload)
             self.pending_rows.append({
-                "ordId": "backup-1", "instId": "ETH-USDT-SWAP", "closePosId": "pos-1",
-                "posSide": "short", "orderType": "market", "triggerPx": payload["triggerPrice"],
+                "ordId": "backup-1", "instId": "ETH-USDT-SWAP", "posId": "pos-1",
+                "posSide": "short", "triggerOrderType": "TPSL", "sz": "0",
+                "slTriggerPx": payload["slTriggerPx"], "slOrdPx": payload["slOrdPx"],
             })
             return {"code": "0", "data": "backup-1"}
 
@@ -435,10 +437,10 @@ def test_reconcile_submits_one_exact_backup_stop_by_default_when_contract_specs_
         contract_spec_provider=provider,
     )
 
-    assert len(client.trigger_payloads) == 1
-    assert client.trigger_payloads[0]["closePosId"] == "pos-1"
-    assert client.trigger_payloads[0]["side"] == "buy"
-    assert client.trigger_payloads[0]["triggerPrice"] == "1903.8"
+    assert len(client.sltp_payloads) == 1
+    assert client.sltp_payloads[0]["posId"] == "pos-1"
+    assert client.sltp_payloads[0]["posSide"] == "short"
+    assert client.sltp_payloads[0]["slTriggerPx"] == "1903.8"
     with session_factory() as session:
         row = session.query(PositionBackupStopOrder).one()
         assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")
@@ -463,8 +465,8 @@ def test_backup_submission_creates_stop_for_verified_market_entry(tmp_path):
     )
 
     assert submitted == 1
-    assert len(client.trigger_payloads) == 1
-    assert client.trigger_payloads[0]["closePosId"] == "pos-1"
+    assert len(client.sltp_payloads) == 1
+    assert client.sltp_payloads[0]["posId"] == "pos-1"
     with session_factory() as session:
         row = session.query(PositionBackupStopOrder).one()
     assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")
@@ -488,7 +490,7 @@ def test_backup_submission_excludes_manual_bound_position(tmp_path):
     )
 
     assert submitted == 0
-    assert client.trigger_payloads == []
+    assert client.sltp_payloads == []
     with session_factory() as session:
         assert session.query(PositionBackupStopOrder).count() == 0
 
@@ -511,7 +513,7 @@ def test_backup_submission_records_primary_stop_blocker_once(tmp_path):
             submitted_at=datetime(2026, 7, 20, 8, minute),
         ) == 0
 
-    assert client.trigger_payloads == []
+    assert client.sltp_payloads == []
     with session_factory() as session:
         incidents = session.query(PositionProtectionIncident).all()
     assert [(row.pos_id, row.incident_type, json.loads(row.evidence_json)) for row in incidents] == [
@@ -519,7 +521,7 @@ def test_backup_submission_records_primary_stop_blocker_once(tmp_path):
     ]
 
 
-def test_backup_submission_stops_batch_after_unknown_exchange_outcome(tmp_path):
+def test_backup_submission_stops_batch_after_unverified_native_tpsl_readback(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_exact_backup_candidate(
         session_factory, pos_id="pos-1", message_id=55, order_kind="trigger_limit"
@@ -549,23 +551,23 @@ def test_backup_submission_stops_batch_after_unknown_exchange_outcome(tmp_path):
     )
 
     assert submitted == 0
-    assert len(client.trigger_payloads) == 1
+    assert len(client.sltp_payloads) == 1
     with session_factory() as session:
         rows = session.query(PositionBackupStopOrder).order_by(PositionBackupStopOrder.pos_id).all()
         incidents = session.query(PositionProtectionIncident).all()
-    assert [(row.pos_id, row.status) for row in rows] == [("pos-1", "unknown_exchange_outcome")]
+    assert [(row.pos_id, row.status) for row in rows] == [("pos-1", "pending_readback")]
     assert [(row.pos_id, row.incident_type) for row in incidents] == [
-        ("pos-1", "backup_exchange_outcome_unknown")
+        ("pos-1", "backup_stop_pending_readback")
     ]
 
 
-def test_backup_submission_marks_response_unknown_until_exact_pending_readback(tmp_path):
+def test_backup_submission_marks_response_pending_until_exact_native_tpsl_readback(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_exact_backup_candidate(session_factory, order_kind="market")
 
     class NoReadbackClient(_BackupStopSubmissionClient):
-        def trigger_order(self, payload):
-            self.trigger_payloads.append(payload)
+        def set_position_sltp(self, payload):
+            self.sltp_payloads.append(payload)
             return {"code": "0", "data": "backup-1"}
 
     client = NoReadbackClient([{
@@ -578,7 +580,7 @@ def test_backup_submission_marks_response_unknown_until_exact_pending_readback(t
     ) == 0
     with session_factory() as session:
         row = session.query(PositionBackupStopOrder).one()
-    assert (row.order_id, row.status) == ("backup-1", "unknown_exchange_outcome")
+    assert (row.order_id, row.status) == ("backup-1", "pending_readback")
 
 
 def test_backup_submission_accepts_exact_order_readback_when_deepcoin_omits_position_id(tmp_path):
@@ -586,18 +588,19 @@ def test_backup_submission_accepts_exact_order_readback_when_deepcoin_omits_posi
     _seed_exact_backup_candidate(session_factory, order_kind="market")
 
     class OmittedPositionReadbackClient(_BackupStopSubmissionClient):
-        def trigger_order(self, payload):
-            self.trigger_payloads.append(payload)
+        def set_position_sltp(self, payload):
+            self.sltp_payloads.append(payload)
             self.pending_rows.append({
                 "ordId": "backup-1", "instId": payload["instId"],
-                "posSide": payload["posSide"], "orderType": payload["orderType"],
-                "triggerPrice": payload["triggerPrice"],
+                "posSide": payload["posSide"], "triggerOrderType": "TPSL", "sz": "0",
+                "slTriggerPx": payload["slTriggerPx"], "slOrdPx": payload["slOrdPx"],
+                "cTime": "1784512860000",
             })
             return {"code": "0", "data": "backup-1"}
 
     client = OmittedPositionReadbackClient([{
         "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
-        "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+        "pos": "4.4", "liqPx": "2000", "mrgPosition": "split", "cTime": "1784512860000",
     }])
     assert submit_verified_trigger_backup_stops(
         session_factory, client=client, contract_spec_provider=_backup_stop_provider(),
