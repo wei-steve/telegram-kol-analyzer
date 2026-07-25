@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.12, FastAPI, SQLAlchemy, Jinja2, pytest, existing DeepCoin REST client and protection-ledger models.
 
+**Recommended Execution Profile:** GPT-5.6 Terra, medium reasoning. Stop for review after the schema migration, the post-fill protection state machine, and server dry-run verification.
+
 ---
 
 ### Task 1: Normalize the official DeepCoin position identity fields
@@ -152,7 +154,194 @@ git add src/telegram_kol_research/position_tpsl_display.py src/telegram_kol_rese
 git commit -m "refactor: join TPSL orders to exact positions"
 ```
 
-### Task 3: Persist every verified position TPSL mapping
+### Task 3: Add one durable ledger row per logical protection leg
+
+**Files:**
+- Modify: `src/telegram_kol_research/models.py`
+- Modify: `src/telegram_kol_research/database.py`
+- Create: `src/telegram_kol_research/position_protection_legs.py`
+- Create: `tests/test_position_protection_legs.py`
+- Test: `tests/test_database.py`
+
+**Step 1: Write failing model and state-transition tests**
+
+Cover:
+
+- one `primary_stop`, one `backup_stop` and three `take_profit` rows for one entry leg;
+- stable idempotency on `(venue, execution_order_leg_id, role, leg_index)`;
+- creation before `pos_id` or exchange `order_id` exists;
+- binding the parent entry `ordId` after submission;
+- binding one exact `posId` after fill;
+- binding the actual protection `ordId` only after readback;
+- rejection of position or order identity changes after verification;
+- allowed lifecycle transitions and fail-closed unknown outcomes.
+
+Example:
+
+```python
+primary = create_or_get_protection_leg(
+    session,
+    venue="deepcoin",
+    execution_order_leg_id=entry_leg.id,
+    role="primary_stop",
+    leg_index=1,
+    planned_trigger_price="62000",
+    planned_size="3",
+)
+assert primary.status == "planned"
+assert primary.pos_id is None
+assert primary.exchange_order_id is None
+```
+
+**Step 2: Run tests and verify failure**
+
+Run:
+
+```bash
+pytest tests/test_position_protection_legs.py tests/test_database.py -q
+```
+
+Expected: FAIL because the model and helper do not exist.
+
+**Step 3: Add the schema and migration**
+
+Create `PositionProtectionLeg` with a generated `protection_leg_id`, binding/entry-leg
+foreign keys, role, leg index, planned price/size, nullable parent entry order ID,
+nullable `pos_id`, nullable exchange order ID, lifecycle state and request/response/readback
+evidence. Add unique constraints for logical identity and verified exchange identity.
+
+Do not weaken the existing `PositionProtectionLedger(venue, order_id)` uniqueness: it
+continues to represent one real exchange order. A combined exchange TPSL may be referenced
+by multiple logical protection legs.
+
+**Step 4: Implement guarded state transitions**
+
+Add explicit helpers for:
+
+```python
+bind_parent_entry_order(...)
+bind_filled_position(...)
+mark_protection_submitting(...)
+bind_verified_exchange_order(...)
+mark_protection_unknown(...)
+mark_protection_terminal(...)
+```
+
+Each helper must be idempotent for identical evidence and reject conflicting identity.
+
+**Step 5: Run focused tests**
+
+Run:
+
+```bash
+pytest tests/test_position_protection_legs.py tests/test_database.py -q
+```
+
+Expected: PASS.
+
+**Step 6: Commit**
+
+```bash
+git add src/telegram_kol_research/models.py src/telegram_kol_research/database.py \
+  src/telegram_kol_research/position_protection_legs.py \
+  tests/test_position_protection_legs.py tests/test_database.py
+git commit -m "feat: add logical protection leg ledger"
+```
+
+### Task 4: Carry attached stop and staged exits across entry fill
+
+**Files:**
+- Modify: `src/telegram_kol_research/recovery_live_submit.py`
+- Modify: `src/telegram_kol_research/trigger_protection_intents.py`
+- Modify: `src/telegram_kol_research/execution_bindings.py`
+- Modify: `src/telegram_kol_research/trigger_take_profit_convergence.py`
+- Modify: `src/telegram_kol_research/trigger_take_profit_convergence_executor.py`
+- Modify: `src/telegram_kol_research/trigger_backup_stop_executor.py`
+- Test: `tests/test_recovery_live_submit.py`
+- Test: `tests/test_execution_bindings.py`
+- Test: `tests/test_trigger_take_profit_convergence.py`
+- Test: `tests/test_trigger_take_profit_convergence_executor.py`
+- Test: `tests/test_trigger_backup_stop_executor.py`
+
+**Step 1: Write failing pre-fill ledger tests**
+
+Submit a trigger-limit entry containing an attached primary stop and a staged plan with
+multiple take-profits plus a backup stop. Assert that before the API call every logical
+protection leg exists, and after the response all of them reference the same parent entry
+`ordId` while `pos_id` and protection child `ordId` remain null.
+
+**Step 2: Run tests and verify failure**
+
+Run:
+
+```bash
+pytest tests/test_recovery_live_submit.py -k "trigger_protection or protection_leg" -q
+```
+
+Expected: FAIL because submission currently stores a combined intent/JSON plan rather than
+one unified ledger record per protection leg.
+
+**Step 3: Persist protection legs around the parent entry submission**
+
+Reuse `TriggerProtectionIntent` as recovery coordination, but make the new logical ledger
+authoritative for the individual primary stop, backup stop and TP legs. Persist the legs
+before `trigger_order()`, then bind the returned parent `ordId` idempotently.
+
+**Step 4: Write failing post-fill gating tests**
+
+Cover:
+
+- no second stop or TP creation before a unique verified `posId`;
+- no second stop or TP creation before the attached primary stop is adopted and verified;
+- exact child protection order adoption after fill;
+- one exchange mutation per staged TP/backup-stop leg;
+- restart between any two transitions without duplicates;
+- missing/ambiguous primary stop causing waiting/risk state rather than guessed attribution.
+
+**Step 5: Implement the post-fill state machine**
+
+After entry reconciliation:
+
+1. bind the exact `posId` to all planned protection legs;
+2. adopt the attached primary-stop child order and verify it by exchange readback;
+3. mark staged exits ready only after the primary stop is verified;
+4. submit the backup stop and each TP separately with the exact `posId`;
+5. update each logical leg from its own request, response and readback.
+
+**Step 6: Run affected tests**
+
+Run:
+
+```bash
+pytest \
+  tests/test_recovery_live_submit.py \
+  tests/test_execution_bindings.py \
+  tests/test_trigger_take_profit_convergence.py \
+  tests/test_trigger_take_profit_convergence_executor.py \
+  tests/test_trigger_backup_stop_executor.py -q
+```
+
+Expected: PASS.
+
+**Step 7: Commit**
+
+```bash
+git add \
+  src/telegram_kol_research/recovery_live_submit.py \
+  src/telegram_kol_research/trigger_protection_intents.py \
+  src/telegram_kol_research/execution_bindings.py \
+  src/telegram_kol_research/trigger_take_profit_convergence.py \
+  src/telegram_kol_research/trigger_take_profit_convergence_executor.py \
+  src/telegram_kol_research/trigger_backup_stop_executor.py \
+  tests/test_recovery_live_submit.py \
+  tests/test_execution_bindings.py \
+  tests/test_trigger_take_profit_convergence.py \
+  tests/test_trigger_take_profit_convergence_executor.py \
+  tests/test_trigger_backup_stop_executor.py
+git commit -m "fix: bind staged protection after entry fill"
+```
+
+### Task 5: Persist every verified position TPSL mapping
 
 **Files:**
 - Modify: `src/telegram_kol_research/protection_ledger.py`
@@ -248,7 +437,7 @@ git add \
 git commit -m "fix: persist exact TPSL position ownership"
 ```
 
-### Task 4: Add a fail-closed legacy evidence repair
+### Task 6: Add a fail-closed legacy evidence repair
 
 **Files:**
 - Create: `src/telegram_kol_research/tpsl_position_ledger_repair.py`
@@ -304,7 +493,7 @@ git add src/telegram_kol_research/tpsl_position_ledger_repair.py src/telegram_ko
 git commit -m "feat: repair exact TPSL position evidence"
 ```
 
-### Task 5: Render the official-style position card with strategy attribution
+### Task 7: Render the official-style position card with strategy attribution
 
 **Files:**
 - Modify: `src/telegram_kol_research/templates/_exchange_positions_panel.html`
@@ -358,7 +547,7 @@ git add src/telegram_kol_research/templates/_exchange_positions_panel.html src/t
 git commit -m "feat: render official-style position protection"
 ```
 
-### Task 6: Add optional WebSocket field verification without making it authoritative
+### Task 8: Add optional WebSocket field verification without making it authoritative
 
 **Files:**
 - Create: `scripts/deepcoin_private_ws_field_probe.py`
@@ -404,7 +593,7 @@ git add scripts/deepcoin_private_ws_field_probe.py tests/test_deepcoin_private_w
 git commit -m "test: verify DeepCoin websocket position fields"
 ```
 
-### Task 7: Complete local and production verification
+### Task 9: Complete local and production verification
 
 **Files:**
 - Modify: `docs/deepcoin-tpsl-live-verification-2026-07-25.md`

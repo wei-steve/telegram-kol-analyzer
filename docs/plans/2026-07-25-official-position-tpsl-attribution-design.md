@@ -65,9 +65,34 @@ position
     └── association_state
 ```
 
-现有 `PositionProtectionLedger` 作为通用订单到仓位账本；
-`PositionTakeProfitOrder` 继续保存分批止盈生命周期；
-`PositionBackupStopOrder` 继续保存第二止损执行生命周期。无需新增数据库表。
+新增 `PositionProtectionLeg` 作为“每一个逻辑保护腿一条记录”的生命周期账本。
+它在交易所提交前就存在，因此 `protection_leg_id` 永远有值，而 `parent_entry_order_id`、
+`pos_id` 和 `exchange_order_id` 可以随状态机逐步补齐：
+
+```text
+PositionProtectionLeg
+├── protection_leg_id
+├── execution_binding_id / execution_order_leg_id
+├── role: primary_stop | backup_stop | take_profit
+├── leg_index
+├── planned_trigger_price / planned_size
+├── parent_entry_order_id
+├── pos_id
+├── exchange_order_id
+├── status
+│   └── planned | waiting_fill | submitting | verified
+│       | triggered | cancelled | unknown_exchange_outcome
+└── request / response / readback evidence
+```
+
+现有 `PositionProtectionLedger` 保持为“已取得交易所订单 ID 后的
+`ordId ↔ posId` 精确映射账本”；`PositionTakeProfitOrder` 和
+`PositionBackupStopOrder` 继续保存各自执行生命周期，但它们必须引用对应的
+`protection_leg_id`，不能替代统一逻辑保护腿账本。
+
+这样即使 DeepCoin 把止盈和止损放在同一个组合 TPSL 订单中，也可以用同一个
+`exchange_order_id` 对应两个逻辑保护腿；交易所订单映射仍只保存一份，不复制或
+伪造订单 ID。
 
 ## 关联优先级
 
@@ -109,17 +134,62 @@ unresolved/conflicting TPSL ── global unattributed section
 
 所有关联函数保持纯只读。展示层不得改变订单修改、撤销和保护健康检查的安全边界。
 
+## 分阶段创建与绑定
+
+限价/触发入场使用以下状态机：
+
+```text
+保护计划持久化
+  └─ primary_stop / backup_stop / take_profit[1..n]
+          ↓
+父入场委托提交成功（记录 parent ordId / clOrdId）
+          ↓
+等待成交（此时不得伪造 posId 或保护子单 ordId）
+          ↓
+entry leg 精确绑定真实 posId
+          ↓
+认领并回读验证随父委托附带的主止损
+          ↓
+逐条创建第二止损和多段止盈
+          ↓
+每条按返回 ordId 回读，并写入精确交易所订单账本
+```
+
+父入场委托本身有 `ordId`，所以不存在“委托没有 ID”的问题；真正暂时不存在的是
+成交后的仓位 `posId`，以及 DeepCoin 为附带主止损生成的独立保护单 `ordId`。
+成交前以内部 `protection_leg_id + parent_entry_order_id` 保留完整意图，成交后再
+补齐真实身份。
+
+只有同时满足以下条件，才允许创建第二止损和多段止盈：
+
+1. entry leg 已成交并处于 active；
+2. entry leg 的归属状态为 verified；
+3. 已取得唯一真实 `posId`；
+4. 随入场委托附带的主止损已经按交易所回读认领并验证。
+
+如果主止损未出现、身份冲突或回读不完整，后续保护腿保持等待状态并触发风险事件，
+不能猜测仓位，也不能把计划记录伪装成已生效订单。
+
 ## 写入一致性
 
-每条 `set-position-sltp` 路径必须遵循：
+每一个逻辑止盈/止损腿必须遵循：
 
-1. 提交前持久化意图或保留现有事务性预留；
-2. 请求必须携带精确 `posId`；
-3. 从响应提取 `ordId`；
-4. 用 pending API 按 `ordId`、类型、触发价、数量和市场单语义回读；
-5. 回读成功后统一 upsert `PositionProtectionLedger`；
-6. 专用 TP/第二止损表按各自生命周期更新；
-7. 任何提交结果不明、缺少订单 ID、回读失败或本地冲突都冻结，不标记 verified。
+1. 在任何交易所写操作前创建独立 `PositionProtectionLeg`；
+2. 入场附带主止损先绑定父入场委托 ID，等待成交后认领保护子单；
+3. 成交后新增保护请求必须携带精确 `posId`；
+4. 从响应提取该保护单的 `ordId`；
+5. 用 pending API 按 `ordId`、类型、触发价、数量和市场单语义回读；
+6. 回读成功后 upsert `PositionProtectionLedger` 并把真实身份回填逻辑保护腿；
+7. 专用 TP/第二止损表引用同一 `protection_leg_id` 并更新各自生命周期；
+8. 任何提交结果不明、缺少订单 ID、回读失败或本地冲突都冻结，不标记 verified。
+
+账本不变量：
+
+- 每个计划中的 TP/SL 都恰好有一个逻辑保护腿；
+- 每个 verified 逻辑保护腿都必须有真实 `pos_id` 和 `exchange_order_id`；
+- 每个本系统创建并仍在交易所 pending 的保护单都必须有通用订单账本映射；
+- 同一个逻辑保护腿不能迁移到同币种的新仓位；
+- 专用 TP/第二止损记录与通用账本冲突时按事故处理，不静默覆盖。
 
 ## 旧数据修复
 
@@ -143,6 +213,10 @@ unresolved/conflicting TPSL ── global unattributed section
 ## 测试与验收
 
 - 单仓多 TP、多 SL 和组合 TPSL 全部保留为独立显示行；
+- 入场未成交时，每段计划 TP/SL 已有逻辑账本，但不会显示为交易所 active；
+- 入场成交并取得唯一 `posId` 前，不会创建第二止损或多段止盈；
+- 随入场委托附带的主止损必须先完成子单认领和回读验证；
+- 每一个 TP/SL 逻辑腿从 planned 到终态都有独立、连续、可审计的记录；
 - 交易所直接 `PositionID` 与本地 `ordId ↔ posId` 得到相同关联结果；
 - 两个同币种同方向分仓不会共享 `sz=0` TPSL；
 - 未归属订单只出现一次；

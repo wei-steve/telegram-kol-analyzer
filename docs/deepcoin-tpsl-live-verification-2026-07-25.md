@@ -151,3 +151,38 @@ and order.shown
 网页内部 `send-batch` 依赖官网登录态、网页签名和未公开契约，只能作为研究与
 人工诊断证据，不应成为生产交易或持仓页面的依赖。没有交易所 `PositionID`
 或本地持久化 `ordId ↔ posId` 的旧订单继续进入“未归属保护单”，不得自动猜测。
+
+## 分阶段保护单与账本结论
+
+补充审查日期：2026-07-25。
+
+系统的触发入场已经具备正确的两阶段基础：
+
+- 提交触发入场前创建 `TriggerProtectionIntent`；
+- DeepCoin 接受入场委托后保存父委托 `ordId`；
+- 入场成交并归属到唯一 entry leg 后取得真实 `posId`；
+- 随入场委托附带的主止损在成交后从交易所快照中认领；
+- 多段止盈通过 `TriggerTakeProfitConvergence` 等待真实仓位，再逐条提交；
+- 第二止损通过专用执行器在主止损验证后创建。
+
+因此，入场委托本身不存在 ID 缺失问题。成交前可使用父委托 `ordId/clOrdId`
+关联保护意图；暂时不存在的是仓位 `posId` 和成交后生成的保护子单 `ordId`。
+这两个值只能在成交和交易所回读后补齐，不能提前猜测。
+
+现有审计记录仍有结构性缺口：
+
+- `TriggerProtectionIntent` 是父委托级恢复记录，不是每个 TP/SL 一条记录；
+- 多段止盈计划以集合 JSON 保存，提交前没有逐腿生命周期；
+- `PositionProtectionLedger` 要求真实 `posId` 和 `order_id`，不能表达成交前计划；
+- `PositionTakeProfitOrder` 与 `PositionBackupStopOrder` 是专用执行记录，不能单独
+  充当所有保护单的统一审计账本。
+
+后续采用两层账本：
+
+1. 每一个主止损、第二止损和分段止盈都有独立逻辑保护腿，从 `planned` 开始记录；
+2. 取得并回读验证真实保护单 `ordId` 后，再写入
+   `PositionProtectionLedger(ordId ↔ posId)`。
+
+第二止损和多段止盈只有在 entry leg 已成交、归属 verified、取得唯一 `posId`，
+并且随入场委托附带的主止损已经认领和验证后才允许提交。任一步出现不确定结果，
+对应逻辑保护腿进入等待或未知状态，不得标记为交易所已生效。
