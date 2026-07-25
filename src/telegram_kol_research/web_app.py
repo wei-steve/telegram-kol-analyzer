@@ -2376,83 +2376,20 @@ def _split_exchange_protection_display_rows(
     exact_order_position_ids: dict[str, str] | None = None,
 ) -> tuple[dict[str, list[dict[str, str]]], list[dict[str, str]]]:
     """Separate exact position TPSL rows from exchange rows without an owner."""
+    from telegram_kol_research.position_tpsl_display import build_position_tpsl_display
 
-    positions_by_id = {
-        pos_id: position
-        for position in positions
-        if (pos_id := _first_position_string(position, "posId", "pos_id", "id"))
-    }
-    direct_orders: dict[str, list[dict[str, Any]]] = {
-        pos_id: [] for pos_id in positions_by_id
-    }
-    exact_order_position_ids = exact_order_position_ids or {}
-    unattributed_orders: list[dict[str, Any]] = []
-    for order in pending_orders:
-        order_pos_id = _first_position_string(
-            order,
-            "closePosId",
-            "close_pos_id",
-            "closePositionId",
-            "posId",
-            "pos_id",
-            "positionId",
-        )
-        order_id = _first_position_string(
-            order,
-            "ordId",
-            "orderId",
-            "order_id",
-            "algoId",
-            "triggerOrderId",
-            "id",
-        )
-        resolved_by_verified_local_order = False
-        if not order_pos_id:
-            order_pos_id = exact_order_position_ids.get(order_id or "")
-            resolved_by_verified_local_order = order_pos_id is not None
-        if order_pos_id in positions_by_id:
-            display_order = dict(order)
-            if resolved_by_verified_local_order:
-                # Preserve verified local ownership for the display renderer
-                # without mutating DeepCoin's raw order payload.
-                display_order["posId"] = order_pos_id
-            direct_orders[order_pos_id].append(display_order)
-        else:
-            unattributed_orders.append(order)
-
-    direct_rows = {
-        pos_id: _exchange_protection_display_rows(
-            position=position,
-            pending_orders=direct_orders[pos_id],
-        )
-        for pos_id, position in positions_by_id.items()
-    }
-    unattributed_rows: list[dict[str, str]] = []
-    for order in unattributed_orders:
-        display_order = dict(order)
-        for key in (
-            "closePosId",
-            "close_pos_id",
-            "closePositionId",
-            "posId",
-            "pos_id",
-            "positionId",
-        ):
-            display_order.pop(key, None)
-        rendered_rows = _exchange_protection_display_rows(
-            position={
-                "instId": display_order.get("instId"),
-                "posSide": display_order.get("posSide"),
-            },
-            pending_orders=[display_order],
-        )
-        for row in rendered_rows:
-            row["instrument_id"] = str(display_order.get("instId") or "").upper()
-            row["side"] = _normalize_deepcoin_position_side(
-                display_order.get("posSide")
-            )
-        unattributed_rows.extend(rendered_rows)
-    return direct_rows, unattributed_rows
+    display = build_position_tpsl_display(
+        positions=positions,
+        pending_orders=pending_orders,
+        exact_order_position_ids=exact_order_position_ids or {},
+    )
+    return (
+        {
+            pos_id: [row.as_dict() for row in rows]
+            for pos_id, rows in display.by_pos_id.items()
+        },
+        [row.as_dict() for row in display.unattributed],
+    )
 
 
 def _deepcoin_position_protection_key(position: dict[str, Any]) -> tuple[str, str, str, str]:
