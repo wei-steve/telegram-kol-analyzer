@@ -1275,6 +1275,51 @@ def test_unattributed_protection_rows_are_not_repeated_on_each_position():
     assert [row["order_id"] for row in unattributed_rows] == ["legacy-1"]
 
 
+def test_ledger_order_position_fallback_binds_unscoped_tpsl_to_live_position():
+    from telegram_kol_research.web_app import _split_exchange_protection_display_rows
+
+    direct_rows, unattributed_rows = _split_exchange_protection_display_rows(
+        positions=[
+            {"instId": "BTC-USDT-SWAP", "posId": "pos-a", "posSide": "long"},
+        ],
+        pending_orders=[
+            {
+                "ordId": "ledger-stop-1", "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP", "side": "sell",
+                "sz": "3", "slTriggerPx": "62000",
+            },
+            {
+                "ordId": "unknown-stop-1", "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP", "side": "sell",
+                "sz": "0", "slTriggerPx": "61000",
+            },
+        ],
+        exact_order_position_ids={"ledger-stop-1": "pos-a"},
+    )
+
+    assert [row["order_id"] for row in direct_rows["pos-a"]] == ["ledger-stop-1"]
+    assert [row["order_id"] for row in unattributed_rows] == ["unknown-stop-1"]
+
+
+def test_conflicting_exact_order_owners_fail_closed():
+    from telegram_kol_research.web_app import _register_exact_order_position_id
+
+    exact_order_position_ids: dict[str, str] = {}
+    conflicting_order_ids: set[str] = set()
+    _register_exact_order_position_id(
+        exact_order_position_ids, conflicting_order_ids, "shared-order-1", "pos-a"
+    )
+    _register_exact_order_position_id(
+        exact_order_position_ids, conflicting_order_ids, "shared-order-1", "pos-b"
+    )
+    _register_exact_order_position_id(
+        exact_order_position_ids, conflicting_order_ids, "shared-order-1", "pos-a"
+    )
+
+    assert exact_order_position_ids == {}
+    assert conflicting_order_ids == {"shared-order-1"}
+
+
 def test_execution_dashboard_uses_position_tpsl_fields_for_live_protection(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):

@@ -11,6 +11,7 @@ from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import MediaAsset
 from telegram_kol_research.models import MessageRecognition
 from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.models import PositionTakeProfitOrder
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import RecognitionDecision
 from telegram_kol_research.models import SignalCandidate
@@ -1691,6 +1692,76 @@ def test_positions_panel_lists_unattributed_protection_once_outside_position_car
     assert response.text.index("data-unattributed-protection-orders") > response.text.index(
         'data-exchange-view-panel="grouped"'
     )
+
+
+def test_ledger_order_position_fallback_renders_tpsl_on_exact_position(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:100", chat_id=100, message_id=1, symbol="BTC",
+            side="long", venue="deepcoin", status="active", pos_id="pos-a",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id, leg_index=1, purpose="entry",
+            order_kind="market", pos_id="pos-a", venue="deepcoin",
+            attribution_status="verified", status="active",
+            response_json=json.dumps({"posId": "pos-a"}),
+            attribution_evidence_json=json.dumps({"evidence_type": "exact_regular_order_id"}),
+        )
+        session.add(leg)
+        session.flush()
+        session.add(PositionProtectionLedger(
+            venue="deepcoin", execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id, pos_id="pos-a",
+            instrument_id="BTC-USDT-SWAP", side="long", order_id="ledger-tp-1",
+            purpose="take_profit", trigger_price="66000", status="verified",
+            evidence_source="native_tpsl_readback",
+        ))
+        session.add(PositionTakeProfitOrder(
+            venue="deepcoin", execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id, pos_id="pos-a",
+            order_id="recorded-tp-1", trigger_price="66500", status="active",
+        ))
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [{"instId": "BTC-USDT-SWAP", "posId": "pos-a", "posSide": "long", "pos": "3", "avgPx": "64000"}]
+
+        def list_open_orders(self, *, inst_id=None): return []
+        def list_order_history(self, *, inst_id=None): return []
+        def list_trigger_order_history(self, *, inst_id=None): return []
+        def list_position_history(self, *, inst_id=None): return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return [
+                {"ordId": "ledger-tp-1", "triggerOrderType": "TPSL", "instId": inst_id, "side": "sell", "sz": "3", "tpTriggerPx": "66000"},
+                {"ordId": "recorded-tp-1", "triggerOrderType": "TPSL", "instId": inst_id, "side": "sell", "sz": "1", "tpTriggerPx": "66500"},
+                {"ordId": "unknown-tp-1", "triggerOrderType": "TPSL", "instId": inst_id, "side": "sell", "sz": "0", "tpTriggerPx": "67000"},
+            ]
+
+    response = TestClient(create_web_app(
+        database_path=database_path, deepcoin_client_factory=FakeDeepcoinClient,
+    )).get("/positions-panel")
+
+    card = re.search(
+        r'<article class="exchange-position-card" data-position-pos-id="pos-a".*?</article>',
+        response.text,
+        re.DOTALL,
+    ).group(0)
+    summary = re.search(
+        r'<section[^>]*data-unattributed-protection-orders[^>]*>.*?</section>',
+        response.text,
+        re.DOTALL,
+    ).group(0)
+    assert "order ledger-tp-1" in card
+    assert "order ledger-tp-1" not in summary
+    assert "order recorded-tp-1" in card
+    assert "order recorded-tp-1" not in summary
+    assert "order unknown-tp-1" in summary
 
 
 def test_bound_position_close_renders_exact_context_for_bound_exchange_position(tmp_path):

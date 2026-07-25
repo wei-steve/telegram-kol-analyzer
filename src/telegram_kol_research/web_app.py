@@ -61,6 +61,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     PositionBackupStopOrder,
     PositionProtectionLedger,
+    PositionTakeProfitOrder,
     RecognitionDecision,
     StrategyManagementBatch,
     StrategyManagementLeg,
@@ -873,15 +874,6 @@ def _load_deepcoin_live_position_rows(
         deepcoin_client,
         active_positions,
     )
-    direct_protection_rows, pending_unattributed_rows = (
-        _split_exchange_protection_display_rows(
-            positions=active_positions,
-            pending_orders=tpsl_orders,
-        )
-    )
-    if unattributed_protection_rows is not None:
-        unattributed_protection_rows.extend(pending_unattributed_rows)
-
     with session_factory() as session:
         active_pos_ids = {
             pos_id
@@ -909,6 +901,7 @@ def _load_deepcoin_live_position_rows(
             )
         }
         exact_order_position_ids: dict[str, str] = {}
+        conflicting_order_ids: set[str] = set()
         verified_live_leg_ids: set[int] = set()
         for leg in legs:
             binding = bindings_by_id.get(int(leg.execution_binding_id))
@@ -943,7 +936,48 @@ def _load_deepcoin_live_position_rows(
                     and leg is not None
                     and int(leg.id) == int(ledger_row.execution_order_leg_id)
                 ):
-                    exact_order_position_ids[order_id] = pos_id
+                    _register_exact_order_position_id(
+                        exact_order_position_ids,
+                        conflicting_order_ids,
+                        order_id,
+                        pos_id,
+                    )
+        if verified_live_leg_ids:
+            for take_profit_order in (
+                session.query(PositionTakeProfitOrder)
+                .filter(PositionTakeProfitOrder.venue == "deepcoin")
+                .filter(
+                    PositionTakeProfitOrder.execution_order_leg_id.in_(
+                        verified_live_leg_ids
+                    )
+                )
+                .filter(PositionTakeProfitOrder.status == "active")
+                .all()
+            ):
+                order_id = str(take_profit_order.order_id or "").strip()
+                pos_id = str(take_profit_order.pos_id or "").strip()
+                leg = legs_by_pos_id.get(pos_id)
+                if (
+                    order_id
+                    and pos_id in active_pos_ids
+                    and leg is not None
+                    and int(leg.id) == int(take_profit_order.execution_order_leg_id)
+                ):
+                    _register_exact_order_position_id(
+                        exact_order_position_ids,
+                        conflicting_order_ids,
+                        order_id,
+                        pos_id,
+                    )
+        direct_protection_rows, pending_unattributed_rows = (
+            _split_exchange_protection_display_rows(
+                positions=active_positions,
+                pending_orders=tpsl_orders,
+                exact_order_position_ids=exact_order_position_ids,
+            )
+        )
+        if unattributed_protection_rows is not None:
+            unattributed_protection_rows.extend(pending_unattributed_rows)
         backup_by_leg_id = {
             int(row.execution_order_leg_id): row
             for row in (
@@ -2317,10 +2351,29 @@ def _exchange_protection_display_rows(
     )
 
 
+def _register_exact_order_position_id(
+    exact_order_position_ids: dict[str, str],
+    conflicting_order_ids: set[str],
+    order_id: str,
+    pos_id: str,
+) -> None:
+    """Record one exact order owner, failing closed on conflicting local evidence."""
+
+    if order_id in conflicting_order_ids:
+        return
+    existing_pos_id = exact_order_position_ids.get(order_id)
+    if existing_pos_id is not None and existing_pos_id != pos_id:
+        exact_order_position_ids.pop(order_id, None)
+        conflicting_order_ids.add(order_id)
+        return
+    exact_order_position_ids[order_id] = pos_id
+
+
 def _split_exchange_protection_display_rows(
     *,
     positions: list[dict[str, Any]],
     pending_orders: list[dict[str, Any]],
+    exact_order_position_ids: dict[str, str] | None = None,
 ) -> tuple[dict[str, list[dict[str, str]]], list[dict[str, str]]]:
     """Separate exact position TPSL rows from exchange rows without an owner."""
 
@@ -2332,6 +2385,7 @@ def _split_exchange_protection_display_rows(
     direct_orders: dict[str, list[dict[str, Any]]] = {
         pos_id: [] for pos_id in positions_by_id
     }
+    exact_order_position_ids = exact_order_position_ids or {}
     unattributed_orders: list[dict[str, Any]] = []
     for order in pending_orders:
         order_pos_id = _first_position_string(
@@ -2343,6 +2397,17 @@ def _split_exchange_protection_display_rows(
             "pos_id",
             "positionId",
         )
+        order_id = _first_position_string(
+            order,
+            "ordId",
+            "orderId",
+            "order_id",
+            "algoId",
+            "triggerOrderId",
+            "id",
+        )
+        if not order_pos_id:
+            order_pos_id = exact_order_position_ids.get(order_id or "")
         if order_pos_id in positions_by_id:
             direct_orders[order_pos_id].append(order)
         else:
