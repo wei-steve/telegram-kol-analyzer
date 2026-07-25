@@ -41,6 +41,9 @@ from telegram_kol_research.deepcoin_contract_specs import StaticDeepcoinContract
 from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.position_attribution import FillEvidence
+from telegram_kol_research.trigger_backup_stop_executor import (
+    submit_verified_trigger_backup_stops,
+)
 
 
 def _binding(**overrides):
@@ -227,6 +230,89 @@ class _ProtectionAdoptionReconciliationClient:
         return self.history_rows
 
 
+class _BackupStopSubmissionClient:
+    def __init__(self, positions, *, responses=None):
+        self.positions = list(positions)
+        self.responses = list(responses or [])
+        self.trigger_payloads = []
+
+    def list_positions(self, *, inst_id=None):
+        if inst_id is None:
+            return self.positions
+        return [row for row in self.positions if row.get("instId") == inst_id]
+
+    def trigger_order(self, payload):
+        self.trigger_payloads.append(payload)
+        return self.responses.pop(0) if self.responses else {"code": "0", "data": "backup-1"}
+
+
+def _backup_stop_provider():
+    return StaticDeepcoinContractSpecProvider({
+        "ETH-USDT-SWAP": DeepcoinContractSpec(
+            instrument_id="ETH-USDT-SWAP", contract_value=0.1, quantity_step=0.1,
+            min_quantity=0.1, price_tick=0.1,
+        )
+    })
+
+
+def _seed_exact_backup_candidate(
+    session_factory,
+    *,
+    pos_id="pos-1",
+    message_id=55,
+    order_kind="market",
+    with_primary=True,
+):
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            message_id=message_id,
+            symbol="ETH",
+            side="short",
+            order_id=f"entry-{pos_id}",
+            client_order_id=f"entry-client-{pos_id}",
+            status="active",
+        ),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        order_id=f"entry-{pos_id}",
+        client_order_id=f"entry-client-{pos_id}",
+        pos_id=pos_id,
+        status="active",
+        attribution_status="verified",
+        request={"instId": "ETH-USDT-SWAP", "orderType": order_kind},
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == binding_id)
+            .one()
+        )
+        leg.order_kind = order_kind
+        leg.attribution_evidence_json = json.dumps({"policy_version": 2})
+        if with_primary:
+            session.add(PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                pos_id=pos_id,
+                instrument_id="ETH-USDT-SWAP",
+                side="short",
+                order_id=f"primary-{pos_id}",
+                purpose="stop_loss",
+                trigger_price="1900",
+                status="verified",
+                evidence_source="test",
+                evidence_json="{}",
+            ))
+        session.commit()
+    return binding_id
+
+
 def test_reconcile_persists_raw_pending_tpsl_completeness_evidence(tmp_path):
     session_factory = create_session_factory(tmp_path / "pending-tpsl-audit.db")
     _seed_trigger_protection_adoption(session_factory)
@@ -338,11 +424,125 @@ def test_reconcile_submits_one_exact_backup_stop_by_default_when_contract_specs_
     assert len(client.trigger_payloads) == 1
     assert client.trigger_payloads[0]["closePosId"] == "pos-1"
     assert client.trigger_payloads[0]["side"] == "buy"
-    assert client.trigger_payloads[0]["triggerPrice"] == "1909.5"
+    assert client.trigger_payloads[0]["triggerPrice"] == "1903.8"
     with session_factory() as session:
         row = session.query(PositionBackupStopOrder).one()
         assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")
         assert session.query(ExecutionEvent).filter(ExecutionEvent.action == "create_backup_stop").count() == 1
+
+
+def test_backup_submission_creates_stop_for_verified_market_entry(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+    client = _BackupStopSubmissionClient([
+        {
+            "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+            "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+        }
+    ])
+
+    submitted = submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    assert submitted == 1
+    assert len(client.trigger_payloads) == 1
+    assert client.trigger_payloads[0]["closePosId"] == "pos-1"
+    with session_factory() as session:
+        row = session.query(PositionBackupStopOrder).one()
+    assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")
+
+
+def test_backup_submission_excludes_manual_bound_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="manual_bind")
+    client = _BackupStopSubmissionClient([
+        {
+            "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+            "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+        }
+    ])
+
+    submitted = submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    assert submitted == 0
+    assert client.trigger_payloads == []
+    with session_factory() as session:
+        assert session.query(PositionBackupStopOrder).count() == 0
+
+
+def test_backup_submission_records_primary_stop_blocker_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market", with_primary=False)
+    client = _BackupStopSubmissionClient([
+        {
+            "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+            "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+        }
+    ])
+
+    for minute in (5, 6):
+        assert submit_verified_trigger_backup_stops(
+            session_factory,
+            client=client,
+            contract_spec_provider=_backup_stop_provider(),
+            submitted_at=datetime(2026, 7, 20, 8, minute),
+        ) == 0
+
+    assert client.trigger_payloads == []
+    with session_factory() as session:
+        incidents = session.query(PositionProtectionIncident).all()
+    assert [(row.pos_id, row.incident_type, json.loads(row.evidence_json)) for row in incidents] == [
+        ("pos-1", "backup_stop_blocked", {"reason_code": "primary_stop_not_verified"})
+    ]
+
+
+def test_backup_submission_stops_batch_after_unknown_exchange_outcome(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_backup_candidate(
+        session_factory, pos_id="pos-1", message_id=55, order_kind="trigger_limit"
+    )
+    _seed_exact_backup_candidate(
+        session_factory, pos_id="pos-2", message_id=56, order_kind="trigger_limit"
+    )
+    client = _BackupStopSubmissionClient(
+        [
+            {
+                "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+                "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+            },
+            {
+                "instId": "ETH-USDT-SWAP", "posId": "pos-2", "posSide": "short",
+                "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+            },
+        ],
+        responses=[{}],
+    )
+
+    submitted = submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    assert submitted == 0
+    assert len(client.trigger_payloads) == 1
+    with session_factory() as session:
+        rows = session.query(PositionBackupStopOrder).order_by(PositionBackupStopOrder.pos_id).all()
+        incidents = session.query(PositionProtectionIncident).all()
+    assert [(row.pos_id, row.status) for row in rows] == [("pos-1", "unknown_exchange_outcome")]
+    assert [(row.pos_id, row.incident_type) for row in incidents] == [
+        ("pos-1", "backup_exchange_outcome_unknown")
+    ]
 
 
 def test_reconcile_marks_triggered_primary_stop_failure_and_deduplicates_exact_incident(tmp_path):

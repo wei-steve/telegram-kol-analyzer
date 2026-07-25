@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -14,10 +16,24 @@ from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionBackupStopOrder
+from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.position_attribution import has_authoritative_persisted_position
 from telegram_kol_research.trigger_backup_stop import BackupStopError
 from telegram_kol_research.trigger_backup_stop import build_backup_stop_trigger_payload
 from telegram_kol_research.trigger_backup_stop import calculate_backup_stop_price
+
+
+@dataclass(frozen=True, slots=True)
+class BackupStopPlan:
+    """One read-only result for a single exact-position backup-stop candidate."""
+
+    status: str
+    reason_code: str | None = None
+    binding_id: int | None = None
+    leg_id: int | None = None
+    pos_id: str | None = None
+    payload: dict[str, str] | None = None
 
 
 def submit_verified_trigger_backup_stops(
@@ -43,7 +59,7 @@ def submit_verified_trigger_backup_stops(
     submitted = 0
     for binding_id, leg_id, pos_id in candidates:
         with session_factory() as session:
-            candidate = _prepare_submission(
+            plan = _plan_submission(
                 session,
                 binding_id=binding_id,
                 leg_id=leg_id,
@@ -52,13 +68,22 @@ def submit_verified_trigger_backup_stops(
                 contract_spec_provider=contract_spec_provider,
                 submitted_at=submitted_at,
             )
-            if candidate is None:
+            if plan.status == "already_protected":
                 continue
-            row, payload = candidate
+            if plan.status != "ready" or plan.payload is None:
+                _record_incident(
+                    session,
+                    plan=plan,
+                    incident_type="backup_stop_blocked",
+                    observed_at=submitted_at,
+                )
+                session.commit()
+                continue
+            row = _reserve_submission(session, plan=plan, submitted_at=submitted_at)
             row_id = int(row.id)
             session.commit()
         try:
-            response = trigger_order(payload)
+            response = trigger_order(plan.payload)
             order_id = _response_order_id(response)
             if not order_id:
                 raise RuntimeError("backup stop response missing exchange order id")
@@ -69,8 +94,20 @@ def submit_verified_trigger_backup_stops(
                     row.status = "unknown_exchange_outcome"
                     row.error_json = json.dumps({"error": str(exc)}, ensure_ascii=False)
                     row.updated_at = submitted_at
+                    _record_incident(
+                        session,
+                        plan=BackupStopPlan(
+                            status="exchange_unavailable",
+                            reason_code="backup_exchange_outcome_unknown",
+                            binding_id=int(row.execution_binding_id),
+                            leg_id=int(row.execution_order_leg_id),
+                            pos_id=str(row.pos_id),
+                        ),
+                        incident_type="backup_exchange_outcome_unknown",
+                        observed_at=submitted_at,
+                    )
                     session.commit()
-            continue
+            return submitted
         with session_factory() as session:
             row = session.get(PositionBackupStopOrder, row_id)
             if row is None:
@@ -105,8 +142,9 @@ def _eligible_candidates(session) -> list[tuple[int, int, str]]:
         session.query(ExecutionBinding, ExecutionOrderLeg)
         .join(ExecutionOrderLeg, ExecutionOrderLeg.execution_binding_id == ExecutionBinding.id)
         .filter(ExecutionBinding.venue == "deepcoin")
+        .filter(ExecutionBinding.status.in_(("open", "active")))
         .filter(ExecutionOrderLeg.purpose == "entry")
-        .filter(ExecutionOrderLeg.order_kind == "trigger_limit")
+        .filter(ExecutionOrderLeg.order_kind != "manual_bind")
         .filter(ExecutionOrderLeg.status == "active")
         .filter(ExecutionOrderLeg.attribution_status == "verified")
         .order_by(ExecutionOrderLeg.id.asc())
@@ -115,12 +153,21 @@ def _eligible_candidates(session) -> list[tuple[int, int, str]]:
     result = []
     for binding, leg in rows:
         pos_id = str(leg.pos_id or "").strip()
-        if not pos_id:
+        if (
+            not pos_id
+            or _is_manual_operator_binding(leg)
+            or not has_authoritative_persisted_position(leg, session=session)
+        ):
             continue
         existing = (
             session.query(PositionBackupStopOrder.id)
             .filter(PositionBackupStopOrder.venue == "deepcoin")
             .filter(PositionBackupStopOrder.pos_id == pos_id)
+            .filter(
+                PositionBackupStopOrder.status.in_(
+                    ("submitting", "active", "unknown_exchange_outcome")
+                )
+            )
             .first()
         )
         if existing is None:
@@ -128,11 +175,35 @@ def _eligible_candidates(session) -> list[tuple[int, int, str]]:
     return result
 
 
-def _prepare_submission(session, *, binding_id, leg_id, pos_id, client, contract_spec_provider, submitted_at):
+def _plan_submission(session, *, binding_id, leg_id, pos_id, client, contract_spec_provider, submitted_at):
     binding = session.get(ExecutionBinding, binding_id)
     leg = session.get(ExecutionOrderLeg, leg_id)
     if binding is None or leg is None or str(leg.pos_id or "") != pos_id:
-        return None
+        return BackupStopPlan(
+            status="blocked", reason_code="binding_or_leg_unavailable",
+            binding_id=binding_id, leg_id=leg_id, pos_id=pos_id,
+        )
+    if str(binding.status or "").lower() not in {"open", "active"}:
+        return _blocked_plan(binding_id, leg_id, pos_id, "binding_not_active")
+    if _is_manual_operator_binding(leg):
+        return _blocked_plan(binding_id, leg_id, pos_id, "manual_binding")
+    if not has_authoritative_persisted_position(leg, session=session):
+        return _blocked_plan(binding_id, leg_id, pos_id, "position_not_authoritative")
+    existing = (
+        session.query(PositionBackupStopOrder.id)
+        .filter(PositionBackupStopOrder.venue == "deepcoin")
+        .filter(PositionBackupStopOrder.pos_id == pos_id)
+        .filter(
+            PositionBackupStopOrder.status.in_(
+                ("submitting", "active", "unknown_exchange_outcome")
+            )
+        )
+        .first()
+    )
+    if existing is not None:
+        return BackupStopPlan(
+            status="already_protected", binding_id=binding_id, leg_id=leg_id, pos_id=pos_id
+        )
     primary = (
         session.query(PositionProtectionLedger)
         .filter(PositionProtectionLedger.execution_binding_id == binding_id)
@@ -145,28 +216,39 @@ def _prepare_submission(session, *, binding_id, leg_id, pos_id, client, contract
     )
     primary_stop = _primary_stop_price(primary)
     if primary_stop is None:
-        return None
+        return _blocked_plan(binding_id, leg_id, pos_id, "primary_stop_not_verified")
     instrument_id = f"{str(binding.symbol).upper()}-USDT-SWAP"
     spec = contract_spec_provider.get_contract_spec(instrument_id)
     if spec is None:
-        return None
+        return _blocked_plan(binding_id, leg_id, pos_id, "contract_spec_unavailable")
     try:
         positions = client.list_positions(inst_id=instrument_id)
     except TypeError:
-        positions = client.list_positions()
+        try:
+            positions = client.list_positions()
+        except Exception:
+            return BackupStopPlan(
+                status="exchange_unavailable", reason_code="live_position_snapshot_unavailable",
+                binding_id=binding_id, leg_id=leg_id, pos_id=pos_id,
+            )
+    except Exception:
+        return BackupStopPlan(
+            status="exchange_unavailable", reason_code="live_position_snapshot_unavailable",
+            binding_id=binding_id, leg_id=leg_id, pos_id=pos_id,
+        )
     exact = [row for row in positions if isinstance(row, dict) and str(row.get("posId") or row.get("pos_id") or "") == pos_id]
     if len(exact) != 1:
-        return None
+        return _blocked_plan(binding_id, leg_id, pos_id, "live_position_not_unique")
     position = exact[0]
     if str(position.get("instId") or "").upper() != instrument_id:
-        return None
+        return _blocked_plan(binding_id, leg_id, pos_id, "live_position_instrument_mismatch")
     if str(position.get("posSide") or position.get("side") or "").lower() != str(binding.side).lower():
-        return None
+        return _blocked_plan(binding_id, leg_id, pos_id, "live_position_side_mismatch")
     if str(position.get("mrgPosition") or position.get("posMode") or "split").lower() != "split":
-        return None
+        return _blocked_plan(binding_id, leg_id, pos_id, "live_position_mode_not_split")
     liquidation = position.get("liqPx") or position.get("liquidationPrice")
     if liquidation in (None, "", "0"):
-        return None
+        return _blocked_plan(binding_id, leg_id, pos_id, "liquidation_price_unavailable")
     try:
         backup_price = calculate_backup_stop_price(
             primary_stop=primary_stop, side=binding.side,
@@ -182,17 +264,76 @@ def _prepare_submission(session, *, binding_id, leg_id, pos_id, client, contract
             ),
         )
     except BackupStopError:
-        return None
+        return _blocked_plan(binding_id, leg_id, pos_id, "backup_stop_unsafe")
+    return BackupStopPlan(
+        status="ready", binding_id=binding_id, leg_id=leg_id, pos_id=pos_id, payload=payload
+    )
+
+
+def _reserve_submission(session, *, plan: BackupStopPlan, submitted_at: datetime) -> PositionBackupStopOrder:
+    if (
+        plan.binding_id is None
+        or plan.leg_id is None
+        or plan.pos_id is None
+        or plan.payload is None
+    ):
+        raise ValueError("backup stop reservation requires a ready exact-position plan")
+    binding = session.get(ExecutionBinding, plan.binding_id)
+    if binding is None:
+        raise ValueError("backup stop binding disappeared before reservation")
     row = PositionBackupStopOrder(
-        venue="deepcoin", execution_binding_id=binding_id, execution_order_leg_id=leg_id,
-        pos_id=pos_id, instrument_id=instrument_id, side=str(binding.side).lower(),
-        trigger_price=backup_price, client_order_id=payload["clOrdId"], status="submitting",
-        request_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        venue="deepcoin", execution_binding_id=plan.binding_id, execution_order_leg_id=plan.leg_id,
+        pos_id=plan.pos_id, instrument_id=plan.payload["instId"], side=str(binding.side).lower(),
+        trigger_price=plan.payload["triggerPrice"], client_order_id=plan.payload["clOrdId"], status="submitting",
+        request_json=json.dumps(plan.payload, ensure_ascii=False, sort_keys=True),
         created_at=submitted_at, updated_at=submitted_at,
     )
     session.add(row)
     session.flush()
-    return row, payload
+    return row
+
+
+def _blocked_plan(binding_id: int, leg_id: int, pos_id: str, reason_code: str) -> BackupStopPlan:
+    return BackupStopPlan(
+        status="blocked", reason_code=reason_code, binding_id=binding_id, leg_id=leg_id, pos_id=pos_id
+    )
+
+
+def _is_manual_operator_binding(leg: ExecutionOrderLeg) -> bool:
+    if str(leg.order_kind or "").lower() == "manual_bind":
+        return True
+    try:
+        evidence = json.loads(str(leg.attribution_evidence_json or "{}"))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(evidence, dict) and evidence.get("source") == "manual_operator_bind"
+
+
+def _record_incident(
+    session,
+    *,
+    plan: BackupStopPlan,
+    incident_type: str,
+    observed_at: datetime,
+) -> None:
+    if plan.binding_id is None or plan.leg_id is None or not plan.pos_id:
+        return
+    evidence = {"reason_code": str(plan.reason_code or incident_type)}
+    fingerprint = hashlib.sha256(json.dumps({
+        "venue": "deepcoin", "binding_id": plan.binding_id, "leg_id": plan.leg_id,
+        "pos_id": plan.pos_id, "incident_type": incident_type, "evidence": evidence,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if session.query(PositionProtectionIncident.id).filter(
+        PositionProtectionIncident.fingerprint == fingerprint
+    ).first() is not None:
+        return
+    session.add(PositionProtectionIncident(
+        venue="deepcoin", execution_binding_id=plan.binding_id,
+        execution_order_leg_id=plan.leg_id, pos_id=plan.pos_id,
+        incident_type=incident_type, fingerprint=fingerprint,
+        evidence_json=json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+        delivery_status="pending", created_at=observed_at, updated_at=observed_at,
+    ))
 
 
 def _response_order_id(response: Any) -> str | None:
