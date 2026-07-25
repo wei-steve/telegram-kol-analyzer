@@ -978,6 +978,7 @@ def _require_fresh_close_write_boundary(
 ) -> None:
     """Re-read exact exchange positions at the shared close write boundary."""
 
+    _require_exact_protection_recovery_full_exit_bypass(batch)
     inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
     live_positions = list(deepcoin_client.list_positions(inst_id=inst_id))
     positions = _preflight_exact_position_identity(
@@ -1043,6 +1044,32 @@ def _require_fresh_close_write_boundary(
             raise ManagementBatchExecutionError(
                 "close_final_preflight_position_size_drift"
             )
+
+
+def _require_exact_protection_recovery_full_exit_bypass(
+    batch: ManagementBatchRecord,
+) -> None:
+    if batch.reason_code != "protection_recovery_bypassed_for_full_exit":
+        return
+    snapshot = batch.target_snapshot
+    marker = (
+        snapshot.get("protection_recovery_bypass")
+        if isinstance(snapshot, dict)
+        else None
+    )
+    expected_pos_ids = sorted(str(leg.pos_id) for leg in batch.legs)
+    if not isinstance(marker, dict) or (
+        marker.get("version") != 1
+        or marker.get("reason") != "protection_recovery_required"
+        or marker.get("allowed_action") != "full_exit"
+        or batch.effective_action != "full_exit"
+        or marker.get("target_lifecycle_id") != batch.target_lifecycle_id
+        or marker.get("execution_binding_id") != batch.execution_binding_id
+        or marker.get("target_pos_ids") != expected_pos_ids
+    ):
+        raise ManagementBatchExecutionError(
+            "close_final_preflight_protection_recovery_bypass_invalid"
+        )
 
 
 def _preflight_exact_position_identity(

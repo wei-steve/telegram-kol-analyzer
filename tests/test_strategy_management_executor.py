@@ -467,6 +467,84 @@ def test_close_legs_are_committed_reserved_before_exact_market_submission(tmp_pa
         assert [entry.status for entry in entries] == ["active", "active"]
 
 
+def test_protection_recovery_full_exit_requires_exact_immutable_bypass_marker(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("1", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    with session_factory() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        stored.reason_code = "protection_recovery_bypassed_for_full_exit"
+        snapshot = json.loads(stored.target_snapshot_json)
+        snapshot["protection_recovery_bypass"] = {
+            "version": 1,
+            "reason": "protection_recovery_required",
+            "allowed_action": "full_exit",
+            "target_lifecycle_id": stored.target_lifecycle_id,
+            "execution_binding_id": stored.execution_binding_id,
+            "target_pos_ids": ["pos-1"],
+        }
+        stored.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+    client = _FakeClient(session_factory)
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert client.calls == []
+    assert result["status"] == "recovery_required"
+    assert result["reason"] == "close_final_preflight_failed"
+
+
+def test_protection_recovery_full_exit_closes_only_marked_positions(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("1", "2"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    with session_factory() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        stored.reason_code = "protection_recovery_bypassed_for_full_exit"
+        snapshot = json.loads(stored.target_snapshot_json)
+        snapshot["protection_recovery_bypass"] = {
+            "version": 1,
+            "reason": "protection_recovery_required",
+            "allowed_action": "full_exit",
+            "target_lifecycle_id": stored.target_lifecycle_id,
+            "execution_binding_id": stored.execution_binding_id,
+            "target_pos_ids": ["pos-1", "pos-2"],
+        }
+        stored.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+    client = _FakeClient(session_factory)
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "reconciling"
+    assert [payload["closePosId"] for payload, _ in client.calls] == [
+        "pos-1",
+        "pos-2",
+    ]
+
+
 def test_close_batch_accepts_verified_entry_subset_with_pending_range_leg(tmp_path):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
 
