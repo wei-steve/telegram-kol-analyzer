@@ -1,6 +1,7 @@
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import PendingTpslSnapshotObservation
 from telegram_kol_research.protection_snapshot import (
+    build_position_protection_audit,
     observe_pending_tpsl,
     record_pending_tpsl_observation,
 )
@@ -45,3 +46,139 @@ def test_observation_is_persisted_append_only(tmp_path):
     assert rows[0].response_count == 1
     assert rows[0].order_ids_json == '["tp-1"]'
     assert rows[0].complete is True
+
+
+def test_position_audit_distinguishes_native_protection_manual_and_submit_response():
+    audit = build_position_protection_audit(
+        position={
+            "posId": "pos-1",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.006",
+            "cTime": "1000",
+        },
+        protection_ledger=[
+            {
+                "pos_id": "pos-1",
+                "purpose": "stop_loss",
+                "order_id": "primary-1",
+                "trigger_price": "63200",
+                "size_text": "0.006",
+                "status": "verified",
+                "evidence_source": "entry_protection_response",
+                "evidence_json": '{"match":"exchange_returned_order_id"}',
+            },
+            {
+                "pos_id": "pos-1",
+                "purpose": "take_profit",
+                "order_id": "tp-submit-only",
+                "trigger_price": "65000",
+                "size_text": "0.003",
+                "status": "verified",
+                "evidence_source": "tpsl_write_response",
+                "evidence_json": '{"match":"exchange_returned_order_id"}',
+            },
+        ],
+        backup_stops=[
+            {
+                "pos_id": "pos-1",
+                "order_id": "backup-1",
+                "trigger_price": "63073.6",
+                "status": "active",
+                "request_json": '{"slTriggerPx":"63073.6"}',
+            }
+        ],
+        take_profit_orders=[],
+        pending_trigger_orders=[
+            {
+                "ordId": "primary-1",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "long",
+                "sz": "0.006",
+                "slTriggerPx": "63200",
+            },
+            {
+                "ordId": "backup-1",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "long",
+                "sz": "0.006",
+                "slTriggerPx": "63073.6",
+            },
+            {
+                "ordId": "manual-63000",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "long",
+                "sz": "0",
+                "slTriggerPx": "63000",
+            },
+        ],
+    )
+
+    assert audit["primary_stop"] == {
+        "source": "entry",
+        "verification_status": "verified",
+        "matching_strategy": "order_id",
+        "order_id": "primary-1",
+    }
+    assert audit["backup_stop"] == {
+        "protocol": "native",
+        "verification_status": "verified",
+        "matching_strategy": "order_id",
+        "order_id": "backup-1",
+    }
+    assert audit["take_profits"] == [
+        {
+            "order_id": "tp-submit-only",
+            "verification_status": "submitted_response",
+            "matching_strategy": "order_id",
+        }
+    ]
+    assert audit["manual_order_detected"] is True
+    assert audit["manual_order_ids"] == ["manual-63000"]
+    assert audit["freeze_reasons"] == [
+        "manual_or_unowned_native_tpsl",
+        "submitted_response_not_verified",
+    ]
+    assert audit["protected"] is False
+
+
+def test_position_audit_marks_legacy_generic_backup_as_unprotected():
+    audit = build_position_protection_audit(
+        position={
+            "posId": "pos-1",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "pos": "0.006",
+            "cTime": "1000",
+        },
+        protection_ledger=[],
+        backup_stops=[
+            {
+                "pos_id": "pos-1",
+                "order_id": "generic-backup-1",
+                "trigger_price": "63073.6",
+                "status": "active",
+                "request_json": '{"triggerPrice":"63073.6","closePosId":"pos-1"}',
+            }
+        ],
+        take_profit_orders=[],
+        pending_trigger_orders=[],
+    )
+
+    assert audit["backup_stop"] == {
+        "protocol": "generic",
+        "verification_status": "legacy_generic",
+        "matching_strategy": "not_applicable",
+        "order_id": "generic-backup-1",
+    }
+    assert audit["freeze_reasons"] == [
+        "legacy_generic_backup_stop",
+        "primary_stop_missing",
+    ]
+    assert audit["protected"] is False

@@ -3,12 +3,272 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from telegram_kol_research.models import PendingTpslSnapshotObservation
+from telegram_kol_research.native_tpsl import (
+    NativeTpslExpectation,
+    match_native_tpsl_order,
+    native_tpsl_belongs_to_position,
+    normalize_native_tpsl,
+)
 
 
 _PAGINATION_KEYS = frozenset({"cursor", "nextcursor", "page", "total", "hasmore"})
+
+
+def build_position_protection_audit(
+    *,
+    position: dict[str, Any],
+    protection_ledger: Iterable[object],
+    backup_stops: Iterable[object],
+    take_profit_orders: Iterable[object],
+    pending_trigger_orders: Iterable[dict[str, Any]],
+    freeze_reasons: Iterable[object] = (),
+    open_positions: Iterable[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Summarize one position's protection from read-only evidence.
+
+    An API acknowledgement alone is deliberately not verification.  A native
+    order is verified only when its pending-TPSL row can be matched back to its
+    durable local record.
+    """
+
+    pos_id = _text(position.get("posId") or position.get("pos_id") or position.get("id"))
+    pending = [row for row in pending_trigger_orders if isinstance(row, dict)]
+    scope = list(open_positions) if open_positions is not None else [position]
+    ledger_rows = [row for row in protection_ledger if _field(row, "pos_id") == pos_id]
+    backup_rows = [row for row in backup_stops if _field(row, "pos_id") == pos_id]
+    take_profit_rows = [row for row in take_profit_orders if _field(row, "pos_id") == pos_id]
+
+    primary_rows = [
+        row for row in ledger_rows
+        if _text(_field(row, "purpose")) in {"stop_loss", "combined"}
+    ]
+    primary = _primary_stop_summary(position, pending, scope, primary_rows)
+    backup = _backup_stop_summary(position, pending, scope, backup_rows)
+    take_profits = _take_profit_summaries(
+        position,
+        pending,
+        scope,
+        ledger_rows=ledger_rows,
+        take_profit_rows=take_profit_rows,
+    )
+
+    known_order_ids = {
+        order_id
+        for row in [*ledger_rows, *backup_rows, *take_profit_rows]
+        if (order_id := _text(_field(row, "order_id")))
+    }
+    manual_order_ids = sorted(
+        {
+            order.ord_id
+            for raw in pending
+            if (order := normalize_native_tpsl(raw))
+            and order.ord_id
+            and order.ord_id not in known_order_ids
+            and _unowned_native_order_can_affect_position(order, position)
+        }
+    )
+    reasons = {
+        _text(_field(reason, "reason") or _field(reason, "incident_type") or reason)
+        for reason in freeze_reasons
+        if _text(_field(reason, "reason") or _field(reason, "incident_type") or reason)
+    }
+    if primary["verification_status"] == "none":
+        reasons.add("primary_stop_missing")
+    elif primary["verification_status"] != "verified":
+        reasons.add(f"primary_stop_{primary['verification_status']}")
+    if backup["protocol"] == "none":
+        reasons.add("backup_stop_missing")
+    elif backup["verification_status"] == "legacy_generic":
+        reasons.add("legacy_generic_backup_stop")
+    elif backup["verification_status"] != "verified":
+        reasons.add(f"backup_stop_{backup['verification_status']}")
+    if any(item["verification_status"] == "submitted_response" for item in take_profits):
+        reasons.add("submitted_response_not_verified")
+    if any(item["verification_status"] == "ambiguous" for item in take_profits):
+        reasons.add("take_profit_ambiguous")
+    if manual_order_ids:
+        reasons.add("manual_or_unowned_native_tpsl")
+
+    protected = (
+        primary["verification_status"] == "verified"
+        and backup["protocol"] == "native"
+        and backup["verification_status"] == "verified"
+        and all(item["verification_status"] == "verified" for item in take_profits)
+        and not manual_order_ids
+    )
+    matching_strategies = sorted(
+        {
+            item["matching_strategy"]
+            for item in [primary, backup, *take_profits]
+            if item["matching_strategy"] not in {"not_applicable", "none"}
+        }
+    )
+    return {
+        "pos_id": pos_id,
+        "primary_stop": primary,
+        "backup_stop": backup,
+        "take_profits": take_profits,
+        "matching_strategies": matching_strategies,
+        "manual_order_detected": bool(manual_order_ids),
+        "manual_order_ids": manual_order_ids,
+        "freeze_reasons": sorted(reasons),
+        "protected": protected,
+    }
+
+
+def _primary_stop_summary(position, pending, scope, rows):
+    if not rows:
+        return _empty_stop(source="none")
+    row = _latest_row(rows)
+    source = "entry" if "entry" in (_text(_field(row, "evidence_source")) or "") else "native"
+    return {
+        "source": source,
+        **_native_verification_summary(position, pending, scope, row, purpose="stop_loss"),
+    }
+
+
+def _backup_stop_summary(position, pending, scope, rows):
+    if not rows:
+        return {
+            "protocol": "none",
+            "verification_status": "none",
+            "matching_strategy": "none",
+            "order_id": None,
+        }
+    row = _latest_row(rows)
+    request = _json_value(_field(row, "request_json"))
+    protocol = "native" if any(key in request for key in ("slTriggerPx", "slTriggerPrice")) else "generic"
+    if protocol == "generic":
+        return {
+            "protocol": "generic",
+            "verification_status": "legacy_generic",
+            "matching_strategy": "not_applicable",
+            "order_id": _text(_field(row, "order_id")),
+        }
+    return {
+        "protocol": "native",
+        **_native_verification_summary(position, pending, scope, row, purpose="stop_loss"),
+    }
+
+
+def _take_profit_summaries(position, pending, scope, *, ledger_rows, take_profit_rows):
+    rows_by_id: dict[str, object] = {}
+    for row in [
+        *[row for row in ledger_rows if _text(_field(row, "purpose")) == "take_profit"],
+        *take_profit_rows,
+    ]:
+        if (order_id := _text(_field(row, "order_id"))):
+            rows_by_id[order_id] = row
+    return [
+        _native_verification_summary(position, pending, scope, row, purpose="take_profit")
+        for _, row in sorted(rows_by_id.items())
+    ]
+
+
+def _native_verification_summary(position, pending, scope, row, *, purpose):
+    order_id = _text(_field(row, "order_id"))
+    trigger_price = _field(row, "trigger_price")
+    size_text = _field(row, "size_text")
+    evidence_source = _text(_field(row, "evidence_source")) or ""
+    actual = next(
+        (
+            order for raw in pending
+            if (order := normalize_native_tpsl(raw)) and order.ord_id == order_id
+        ),
+        None,
+    )
+    expected_size = size_text if _decimal(size_text) is not None else (actual.size if actual else None)
+    status = "not_read_back"
+    if not order_id or _decimal(trigger_price) is None or expected_size is None:
+        status = "invalid_local_evidence"
+    else:
+        try:
+            match = match_native_tpsl_order(
+                position,
+                pending,
+                NativeTpslExpectation(
+                    purpose=purpose,
+                    trigger_price=trigger_price,
+                    size=expected_size,
+                    ord_id=order_id,
+                ),
+                open_positions=scope,
+            )
+            status = match.status
+        except (TypeError, ValueError):
+            status = "invalid_local_evidence"
+    if status == "not_found":
+        if _text(_field(row, "status")) == "pending_readback":
+            status = "pending_readback"
+        elif evidence_source == "tpsl_write_response":
+            status = "submitted_response"
+        else:
+            status = "not_read_back"
+    return {
+        "order_id": order_id,
+        "verification_status": status,
+        "matching_strategy": "order_id" if order_id else "none",
+    }
+
+
+def _empty_stop(*, source):
+    return {
+        "source": source,
+        "verification_status": "none",
+        "matching_strategy": "none",
+        "order_id": None,
+    }
+
+
+def _unowned_native_order_can_affect_position(order, position):
+    pos_id = _text(position.get("posId") or position.get("pos_id") or position.get("id"))
+    if order.pos_id and order.pos_id == pos_id:
+        return True
+    if order.size == Decimal("0"):
+        position_inst_id = _text(position.get("instId") or position.get("inst_id")) or ""
+        position_side = _text(position.get("posSide") or position.get("side")) or ""
+        return (
+            order.inst_id == position_inst_id.upper()
+            and order.pos_side == position_side.lower()
+        )
+    return native_tpsl_belongs_to_position(position, order)
+
+
+def _latest_row(rows):
+    return sorted(rows, key=lambda row: str(_field(row, "id") or ""))[-1]
+
+
+def _field(value, name):
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _text(value):
+    return str(value).strip() if value not in (None, "") else None
+
+
+def _json_value(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _decimal(value):
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
 
 
 def observe_pending_tpsl(
