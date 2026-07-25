@@ -318,6 +318,7 @@ def execute_management_batch(
     if batch.effective_action not in {"full_close", "full_exit"}:
         _require_exact_entry_legs(session_factory, batch)
     try:
+        _require_exact_protection_recovery_full_exit_bypass(batch)
         if batch.effective_action in {"full_close", "full_exit"}:
             _require_exact_entry_legs(session_factory, batch)
         _cancel_deferred_entry_legs(
@@ -343,9 +344,14 @@ def execute_management_batch(
             new_status="recovery_required",
             transitioned_at=now,
             reason_code=(
-                "deferred_entry_cancel_race_detected"
-                if isinstance(exc, DeepcoinDefiniteRejection)
-                else "deferred_entry_cancel_preflight_failed"
+                "close_final_preflight_failed"
+                if str(exc)
+                == "close_final_preflight_protection_recovery_bypass_invalid"
+                else (
+                    "deferred_entry_cancel_race_detected"
+                    if isinstance(exc, DeepcoinDefiniteRejection)
+                    else "deferred_entry_cancel_preflight_failed"
+                )
             ),
         ):
             raise ManagementBatchExecutionError(
@@ -354,9 +360,14 @@ def execute_management_batch(
         return _result(
             load_management_batch(session_factory, batch.id),
             reason=(
-                "deferred_entry_cancel_race_detected"
-                if isinstance(exc, DeepcoinDefiniteRejection)
-                else "deferred_entry_cancel_preflight_failed"
+                "close_final_preflight_failed"
+                if str(exc)
+                == "close_final_preflight_protection_recovery_bypass_invalid"
+                else (
+                    "deferred_entry_cancel_race_detected"
+                    if isinstance(exc, DeepcoinDefiniteRejection)
+                    else "deferred_entry_cancel_preflight_failed"
+                )
             ),
         )
     try:
@@ -978,7 +989,6 @@ def _require_fresh_close_write_boundary(
 ) -> None:
     """Re-read exact exchange positions at the shared close write boundary."""
 
-    _require_exact_protection_recovery_full_exit_bypass(batch)
     inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
     live_positions = list(deepcoin_client.list_positions(inst_id=inst_id))
     positions = _preflight_exact_position_identity(
