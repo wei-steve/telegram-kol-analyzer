@@ -14,6 +14,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionProtectionIncident,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -243,6 +244,27 @@ def _persist_exact_management_target(
         )
         session.commit()
         return management.id, lifecycle_b.id, binding_b.id if binding_b else None
+
+
+def _persist_open_protection_incident(session_factory, *, binding_id, pos_id="pos-b"):
+    with session_factory() as session:
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, pos_id=pos_id)
+            .one()
+        )
+        session.add(
+            PositionProtectionIncident(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                pos_id=pos_id,
+                incident_type="protection_unknown",
+                fingerprint=("bypass-incident-" + pos_id).ljust(64, "x")[:64],
+                evidence_json="{}",
+            )
+        )
+        session.commit()
 
 
 def _persist_partial_filled_range_management_target(session_factory, *, both_pending=False):
@@ -684,6 +706,96 @@ def test_pending_only_range_entry_still_blocks_management(monkeypatch, tmp_path)
     assert result.status == "blocked"
     assert result.reason_code == "target_position_ownership_not_verified"
     assert result.batch.legs == ()
+
+
+def test_full_exit_bypasses_open_protection_incident_for_exact_position(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    _persist_open_protection_incident(session_factory, binding_id=binding_id)
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position("pos-b")]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.reason_code == "protection_recovery_bypassed_for_full_exit"
+    assert result.batch.target_snapshot["protection_recovery_bypass"] == {
+        "version": 1,
+        "reason": "protection_recovery_required",
+        "allowed_action": "full_exit",
+        "target_lifecycle_id": lifecycle_id,
+        "execution_binding_id": binding_id,
+        "target_pos_ids": ["pos-b"],
+    }
+
+
+def test_full_exit_replaces_its_zero_leg_protection_recovery_block(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    _persist_open_protection_incident(session_factory, binding_id=binding_id)
+    _disable_reconciliation(monkeypatch, planner)
+    identity = planner._load_exact_identity(session_factory, raw_message_id=raw_id)
+    blocked = planner._persist_blocked(
+        session_factory,
+        identity=identity,
+        raw_message_id=raw_id,
+        intent="full_exit",
+        reason_code="protection_recovery_required",
+        planned_at=PLANNED_AT,
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position("pos-b")]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT + timedelta(seconds=1),
+    )
+
+    assert result.status == "ready"
+    assert result.batch.id == blocked.batch.id
+    assert result.batch.reason_code == "protection_recovery_bypassed_for_full_exit"
+
+
+@pytest.mark.parametrize(
+    "intent", ["adjust_stop_loss", "move_stop_to_break_even", "partial_take_profit"]
+)
+def test_open_protection_incident_still_blocks_non_full_exit(
+    monkeypatch, tmp_path, intent
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory, intent=intent
+    )
+    _persist_open_protection_incident(session_factory, binding_id=binding_id)
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position("pos-b")]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "protection_recovery_required"
 
 
 @pytest.mark.parametrize(

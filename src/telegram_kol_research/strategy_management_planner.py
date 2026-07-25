@@ -310,16 +310,19 @@ def _plan_strategy_management_batch_locked(
         )
     target_entry_legs = entry_leg_plan.target_legs
     with session_factory() as session:
-        if _protection_incident_requires_recovery(session, entry_legs=target_entry_legs):
-            return _persist_blocked(
-                session_factory,
-                identity=identity,
-                raw_message_id=raw_message_id,
-                intent=intent,
-                reason_code="protection_recovery_required",
-                planned_at=now,
-                execution_mode=execution_mode,
-            )
+        protection_recovery_bypass = _protection_incident_requires_recovery(
+            session, entry_legs=target_entry_legs
+        )
+    if protection_recovery_bypass and intent != "full_exit":
+        return _persist_blocked(
+            session_factory,
+            identity=identity,
+            raw_message_id=raw_message_id,
+            intent=intent,
+            reason_code="protection_recovery_required",
+            planned_at=now,
+            execution_mode=execution_mode,
+        )
     target_legs_by_pos_id = _leg_by_pos_id(target_entry_legs)
 
     instrument_id = f"{str(lifecycle.symbol).upper()}-USDT-SWAP"
@@ -578,6 +581,17 @@ def _plan_strategy_management_batch_locked(
         "contract_spec": contract_spec.to_dict(),
         "protection": protection_by_pos_id,
     }
+    if protection_recovery_bypass:
+        target_snapshot["protection_recovery_bypass"] = {
+            "version": 1,
+            "reason": "protection_recovery_required",
+            "allowed_action": "full_exit",
+            "target_lifecycle_id": lifecycle.id,
+            "execution_binding_id": binding.id,
+            "target_pos_ids": sorted(
+                str(position["pos_id"]) for position in economics
+            ),
+        }
     target_fingerprint = management_target_fingerprint(target_snapshot)
     legs_by_pos_id = target_legs_by_pos_id
     batch_legs = [
@@ -646,7 +660,11 @@ def _plan_strategy_management_batch_locked(
                         else (
                             "management_disabled_plan_only"
                             if execution_mode == "disabled"
-                            else None
+                            else (
+                                "protection_recovery_bypassed_for_full_exit"
+                                if protection_recovery_bypass
+                                else None
+                            )
                         )
                     ),
                     validate_current_state=lambda current_session: (
@@ -682,7 +700,11 @@ def _plan_strategy_management_batch_locked(
                         else (
                             "management_disabled_plan_only"
                             if execution_mode == "disabled"
-                            else None
+                            else (
+                                "protection_recovery_bypassed_for_full_exit"
+                                if protection_recovery_bypass
+                                else None
+                            )
                         )
                     ),
                     partial_policy_state=partial_policy_state,
@@ -1256,7 +1278,7 @@ def _retryable_preflight_blocked_batch(
         return False
     if batch.status != "blocked":
         return False
-    if batch.reason_code not in RETRYABLE_PREFLIGHT_BLOCK_REASONS:
+    if not _is_retryable_preflight_reason(batch):
         return False
     if batch.reason_code in _TEMPORARY_PROTECTION_VISIBILITY_REASONS:
         reference = now or datetime.now(UTC)
@@ -1272,6 +1294,16 @@ def _retryable_preflight_blocked_batch(
         return False
     positions = snapshot.get("positions")
     return positions == [] or positions is None
+
+
+def _is_retryable_preflight_reason(batch: ManagementBatchRecord) -> bool:
+    if batch.reason_code in RETRYABLE_PREFLIGHT_BLOCK_REASONS:
+        return True
+    return bool(
+        batch.reason_code == "protection_recovery_required"
+        and batch.intent == "full_exit"
+        and batch.effective_action == "full_exit"
+    )
 
 
 _TEMPORARY_PROTECTION_VISIBILITY_REASONS = frozenset(
@@ -1339,7 +1371,7 @@ def _replace_retryable_preflight_blocked_batch_in_session(
         or batch.strategy_instance_id != str(identity.binding.strategy_instance_id)
         or batch.intent != intent
         or batch.status != "blocked"
-        or batch.reason_code not in RETRYABLE_PREFLIGHT_BLOCK_REASONS
+        or not _is_retryable_preflight_reason(batch)
         or not isinstance(snapshot, dict)
         or snapshot.get("blocked_reason") != batch.reason_code
     ):
