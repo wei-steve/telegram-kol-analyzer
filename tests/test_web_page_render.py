@@ -1761,6 +1761,14 @@ def test_ledger_order_position_fallback_renders_tpsl_on_exact_position(tmp_path)
     assert "order ledger-tp-1" not in summary
     assert "order recorded-tp-1" in card
     assert "order recorded-tp-1" not in summary
+    assert re.search(
+        r"order ledger-tp-1</code>\s*<span class=\"exchange-attribution-chip\">已验证归属</span>",
+        card,
+    )
+    assert re.search(
+        r"order recorded-tp-1</code>\s*<span class=\"exchange-attribution-chip\">已验证归属</span>",
+        card,
+    )
     assert "order unknown-tp-1" in summary
 
 

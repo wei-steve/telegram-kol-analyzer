@@ -2406,10 +2406,17 @@ def _split_exchange_protection_display_rows(
             "triggerOrderId",
             "id",
         )
+        resolved_by_verified_local_order = False
         if not order_pos_id:
             order_pos_id = exact_order_position_ids.get(order_id or "")
+            resolved_by_verified_local_order = order_pos_id is not None
         if order_pos_id in positions_by_id:
-            direct_orders[order_pos_id].append(order)
+            display_order = dict(order)
+            if resolved_by_verified_local_order:
+                # Preserve verified local ownership for the display renderer
+                # without mutating DeepCoin's raw order payload.
+                display_order["posId"] = order_pos_id
+            direct_orders[order_pos_id].append(display_order)
         else:
             unattributed_orders.append(order)
 
