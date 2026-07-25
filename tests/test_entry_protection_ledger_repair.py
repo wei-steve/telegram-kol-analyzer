@@ -23,8 +23,10 @@ from telegram_kol_research.models import (
 class FakeDeepcoinClient:
     def __init__(self, rows):
         self.rows = rows
+        self.pending_calls = []
 
     def list_trigger_orders_pending(self, *, inst_id):
+        self.pending_calls.append(inst_id)
         return [
             row for row in self.rows if str(row.get("instId") or "").upper() == inst_id
         ]
@@ -124,6 +126,34 @@ def test_entry_protection_repair_refuses_when_returned_order_missing(tmp_path):
 
     assert plan.actions == ()
     assert plan.refusals[0].reason == "returned_order_not_pending"
+
+
+def test_entry_protection_repair_reads_pending_orders_once_per_instrument(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_entry_protection_event(
+        session_factory,
+        binding_id=149,
+        leg_id_holder=[],
+        pos_id="pos-1",
+        returned_order_id="tpsl-1",
+    )
+    _seed_entry_protection_event(
+        session_factory,
+        binding_id=150,
+        leg_id_holder=[],
+        pos_id="pos-2",
+        returned_order_id="tpsl-2",
+        message_id=1845,
+    )
+    client = FakeDeepcoinClient([])
+
+    build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 18, 8, 0, tzinfo=UTC),
+    )
+
+    assert client.pending_calls == ["ETH-USDT-SWAP"]
 
 
 def test_entry_protection_repair_refuses_ambiguous_sibling(tmp_path):
@@ -1017,6 +1047,7 @@ def _seed_entry_protection_event(
     pos_id,
     returned_order_id,
     attribution_status="verified",
+    message_id=1844,
 ):
     with session_factory() as session:
         binding = ExecutionBinding(
@@ -1024,7 +1055,7 @@ def _seed_entry_protection_event(
             strategy_instance_id="deepcoin:-1003825498321:1844:ETH:long",
             kol_id="group:-1003825498321",
             chat_id=-1003825498321,
-            message_id=1844,
+            message_id=message_id,
             symbol="ETH",
             side="long",
             venue="deepcoin",

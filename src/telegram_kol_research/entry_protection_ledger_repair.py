@@ -302,9 +302,8 @@ def _plan_event_repair(
     response_order_ids = _response_order_ids(response)
     if not response_order_ids:
         return [], _refusal(event, "response_order_id_missing")
-    pending_rows = pending_cache.setdefault(
-        instrument_id,
-        _safe_pending_tpsl_rows(deepcoin_client, inst_id=instrument_id),
+    pending_rows = _cached_pending_tpsl_rows(
+        pending_cache, deepcoin_client=deepcoin_client, inst_id=instrument_id
     )
     pending_by_order_id = {
         order_id: row
@@ -458,9 +457,8 @@ def _plan_trigger_entry_repair(
             reason="trigger_entry_tpsl_identity_conflict",
             evidence={"candidate_order_ids": exact_order_ids},
         )
-    pending_rows = pending_cache.setdefault(
-        instrument_id,
-        _safe_pending_tpsl_rows(deepcoin_client, inst_id=instrument_id),
+    pending_rows = _cached_pending_tpsl_rows(
+        pending_cache, deepcoin_client=deepcoin_client, inst_id=instrument_id
     )
     result = plan_verified_trigger_entry_protection_adoption(
         session,
@@ -1068,6 +1066,21 @@ def _safe_pending_tpsl_rows(deepcoin_client, *, inst_id: str) -> list[dict[str, 
     if not isinstance(rows, list):
         return []
     return [row for row in rows if isinstance(row, dict)]
+
+
+def _cached_pending_tpsl_rows(
+    pending_cache: dict[str, list[dict[str, Any]]],
+    *,
+    deepcoin_client,
+    inst_id: str,
+) -> list[dict[str, Any]]:
+    """Read a pending snapshot once per instrument for one dry-run plan."""
+
+    if inst_id not in pending_cache:
+        pending_cache[inst_id] = _safe_pending_tpsl_rows(
+            deepcoin_client, inst_id=inst_id
+        )
+    return pending_cache[inst_id]
 
 
 def _expected_protection_rows(protection_request: Any) -> list[dict[str, str | None]]:
