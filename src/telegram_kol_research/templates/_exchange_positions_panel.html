@@ -69,6 +69,22 @@
       {% elif item.take_profit %}<div><dt>止盈</dt><dd>{{ item.take_profit }}</dd></div>{% endif %}
       {% if item.last_checked_at_display %}<div><dt>更新时间</dt><dd>{{ item.last_checked_at_display }}</dd></div>{% endif %}
     </dl>
+    {% if item.exchange_protection_orders %}
+      <section class="exchange-protection-orders" aria-label="交易所保护单">
+        <strong>交易所保护单</strong>
+        <ul>
+          {% for order in item.exchange_protection_orders %}
+            <li>
+              <span>{{ '止盈' if order.kind == 'take_profit' else '止损' }}</span>
+              <span>{{ order.trigger_price_text }}</span>
+              <span>{{ order.size_text }} contracts</span>
+              <code>order {{ order.order_id }}</code>
+              <span class="exchange-attribution-chip">{{ order.ownership_state }}</span>
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
     {% if attr and attr.state == 'bound' and item.pos_id %}
       <details class="exchange-position-danger-zone" data-position-danger-zone>
         <summary>仓位操作</summary>

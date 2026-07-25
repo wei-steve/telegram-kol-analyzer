@@ -1176,6 +1176,78 @@ def test_execution_dashboard_uses_pending_tpsl_orders_for_live_protection(tmp_pa
     assert response.text.count("无保护单") == 1
 
 
+def test_exchange_protection_display_rows_preserve_all_pending_tpsl_sides():
+    from telegram_kol_research.web_app import _exchange_protection_display_rows
+
+    rows = _exchange_protection_display_rows(
+        position={
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "long",
+        },
+        pending_orders=[
+            {
+                "ordId": "tp-1",
+                "triggerOrderType": "TPSL",
+                "posId": "pos-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "sz": "2",
+                "tpTriggerPx": "65000",
+            },
+            {
+                "ordId": "combined-1",
+                "triggerOrderType": "TPSL",
+                "posId": "pos-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "sz": "3",
+                "tpTriggerPx": "66000",
+                "slTriggerPx": "62000",
+            },
+            {
+                "ordId": "legacy-stop-1",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "side": "sell",
+                "sz": "0",
+                "slTriggerPx": "61000",
+            },
+        ],
+    )
+
+    assert rows == [
+        {
+            "kind": "take_profit",
+            "trigger_price_text": "65000",
+            "size_text": "2",
+            "order_id": "tp-1",
+            "ownership_state": "已验证归属",
+        },
+        {
+            "kind": "take_profit",
+            "trigger_price_text": "66000",
+            "size_text": "3",
+            "order_id": "combined-1",
+            "ownership_state": "已验证归属",
+        },
+        {
+            "kind": "stop_loss",
+            "trigger_price_text": "62000",
+            "size_text": "3",
+            "order_id": "combined-1",
+            "ownership_state": "已验证归属",
+        },
+        {
+            "kind": "stop_loss",
+            "trigger_price_text": "61000",
+            "size_text": "0",
+            "order_id": "legacy-stop-1",
+            "ownership_state": "无法归属",
+        },
+    ]
+
+
 def test_execution_dashboard_uses_position_tpsl_fields_for_live_protection(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):

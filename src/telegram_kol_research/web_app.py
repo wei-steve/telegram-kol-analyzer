@@ -1106,6 +1106,12 @@ def _load_deepcoin_live_position_rows(
                     "take_profit_text": "/".join(
                         _position_text_value(value) or "" for value in take_profit_values
                     ) or None,
+                    "exchange_protection_orders": (
+                        _exchange_protection_display_rows(
+                            position=position,
+                            pending_orders=tpsl_orders,
+                        )
+                    ),
                     "protection_status": (
                         "protected"
                         if protection_status == "verified" and has_protection
@@ -2203,6 +2209,102 @@ def _load_deepcoin_pending_tpsl_orders(
                 continue
             result.append(order)
     return result, evidence_available
+
+
+def _exchange_protection_display_rows(
+    *,
+    position: dict[str, Any],
+    pending_orders: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Return every exchange TPSL side relevant to a live-position card.
+
+    This is intentionally a display-only view.  It must not be used to infer
+    strategy ownership or relax the conservative protection-mutation checks.
+    """
+
+    position_id = _first_position_string(position, "posId", "pos_id", "id")
+    instrument_id = str(position.get("instId") or "").upper()
+    side = _normalize_deepcoin_position_side(
+        position.get("posSide") or position.get("side")
+    )
+    display_rows: list[dict[str, str]] = []
+    for order in pending_orders:
+        if str(order.get("triggerOrderType") or "").upper() != "TPSL":
+            continue
+        order_position_id = _first_position_string(
+            order,
+            "closePosId",
+            "close_pos_id",
+            "closePositionId",
+            "posId",
+            "pos_id",
+            "positionId",
+        )
+        if order_position_id:
+            if order_position_id != position_id:
+                continue
+            ownership_state = "已验证归属"
+        elif str(order.get("instId") or "").upper() != instrument_id:
+            continue
+        else:
+            explicit_position_side = _position_text_value(order.get("posSide"))
+            if (
+                explicit_position_side is not None
+                and _normalize_deepcoin_position_side(explicit_position_side) != side
+            ):
+                continue
+            # A TPSL's plain `side` is its closing-order direction, not reliable
+            # position-side evidence. Without `posSide`, show it as a candidate
+            # instead of either dropping it or claiming a verified association.
+            ownership_state = "无法归属"
+
+        for kind, keys in (
+            ("take_profit", ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")),
+            ("stop_loss", ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")),
+        ):
+            trigger_price = next(
+                (
+                    order.get(key)
+                    for key in keys
+                    if _is_nonzero_price(order.get(key))
+                ),
+                None,
+            )
+            trigger_price_text = _position_text_value(trigger_price)
+            if trigger_price_text is None:
+                continue
+            display_rows.append(
+                {
+                    "kind": kind,
+                    "trigger_price_text": trigger_price_text,
+                    "size_text": _position_text_value(
+                        order.get("sz") or order.get("size")
+                    )
+                    or "0",
+                    "order_id": _first_position_string(
+                        order,
+                        "ordId",
+                        "orderId",
+                        "order_id",
+                        "algoId",
+                        "triggerOrderId",
+                        "id",
+                    )
+                    or "-",
+                    "ownership_state": ownership_state,
+                }
+            )
+    state_sort = {"已验证归属": 0, "无法归属": 1}
+    kind_sort = {"take_profit": 0, "stop_loss": 1}
+    return sorted(
+        display_rows,
+        key=lambda row: (
+            state_sort[row["ownership_state"]],
+            kind_sort[row["kind"]],
+            _float_or_none(row["trigger_price_text"]) or float("inf"),
+            row["order_id"],
+        ),
+    )
 
 
 def _deepcoin_position_protection_key(position: dict[str, Any]) -> tuple[str, str, str, str]:

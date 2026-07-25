@@ -1522,6 +1522,130 @@ def test_bound_position_close_is_not_rendered_for_unbound_exchange_position(tmp_
     assert "data-close-bound-position" not in response.text
 
 
+def test_positions_panel_renders_all_exchange_protection_orders(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-1",
+                    "posSide": "long",
+                    "pos": "5",
+                    "avgPx": "64000",
+                }
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return [
+                {
+                    "ordId": "combined-1",
+                    "triggerOrderType": "TPSL",
+                    "posId": "pos-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "sz": "3",
+                    "tpTriggerPx": "66000",
+                    "slTriggerPx": "62000",
+                },
+                {
+                    "ordId": "legacy-stop-1",
+                    "triggerOrderType": "TPSL",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "sz": "0",
+                    "slTriggerPx": "61000",
+                },
+            ]
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+        def list_position_history(self, *, inst_id=None):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=FakeDeepcoinClient,
+        )
+    ).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "交易所保护单" in response.text
+    assert "66000" in response.text
+    assert "62000" in response.text
+    assert "61000" in response.text
+    assert "已验证归属" in response.text
+    assert "无法归属" in response.text
+    assert "order combined-1" in response.text
+    assert "order legacy-stop-1" in response.text
+
+
+def test_positions_panel_keeps_available_protection_when_another_instrument_fails(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "btc-pos",
+                    "posSide": "long",
+                    "pos": "5",
+                    "avgPx": "64000",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "eth-pos",
+                    "posSide": "long",
+                    "pos": "2",
+                    "avgPx": "2000",
+                },
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            if inst_id == "ETH-USDT-SWAP":
+                raise RuntimeError("ETH pending TPSL unavailable")
+            return [
+                {
+                    "ordId": "btc-stop-1",
+                    "triggerOrderType": "TPSL",
+                    "posId": "btc-pos",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "sz": "5",
+                    "slTriggerPx": "62000",
+                }
+            ]
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+        def list_position_history(self, *, inst_id=None):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=FakeDeepcoinClient,
+        )
+    ).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "order btc-stop-1" in response.text
+    assert "62000" in response.text
+
+
 def test_bound_position_close_renders_exact_context_for_bound_exchange_position(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
