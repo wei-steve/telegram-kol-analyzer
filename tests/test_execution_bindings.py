@@ -12,6 +12,7 @@ from telegram_kol_research.execution_bindings import (
     ExecutionOrderLegRecord,
     _leg_evidence,
     _leg_has_successful_fill_evidence,
+    _successful_fill_leg_ids,
     build_position_evidence,
     _post_entry_protection_mutated_binding_ids,
     build_client_order_id,
@@ -1346,6 +1347,39 @@ def test_successful_fill_accepts_matching_order_and_client_pair():
     assert _leg_has_successful_fill_evidence(
         matching_leg, evidence, legs=[matching_leg, other_leg]
     )
+
+
+def test_successful_fill_index_preserves_unique_matches_for_all_legs():
+    legs = [
+        ExecutionOrderLeg(
+            id=leg_id,
+            execution_binding_id=7,
+            leg_index=leg_id,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id=f"order-{leg_id}",
+            client_order_id=f"client-{leg_id}",
+            venue="deepcoin",
+            status="open",
+        )
+        for leg_id in range(1, 5)
+    ]
+    evidence = [
+        FillEvidence(
+            source="regular_order",
+            order_id=f"order-{leg_id}",
+            client_order_id=f"client-{leg_id}",
+            pos_id=None,
+            symbol="ETH-USDT-SWAP",
+            side="short",
+            size=1.5,
+            price=1770.0,
+            created_at_ms=10_000 + leg_id,
+        )
+        for leg_id in range(1, 5)
+    ]
+
+    assert _successful_fill_leg_ids(evidence, legs=legs) == {1, 2, 3, 4}
 
 
 @pytest.mark.parametrize("invalid_list_value", [None, "not-a-list", {"bad": "shape"}])

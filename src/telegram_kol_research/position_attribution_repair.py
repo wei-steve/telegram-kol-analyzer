@@ -16,12 +16,12 @@ from telegram_kol_research.db import (
 )
 from telegram_kol_research.execution_bindings import (
     _exchange_row_matches_leg,
-    _leg_has_successful_fill_evidence,
     _leg_evidence,
     _load_reconcile_snapshot,
     _post_entry_protection_mutated_binding_ids,
     build_position_evidence,
     _snapshot_fill_evidence,
+    _successful_fill_leg_ids,
 )
 from telegram_kol_research.historical_attribution_cleanup import (
     HistoricalCleanupAction,
@@ -258,6 +258,7 @@ def build_position_attribution_repair_plan(
             legs=legs,
             bindings_by_id=bindings_by_id,
         )
+        successful_fill_leg_ids = _successful_fill_leg_ids(fill_rows, legs=legs)
         mutated_binding_ids = _post_entry_protection_mutated_binding_ids(
             session, binding_ids=set(bindings_by_id)
         )
@@ -265,9 +266,7 @@ def build_position_attribution_repair_plan(
             _leg_evidence(
                 leg,
                 binding=bindings_by_id[int(leg.execution_binding_id)],
-                has_successful_entry_evidence=_leg_has_successful_fill_evidence(
-                    leg, fill_rows, legs=legs
-                ),
+                has_successful_entry_evidence=int(leg.id) in successful_fill_leg_ids,
                 protection_mutated=(
                     int(leg.execution_binding_id) in mutated_binding_ids
                 ),

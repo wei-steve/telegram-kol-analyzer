@@ -685,6 +685,7 @@ def _apply_reconcile_snapshot(
             legs=legs,
             bindings_by_id=bindings_by_id,
         )
+        successful_fill_leg_ids = _successful_fill_leg_ids(fill_rows, legs=legs)
         mutated_binding_ids = _post_entry_protection_mutated_binding_ids(
             session, binding_ids=set(bindings_by_id)
         )
@@ -697,9 +698,7 @@ def _apply_reconcile_snapshot(
             _leg_evidence(
                 leg,
                 binding=bindings_by_id[int(leg.execution_binding_id)],
-                has_successful_entry_evidence=_leg_has_successful_fill_evidence(
-                    leg, fill_rows, legs=legs
-                ),
+                has_successful_entry_evidence=int(leg.id) in successful_fill_leg_ids,
                 protection_mutated=(
                     int(leg.execution_binding_id) in mutated_binding_ids
                 ),
@@ -1851,21 +1850,30 @@ def _numbers_equal(left: float | None, right: float | None) -> bool:
     return abs(left - right) <= 1e-8
 
 
-def _leg_has_successful_fill_evidence(
-    leg: ExecutionOrderLeg,
-    evidence: list[FillEvidence],
-    *,
-    legs: list[ExecutionOrderLeg],
-) -> bool:
+def _successful_fill_leg_ids(
+    evidence: list[FillEvidence], *, legs: list[ExecutionOrderLeg]
+) -> set[int]:
+    """Return leg ids with a fill identifier unique among the current legs."""
+
+    successful_leg_ids: set[int] = set()
     for row in evidence:
         matching_legs = [
             candidate
             for candidate in legs
             if _leg_identifiers_match_fill(candidate, row)
         ]
-        if len(matching_legs) == 1 and int(matching_legs[0].id) == int(leg.id):
-            return True
-    return False
+        if len(matching_legs) == 1:
+            successful_leg_ids.add(int(matching_legs[0].id))
+    return successful_leg_ids
+
+
+def _leg_has_successful_fill_evidence(
+    leg: ExecutionOrderLeg,
+    evidence: list[FillEvidence],
+    *,
+    legs: list[ExecutionOrderLeg],
+) -> bool:
+    return int(leg.id) in _successful_fill_leg_ids(evidence, legs=legs)
 
 
 def _leg_identifiers_match_fill(
