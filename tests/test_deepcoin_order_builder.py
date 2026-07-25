@@ -6,6 +6,7 @@ from telegram_kol_research.deepcoin_order_builder import (
 )
 from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_draft
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.recovery_live_submit import build_deepcoin_trigger_order_payload
 
 
 def _payload_preview(**overrides):
@@ -114,6 +115,29 @@ def test_build_deepcoin_order_draft_splits_long_limit_order_into_range_endpoints
             "contract_size_must_be_verified_before_live_order",
         ],
     }
+
+
+def test_pending_limit_entry_embeds_primary_market_stop_without_position_id():
+    payload = build_deepcoin_trigger_order_payload(
+        {
+            "instrument_id": "BTC-USDT-SWAP",
+            "margin_mode": "cross",
+            "position_mode": "split",
+            "stop_loss": 63200.0,
+            "order_legs": [{"position_side": "long"}],
+        },
+        {
+            "side": "buy",
+            "position_side": "long",
+            "price": 64000.0,
+            "quantity": 6.0,
+        },
+    )
+
+    assert payload["slTriggerPx"] == "63200.0"
+    assert payload["slTriggerPxType"] == "last"
+    assert payload["slOrdPx"] == "-1"
+    assert "posId" not in payload
 
 
 def test_build_deepcoin_order_draft_uses_low_then_high_for_short_limit_orders():

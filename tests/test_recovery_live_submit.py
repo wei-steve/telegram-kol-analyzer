@@ -21,6 +21,7 @@ from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_si
 from telegram_kol_research.recovery_live_submit import process_next_trade_signal_live
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
 from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
+from telegram_kol_research.deepcoin_execution_actions import _exact_exchange_order_id
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
@@ -39,6 +40,12 @@ class _StaticContractSpecProvider:
             min_quantity=1,
             price_tick=0.1,
         )
+
+
+def test_pending_entry_update_requires_an_exact_exchange_order_id():
+    assert _exact_exchange_order_id({"ordId": "trigger-123", "clOrdId": "client-123"}) == "trigger-123"
+    assert _exact_exchange_order_id({"clOrdId": "client-123"}) is None
+    assert _exact_exchange_order_id({"id": "internal-123"}) is None
 
 
 @pytest.mark.parametrize("payload", [None, [], "scalar", 42, 1.5, True])
@@ -416,7 +423,7 @@ def test_build_deepcoin_trigger_order_payload_is_stop_only_for_staged_take_profi
     assert payload["orderType"] == "limit"
     assert payload["triggerPrice"] == "68100.0"
     assert not any(key.startswith("tp") for key in payload)
-    assert payload["slTriggerPx"] == 67500.0
+    assert payload["slTriggerPx"] == "67500.0"
     assert payload["mrgPosition"] == "split"
     assert payload["clOrdId"] == "TKFG8248E1"
 
@@ -615,7 +622,10 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     assert fake_client.trigger_payloads[0]["orderType"] == "limit"
     assert fake_client.trigger_payloads[0]["triggerPrice"] == "68302.3"
     assert all(not any(key.startswith("tp") for key in payload) for payload in fake_client.trigger_payloads)
-    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
+    assert fake_client.trigger_payloads[0]["slTriggerPx"] == "67500.0"
+    assert fake_client.trigger_payloads[0]["slTriggerPxType"] == "last"
+    assert fake_client.trigger_payloads[0]["slOrdPx"] == "-1"
+    assert "posId" not in fake_client.trigger_payloads[0]
     assert fake_client.position_protection_payloads == []
     assert result["warnings"] == []
     with session_factory() as session:
@@ -1198,7 +1208,7 @@ def test_limit_submit_uses_stop_only_trigger_protection(tmp_path):
     assert fake_client.protection_payloads == []
     assert fake_client.trigger_payloads[0]["orderType"] == "limit"
     assert all(not any(key.startswith("tp") for key in payload) for payload in fake_client.trigger_payloads)
-    assert fake_client.trigger_payloads[0]["slTriggerPx"] == 67500.0
+    assert fake_client.trigger_payloads[0]["slTriggerPx"] == "67500.0"
     assert fake_client.position_protection_payloads == []
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()

@@ -1870,9 +1870,9 @@ def _deepcoin_embedded_sltp_fields(
     if not isinstance(stop_loss, int | float) or stop_loss <= 0:
         raise RecoveryLiveSubmitError("missing_stop_loss_for_protection")
     return {
-        "slTriggerPx": float(stop_loss),
+        "slTriggerPx": str(stop_loss),
         "slTriggerPxType": "last",
-        "slOrdPx": -1,
+        "slOrdPx": "-1",
     }
 
 

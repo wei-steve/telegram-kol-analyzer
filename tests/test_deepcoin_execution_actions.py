@@ -2151,7 +2151,7 @@ def test_process_trade_signal_live_cancels_all_bound_trigger_entry_legs(tmp_path
     ]
 
 
-def test_process_trade_signal_live_recreates_trigger_entry_to_adjust_tpsl(tmp_path):
+def test_process_trade_signal_live_recreates_trigger_entry_with_embedded_stop_only(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
     binding_id = _binding(session_factory, order_id="trigger-old", pos_id=None, status="open")
@@ -2202,8 +2202,11 @@ def test_process_trade_signal_live_recreates_trigger_entry_to_adjust_tpsl(tmp_pa
 
     assert client.cancel_trigger_payloads == [{"instId": "ETH-USDT-SWAP", "ordId": "trigger-old"}]
     assert client.trigger_payloads[0]["price"] == "1000"
-    assert client.trigger_payloads[0]["tpTriggerPx"] == 1615.12
-    assert client.trigger_payloads[0]["slTriggerPx"] == 1577.04
+    assert client.trigger_payloads[0]["slTriggerPx"] == "1577.04"
+    assert client.trigger_payloads[0]["slTriggerPxType"] == "last"
+    assert client.trigger_payloads[0]["slOrdPx"] == "-1"
+    assert "posId" not in client.trigger_payloads[0]
+    assert not any(key.startswith("tp") for key in client.trigger_payloads[0])
     assert result["old_order_id"] == "trigger-old"
     assert result["new_order_id"] == "trigger-new"
     with session_factory() as session:
@@ -2213,4 +2216,76 @@ def test_process_trade_signal_live_recreates_trigger_entry_to_adjust_tpsl(tmp_pa
     legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
     assert [(leg.leg_index, leg.order_id, leg.client_order_id, leg.status) for leg in legs] == [
         (1, "trigger-new", "client-new", "open")
+    ]
+
+
+@pytest.mark.parametrize(
+    "create_response",
+    [
+        {"code": "0", "data": {"id": "generic-response-id"}},
+        {"code": "0", "data": {}},
+    ],
+)
+def test_recreated_pending_entry_requires_exact_exchange_response_order_id(
+    tmp_path, create_response
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    binding_id = _binding(session_factory, order_id="trigger-old", pos_id=None, status="open")
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:ETH:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="trigger-old",
+            client_order_id="client-old",
+            status="open",
+        ),
+    )
+    trade_signal = _signal(
+        session_factory,
+        action="adjust_trigger_entry_tpsl",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+    )
+    client = _FakeDeepcoinClient()
+    client.trigger_pending = [
+        {
+            "triggerOrderType": "NORMAL",
+            "ordId": "trigger-old",
+            "instId": "ETH-USDT-SWAP",
+            "side": "buy",
+            "posSide": "long",
+            "price": "1000",
+            "triggerPrice": "1000",
+            "sz": "0.1",
+            "slTriggerPx": "1567.52",
+        }
+    ]
+
+    def trigger_order(payload):
+        client.trigger_payloads.append(payload)
+        return create_response
+
+    client.trigger_order = trigger_order
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="recreated_trigger_entry_missing_exchange_order_id",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=trade_signal.id,
+            deepcoin_client=client,
+        )
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+    legs = list_execution_order_legs(session_factory, execution_binding_id=binding_id)
+    assert binding.order_id == "trigger-old"
+    assert binding.last_exchange_status is None
+    assert [(leg.order_id, leg.client_order_id, leg.status) for leg in legs] == [
+        ("trigger-old", "client-old", "open")
     ]

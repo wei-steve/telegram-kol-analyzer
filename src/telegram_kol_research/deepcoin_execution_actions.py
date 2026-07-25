@@ -957,7 +957,7 @@ def recreate_trigger_entry_tpsl(
     )
     if old_order is None:
         raise DeepcoinExecutionActionError("no_bound_pending_trigger_entry")
-    old_order_id = _first_string(old_order, "ordId", "orderId", "order_id", "id")
+    old_order_id = _exact_exchange_order_id(old_order)
     if not old_order_id:
         raise DeepcoinExecutionActionError("missing_trigger_order_id")
 
@@ -980,7 +980,18 @@ def recreate_trigger_entry_tpsl(
         payload=trade_signal.payload,
     )
     create_response = deepcoin_client.trigger_order(create_payload)
-    new_order_id = _extract_order_id(create_response)
+    new_order_id = next(
+        (
+            order_id
+            for response_payload in _response_payloads(create_response)
+            if (order_id := _exact_exchange_order_id(response_payload)) is not None
+        ),
+        None,
+    )
+    if new_order_id is None:
+        raise DeepcoinExecutionActionError(
+            "recreated_trigger_entry_missing_exchange_order_id"
+        )
     record_execution_event(
         session_factory,
         ExecutionEventRecord(
@@ -1301,6 +1312,24 @@ def _order_id_from_payload(payload: dict[str, Any]) -> str | None:
     )
 
 
+def _exact_exchange_order_id(payload: dict[str, Any]) -> str | None:
+    """Return an exchange-issued order id suitable for pending-entry replacement.
+
+    A client id only correlates our local intent and a generic ``id`` is not a
+    sufficiently specific DeepCoin order identity.  Pending-entry updates must
+    therefore fail closed unless the exchange returned its concrete order id.
+    """
+
+    return _first_string(
+        payload,
+        "ordId",
+        "orderId",
+        "order_id",
+        "algoId",
+        "triggerOrderId",
+    )
+
+
 def _resolve_adjusted_tpsl_snapshot(
     *,
     before: dict[str, Any],
@@ -1539,20 +1568,15 @@ def _build_trigger_entry_payload_from_existing(
     client_order_id = payload.get("client_order_id") or payload.get("clOrdId") or old_order.get("clOrdId")
     if client_order_id:
         create["clOrdId"] = str(client_order_id)
-    if after.get("take_profit") is not None:
-        create.update(
-            {
-                "tpTriggerPx": float(after["take_profit"]),
-                "tpTriggerPxType": "last",
-                "tpOrdPx": -1,
-            }
-        )
+    # A pending entry has no exact position identity yet.  Keep the primary
+    # market stop embedded in the entry and defer TP creation until a verified
+    # filled position is available.
     if after.get("stop_loss") is not None:
         create.update(
             {
-                "slTriggerPx": float(after["stop_loss"]),
+                "slTriggerPx": str(after["stop_loss"]),
                 "slTriggerPxType": "last",
-                "slOrdPx": -1,
+                "slOrdPx": "-1",
             }
         )
     return create
