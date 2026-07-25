@@ -682,6 +682,46 @@ def test_reconcile_detects_failed_owned_stop_history_without_position_id(tmp_pat
     ]
 
 
+def test_primary_stop_failure_keeps_verified_backup_stop_active(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([_pending_combined_tpsl("tpsl-1")]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+    with session_factory() as session:
+        primary = session.query(PositionProtectionLedger).one()
+        session.add(PositionBackupStopOrder(
+            venue="deepcoin", execution_binding_id=primary.execution_binding_id,
+            execution_order_leg_id=primary.execution_order_leg_id, pos_id="pos-1",
+            instrument_id="ETH-USDT-SWAP", side="short", trigger_price="1903.8",
+            order_id="backup-1", client_order_id="backup-client-1", status="active",
+            request_json='{"closePosId":"pos-1","orderType":"market"}',
+        ))
+        session.commit()
+
+    failed_history = _pending_combined_tpsl("tpsl-1")
+    failed_history.pop("posId")
+    failed_history.update(triggerTime="1784512900000", errorCode="203")
+    backup_pending = {
+        "instId": "ETH-USDT-SWAP", "ordId": "backup-1", "triggerPrice": "1903.8",
+        "orderType": "market",
+    }
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient(
+            [backup_pending], history_rows=[failed_history]
+        ),
+        recovered_at=datetime(2026, 7, 20, 8, 6),
+    )
+
+    with session_factory() as session:
+        primary = session.query(PositionProtectionLedger).one()
+        backup = session.query(PositionBackupStopOrder).one()
+    assert (primary.status, backup.status) == ("stop_trigger_failed", "active")
+
+
 def test_reconcile_adopts_saved_trigger_protection_intent_once(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_protection_adoption(session_factory)
