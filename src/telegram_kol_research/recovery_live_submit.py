@@ -29,6 +29,10 @@ from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.position_protection_legs import (
+    bind_parent_entry_order,
+    create_or_get_protection_leg,
+)
 from telegram_kol_research.protection_revisions import activate_protection_revision
 from telegram_kol_research.trigger_protection_intents import (
     create_or_get_trigger_protection_intent,
@@ -689,6 +693,12 @@ def _submit_trigger_with_protection_intent(
                     execution_order_leg_id=execution_order_leg_id,
                     desired_take_profits=take_profit_legs,
                 )
+            _create_trigger_protection_leg_plan(
+                session,
+                execution_order_leg_id=execution_order_leg_id,
+                order_payload=order_payload,
+                draft=draft,
+            )
             session.commit()
         try:
             response = deepcoin_client.trigger_order(order_payload)
@@ -711,6 +721,14 @@ def _submit_trigger_with_protection_intent(
                 intent,
                 parent_trigger_order_id=parent_order_id,
             )
+            for protection_leg in _protection_legs_for_entry(
+                session, execution_order_leg_id=execution_order_leg_id
+            ):
+                bind_parent_entry_order(
+                    session,
+                    protection_leg,
+                    parent_entry_order_id=parent_order_id,
+                )
             entry_leg = session.get(ExecutionOrderLeg, execution_order_leg_id)
             if entry_leg is None:  # pragma: no cover - durable leg was just used for the intent
                 raise RecoveryLiveSubmitError("trigger_protection_entry_leg_missing")
@@ -738,6 +756,70 @@ def _submit_trigger_with_protection_intent(
             )
             session.commit()
         return response
+
+
+def _create_trigger_protection_leg_plan(
+    session,
+    *,
+    execution_order_leg_id: int,
+    order_payload: dict[str, Any],
+    draft: dict[str, Any],
+) -> None:
+    """Create one immutable local record for every planned trigger protection."""
+
+    stop_price = _optional_snapshot_text(
+        order_payload, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice"
+    )
+    if stop_price is not None:
+        create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=execution_order_leg_id,
+            role="primary_stop",
+            leg_index=1,
+            planned_trigger_price=stop_price,
+            planned_size=_optional_snapshot_text(order_payload, "sz", "size"),
+        )
+        # The backup price is derived only after the exact filled position and
+        # primary stop are verified, but its audit identity exists now.
+        create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=execution_order_leg_id,
+            role="backup_stop",
+            leg_index=1,
+            planned_trigger_price=None,
+            planned_size=None,
+        )
+    take_profit_legs = draft.get("take_profit_legs")
+    if not isinstance(take_profit_legs, list):
+        return
+    for index, target in enumerate(take_profit_legs, start=1):
+        if not isinstance(target, dict):
+            continue
+        price = _optional_snapshot_text(target, "price")
+        if price is None:
+            continue
+        create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=execution_order_leg_id,
+            role="take_profit",
+            leg_index=index,
+            planned_trigger_price=price,
+            planned_size=_optional_snapshot_text(target, "size", "allocation_pct"),
+        )
+
+
+def _protection_legs_for_entry(session, *, execution_order_leg_id: int):
+    from telegram_kol_research.models import PositionProtectionLeg
+
+    return (
+        session.query(PositionProtectionLeg)
+        .filter(PositionProtectionLeg.execution_order_leg_id == execution_order_leg_id)
+        .order_by(PositionProtectionLeg.id.asc())
+        .all()
+    )
 
 
 def _normalized_pending_tpsl_baseline(

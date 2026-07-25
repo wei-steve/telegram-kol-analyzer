@@ -1251,6 +1251,13 @@ def _reconcile_saved_trigger_protection_intents(
                 evidence_source="reconciliation_trigger_protection_intent", seen_at=recovered_at)
             if row is not None:
                 transition_trigger_protection_intent(session, intent, recovery_state="adopted", adopted_order_id=adoption.action.order_id)
+                _bind_adopted_primary_protection_leg(
+                    session,
+                    entry_leg=leg,
+                    pos_id=adoption.action.pos_id,
+                    exchange_order_id=adoption.action.order_id,
+                    evidence=adoption.action.evidence,
+                )
                 existing_ledger_rows.append(row)
                 result.protection_adopted += 1
         elif adoption.deferred is not None:
@@ -1263,6 +1270,48 @@ def _reconcile_saved_trigger_protection_intents(
         elif adoption.refusal is not None:
             _refuse_trigger_intent(session, leg, intent, adoption.refusal, recovered_at, result, transition_trigger_protection_intent)
     return handled
+
+
+def _bind_adopted_primary_protection_leg(
+    session,
+    *,
+    entry_leg: ExecutionOrderLeg,
+    pos_id: str,
+    exchange_order_id: str,
+    evidence: dict[str, Any],
+) -> None:
+    """Promote only the exact attached primary-stop leg after exchange adoption."""
+
+    from telegram_kol_research.models import PositionProtectionLeg
+    from telegram_kol_research.position_protection_legs import (
+        bind_filled_position,
+        bind_verified_exchange_order,
+    )
+
+    protection_legs = (
+        session.query(PositionProtectionLeg)
+        .filter(PositionProtectionLeg.execution_order_leg_id == int(entry_leg.id))
+        .order_by(PositionProtectionLeg.id.asc())
+        .all()
+    )
+    for protection_leg in protection_legs:
+        bind_filled_position(session, protection_leg, pos_id=pos_id)
+    protection_leg = (
+        session.query(PositionProtectionLeg)
+        .filter(PositionProtectionLeg.execution_order_leg_id == int(entry_leg.id))
+        .filter(PositionProtectionLeg.role == "primary_stop")
+        .filter(PositionProtectionLeg.leg_index == 1)
+        .one_or_none()
+    )
+    if protection_leg is None:
+        return
+    bind_filled_position(session, protection_leg, pos_id=pos_id)
+    bind_verified_exchange_order(
+        session,
+        protection_leg,
+        exchange_order_id=exchange_order_id,
+        readback_evidence=evidence,
+    )
 
 
 def _trigger_intent_due(intent, now: datetime) -> bool:

@@ -19,7 +19,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageInstructionItem, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
+from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageInstructionItem, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
 from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
@@ -1256,10 +1256,20 @@ def test_trigger_limit_entry_persists_tpsl_intent_before_parent_submission(tmp_p
     with session_factory() as session:
         intents = session.query(TriggerProtectionIntent).order_by(TriggerProtectionIntent.id).all()
         legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.id).all()
+        protection_legs = session.query(PositionProtectionLeg).order_by(
+            PositionProtectionLeg.execution_order_leg_id,
+            PositionProtectionLeg.role,
+            PositionProtectionLeg.leg_index,
+        ).all()
     assert [intent.execution_order_leg_id for intent in intents] == [leg.id for leg in legs]
     assert [json.loads(intent.pre_submit_tpsl_baseline_json) for intent in intents] == [[], []]
     assert all(len(intent.request_fingerprint) == 64 for intent in intents)
     assert [intent.parent_trigger_order_id for intent in intents] == ["trigger-1", "trigger-2"]
+    assert {row.role for row in protection_legs} == {
+        "primary_stop", "backup_stop", "take_profit"
+    }
+    assert {row.parent_entry_order_id for row in protection_legs} == {"trigger-1", "trigger-2"}
+    assert all(row.pos_id is None and row.exchange_order_id is None for row in protection_legs)
 
 
 def test_trigger_limit_entry_defers_when_tpsl_snapshot_is_malformed(tmp_path):
