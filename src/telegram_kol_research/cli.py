@@ -34,6 +34,10 @@ from telegram_kol_research.entry_protection_ledger_repair import (
     apply_entry_protection_ledger_repair_plan,
     build_entry_protection_ledger_repair_plan,
 )
+from telegram_kol_research.backup_stop_repair import (
+    apply_backup_stop_repair_plan,
+    build_backup_stop_repair_plan,
+)
 from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
@@ -2036,6 +2040,54 @@ def repair_entry_protection_ledger(
         expected_fingerprint=expected_fingerprint or "",
     )
     typer.echo(f"Applied {result.applied} entry protection ledger repair(s).")
+
+
+@app.command("repair-backup-stops")
+def repair_backup_stops(
+    database_path: Path = Path("data/research.db"),
+    deepcoin_contract_specs_path: Path = Path("config/deepcoin_contract_specs.yaml"),
+    pos_id: str | None = typer.Option(None, "--pos-id"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(None, "--expected-fingerprint"),
+) -> None:
+    """Dry-run or apply one fingerprinted exact-position backup stop repair."""
+
+    session_factory = create_session_factory(database_path)
+    client = build_deepcoin_client_from_env()
+    contract_spec_provider = load_deepcoin_contract_specs(deepcoin_contract_specs_path)
+    plan = build_backup_stop_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        contract_spec_provider=contract_spec_provider,
+        now=datetime.now(UTC),
+    )
+    typer.echo(json.dumps({
+        "mode": "apply" if apply else "dry_run",
+        "database_path": str(database_path),
+        "plan": asdict(plan),
+    }, ensure_ascii=False, indent=2, default=str))
+    if not apply:
+        return
+    clean_pos_id = str(pos_id or "").strip()
+    if not clean_pos_id or not expected_fingerprint:
+        typer.echo(
+            "Refusing apply: --apply requires both --pos-id and --expected-fingerprint.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if plan.conflicts:
+        typer.echo("Refusing apply: unresolved backup-stop conflicts remain.", err=True)
+        raise typer.Exit(code=2)
+    result = apply_backup_stop_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        contract_spec_provider=contract_spec_provider,
+        pos_id=clean_pos_id,
+        expected_fingerprint=expected_fingerprint,
+        now=datetime.now(UTC),
+    )
+    typer.echo(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
 
 
 @app.command("archive-unbound-holdings")
