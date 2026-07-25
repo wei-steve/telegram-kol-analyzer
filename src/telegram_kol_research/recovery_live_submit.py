@@ -389,6 +389,7 @@ def _submit_recovery_signal_direct(
                     draft,
                     pos_id=pos_id,
                     position_size=float(leg.get("quantity") or 0),
+                    include_take_profit=False,
                 )
                 protection_responses = []
                 for payload in protection_payloads:
@@ -512,6 +513,13 @@ def _submit_recovery_signal_direct(
         binding_id=binding_id,
         strategy_instance_id=str(draft.get("strategy_instance_id") or trade_signal.strategy_instance_id or ""),
         submitted_orders=submitted_orders,
+    )
+    _record_market_take_profit_convergences(
+        session_factory,
+        binding_id=binding_id,
+        draft=draft,
+        submitted_orders=submitted_orders,
+        created_at=now,
     )
     _record_entry_protection_ledger_rows(
         session_factory,
@@ -978,6 +986,47 @@ def _record_entry_protection_ledger_rows(
                     source="entry_protection",
                     protection_json={"order_ids": [row["order_id"] for row in rows], "rows": rows},
                 )
+        session.commit()
+
+
+def _record_market_take_profit_convergences(
+    session_factory: sessionmaker,
+    *,
+    binding_id: int,
+    draft: dict[str, Any],
+    submitted_orders: list[dict[str, Any]],
+    created_at: datetime,
+) -> None:
+    """Persist deferred TP work for market entries before their next reconciliation."""
+
+    take_profit_legs = draft.get("take_profit_legs")
+    if not isinstance(take_profit_legs, list) or not take_profit_legs:
+        return
+    market_pos_ids = {
+        str(order.get("pos_id") or "")
+        for order in submitted_orders
+        if str(order.get("execution_type") or "").lower() == "market"
+        and str(order.get("pos_id") or "")
+    }
+    if not market_pos_ids:
+        return
+    with session_factory() as session:
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == int(binding_id))
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .filter(ExecutionOrderLeg.order_kind == "market")
+            .filter(ExecutionOrderLeg.pos_id.in_(sorted(market_pos_ids)))
+            .all()
+        )
+        for leg in legs:
+            create_or_get_trigger_take_profit_convergence(
+                session,
+                venue=str(leg.venue or "deepcoin"),
+                execution_order_leg_id=int(leg.id),
+                desired_take_profits=take_profit_legs,
+                created_at=created_at,
+            )
         session.commit()
 
 
@@ -1737,24 +1786,33 @@ def build_deepcoin_position_sltp_payloads(
     *,
     pos_id: str | None,
     position_size: float,
+    include_take_profit: bool = True,
 ) -> list[dict[str, Any]]:
     """Build one full-position SL payload plus partial TP payloads when needed."""
 
     base_payload = _deepcoin_position_sltp_base_payload(draft, pos_id=pos_id)
     payloads: list[dict[str, Any]] = []
+    stop_loss = draft.get("stop_loss")
+    if not isinstance(stop_loss, int | float) or stop_loss <= 0:
+        raise RecoveryLiveSubmitError("missing_stop_loss_for_protection")
+    if not include_take_profit:
+        return [{
+            **base_payload,
+            "slTriggerPx": str(stop_loss),
+            "slTriggerPxType": "last",
+            "slOrdPx": "-1",
+        }]
     take_profit_legs = draft.get("take_profit_legs")
     if not isinstance(take_profit_legs, list) or len(take_profit_legs) <= 1:
         return [build_deepcoin_position_sltp_payload(draft, pos_id=pos_id)]
-    stop_loss = draft.get("stop_loss")
-    if isinstance(stop_loss, int | float) and stop_loss > 0:
-        payloads.append(
-            {
-                **base_payload,
-                "slTriggerPx": str(stop_loss),
-                "slTriggerPxType": "last",
-                "slOrdPx": "-1",
-            }
-        )
+    payloads.append(
+        {
+            **base_payload,
+            "slTriggerPx": str(stop_loss),
+            "slTriggerPxType": "last",
+            "slOrdPx": "-1",
+        }
+    )
     valid_legs = [item for item in take_profit_legs if isinstance(item, dict)]
     try:
         plan = build_take_profit_plan(

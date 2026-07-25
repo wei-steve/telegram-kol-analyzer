@@ -70,6 +70,28 @@ Both helpers tell the server to:
 2. Reinstall the package in editable mode with the server virtualenv.
 3. Restart `telegram-kol.service`.
 
+## Backup-stop rollout gate
+
+After a reviewed deployment, first verify the service and deployed SHA, then run
+the backup-stop repair command without `--apply`:
+
+```bash
+cd /opt/telegram-kol-analyzer
+systemctl is-active telegram-kol.service
+git rev-parse HEAD
+.venv/bin/telegram-kol-research repair-backup-stops --database-path data/research.db
+```
+
+This dry run reads Deepcoin but does not place, cancel, or modify an order. Stop
+if the snapshot is incomplete, any candidate lacks an exact `posId`, a conflict
+is reported, or a primary stop is failed/unknown. The known failed-primary case
+must not enter ordinary repair.
+
+Only after reviewing one small-position action may an operator execute one
+fingerprinted apply command. Re-run the dry run immediately afterwards and stop
+for a separate approval before every remaining position. Do not use a test
+Telegram message or open a test holding for this verification.
+
 The equivalent server-side command is:
 
 ```bash

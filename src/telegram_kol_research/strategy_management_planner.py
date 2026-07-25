@@ -119,7 +119,11 @@ def _protection_incident_requires_recovery(session, *, entry_legs) -> bool:
             PositionProtectionIncident.pos_id,
         )
         .filter(PositionProtectionIncident.incident_type.in_((
-            "stop_trigger_failed", "protection_missing", "protection_unknown",
+            "stop_trigger_failed",
+            "protection_missing",
+            "protection_unknown",
+            "backup_exchange_outcome_unknown",
+            "protection_position_conflict",
         )))
         .all()
     )

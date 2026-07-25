@@ -207,7 +207,7 @@ def _prepare_plan(session, *, convergence, deepcoin_client):
         or binding is None
         or int(leg.execution_binding_id) != int(binding.id)
         or str(leg.purpose) != "entry"
-        or str(leg.order_kind) != "trigger_limit"
+        or str(leg.order_kind) not in {"trigger_limit", "market"}
         or str(leg.status).lower() != "active"
         or str(leg.attribution_status) != "verified"
         or not str(convergence.pos_id or "").strip()

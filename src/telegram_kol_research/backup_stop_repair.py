@@ -16,6 +16,7 @@ from telegram_kol_research.models import (
     PositionProtectionLedger,
 )
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
+from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trigger_backup_stop import (
     BackupStopError,
     build_backup_stop_trigger_payload,
@@ -72,6 +73,7 @@ def build_backup_stop_repair_plan(
     pending_cache: dict[str, list[dict[str, Any]]] = {}
     database_evidence: list[dict[str, str]] = []
     exchange_evidence: list[dict[str, str]] = []
+    backup_stop_buffer_bps = load_trading_settings(session_factory).trigger_backup_stop_buffer_bps
     with session_factory() as session:
         rows = (
             session.query(ExecutionBinding, ExecutionOrderLeg)
@@ -95,10 +97,9 @@ def build_backup_stop_repair_plan(
             database_evidence.append({
                 "binding_id": str(binding.id), "leg_id": str(leg.id), "pos_id": pos_id,
                 "primary_order_id": str(primary.order_id) if primary is not None else "",
-                "existing_backup": "1" if existing else "0",
+                "existing_backup_order_id": str(existing.order_id or "") if existing else "",
+                "existing_backup_status": str(existing.status) if existing else "",
             })
-            if existing:
-                continue
             if primary is None or not str(primary.trigger_price or "").strip():
                 conflicts.append(_conflict(pos_id, "primary_stop_not_verified"))
                 continue
@@ -139,7 +140,8 @@ def build_backup_stop_repair_plan(
             liquidation = str(position.get("liqPx") or position.get("liquidationPrice") or "")
             try:
                 backup_stop = calculate_backup_stop_price(
-                    primary_stop=str(primary.trigger_price), side=str(binding.side), price_tick=spec.price_tick
+                    primary_stop=str(primary.trigger_price), side=str(binding.side),
+                    price_tick=spec.price_tick, buffer_bps=backup_stop_buffer_bps,
                 )
                 payload = build_backup_stop_trigger_payload(
                     instrument_id=instrument_id, side=str(binding.side), margin_mode=str(binding.margin_mode),
@@ -152,6 +154,35 @@ def build_backup_stop_repair_plan(
                 )
             except BackupStopError:
                 conflicts.append(_conflict(pos_id, "backup_stop_unsafe"))
+                continue
+            if existing is not None:
+                action = BackupStopRepairAction(
+                    binding_id=int(binding.id), leg_id=int(leg.id), pos_id=pos_id,
+                    instrument_id=instrument_id, side=str(binding.side).lower(), size=size,
+                    primary_order_id=str(primary.order_id), primary_stop=str(primary.trigger_price),
+                    backup_stop=backup_stop, liquidation_price=liquidation, request_payload=payload,
+                )
+                if (
+                    str(existing.status) == "active"
+                    and str(existing.order_id or "").strip()
+                    and _verified_pending_backup(
+                        pending, order_id=str(existing.order_id), action=action
+                    )
+                ):
+                    exchange_evidence.append({
+                        "pos_id": pos_id,
+                        "existing_backup_order_id": str(existing.order_id),
+                        "pending_order_ids": ",".join(
+                            sorted(_order_id(row) for row in pending if _order_id(row))
+                        ),
+                    })
+                    continue
+                conflicts.append(_conflict(
+                    pos_id,
+                    "backup_exchange_outcome_unknown"
+                    if str(existing.status) in {"submitting", "unknown_exchange_outcome"}
+                    else "backup_stop_missing_on_exchange",
+                ))
                 continue
             if _unowned_similar_backup(pending, payload=payload, pos_id=pos_id):
                 conflicts.append(_conflict(pos_id, "backup_similar_unscoped_order"))
@@ -263,12 +294,12 @@ def _primary(session, *, binding_id: int, leg_id: int, pos_id: str):
     )
 
 
-def _existing_backup(session, *, pos_id: str) -> bool:
-    return session.query(PositionBackupStopOrder.id).filter(
+def _existing_backup(session, *, pos_id: str) -> PositionBackupStopOrder | None:
+    return session.query(PositionBackupStopOrder).filter(
         PositionBackupStopOrder.venue == "deepcoin",
         PositionBackupStopOrder.pos_id == pos_id,
         PositionBackupStopOrder.status.in_(("submitting", "active", "unknown_exchange_outcome")),
-    ).first() is not None
+    ).order_by(PositionBackupStopOrder.id.asc()).first()
 
 
 def _unowned_similar_backup(pending, *, payload: dict[str, str], pos_id: str) -> bool:

@@ -124,6 +124,38 @@ Start the local browser UI:
 PYTHONPATH=src python -m telegram_kol_research.cli web --host 127.0.0.1 --port 8000
 ```
 
+## Exact backup-stop repair
+
+Second stops are conditional market-close orders bound to one split-position
+`closePosId`. The default distance is 20 bps beyond the verified primary stop,
+rounded conservatively to the contract tick. A primary-stop `203` / insufficient
+margin failure is never retried automatically; an active exact second stop stays
+in place and strategy management remains frozen for operator recovery.
+
+Always start with the read-only plan:
+
+```bash
+telegram-kol-research repair-backup-stops --database-path data/research.db
+```
+
+Review every proposed `pos_id`, primary order, liquidation boundary, second-stop
+price, and the full fingerprint. Apply only one reviewed action:
+
+```bash
+telegram-kol-research repair-backup-stops \
+  --database-path data/research.db \
+  --pos-id <reviewed-pos-id> \
+  --apply \
+  --expected-fingerprint <fingerprint-from-dry-run>
+```
+
+The fingerprint becomes invalid when the local ownership evidence, live position,
+pending orders, contract specification, or candidate set changes. `--apply`
+without both `--pos-id` and `--expected-fingerprint` exits before any exchange
+write. Do not apply all positions in one invocation. An unknown exchange result,
+conflicting position ID, failed primary stop, or similar unowned conditional
+order is an operator stop condition, not permission to retry or infer ownership.
+
 Before using the AI panel, configure the LLM proxy environment:
 
 ```bash

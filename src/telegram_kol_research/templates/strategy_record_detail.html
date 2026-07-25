@@ -150,6 +150,25 @@
       {% endfor %}
     </div>
 
+    <div aria-label="主止损与第二止损" data-strategy-protection-states>
+      <h3>主止损与第二止损</h3>
+      {% for protection in record.execution.protection_states %}
+        <article data-protection-position-id="{{ protection.pos_id }}">
+          <dl>
+            <dt>精确 pos_id</dt><dd><span class="strategy-identifier">{{ protection.pos_id }}</span></dd>
+            <dt>主止损</dt><dd>{{ protection.primary_stop_price or '未验证' }} · {{ protection.primary_stop_status }}</dd>
+            <dt>主止损订单</dt><dd><span class="strategy-identifier">{{ protection.primary_order_id or '-' }}</span></dd>
+            <dt>第二止损</dt><dd>{{ protection.backup_stop_price or '未创建' }} · {{ protection.backup_stop_status }}</dd>
+            <dt>第二止损订单</dt><dd><span class="strategy-identifier">{{ protection.backup_order_id or '-' }}</span></dd>
+            <dt>状态结论</dt><dd>{{ protection.operator_message }}</dd>
+            {% if protection.backup_stop_blocker %}<dt>阻塞原因</dt><dd>{{ protection.backup_stop_blocker }}</dd>{% endif %}
+          </dl>
+        </article>
+      {% else %}
+        <p>暂无可验证的持仓保护记录</p>
+      {% endfor %}
+    </div>
+
     <div aria-label="订单腿证据">
       <h3>订单腿</h3>
       {% for leg in record.execution.order_legs %}

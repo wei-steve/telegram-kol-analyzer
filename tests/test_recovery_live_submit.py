@@ -7,7 +7,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, RawMessage, SignalCandidate
-from telegram_kol_research.models import StrategyLifecycle, TradeSignal
+from telegram_kol_research.models import StrategyLifecycle, TradeSignal, TriggerTakeProfitConvergence
 from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
@@ -1105,6 +1105,33 @@ def test_market_submit_persists_binding_when_position_protection_fails(tmp_path)
     assert binding.last_exchange_status == "position_active_protection_failed"
     assert binding.order_id == "order-market-1"
     assert binding.pos_id == "pos-market-1"
+
+
+def test_market_submit_defers_take_profit_until_verified_backup_stop(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_market_item(session_factory)
+    _persist_lifecycle(session_factory, chat_id=200, message_id=66, symbol="BTC", side="short")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    fake_client = _FakeDeepcoinClient()
+    fake_client.positions = [{
+        "posId": "pos-market-1", "instId": "BTC-USDT-SWAP", "posSide": "short", "pos": "9",
+    }]
+    fake_client.place_order = lambda payload: {"code": "0", "data": {"ordId": "order-market-1", "posId": "pos-market-1"}}
+
+    result = submit_recovery_order_live(
+        session_factory, chat_id=200, message_id=66, symbol="BTC", side="short",
+        deepcoin_client=fake_client, contract_spec_provider=_StaticContractSpecProvider(),
+        submitted_at=datetime(2026, 6, 30, 8, 3, tzinfo=UTC),
+    )
+
+    assert result["submitted"] is True
+    assert len(fake_client.position_protection_payloads) == 1
+    payload = fake_client.position_protection_payloads[0]
+    assert "slTriggerPx" in payload
+    assert "tpTriggerPx" not in payload
+    with session_factory() as session:
+        convergence = session.query(TriggerTakeProfitConvergence).one()
+    assert convergence.status == "waiting_position"
 
 
 def test_market_submit_failure_invalidates_lifecycle(tmp_path):

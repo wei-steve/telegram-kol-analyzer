@@ -263,6 +263,15 @@ def load_strategy_record_detail(
             if entry_leg_ids
             else []
         )
+        primary_stop_rows = (
+            session.query(PositionProtectionLedger)
+            .filter(PositionProtectionLedger.execution_order_leg_id.in_(entry_leg_ids))
+            .filter(PositionProtectionLedger.purpose.in_(("stop_loss", "combined")))
+            .order_by(PositionProtectionLedger.created_at, PositionProtectionLedger.id)
+            .all()
+            if entry_leg_ids
+            else []
+        )
         protection_revisions = (
             session.query(PositionProtectionRevision)
             .filter(
@@ -844,6 +853,12 @@ def load_strategy_record_detail(
             ],
             "take_profit_orders": take_profit_orders,
             "backup_stops": [_backup_stop_detail(row) for row in backup_stop_rows],
+            "protection_states": _protection_state_detail(
+                order_legs=order_legs,
+                primary_rows=primary_stop_rows,
+                backup_rows=backup_stop_rows,
+                incidents=protection_incident_rows,
+            ),
             "protection_incidents": [
                 _protection_incident_detail(row) for row in protection_incident_rows
             ],
@@ -1084,6 +1099,76 @@ def _backup_stop_detail(row: PositionBackupStopOrder) -> dict[str, object]:
         "trigger_price": str(row.trigger_price),
         "status": str(row.status),
     }
+
+
+def _protection_state_detail(
+    *,
+    order_legs: list[ExecutionOrderLeg],
+    primary_rows: list[PositionProtectionLedger],
+    backup_rows: list[PositionBackupStopOrder],
+    incidents: list[PositionProtectionIncident],
+) -> list[dict[str, object]]:
+    """Project exact primary/backup protection health without exposing raw payloads."""
+
+    exact_legs = {
+        (int(leg.id), str(leg.pos_id))
+        for leg in order_legs
+        if leg.purpose == "entry" and leg.id is not None and str(leg.pos_id or "")
+    }
+    result: list[dict[str, object]] = []
+    for leg_id, pos_id in sorted(exact_legs, key=lambda item: item[1]):
+        primary = next(
+            (
+                row for row in reversed(primary_rows)
+                if int(row.execution_order_leg_id) == leg_id and str(row.pos_id) == pos_id
+            ),
+            None,
+        )
+        backup = next(
+            (
+                row for row in reversed(backup_rows)
+                if int(row.execution_order_leg_id) == leg_id and str(row.pos_id) == pos_id
+            ),
+            None,
+        )
+        matching_incidents = [
+            row for row in incidents
+            if int(row.execution_order_leg_id) == leg_id and str(row.pos_id) == pos_id
+        ]
+        primary_status = str(primary.status) if primary is not None else "not_verified"
+        backup_status = str(backup.status) if backup is not None else "not_created"
+        blocker = next(
+            (
+                str(row.incident_type)
+                for row in reversed(matching_incidents)
+                if str(row.incident_type) != "stop_trigger_failed"
+            ),
+            None,
+        )
+        if primary_status == "stop_trigger_failed" and backup_status == "active":
+            message = "主止损失败，第二止损有效"
+        elif backup is None:
+            message = "第二止损未创建/证据未知"
+        elif backup_status == "unknown_exchange_outcome":
+            message = "第二止损提交结果未知"
+        elif primary_status in {"protection_missing", "not_verified"}:
+            message = "主止损证据未知，自动管理已冻结"
+        else:
+            message = "主止损与第二止损已记录"
+        result.append(
+            {
+                "pos_id": pos_id,
+                "primary_stop_price": str(primary.trigger_price) if primary and primary.trigger_price else None,
+                "primary_stop_status": primary_status,
+                "primary_order_id": str(primary.order_id) if primary else None,
+                "backup_stop_price": str(backup.trigger_price) if backup else None,
+                "backup_stop_status": backup_status,
+                "backup_order_id": str(backup.order_id) if backup and backup.order_id else None,
+                "backup_stop_blocker": blocker,
+                "operator_message": message,
+            }
+        )
+    return result
 
 
 def _protection_incident_detail(row: PositionProtectionIncident) -> dict[str, object]:

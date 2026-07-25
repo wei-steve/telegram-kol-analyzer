@@ -19,6 +19,7 @@ from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
+from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trigger_backup_stop import BackupStopError
 from telegram_kol_research.trigger_backup_stop import build_backup_stop_trigger_payload
 from telegram_kol_research.trigger_backup_stop import calculate_backup_stop_price
@@ -52,8 +53,10 @@ def submit_verified_trigger_backup_stops(
 
     trigger_order = getattr(client, "trigger_order", None)
     list_positions = getattr(client, "list_positions", None)
-    if not callable(trigger_order) or not callable(list_positions):
+    list_pending = getattr(client, "list_trigger_orders_pending", None)
+    if not callable(trigger_order) or not callable(list_positions) or not callable(list_pending):
         return 0
+    backup_stop_buffer_bps = load_trading_settings(session_factory).trigger_backup_stop_buffer_bps
     with session_factory() as session:
         candidates = _eligible_candidates(session)
     submitted = 0
@@ -66,6 +69,7 @@ def submit_verified_trigger_backup_stops(
                 pos_id=pos_id,
                 client=client,
                 contract_spec_provider=contract_spec_provider,
+                backup_stop_buffer_bps=backup_stop_buffer_bps,
                 submitted_at=submitted_at,
             )
             if plan.status == "already_protected":
@@ -113,10 +117,47 @@ def submit_verified_trigger_backup_stops(
             if row is None:
                 continue
             row.order_id = order_id
-            row.status = "active"
             row.response_json = json.dumps(response, ensure_ascii=False, sort_keys=True)
             row.submitted_at = submitted_at
             row.updated_at = submitted_at
+            session.commit()
+            instrument_id = row.instrument_id
+        try:
+            pending = _read_pending_trigger_orders(client, instrument_id=instrument_id)
+            verified = _pending_matches_backup(
+                pending, order_id=order_id, payload=plan.payload
+            )
+        except Exception:
+            verified = False
+        if not verified:
+            with session_factory() as session:
+                row = session.get(PositionBackupStopOrder, row_id)
+                if row is not None:
+                    row.status = "unknown_exchange_outcome"
+                    row.error_json = json.dumps(
+                        {"error": "backup stop not verifiable after submission"},
+                        ensure_ascii=False,
+                    )
+                    row.updated_at = submitted_at
+                    _record_incident(
+                        session,
+                        plan=BackupStopPlan(
+                            status="exchange_unavailable",
+                            reason_code="backup_exchange_outcome_unknown",
+                            binding_id=int(row.execution_binding_id),
+                            leg_id=int(row.execution_order_leg_id),
+                            pos_id=str(row.pos_id),
+                        ),
+                        incident_type="backup_exchange_outcome_unknown",
+                        observed_at=submitted_at,
+                    )
+                    session.commit()
+            return submitted
+        with session_factory() as session:
+            row = session.get(PositionBackupStopOrder, row_id)
+            if row is None:
+                continue
+            row.status = "active"
             session.add(ExecutionEvent(
                 execution_binding_id=row.execution_binding_id,
                 strategy_instance_id=_strategy_instance_id(session, row.execution_binding_id),
@@ -159,23 +200,21 @@ def _eligible_candidates(session) -> list[tuple[int, int, str]]:
             or not has_authoritative_persisted_position(leg, session=session)
         ):
             continue
-        existing = (
-            session.query(PositionBackupStopOrder.id)
-            .filter(PositionBackupStopOrder.venue == "deepcoin")
-            .filter(PositionBackupStopOrder.pos_id == pos_id)
-            .filter(
-                PositionBackupStopOrder.status.in_(
-                    ("submitting", "active", "unknown_exchange_outcome")
-                )
-            )
-            .first()
-        )
-        if existing is None:
-            result.append((int(binding.id), int(leg.id), pos_id))
+        result.append((int(binding.id), int(leg.id), pos_id))
     return result
 
 
-def _plan_submission(session, *, binding_id, leg_id, pos_id, client, contract_spec_provider, submitted_at):
+def _plan_submission(
+    session,
+    *,
+    binding_id,
+    leg_id,
+    pos_id,
+    client,
+    contract_spec_provider,
+    backup_stop_buffer_bps,
+    submitted_at,
+):
     binding = session.get(ExecutionBinding, binding_id)
     leg = session.get(ExecutionOrderLeg, leg_id)
     if binding is None or leg is None or str(leg.pos_id or "") != pos_id:
@@ -190,7 +229,7 @@ def _plan_submission(session, *, binding_id, leg_id, pos_id, client, contract_sp
     if not has_authoritative_persisted_position(leg, session=session):
         return _blocked_plan(binding_id, leg_id, pos_id, "position_not_authoritative")
     existing = (
-        session.query(PositionBackupStopOrder.id)
+        session.query(PositionBackupStopOrder)
         .filter(PositionBackupStopOrder.venue == "deepcoin")
         .filter(PositionBackupStopOrder.pos_id == pos_id)
         .filter(
@@ -200,10 +239,6 @@ def _plan_submission(session, *, binding_id, leg_id, pos_id, client, contract_sp
         )
         .first()
     )
-    if existing is not None:
-        return BackupStopPlan(
-            status="already_protected", binding_id=binding_id, leg_id=leg_id, pos_id=pos_id
-        )
     primary = (
         session.query(PositionProtectionLedger)
         .filter(PositionProtectionLedger.execution_binding_id == binding_id)
@@ -253,6 +288,7 @@ def _plan_submission(session, *, binding_id, leg_id, pos_id, client, contract_sp
         backup_price = calculate_backup_stop_price(
             primary_stop=primary_stop, side=binding.side,
             price_tick=spec.price_tick,
+            buffer_bps=backup_stop_buffer_bps,
         )
         payload = build_backup_stop_trigger_payload(
             instrument_id=instrument_id, side=binding.side, margin_mode=binding.margin_mode,
@@ -265,6 +301,33 @@ def _plan_submission(session, *, binding_id, leg_id, pos_id, client, contract_sp
         )
     except BackupStopError:
         return _blocked_plan(binding_id, leg_id, pos_id, "backup_stop_unsafe")
+    if existing is not None:
+        try:
+            pending = _read_pending_trigger_orders(client, instrument_id=instrument_id)
+        except Exception:
+            return BackupStopPlan(
+                status="exchange_unavailable",
+                reason_code="backup_stop_readback_unavailable",
+                binding_id=binding_id,
+                leg_id=leg_id,
+                pos_id=pos_id,
+            )
+        if (
+            str(existing.status) == "active"
+            and str(existing.order_id or "").strip()
+            and _pending_matches_backup(pending, order_id=str(existing.order_id), payload=payload)
+        ):
+            return BackupStopPlan(
+                status="already_protected", binding_id=binding_id, leg_id=leg_id, pos_id=pos_id
+            )
+        return _blocked_plan(
+            binding_id,
+            leg_id,
+            pos_id,
+            "backup_exchange_outcome_unknown"
+            if str(existing.status) in {"submitting", "unknown_exchange_outcome"}
+            else "backup_stop_missing_on_exchange",
+        )
     return BackupStopPlan(
         status="ready", binding_id=binding_id, leg_id=leg_id, pos_id=pos_id, payload=payload
     )
@@ -348,6 +411,40 @@ def _response_order_id(response: Any) -> str | None:
             if value:
                 return str(value)
     return None
+
+
+def _read_pending_trigger_orders(client: Any, *, instrument_id: str) -> list[dict[str, Any]]:
+    reader = getattr(client, "list_trigger_orders_pending", None)
+    if not callable(reader):
+        raise RuntimeError("pending trigger order readback unavailable")
+    response = reader(inst_id=instrument_id)
+    if isinstance(response, dict):
+        response = response.get("data", [])
+    if not isinstance(response, list):
+        raise RuntimeError("pending trigger order response malformed")
+    return [row for row in response if isinstance(row, dict)]
+
+
+def _pending_matches_backup(
+    pending: list[dict[str, Any]], *, order_id: str, payload: dict[str, str]
+) -> bool:
+    for row in pending:
+        if str(row.get("ordId") or row.get("orderId") or row.get("id") or "") != str(order_id):
+            continue
+        if str(row.get("instId") or "").upper() != payload["instId"]:
+            continue
+        exchange_pos_id = str(row.get("closePosId") or row.get("posId") or "")
+        if exchange_pos_id and exchange_pos_id != payload["closePosId"]:
+            continue
+        if str(row.get("posSide") or "").lower() != payload["posSide"]:
+            continue
+        if str(row.get("orderType") or "").lower() != "market":
+            continue
+        trigger_price = str(row.get("triggerPrice") or row.get("triggerPx") or "")
+        if trigger_price != payload["triggerPrice"]:
+            continue
+        return True
+    return False
 
 
 def _primary_stop_price(row: PositionProtectionLedger | None) -> str | None:

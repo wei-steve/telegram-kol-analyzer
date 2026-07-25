@@ -21,6 +21,21 @@ Production Telegram sessions, databases, Deepcoin credentials, API secrets, and 
 
 Use GitHub as the code-transfer channel. After a reviewed commit is pushed to `codex/deepcoin-auto-trading-v1`, use `./scripts/server_git_update.sh` on macOS/Linux or `scripts/server_git_update.ps1` on Windows from an approved workstation to update the server. Both helpers invoke the server update command, which reinstalls the editable package and restarts `telegram-kol.service`.
 
+## Exact stop-protection handoff
+
+The protection chain is `entry fill -> exact posId -> primary stop ownership ->
+verified second stop -> staged take profit`. Persisted `ordId ↔ posId ↔ entry
+leg` ownership is authoritative when a Deepcoin read-back omits a position ID;
+an explicit different position ID is a conflict. The default second-stop offset
+is 20 bps and it uses `closePosId` plus market execution.
+
+Before any production repair, deploy reviewed code, run a server dry run, and
+record its fingerprint, exact candidate evidence, deployed SHA, and service
+state. A real apply is always one `posId` at a time with that exact fingerprint.
+Known failed-primary positions are excluded from normal repair. Do not retry a
+`NotEnoughMoneyToClose` failure automatically; preserve any verified second
+stop and keep automatic management frozen.
+
 ## Handoff checklist
 
 - Read `AGENTS.md`, `docs/runbook.md`, and `docs/server-deployment.md`.

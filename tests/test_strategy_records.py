@@ -137,6 +137,16 @@ def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
                 created_at=NOW - timedelta(hours=4), updated_at=NOW - timedelta(hours=4),
             )
         )
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin", execution_binding_id=binding.id,
+                execution_order_leg_id=order_leg.id,
+                strategy_instance_id=binding.strategy_instance_id, pos_id="pos-1",
+                instrument_id="BTC-USDT-SWAP", side="long", order_id="primary-stop-1",
+                purpose="stop_loss", trigger_price="65000", status="stop_trigger_failed",
+                evidence_source="test", evidence_json="{}",
+            )
+        )
         session.add_all([
             PositionBackupStopOrder(
                 venue="deepcoin", execution_binding_id=binding.id, execution_order_leg_id=order_leg.id,
@@ -246,6 +256,17 @@ def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
     assert detail["execution"]["protection_incidents"] == [{
         "pos_id": "pos-1", "incident_type": "stop_trigger_failed", "delivery_status": "pending",
         "error": "203: NotEnoughMoneyToClose",
+    }]
+    assert detail["execution"]["protection_states"] == [{
+        "pos_id": "pos-1",
+        "primary_stop_price": "65000",
+        "primary_stop_status": "stop_trigger_failed",
+        "primary_order_id": "primary-stop-1",
+        "backup_stop_price": "64675",
+        "backup_stop_status": "active",
+        "backup_order_id": "backup-stop-1",
+        "backup_stop_blocker": None,
+        "operator_message": "主止损失败，第二止损有效",
     }]
 
 

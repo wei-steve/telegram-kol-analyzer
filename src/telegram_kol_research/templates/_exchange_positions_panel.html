@@ -63,6 +63,8 @@
       {% if item.stop_loss_text %}<div><dt>止损</dt><dd>{{ item.stop_loss_text }}</dd></div>
       {% elif item.stop_loss %}<div><dt>止损</dt><dd>{{ "%g"|format(item.stop_loss) }}</dd></div>
       {% elif item.stop_loss_state_text %}<div><dt>止损</dt><dd class="protection-state protection-state--{{ item.protection_status }}">{{ item.stop_loss_state_text }}</dd></div>{% endif %}
+      {% if item.backup_stop_text %}<div><dt>第二止损</dt><dd>{{ item.backup_stop_text }} · {{ item.backup_stop_status }}</dd></div>
+      {% elif item.backup_stop_state_text %}<div><dt>第二止损</dt><dd class="protection-state protection-state--unprotected">{{ item.backup_stop_state_text }}</dd></div>{% endif %}
       {% if item.take_profit_text %}<div><dt>止盈</dt><dd>{{ item.take_profit_text }}</dd></div>
       {% elif item.take_profit %}<div><dt>止盈</dt><dd>{{ item.take_profit }}</dd></div>{% endif %}
       {% if item.last_checked_at_display %}<div><dt>更新时间</dt><dd>{{ item.last_checked_at_display }}</dd></div>{% endif %}

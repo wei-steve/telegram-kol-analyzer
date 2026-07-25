@@ -59,6 +59,7 @@ from telegram_kol_research.models import (
     AiPromptTestRun,
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionBackupStopOrder,
     PositionProtectionLedger,
     RecognitionDecision,
     StrategyManagementBatch,
@@ -910,6 +911,24 @@ def _load_deepcoin_live_position_rows(
                     and int(leg.id) == int(ledger_row.execution_order_leg_id)
                 ):
                     exact_order_position_ids[order_id] = pos_id
+        backup_by_leg_id = {
+            int(row.execution_order_leg_id): row
+            for row in (
+                session.query(PositionBackupStopOrder)
+                .filter(PositionBackupStopOrder.venue == "deepcoin")
+                .filter(
+                    PositionBackupStopOrder.execution_order_leg_id.in_(verified_live_leg_ids)
+                )
+                .order_by(PositionBackupStopOrder.id.asc())
+                .all()
+                if verified_live_leg_ids
+                else []
+            )
+            if (
+                (leg := legs_by_pos_id.get(str(row.pos_id))) is not None
+                and int(leg.id) == int(row.execution_order_leg_id)
+            )
+        }
         protection_match = match_position_protection(
             active_positions,
             tpsl_orders,
@@ -969,6 +988,11 @@ def _load_deepcoin_live_position_rows(
                 else "unassigned"
             )
             ownership_verified = ownership_state == "verified"
+            backup_stop = (
+                backup_by_leg_id.get(int(ownership_leg.id))
+                if ownership_verified and ownership_leg is not None and ownership_leg.id is not None
+                else None
+            )
             binding = (
                 bindings_by_id.get(int(ownership_leg.execution_binding_id))
                 if ownership_leg is not None
@@ -1018,6 +1042,21 @@ def _load_deepcoin_live_position_rows(
                     "entry_price_actual": _float_or_none(position.get("avgPx")),
                     "stop_loss_text": _position_text_value(stop_loss_value),
                     "stop_loss_state_text": stop_loss_state_text,
+                    "backup_stop_text": (
+                        _position_text_value(backup_stop.trigger_price)
+                        if backup_stop is not None
+                        else None
+                    ),
+                    "backup_stop_status": (
+                        str(backup_stop.status) if backup_stop is not None else "not_created"
+                    ),
+                    "backup_stop_state_text": (
+                        None
+                        if backup_stop is not None
+                        else "第二止损未创建"
+                        if ownership_verified
+                        else None
+                    ),
                     "take_profit_text": "/".join(
                         _position_text_value(value) or "" for value in take_profit_values
                     ) or None,

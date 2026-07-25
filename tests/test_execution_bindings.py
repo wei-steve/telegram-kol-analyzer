@@ -235,6 +235,7 @@ class _BackupStopSubmissionClient:
         self.positions = list(positions)
         self.responses = list(responses or [])
         self.trigger_payloads = []
+        self.pending_rows = []
 
     def list_positions(self, *, inst_id=None):
         if inst_id is None:
@@ -243,7 +244,18 @@ class _BackupStopSubmissionClient:
 
     def trigger_order(self, payload):
         self.trigger_payloads.append(payload)
-        return self.responses.pop(0) if self.responses else {"code": "0", "data": "backup-1"}
+        response = self.responses.pop(0) if self.responses else {"code": "0", "data": "backup-1"}
+        order_id = response.get("data") if isinstance(response, dict) else None
+        if isinstance(order_id, str) and order_id:
+            self.pending_rows.append({
+                "ordId": order_id, "instId": payload["instId"],
+                "closePosId": payload["closePosId"], "posSide": payload["posSide"],
+                "orderType": payload["orderType"], "triggerPrice": payload["triggerPrice"],
+            })
+        return response
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        return [row for row in self.pending_rows if row.get("instId") == inst_id]
 
 
 def _backup_stop_provider():
@@ -400,7 +412,7 @@ def test_reconcile_submits_one_exact_backup_stop_by_default_when_contract_specs_
             self.trigger_payloads.append(payload)
             self.pending_rows.append({
                 "ordId": "backup-1", "instId": "ETH-USDT-SWAP", "closePosId": "pos-1",
-                "posSide": "short", "triggerPx": payload["triggerPrice"],
+                "posSide": "short", "orderType": "market", "triggerPx": payload["triggerPrice"],
             })
             return {"code": "0", "data": "backup-1"}
 
@@ -543,6 +555,55 @@ def test_backup_submission_stops_batch_after_unknown_exchange_outcome(tmp_path):
     assert [(row.pos_id, row.incident_type) for row in incidents] == [
         ("pos-1", "backup_exchange_outcome_unknown")
     ]
+
+
+def test_backup_submission_marks_response_unknown_until_exact_pending_readback(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+
+    class NoReadbackClient(_BackupStopSubmissionClient):
+        def trigger_order(self, payload):
+            self.trigger_payloads.append(payload)
+            return {"code": "0", "data": "backup-1"}
+
+    client = NoReadbackClient([{
+        "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+        "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+    }])
+    assert submit_verified_trigger_backup_stops(
+        session_factory, client=client, contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    ) == 0
+    with session_factory() as session:
+        row = session.query(PositionBackupStopOrder).one()
+    assert (row.order_id, row.status) == ("backup-1", "unknown_exchange_outcome")
+
+
+def test_backup_submission_accepts_exact_order_readback_when_deepcoin_omits_position_id(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+
+    class OmittedPositionReadbackClient(_BackupStopSubmissionClient):
+        def trigger_order(self, payload):
+            self.trigger_payloads.append(payload)
+            self.pending_rows.append({
+                "ordId": "backup-1", "instId": payload["instId"],
+                "posSide": payload["posSide"], "orderType": payload["orderType"],
+                "triggerPrice": payload["triggerPrice"],
+            })
+            return {"code": "0", "data": "backup-1"}
+
+    client = OmittedPositionReadbackClient([{
+        "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+        "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+    }])
+    assert submit_verified_trigger_backup_stops(
+        session_factory, client=client, contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    ) == 1
+    with session_factory() as session:
+        row = session.query(PositionBackupStopOrder).one()
+    assert (row.order_id, row.status) == ("backup-1", "active")
 
 
 def test_reconcile_marks_triggered_primary_stop_failure_and_deduplicates_exact_incident(tmp_path):

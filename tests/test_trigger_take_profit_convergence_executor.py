@@ -45,6 +45,7 @@ def _ready_convergence(
     existing_take_profit=True,
     desired_take_profits=None,
     with_backup=True,
+    order_kind="trigger_limit",
 ):
     from telegram_kol_research.db import create_session_factory  # keep import boundaries explicit
     from telegram_kol_research.execution_bindings import (
@@ -73,7 +74,7 @@ def _ready_convergence(
         session_factory,
         ExecutionOrderLegRecord(
             execution_binding_id=binding_id, leg_index=1, purpose="entry",
-            order_kind="trigger_limit", venue="deepcoin", pos_id="pos-10", status="active",
+            order_kind=order_kind, venue="deepcoin", pos_id="pos-10", status="active",
         ),
     )
     with session_factory() as session:
@@ -330,6 +331,26 @@ def test_execution_submits_initial_take_profits_without_cancelling_any_order(tmp
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
     assert [row.status for row in new] == ["active", "active", "active"]
     assert convergence.status == "submitted"
+
+
+def test_execution_submits_take_profits_for_market_entry_after_backup_readback(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(
+        session_factory, existing_take_profit=False, order_kind="market"
+    )
+    client = _Client()
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory, convergence_id=convergence_id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "submitted"
+    assert [payload["sz"] for payload in client.submit_calls] == ["5", "3", "2"]
 
 
 def test_unknown_take_profit_submit_is_frozen_without_automatic_retry(tmp_path):

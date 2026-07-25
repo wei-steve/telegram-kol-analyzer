@@ -296,6 +296,7 @@ def test_strategy_record_detail_is_semantic_read_only_and_escapes_evidence(tmp_p
     assert 'data-strategy-detail-section="overview"' in response.text
     assert 'data-strategy-detail-section="timeline"' in response.text
     assert 'data-strategy-detail-section="execution"' in response.text
+    assert 'data-strategy-protection-states' in response.text
     assert 'data-strategy-detail-section="evidence"' in response.text
     assert "&lt;script&gt;unsafeEvidence()&lt;/script&gt;" in response.text
     assert "<script>unsafeEvidence()</script>" not in response.text

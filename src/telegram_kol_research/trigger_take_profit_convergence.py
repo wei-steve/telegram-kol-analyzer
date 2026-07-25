@@ -1,4 +1,4 @@
-"""Durable staged take-profit convergence records for trigger entries."""
+"""Durable staged take-profit convergence records for exact automatic entries."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def create_or_get_trigger_take_profit_convergence(
     desired_take_profits: list[dict[str, object]],
     created_at: datetime | None = None,
 ) -> TriggerTakeProfitConvergence:
-    """Save one immutable take-profit plan per trigger entry leg."""
+    """Save one immutable take-profit plan per automatic entry leg."""
 
     normalized_venue = _normalized_venue(venue)
     normalized_plan = _normalized_take_profit_plan(desired_take_profits)
@@ -44,8 +44,8 @@ def create_or_get_trigger_take_profit_convergence(
     leg = session.get(ExecutionOrderLeg, execution_order_leg_id)
     if leg is None:
         raise ValueError("execution order leg does not exist")
-    if str(leg.purpose) != "entry" or str(leg.order_kind) != "trigger_limit":
-        raise ValueError("staged take-profit convergence requires a trigger entry leg")
+    if str(leg.purpose) != "entry" or str(leg.order_kind) not in {"trigger_limit", "market"}:
+        raise ValueError("staged take-profit convergence requires an automatic entry leg")
     if str(leg.venue).lower() != normalized_venue:
         raise ValueError("execution order leg venue differs from convergence venue")
     now = created_at or utc_now()
@@ -80,7 +80,7 @@ def mark_trigger_take_profit_convergence_ready(
         or binding is None
         or int(leg.execution_binding_id) != int(binding.id)
         or str(leg.purpose) != "entry"
-        or str(leg.order_kind) != "trigger_limit"
+        or str(leg.order_kind) not in {"trigger_limit", "market"}
         or str(leg.status).lower() != "active"
         or str(leg.attribution_status) != "verified"
         or not str(leg.pos_id or "").strip()
