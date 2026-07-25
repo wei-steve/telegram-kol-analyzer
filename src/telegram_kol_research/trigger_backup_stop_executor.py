@@ -18,10 +18,13 @@ from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.models import PositionProtectionLeg
 from telegram_kol_research.native_tpsl import NativeTpslExpectation
 from telegram_kol_research.native_tpsl import match_native_tpsl_order
 from telegram_kol_research.native_tpsl import normalize_native_tpsl
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
+from telegram_kol_research.position_protection_legs import bind_verified_exchange_order
+from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trigger_backup_stop import BackupStopError
 from telegram_kol_research.trigger_backup_stop import build_backup_stop_trigger_payload
@@ -190,6 +193,32 @@ def submit_verified_trigger_backup_stops(
                 continue
             row.order_id = verified_order_id
             row.status = "active"
+            protection_leg = (
+                session.query(PositionProtectionLeg)
+                .filter(PositionProtectionLeg.execution_order_leg_id == row.execution_order_leg_id)
+                .filter(PositionProtectionLeg.role == "backup_stop")
+                .filter(PositionProtectionLeg.leg_index == 1)
+                .one_or_none()
+            )
+            if protection_leg is not None:
+                protection_leg.planned_trigger_price = row.trigger_price
+                protection_leg.planned_size = "0"
+                bind_verified_exchange_order(
+                    session,
+                    protection_leg,
+                    exchange_order_id=verified_order_id,
+                    readback_evidence={"response": row.response_json, "order_id": verified_order_id},
+                )
+            upsert_protection_ledger_row(
+                session,
+                venue=row.venue, execution_binding_id=int(row.execution_binding_id),
+                execution_order_leg_id=int(row.execution_order_leg_id),
+                strategy_instance_id=_strategy_instance_id(session, row.execution_binding_id),
+                pos_id=row.pos_id, instrument_id=row.instrument_id, side=row.side,
+                order_id=verified_order_id, purpose="stop_loss", trigger_price=row.trigger_price,
+                size_text="0", status="verified", evidence_source="trigger_backup_stop_pending_readback",
+                evidence={"backup_stop": True}, seen_at=submitted_at,
+            )
             session.add(ExecutionEvent(
                 execution_binding_id=row.execution_binding_id,
                 strategy_instance_id=_strategy_instance_id(session, row.execution_binding_id),

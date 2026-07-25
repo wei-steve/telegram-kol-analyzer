@@ -13,6 +13,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     PositionBackupStopOrder,
+    PositionProtectionLeg,
     PositionProtectionLedger,
     PositionTakeProfitOrder,
     TriggerTakeProfitConvergence,
@@ -22,6 +23,8 @@ from telegram_kol_research.position_authority_lock import serialized_position_au
 from telegram_kol_research.position_take_profit_orders import (
     record_take_profit_order,
 )
+from telegram_kol_research.position_protection_legs import bind_verified_exchange_order
+from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.take_profit_plan import TakeProfitPlanError, build_take_profit_plan
 from telegram_kol_research.native_tpsl import (
     NativeTpslExpectation,
@@ -176,6 +179,33 @@ def execute_trigger_take_profit_convergence(
                     "response": _response_dict(response),
                     "native_tpsl": verified.raw,
                 },
+            )
+            protection_leg = (
+                session.query(PositionProtectionLeg)
+                .filter(PositionProtectionLeg.execution_order_leg_id == convergence.execution_order_leg_id)
+                .filter(PositionProtectionLeg.role == "take_profit")
+                .filter(PositionProtectionLeg.planned_trigger_price == str(payload["tpTriggerPx"]))
+                .one_or_none()
+            )
+            if protection_leg is not None:
+                bind_verified_exchange_order(
+                    session,
+                    protection_leg,
+                    exchange_order_id=order_id,
+                    readback_evidence={"response": _response_dict(response), "native_tpsl": verified.raw},
+                )
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=int(convergence.execution_binding_id),
+                execution_order_leg_id=int(convergence.execution_order_leg_id),
+                strategy_instance_id=session.get(ExecutionOrderLeg, convergence.execution_order_leg_id).strategy_instance_id,
+                pos_id=str(convergence.pos_id),
+                instrument_id=str(payload["instId"]), side=str(payload["posSide"]),
+                order_id=order_id, purpose="take_profit", trigger_price=str(payload["tpTriggerPx"]),
+                size_text=str(payload["sz"]), status="verified",
+                evidence_source="trigger_take_profit_pending_readback",
+                evidence={"native_tpsl": verified.raw}, seen_at=now,
             )
             session.commit()
     with session_factory() as session:
