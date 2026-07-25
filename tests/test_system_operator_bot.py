@@ -284,6 +284,35 @@ def test_management_notification_formatter_has_exact_identity_and_safety_labels(
         assert expected in message
 
 
+def test_management_bypass_notification_identifies_exact_full_exit():
+    message = operator_bot_module.format_strategy_management_notification(
+        {
+            "batch_id": 89,
+            "state": "reconciling",
+            "mode": "live",
+            "source_chat_id": -10089,
+            "source_message_id": 902,
+            "raw_message_id": 72,
+            "lifecycle_id": 12,
+            "strategy_instance_id": "deepcoin:-10089:812:BTC:short",
+            "execution_binding_id": 13,
+            "intent": "full_exit",
+            "effective_action": "full_exit",
+            "reason": "close_submissions_pending_reconciliation",
+            "protection_recovery_bypass": {
+                "reason": "protection_recovery_required",
+                "allowed_action": "full_exit",
+                "target_pos_ids": ["pos-89"],
+            },
+            "legs": [],
+        }
+    )
+
+    assert "【保护异常旁路全平】" in message
+    assert "pos-89" in message
+    assert "protection_recovery_required" in message
+
+
 @pytest.mark.parametrize(
     "state", ["blocked", "partial_failed", "submit_unknown", "recovery_required"]
 )

@@ -489,6 +489,31 @@ Percentage and contract-size rules for live management:
   Reconcile the current exchange snapshot first and wait for a new instruction
   or an explicitly reviewed operator action.
 
+For a protection-recovery full-exit audit, use this read-only query. A
+`protection_recovery_bypass` marker proves only that the exact full-exit was
+admitted; `succeeded` still requires the later exchange reconciliation result.
+
+```bash
+sqlite3 -readonly data/research.db <<'SQL'
+.headers on
+.mode column
+SELECT b.id AS batch_id,
+       b.status AS batch_status,
+       b.reason_code,
+       l.pos_id,
+       l.status AS leg_status,
+       l.exchange_order_id,
+       sl.lifecycle_status,
+       sl.exit_reason
+FROM strategy_management_batches AS b
+JOIN strategy_management_legs AS l ON l.management_batch_id = b.id
+JOIN strategy_lifecycles AS sl ON sl.id = b.target_lifecycle_id
+WHERE json_extract(b.target_snapshot_json, '$.protection_recovery_bypass.version') = 1
+ORDER BY b.id DESC, l.leg_index ASC
+LIMIT 100;
+SQL
+```
+
 Run the bounded read-only audit from the server checkout:
 
 ```bash

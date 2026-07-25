@@ -255,6 +255,26 @@ def _management_batch_mode(batch: StrategyManagementBatch, snapshot: dict[str, A
     return mode if mode in {"disabled", "shadow", "live"} else "disabled"
 
 
+def _management_protection_recovery_bypass(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    marker = snapshot.get("protection_recovery_bypass")
+    if not isinstance(marker, dict) or marker.get("version") != 1:
+        return None
+    pos_ids = marker.get("target_pos_ids")
+    if not isinstance(pos_ids, list):
+        return None
+    return {
+        "reason": _bounded_management_text(marker.get("reason"), limit=80),
+        "allowed_action": _bounded_management_text(
+            marker.get("allowed_action"), limit=64
+        ),
+        "target_pos_ids": [
+            _bounded_management_text(pos_id, limit=120)
+            for pos_id in pos_ids[:20]
+            if pos_id not in (None, "")
+        ],
+    }
+
+
 def _management_batch_api_rows(
     session_factory, *, chat_id: int | None, limit: int, group_labels=None
 ):
@@ -327,6 +347,9 @@ def _management_batch_api_rows(
                     "partial_round_before": batch.partial_round_before,
                     "status": batch.status,
                     "reason": _bounded_management_text(batch.reason_code, limit=240),
+                    "protection_recovery_bypass": _management_protection_recovery_bypass(
+                        snapshot
+                    ),
                     "safety_label": "禁止自动重试" if batch.status == "recovery_required" else None,
                     "source": {
                         "chat_id": raw.chat_id,

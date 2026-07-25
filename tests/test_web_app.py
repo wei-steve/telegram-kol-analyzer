@@ -155,6 +155,16 @@ def test_management_batch_api_is_bounded_redacted_read_only_and_group_isolated(t
                 target_fingerprint=("a" if index == 1 else "b") * 64,
                 target_snapshot_json=json.dumps({
                     "mode": "live", "targets": [{"pos_id": f"pos-{index}", "size": "0.02"}],
+                    "protection_recovery_bypass": (
+                        {
+                            "version": 1,
+                            "reason": "protection_recovery_required",
+                            "allowed_action": "full_exit",
+                            "target_pos_ids": [f"pos-{index}"],
+                        }
+                        if index == 2
+                        else None
+                    ),
                     "headers": {"DC-ACCESS-KEY": "never-return"}, "raw_response": "never-return",
                 }), planned_at=now, created_at=now, updated_at=now,
             )
@@ -211,6 +221,11 @@ def test_management_batch_api_is_bounded_redacted_read_only_and_group_isolated(t
     assert group_b[0]["source"]["chat_id"] == -1002
     assert group_b[0]["strategy_instance_id"] == "deepcoin:-1002:7:BTC:short"
     assert group_b[0]["legs"][0]["pos_id"] == "pos-2"
+    assert group_b[0]["protection_recovery_bypass"] == {
+        "reason": "protection_recovery_required",
+        "allowed_action": "full_exit",
+        "target_pos_ids": ["pos-2"],
+    }
     assert "pos-1" not in json.dumps(group_b)
 
 

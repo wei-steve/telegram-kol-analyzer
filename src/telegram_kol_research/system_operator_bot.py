@@ -279,6 +279,7 @@ def format_position_protection_incident_message(payload: dict[str, Any]) -> str:
 MANAGEMENT_ALERT_STATES = frozenset(
     {"blocked", "partial_failed", "submit_unknown", "recovery_required"}
 )
+_BYPASS_ALERT_STATES = frozenset({"reconciling", "succeeded", "recovery_required", "partial_failed", "submit_unknown"})
 _MANAGEMENT_TELEGRAM_MAX_CHARS = 3900
 _DEFERRED_CANCEL_EVENT_ACTIONS = frozenset({
     "strategy_management_cancel_deferred_trigger_entry",
@@ -296,8 +297,10 @@ def format_strategy_management_notification(payload: dict[str, Any]) -> str:
 
     state = str(payload.get("state") or "-")
     mode = str(payload.get("mode") or "shadow")
+    bypass = payload.get("protection_recovery_bypass")
+    is_bypass = isinstance(bypass, dict)
     lines = [
-        "【策略管理批次异常】",
+        "【保护异常旁路全平】" if is_bypass else "【策略管理批次异常】",
         f"通知ID: {payload.get('notification_id') or '-'}",
         f"batch #{payload.get('batch_id') or '-'} / 状态: {state}",
         (
@@ -317,6 +320,20 @@ def format_strategy_management_notification(payload: dict[str, Any]) -> str:
     ]
     if state == "recovery_required":
         lines.append("安全限制: 禁止自动重试")
+    if is_bypass:
+        pos_ids = bypass.get("target_pos_ids")
+        if not isinstance(pos_ids, list):
+            pos_ids = []
+        lines.extend(
+            [
+                "旁路原因: " + _safe_management_text(bypass.get("reason"), limit=80),
+                "精确仓位: " + ", ".join(
+                    _safe_management_text(pos_id, limit=120)
+                    for pos_id in pos_ids[:20]
+                    if pos_id not in (None, "")
+                ),
+            ]
+        )
     deferred_entry_legs = (
         payload.get("deferred_entry_legs")
         if isinstance(payload.get("deferred_entry_legs"), list) else []
@@ -588,6 +605,7 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
                 if key != "execution_order_leg_id"
             }
     snapshot = _decode_mapping(batch.target_snapshot_json)
+    bypass = _management_protection_recovery_bypass(snapshot)
     identity = snapshot.get("identity")
     deferred_entry_leg_ids = (
         identity.get("deferred_entry_leg_ids") if isinstance(identity, dict) else []
@@ -689,8 +707,30 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
         "intent": _safe_management_text(batch.intent, limit=64),
         "effective_action": _safe_management_text(batch.effective_action, limit=64),
         "reason": _safe_management_text(batch.reason_code, limit=240),
+        "protection_recovery_bypass": bypass,
         "deferred_entry_legs": deferred_entry_legs,
         "legs": legs,
+    }
+
+
+def _management_protection_recovery_bypass(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    marker = snapshot.get("protection_recovery_bypass")
+    if not isinstance(marker, dict) or marker.get("version") != 1:
+        return None
+    if (
+        marker.get("reason") != "protection_recovery_required"
+        or marker.get("allowed_action") != "full_exit"
+        or not isinstance(marker.get("target_pos_ids"), list)
+    ):
+        return None
+    return {
+        "reason": "protection_recovery_required",
+        "allowed_action": "full_exit",
+        "target_pos_ids": [
+            _safe_management_text(pos_id, limit=120)
+            for pos_id in marker["target_pos_ids"][:20]
+            if pos_id not in (None, "")
+        ],
     }
 
 
@@ -743,9 +783,12 @@ def persist_strategy_management_notification_in_session(
 
     from telegram_kol_research.models import StrategyManagementNotification
 
-    if batch.status not in MANAGEMENT_ALERT_STATES:
-        return False
     payload = _management_payload_for_batch(session, batch, group_labels=group_labels)
+    bypass = payload.get("protection_recovery_bypass")
+    if batch.status not in MANAGEMENT_ALERT_STATES and not (
+        isinstance(bypass, dict) and batch.status in _BYPASS_ALERT_STATES
+    ):
+        return False
     fingerprint = _management_payload_fingerprint(payload)
     row = StrategyManagementNotification(
         management_batch_id=batch.id,
@@ -774,14 +817,18 @@ def enqueue_strategy_management_notifications(session_factory, *, group_labels=N
     with session_factory() as session:
         batch_ids = [
             row[0] for row in session.query(StrategyManagementBatch.id)
-            .filter(StrategyManagementBatch.status.in_(MANAGEMENT_ALERT_STATES))
+            .filter(
+                StrategyManagementBatch.status.in_(
+                    MANAGEMENT_ALERT_STATES | _BYPASS_ALERT_STATES
+                )
+            )
             .order_by(StrategyManagementBatch.id.asc()).limit(100).all()
         ]
     created = 0
     for batch_id in batch_ids:
         with session_factory() as session:
             batch = session.get(StrategyManagementBatch, batch_id)
-            if batch is None or batch.status not in MANAGEMENT_ALERT_STATES:
+            if batch is None:
                 continue
             if persist_strategy_management_notification_in_session(
                 session, batch, group_labels=group_labels
