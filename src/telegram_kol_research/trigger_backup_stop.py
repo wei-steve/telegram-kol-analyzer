@@ -63,27 +63,21 @@ def build_backup_stop_trigger_payload(
             raise BackupStopError("backup stop must be on the long risk side of primary stop")
         if backup <= liquidation:
             raise BackupStopError("backup stop must remain safely before long liquidation")
-        close_side = "sell"
     else:
         if backup <= primary:
             raise BackupStopError("backup stop must be on the short risk side of primary stop")
         if backup >= liquidation:
             raise BackupStopError("backup stop must remain safely before short liquidation")
-        close_side = "buy"
     return {
+        "instType": "SWAP",
         "instId": normalized_instrument,
-        "productGroup": "Swap",
-        "side": close_side,
         "posSide": normalized_side,
         "mrgPosition": "split",
         "tdMode": normalized_margin,
-        "closePosId": normalized_pos_id,
-        "orderType": "market",
-        "sz": _decimal_text(close_size),
-        "triggerPrice": _decimal_text(backup),
-        "triggerPxType": "last",
-        "price": "-1",
-        "clOrdId": normalized_client_id,
+        "posId": normalized_pos_id,
+        "slTriggerPx": _decimal_text(backup),
+        "slTriggerPxType": "last",
+        "slOrdPx": "-1",
     }
 
 

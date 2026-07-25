@@ -59,7 +59,7 @@ def test_build_backup_stop_trigger_payload_requires_safe_liquidation_boundary():
         )
 
 
-def test_build_backup_stop_trigger_payload_closes_only_the_exact_split_position_at_market():
+def test_build_backup_stop_trigger_payload_uses_native_position_tpsl_for_exact_split_position():
     payload = build_backup_stop_trigger_payload(
         instrument_id="ETH-USDT-SWAP",
         side="short",
@@ -73,19 +73,15 @@ def test_build_backup_stop_trigger_payload_closes_only_the_exact_split_position_
     )
 
     assert payload == {
+        "instType": "SWAP",
         "instId": "ETH-USDT-SWAP",
-        "productGroup": "Swap",
-        "side": "buy",
         "posSide": "short",
         "mrgPosition": "split",
         "tdMode": "cross",
-        "closePosId": "pos-1",
-        "orderType": "market",
-        "sz": "2.5",
-        "triggerPrice": "1928.6",
-        "triggerPxType": "last",
-        "price": "-1",
-        "clOrdId": "TKBACKUP1",
+        "posId": "pos-1",
+        "slTriggerPx": "1928.6",
+        "slTriggerPxType": "last",
+        "slOrdPx": "-1",
     }
 
 

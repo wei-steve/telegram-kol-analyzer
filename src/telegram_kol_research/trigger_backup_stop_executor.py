@@ -18,6 +18,8 @@ from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.native_tpsl import NativeTpslExpectation
+from telegram_kol_research.native_tpsl import match_native_tpsl_order
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trigger_backup_stop import BackupStopError
@@ -35,6 +37,8 @@ class BackupStopPlan:
     leg_id: int | None = None
     pos_id: str | None = None
     payload: dict[str, str] | None = None
+    position: dict[str, Any] | None = None
+    open_positions: tuple[dict[str, Any], ...] = ()
 
 
 def submit_verified_trigger_backup_stops(
@@ -51,10 +55,10 @@ def submit_verified_trigger_backup_stops(
     ambiguous network outcome cannot be blindly retried.
     """
 
-    trigger_order = getattr(client, "trigger_order", None)
+    set_position_sltp = getattr(client, "set_position_sltp", None)
     list_positions = getattr(client, "list_positions", None)
     list_pending = getattr(client, "list_trigger_orders_pending", None)
-    if not callable(trigger_order) or not callable(list_positions) or not callable(list_pending):
+    if not callable(set_position_sltp) or not callable(list_positions) or not callable(list_pending):
         return 0
     backup_stop_buffer_bps = load_trading_settings(session_factory).trigger_backup_stop_buffer_bps
     with session_factory() as session:
@@ -87,10 +91,8 @@ def submit_verified_trigger_backup_stops(
             row_id = int(row.id)
             session.commit()
         try:
-            response = trigger_order(plan.payload)
+            response = set_position_sltp(plan.payload)
             order_id = _response_order_id(response)
-            if not order_id:
-                raise RuntimeError("backup stop response missing exchange order id")
         except Exception as exc:
             with session_factory() as session:
                 row = session.get(PositionBackupStopOrder, row_id)
@@ -123,19 +125,35 @@ def submit_verified_trigger_backup_stops(
             session.commit()
             instrument_id = row.instrument_id
         try:
+            post_submit_positions = list(client.list_positions())
+            exact_post_submit = [
+                row for row in post_submit_positions if isinstance(row, dict)
+                and str(row.get("posId") or row.get("pos_id") or "") == plan.pos_id
+            ]
+            if len(exact_post_submit) != 1 or not _live_position_matches_plan(
+                exact_post_submit[0],
+                plan,
+            ):
+                raise RuntimeError("live_position_snapshot_not_unique_or_mismatched")
             pending = _read_pending_trigger_orders(client, instrument_id=instrument_id)
-            verified = _pending_matches_backup(
-                pending, order_id=order_id, payload=plan.payload
+            verified_order_id = _pending_matches_backup(
+                pending,
+                order_id=order_id,
+                payload=plan.payload,
+                position=exact_post_submit[0],
+                open_positions=tuple(
+                    row for row in post_submit_positions if isinstance(row, dict)
+                ),
             )
         except Exception:
-            verified = False
-        if not verified:
+            verified_order_id = None
+        if not verified_order_id:
             with session_factory() as session:
                 row = session.get(PositionBackupStopOrder, row_id)
                 if row is not None:
-                    row.status = "unknown_exchange_outcome"
+                    row.status = "pending_readback"
                     row.error_json = json.dumps(
-                        {"error": "backup stop not verifiable after submission"},
+                        {"error": "native backup stop pending readback"},
                         ensure_ascii=False,
                     )
                     row.updated_at = submitted_at
@@ -143,12 +161,12 @@ def submit_verified_trigger_backup_stops(
                         session,
                         plan=BackupStopPlan(
                             status="exchange_unavailable",
-                            reason_code="backup_exchange_outcome_unknown",
+                            reason_code="backup_stop_pending_readback",
                             binding_id=int(row.execution_binding_id),
                             leg_id=int(row.execution_order_leg_id),
                             pos_id=str(row.pos_id),
                         ),
-                        incident_type="backup_exchange_outcome_unknown",
+                        incident_type="backup_stop_pending_readback",
                         observed_at=submitted_at,
                     )
                     session.commit()
@@ -157,6 +175,7 @@ def submit_verified_trigger_backup_stops(
             row = session.get(PositionBackupStopOrder, row_id)
             if row is None:
                 continue
+            row.order_id = verified_order_id
             row.status = "active"
             session.add(ExecutionEvent(
                 execution_binding_id=row.execution_binding_id,
@@ -166,7 +185,7 @@ def submit_verified_trigger_backup_stops(
                 status="submitted",
                 symbol=row.instrument_id.split("-", 1)[0],
                 side=row.side,
-                order_id=order_id,
+                order_id=verified_order_id,
                 client_order_id=row.client_order_id,
                 pos_id=row.pos_id,
                 request_json=row.request_json,
@@ -234,7 +253,7 @@ def _plan_submission(
         .filter(PositionBackupStopOrder.pos_id == pos_id)
         .filter(
             PositionBackupStopOrder.status.in_(
-                ("submitting", "active", "unknown_exchange_outcome")
+                ("submitting", "pending_readback", "active", "unknown_exchange_outcome")
             )
         )
         .first()
@@ -315,7 +334,13 @@ def _plan_submission(
         if (
             str(existing.status) == "active"
             and str(existing.order_id or "").strip()
-            and _pending_matches_backup(pending, order_id=str(existing.order_id), payload=payload)
+            and _pending_matches_backup(
+                pending,
+                order_id=str(existing.order_id),
+                payload=payload,
+                position=position,
+                open_positions=tuple(row for row in positions if isinstance(row, dict)),
+            )
         ):
             return BackupStopPlan(
                 status="already_protected", binding_id=binding_id, leg_id=leg_id, pos_id=pos_id
@@ -324,12 +349,16 @@ def _plan_submission(
             binding_id,
             leg_id,
             pos_id,
-            "backup_exchange_outcome_unknown"
-            if str(existing.status) in {"submitting", "unknown_exchange_outcome"}
+            "backup_stop_pending_readback"
+            if str(existing.status) in {"submitting", "pending_readback"}
+            else "backup_exchange_outcome_unknown"
+            if str(existing.status) == "unknown_exchange_outcome"
             else "backup_stop_missing_on_exchange",
         )
     return BackupStopPlan(
-        status="ready", binding_id=binding_id, leg_id=leg_id, pos_id=pos_id, payload=payload
+        status="ready", binding_id=binding_id, leg_id=leg_id, pos_id=pos_id,
+        payload=payload, position=position,
+        open_positions=tuple(row for row in positions if isinstance(row, dict)),
     )
 
 
@@ -347,7 +376,13 @@ def _reserve_submission(session, *, plan: BackupStopPlan, submitted_at: datetime
     row = PositionBackupStopOrder(
         venue="deepcoin", execution_binding_id=plan.binding_id, execution_order_leg_id=plan.leg_id,
         pos_id=plan.pos_id, instrument_id=plan.payload["instId"], side=str(binding.side).lower(),
-        trigger_price=plan.payload["triggerPrice"], client_order_id=plan.payload["clOrdId"], status="submitting",
+        trigger_price=plan.payload["slTriggerPx"],
+        client_order_id=build_client_order_id(
+            strategy_instance_id=str(binding.strategy_instance_id),
+            leg_index=int(session.get(ExecutionOrderLeg, plan.leg_id).leg_index),
+            purpose="backup_stop",
+        ),
+        status="submitting",
         request_json=json.dumps(plan.payload, ensure_ascii=False, sort_keys=True),
         created_at=submitted_at, updated_at=submitted_at,
     )
@@ -426,25 +461,41 @@ def _read_pending_trigger_orders(client: Any, *, instrument_id: str) -> list[dic
 
 
 def _pending_matches_backup(
-    pending: list[dict[str, Any]], *, order_id: str, payload: dict[str, str]
-) -> bool:
-    for row in pending:
-        if str(row.get("ordId") or row.get("orderId") or row.get("id") or "") != str(order_id):
-            continue
-        if str(row.get("instId") or "").upper() != payload["instId"]:
-            continue
-        exchange_pos_id = str(row.get("closePosId") or row.get("posId") or "")
-        if exchange_pos_id and exchange_pos_id != payload["closePosId"]:
-            continue
-        if str(row.get("posSide") or "").lower() != payload["posSide"]:
-            continue
-        if str(row.get("orderType") or "").lower() != "market":
-            continue
-        trigger_price = str(row.get("triggerPrice") or row.get("triggerPx") or "")
-        if trigger_price != payload["triggerPrice"]:
-            continue
-        return True
-    return False
+    pending: list[dict[str, Any]],
+    *,
+    order_id: str | None,
+    payload: dict[str, str],
+    position: dict[str, Any] | None,
+    open_positions: tuple[dict[str, Any], ...],
+) -> str | None:
+    if not order_id or position is None or not open_positions:
+        return None
+    match = match_native_tpsl_order(
+        position,
+        pending,
+        NativeTpslExpectation(
+            purpose="stop_loss",
+            trigger_price=payload["slTriggerPx"],
+            # DeepCoin's position-level TPSL represents "close this exact
+            # split position in full" as sz=0; posId supplies the exact scope.
+            size="0",
+            ord_id=order_id,
+        ),
+        open_positions=list(open_positions),
+    )
+    return match.order.ord_id if match.status == "verified" and match.order is not None else None
+
+
+def _live_position_matches_plan(position: dict[str, Any], plan: BackupStopPlan) -> bool:
+    if plan.pos_id is None or plan.payload is None:
+        return False
+    return (
+        str(position.get("posId") or position.get("pos_id") or "") == plan.pos_id
+        and str(position.get("instId") or "").upper() == plan.payload["instId"]
+        and str(position.get("posSide") or position.get("side") or "").lower()
+        == plan.payload["posSide"]
+        and str(position.get("mrgPosition") or position.get("posMode") or "").lower() == "split"
+    )
 
 
 def _primary_stop_price(row: PositionProtectionLedger | None) -> str | None:

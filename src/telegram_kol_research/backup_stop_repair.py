@@ -15,6 +15,9 @@ from telegram_kol_research.models import (
     PositionBackupStopOrder,
     PositionProtectionLedger,
 )
+from telegram_kol_research.native_tpsl import NativeTpslExpectation
+from telegram_kol_research.native_tpsl import match_native_tpsl_order
+from telegram_kol_research.native_tpsl import normalize_native_tpsl
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trigger_backup_stop import (
@@ -36,7 +39,9 @@ class BackupStopRepairAction:
     primary_stop: str
     backup_stop: str
     liquidation_price: str
+    client_order_id: str
     request_payload: dict[str, str]
+    open_positions: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,13 +165,23 @@ def build_backup_stop_repair_plan(
                     binding_id=int(binding.id), leg_id=int(leg.id), pos_id=pos_id,
                     instrument_id=instrument_id, side=str(binding.side).lower(), size=size,
                     primary_order_id=str(primary.order_id), primary_stop=str(primary.trigger_price),
-                    backup_stop=backup_stop, liquidation_price=liquidation, request_payload=payload,
+                    backup_stop=backup_stop, liquidation_price=liquidation,
+                    client_order_id=build_client_order_id(
+                        strategy_instance_id=str(binding.strategy_instance_id),
+                        leg_index=int(leg.leg_index), purpose="backup_stop",
+                    ),
+                    request_payload=payload,
+                    open_positions=tuple(row for row in positions if isinstance(row, dict)),
                 )
                 if (
                     str(existing.status) == "active"
                     and str(existing.order_id or "").strip()
                     and _verified_pending_backup(
-                        pending, order_id=str(existing.order_id), action=action
+                        pending,
+                        order_id=str(existing.order_id),
+                        action=action,
+                        position=position,
+                        open_positions=action.open_positions,
                     )
                 ):
                     exchange_evidence.append({
@@ -179,19 +194,32 @@ def build_backup_stop_repair_plan(
                     continue
                 conflicts.append(_conflict(
                     pos_id,
-                    "backup_exchange_outcome_unknown"
-                    if str(existing.status) in {"submitting", "unknown_exchange_outcome"}
+                    "backup_stop_pending_readback"
+                    if str(existing.status) in {"submitting", "pending_readback"}
+                    else "backup_exchange_outcome_unknown"
+                    if str(existing.status) == "unknown_exchange_outcome"
                     else "backup_stop_missing_on_exchange",
                 ))
                 continue
-            if _unowned_similar_backup(pending, payload=payload, pos_id=pos_id):
+            if _unowned_similar_backup(
+                pending,
+                payload=payload,
+                position=position,
+                open_positions=positions,
+            ):
                 conflicts.append(_conflict(pos_id, "backup_similar_unscoped_order"))
                 continue
             actions.append(BackupStopRepairAction(
                 binding_id=int(binding.id), leg_id=int(leg.id), pos_id=pos_id,
                 instrument_id=instrument_id, side=str(binding.side).lower(), size=size,
                 primary_order_id=str(primary.order_id), primary_stop=str(primary.trigger_price),
-                backup_stop=backup_stop, liquidation_price=liquidation, request_payload=payload,
+                backup_stop=backup_stop, liquidation_price=liquidation,
+                client_order_id=build_client_order_id(
+                    strategy_instance_id=str(binding.strategy_instance_id),
+                    leg_index=int(leg.leg_index), purpose="backup_stop",
+                ),
+                request_payload=payload,
+                open_positions=tuple(row for row in positions if isinstance(row, dict)),
             ))
             exchange_evidence.append({
                 "pos_id": pos_id, "size": size, "liquidation_price": liquidation,
@@ -247,7 +275,7 @@ def apply_backup_stop_repair_plan(
             venue="deepcoin", execution_binding_id=action.binding_id,
             execution_order_leg_id=action.leg_id, pos_id=action.pos_id,
             instrument_id=action.instrument_id, side=action.side, trigger_price=action.backup_stop,
-            client_order_id=action.request_payload["clOrdId"], status="submitting",
+            client_order_id=action.client_order_id, status="submitting",
             request_json=json.dumps(action.request_payload, ensure_ascii=False, sort_keys=True),
             created_at=observed_at, updated_at=observed_at,
         )
@@ -255,30 +283,62 @@ def apply_backup_stop_repair_plan(
         session.commit()
         row_id = int(row.id)
     try:
-        response = deepcoin_client.trigger_order(dict(action.request_payload))
+        response = deepcoin_client.set_position_sltp(dict(action.request_payload))
         order_id = _response_order_id(response)
-        if not order_id:
-            raise RuntimeError("backup stop response missing exchange order id")
-        pending = list(deepcoin_client.list_trigger_orders_pending(inst_id=action.instrument_id))
-        verified = _verified_pending_backup(pending, order_id=order_id, action=action)
     except Exception as exc:
-        return _mark_unknown(session_factory, row_id=row_id, pos_id=action.pos_id, now=observed_at, error=exc)
-    if not verified:
         return _mark_unknown(
+            session_factory,
+            row_id=row_id,
+            pos_id=action.pos_id,
+            now=observed_at,
+            error=exc,
+        )
+    try:
+        positions = list(deepcoin_client.list_positions())
+        exact = [
+            row for row in positions if isinstance(row, dict)
+            and str(row.get("posId") or row.get("pos_id") or "") == action.pos_id
+        ]
+        if len(exact) != 1 or not _live_position_matches_action(exact[0], action):
+            return _mark_pending_readback(
+                session_factory,
+                row_id=row_id,
+                pos_id=action.pos_id,
+                now=observed_at,
+                error=RuntimeError("live_position_snapshot_not_unique_or_mismatched"),
+            )
+        pending = list(deepcoin_client.list_trigger_orders_pending(inst_id=action.instrument_id))
+        verified_order_id = _verified_pending_backup(
+            pending,
+            order_id=order_id,
+            action=action,
+            position=exact[0],
+            open_positions=tuple(row for row in positions if isinstance(row, dict)),
+        )
+    except Exception as exc:
+        return _mark_pending_readback(
+            session_factory,
+            row_id=row_id,
+            pos_id=action.pos_id,
+            now=observed_at,
+            error=exc,
+        )
+    if not verified_order_id:
+        return _mark_pending_readback(
             session_factory, row_id=row_id, pos_id=action.pos_id, now=observed_at,
-            error=RuntimeError("backup stop not verifiable after submission"),
+            error=RuntimeError("native backup stop pending readback"),
         )
     with session_factory() as session:
         row = session.get(PositionBackupStopOrder, row_id)
         if row is None:
             return BackupStopRepairResult("unknown_exchange_outcome", action.pos_id, reason_code="reservation_missing")
-        row.order_id = order_id
+        row.order_id = verified_order_id
         row.status = "active"
         row.response_json = json.dumps(response, ensure_ascii=False, sort_keys=True)
         row.submitted_at = observed_at
         row.updated_at = observed_at
         session.commit()
-    return BackupStopRepairResult("active", action.pos_id, order_id=order_id)
+    return BackupStopRepairResult("active", action.pos_id, order_id=verified_order_id)
 
 
 def _primary(session, *, binding_id: int, leg_id: int, pos_id: str):
@@ -298,39 +358,100 @@ def _existing_backup(session, *, pos_id: str) -> PositionBackupStopOrder | None:
     return session.query(PositionBackupStopOrder).filter(
         PositionBackupStopOrder.venue == "deepcoin",
         PositionBackupStopOrder.pos_id == pos_id,
-        PositionBackupStopOrder.status.in_(("submitting", "active", "unknown_exchange_outcome")),
+        PositionBackupStopOrder.status.in_(
+            ("submitting", "pending_readback", "active", "unknown_exchange_outcome")
+        ),
     ).order_by(PositionBackupStopOrder.id.asc()).first()
 
 
-def _unowned_similar_backup(pending, *, payload: dict[str, str], pos_id: str) -> bool:
-    for row in pending:
-        if not isinstance(row, dict) or str(row.get("orderType") or "").lower() != "market":
-            continue
-        if str(row.get("posSide") or "").lower() != payload["posSide"]:
-            continue
-        if str(row.get("triggerPrice") or row.get("triggerPx") or "") != payload["triggerPrice"]:
-            continue
-        if str(row.get("closePosId") or row.get("posId") or "") != pos_id:
-            continue
+def _unowned_similar_backup(
+    pending,
+    *,
+    payload: dict[str, str],
+    position: dict[str, Any],
+    open_positions: list[dict[str, Any]],
+) -> bool:
+    match = match_native_tpsl_order(
+        position,
+        pending,
+        NativeTpslExpectation(
+            purpose="stop_loss",
+            trigger_price=payload["slTriggerPx"],
+            size="0",
+        ),
+        open_positions=open_positions,
+    )
+    if match.status in {"verified", "ambiguous"}:
         return True
-    return False
-
-
-def _verified_pending_backup(pending, *, order_id: str, action: BackupStopRepairAction) -> bool:
-    for row in pending:
-        if not isinstance(row, dict) or _order_id(row) != order_id:
+    # A full-position native TPSL without posId cannot be safely assigned when
+    # the exchange omits the creation-time identity fields. Freeze rather than
+    # create a second stop beside a potentially manual one.
+    for raw in pending:
+        if not isinstance(raw, dict):
             continue
-        exchange_pos_id = str(row.get("closePosId") or row.get("posId") or row.get("pos_id") or "")
-        if exchange_pos_id and exchange_pos_id != action.pos_id:
-            return False
-        trigger = str(row.get("triggerPrice") or row.get("triggerPx") or "")
-        return (
-            str(row.get("instId") or "").upper() == action.instrument_id
-            and str(row.get("posSide") or "").lower() == action.side
-            and (not trigger or trigger == action.backup_stop)
-            and (not row.get("orderType") or str(row.get("orderType")).lower() == "market")
-        )
+        order = normalize_native_tpsl(raw)
+        if order is None or order.pos_id is not None or order.size != 0:
+            continue
+        if (
+            order.inst_id == payload["instId"]
+            and order.pos_side == payload["posSide"]
+            and order.stop_loss_trigger_price is not None
+            and str(order.stop_loss_trigger_price) == payload["slTriggerPx"]
+        ):
+            return True
     return False
+
+
+def _verified_pending_backup(
+    pending,
+    *,
+    order_id: str | None,
+    action: BackupStopRepairAction,
+    position: dict[str, Any],
+    open_positions: tuple[dict[str, Any], ...],
+) -> str | None:
+    if not order_id or not open_positions:
+        return None
+    match = match_native_tpsl_order(
+        position,
+        [row for row in pending if isinstance(row, dict)],
+        NativeTpslExpectation(
+            purpose="stop_loss",
+            trigger_price=action.backup_stop,
+            # Position TPSL uses sz=0 to close the exact posId in full.
+            size="0",
+            ord_id=order_id,
+        ),
+        open_positions=list(open_positions),
+    )
+    return match.order.ord_id if match.status == "verified" and match.order is not None else None
+
+
+def _live_position_matches_action(position: dict[str, Any], action: BackupStopRepairAction) -> bool:
+    return (
+        str(position.get("instId") or "").upper() == action.instrument_id
+        and str(position.get("posSide") or position.get("side") or "").lower() == action.side
+        and str(position.get("mrgPosition") or position.get("posMode") or "").lower() == "split"
+        and str(position.get("pos") or position.get("size") or "") == action.size
+    )
+
+
+def _mark_pending_readback(
+    session_factory,
+    *,
+    row_id: int,
+    pos_id: str,
+    now: datetime,
+    error: Exception,
+) -> BackupStopRepairResult:
+    with session_factory() as session:
+        row = session.get(PositionBackupStopOrder, row_id)
+        if row is not None:
+            row.status = "pending_readback"
+            row.error_json = json.dumps({"error": str(error)[:512]}, ensure_ascii=False)
+            row.updated_at = now
+            session.commit()
+    return BackupStopRepairResult("pending_readback", pos_id, reason_code="backup_stop_pending_readback")
 
 
 def _mark_unknown(session_factory, *, row_id: int, pos_id: str, now: datetime, error: Exception) -> BackupStopRepairResult:
