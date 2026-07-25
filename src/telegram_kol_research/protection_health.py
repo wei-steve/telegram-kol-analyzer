@@ -35,7 +35,11 @@ def reconcile_position_protection_health(
     ledgers = (
         session.query(PositionProtectionLedger)
         .filter(PositionProtectionLedger.pos_id.in_(sorted(live_ids)))
-        .filter(PositionProtectionLedger.status.in_(("verified", "protected")))
+        .filter(
+            PositionProtectionLedger.status.in_(
+                ("verified", "protected", "protection_missing")
+            )
+        )
         .all()
     )
     backups = (
@@ -54,7 +58,11 @@ def reconcile_position_protection_health(
                 evidence={"errors": dict(sorted(snapshot_errors.items())), "order_id": order_id}, observed_at=observed_at,
             )
             continue
-        histories = [item for item in trigger_history if _matches(item, pos_id=pos_id, order_id=order_id)]
+        histories = [
+            item
+            for item in trigger_history
+            if _matches_owned_order(item, pos_id=pos_id, order_id=order_id)
+        ]
         failed = next((item for item in histories if _trigger_failed(item)), None)
         if failed is not None:
             row.status = "stop_trigger_failed" if isinstance(row, PositionProtectionLedger) else "failed"
@@ -64,14 +72,41 @@ def reconcile_position_protection_health(
                 evidence={"order_id": order_id, "exchange": _redacted_exchange_evidence(failed)}, observed_at=observed_at,
             )
             continue
-        if order_id and not any(_matches(item, pos_id=pos_id, order_id=order_id) for item in pending_orders):
-            if not any(_successful_close(item) for item in histories):
-                row.status = "protection_missing" if isinstance(row, PositionProtectionLedger) else "missing"
-                row.updated_at = observed_at
-                created += _incident(
-                    session, row=row, incident_type="protection_missing",
-                    evidence={"order_id": order_id}, observed_at=observed_at,
-                )
+        pending = [
+            item
+            for item in pending_orders
+            if _matches_owned_order(item, pos_id=pos_id, order_id=order_id)
+        ]
+        if pending:
+            row.status = "verified" if isinstance(row, PositionProtectionLedger) else "active"
+            row.updated_at = observed_at
+            continue
+        conflicts = [
+            item
+            for item in pending_orders
+            if _has_explicit_position_conflict(item, pos_id=pos_id, order_id=order_id)
+        ]
+        if conflicts:
+            row.status = "protection_missing" if isinstance(row, PositionProtectionLedger) else "missing"
+            row.updated_at = observed_at
+            created += _incident(
+                session,
+                row=row,
+                incident_type="protection_position_conflict",
+                evidence={
+                    "order_id": order_id,
+                    "exchange": _redacted_exchange_evidence(conflicts[0]),
+                },
+                observed_at=observed_at,
+            )
+            continue
+        if order_id and not any(_successful_close(item) for item in histories):
+            row.status = "protection_missing" if isinstance(row, PositionProtectionLedger) else "missing"
+            row.updated_at = observed_at
+            created += _incident(
+                session, row=row, incident_type="protection_missing",
+                evidence={"order_id": order_id}, observed_at=observed_at,
+            )
     return created
 
 
@@ -94,10 +129,22 @@ def _incident(session, *, row, incident_type, evidence, observed_at) -> int:
     return 1
 
 
-def _matches(row: dict[str, Any], *, pos_id: str, order_id: str) -> bool:
-    return _text(row, "closePosId", "posId", "pos_id", "positionId") == pos_id and (
-        not order_id or _text(row, "ordId", "orderId", "order_id") == order_id
-    )
+def _matches_owned_order(row: dict[str, Any], *, pos_id: str, order_id: str) -> bool:
+    """Match an already-persisted exact order, allowing omitted exchange position IDs."""
+
+    if not order_id or _text(row, "ordId", "orderId", "order_id") != order_id:
+        return False
+    exchange_pos_id = _text(row, "closePosId", "posId", "pos_id", "positionId")
+    return not exchange_pos_id or exchange_pos_id == pos_id
+
+
+def _has_explicit_position_conflict(
+    row: dict[str, Any], *, pos_id: str, order_id: str
+) -> bool:
+    if not order_id or _text(row, "ordId", "orderId", "order_id") != order_id:
+        return False
+    exchange_pos_id = _text(row, "closePosId", "posId", "pos_id", "positionId")
+    return bool(exchange_pos_id and exchange_pos_id != pos_id)
 
 
 def _trigger_failed(row: dict[str, Any]) -> bool:

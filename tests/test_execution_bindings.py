@@ -377,6 +377,111 @@ def test_reconcile_marks_triggered_primary_stop_failure_and_deduplicates_exact_i
     ]
 
 
+def test_reconcile_keeps_owned_stop_verified_when_pending_row_omits_position_id(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([_pending_combined_tpsl("tpsl-1")]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    unscoped_pending = _pending_combined_tpsl("tpsl-1")
+    unscoped_pending.pop("posId")
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([unscoped_pending]),
+        recovered_at=datetime(2026, 7, 20, 8, 6),
+    )
+
+    with session_factory() as session:
+        protection = session.query(PositionProtectionLedger).one()
+    assert protection.status == "verified"
+
+
+def test_reconcile_restores_missing_owned_stop_when_same_order_is_pending(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([_pending_combined_tpsl("tpsl-1")]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+    with session_factory() as session:
+        protection = session.query(PositionProtectionLedger).one()
+        protection.status = "protection_missing"
+        session.commit()
+
+    unscoped_pending = _pending_combined_tpsl("tpsl-1")
+    unscoped_pending.pop("posId")
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([unscoped_pending]),
+        recovered_at=datetime(2026, 7, 20, 8, 6),
+    )
+
+    with session_factory() as session:
+        protection = session.query(PositionProtectionLedger).one()
+    assert protection.status == "verified"
+
+
+def test_reconcile_refuses_owned_order_when_exchange_position_id_conflicts(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([_pending_combined_tpsl("tpsl-1")]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    conflict = _pending_combined_tpsl("tpsl-1")
+    conflict["posId"] = "other-pos"
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([conflict]),
+        recovered_at=datetime(2026, 7, 20, 8, 6),
+    )
+
+    with session_factory() as session:
+        protection = session.query(PositionProtectionLedger).one()
+        incidents = session.query(PositionProtectionIncident).all()
+    assert protection.status == "protection_missing"
+    assert [(row.pos_id, row.incident_type) for row in incidents] == [
+        ("pos-1", "protection_position_conflict")
+    ]
+
+
+def test_reconcile_detects_failed_owned_stop_history_without_position_id(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([_pending_combined_tpsl("tpsl-1")]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    failed_history = _pending_combined_tpsl("tpsl-1")
+    failed_history.pop("posId")
+    failed_history.update(
+        triggerTime="1784512900000",
+        errorCode="203",
+        errorMsg="NotEnoughMoneyToClose",
+    )
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([], history_rows=[failed_history]),
+        recovered_at=datetime(2026, 7, 20, 8, 6),
+    )
+
+    with session_factory() as session:
+        protection = session.query(PositionProtectionLedger).one()
+        incidents = session.query(PositionProtectionIncident).all()
+    assert protection.status == "stop_trigger_failed"
+    assert [(row.pos_id, row.incident_type) for row in incidents] == [
+        ("pos-1", "stop_trigger_failed")
+    ]
+
+
 def test_reconcile_adopts_saved_trigger_protection_intent_once(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_protection_adoption(session_factory)
