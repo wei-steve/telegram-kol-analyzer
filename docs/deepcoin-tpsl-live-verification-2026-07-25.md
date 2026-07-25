@@ -62,3 +62,92 @@
 本次实盘状态证明：官方页面显示的 45 条持仓止盈止损，与 API 中 45 条原生 `TPSL` 完全一致。项目当前针对 `TPSL`/`Conditional` 的类型隔离是正确的。
 
 但这不是 API 能逐条回传 `posId` 的证明：它当前没有回传。因此，未来的创建、调整或撤销必须持续保存并使用 `ordId ↔ posId` 的本地证据；对没有精确归属证据的原生 TPSL 或任何 `Conditional`，禁止批量撤销、替换或自动标记为已保护。
+
+## 官方网页代码研究
+
+研究日期：2026-07-25。研究对象是当时 DeepCoin 官方合约页面加载的构建文件
+`4288.98c10ee1433f7b3c.js`。构建哈希可能随官网发布变化，因此本节记录的是
+字段契约与算法，不把文件名当作长期 API。
+
+### 官网使用的数据入口
+
+官网不是使用公开的 `GET /deepcoin/trade/trigger-orders-pending` 构造持仓卡。
+它向网页内部接口 `POST /v2/public/query/swap/send-batch` 提交 `Actions`，
+一次读取：
+
+- `account`
+- `position`
+- `order`
+- `trigger_order`
+
+每个 Action 都使用 `Method=GET`、`ExchangeID=DeepCoin`，并携带
+`ProductGroup`、分页及账户范围。这个网页内部接口返回的仓位和触发单保留
+PascalCase 原始字段，其中包括 `PositionID`。
+
+### 字段标准化
+
+官网将 `position` 行标准化为内部仓位对象，关键映射为：
+
+| 交易所原字段 | 官网内部字段 |
+| --- | --- |
+| `PositionID` | `positionId` |
+| `TradeUnitID` | `tradeUnitId` |
+| `InstrumentID` | `instrumentId` |
+| `AccountID` | `accountId` |
+| `IsCrossMargin` | `isCrossMargin` |
+| `PosiDirection` | `posiDirection` |
+
+官网将 `trigger_order` 行标准化为内部订单对象时使用相同的
+`PositionID → positionId` 映射，并另外保留 `OrderSysID → orderSysId`、
+`BusinessType`、方向、触发价、数量及 TP/SL 字段。`BusinessType=X` 被归类为
+`STOP_LOSS_TAKE_PROFIT`。
+
+### 精确关联算法
+
+官网构造每个仓位的 `tpslList` 时，不按价格、数量、创建时间或数组顺序猜测。
+普通模式的核心条件是：
+
+```text
+order.positionId == position.positionId
+and order.instrumentId == position.instrumentId
+and order.pcType == STOP_LOSS_TAKE_PROFIT
+```
+
+双向持仓模式进一步要求：
+
+```text
+order.isCrossMargin == position.isCrossMargin
+and order.posiDirection == position.posiDirection
+and order.accountId == position.accountId
+and order.tradeUnitId == position.tradeUnitId
+and order.direction != position.direction
+and order.shown
+```
+
+官网还会从仓位委托展示集合中排除“TPSL 但没有 `positionId`”的订单。实时更新
+沿用同一模型：`TriggerOrder` 推送更新订单集合，`Position` 推送更新仓位集合，
+随后重新执行 `positionId` 关联。
+
+### 与公开 API 的差异
+
+截至本次实盘检查：
+
+- V1 `trigger-orders-pending` 不返回 `posId`；
+- V2 `orders-algo-pending` 也不返回 `posId`；
+- 官网网页内部 `send-batch` 的 `trigger_order` 数据包含 `PositionID`；
+- 官网前端同时识别 `PositionID` 与 `TradeUnitID`，二者不是同一个字段；
+- 私有 WebSocket 文档把 `TradeUnitID` 描述为 Position ID，但当前官网代码仍以
+  独立的 `PositionID` 作为 TPSL 与仓位的主关联键。
+
+因此不能把 `TradeUnitID` 直接替代 `PositionID`，也不能仅凭公开 REST 的缺字段
+响应复现官网逐仓关联。
+
+### 工程结论
+
+官网代码证明交易所内部确实保留 `OrderSysID ↔ PositionID` 关系。生产系统的
+可靠实现应在提交 `set-position-sltp` 时利用已知请求 `posId` 和响应 `ordId`
+持久化该关系，再用公开 pending API 的 `ordId` 做实时存在性核对。
+
+网页内部 `send-batch` 依赖官网登录态、网页签名和未公开契约，只能作为研究与
+人工诊断证据，不应成为生产交易或持仓页面的依赖。没有交易所 `PositionID`
+或本地持久化 `ordId ↔ posId` 的旧订单继续进入“未归属保护单”，不得自动猜测。
