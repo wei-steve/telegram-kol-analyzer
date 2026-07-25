@@ -82,8 +82,6 @@ def build_position_protection_audit(
         reasons.add(f"primary_stop_{primary['verification_status']}")
     if backup["protocol"] == "none":
         reasons.add("backup_stop_missing")
-    elif backup["verification_status"] == "legacy_generic":
-        reasons.add("legacy_generic_backup_stop")
     elif backup["verification_status"] != "verified":
         reasons.add(f"backup_stop_{backup['verification_status']}")
     if any(item["verification_status"] == "submitted_response" for item in take_profits):
@@ -145,7 +143,7 @@ def _backup_stop_summary(position, pending, scope, rows):
     if protocol == "generic":
         return {
             "protocol": "generic",
-            "verification_status": "legacy_generic",
+            "verification_status": "unverified_exchange",
             "matching_strategy": "not_applicable",
             "order_id": _text(_field(row, "order_id")),
         }

@@ -111,6 +111,7 @@ from telegram_kol_research.position_attribution import PositionAttributionError
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
 from telegram_kol_research.position_attribution import require_manual_position_attribution_allowed
 from telegram_kol_research.protection_attribution import match_position_protection
+from telegram_kol_research.protection_snapshot import build_position_protection_audit
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import list_recovery_decisions
 from telegram_kol_research.recovery_execution_queue import list_recovery_execution_previews
@@ -993,6 +994,23 @@ def _load_deepcoin_live_position_rows(
                 if ownership_verified and ownership_leg is not None and ownership_leg.id is not None
                 else None
             )
+            backup_stop_audit = (
+                build_position_protection_audit(
+                    position=position,
+                    protection_ledger=[],
+                    backup_stops=[backup_stop],
+                    take_profit_orders=[],
+                    pending_trigger_orders=tpsl_orders,
+                    open_positions=active_positions,
+                )["backup_stop"]
+                if backup_stop is not None and tpsl_evidence_available
+                else None
+            )
+            backup_stop_verified = bool(
+                backup_stop_audit is not None
+                and backup_stop_audit["protocol"] == "native"
+                and backup_stop_audit["verification_status"] == "verified"
+            )
             binding = (
                 bindings_by_id.get(int(ownership_leg.execution_binding_id))
                 if ownership_leg is not None
@@ -1044,14 +1062,19 @@ def _load_deepcoin_live_position_rows(
                     "stop_loss_state_text": stop_loss_state_text,
                     "backup_stop_text": (
                         _position_text_value(backup_stop.trigger_price)
-                        if backup_stop is not None
+                        if backup_stop_verified
                         else None
                     ),
                     "backup_stop_status": (
-                        str(backup_stop.status) if backup_stop is not None else "not_created"
+                        str(backup_stop.status) if backup_stop_verified else "not_created"
                     ),
                     "backup_stop_state_text": (
-                        None
+                        "交易所未验证（旧通用条件单）"
+                        if backup_stop_audit is not None
+                        and backup_stop_audit["verification_status"] == "unverified_exchange"
+                        else "第二止损证据暂不可用"
+                        if backup_stop is not None and not tpsl_evidence_available
+                        else "第二止损交易所未验证"
                         if backup_stop is not None
                         else "第二止损未创建"
                         if ownership_verified

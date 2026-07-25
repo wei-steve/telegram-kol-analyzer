@@ -35,6 +35,7 @@ from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TradeSignal
@@ -1365,6 +1366,79 @@ def test_execution_dashboard_uses_exact_ledger_evidence_for_late_managed_stop(tm
     assert response.status_code == 200
     assert "止损: 67200" in response.text
     assert "无止损" not in response.text
+
+
+def test_execution_dashboard_marks_absent_legacy_backup_stop_unverified(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [{
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-legacy-backup",
+                "posSide": "long",
+                "pos": "6",
+                "avgPx": "64797",
+                "cTime": "10000",
+            }]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            assert inst_id == "BTC-USDT-SWAP"
+            return []
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+    with app.state.session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="long",
+            status="active",
+            pos_id="pos-legacy-backup",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            pos_id="pos-legacy-backup",
+            venue="deepcoin",
+            attribution_status="verified",
+            attribution_evidence_json=json.dumps({"policy_version": 2}),
+            status="active",
+        )
+        session.add(leg)
+        session.flush()
+        session.add(
+            PositionBackupStopOrder(
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-legacy-backup",
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                trigger_price="63073.6",
+                order_id="legacy-generic-backup",
+                client_order_id="legacy-generic-backup-client",
+                status="active",
+                request_json=json.dumps({
+                    "triggerPrice": "63073.6",
+                    "closePosId": "pos-legacy-backup",
+                }),
+            )
+        )
+        session.commit()
+
+    response = TestClient(app).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "pos-legacy-backup" in response.text
+    assert "交易所未验证（旧通用条件单）" in response.text
+    assert "63073.6 · active" not in response.text
 
 
 def test_execution_dashboard_does_not_use_ledger_for_closed_entry_leg(tmp_path):

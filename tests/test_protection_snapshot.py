@@ -173,12 +173,12 @@ def test_position_audit_marks_legacy_generic_backup_as_unprotected():
 
     assert audit["backup_stop"] == {
         "protocol": "generic",
-        "verification_status": "legacy_generic",
+        "verification_status": "unverified_exchange",
         "matching_strategy": "not_applicable",
         "order_id": "generic-backup-1",
     }
     assert audit["freeze_reasons"] == [
-        "legacy_generic_backup_stop",
+        "backup_stop_unverified_exchange",
         "primary_stop_missing",
     ]
     assert audit["protected"] is False
