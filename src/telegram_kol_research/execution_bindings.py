@@ -602,6 +602,7 @@ def _apply_reconcile_snapshot(
             .filter(ExecutionOrderLeg.purpose == "entry")
             .all()
         )
+        entry_legs_by_binding_id = _entry_legs_by_binding_id(legs)
         bindings_by_id = {int(binding.id): binding for binding in bindings}
         expire_unconfirmed_protection_revisions(session, now=recovered_at)
         _confirm_visible_management_protection_revisions(
@@ -857,9 +858,7 @@ def _apply_reconcile_snapshot(
             if int(binding.id) in manual_terminal_binding_ids:
                 _count_reconcile_binding(result, binding)
                 continue
-            binding_legs = [
-                leg for leg in legs if int(leg.execution_binding_id) == int(binding.id)
-            ]
+            binding_legs = entry_legs_by_binding_id.get(int(binding.id), [])
             if any(
                 leg.pos_id and str(leg.pos_id) in reserved_pos_ids
                 for leg in binding_legs
@@ -1865,6 +1864,17 @@ def _successful_fill_leg_ids(
         if len(matching_legs) == 1:
             successful_leg_ids.add(int(matching_legs[0].id))
     return successful_leg_ids
+
+
+def _entry_legs_by_binding_id(
+    legs: list[ExecutionOrderLeg],
+) -> dict[int, list[ExecutionOrderLeg]]:
+    """Index entry legs once while preserving their database query order."""
+
+    grouped: dict[int, list[ExecutionOrderLeg]] = {}
+    for leg in legs:
+        grouped.setdefault(int(leg.execution_binding_id), []).append(leg)
+    return grouped
 
 
 def _leg_has_successful_fill_evidence(

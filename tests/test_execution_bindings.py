@@ -12,6 +12,7 @@ from telegram_kol_research.execution_bindings import (
     ExecutionOrderLegRecord,
     _leg_evidence,
     _leg_has_successful_fill_evidence,
+    _entry_legs_by_binding_id,
     _successful_fill_leg_ids,
     build_position_evidence,
     _post_entry_protection_mutated_binding_ids,
@@ -1380,6 +1381,19 @@ def test_successful_fill_index_preserves_unique_matches_for_all_legs():
     ]
 
     assert _successful_fill_leg_ids(evidence, legs=legs) == {1, 2, 3, 4}
+
+
+def test_entry_legs_index_groups_by_binding_without_reordering_legs():
+    legs = [
+        ExecutionOrderLeg(id=1, execution_binding_id=8, leg_index=1, purpose="entry", order_kind="market", venue="deepcoin", status="open"),
+        ExecutionOrderLeg(id=2, execution_binding_id=7, leg_index=2, purpose="entry", order_kind="market", venue="deepcoin", status="open"),
+        ExecutionOrderLeg(id=3, execution_binding_id=8, leg_index=3, purpose="entry", order_kind="market", venue="deepcoin", status="open"),
+    ]
+
+    grouped = _entry_legs_by_binding_id(legs)
+
+    assert [leg.id for leg in grouped[8]] == [1, 3]
+    assert [leg.id for leg in grouped[7]] == [2]
 
 
 @pytest.mark.parametrize("invalid_list_value", [None, "not-a-list", {"bad": "shape"}])
