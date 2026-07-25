@@ -1344,6 +1344,41 @@ body {
   color: #fecaca;
 }
 
+.exchange-protection-orders {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+
+.exchange-protection-orders > strong {
+  font-size: 0.9rem;
+}
+
+.exchange-protection-orders ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.exchange-protection-order-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px 12px;
+  min-height: 34px;
+  color: var(--color-muted);
+  font-size: 0.84rem;
+}
+
+.exchange-protection-order-kind {
+  color: var(--color-text);
+  font-weight: 700;
+}
+
 .exchange-card-head {
   display: flex;
   align-items: center;
