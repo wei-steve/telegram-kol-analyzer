@@ -65,6 +65,7 @@ def normalize_native_tpsl(payload: dict[str, Any]) -> NativeTpslOrder | None:
     return NativeTpslOrder(
         ord_id=_first_string(
             payload,
+            "OrderSysID",
             "ordId",
             "orderId",
             "order_id",
@@ -72,19 +73,29 @@ def normalize_native_tpsl(payload: dict[str, Any]) -> NativeTpslOrder | None:
             "triggerOrderId",
             "id",
         ),
-        inst_id=str(payload.get("instId") or "").upper(),
-        pos_side=_normalize_side(str(payload.get("posSide") or "")),
-        pos_id=_first_string(payload, "posId", "pos_id", "positionId"),
-        size=_decimal(payload.get("sz") if payload.get("sz") not in (None, "") else payload.get("size")),
-        created_time=_first_string(payload, "cTime", "uTime", "createdTime", "created_at"),
+        inst_id=str(payload.get("instId") or payload.get("InstrumentID") or "").upper(),
+        pos_side=_normalize_side(str(payload.get("posSide") or payload.get("PosiDirection") or "")),
+        pos_id=_first_string(payload, "PositionID", "posId", "pos_id", "positionId"),
+        size=_decimal(
+            payload.get("sz")
+            if payload.get("sz") not in (None, "")
+            else payload.get("size")
+            if payload.get("size") not in (None, "")
+            else payload.get("Volume")
+        ),
+        created_time=_first_string(
+            payload, "cTime", "uTime", "createdTime", "created_at", "CreateTime"
+        ),
         stop_loss_trigger_price=_first_positive_decimal(
             payload,
+            "SLTriggerPrice",
             "slTriggerPx",
             "slTriggerPrice",
             "closeSLTriggerPrice",
         ),
         take_profit_trigger_price=_first_positive_decimal(
             payload,
+            "TPTriggerPrice",
             "tpTriggerPx",
             "tpTriggerPrice",
             "closeTPTriggerPrice",
