@@ -250,6 +250,28 @@
       <div class="exchange-view-panel" data-exchange-view-panel="grouped">
         {{ grouped_list(exchange_snapshot.grouped.positions, '暂无持仓', 'position') }}
       </div>
+      {% if exchange_snapshot.unattributed_protection_orders %}
+        <section class="exchange-protection-orders" data-unattributed-protection-orders>
+          <strong>未归属交易所保护单</strong>
+          {% for instrument_id, orders in exchange_snapshot.unattributed_protection_orders | groupby('instrument_id') %}
+            <div>
+              <strong>{{ instrument_id }}</strong>
+              <ul>
+                {% for order in orders %}
+                  <li>
+                    <span>{{ '多' if order.side == 'long' else '空' if order.side == 'short' else '方向未知' }}</span>
+                    <span>{{ '止盈' if order.kind == 'take_profit' else '止损' }}</span>
+                    <span>{{ order.trigger_price_text }}</span>
+                    <span>{{ order.size_text }} contracts</span>
+                    <code>order {{ order.order_id }}</code>
+                    <span class="exchange-attribution-chip">无法归属</span>
+                  </li>
+                {% endfor %}
+              </ul>
+            </div>
+          {% endfor %}
+        </section>
+      {% endif %}
     </section>
 
     <section class="exchange-tab-panel" data-exchange-position-panel="open-orders">

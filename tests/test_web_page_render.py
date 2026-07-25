@@ -1646,6 +1646,53 @@ def test_positions_panel_keeps_available_protection_when_another_instrument_fail
     assert "62000" in response.text
 
 
+def test_positions_panel_lists_unattributed_protection_once_outside_position_cards(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {"instId": "BTC-USDT-SWAP", "posId": "pos-a", "posSide": "long", "pos": "3", "avgPx": "64000"},
+                {"instId": "BTC-USDT-SWAP", "posId": "pos-b", "posSide": "long", "pos": "4", "avgPx": "64100"},
+            ]
+
+        def list_open_orders(self, *, inst_id=None): return []
+        def list_order_history(self, *, inst_id=None): return []
+        def list_trigger_order_history(self, *, inst_id=None): return []
+        def list_position_history(self, *, inst_id=None): return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return [
+                {"ordId": "direct-a", "triggerOrderType": "TPSL", "instId": inst_id, "posId": "pos-a", "posSide": "long", "sz": "3", "slTriggerPx": "62000"},
+                {"ordId": "legacy-1", "triggerOrderType": "TPSL", "instId": inst_id, "side": "sell", "sz": "0", "slTriggerPx": "61000"},
+            ]
+
+    response = TestClient(create_web_app(
+        database_path=tmp_path / "research.db", deepcoin_client_factory=FakeDeepcoinClient,
+    )).get("/positions-panel")
+
+    assert response.status_code == 200
+    cards = {
+        pos_id: re.search(
+            rf'<article class="exchange-position-card" data-position-pos-id="{pos_id}".*?</article>',
+            response.text,
+            re.DOTALL,
+        ).group(0)
+        for pos_id in ("pos-a", "pos-b")
+    }
+    assert "order direct-a" in cards["pos-a"]
+    assert "order legacy-1" not in cards["pos-a"]
+    assert "order legacy-1" not in cards["pos-b"]
+    summary = re.search(
+        r'<section[^>]*data-unattributed-protection-orders[^>]*>.*?</section>',
+        response.text,
+        re.DOTALL,
+    ).group(0)
+    assert "未归属交易所保护单" in summary
+    assert "order legacy-1" in summary
+    assert response.text.index("data-unattributed-protection-orders") > response.text.index(
+        'data-exchange-view-panel="grouped"'
+    )
+
+
 def test_bound_position_close_renders_exact_context_for_bound_exchange_position(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

@@ -852,6 +852,7 @@ def _load_deepcoin_live_position_rows(
     group_label_by_chat_id: dict[int, str],
     error_state: dict[str, str] | None = None,
     deepcoin_client=None,
+    unattributed_protection_rows: list[dict[str, str]] | None = None,
 ) -> list[dict[str, object]]:
     try:
         if deepcoin_client is None:
@@ -872,6 +873,14 @@ def _load_deepcoin_live_position_rows(
         deepcoin_client,
         active_positions,
     )
+    direct_protection_rows, pending_unattributed_rows = (
+        _split_exchange_protection_display_rows(
+            positions=active_positions,
+            pending_orders=tpsl_orders,
+        )
+    )
+    if unattributed_protection_rows is not None:
+        unattributed_protection_rows.extend(pending_unattributed_rows)
 
     with session_factory() as session:
         active_pos_ids = {
@@ -1107,10 +1116,7 @@ def _load_deepcoin_live_position_rows(
                         _position_text_value(value) or "" for value in take_profit_values
                     ) or None,
                     "exchange_protection_orders": (
-                        _exchange_protection_display_rows(
-                            position=position,
-                            pending_orders=tpsl_orders,
-                        )
+                        direct_protection_rows.get(pos_id or "", [])
                     ),
                     "protection_status": (
                         "protected"
@@ -1178,6 +1184,7 @@ def _load_exchange_position_snapshot(
     """Load the exchange-style dashboard snapshot from Deepcoin read APIs."""
     snapshot: dict[str, Any] = {
         "positions": [],
+        "unattributed_protection_orders": [],
         "open_orders": [],
         "order_history": [],
         "position_history": [],
@@ -1191,14 +1198,17 @@ def _load_exchange_position_snapshot(
         return snapshot
 
     position_error: dict[str, str] = {}
+    unattributed_protection_orders: list[dict[str, str]] = []
     positions = _load_deepcoin_live_position_rows(
         session_factory,
         deepcoin_client_factory=deepcoin_client_factory,
         group_label_by_chat_id=group_label_by_chat_id,
         error_state=position_error,
         deepcoin_client=client,
+        unattributed_protection_rows=unattributed_protection_orders,
     )
     snapshot["positions"] = positions
+    snapshot["unattributed_protection_orders"] = unattributed_protection_orders
     if position_error:
         snapshot["error"] = position_error["error"]
         return snapshot
@@ -2305,6 +2315,72 @@ def _exchange_protection_display_rows(
             row["order_id"],
         ),
     )
+
+
+def _split_exchange_protection_display_rows(
+    *,
+    positions: list[dict[str, Any]],
+    pending_orders: list[dict[str, Any]],
+) -> tuple[dict[str, list[dict[str, str]]], list[dict[str, str]]]:
+    """Separate exact position TPSL rows from exchange rows without an owner."""
+
+    positions_by_id = {
+        pos_id: position
+        for position in positions
+        if (pos_id := _first_position_string(position, "posId", "pos_id", "id"))
+    }
+    direct_orders: dict[str, list[dict[str, Any]]] = {
+        pos_id: [] for pos_id in positions_by_id
+    }
+    unattributed_orders: list[dict[str, Any]] = []
+    for order in pending_orders:
+        order_pos_id = _first_position_string(
+            order,
+            "closePosId",
+            "close_pos_id",
+            "closePositionId",
+            "posId",
+            "pos_id",
+            "positionId",
+        )
+        if order_pos_id in positions_by_id:
+            direct_orders[order_pos_id].append(order)
+        else:
+            unattributed_orders.append(order)
+
+    direct_rows = {
+        pos_id: _exchange_protection_display_rows(
+            position=position,
+            pending_orders=direct_orders[pos_id],
+        )
+        for pos_id, position in positions_by_id.items()
+    }
+    unattributed_rows: list[dict[str, str]] = []
+    for order in unattributed_orders:
+        display_order = dict(order)
+        for key in (
+            "closePosId",
+            "close_pos_id",
+            "closePositionId",
+            "posId",
+            "pos_id",
+            "positionId",
+        ):
+            display_order.pop(key, None)
+        rendered_rows = _exchange_protection_display_rows(
+            position={
+                "instId": display_order.get("instId"),
+                "posSide": display_order.get("posSide"),
+            },
+            pending_orders=[display_order],
+        )
+        for row in rendered_rows:
+            row["instrument_id"] = str(display_order.get("instId") or "").upper()
+            row["side"] = _normalize_deepcoin_position_side(
+                display_order.get("posSide")
+            )
+        unattributed_rows.extend(rendered_rows)
+    return direct_rows, unattributed_rows
 
 
 def _deepcoin_position_protection_key(position: dict[str, Any]) -> tuple[str, str, str, str]:
