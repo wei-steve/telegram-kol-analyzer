@@ -17,7 +17,7 @@ def calculate_backup_stop_price(
     primary_stop: str | float | Decimal,
     side: str,
     price_tick: str | float | Decimal,
-    buffer_bps: str | float | Decimal = 50,
+    buffer_bps: str | float | Decimal = 20,
 ) -> str:
     """Move a stop farther into loss, rounded conservatively to contract tick."""
 

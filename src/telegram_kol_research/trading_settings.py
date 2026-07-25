@@ -31,7 +31,7 @@ class TradingSettings:
     symbol_max_loss_usdt: dict[str, float] = field(default_factory=dict)
     entry_range_order_style: str = "eager"
     take_profit_allocations: list[float] = field(default_factory=lambda: [40.0, 30.0, 30.0])
-    trigger_backup_stop_buffer_bps: float = 50.0
+    trigger_backup_stop_buffer_bps: float = 20.0
     move_stop_to_breakeven_after_tp1: bool = True
     allow_vision_auto_trade: bool = True
 

@@ -16,6 +16,15 @@ def test_calculate_backup_stop_price_applies_50_bps_buffer_and_rounds_away_from_
     ) == expected
 
 
+@pytest.mark.parametrize(
+    ("side", "expected"), [("long", "63872"), ("short", "64128")]
+)
+def test_calculate_backup_stop_price_applies_20_bps_by_default(side, expected):
+    assert calculate_backup_stop_price(
+        primary_stop="64000", side=side, price_tick="0.1"
+    ) == expected
+
+
 def test_calculate_backup_stop_price_rejects_invalid_values_and_wrong_risk_side():
     with pytest.raises(BackupStopError, match="side"):
         calculate_backup_stop_price(primary_stop="1919", side="flat", price_tick="0.1")
@@ -80,7 +89,7 @@ def test_build_backup_stop_trigger_payload_closes_only_the_exact_split_position_
     }
 
 
-def test_backup_stop_buffer_settings_default_to_50_bps_and_validate_positive_values():
-    assert TradingSettings().trigger_backup_stop_buffer_bps == 50
+def test_backup_stop_buffer_settings_default_to_20_bps_and_validate_positive_values():
+    assert TradingSettings().trigger_backup_stop_buffer_bps == 20
     assert trading_settings_from_payload({"trigger_backup_stop_buffer_bps": "25"}).trigger_backup_stop_buffer_bps == 25
-    assert trading_settings_from_payload({"trigger_backup_stop_buffer_bps": 0}).trigger_backup_stop_buffer_bps == 50
+    assert trading_settings_from_payload({"trigger_backup_stop_buffer_bps": 0}).trigger_backup_stop_buffer_bps == 20
