@@ -200,6 +200,14 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "management_signal_message_id": "ALTER TABLE strategy_lifecycles ADD COLUMN management_signal_message_id INTEGER",
         "management_action": "ALTER TABLE strategy_lifecycles ADD COLUMN management_action VARCHAR(64)",
         "management_note": "ALTER TABLE strategy_lifecycles ADD COLUMN management_note TEXT",
+        "expiry_review_notified_at": (
+            "ALTER TABLE strategy_lifecycles "
+            "ADD COLUMN expiry_review_notified_at DATETIME"
+        ),
+        "expiry_review_next_at": (
+            "ALTER TABLE strategy_lifecycles "
+            "ADD COLUMN expiry_review_next_at DATETIME"
+        ),
     },
     "recognition_experiments": {
         "updated_at": "ALTER TABLE recognition_experiments ADD COLUMN updated_at DATETIME",
@@ -408,6 +416,7 @@ def init_db(engine: Engine) -> None:
     _configure_sqlite(engine)
     Base.metadata.create_all(engine)
     _backfill_sqlite_columns(engine)
+    _backfill_sqlite_expiry_review_state(engine)
     _backfill_sqlite_indexes(engine)
 
 
@@ -442,6 +451,40 @@ def _backfill_sqlite_columns(engine: Engine) -> None:
             for column_name, alter_sql in required_columns.items():
                 if column_name not in existing_columns:
                     connection.execute(text(alter_sql))
+
+
+def _backfill_sqlite_expiry_review_state(engine: Engine) -> None:
+    if engine.dialect.name != "sqlite":
+        return
+
+    with engine.begin() as connection:
+        table_exists = connection.execute(
+            text(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='strategy_lifecycles'"
+            )
+        ).first()
+        if table_exists is None:
+            return
+        connection.execute(
+            text(
+                "UPDATE strategy_lifecycles "
+                "SET expiry_review_notified_at = "
+                "COALESCE(last_checked_at, updated_at) "
+                "WHERE management_action = 'expiry_review_requested' "
+                "AND expiry_review_notified_at IS NULL"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE strategy_lifecycles "
+                "SET expiry_review_next_at = "
+                "datetime(COALESCE(last_checked_at, updated_at), '+3 hours') "
+                "WHERE management_action = 'expiry_review_continued' "
+                "AND expiry_review_notified_at IS NULL "
+                "AND expiry_review_next_at IS NULL"
+            )
+        )
 
 
 def _backfill_sqlite_indexes(engine: Engine) -> None:

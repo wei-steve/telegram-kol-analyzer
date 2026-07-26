@@ -784,6 +784,71 @@ def test_database_bootstrap_enables_sqlite_busy_timeout(tmp_path):
     assert busy_timeout >= 30000
 
 
+def test_database_bootstrap_backfills_expiry_review_notification_state(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    existing_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(strategy_lifecycles)").fetchall()
+    }
+    for column_name in ("expiry_review_notified_at", "expiry_review_next_at"):
+        if column_name in existing_columns:
+            conn.execute(f"ALTER TABLE strategy_lifecycles DROP COLUMN {column_name}")
+    conn.execute(
+        """
+        INSERT INTO strategy_lifecycles (
+            chat_id, message_id, symbol, side, lifecycle_status, signal_at,
+            filled_tp_index, management_action, last_checked_at, created_at, updated_at
+        ) VALUES (
+            88, 7001, 'BTC', 'long', 'pending_entry',
+            '2026-07-27 00:00:00', -1, 'expiry_review_requested',
+            '2026-07-27 03:05:00', '2026-07-27 00:00:00',
+            '2026-07-27 03:05:00'
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO strategy_lifecycles (
+            chat_id, message_id, symbol, side, lifecycle_status, signal_at,
+            filled_tp_index, management_action, last_checked_at, created_at, updated_at
+        ) VALUES (
+            88, 7002, 'ETH', 'short', 'pending_entry',
+            '2026-07-27 00:00:00', -1, 'expiry_review_continued',
+            '2026-07-27 04:10:00', '2026-07-27 00:00:00',
+            '2026-07-27 04:10:00'
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(strategy_lifecycles)").fetchall()
+    }
+    rows = conn.execute(
+        """
+        SELECT message_id, expiry_review_notified_at, expiry_review_next_at
+        FROM strategy_lifecycles
+        ORDER BY message_id
+        """
+    ).fetchall()
+    conn.close()
+
+    assert {"expiry_review_notified_at", "expiry_review_next_at"} <= columns
+    assert rows == [
+        (7001, "2026-07-27 03:05:00", None),
+        (7002, None, "2026-07-27 07:10:00"),
+    ]
+
+
 def test_database_bootstrap_backfills_web_performance_indexes(tmp_path):
     database_path = tmp_path / "research.db"
 

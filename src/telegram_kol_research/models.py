@@ -1344,6 +1344,12 @@ class StrategyLifecycle(Base):
     management_signal_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     management_action: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     management_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    expiry_review_notified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    expiry_review_next_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
