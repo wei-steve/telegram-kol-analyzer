@@ -121,7 +121,7 @@
             </div>
             <div>
               <h2>比特智 智哥</h2>
-              <p>左侧挂单 · 后续管理</p>
+              <p>限价挂单 · 后续更新</p>
             </div>
           </div>
           <div class="message-card">
@@ -145,7 +145,10 @@
           <span>橙</span><span>林</span><span>海</span><span>链</span>
           <span>量</span><span>航</span><span>辰</span><span>川</span>
         </div>
-        <p>数百条聊天 <b>≠</b> 数百条策略</p>
+        <div class="isolation-note">
+          <strong>群组隔离</strong>
+          <span>每个 KOL 群独立解析 · 独立风控 · 独立执行</span>
+        </div>
         <small>只展示脱敏样本，不代表胜率或收益承诺</small>
       </footer>
     </div>
@@ -353,13 +356,25 @@
         font-size: 17px;
       }
 
-      #scene-kol-roster .roster-footer p {
-        margin: 0;
-        font-size: 26px;
+      #scene-kol-roster .isolation-note {
+        display: flex;
+        align-items: center;
+        padding: 12px 20px;
+        gap: 14px;
+        border: 1px solid rgba(47, 230, 166, 0.34);
+        border-radius: 16px;
+        background: rgba(47, 230, 166, 0.07);
       }
 
-      #scene-kol-roster .roster-footer b {
-        color: #ff4d67;
+      #scene-kol-roster .isolation-note strong {
+        color: #2fe6a6;
+        font-size: 19px;
+        font-weight: 800;
+      }
+
+      #scene-kol-roster .isolation-note span {
+        color: rgba(244, 247, 255, 0.82);
+        font-size: 18px;
       }
 
       #scene-kol-roster .roster-footer small {
@@ -404,7 +419,7 @@
         },
         "roster-build+=2.7",
       );
-      kolRosterTimeline.from("#scene-kol-roster .roster-footer p", { y: 22, opacity: 0, duration: 0.46, ease: "power2.out" }, "roster-build+=3");
+      kolRosterTimeline.from("#scene-kol-roster .isolation-note", { y: 22, opacity: 0, duration: 0.46, ease: "power2.out" }, "roster-build+=3");
       kolRosterTimeline.from("#scene-kol-roster .roster-footer small", { opacity: 0, duration: 0.82, ease: "sine.out" }, "roster-build+=3.22");
       kolRosterTimeline.from(
         "#scene-kol-roster .signal-dot",
