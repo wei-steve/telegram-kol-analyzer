@@ -17,6 +17,26 @@ def test_database_bootstrap_creates_tables(tmp_path):
     assert engine is not None
 
 
+def test_message_instruction_items_have_visibility_retry_columns(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(message_instruction_items)"
+        ).fetchall()
+    }
+    conn.close()
+
+    assert {
+        "visibility_first_failed_at",
+        "visibility_retry_attempts",
+        "visibility_next_attempt_at",
+    } <= columns
+
+
 def test_database_bootstrap_creates_prompt_registry_tables(tmp_path):
     database_path = tmp_path / "research.db"
     create_session_factory(database_path)

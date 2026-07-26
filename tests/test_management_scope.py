@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -215,6 +215,139 @@ def test_risk_increasing_action_never_fans_out(tmp_path) -> None:
 
         with pytest.raises(
             ManagementScopeError, match="risk_increasing_fanout_forbidden"
+        ):
+            resolve_management_scope_in_session(
+                session,
+                raw_message=message,
+                directive=directive,
+                explicit_target_lifecycle_id=None,
+                reply_target_lifecycle_id=None,
+            )
+
+
+def test_unscoped_cancel_entry_never_fans_out_to_entered_positions(tmp_path) -> None:
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        _persist_live_strategy(
+            session, chat_id=88, message_id=1, pos_id="pos-1"
+        )
+        message = RawMessage(chat_id=88, message_id=2, text="BTC多单取消策略")
+        session.add(message)
+        session.flush()
+        directive = resolve_management_directive(
+            text=message.text or "",
+            lifecycle_event={
+                "event_type": "cancel_entry",
+                "symbol": "BTC",
+                "side": "long",
+            },
+        )
+
+        with pytest.raises(
+            ManagementScopeError, match="risk_increasing_fanout_forbidden"
+        ):
+            resolve_management_scope_in_session(
+                session,
+                raw_message=message,
+                directive=directive,
+                explicit_target_lifecycle_id=None,
+                reply_target_lifecycle_id=None,
+            )
+
+
+def test_fanout_excludes_positions_created_after_management_message(tmp_path) -> None:
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = _persist_live_strategy(
+            session, chat_id=88, message_id=2, pos_id="pos-2"
+        )
+        lifecycle.signal_at = NOW + timedelta(hours=1)
+        message = RawMessage(
+            chat_id=88,
+            message_id=1,
+            posted_at=NOW,
+            text="BTC多单成本保护",
+        )
+        session.add(message)
+        session.flush()
+
+        with pytest.raises(
+            ManagementScopeError,
+            match="verified_group_management_target_not_found",
+        ):
+            resolve_management_scope_in_session(
+                session,
+                raw_message=message,
+                directive=_break_even_directive(),
+                explicit_target_lifecycle_id=None,
+                reply_target_lifecycle_id=None,
+            )
+
+
+def test_long_stop_widening_cannot_fan_out(tmp_path) -> None:
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = _persist_live_strategy(
+            session, chat_id=88, message_id=1, pos_id="pos-1"
+        )
+        lifecycle.stop_loss = 64000
+        message = RawMessage(chat_id=88, message_id=2, text="BTC多单止损改到60000")
+        session.add(message)
+        session.flush()
+        directive = resolve_management_directive(
+            text=message.text or "",
+            lifecycle_event={
+                "event_type": "position_update",
+                "symbol": "BTC",
+                "side": "long",
+                "management_action": "adjust_stop_loss",
+                "stop_loss": 60000,
+            },
+        )
+
+        with pytest.raises(
+            ManagementScopeError,
+            match="group_stop_adjustment_direction_not_verified",
+        ):
+            resolve_management_scope_in_session(
+                session,
+                raw_message=message,
+                directive=directive,
+                explicit_target_lifecycle_id=None,
+                reply_target_lifecycle_id=None,
+            )
+
+
+def test_group_stop_update_fails_closed_if_any_verified_target_would_widen(
+    tmp_path,
+) -> None:
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        tighter = _persist_live_strategy(
+            session, chat_id=88, message_id=1, pos_id="pos-1"
+        )
+        wider = _persist_live_strategy(
+            session, chat_id=88, message_id=2, pos_id="pos-2"
+        )
+        tighter.stop_loss = 60000
+        wider.stop_loss = 65000
+        message = RawMessage(chat_id=88, message_id=3, text="BTC多单止损改到64000")
+        session.add(message)
+        session.flush()
+        directive = resolve_management_directive(
+            text=message.text or "",
+            lifecycle_event={
+                "event_type": "position_update",
+                "symbol": "BTC",
+                "side": "long",
+                "management_action": "adjust_stop_loss",
+                "stop_loss": 64000,
+            },
+        )
+
+        with pytest.raises(
+            ManagementScopeError,
+            match="group_stop_adjustment_direction_not_verified",
         ):
             resolve_management_scope_in_session(
                 session,

@@ -91,39 +91,16 @@ def resolve_management_directive(
     stop_loss = _normalized_optional(lifecycle_event.get("stop_loss"), upper=False)
 
     if any(term in combined for term in _CANCEL_ENTRY_TERMS) or event_type == "cancel_entry":
-        return _directive(
-            "cancel_entry", symbol=symbol, side=side,
-            reason_code="explicit_cancel_entry",
-        )
-
-    if any(term in combined for term in _TAIL_TERMS):
-        return _directive(
-            "partial_take_profit",
-            fraction=DEFAULT_TAIL_CLOSE_FRACTION,
-            symbol=symbol,
-            side=side,
-            reason_code=(
-                "tail_retention_preferred_over_optional_exit"
-                if any(term in combined for term in _FULL_EXIT_TERMS)
-                or "出局" in combined
-                else "tail_retention"
-            ),
-        )
-
-    if raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}:
-        return _directive(
-            "adjust_stop_loss",
+        return ManagementDirective(
+            intent="cancel_entry",
+            fraction=None,
             symbol=symbol,
             side=side,
             stop_loss=stop_loss,
-            reason_code="explicit_stop_adjustment_requires_position_validation",
-        )
-
-    if event_type in {
-        "exit_position", "exit_full", "full_exit", "close_position",
-    } or any(term in combined for term in _FULL_EXIT_TERMS):
-        return _directive(
-            "full_exit", symbol=symbol, side=side, reason_code="explicit_full_exit",
+            risk_reducing=True,
+            fanout_allowed=False,
+            cancel_deferred_entries=True,
+            reason_code="explicit_cancel_entry",
         )
 
     risk_increasing = raw_action in {
@@ -143,6 +120,48 @@ def resolve_management_directive(
             fanout_allowed=False,
             cancel_deferred_entries=False,
             reason_code="risk_increasing_fanout_forbidden",
+        )
+
+    if raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}:
+        if stop_loss is None:
+            return ManagementDirective(
+                intent="adjust_stop_loss",
+                fraction=None,
+                symbol=symbol,
+                side=side,
+                stop_loss=None,
+                risk_reducing=False,
+                fanout_allowed=False,
+                cancel_deferred_entries=False,
+                reason_code="stop_adjustment_direction_not_verified",
+            )
+        return _directive(
+            "adjust_stop_loss",
+            symbol=symbol,
+            side=side,
+            stop_loss=stop_loss,
+            reason_code="explicit_stop_adjustment_requires_position_validation",
+        )
+
+    if any(term in combined for term in _TAIL_TERMS):
+        return _directive(
+            "partial_take_profit",
+            fraction=DEFAULT_TAIL_CLOSE_FRACTION,
+            symbol=symbol,
+            side=side,
+            reason_code=(
+                "tail_retention_preferred_over_optional_exit"
+                if any(term in combined for term in _FULL_EXIT_TERMS)
+                or "出局" in combined
+                else "tail_retention"
+            ),
+        )
+
+    if event_type in {
+        "exit_position", "exit_full", "full_exit", "close_position",
+    } or any(term in combined for term in _FULL_EXIT_TERMS):
+        return _directive(
+            "full_exit", symbol=symbol, side=side, reason_code="explicit_full_exit",
         )
 
     has_partial = (
@@ -193,6 +212,18 @@ def resolve_management_directive(
     if raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"} or (
         stop_loss is not None and event_type == "position_update"
     ):
+        if stop_loss is None:
+            return ManagementDirective(
+                intent="adjust_stop_loss",
+                fraction=None,
+                symbol=symbol,
+                side=side,
+                stop_loss=None,
+                risk_reducing=False,
+                fanout_allowed=False,
+                cancel_deferred_entries=False,
+                reason_code="stop_adjustment_direction_not_verified",
+            )
         return _directive(
             "adjust_stop_loss",
             symbol=symbol,

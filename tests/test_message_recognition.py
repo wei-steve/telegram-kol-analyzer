@@ -653,6 +653,147 @@ def test_authoritative_unscoped_break_even_fans_out_to_verified_same_group_posit
     assert [item.instruction_kind for item in items] == ["management", "management"]
 
 
+def test_authoritative_reply_target_wins_over_conflicting_model_target(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9720,
+            reply_to_message_id=9654,
+            posted_at=datetime(2026, 7, 26, 4, 29, tzinfo=UTC),
+            text="BTC多单修改止损到成本保护。",
+        )
+        session.add(raw_message)
+        target_ids = []
+        for message_id, pos_id in ((9654, "pos-1"), (9701, "pos-2")):
+            strategy_id = f"deepcoin:88:{message_id}:BTC:long"
+            binding = None
+            if message_id != 9654:
+                binding = ExecutionBinding(
+                    strategy_instance_id=strategy_id,
+                    kol_id="group:88",
+                    chat_id=88,
+                    message_id=message_id,
+                    symbol="BTC",
+                    side="long",
+                    venue="deepcoin",
+                    pos_id=pos_id,
+                    status="active",
+                )
+                session.add(binding)
+                session.flush()
+            lifecycle = StrategyLifecycle(
+                chat_id=88,
+                message_id=message_id,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 25, 8, tzinfo=UTC),
+                entered_at=datetime(2026, 7, 25, 8, 1, tzinfo=UTC),
+                execution_binding_id=(binding.id if binding is not None else None),
+            )
+            session.add(lifecycle)
+            if binding is not None:
+                session.add(
+                    ExecutionOrderLeg(
+                        execution_binding_id=binding.id,
+                        strategy_instance_id=strategy_id,
+                        leg_index=1,
+                        purpose="entry",
+                        order_kind="market",
+                        order_id=f"order-{pos_id}",
+                        pos_id=pos_id,
+                        status="active",
+                        attribution_status="verified",
+                    )
+                )
+            session.flush()
+            target_ids.append(lifecycle.id)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "非策略",
+            "reason": "回复管理已有仓位",
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "target_lifecycle_id": target_ids[1],
+                "symbol": "BTC",
+                "side": "long",
+                "management_action": "move_stop_to_protect",
+                "confidence": 0.9,
+            },
+        },
+        model="mimo-v2.5",
+        authoritative_generation="reply-wins-9720",
+    )
+
+    with session_factory() as session:
+        candidates = (
+            session.query(SignalCandidate)
+            .filter_by(raw_message_id=raw_message_id)
+            .all()
+        )
+
+    assert [candidate.target_lifecycle_id for candidate in candidates] == [
+        target_ids[0]
+    ]
+
+
+def test_authoritative_ambiguous_management_fraction_fails_closed(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9721,
+            posted_at=datetime(2026, 7, 26, 4, 30, tzinfo=UTC),
+            text="BTC多单止盈30%，保留50%",
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=9654,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 25, 8, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 25, 8, 1, tzinfo=UTC),
+        )
+        session.add_all([raw_message, lifecycle])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "target_lifecycle_id": lifecycle_id,
+                "symbol": "BTC",
+                "side": "long",
+                "management_action": "partial_take_profit",
+                "confidence": 0.95,
+            },
+        },
+        model="mimo-v2.5",
+        authoritative_generation="ambiguous-fraction-9721",
+    )
+
+    assert result.status == "识别失败"
+    with session_factory() as session:
+        assert (
+            session.query(SignalCandidate)
+            .filter_by(raw_message_id=raw_message_id)
+            .count()
+            == 0
+        )
+
+
 def test_authoritative_low_confidence_group_exit_fans_out_to_same_chat_btc_and_eth(
     tmp_path,
 ):

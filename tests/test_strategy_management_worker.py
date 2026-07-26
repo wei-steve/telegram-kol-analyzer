@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -13,7 +14,12 @@ from telegram_kol_research.execution_bindings import (
     upsert_execution_binding,
     upsert_execution_order_leg,
 )
-from telegram_kol_research.models import StrategyManagementBatch
+from telegram_kol_research.models import (
+    MessageInstructionItem,
+    RawMessage,
+    SignalCandidate,
+    StrategyManagementBatch,
+)
 from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.strategy_management_planner import _protection_incident_requires_recovery
 from telegram_kol_research.strategy_management_batches import (
@@ -102,6 +108,75 @@ def test_visibility_retry_expiry_becomes_actionable_terminal_block(tmp_path):
         assert batch.reason_code == "protection_visibility_retry_expired"
         assert batch.visibility_next_attempt_at is None
         assert batch.notification_state == "pending"
+
+
+def test_worker_retries_due_visibility_item_and_finishes_same_item(tmp_path):
+    session_factory = create_session_factory(tmp_path / "item-visibility.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=30, text="BTC exit")
+        session.add(raw)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="BTC",
+            side="short",
+            event_type="close_signal",
+            management_action="full_exit",
+        )
+        session.add(candidate)
+        session.flush()
+        item = MessageInstructionItem(
+            raw_message_id=raw.id,
+            signal_candidate_id=candidate.id,
+            sequence=0,
+            instruction_kind="management",
+            strategy_instance_id="deepcoin:100:20:BTC:short",
+            idempotency_key="v" * 64,
+            status="pending",
+            result_json=json.dumps(
+                {
+                    "status": "deferred",
+                    "reason": "target_strategy_binding_not_visible_yet",
+                    "execution_mode": "live",
+                }
+            ),
+            visibility_first_failed_at=NOW - timedelta(seconds=5),
+            visibility_retry_attempts=1,
+            visibility_next_attempt_at=NOW,
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    planned = SimpleNamespace(
+        status="ready",
+        reason_code=None,
+        batch=SimpleNamespace(id=77),
+        batch_id=77,
+    )
+    result = run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        max_batches=1,
+        batch_lister=lambda *_args, **_kwargs: [],
+        binding_reconciler=lambda *_args, **_kwargs: None,
+        take_profit_convergence_runner=lambda *_args, **_kwargs: 0,
+        instruction_planner=lambda *_args, **_kwargs: planned,
+        executor=lambda *_args, **_kwargs: {
+            "status": "reconciling",
+            "submitted": True,
+            "batch_id": 77,
+            "legs": [],
+        },
+        contract_spec_provider=object(),
+        processed_at=NOW,
+    )
+
+    assert result.executed == 1
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        assert item.status == "submitted"
+        assert item.visibility_retry_attempts == 1
 
 
 def test_worker_runs_ready_take_profit_convergence_only_when_execution_enabled():

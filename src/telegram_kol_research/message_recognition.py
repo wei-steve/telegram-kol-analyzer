@@ -1778,6 +1778,22 @@ def _apply_deterministic_management_scope_if_matched(
     ):
         return False
 
+    expanded_targets = _expand_lifecycle_event_targets(decision)
+    if expanded_targets is None:
+        return False
+    if len(expanded_targets) != 1 or expanded_targets[0] is not decision:
+        applied = False
+        for target_decision in expanded_targets:
+            applied = _apply_deterministic_management_scope_if_matched(
+                session,
+                raw_message,
+                target_decision,
+                parse_source=parse_source,
+                authoritative_generation=authoritative_generation,
+                applied_candidate_ids=applied_candidate_ids,
+            ) or applied
+        return applied
+
     scoped_decision = dict(decision)
     if str(scoped_decision.get("event_type") or "") == "exit_position" and (
         _exit_decision_looks_like_management_update(
@@ -1799,11 +1815,36 @@ def _apply_deterministic_management_scope_if_matched(
         ):
             scoped_decision["take_profit"] = scoped_decision.get("exit_price")
         scoped_decision["exit_price"] = None
+    if not scoped_decision.get("stop_loss"):
+        explicit_stop_loss = _extract_explicit_stop_loss_from_management_text(
+            raw_message.text
+        )
+        if explicit_stop_loss is not None:
+            scoped_decision["stop_loss"] = explicit_stop_loss
+    raw_management_action = str(
+        scoped_decision.get("management_action") or ""
+    ).strip()
+    if (
+        not scoped_decision.get("stop_loss")
+        and raw_management_action
+        in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}
+        and _should_move_stop_to_protect(
+            current_text=raw_message.text,
+            decision=scoped_decision,
+            management_action=raw_management_action,
+        )
+    ):
+        scoped_decision["management_action"] = "move_stop_to_break_even"
 
-    directive = resolve_management_directive(
-        text=raw_message.text or "",
-        lifecycle_event=scoped_decision,
-    )
+    try:
+        directive = resolve_management_directive(
+            text=raw_message.text or "",
+            lifecycle_event=scoped_decision,
+        )
+    except ValueError as exc:
+        if str(exc) != "management_fraction_ambiguous":
+            raise
+        return False
     reply_target = _resolve_reply_lifecycle_target(session, raw_message)
     try:
         targets = resolve_management_scope_in_session(
@@ -2227,23 +2268,34 @@ def apply_authoritative_mimo_payload(
             applied_candidate_ids=accepted_candidate_ids,
         )
         if not lifecycle_applied and event_type != "none":
-            lifecycle_applied = _apply_lifecycle_event_decision(
-                session,
-                raw_message,
-                lifecycle_event,
-                parse_source="mimo_authoritative",
-                authoritative_generation=authoritative_generation,
-                applied_candidate_ids=accepted_candidate_ids,
-            )
-        if not lifecycle_applied and event_type != "none":
-            lifecycle_applied = _apply_deterministic_management_scope_if_matched(
-                session,
-                raw_message,
-                lifecycle_event,
-                parse_source="mimo_authoritative",
-                authoritative_generation=authoritative_generation,
-                applied_candidate_ids=accepted_candidate_ids,
-            )
+            management_event = event_type in {
+                "cancel_entry",
+                "exit_position",
+                "exit_full",
+                "full_exit",
+                "close_position",
+                "position_update",
+            }
+            if management_event:
+                lifecycle_applied = (
+                    _apply_deterministic_management_scope_if_matched(
+                        session,
+                        raw_message,
+                        lifecycle_event,
+                        parse_source="mimo_authoritative",
+                        authoritative_generation=authoritative_generation,
+                        applied_candidate_ids=accepted_candidate_ids,
+                    )
+                )
+            if not lifecycle_applied and not management_event:
+                lifecycle_applied = _apply_lifecycle_event_decision(
+                    session,
+                    raw_message,
+                    lifecycle_event,
+                    parse_source="mimo_authoritative",
+                    authoritative_generation=authoritative_generation,
+                    applied_candidate_ids=accepted_candidate_ids,
+                )
 
         result = _result_from_ai_payload(
             raw_message_id=raw_message_id,

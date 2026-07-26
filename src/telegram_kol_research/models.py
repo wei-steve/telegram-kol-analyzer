@@ -132,6 +132,15 @@ class MessageInstructionItem(Base):
     result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     retired_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    visibility_first_failed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    visibility_retry_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    visibility_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
     summary_notification_claimed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime,
         nullable=True,

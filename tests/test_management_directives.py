@@ -114,6 +114,38 @@ def test_break_even_is_risk_reducing_but_add_position_is_not() -> None:
     assert add_position.fanout_allowed is False
 
 
+def test_unresolved_risk_update_is_not_marked_safe_for_fanout() -> None:
+    directive = resolve_management_directive(
+        text="BTC多单修改止损到成本保护",
+        lifecycle_event={
+            "event_type": "position_update",
+            "symbol": "BTC",
+            "side": "long",
+            "management_action": "risk_update",
+        },
+    )
+
+    assert directive.intent == "adjust_stop_loss"
+    assert directive.risk_reducing is False
+    assert directive.fanout_allowed is False
+
+
+def test_mixed_reduce_then_add_message_fails_closed_for_fanout() -> None:
+    directive = resolve_management_directive(
+        text="BTC多单先止盈一半，然后继续加仓",
+        lifecycle_event={
+            "event_type": "position_update",
+            "symbol": "BTC",
+            "side": "long",
+            "management_action": "partial_take_profit",
+        },
+    )
+
+    assert directive.risk_reducing is False
+    assert directive.fanout_allowed is False
+    assert directive.reason_code == "risk_increasing_fanout_forbidden"
+
+
 def test_full_exit_and_cancel_entry_are_risk_reducing() -> None:
     full_exit = resolve_management_directive(
         text="BTC多单全部止盈出局",

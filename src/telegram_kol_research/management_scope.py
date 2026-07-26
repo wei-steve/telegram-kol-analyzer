@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
+from telegram_kol_research.execution_bindings import build_strategy_instance_id
 from telegram_kol_research.management_directives import ManagementDirective
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -52,11 +53,21 @@ def resolve_management_scope_in_session(
         lifecycle = session.get(StrategyLifecycle, exact_target_id)
         if lifecycle is None:
             raise ManagementScopeError("target_lifecycle_not_found")
+        if _lifecycle_starts_after_message(
+            lifecycle=lifecycle,
+            raw_message=raw_message,
+        ):
+            raise ManagementScopeError("target_lifecycle_not_yet_created")
         _require_source_identity(
             raw_message=raw_message,
             lifecycle=lifecycle,
             directive=directive,
         )
+        if not _directive_reduces_lifecycle_risk(
+            lifecycle=lifecycle,
+            directive=directive,
+        ):
+            raise ManagementScopeError("stop_adjustment_direction_not_verified")
         target = _verified_live_target(
             session,
             lifecycle=lifecycle,
@@ -65,7 +76,26 @@ def resolve_management_scope_in_session(
             ),
         )
         if target is None:
-            raise ManagementScopeError("target_position_ownership_not_verified")
+            return (
+                ManagementScopeTarget(
+                    lifecycle_id=int(lifecycle.id),
+                    strategy_instance_id=build_strategy_instance_id(
+                        venue="deepcoin",
+                        chat_id=lifecycle.chat_id,
+                        message_id=lifecycle.message_id,
+                        symbol=lifecycle.symbol,
+                        side=lifecycle.side,
+                    ),
+                    chat_id=int(lifecycle.chat_id),
+                    symbol=str(lifecycle.symbol).upper(),
+                    side=str(lifecycle.side).lower(),
+                    scope_source=(
+                        "reply_unverified"
+                        if reply_target_lifecycle_id is not None
+                        else "explicit_unverified"
+                    ),
+                ),
+            )
         return (target,)
 
     if not directive.risk_reducing or not directive.fanout_allowed:
@@ -82,21 +112,74 @@ def resolve_management_scope_in_session(
         .order_by(StrategyLifecycle.id.asc())
         .all()
     )
-    targets = tuple(
-        target
+    lifecycles = [
+        lifecycle
         for lifecycle in lifecycles
-        if (
-            target := _verified_live_target(
-                session,
-                lifecycle=lifecycle,
-                scope_source="verified_group_fanout",
-            )
+        if not _lifecycle_starts_after_message(
+            lifecycle=lifecycle,
+            raw_message=raw_message,
         )
-        is not None
-    )
+    ]
+    resolved_targets: list[ManagementScopeTarget] = []
+    for lifecycle in lifecycles:
+        target = _verified_live_target(
+            session,
+            lifecycle=lifecycle,
+            scope_source="verified_group_fanout",
+        )
+        if target is None:
+            continue
+        if not _directive_reduces_lifecycle_risk(
+            lifecycle=lifecycle,
+            directive=directive,
+        ):
+            raise ManagementScopeError(
+                "group_stop_adjustment_direction_not_verified"
+            )
+        resolved_targets.append(target)
+    targets = tuple(resolved_targets)
     if not targets:
         raise ManagementScopeError("verified_group_management_target_not_found")
     return targets
+
+
+def _lifecycle_starts_after_message(
+    *,
+    lifecycle: StrategyLifecycle,
+    raw_message: RawMessage,
+) -> bool:
+    if raw_message.posted_at is None or lifecycle.signal_at is None:
+        return False
+    signal_at = lifecycle.signal_at
+    posted_at = raw_message.posted_at
+    if signal_at.tzinfo is None and posted_at.tzinfo is not None:
+        posted_at = posted_at.replace(tzinfo=None)
+    elif signal_at.tzinfo is not None and posted_at.tzinfo is None:
+        signal_at = signal_at.replace(tzinfo=None)
+    return signal_at > posted_at
+
+
+def _directive_reduces_lifecycle_risk(
+    *,
+    lifecycle: StrategyLifecycle,
+    directive: ManagementDirective,
+) -> bool:
+    if directive.intent != "adjust_stop_loss":
+        return directive.risk_reducing
+    try:
+        requested_stop = float(directive.stop_loss or "")
+    except (TypeError, ValueError):
+        return False
+    if requested_stop <= 0:
+        return False
+    current_stop = lifecycle.stop_loss
+    if current_stop is None:
+        return True
+    if str(lifecycle.side or "").lower() == "long":
+        return requested_stop >= float(current_stop)
+    if str(lifecycle.side or "").lower() == "short":
+        return requested_stop <= float(current_stop)
+    return False
 
 
 def _require_source_identity(

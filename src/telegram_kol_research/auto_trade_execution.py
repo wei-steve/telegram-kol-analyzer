@@ -29,6 +29,7 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.message_instruction_items import (
     claim_next_message_instruction_item,
+    defer_message_instruction_item_for_visibility,
     finish_message_instruction_item,
     has_message_instruction_items,
     list_message_instruction_item_results,
@@ -128,6 +129,17 @@ def execute_message_instruction_items(
             result = {"type": type(exc).__name__, "message": str(exc)}
         else:
             finish_status = _instruction_finish_status(result)
+        if (
+            str(result.get("status") or "").lower() == "deferred"
+            and result.get("reason") == "target_strategy_binding_not_visible_yet"
+        ):
+            defer_message_instruction_item_for_visibility(
+                session_factory,
+                item_id=item.id,
+                result=result,
+                now=now,
+            )
+            continue
         finish_message_instruction_item(
             session_factory,
             item_id=item.id,
@@ -656,6 +668,7 @@ def _auto_process_management_signal(
             "status": "blocked" if result.status == "blocked" else result.status,
             "reason": result.reason_code,
             "batch_id": result.batch_id,
+            "execution_mode": settings.management_execution_mode,
         }
     if settings.management_execution_mode == "shadow":
         return {

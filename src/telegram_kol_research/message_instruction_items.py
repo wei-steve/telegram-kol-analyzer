@@ -26,6 +26,9 @@ MANAGEMENT_EVENT_TYPES = frozenset({"close_signal", "position_update"})
 FINISH_STATUSES = frozenset({"submitted", "succeeded", "failed", "unknown"})
 ERROR_STATUSES = frozenset({"failed", "unknown"})
 SUMMARY_NOTIFICATION_LEASE = timedelta(minutes=5)
+VISIBILITY_RETRY_DELAYS = (5, 15, 30, 60, 120, 300)
+VISIBILITY_RETRY_DEADLINE = timedelta(hours=6)
+VISIBILITY_RETRY_CLAIM_LEASE = timedelta(minutes=5)
 
 
 def create_message_instruction_items_in_session(
@@ -163,18 +166,199 @@ def claim_next_message_instruction_item(
                 MessageInstructionItem.id == next_item_id,
                 MessageInstructionItem.status == "pending",
                 MessageInstructionItem.retired_at.is_(None),
+                or_(
+                    MessageInstructionItem.visibility_next_attempt_at.is_(None),
+                    MessageInstructionItem.visibility_next_attempt_at <= now,
+                ),
             )
             .values(status="executing", updated_at=now)
             .returning(MessageInstructionItem.id)
         )
         if item_id is None:
-            session.rollback()
+            session.commit()
             return None
 
         session.commit()
         item = session.get(MessageInstructionItem, item_id)
         if item is None:
             raise RuntimeError("claimed instruction item disappeared")
+        session.expunge(item)
+        return item
+
+
+def defer_message_instruction_item_for_visibility(
+    session_factory: sessionmaker,
+    *,
+    item_id: int,
+    result: dict,
+    now: datetime,
+) -> str:
+    """Return an executing item to pending with bounded persistent backoff."""
+
+    payload_json = json.dumps(
+        result,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, int(item_id))
+        if item is None or item.status != "executing":
+            raise RuntimeError("instruction item is missing or not executing")
+        first_failed_at = item.visibility_first_failed_at or now
+        deadline = first_failed_at + VISIBILITY_RETRY_DEADLINE
+        if not _datetime_after(deadline, now):
+            item.status = "failed"
+            item.error_json = json.dumps(
+                {
+                    **result,
+                    "reason": "target_strategy_binding_visibility_retry_expired",
+                    "priority": "high",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            item.result_json = None
+            item.visibility_next_attempt_at = None
+            item.summary_notification_status = "pending"
+            item.summary_notification_claim_token = None
+            item.summary_notification_claimed_at = None
+            item.updated_at = now
+            session.commit()
+            return "failed"
+
+        attempts = int(item.visibility_retry_attempts or 0) + 1
+        delay = VISIBILITY_RETRY_DELAYS[
+            min(attempts - 1, len(VISIBILITY_RETRY_DELAYS) - 1)
+        ]
+        item.status = "pending"
+        item.result_json = payload_json
+        item.error_json = None
+        item.visibility_first_failed_at = first_failed_at
+        item.visibility_retry_attempts = attempts
+        item.visibility_next_attempt_at = now + timedelta(seconds=delay)
+        item.updated_at = now
+        session.commit()
+        return "pending"
+
+
+def claim_next_visibility_retry_instruction_item(
+    session_factory: sessionmaker,
+    *,
+    now: datetime,
+) -> MessageInstructionItem | None:
+    """Atomically claim the oldest due management visibility retry."""
+
+    with session_factory() as session:
+        candidate = aliased(MessageInstructionItem)
+        earlier = aliased(MessageInstructionItem)
+        stale_cutoff = now - VISIBILITY_RETRY_CLAIM_LEASE
+        expiry_cutoff = now - VISIBILITY_RETRY_DEADLINE
+        expired_error_json = json.dumps(
+            {
+                "reason": "target_strategy_binding_visibility_retry_expired",
+                "priority": "high",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        session.execute(
+            update(MessageInstructionItem)
+            .where(
+                MessageInstructionItem.retired_at.is_(None),
+                MessageInstructionItem.visibility_first_failed_at.is_not(None),
+                MessageInstructionItem.visibility_first_failed_at <= expiry_cutoff,
+                or_(
+                    MessageInstructionItem.status == "pending",
+                    and_(
+                        MessageInstructionItem.status == "executing",
+                        MessageInstructionItem.updated_at <= stale_cutoff,
+                    ),
+                ),
+            )
+            .values(
+                status="failed",
+                result_json=None,
+                error_json=expired_error_json,
+                visibility_next_attempt_at=None,
+                summary_notification_status="pending",
+                summary_notification_claim_token=None,
+                summary_notification_claimed_at=None,
+                updated_at=now,
+            )
+        )
+        session.flush()
+        claimable = or_(
+            and_(
+                candidate.status == "pending",
+                candidate.visibility_next_attempt_at.is_not(None),
+                candidate.visibility_next_attempt_at <= now,
+            ),
+            and_(
+                candidate.status == "executing",
+                candidate.updated_at <= stale_cutoff,
+            ),
+        )
+        next_item_id = (
+            select(candidate.id)
+            .where(
+                candidate.retired_at.is_(None),
+                candidate.instruction_kind == "management",
+                candidate.visibility_first_failed_at.is_not(None),
+                claimable,
+                ~exists(
+                    select(earlier.id).where(
+                        earlier.raw_message_id == candidate.raw_message_id,
+                        earlier.retired_at.is_(None),
+                        earlier.status.in_(("pending", "executing")),
+                        or_(
+                            earlier.sequence < candidate.sequence,
+                            and_(
+                                earlier.sequence == candidate.sequence,
+                                earlier.id < candidate.id,
+                            ),
+                        ),
+                    )
+                ),
+            )
+            .order_by(
+                candidate.visibility_next_attempt_at.asc(),
+                candidate.id.asc(),
+            )
+            .limit(1)
+            .scalar_subquery()
+        )
+        item_id = session.scalar(
+            update(MessageInstructionItem)
+            .where(
+                MessageInstructionItem.id == next_item_id,
+                MessageInstructionItem.retired_at.is_(None),
+                or_(
+                    and_(
+                        MessageInstructionItem.status == "pending",
+                        MessageInstructionItem.visibility_next_attempt_at.is_not(
+                            None
+                        ),
+                        MessageInstructionItem.visibility_next_attempt_at <= now,
+                    ),
+                    and_(
+                        MessageInstructionItem.status == "executing",
+                        MessageInstructionItem.updated_at <= stale_cutoff,
+                    ),
+                ),
+            )
+            .values(status="executing", updated_at=now)
+            .returning(MessageInstructionItem.id)
+        )
+        if item_id is None:
+            session.commit()
+            return None
+        session.commit()
+        item = session.get(MessageInstructionItem, item_id)
+        if item is None:
+            raise RuntimeError("claimed visibility retry item disappeared")
         session.expunge(item)
         return item
 

@@ -386,7 +386,7 @@ def _disable_reconciliation(monkeypatch, planner):
     return calls
 
 
-def test_selected_lifecycle_cannot_borrow_same_symbol_binding(monkeypatch, tmp_path):
+def test_selected_lifecycle_without_exact_binding_is_deferred(monkeypatch, tmp_path):
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id, lifecycle_id, _ = _persist_exact_management_target(
@@ -402,11 +402,68 @@ def test_selected_lifecycle_cannot_borrow_same_symbol_binding(monkeypatch, tmp_p
         planned_at=PLANNED_AT,
     )
 
-    assert result.status == "blocked"
-    assert result.reason_code == "target_strategy_binding_not_found"
+    assert result.status == "deferred"
+    assert result.reason_code == "target_strategy_binding_not_visible_yet"
     assert result.batch is None
     assert result.target_lifecycle_id == lifecycle_id
     assert len(calls) == 1
+
+
+def test_selected_lifecycle_relinks_unique_exact_strategy_binding(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory
+    )
+    with session_factory() as session:
+        session.get(StrategyLifecycle, lifecycle_id).execution_binding_id = None
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready", result.reason_code
+    assert result.batch is not None
+    assert result.batch.execution_binding_id == binding_id
+    with session_factory() as session:
+        assert (
+            session.get(StrategyLifecycle, lifecycle_id).execution_binding_id
+            == binding_id
+        )
+
+
+def test_selected_lifecycle_without_pointer_blocks_duplicate_exact_bindings(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, _ = _persist_exact_management_target(
+        session_factory,
+        second_active_binding=True,
+    )
+    with session_factory() as session:
+        session.get(StrategyLifecycle, lifecycle_id).execution_binding_id = None
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "target_strategy_binding_not_unique"
 
 
 def test_cross_chat_management_raw_cannot_target_lifecycle(monkeypatch, tmp_path):

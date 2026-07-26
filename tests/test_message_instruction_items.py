@@ -14,7 +14,9 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_instruction_items import (
     claim_message_instruction_summary,
     claim_next_message_instruction_item,
+    claim_next_visibility_retry_instruction_item,
     create_message_instruction_items_in_session,
+    defer_message_instruction_item_for_visibility,
     finish_message_instruction_item,
     finish_message_instruction_summary_delivery,
     list_message_instruction_item_results,
@@ -187,6 +189,137 @@ def test_claim_transitions_only_pending_items_in_sequence(tmp_path):
     assert entry is not None
     assert entry.instruction_kind == "entry"
     assert entry.status == "executing"
+
+
+def test_visibility_retry_keeps_item_pending_and_prevents_sequence_bypass(tmp_path):
+    session_factory = create_session_factory(tmp_path / "visibility-retry.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        create_message_instruction_items_in_session(session, raw_message_id=raw_id)
+        session.commit()
+
+    management = claim_next_message_instruction_item(
+        session_factory, raw_message_id=raw_id, now=NOW
+    )
+    assert management is not None
+    status = defer_message_instruction_item_for_visibility(
+        session_factory,
+        item_id=management.id,
+        result={
+            "status": "deferred",
+            "reason": "target_strategy_binding_not_visible_yet",
+        },
+        now=NOW,
+    )
+
+    assert status == "pending"
+    assert (
+        claim_next_message_instruction_item(
+            session_factory,
+            raw_message_id=raw_id,
+            now=NOW + timedelta(seconds=4),
+        )
+        is None
+    )
+    retry = claim_next_visibility_retry_instruction_item(
+        session_factory,
+        now=NOW + timedelta(seconds=5),
+    )
+    assert retry is not None
+    assert retry.id == management.id
+    assert retry.visibility_retry_attempts == 1
+    assert retry.visibility_first_failed_at is not None
+
+
+def test_stale_executing_visibility_retry_is_reclaimed_after_lease(tmp_path):
+    session_factory = create_session_factory(tmp_path / "visibility-stale.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session, raw_message_id=raw_id
+        )
+        item = items[0]
+        item.status = "executing"
+        item.visibility_first_failed_at = NOW - timedelta(minutes=10)
+        item.visibility_retry_attempts = 2
+        item.visibility_next_attempt_at = NOW - timedelta(minutes=9)
+        item.updated_at = NOW - timedelta(minutes=6)
+        session.commit()
+        item_id = item.id
+
+    reclaimed = claim_next_visibility_retry_instruction_item(
+        session_factory,
+        now=NOW,
+    )
+
+    assert reclaimed is not None
+    assert reclaimed.id == item_id
+    assert reclaimed.status == "executing"
+
+
+def test_visibility_retry_expiry_is_terminal_and_requests_notification(tmp_path):
+    session_factory = create_session_factory(tmp_path / "visibility-expiry.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session, raw_message_id=raw_id
+        )
+        item = items[0]
+        item.status = "executing"
+        item.visibility_first_failed_at = NOW - timedelta(hours=6)
+        item.visibility_retry_attempts = 10
+        session.commit()
+        item_id = item.id
+
+    status = defer_message_instruction_item_for_visibility(
+        session_factory,
+        item_id=item_id,
+        result={"reason": "target_strategy_binding_not_visible_yet"},
+        now=NOW,
+    )
+
+    assert status == "failed"
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        assert item.status == "failed"
+        assert item.visibility_next_attempt_at is None
+        assert item.summary_notification_status == "pending"
+        assert (
+            json.loads(item.error_json)["reason"]
+            == "target_strategy_binding_visibility_retry_expired"
+        )
+        assert json.loads(item.error_json)["priority"] == "high"
+
+
+def test_expired_visibility_retry_is_failed_before_it_can_be_claimed(tmp_path):
+    session_factory = create_session_factory(tmp_path / "visibility-old.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session, raw_message_id=raw_id
+        )
+        item = items[0]
+        item.status = "pending"
+        item.visibility_first_failed_at = NOW - timedelta(hours=7)
+        item.visibility_retry_attempts = 20
+        item.visibility_next_attempt_at = NOW - timedelta(hours=6)
+        session.commit()
+        item_id = item.id
+
+    assert (
+        claim_next_visibility_retry_instruction_item(
+            session_factory,
+            now=NOW,
+        )
+        is None
+    )
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        assert item.status == "failed"
+        assert (
+            json.loads(item.error_json)["reason"]
+            == "target_strategy_binding_visibility_retry_expired"
+        )
 
 
 def test_racing_claim_cannot_bypass_pending_or_executing_management(

@@ -802,12 +802,49 @@ def _load_exact_identity(
                 target_lifecycle_id=lifecycle.id,
             )
         if lifecycle.execution_binding_id is None:
-            return ManagementPlanningResult(
-                status="blocked",
-                reason_code="target_strategy_binding_not_found",
-                target_lifecycle_id=lifecycle.id,
+            expected_strategy_instance_id = build_strategy_instance_id(
+                venue="deepcoin",
+                chat_id=lifecycle.chat_id,
+                message_id=lifecycle.message_id,
+                symbol=lifecycle.symbol,
+                side=lifecycle.side,
             )
-        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+            bindings = (
+                session.query(ExecutionBinding)
+                .filter(ExecutionBinding.venue == "deepcoin")
+                .filter(
+                    ExecutionBinding.strategy_instance_id
+                    == expected_strategy_instance_id
+                )
+                .filter(ExecutionBinding.status.in_(["open", "active"]))
+                .order_by(ExecutionBinding.id.asc())
+                .all()
+            )
+            if not bindings:
+                return ManagementPlanningResult(
+                    status="deferred",
+                    reason_code="target_strategy_binding_not_visible_yet",
+                    target_lifecycle_id=lifecycle.id,
+                )
+            if len(bindings) != 1:
+                return ManagementPlanningResult(
+                    status="blocked",
+                    reason_code="target_strategy_binding_not_unique",
+                    target_lifecycle_id=lifecycle.id,
+                )
+            binding = bindings[0]
+            if not _binding_matches_lifecycle(binding, lifecycle):
+                return ManagementPlanningResult(
+                    status="blocked",
+                    reason_code="target_strategy_binding_not_found",
+                    target_lifecycle_id=lifecycle.id,
+                )
+            lifecycle.execution_binding_id = binding.id
+            session.commit()
+            for row in (raw_message, decision, candidate, lifecycle, binding):
+                session.refresh(row)
+        else:
+            binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
         if (
             binding is None
             or str(binding.venue or "").lower() != "deepcoin"

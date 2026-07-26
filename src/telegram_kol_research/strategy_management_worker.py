@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
+from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.execution_bindings import (
     load_deepcoin_execution_reconciliation_snapshot,
     reconcile_deepcoin_execution_bindings,
@@ -34,6 +36,11 @@ from telegram_kol_research.strategy_management_reconciliation import (
     reconcile_strategy_management_batches,
 )
 from telegram_kol_research.strategy_management_planner import plan_strategy_management_batch
+from telegram_kol_research.message_instruction_items import (
+    claim_next_visibility_retry_instruction_item,
+    defer_message_instruction_item_for_visibility,
+    finish_message_instruction_item,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -103,6 +110,7 @@ def run_strategy_management_worker_tick(
     cursor: StrategyManagementWorkerCursor | None = None,
     contract_spec_provider=None,
     take_profit_convergence_runner: Callable[..., int] = execute_ready_trigger_take_profit_convergences,
+    instruction_planner: Callable[..., Any] = plan_strategy_management_batch,
 ) -> StrategyManagementWorkerResult:
     """Process a bounded amount of work, isolating every durable batch failure."""
 
@@ -144,6 +152,129 @@ def run_strategy_management_worker_tick(
         if snapshot is None:
             snapshot = snapshot_loader(session_factory, client=get_client())
         return snapshot
+
+    if (
+        allow_execution
+        and contract_spec_provider is not None
+        and callable(session_factory)
+    ):
+        for _ in range(limit):
+            item = claim_next_visibility_retry_instruction_item(
+                session_factory,
+                now=now,
+            )
+            if item is None:
+                break
+            counts["discovered"] += 1
+            try:
+                prior_result = json.loads(item.result_json or "{}")
+                execution_mode = str(
+                    prior_result.get("execution_mode") or "live"
+                ).lower()
+                planning_result = instruction_planner(
+                    session_factory,
+                    raw_message_id=item.raw_message_id,
+                    candidate_id=item.signal_candidate_id,
+                    deepcoin_client=get_client(),
+                    contract_spec_provider=contract_spec_provider,
+                    planned_at=now,
+                    execution_mode=execution_mode,
+                )
+                if (
+                    planning_result.status == "deferred"
+                    and planning_result.reason_code
+                    == "target_strategy_binding_not_visible_yet"
+                ):
+                    defer_message_instruction_item_for_visibility(
+                        session_factory,
+                        item_id=item.id,
+                        result={
+                            "status": "deferred",
+                            "reason": planning_result.reason_code,
+                            "execution_mode": execution_mode,
+                        },
+                        now=now,
+                    )
+                    counts["recovered"] += 1
+                    continue
+                if planning_result.status != "ready" or planning_result.batch is None:
+                    finish_message_instruction_item(
+                        session_factory,
+                        item_id=item.id,
+                        status="failed",
+                        result={
+                            "status": planning_result.status,
+                            "reason": planning_result.reason_code,
+                            "batch_id": planning_result.batch_id,
+                        },
+                        now=now,
+                    )
+                    counts["failed"] += 1
+                    continue
+                if execution_mode == "shadow":
+                    finish_message_instruction_item(
+                        session_factory,
+                        item_id=item.id,
+                        status="succeeded",
+                        result={
+                            "status": "shadow_planned",
+                            "batch_id": planning_result.batch.id,
+                        },
+                        now=now,
+                    )
+                    counts["recovered"] += 1
+                    continue
+                execution_result = executor(
+                    session_factory,
+                    batch_id=planning_result.batch.id,
+                    deepcoin_client=get_client(),
+                    executed_at=now,
+                )
+                finish_status = (
+                    "submitted"
+                    if execution_result.get("submitted") is True
+                    else "failed"
+                    if str(execution_result.get("status") or "").lower()
+                    in {"failed", "partial_failed", "blocked"}
+                    else "succeeded"
+                )
+                finish_message_instruction_item(
+                    session_factory,
+                    item_id=item.id,
+                    status=finish_status,
+                    result=execution_result,
+                    now=now,
+                )
+                if finish_status == "failed":
+                    counts["failed"] += 1
+                else:
+                    counts["executed"] += 1
+            except DeepcoinRequestOutcomeUnknown as exc:
+                finish_message_instruction_item(
+                    session_factory,
+                    item_id=item.id,
+                    status="unknown",
+                    result={"type": type(exc).__name__, "message": str(exc)},
+                    now=now,
+                )
+                counts["failed"] += 1
+                logger.exception(
+                    "management visibility retry instruction %s outcome unknown",
+                    item.id,
+                )
+            except Exception as exc:
+                finish_message_instruction_item(
+                    session_factory,
+                    item_id=item.id,
+                    status="failed",
+                    result={"type": type(exc).__name__, "message": str(exc)},
+                    now=now,
+                )
+                counts["failed"] += 1
+                logger.exception(
+                    "management visibility retry instruction %s failed",
+                    item.id,
+                )
 
     if allow_execution and contract_spec_provider is not None:
         try:
