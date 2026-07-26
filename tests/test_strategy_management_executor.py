@@ -2349,6 +2349,24 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
         stop_loss=None,
         keep_close_plan=True,
     )
+    with session_factory() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored.target_snapshot_json)
+        snapshot["protection_recovery"] = {
+            "version": 1,
+            "mode": "replace_after_reduction",
+            "positions": [
+                {
+                    "pos_id": pos_id,
+                    "owned_order_ids": [
+                        row["ordId"] for row in rows_by_pos[pos_id]
+                    ],
+                }
+                for pos_id in ("pos-1", "pos-2")
+            ],
+        }
+        stored.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
     client = _ProtectionClient(session_factory, rows_by_pos)
 
     close_result = execute_management_batch(

@@ -1623,6 +1623,93 @@ def test_partial_then_break_even_plans_durable_close_and_protection_phases(
     assert result.batch.legs[0].old_tpsl["order_ids"] == ["tp-old", "sl-old"]
 
 
+def test_risk_reduction_protection_recovery_snapshots_exact_owned_orders(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_then_break_even",
+        management_fraction=None,
+    )
+    _persist_open_protection_incident(
+        session_factory,
+        binding_id=binding_id,
+        pos_id="pos-b",
+    )
+    with session_factory() as session:
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, pos_id="pos-b")
+            .one()
+        )
+        for order_id, purpose, trigger_price in (
+            ("tp-old", "take_profit", "61000"),
+            ("sl-old", "stop_loss", "63000"),
+        ):
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=leg.strategy_instance_id,
+                pos_id="pos-b",
+                instrument_id="BTC-USDT-SWAP",
+                side="short",
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price=trigger_price,
+                size_text="10" if purpose == "take_profit" else "0",
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence={"match": "exact_written_order"},
+                seen_at=PLANNED_AT,
+            )
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+    tpsl = [
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "tp-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "posId": "pos-b",
+            "tpTriggerPx": "61000",
+            "sz": "10",
+            "cTime": "1721000000000",
+        },
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "sl-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "posId": "pos-b",
+            "slTriggerPx": "63000",
+            "sz": "0",
+            "cTime": "1721000000000",
+        },
+    ]
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()], tpsl_orders=tpsl),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    recovery = result.batch.target_snapshot["protection_recovery"]
+    assert recovery["mode"] == "replace_after_reduction"
+    assert recovery["positions"] == [
+        {
+            "pos_id": "pos-b",
+            "owned_order_ids": ["tp-old", "sl-old"],
+        }
+    ]
+
+
 def _persist_prior_partial_batch(
     session_factory,
     *,

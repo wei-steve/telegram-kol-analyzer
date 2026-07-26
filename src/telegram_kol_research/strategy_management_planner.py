@@ -313,7 +313,14 @@ def _plan_strategy_management_batch_locked(
         protection_recovery_bypass = _protection_incident_requires_recovery(
             session, entry_legs=target_entry_legs
         )
-    if protection_recovery_bypass and intent != "full_exit":
+    protection_recovery_for_risk_reduction = (
+        protection_recovery_bypass and intent == "partial_then_break_even"
+    )
+    if (
+        protection_recovery_bypass
+        and intent != "full_exit"
+        and not protection_recovery_for_risk_reduction
+    ):
         return _persist_blocked(
             session_factory,
             identity=identity,
@@ -530,6 +537,22 @@ def _plan_strategy_management_batch_locked(
                 "row_snapshots": snapshot_protection_rows(protection.rows),
                 "evidence": protection.evidence,
             }
+            if protection_recovery_for_risk_reduction:
+                exact_ledger_order_ids = {
+                    str(row.order_id)
+                    for row in ledger_rows_by_pos_id.get(position["pos_id"], [])
+                    if row.order_id and str(row.status or "").lower() == "verified"
+                }
+                if exact_ledger_order_ids != set(protection.order_ids):
+                    return _persist_blocked(
+                        session_factory,
+                        identity=identity,
+                        raw_message_id=raw_message_id,
+                        intent=intent,
+                        reason_code="protection_recovery_exact_ledger_required",
+                        planned_at=now,
+                        execution_mode=execution_mode,
+                    )
 
     planned_close_sizes: tuple[str | None, ...]
     if effective_fraction is None:
@@ -581,6 +604,20 @@ def _plan_strategy_management_batch_locked(
         "contract_spec": contract_spec.to_dict(),
         "protection": protection_by_pos_id,
     }
+    if protection_recovery_for_risk_reduction:
+        target_snapshot["protection_recovery"] = {
+            "version": 1,
+            "mode": "replace_after_reduction",
+            "positions": [
+                {
+                    "pos_id": str(position["pos_id"]),
+                    "owned_order_ids": list(
+                        protection_by_pos_id[str(position["pos_id"])]["order_ids"]
+                    ),
+                }
+                for position in economics
+            ],
+        }
     if protection_recovery_bypass:
         target_snapshot["protection_recovery_bypass"] = {
             "version": 1,

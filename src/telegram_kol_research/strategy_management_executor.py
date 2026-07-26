@@ -319,6 +319,7 @@ def execute_management_batch(
         _require_exact_entry_legs(session_factory, batch)
     try:
         _require_exact_protection_recovery_full_exit_bypass(batch)
+        _require_exact_risk_reduction_protection_recovery_marker(batch)
         if batch.effective_action in {"full_close", "full_exit"}:
             _require_exact_entry_legs(session_factory, batch)
         _cancel_deferred_entry_legs(
@@ -345,8 +346,10 @@ def execute_management_batch(
             transitioned_at=now,
             reason_code=(
                 "close_final_preflight_failed"
-                if str(exc)
-                == "close_final_preflight_protection_recovery_bypass_invalid"
+                if str(exc) in {
+                    "close_final_preflight_protection_recovery_bypass_invalid",
+                    "close_final_preflight_protection_recovery_marker_invalid",
+                }
                 else (
                     "deferred_entry_cancel_race_detected"
                     if isinstance(exc, DeepcoinDefiniteRejection)
@@ -361,8 +364,10 @@ def execute_management_batch(
             load_management_batch(session_factory, batch.id),
             reason=(
                 "close_final_preflight_failed"
-                if str(exc)
-                == "close_final_preflight_protection_recovery_bypass_invalid"
+                if str(exc) in {
+                    "close_final_preflight_protection_recovery_bypass_invalid",
+                    "close_final_preflight_protection_recovery_marker_invalid",
+                }
                 else (
                     "deferred_entry_cancel_race_detected"
                     if isinstance(exc, DeepcoinDefiniteRejection)
@@ -1079,6 +1084,44 @@ def _require_exact_protection_recovery_full_exit_bypass(
     ):
         raise ManagementBatchExecutionError(
             "close_final_preflight_protection_recovery_bypass_invalid"
+        )
+
+
+def _require_exact_risk_reduction_protection_recovery_marker(
+    batch: ManagementBatchRecord,
+) -> None:
+    snapshot = batch.target_snapshot
+    marker = (
+        snapshot.get("protection_recovery")
+        if isinstance(snapshot, dict)
+        else None
+    )
+    if marker is None:
+        return
+    positions = marker.get("positions") if isinstance(marker, dict) else None
+    expected = [
+        {
+            "pos_id": str(leg.pos_id),
+            "owned_order_ids": list((leg.old_tpsl or {}).get("order_ids") or []),
+        }
+        for leg in batch.legs
+    ]
+    all_order_ids = [
+        str(order_id)
+        for position in expected
+        for order_id in position["owned_order_ids"]
+    ]
+    if (
+        batch.effective_action != "partial_then_break_even"
+        or not isinstance(marker, dict)
+        or marker.get("version") != 1
+        or marker.get("mode") != "replace_after_reduction"
+        or positions != expected
+        or any(not position["owned_order_ids"] for position in expected)
+        or len(all_order_ids) != len(set(all_order_ids))
+    ):
+        raise ManagementBatchExecutionError(
+            "close_final_preflight_protection_recovery_marker_invalid"
         )
 
 
