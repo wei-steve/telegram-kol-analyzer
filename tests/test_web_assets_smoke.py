@@ -916,7 +916,7 @@ def test_app_js_does_not_cache_stale_group_destination_as_loaded(tmp_path):
 
     assert visible_block.count("return false") >= 2
     assert visible_block.count("return true") >= 2
-    assert "const committed = await loadVisibleGroupDestination" in selected_block
+    assert "committed = await loadVisibleGroupDestination" in selected_block
     assert "if (!committed) return false" in selected_block
     assert "loaded = await loadSelectedGroupDestination(view)" in ensure_block
     assert "if (!loaded)" in ensure_block
@@ -934,7 +934,29 @@ def test_app_js_loads_message_companion_on_any_screen_size(tmp_path):
     assert "matchMedia('(min-width: 761px)')" not in companion_block
     assert "requestId !== groupSwitchRequestId" in companion_block
     assert "getSelectedChatId() !== chatId" in companion_block
-    assert "fetchDetailPanel(chatId)" in companion_block
+    assert "await detailPromise" in companion_block
+
+
+def test_group_switch_starts_detail_fetch_before_strategy_wait_and_aborts_previous(
+    tmp_path,
+):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    js = client.get("/static/app.js").text
+
+    assert "let activeGroupSwitchController = null;" in js
+    assert "activeGroupSwitchController.abort();" in js
+    assert "new AbortController()" in js
+    assert "signal: controller.signal" in js
+    assert "error?.name === 'AbortError'" in js
+
+    bind_start = js.index("function bindGroupLinks")
+    bind_end = js.index("\nasync function loadVisibleGroupDestination", bind_start)
+    bind_block = js[bind_start:bind_end]
+    assert bind_block.index("const detailPromise =") < bind_block.index(
+        "await loadVisibleGroupDestination"
+    )
+    assert "fetchDetailPanel(chatId, { signal: controller.signal })" in bind_block
 
 
 def test_app_js_routes_group_detail_updates_to_the_active_workbench_panel(tmp_path):
@@ -953,7 +975,8 @@ def test_app_js_routes_group_detail_updates_to_the_active_workbench_panel(tmp_pa
     selected_block = js[selected_start:selected_end]
     assert "const legacyView = view === 'activity' ? 'activity' : 'strategies';" in selected_block
     assert "activeView: legacyView" in selected_block
-    assert "detailPanel: getDetailPanelForWorkbenchView(view)" in selected_block
+    assert "const detailPanel = getDetailPanelForWorkbenchView(view);" in selected_block
+    assert "detailPanel," in selected_block
 
     group_link_start = js.index("function bindGroupLinks")
     group_link_end = js.index("\nasync function ", group_link_start + 1)

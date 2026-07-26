@@ -1,6 +1,7 @@
 let latestFreshnessSnapshot = null;
 let currentSelectedChatId = null;
 let groupSwitchRequestId = 0;
+let activeGroupSwitchController = null;
 let promptCenterRequestId = 0;
 const PROMPT_API_ACTIONS = ['/draft', '/validate', '/test', '/publish', '/history', '/rollback'];
 let promptCenterState = {
@@ -35,6 +36,17 @@ const workbenchLoadState = {
 
 const MESSAGE_TOP_THRESHOLD = 24;
 const MESSAGE_LOAD_MORE_THRESHOLD = 320;
+
+function beginGroupSwitchRequest() {
+  if (activeGroupSwitchController) activeGroupSwitchController.abort();
+  activeGroupSwitchController = new AbortController();
+  return activeGroupSwitchController;
+}
+
+function handleGroupDetailCompanionError(error, requestId) {
+  if (error?.name === 'AbortError' || requestId !== groupSwitchRequestId) return;
+  setAiStatus('消息加载失败，请重试。', true);
+}
 
 function setMutationBusy(control, busy) {
   if (!control) return;
@@ -619,9 +631,12 @@ async function fetchMessagePanel(chatId, options = {}) {
   return doc.querySelector('[data-messages-panel]');
 }
 
-async function fetchDetailPanel(chatId) {
+async function fetchDetailPanel(chatId, options = {}) {
   const url = `/groups/${chatId}/detail?_t=${Date.now()}`;
-  const response = await fetch(url, { cache: 'no-store' });
+  const response = await fetch(url, {
+    cache: 'no-store',
+    signal: options.signal,
+  });
   if (!response.ok) throw new Error(`detail request failed: ${response.status}`);
   const html = await response.text();
   const parser = new DOMParser();
@@ -631,9 +646,12 @@ async function fetchDetailPanel(chatId) {
   return fragment;
 }
 
-async function fetchStrategyMidPanel(chatId, filter) {
+async function fetchStrategyMidPanel(chatId, filter, options = {}) {
   const url = `/groups/${chatId}/strategy-mid-panel?filter=${filter}&_t=${Date.now()}`;
-  const response = await fetch(url, { cache: 'no-store' });
+  const response = await fetch(url, {
+    cache: 'no-store',
+    signal: options.signal,
+  });
   if (!response.ok) throw new Error(`strategy request failed: ${response.status}`);
   const html = await response.text();
   const parser = new DOMParser();
@@ -1157,6 +1175,7 @@ function bindGroupLinks() {
     element.addEventListener('click', async () => {
       const chatId = Number(element.dataset.chatId);
       const requestId = ++groupSwitchRequestId;
+      const controller = beginGroupSwitchRequest();
       hasDeferredMessageRefresh = false;
       const filterInput = document.querySelector('[data-strategy-filter-input]');
       const filter = filterInput ? filterInput.value : 'holding';
@@ -1165,21 +1184,40 @@ function bindGroupLinks() {
         : 'groups';
       const detailPanel = getDetailPanelForWorkbenchView(activeView);
       const strategyPanel = document.querySelector('[data-strategy-panel]');
+      const detailPromise = activeView === 'groups'
+        ? fetchDetailPanel(chatId, { signal: controller.signal })
+        : null;
+      if (detailPromise) detailPromise.catch(() => {});
       setAiStatus('');
       document.dispatchEvent(new CustomEvent('group-context-pending', { detail: { chatId } }));
       try {
-        await loadVisibleGroupDestination({ activeView, chatId, filter, detailPanel, strategyPanel, requestId });
+        await loadVisibleGroupDestination({
+          activeView,
+          chatId,
+          filter,
+          detailPanel,
+          strategyPanel,
+          requestId,
+          signal: controller.signal,
+        });
         if (requestId !== groupSwitchRequestId) return;
         markWorkbenchLoaded(activeView, chatId);
         syncSelectedGroupState(chatId, { focus: true });
-        if (activeView === 'groups') {
-          loadGroupDetailCompanion({ chatId, detailPanel, requestId }).catch(() => {});
+        if (detailPromise) {
+          loadGroupDetailCompanion({
+            chatId,
+            detailPanel,
+            requestId,
+            detailPromise,
+          }).catch((error) => handleGroupDetailCompanionError(error, requestId));
         }
         applyGroupPromptToEditor(String(chatId));
         renderConversationHistory();
         document.dispatchEvent(new CustomEvent('group-context-success', { detail: { chatId } }));
         refreshGroupList().catch(() => {});
       } catch (error) {
+        controller.abort();
+        if (error?.name === 'AbortError') return;
         if (requestId === groupSwitchRequestId) {
           setAiStatus('群组切换失败，请重试。', true);
           document.dispatchEvent(new CustomEvent('group-context-error', { detail: { chatId } }));
@@ -1189,9 +1227,17 @@ function bindGroupLinks() {
   });
 }
 
-async function loadVisibleGroupDestination({ activeView, chatId, filter, detailPanel, strategyPanel, requestId }) {
+async function loadVisibleGroupDestination({
+  activeView,
+  chatId,
+  filter,
+  detailPanel,
+  strategyPanel,
+  requestId,
+  signal,
+}) {
   if (activeView === 'activity') {
-    const nextContent = await fetchDetailPanel(chatId);
+    const nextContent = await fetchDetailPanel(chatId, { signal });
     if (requestId !== groupSwitchRequestId) return false;
     if (!detailPanel) throw new Error('missing detail panel');
     detailPanel.innerHTML = '';
@@ -1200,7 +1246,7 @@ async function loadVisibleGroupDestination({ activeView, chatId, filter, detailP
     bindWorkflowFilters();
     return true;
   }
-  const nextStrategyContent = await fetchStrategyMidPanel(chatId, filter);
+  const nextStrategyContent = await fetchStrategyMidPanel(chatId, filter, { signal });
   if (requestId !== groupSwitchRequestId) return false;
   if (!strategyPanel) throw new Error('missing strategy panel');
   strategyPanel.innerHTML = '';
@@ -1219,9 +1265,14 @@ function getDetailPanelForWorkbenchView(view = null) {
     || document.querySelector('[data-detail-panel]');
 }
 
-async function loadGroupDetailCompanion({ chatId, detailPanel, requestId }) {
+async function loadGroupDetailCompanion({
+  chatId,
+  detailPanel,
+  requestId,
+  detailPromise,
+}) {
   if (!detailPanel) return;
-  const nextContent = await fetchDetailPanel(chatId);
+  const nextContent = await detailPromise;
   if (requestId !== groupSwitchRequestId || getSelectedChatId() !== chatId) return;
   detailPanel.innerHTML = '';
   detailPanel.appendChild(nextContent);
@@ -1781,24 +1832,38 @@ async function loadSelectedGroupDestination(view) {
   const chatId = getSelectedChatId();
   if (!chatId) return false;
   const requestId = ++groupSwitchRequestId;
+  const controller = beginGroupSwitchRequest();
   const filterInput = document.querySelector('[data-strategy-filter-input]');
   const filter = filterInput ? filterInput.value : 'holding';
   const legacyView = view === 'activity' ? 'activity' : 'strategies';
-  const committed = await loadVisibleGroupDestination({
-    activeView: legacyView,
-    chatId,
-    filter,
-    detailPanel: getDetailPanelForWorkbenchView(view),
-    strategyPanel: document.querySelector('[data-strategy-panel]'),
-    requestId,
-  });
+  const detailPanel = getDetailPanelForWorkbenchView(view);
+  const detailPromise = view === 'groups'
+    ? fetchDetailPanel(chatId, { signal: controller.signal })
+    : null;
+  if (detailPromise) detailPromise.catch(() => {});
+  let committed = false;
+  try {
+    committed = await loadVisibleGroupDestination({
+      activeView: legacyView,
+      chatId,
+      filter,
+      detailPanel,
+      strategyPanel: document.querySelector('[data-strategy-panel]'),
+      requestId,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    controller.abort();
+    throw error;
+  }
   if (!committed) return false;
-  if (view === 'groups') {
+  if (detailPromise) {
     loadGroupDetailCompanion({
       chatId,
-      detailPanel: getDetailPanelForWorkbenchView(view),
+      detailPanel,
       requestId,
-    }).catch(() => {});
+      detailPromise,
+    }).catch((error) => handleGroupDetailCompanionError(error, requestId));
   }
   return true;
 }
