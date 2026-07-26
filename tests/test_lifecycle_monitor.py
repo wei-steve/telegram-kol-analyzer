@@ -776,6 +776,7 @@ def test_lifecycle_monitor_continued_expiry_review_repeats_after_interval(tmp_pa
             take_profit="59600",
             management_action="expiry_review_continued",
             last_checked_at=last_review_at,
+            expiry_review_next_at=datetime(2026, 6, 30, 12, 0, tzinfo=UTC),
         )
         session.add(lifecycle)
         session.commit()
@@ -807,6 +808,70 @@ def test_lifecycle_monitor_continued_expiry_review_repeats_after_interval(tmp_pa
     assert review_requests[0]["lifecycle_id"] == lifecycle_id
     assert review_requests[0]["previous_review_at"] == last_review_at.replace(tzinfo=None)
     assert review_requests[0]["expiry_at"] == datetime(2026, 6, 30, 12, 0, tzinfo=UTC)
+    assert lifecycle.expiry_review_notified_at == datetime(2026, 6, 30, 12, 0)
+    assert lifecycle.expiry_review_next_at is None
+
+
+def test_lifecycle_monitor_does_not_reopen_review_after_management_action_changes(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3891,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 30, 0, 0, tzinfo=UTC),
+            entry_range_low=60300,
+            entry_range_high=60800,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    review_requests = []
+
+    async def fake_notifier(payload):
+        review_requests.append(payload)
+
+    monitor = LifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        now_provider=lambda: datetime(2026, 6, 30, 3, 1, tzinfo=UTC),
+        expiry_review_notifier=fake_notifier,
+    )
+
+    asyncio.run(
+        monitor._request_pending_expiry_reviews(
+            datetime(2026, 6, 30, 3, 1, tzinfo=UTC)
+        )
+    )
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        lifecycle.management_action = "protection_update_confirmed"
+        session.commit()
+
+    restarted_monitor = LifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        now_provider=lambda: datetime(2026, 6, 30, 12, 0, tzinfo=UTC),
+        expiry_review_notifier=fake_notifier,
+    )
+    asyncio.run(
+        restarted_monitor._request_pending_expiry_reviews(
+            datetime(2026, 6, 30, 12, 0, tzinfo=UTC)
+        )
+    )
+    asyncio.run(
+        restarted_monitor._request_pending_expiry_reviews(
+            datetime(2026, 6, 30, 15, 0, tzinfo=UTC)
+        )
+    )
+
+    assert len(review_requests) == 1
+    assert review_requests[0]["lifecycle_id"] == lifecycle_id
 
 
 def test_lifecycle_monitor_default_pending_review_window_is_three_hours():
@@ -1009,6 +1074,80 @@ def test_lifecycle_monitor_does_not_repeat_entered_pending_leg_review_after_acti
     assert actions == handled_actions
 
 
+def test_lifecycle_monitor_clears_scheduled_review_when_pending_leg_resolves(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="miya",
+            chat_id=88,
+            message_id=603,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="active",
+            pos_id="pos-live",
+            order_id="order-live",
+            strategy_instance_id="deepcoin:88:603:BTC:long",
+        )
+        session.add(binding)
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=1,
+                purpose="entry",
+                order_kind="market",
+                order_id="order-live",
+                pos_id="pos-live",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="active",
+            )
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=603,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 30, 0, 0, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 30, 0, 1, tzinfo=UTC),
+            execution_binding_id=binding.id,
+            expiry_review_notified_at=datetime(2026, 6, 30, 3, 0, tzinfo=UTC),
+            expiry_review_next_at=datetime(2026, 6, 30, 6, 0, tzinfo=UTC),
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    review_requests = []
+
+    async def fake_notifier(payload):
+        review_requests.append(payload)
+
+    monitor = LifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        now_provider=lambda: datetime(2026, 6, 30, 6, 1, tzinfo=UTC),
+        expiry_review_notifier=fake_notifier,
+    )
+
+    asyncio.run(
+        monitor._request_pending_expiry_reviews(
+            datetime(2026, 6, 30, 6, 1, tzinfo=UTC)
+        )
+    )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert review_requests == []
+    assert lifecycle.expiry_review_next_at is None
+
+
 def test_lifecycle_monitor_requested_expiry_review_keeps_scanning_for_entry(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
@@ -1025,6 +1164,7 @@ def test_lifecycle_monitor_requested_expiry_review_keeps_scanning_for_entry(tmp_
             take_profit="59600",
             management_action="expiry_review_requested",
             last_checked_at=datetime(2026, 6, 30, 6, 0, tzinfo=UTC),
+            expiry_review_notified_at=datetime(2026, 6, 30, 6, 0, tzinfo=UTC),
         )
         session.add(lifecycle)
         session.commit()

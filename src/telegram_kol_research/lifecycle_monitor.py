@@ -623,6 +623,7 @@ class LifecycleMonitor:
 
     async def _request_pending_expiry_reviews(self, now: datetime) -> None:
         review_payloads: list[dict[str, Any]] = []
+        state_changed = False
         with self._session_factory() as session:
             rows = (
                 session.query(StrategyLifecycle)
@@ -631,35 +632,32 @@ class LifecycleMonitor:
                         ["pending_entry", "entered"]
                     )
                 )
-                .filter(
-                    or_(
-                        StrategyLifecycle.management_action.is_(None),
-                        ~StrategyLifecycle.management_action.in_(
-                            [
-                                "expiry_review_requested",
-                                "expiry_cancel_requested",
-                                "expiry_pending_leg_keep_order",
-                                "expiry_pending_leg_cancel_requested",
-                            ]
-                        ),
-                    )
-                )
                 .all()
             )
             for row in rows:
+                management_action = str(row.management_action or "")
+                if management_action.startswith("expiry_") and management_action not in {
+                    "expiry_review_requested",
+                    "expiry_review_continued",
+                }:
+                    continue
                 pending_leg_context = (
                     self._entered_lifecycle_pending_entry_leg_context(session, row)
                     if row.lifecycle_status == "entered"
                     else {}
                 )
                 if row.lifecycle_status == "entered" and not pending_leg_context:
+                    if row.expiry_review_next_at is not None:
+                        row.expiry_review_next_at = None
+                        state_changed = True
                     continue
                 if not self._expiry_review_due(row, now):
                     continue
+                continued_review = row.expiry_review_next_at is not None
                 expiry_at = self._next_expiry_review_at(row)
                 previous_review_at = (
                     row.last_checked_at
-                    if row.management_action == "expiry_review_continued"
+                    if continued_review
                     else None
                 )
                 review_reason = self._expiry_review_reason(
@@ -667,14 +665,39 @@ class LifecycleMonitor:
                     pending_entry_leg_count=len(
                         pending_leg_context.get("pending_leg_ids", [])
                     ),
+                    continued_review=continued_review,
                 )
-                row.management_action = "expiry_review_requested"
-                row.management_note = (
+                management_note = (
                     f"{review_reason}，"
                     "需要人工确认继续等待、标记过期或撤销交易所挂单。"
                 )
-                row.last_checked_at = now
-                row.updated_at = now
+                claim = session.query(StrategyLifecycle).filter(
+                    StrategyLifecycle.id == row.id
+                )
+                if continued_review:
+                    claim = claim.filter(
+                        StrategyLifecycle.expiry_review_next_at.is_not(None),
+                        StrategyLifecycle.expiry_review_next_at <= _utc_naive(now),
+                    )
+                else:
+                    claim = claim.filter(
+                        StrategyLifecycle.expiry_review_notified_at.is_(None),
+                        StrategyLifecycle.expiry_review_next_at.is_(None),
+                    )
+                claimed = claim.update(
+                    {
+                        StrategyLifecycle.management_action: "expiry_review_requested",
+                        StrategyLifecycle.management_note: management_note,
+                        StrategyLifecycle.last_checked_at: now,
+                        StrategyLifecycle.updated_at: now,
+                        StrategyLifecycle.expiry_review_notified_at: now,
+                        StrategyLifecycle.expiry_review_next_at: None,
+                    },
+                    synchronize_session=False,
+                )
+                if claimed != 1:
+                    continue
+                state_changed = True
                 review_payloads.append(
                     {
                         "lifecycle_id": row.id,
@@ -695,7 +718,7 @@ class LifecycleMonitor:
                         **pending_leg_context,
                     }
                 )
-            if review_payloads:
+            if state_changed:
                 session.commit()
 
         if self._expiry_review_notifier is None:
@@ -1189,21 +1212,31 @@ class LifecycleMonitor:
         return signal_at + timedelta(hours=self._config.max_age_hours)
 
     def _expiry_review_due(self, sig: StrategyLifecycle, now: datetime) -> bool:
+        next_review_at = getattr(sig, "expiry_review_next_at", None)
+        if next_review_at is None:
+            if getattr(sig, "expiry_review_notified_at", None) is not None:
+                return False
+            if getattr(sig, "management_action", None) == "expiry_review_continued":
+                return False
         review_at = self._next_expiry_review_at(sig)
         return not _before(now, review_at)
 
     def _next_expiry_review_at(self, sig: StrategyLifecycle) -> datetime:
-        if getattr(sig, "management_action", None) == "expiry_review_continued":
-            review_base = sig.last_checked_at or sig.updated_at or sig.signal_at
-            if review_base.tzinfo is None:
-                review_base = review_base.replace(tzinfo=UTC)
-            return review_base + timedelta(hours=self._config.max_age_hours)
+        next_review_at = getattr(sig, "expiry_review_next_at", None)
+        if next_review_at is not None:
+            if next_review_at.tzinfo is None:
+                return next_review_at.replace(tzinfo=UTC)
+            return next_review_at
         return self._expiry_at(sig)
 
     def _expiry_review_reason(
-        self, sig: StrategyLifecycle, *, pending_entry_leg_count: int = 0
+        self,
+        sig: StrategyLifecycle,
+        *,
+        pending_entry_leg_count: int = 0,
+        continued_review: bool = False,
     ) -> str:
-        if getattr(sig, "management_action", None) == "expiry_review_continued":
+        if continued_review:
             return f"上次人工选择继续等待后又超过 {self._config.max_age_hours} 小时"
         if pending_entry_leg_count:
             return (
