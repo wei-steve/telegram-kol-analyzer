@@ -880,6 +880,174 @@ def test_lifecycle_monitor_does_not_reopen_review_after_management_action_change
     assert review_requests[0]["lifecycle_id"] == lifecycle_id
 
 
+def test_lifecycle_monitor_does_not_consume_review_without_notifier(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3892,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 30, 0, 0, tzinfo=UTC),
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    monitor = LifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        expiry_review_notifier=None,
+    )
+
+    asyncio.run(
+        monitor._request_pending_expiry_reviews(
+            datetime(2026, 6, 30, 3, 1, tzinfo=UTC)
+        )
+    )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert lifecycle.management_action is None
+    assert lifecycle.expiry_review_notified_at is None
+    assert lifecycle.expiry_review_next_at is None
+
+
+def test_lifecycle_monitor_stale_review_claim_cannot_overwrite_terminal_decision(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3893,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 30, 0, 0, tzinfo=UTC),
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    with session_factory() as stale_session:
+        stale_lifecycle = stale_session.get(StrategyLifecycle, lifecycle_id)
+        stale_session.expunge(stale_lifecycle)
+
+    with session_factory() as decision_session:
+        lifecycle = decision_session.get(StrategyLifecycle, lifecycle_id)
+        lifecycle.lifecycle_status = "expired"
+        lifecycle.management_action = "expiry_expired_no_live_order"
+        decision_session.commit()
+
+    monitor = LifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        expiry_review_notifier=lambda payload: None,
+    )
+    with session_factory() as claim_session:
+        claimed = monitor._claim_expiry_review(
+            claim_session,
+            stale_lifecycle,
+            now=datetime(2026, 6, 30, 3, 1, tzinfo=UTC),
+            management_note="stale review must not win",
+            continued_review=False,
+            require_pending_leg=False,
+        )
+        claim_session.commit()
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert claimed is False
+    assert lifecycle.lifecycle_status == "expired"
+    assert lifecycle.management_action == "expiry_expired_no_live_order"
+    assert lifecycle.expiry_review_notified_at is None
+
+
+def test_lifecycle_monitor_stale_review_claim_requires_pending_leg_to_still_exist(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="miya",
+            chat_id=88,
+            message_id=3894,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="active",
+            pos_id="pos-live",
+            order_id="order-pending",
+            strategy_instance_id="deepcoin:88:3894:BTC:long",
+        )
+        session.add(binding)
+        session.flush()
+        pending_leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=2,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="order-pending",
+            venue="deepcoin",
+            attribution_status="unassigned",
+            status="pending",
+        )
+        session.add(pending_leg)
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3894,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 6, 30, 0, 0, tzinfo=UTC),
+            entered_at=datetime(2026, 6, 30, 0, 1, tzinfo=UTC),
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+        leg_id = pending_leg.id
+
+    with session_factory() as stale_session:
+        stale_lifecycle = stale_session.get(StrategyLifecycle, lifecycle_id)
+        stale_session.expunge(stale_lifecycle)
+
+    with session_factory() as fill_session:
+        pending_leg = fill_session.get(ExecutionOrderLeg, leg_id)
+        pending_leg.status = "active"
+        pending_leg.pos_id = "pos-second"
+        pending_leg.attribution_status = "verified"
+        fill_session.commit()
+
+    monitor = LifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        expiry_review_notifier=lambda payload: None,
+    )
+    with session_factory() as claim_session:
+        claimed = monitor._claim_expiry_review(
+            claim_session,
+            stale_lifecycle,
+            now=datetime(2026, 6, 30, 3, 1, tzinfo=UTC),
+            management_note="stale pending-leg review must not win",
+            continued_review=False,
+            require_pending_leg=True,
+        )
+        claim_session.commit()
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+
+    assert claimed is False
+    assert lifecycle.management_action is None
+    assert lifecycle.expiry_review_notified_at is None
+
+
 def test_lifecycle_monitor_default_pending_review_window_is_three_hours():
     assert LifecycleMonitorConfig().max_age_hours == 3
 

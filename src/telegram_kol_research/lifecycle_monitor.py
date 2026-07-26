@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable
 
 import httpx
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, exists, func, or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.live_updates import LiveUpdateBroker
@@ -622,6 +622,8 @@ class LifecycleMonitor:
             return signals
 
     async def _request_pending_expiry_reviews(self, now: datetime) -> None:
+        if self._expiry_review_notifier is None:
+            return
         review_payloads: list[dict[str, Any]] = []
         state_changed = False
         with self._session_factory() as session:
@@ -671,31 +673,15 @@ class LifecycleMonitor:
                     f"{review_reason}，"
                     "需要人工确认继续等待、标记过期或撤销交易所挂单。"
                 )
-                claim = session.query(StrategyLifecycle).filter(
-                    StrategyLifecycle.id == row.id
+                claimed = self._claim_expiry_review(
+                    session,
+                    row,
+                    now=now,
+                    management_note=management_note,
+                    continued_review=continued_review,
+                    require_pending_leg=row.lifecycle_status == "entered",
                 )
-                if continued_review:
-                    claim = claim.filter(
-                        StrategyLifecycle.expiry_review_next_at.is_not(None),
-                        StrategyLifecycle.expiry_review_next_at <= _utc_naive(now),
-                    )
-                else:
-                    claim = claim.filter(
-                        StrategyLifecycle.expiry_review_notified_at.is_(None),
-                        StrategyLifecycle.expiry_review_next_at.is_(None),
-                    )
-                claimed = claim.update(
-                    {
-                        StrategyLifecycle.management_action: "expiry_review_requested",
-                        StrategyLifecycle.management_note: management_note,
-                        StrategyLifecycle.last_checked_at: now,
-                        StrategyLifecycle.updated_at: now,
-                        StrategyLifecycle.expiry_review_notified_at: now,
-                        StrategyLifecycle.expiry_review_next_at: None,
-                    },
-                    synchronize_session=False,
-                )
-                if claimed != 1:
+                if not claimed:
                     continue
                 state_changed = True
                 review_payloads.append(
@@ -721,8 +707,6 @@ class LifecycleMonitor:
             if state_changed:
                 session.commit()
 
-        if self._expiry_review_notifier is None:
-            return
         for payload in review_payloads:
             try:
                 await self._expiry_review_notifier(payload)
@@ -731,6 +715,73 @@ class LifecycleMonitor:
                     "Pending-entry expiry review notifier failed lifecycle_id=%s",
                     payload.get("lifecycle_id"),
                 )
+
+    @staticmethod
+    def _claim_expiry_review(
+        session,
+        row: StrategyLifecycle,
+        *,
+        now: datetime,
+        management_note: str,
+        continued_review: bool,
+        require_pending_leg: bool,
+    ) -> bool:
+        claim = session.query(StrategyLifecycle).filter(
+            StrategyLifecycle.id == row.id,
+            StrategyLifecycle.lifecycle_status == row.lifecycle_status,
+            StrategyLifecycle.execution_binding_id == row.execution_binding_id,
+        )
+        if row.management_action is None:
+            claim = claim.filter(StrategyLifecycle.management_action.is_(None))
+        else:
+            claim = claim.filter(
+                StrategyLifecycle.management_action == row.management_action
+            )
+        if continued_review:
+            claim = claim.filter(
+                StrategyLifecycle.expiry_review_next_at.is_not(None),
+                StrategyLifecycle.expiry_review_next_at <= _utc_naive(now),
+            )
+        else:
+            claim = claim.filter(
+                StrategyLifecycle.expiry_review_notified_at.is_(None),
+                StrategyLifecycle.expiry_review_next_at.is_(None),
+            )
+        if require_pending_leg:
+            pending_leg_exists = exists().where(
+                and_(
+                    ExecutionOrderLeg.execution_binding_id
+                    == StrategyLifecycle.execution_binding_id,
+                    ExecutionOrderLeg.purpose == "entry",
+                    func.lower(ExecutionOrderLeg.status).in_(
+                        ["open", "pending", "submitted"]
+                    ),
+                    ExecutionOrderLeg.terminal_reason.is_(None),
+                    or_(
+                        ExecutionOrderLeg.pos_id.is_(None),
+                        ExecutionOrderLeg.pos_id == "",
+                    ),
+                    ~func.lower(
+                        func.coalesce(
+                            ExecutionOrderLeg.attribution_status,
+                            "unassigned",
+                        )
+                    ).in_(["attribution_conflict", "evidence_unavailable"]),
+                )
+            )
+            claim = claim.filter(pending_leg_exists)
+        claimed = claim.update(
+            {
+                StrategyLifecycle.management_action: "expiry_review_requested",
+                StrategyLifecycle.management_note: management_note,
+                StrategyLifecycle.last_checked_at: now,
+                StrategyLifecycle.updated_at: now,
+                StrategyLifecycle.expiry_review_notified_at: now,
+                StrategyLifecycle.expiry_review_next_at: None,
+            },
+            synchronize_session=False,
+        )
+        return claimed == 1
 
     @staticmethod
     def _entered_lifecycle_pending_entry_leg_context(
