@@ -437,6 +437,10 @@ def test_plan_submits_only_missing_targets_after_exact_owned_target_is_verified(
         "instId": "BTC-USDT-SWAP", "posId": "pos-10", "posSide": "short", "ordId": "tp-old-1",
         "triggerOrderType": "TPSL", "tpTriggerPx": "64500", "tpOrdPx": "-1", "tpPrice": "0", "sz": "5",
     })
+    client.pending.append({
+        "instId": "BTC-USDT-SWAP", "posId": "pos-other", "posSide": "short", "ordId": "other-leg-tp",
+        "triggerOrderType": "TPSL", "tpTriggerPx": "64000", "tpOrdPx": "-1", "tpPrice": "0", "sz": "2",
+    })
 
     plan = plan_trigger_take_profit_convergence(
         session_factory, convergence_id=convergence_id, deepcoin_client=client, planned_at=NOW

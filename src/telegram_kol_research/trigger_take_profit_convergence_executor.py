@@ -463,6 +463,7 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
         pending=pending,
         inst_id=inst_id,
         side=str(binding.side).lower(),
+        pos_id=pos_id,
         owned_order_ids=satisfied_order_ids,
     ):
         return "convergence_unowned_take_profit_present"
@@ -623,6 +624,7 @@ def _unowned_pending_take_profit_present(
     pending: list[dict[str, object]],
     inst_id: str,
     side: str,
+    pos_id: str,
     owned_order_ids: set[str],
 ) -> bool:
     """Fail closed on any TP that could affect this exact side but lacks local ownership."""
@@ -637,6 +639,8 @@ def _unowned_pending_take_profit_present(
             or order.inst_id != inst_id
             or order.pos_side != side
         ):
+            continue
+        if order.pos_id is not None and order.pos_id != pos_id:
             continue
         if order.ord_id not in owned_order_ids:
             return True
