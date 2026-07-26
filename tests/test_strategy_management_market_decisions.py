@@ -12,6 +12,7 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.strategy_management_market_decisions import (
     BreakEvenMarketDecisionConflict,
+    load_break_even_market_decision,
     reserve_break_even_market_decision,
 )
 
@@ -157,6 +158,9 @@ def test_reserve_market_decision_is_sorted_fingerprinted_and_idempotent(tmp_path
     assert first.quote_price_field == "last"
     assert [row["pos_id"] for row in first.decisions] == ["pos-a", "pos-b"]
     assert len(first.decision_fingerprint) == 64
+    assert load_break_even_market_decision(
+        session_factory, batch_id=batch_id
+    ) == first
 
 
 def test_reserve_market_decision_rejects_conflicting_second_choice(tmp_path):

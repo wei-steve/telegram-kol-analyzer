@@ -44,6 +44,23 @@ class BreakEvenMarketDecisionRecord:
     decision_fingerprint: str
 
 
+def load_break_even_market_decision(
+    session_factory: sessionmaker, *, batch_id: int
+) -> BreakEvenMarketDecisionRecord | None:
+    """Load a previously reserved decision without consulting market data."""
+
+    with session_factory() as session:
+        row = (
+            session.query(StrategyManagementMarketDecision)
+            .filter(
+                StrategyManagementMarketDecision.management_batch_id
+                == int(batch_id)
+            )
+            .one_or_none()
+        )
+        return None if row is None else _to_record(row)
+
+
 def reserve_break_even_market_decision(
     session_factory: sessionmaker,
     *,

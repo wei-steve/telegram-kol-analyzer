@@ -21,6 +21,7 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
+    StrategyManagementMarketDecision,
 )
 from telegram_kol_research.protection_attribution import snapshot_protection_rows
 from telegram_kol_research.protection_ledger import (
@@ -262,6 +263,25 @@ def _persist_protection_batch(
     return load_management_batch(session_factory, batch.id), rows_by_pos
 
 
+def _persist_market_break_even_batch(session_factory):
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory,
+        action="move_stop_to_break_even",
+        stop_loss=None,
+    )
+    with session_factory() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        stored.effective_action = "break_even_by_market"
+        for leg in (
+            session.query(StrategyManagementLeg)
+            .filter(StrategyManagementLeg.management_batch_id == batch.id)
+            .all()
+        ):
+            leg.planned_tpsl_json = None
+        session.commit()
+    return load_management_batch(session_factory, batch.id), rows_by_pos
+
+
 class _FakeClient:
     def __init__(self, session_factory, outcomes=None):
         self.session_factory = session_factory
@@ -370,6 +390,12 @@ class _ProtectionClient:
         self.pending_reads = 0
         self.close_calls = []
         self.call_log = []
+        self.quote = {
+            "instrument_id": "BTC-USDT-SWAP",
+            "price": "64200",
+            "price_field": "last",
+        }
+        self.quote_reads = []
 
     def list_positions(self, *, inst_id=None):
         return [dict(row) for row in self.positions]
@@ -377,6 +403,10 @@ class _ProtectionClient:
     def list_trigger_orders_pending(self, *, inst_id):
         self.pending_reads += 1
         return [dict(row) for row in self.pending]
+
+    def get_ticker_quote(self, *, inst_id):
+        self.quote_reads.append(inst_id)
+        return None if self.quote is None else dict(self.quote)
 
     def place_order(self, payload):
         self.close_calls.append(dict(payload))
@@ -432,6 +462,229 @@ def _legacy_close_signal(session_factory, batch, **overrides):
     }
     values.update(overrides)
     return enqueue_trade_signal(session_factory, **values)
+
+
+def test_break_even_market_reservation_persists_mixed_per_position_actions(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    decision = reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+
+    assert [(row["pos_id"], row["action"]) for row in decision.decisions] == [
+        ("pos-1", "full_exit"),
+        ("pos-2", "set_break_even"),
+    ]
+    assert decision.quote_price == "64200"
+    assert decision.quote_price_field == "last"
+    assert client.quote_reads == ["BTC-USDT-SWAP"]
+    assert client.pending_reads == 1
+    assert client.call_log == []
+
+
+@pytest.mark.parametrize("quote", [None, {"instrument_id": "ETH-USDT-SWAP", "price": "64200", "price_field": "last"}])
+def test_break_even_market_reservation_blocks_unsafe_quote_without_writes(
+    tmp_path, quote
+):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.quote = quote
+
+    with pytest.raises(
+        ManagementBatchExecutionError,
+        match="break_even_market_quote_unavailable",
+    ):
+        reserve_break_even_market_actions(
+            session_factory,
+            batch=batch,
+            deepcoin_client=client,
+            observed_at=NOW,
+        )
+
+    assert client.call_log == []
+    with session_factory() as session:
+        assert session.query(StrategyManagementMarketDecision).count() == 0
+
+
+def test_break_even_market_reservation_requires_protection_only_for_allowed_legs(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.pending = [
+        row for row in client.pending if str(row.get("posId")) != "pos-2"
+    ]
+
+    with pytest.raises(
+        ManagementBatchExecutionError,
+        match="protection_preflight_rows_ambiguous_or_drifted",
+    ):
+        reserve_break_even_market_actions(
+            session_factory,
+            batch=batch,
+            deepcoin_client=client,
+            observed_at=NOW,
+        )
+
+    assert client.call_log == []
+    with session_factory() as session:
+        assert session.query(StrategyManagementMarketDecision).count() == 0
+
+
+def test_break_even_market_reservation_all_full_exit_needs_no_protection_rows(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.quote["price"] = "65000"
+    client.pending = []
+
+    decision = reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+
+    assert {row["action"] for row in decision.decisions} == {"full_exit"}
+    assert client.pending_reads == 0
+    assert client.call_log == []
+
+
+def test_break_even_market_reservation_rejects_position_drift_without_writes(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.positions[0]["pos"] = "3"
+
+    with pytest.raises(
+        ManagementBatchExecutionError,
+        match="protection_preflight_position_economics_drift",
+    ):
+        reserve_break_even_market_actions(
+            session_factory,
+            batch=batch,
+            deepcoin_client=client,
+            observed_at=NOW,
+        )
+
+    assert client.call_log == []
+    with session_factory() as session:
+        assert session.query(StrategyManagementMarketDecision).count() == 0
+
+
+def test_break_even_market_reservation_retry_reuses_decision_without_ticker(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    first = reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+    client.get_ticker_quote = lambda *, inst_id: (_ for _ in ()).throw(
+        AssertionError("reserved decision must not reread ticker")
+    )
+
+    second = reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+
+    assert second == first
+    assert client.call_log == []
 
 
 def test_close_legs_are_committed_reserved_before_exact_market_submission(tmp_path):

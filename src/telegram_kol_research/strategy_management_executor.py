@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -55,6 +55,15 @@ from telegram_kol_research.strategy_management_batches import (
     load_management_batch,
     transition_batch,
     transition_leg,
+)
+from telegram_kol_research.strategy_management_market_decisions import (
+    BreakEvenMarketDecisionRecord,
+    load_break_even_market_decision,
+    reserve_break_even_market_decision,
+)
+from telegram_kol_research.strategy_management_market_policy import (
+    BreakEvenMarketPolicyError,
+    assess_break_even_market,
 )
 from telegram_kol_research.trigger_protection_intents import transition_trigger_protection_intent
 from telegram_kol_research.trading_settings import load_trading_settings
@@ -272,6 +281,116 @@ def _trigger_protection_rescue_result(rescue: TriggerProtectionStopRescue) -> di
         "rescue_id": int(rescue.id), "status": rescue.status,
         "reason": rescue.reason_code, "order_id": rescue.exchange_order_id,
     }
+
+
+def reserve_break_even_market_actions(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    observed_at: datetime,
+) -> BreakEvenMarketDecisionRecord:
+    """Reserve one per-position decision before any exchange mutation."""
+
+    if (
+        batch.intent != "move_stop_to_break_even"
+        or batch.effective_action != "break_even_by_market"
+        or batch.status != "executing"
+        or not batch.legs
+    ):
+        raise ManagementBatchExecutionError(
+            "break_even_market_batch_not_executable"
+        )
+    existing = load_break_even_market_decision(
+        session_factory, batch_id=batch.id
+    )
+    if existing is not None:
+        return existing
+
+    binding = _load_exact_binding(session_factory, batch)
+    _require_exact_entry_legs(session_factory, batch)
+    inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
+    live_positions = list(deepcoin_client.list_positions(inst_id=inst_id))
+    _preflight_exact_protection_positions(
+        session_factory=session_factory,
+        batch=batch,
+        binding=binding,
+        live_positions=live_positions,
+        inst_id=inst_id,
+        after_partial_close=False,
+    )
+    try:
+        quote = deepcoin_client.get_ticker_quote(inst_id=inst_id)
+    except Exception as exc:
+        raise ManagementBatchExecutionError(
+            "break_even_market_quote_unavailable"
+        ) from exc
+    if (
+        not isinstance(quote, dict)
+        or str(quote.get("instrument_id") or "").upper() != inst_id.upper()
+        or quote.get("price") in (None, "")
+        or quote.get("price_field") not in {"last", "lastPx"}
+    ):
+        raise ManagementBatchExecutionError(
+            "break_even_market_quote_unavailable"
+        )
+
+    decisions: list[dict[str, Any]] = []
+    allowed_legs = []
+    for leg in batch.legs:
+        try:
+            market = assess_break_even_market(
+                side=binding.side,
+                entry_price=leg.avg_entry_price,
+                market_price=quote["price"],
+            )
+        except BreakEvenMarketPolicyError as exc:
+            raise ManagementBatchExecutionError(
+                "break_even_market_quote_unavailable"
+            ) from exc
+        action = "set_break_even" if market.allowed else "full_exit"
+        decisions.append(
+            {
+                "management_leg_id": int(leg.id),
+                "execution_order_leg_id": int(leg.execution_order_leg_id),
+                "pos_id": str(leg.pos_id),
+                "side": market.side,
+                "entry_price": market.entry_price,
+                "comparison": market.comparison,
+                "action": action,
+            }
+        )
+        if market.allowed:
+            allowed_legs.append(leg)
+
+    if allowed_legs:
+        if any(
+            not isinstance(leg.old_tpsl, dict)
+            or not leg.old_tpsl.get("order_ids")
+            for leg in allowed_legs
+        ):
+            raise ManagementBatchExecutionError(
+                "protection_preflight_rows_ambiguous_or_drifted"
+            )
+        pending = list(
+            deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
+        )
+        _preflight_exact_protection_rows(
+            session_factory=session_factory,
+            batch=replace(batch, legs=tuple(allowed_legs)),
+            live_positions=live_positions,
+            pending=pending,
+        )
+
+    return reserve_break_even_market_decision(
+        session_factory,
+        batch_id=batch.id,
+        instrument_id=inst_id,
+        quote_price=quote["price"],
+        quote_price_field=str(quote["price_field"]),
+        observed_at=observed_at,
+        decisions=decisions,
+    )
 
 
 @serialized_position_authority_mutation
