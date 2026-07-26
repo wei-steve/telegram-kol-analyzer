@@ -914,14 +914,14 @@ def _ready_verified_trigger_take_profit_convergences(
         .all()
     )
     for row in rows:
-        # Earlier releases treated a full-position (``sz=0``) primary stop as
-        # missing and terminalized the convergence.  That is now a verified
-        # native stop shape, so only this precise historical reason may be
-        # re-evaluated.  All other conflicts stay fail-closed.
-        if (
-            str(row.status) == "conflicted"
-            and str(row.reason_code) != "convergence_verified_stop_missing"
-        ):
+        # Earlier releases could terminalize a convergence for a full-position
+        # (``sz=0``) primary stop or for legacy TPSLs whose exact ledger owner
+        # was not consulted. Both are now re-verified below; all other
+        # conflicts remain fail-closed.
+        if str(row.status) == "conflicted" and str(row.reason_code) not in {
+            "convergence_verified_stop_missing",
+            "convergence_unowned_take_profit_present",
+        }:
             continue
         leg = next((item for item in legs if int(item.id) == int(row.execution_order_leg_id)), None)
         if leg is None or _trigger_leg_child_fill_incomplete(leg, snapshot=snapshot):
