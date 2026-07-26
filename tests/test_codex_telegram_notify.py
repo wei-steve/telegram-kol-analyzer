@@ -1,7 +1,9 @@
 import importlib.util
+import io
 import json
 import subprocess
 import urllib.error
+import urllib.parse as urllib_parse
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -70,6 +72,8 @@ def test_send_notification_reads_keychain_and_posts_summary(monkeypatch):
     request = urlopen.call_args.args[0]
     assert request.full_url.endswith("/botsecret-token/sendMessage")
     assert b"chat_id=8129644952" in request.data
+    payload = urllib_parse.parse_qs(request.data.decode())
+    assert payload["text"] == ["【Telegram 获取消息项目】\n测试任务已完成"]
     assert "%E6%B5%8B%E8%AF%95%E4%BB%BB%E5%8A%A1%E5%B7%B2%E5%AE%8C%E6%88%90" in request.data.decode()
     assert urlopen.call_args.kwargs == {"timeout": 10.0}
 
@@ -123,6 +127,41 @@ def test_main_fails_when_telegram_rejects_request(monkeypatch, capsys):
     assert "secret-token" not in captured.err
 
 
+def test_main_classifies_telegram_http_error_as_rejection(monkeypatch, capsys):
+    codex_telegram_notify = _load_module()
+    monkeypatch.setattr(
+        codex_telegram_notify.subprocess,
+        "run",
+        Mock(
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="secret-token\n",
+                stderr="",
+            )
+        ),
+    )
+    telegram_error = urllib.error.HTTPError(
+        url="https://api.telegram.invalid/sendMessage",
+        code=400,
+        msg="Bad Request",
+        hdrs=None,
+        fp=io.BytesIO(b'{"ok":false}'),
+    )
+    monkeypatch.setattr(
+        codex_telegram_notify.urllib_request,
+        "urlopen",
+        Mock(side_effect=telegram_error),
+    )
+
+    exit_code = codex_telegram_notify.main(["任务已完成"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Telegram notification failed: Telegram rejected the message." in captured.err
+    assert "secret-token" not in captured.err
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -158,3 +197,12 @@ def test_main_does_not_leak_credentials_in_transport_errors(
     assert exit_code == 1
     assert "Telegram notification failed: Unable to deliver the message." in captured.err
     assert "secret-token" not in captured.err
+
+
+def test_project_instruction_uses_repository_root_independent_path():
+    agents_text = (MODULE_PATH.parents[1] / "AGENTS.md").read_text()
+
+    assert (
+        'python3 "$(git rev-parse --show-toplevel)/scripts/'
+        'codex_telegram_notify.py"'
+    ) in agents_text

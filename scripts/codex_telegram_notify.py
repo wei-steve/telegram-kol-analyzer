@@ -6,12 +6,14 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 KEYCHAIN_ACCOUNT = "bot-token"
 KEYCHAIN_SERVICE = "telegram-kol-codex-notifier"
 TELEGRAM_CHAT_ID = "8129644952"
+PROJECT_LABEL = "【Telegram 获取消息项目】"
 REQUEST_TIMEOUT_SECONDS = 10.0
 
 
@@ -52,7 +54,7 @@ def send_notification(summary: str) -> None:
     """Send one non-sensitive task-completion summary."""
     token = _load_bot_token()
     body = urllib_parse.urlencode(
-        {"chat_id": TELEGRAM_CHAT_ID, "text": summary}
+        {"chat_id": TELEGRAM_CHAT_ID, "text": f"{PROJECT_LABEL}\n{summary}"}
     ).encode()
     request = urllib_request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage",
@@ -60,10 +62,15 @@ def send_notification(summary: str) -> None:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib_request.urlopen(
-        request, timeout=REQUEST_TIMEOUT_SECONDS
-    ) as response:
-        payload = json.loads(response.read().decode())
+    try:
+        with urllib_request.urlopen(
+            request, timeout=REQUEST_TIMEOUT_SECONDS
+        ) as response:
+            payload = json.loads(response.read().decode())
+    except urllib_error.HTTPError as exc:
+        if 400 <= exc.code < 500:
+            raise TelegramRejected from exc
+        raise
     if payload.get("ok") is not True:
         raise TelegramRejected
 
