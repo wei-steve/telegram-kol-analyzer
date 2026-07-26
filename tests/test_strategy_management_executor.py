@@ -3487,8 +3487,26 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
         stop_loss=None,
         keep_close_plan=True,
     )
+    rows_by_pos["pos-1"] = [
+        row for row in rows_by_pos["pos-1"] if row["ordId"] != "tp-1b"
+    ]
     with session_factory() as session:
         stored = session.get(StrategyManagementBatch, batch.id)
+        pos_one_leg = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=batch.id, pos_id="pos-1")
+            .one()
+        )
+        pos_one_leg.old_tpsl_json = json.dumps(
+            {
+                "status": "verified",
+                "order_ids": [row["ordId"] for row in rows_by_pos["pos-1"]],
+                "rows": rows_by_pos["pos-1"],
+                "row_snapshots": snapshot_protection_rows(
+                    rows_by_pos["pos-1"]
+                ),
+            }
+        )
         snapshot = json.loads(stored.target_snapshot_json)
         snapshot["protection_recovery"] = {
             "version": 1,
@@ -3518,14 +3536,13 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
 
     assert close_result["status"] == "reconciling"
     assert len(client.close_calls) == 2
-    assert [call[0] for call in client.call_log[:5]] == [
-        "cancel_position_sltp",
+    assert [call[0] for call in client.call_log[:4]] == [
         "cancel_position_sltp",
         "cancel_position_sltp",
         "cancel_position_sltp",
         "cancel_position_sltp",
     ]
-    assert [call[0] for call in client.call_log[5:]] == [
+    assert [call[0] for call in client.call_log[4:]] == [
         "place_order",
         "place_order",
     ]
@@ -3569,7 +3586,7 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
     )
     assert reconciled.pending == 1
     assert load_management_batch(session_factory, batch.id).status == "protection_ready"
-    assert len(client.cancel_calls) == 5
+    assert len(client.cancel_calls) == 4
     assert client.set_calls == []
 
     client.positions = list(snapshot.positions)
@@ -3578,7 +3595,7 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
     )
 
     assert protection_result["status"] == "succeeded"
-    assert len(client.cancel_calls) == 5
+    assert len(client.cancel_calls) == 4
     stops = [row for row in client.set_calls if "slTriggerPx" in row]
     assert [(row["posId"], row["slTriggerPx"]) for row in stops] == [
         ("pos-1", "64000"),
@@ -3939,6 +3956,70 @@ def test_partial_then_break_even_replaces_protection_after_exchange_resizes_old_
         ("pos-2", "62500", None, "2"),
         ("pos-2", None, "64500", None),
     ]
+
+
+def test_precancelled_partial_protection_reallocates_staged_targets_to_remaining_size():
+    from telegram_kol_research.strategy_management_executor import (
+        _resize_protection_rows_for_remaining_position,
+    )
+
+    batch = SimpleNamespace(
+        target_snapshot={
+            "contract_spec": {"quantity_step": "1", "min_quantity": "1"}
+        }
+    )
+    leg = SimpleNamespace(
+        preflight_size="3",
+        planned_close_size="1",
+        quantity_step="1",
+    )
+    rows = [
+        {"purpose": "stop_loss", "size": "3", "trigger_price": "61000"},
+        {"purpose": "take_profit", "size": "1", "trigger_price": "65600"},
+        {"purpose": "take_profit", "size": "2", "trigger_price": "67100"},
+    ]
+
+    resized = _resize_protection_rows_for_remaining_position(
+        batch=batch,
+        leg=leg,
+        rows=rows,
+    )
+
+    assert [row["size"] for row in resized] == ["2", "1", "1"]
+
+
+def test_precancelled_partial_protection_rejects_more_stages_than_remaining_steps():
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        _resize_protection_rows_for_remaining_position,
+    )
+
+    batch = SimpleNamespace(
+        target_snapshot={
+            "contract_spec": {"quantity_step": "1", "min_quantity": "1"}
+        }
+    )
+    leg = SimpleNamespace(
+        preflight_size="3",
+        planned_close_size="1",
+        quantity_step="1",
+    )
+    rows = [
+        {"purpose": "stop_loss", "size": "3", "trigger_price": "61000"},
+        {"purpose": "take_profit", "size": "1", "trigger_price": "65000"},
+        {"purpose": "take_profit", "size": "1", "trigger_price": "66000"},
+        {"purpose": "take_profit", "size": "1", "trigger_price": "67000"},
+    ]
+
+    with pytest.raises(
+        ManagementBatchExecutionError,
+        match="protection_take_profit_stages_exceed_remaining_size",
+    ):
+        _resize_protection_rows_for_remaining_position(
+            batch=batch,
+            leg=leg,
+            rows=rows,
+        )
 
 
 @pytest.mark.parametrize(

@@ -2212,24 +2212,115 @@ def _precancelled_protection_rows(
         raise ManagementBatchExecutionError(
             "protection_precancel_success_evidence_incomplete"
         )
-    return _resize_protection_rows_for_remaining_position(leg=leg, rows=rows)
+    return _resize_protection_rows_for_remaining_position(
+        batch=batch,
+        leg=leg,
+        rows=rows,
+    )
 
 
 def _resize_protection_rows_for_remaining_position(
-    *, leg: Any, rows: list[dict[str, Any]]
+    *,
+    batch: ManagementBatchRecord,
+    leg: Any,
+    rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     remaining = _remaining_size_after_partial_close(leg)
     preflight = _decimal_or_none(leg.preflight_size)
     if remaining is None or preflight is None:
         raise ManagementBatchExecutionError("protection_remaining_size_invalid")
+    contract_spec = (
+        batch.target_snapshot.get("contract_spec")
+        if isinstance(batch.target_snapshot, dict)
+        else None
+    )
+    if not isinstance(contract_spec, dict):
+        raise ManagementBatchExecutionError(
+            "protection_remaining_contract_spec_missing"
+        )
+    quantity_step = _decimal_or_none(contract_spec.get("quantity_step"))
+    min_quantity = _decimal_or_none(contract_spec.get("min_quantity"))
+    persisted_step = _decimal_or_none(leg.quantity_step)
+    if (
+        quantity_step is None
+        or min_quantity is None
+        or persisted_step != quantity_step
+        or remaining % quantity_step != 0
+        or min_quantity % quantity_step != 0
+    ):
+        raise ManagementBatchExecutionError(
+            "protection_remaining_contract_spec_invalid"
+        )
+
     resized: list[dict[str, Any]] = []
     for source in rows:
         row = dict(source)
         size = _decimal_or_none(row.get("size"))
         if size == preflight:
-            row["size"] = str(remaining)
+            row["size"] = _plain_decimal(remaining)
         resized.append(row)
+
+    take_profit_indexes = [
+        index
+        for index, row in enumerate(resized)
+        if row.get("purpose") == "take_profit"
+        or (
+            row.get("purpose") == "combined"
+            and isinstance(row.get("take_profit"), dict)
+            and _has_positive_trigger(row["take_profit"])
+        )
+    ]
+    if not take_profit_indexes:
+        return resized
+    if remaining < min_quantity * len(take_profit_indexes):
+        raise ManagementBatchExecutionError(
+            "protection_take_profit_stages_exceed_remaining_size"
+        )
+
+    weights: list[Decimal] = []
+    for index in take_profit_indexes:
+        row = resized[index]
+        size = (
+            preflight
+            if row.get("full_position")
+            else _decimal_or_none(row.get("size"))
+        )
+        if size is None or size <= 0 or size % quantity_step != 0:
+            raise ManagementBatchExecutionError(
+                "protection_take_profit_size_invalid"
+            )
+        weights.append(size)
+    total_weight = sum(weights, Decimal("0"))
+    distributable = remaining - min_quantity * len(take_profit_indexes)
+    allocations = [min_quantity for _ in take_profit_indexes]
+    fractional: list[tuple[Decimal, int]] = []
+    allocated_extra = Decimal("0")
+    for offset, weight in enumerate(weights):
+        ideal = distributable * weight / total_weight
+        extra = (ideal // quantity_step) * quantity_step
+        allocations[offset] += extra
+        allocated_extra += extra
+        fractional.append((ideal - extra, offset))
+    leftover_steps = int((distributable - allocated_extra) / quantity_step)
+    for _fraction, offset in sorted(
+        fractional, key=lambda item: (-item[0], item[1])
+    )[:leftover_steps]:
+        allocations[offset] += quantity_step
+
+    if sum(allocations, Decimal("0")) != remaining:
+        raise ManagementBatchExecutionError(
+            "protection_take_profit_allocation_invalid"
+        )
+    for index, allocation in zip(
+        take_profit_indexes, allocations, strict=True
+    ):
+        resized[index]["full_position"] = False
+        resized[index]["size"] = _plain_decimal(allocation)
     return resized
+
+
+def _plain_decimal(value: Decimal) -> str:
+    return format(value.normalize(), "f")
 
 
 def _restore_precancelled_protection_for_rejected_close(
