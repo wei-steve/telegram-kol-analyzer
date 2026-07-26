@@ -39,6 +39,9 @@ from telegram_kol_research.lifecycle_exit_intents import (
 from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
 )
+from telegram_kol_research.management_directives import (
+    resolve_management_directive,
+)
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 from telegram_kol_research.recognition_profiles import BITCOIN_JUNZHANG_PROFILE
 from telegram_kol_research.parsing.text_parser import parse_signal_text
@@ -1291,46 +1294,16 @@ def normalize_management_intent(
     decision: Mapping[str, Any],
     text: str,
 ) -> tuple[str, float | None]:
-    """Normalize an actionable lifecycle decision without inventing a fraction."""
+    """Normalize an actionable lifecycle decision through deterministic policy."""
 
-    event_type = str(decision.get("event_type") or "").strip().lower()
-    raw_action = str(decision.get("management_action") or "").strip().lower()
-    combined = " ".join(
-        str(part or "")
-        for part in (text, decision.get("reason"), raw_action)
-    ).lower()
-
-    if event_type in {"exit_position", "exit_full", "full_exit", "close_position"}:
-        return "full_exit", None
-    if raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}:
-        return "adjust_stop_loss", None
-
-    has_partial = (
-        "partial_take_profit" in raw_action
-        or _has_partial_take_profit_terms(combined)
+    directive = resolve_management_directive(
+        text=text,
+        lifecycle_event=decision,
     )
-    has_break_even = (
-        any(
-            term in raw_action
-            for term in (
-                "move_stop_to_protect",
-                "move_stop_to_break_even",
-                "breakeven",
-                "break_even",
-            )
-        )
-        or _has_protective_stop_terms(combined)
-    )
-    fraction = _explicit_management_fraction(decision, combined) if has_partial else None
-    if has_partial and has_break_even:
-        return "partial_then_break_even", fraction
-    if has_partial:
-        return "partial_take_profit", fraction
-    if has_break_even:
-        return "move_stop_to_break_even", None
-    if decision.get("stop_loss") not in (None, ""):
-        return "adjust_stop_loss", None
-    return raw_action or "position_update", None
+    if directive.intent == "none":
+        raw_action = str(decision.get("management_action") or "").strip().lower()
+        return raw_action or "position_update", None
+    return directive.intent, directive.fraction
 
 
 def _explicit_management_fraction(

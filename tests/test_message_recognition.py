@@ -124,7 +124,7 @@ def test_normalize_management_intent_rejects_conflicting_close_and_retained_frac
         )
 
 
-def test_normalize_management_intent_leaves_unqualified_management_fraction_unset():
+def test_normalize_management_intent_defaults_unqualified_partial_to_half():
     action, fraction = message_recognition_module.normalize_management_intent(
         {
             "event_type": "position_update",
@@ -134,7 +134,7 @@ def test_normalize_management_intent_leaves_unqualified_management_fraction_unse
     )
 
     assert action == "partial_take_profit"
-    assert fraction is None
+    assert fraction == pytest.approx(0.5)
 
 
 def test_position_update_persists_intent_without_mutating_confirmed_lifecycle(tmp_path):
@@ -198,7 +198,7 @@ def test_position_update_persists_intent_without_mutating_confirmed_lifecycle(tm
 @pytest.mark.parametrize(
     ("text", "model_action", "expected_action", "expected_fraction"),
     [
-        ("现在先分批止盈", None, "partial_take_profit", None),
+        ("现在先分批止盈", None, "partial_take_profit", 0.5),
         (
             "提前止盈一半并移动止损至成本价",
             "partial_take_profit, move_stop_to_protect",
