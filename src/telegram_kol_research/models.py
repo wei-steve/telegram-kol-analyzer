@@ -647,6 +647,36 @@ class StrategyManagementLeg(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class StrategyManagementMarketDecision(Base):
+    """Append-only market choice reserved before a management exchange write."""
+
+    __tablename__ = "strategy_management_market_decisions"
+    __table_args__ = (
+        Index(
+            "uq_strategy_management_market_decisions_batch",
+            "management_batch_id",
+            unique=True,
+        ),
+        Index(
+            "ix_strategy_management_market_decisions_fingerprint",
+            "decision_fingerprint",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    management_batch_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_management_batches.id"), nullable=False
+    )
+    strategy_instance_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    instrument_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    quote_price: Mapped[str] = mapped_column(String(64), nullable=False)
+    quote_price_field: Mapped[str] = mapped_column(String(32), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    decisions_json: Mapped[str] = mapped_column(Text, nullable=False)
+    decision_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class StrategyManagementNotification(Base):
     """Durable, immutable delivery identity for an operator batch alert."""
 
