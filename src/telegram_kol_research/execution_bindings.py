@@ -921,6 +921,7 @@ def _ready_verified_trigger_take_profit_convergences(
         if str(row.status) == "conflicted" and str(row.reason_code) not in {
             "convergence_verified_stop_missing",
             "convergence_unowned_take_profit_present",
+            "convergence_exchange_preflight_unavailable",
         }:
             continue
         leg = next((item for item in legs if int(item.id) == int(row.execution_order_leg_id)), None)
