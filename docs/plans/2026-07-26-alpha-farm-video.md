@@ -576,13 +576,13 @@ Display calculations in this exact order:
 Then show the greedy leg:
 
 ```text
-50 ÷ (62,000 − 61,500) = 0.1 BTC
+50 ÷ (62,400 − 61,500) ≈ 0.0556 BTC
 ```
 
 Then show the conservative leg:
 
 ```text
-50 ÷ (62,400 − 61,500) ≈ 0.0556 BTC
+50 ÷ (62,000 − 61,500) = 0.1 BTC
 ```
 
 Finish with:

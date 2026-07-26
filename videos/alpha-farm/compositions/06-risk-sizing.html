@@ -40,15 +40,15 @@
               <strong>61,500</strong>
               <span>固定止损</span>
             </div>
-            <div class="tick greedy">
-              <i></i>
-              <strong>62,000</strong>
-              <span>贪婪入场</span>
-            </div>
             <div class="tick conservative">
               <i></i>
-              <strong>62,400</strong>
+              <strong>62,000</strong>
               <span>保守入场</span>
+            </div>
+            <div class="tick greedy">
+              <i></i>
+              <strong>62,400</strong>
+              <span>贪婪入场</span>
             </div>
             <div class="distance distance-one" data-layout-allow-overflow><b>500 USDT 距离</b></div>
             <div class="distance distance-two" data-layout-allow-overflow><b>900 USDT 距离</b></div>
@@ -61,8 +61,8 @@
               <span>贪婪腿</span>
               <b>RISK 50 USDT</b>
             </div>
-            <div class="formula">50 ÷ (62,000 − 61,500)</div>
-            <div class="result">= 0.1 <small>BTC</small></div>
+            <div class="formula">50 ÷ (62,400 − 61,500)</div>
+            <div class="result">≈ 0.0556 <small>BTC</small></div>
           </article>
 
           <article class="formula-card conservative-card">
@@ -70,8 +70,8 @@
               <span>保守腿</span>
               <b>RISK 50 USDT</b>
             </div>
-            <div class="formula">50 ÷ (62,400 − 61,500)</div>
-            <div class="result">≈ 0.0556 <small>BTC</small></div>
+            <div class="formula">50 ÷ (62,000 − 61,500)</div>
+            <div class="result">= 0.1 <small>BTC</small></div>
           </article>
         </section>
       </main>
@@ -303,8 +303,8 @@
       }
 
       #scene-risk-sizing .stop { left: 18%; }
-      #scene-risk-sizing .greedy { left: 52%; }
-      #scene-risk-sizing .conservative { left: 82%; }
+      #scene-risk-sizing .conservative { left: 52%; }
+      #scene-risk-sizing .greedy { left: 82%; }
       #scene-risk-sizing .stop i { background: #ff4d67; }
       #scene-risk-sizing .greedy i { background: #35c2ff; }
       #scene-risk-sizing .conservative i { background: #8b5cf6; }
