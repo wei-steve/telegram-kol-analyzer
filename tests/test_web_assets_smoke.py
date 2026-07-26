@@ -1,3 +1,8 @@
+import shutil
+import subprocess
+import textwrap
+
+import pytest
 from fastapi.testclient import TestClient
 
 from telegram_kol_research.web_app import create_web_app
@@ -124,6 +129,169 @@ def test_app_js_restores_exchange_position_view_after_partial_reload(tmp_path):
     assert "function restoreExchangePositionView(root)" in js
     assert "restoreExchangePositionView(root);" in js
     assert "saveExchangePositionView(mode);" in js
+
+
+def test_app_js_restores_exchange_position_tab_after_partial_reload(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    js = client.get("/static/app.js").text
+    bind_start = js.index("function bindExchangePositionTabs")
+    bind_end = js.index("\nfunction ", bind_start + 1)
+    bind_block = js[bind_start:bind_end]
+    load_start = js.index("async function loadPositionsPanel")
+    load_end = js.index("\nfunction ", load_start + 1)
+    load_block = js[load_start:load_end]
+
+    assert "const EXCHANGE_POSITION_TAB_KEY" in js
+    assert "const EXCHANGE_POSITION_TABS = [" in js
+    for tab in ("positions", "open-orders", "order-history", "position-history"):
+        assert f"'{tab}'" in js
+    assert "function exchangePositionTab()" in js
+    assert "function saveExchangePositionTab(tab)" in js
+    assert "function setExchangePositionTab(root, tab)" in js
+    assert "function restoreExchangePositionTab(root)" in js
+    assert "saveExchangePositionTab(target);" in bind_block
+    assert "restoreExchangePositionTab(root);" in bind_block
+    assert "return 'positions';" in js
+    assert load_block.index("container.appendChild(fragment);") < load_block.index(
+        "bindExchangePositionTabs();"
+    )
+
+
+def test_exchange_position_tab_persists_across_dom_replacement(tmp_path):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required for the browser-state behavior test")
+
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    constants_start = js.index("const EXCHANGE_POSITION_TAB_KEY")
+    constants_end = js.index("\nlet strategyRecordRequestId", constants_start)
+    functions_start = js.index("function bindExchangePositionTabs")
+    functions_end = js.index("\nfunction exchangePositionViewMode", functions_start)
+    harness = textwrap.dedent(
+        """
+        const storage = new Map();
+        global.window = {
+          localStorage: {
+            getItem: (key) => storage.has(key) ? storage.get(key) : null,
+            setItem: (key, value) => storage.set(key, value),
+          },
+        };
+
+        class FakeClassList {
+          constructor(initial = []) { this.values = new Set(initial); }
+          toggle(name, enabled) {
+            if (enabled) this.values.add(name);
+            else this.values.delete(name);
+          }
+          contains(name) { return this.values.has(name); }
+        }
+
+        class FakeElement {
+          constructor(dataset, active = false) {
+            this.dataset = dataset;
+            this.classList = new FakeClassList(active ? ['is-active'] : []);
+            this.attributes = {};
+            this.listeners = {};
+          }
+          addEventListener(name, listener) { this.listeners[name] = listener; }
+          setAttribute(name, value) { this.attributes[name] = value; }
+          click() { this.listeners.click(); }
+        }
+
+        class FakeRoot {
+          constructor(names) {
+            this.tabs = names.map((name, index) => new FakeElement(
+              { exchangePositionTab: name },
+              index === 0,
+            ));
+            this.panels = names.map((name, index) => new FakeElement(
+              { exchangePositionPanel: name },
+              index === 0,
+            ));
+          }
+          querySelectorAll(selector) {
+            if (selector === '[data-exchange-position-tab]') return this.tabs;
+            if (selector === '[data-exchange-position-panel]') return this.panels;
+            if (selector === '[data-exchange-view-mode]') return [];
+            return [];
+          }
+        }
+
+        let roots = [];
+        global.document = {
+          querySelectorAll: (selector) => selector === '[data-exchange-position-tabs]'
+            ? roots
+            : [],
+        };
+        function restoreExchangePositionView() {}
+
+        function assertSelected(root, expected) {
+          for (const tab of root.tabs) {
+            const selected = tab.dataset.exchangePositionTab === expected;
+            if (tab.classList.contains('is-active') !== selected) {
+              throw new Error(`wrong active tab for ${tab.dataset.exchangePositionTab}`);
+            }
+            if (tab.attributes['aria-selected'] !== String(selected)) {
+              throw new Error(`wrong aria-selected for ${tab.dataset.exchangePositionTab}`);
+            }
+          }
+          for (const panel of root.panels) {
+            const selected = panel.dataset.exchangePositionPanel === expected;
+            if (panel.classList.contains('is-active') !== selected) {
+              throw new Error(`wrong active panel for ${panel.dataset.exchangePositionPanel}`);
+            }
+          }
+        }
+
+        const allTabs = ['positions', 'open-orders', 'order-history', 'position-history'];
+        const firstRoot = new FakeRoot(allTabs);
+        roots = [firstRoot];
+        bindExchangePositionTabs();
+        firstRoot.tabs[2].click();
+        if (storage.get(EXCHANGE_POSITION_TAB_KEY) !== 'order-history') {
+          throw new Error('clicked tab was not persisted');
+        }
+        assertSelected(firstRoot, 'order-history');
+
+        const refreshedRoot = new FakeRoot(allTabs);
+        roots = [refreshedRoot];
+        bindExchangePositionTabs();
+        assertSelected(refreshedRoot, 'order-history');
+
+        storage.set(EXCHANGE_POSITION_TAB_KEY, 'unsupported');
+        const invalidRoot = new FakeRoot(allTabs);
+        roots = [invalidRoot];
+        bindExchangePositionTabs();
+        assertSelected(invalidRoot, 'positions');
+
+        storage.set(EXCHANGE_POSITION_TAB_KEY, 'order-history');
+        const incompleteRoot = new FakeRoot(['positions', 'open-orders']);
+        roots = [incompleteRoot];
+        bindExchangePositionTabs();
+        assertSelected(incompleteRoot, 'positions');
+
+        window.localStorage.getItem = () => { throw new Error('storage blocked'); };
+        window.localStorage.setItem = () => { throw new Error('storage blocked'); };
+        if (exchangePositionTab() !== 'positions') {
+          throw new Error('blocked storage did not fall back to positions');
+        }
+        saveExchangePositionTab('position-history');
+        """
+    )
+    result = subprocess.run(
+        ["node", "-e", "\n".join((
+            js[constants_start:constants_end],
+            js[functions_start:functions_end],
+            harness,
+        ))],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_app_js_defaults_message_panel_to_latest_messages_at_top(tmp_path):

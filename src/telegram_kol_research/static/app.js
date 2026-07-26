@@ -12,6 +12,13 @@ const STRATEGY_RECORD_FILTER_KEY = 'telegram-workbench:strategy-filter';
 const STRATEGY_RECORD_GROUP_KEY = 'telegram-workbench:strategy-group';
 const STRATEGY_RECORD_SCROLL_KEY = 'telegram-workbench:strategy-scroll';
 const EXCHANGE_POSITION_VIEW_KEY = 'telegram-workbench:exchange-position-view';
+const EXCHANGE_POSITION_TAB_KEY = 'telegram-workbench:exchange-position-tab';
+const EXCHANGE_POSITION_TABS = [
+  'positions',
+  'open-orders',
+  'order-history',
+  'position-history',
+];
 let strategyRecordRequestId = 0;
 let strategyRecordHasPendingChanges = false;
 let lastSuccessfulStrategyRecordAt = null;
@@ -2063,20 +2070,12 @@ function bindMobileWorkNavigation() {
 function bindExchangePositionTabs() {
   document.querySelectorAll('[data-exchange-position-tabs]').forEach((root) => {
     const tabs = root.querySelectorAll('[data-exchange-position-tab]');
-    const panels = root.querySelectorAll('[data-exchange-position-panel]');
     const viewButtons = root.querySelectorAll('[data-exchange-view-mode]');
-    const viewPanels = root.querySelectorAll('[data-exchange-view-panel]');
     tabs.forEach((tab) => {
       tab.addEventListener('click', () => {
         const target = tab.dataset.exchangePositionTab;
-        tabs.forEach((item) => {
-          const isActive = item === tab;
-          item.classList.toggle('is-active', isActive);
-          item.setAttribute('aria-selected', isActive ? 'true' : 'false');
-        });
-        panels.forEach((panel) => {
-          panel.classList.toggle('is-active', panel.dataset.exchangePositionPanel === target);
-        });
+        setExchangePositionTab(root, target);
+        saveExchangePositionTab(target);
       });
     });
     viewButtons.forEach((button) => {
@@ -2086,8 +2085,50 @@ function bindExchangePositionTabs() {
         saveExchangePositionView(mode);
       });
     });
+    restoreExchangePositionTab(root);
     restoreExchangePositionView(root);
   });
+}
+
+function exchangePositionTab() {
+  try {
+    const tab = window.localStorage.getItem(EXCHANGE_POSITION_TAB_KEY);
+    return EXCHANGE_POSITION_TABS.includes(tab) ? tab : 'positions';
+  } catch {
+    return 'positions';
+  }
+}
+
+function saveExchangePositionTab(tab) {
+  if (!EXCHANGE_POSITION_TABS.includes(tab)) return;
+  try {
+    window.localStorage.setItem(EXCHANGE_POSITION_TAB_KEY, tab);
+  } catch {
+    // Keep the active in-memory DOM state when browser storage is unavailable.
+  }
+}
+
+function setExchangePositionTab(root, tab) {
+  const tabs = Array.from(root.querySelectorAll('[data-exchange-position-tab]'));
+  const availableTabs = tabs.map((item) => item.dataset.exchangePositionTab);
+  const selectedTab = EXCHANGE_POSITION_TABS.includes(tab) && availableTabs.includes(tab)
+    ? tab
+    : 'positions';
+  tabs.forEach((item) => {
+    const isActive = item.dataset.exchangePositionTab === selectedTab;
+    item.classList.toggle('is-active', isActive);
+    item.setAttribute('aria-selected', isActive ? 'true' : 'false');
+  });
+  root.querySelectorAll('[data-exchange-position-panel]').forEach((panel) => {
+    panel.classList.toggle(
+      'is-active',
+      panel.dataset.exchangePositionPanel === selectedTab,
+    );
+  });
+}
+
+function restoreExchangePositionTab(root) {
+  setExchangePositionTab(root, exchangePositionTab());
 }
 
 function exchangePositionViewMode() {
