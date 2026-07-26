@@ -1773,6 +1773,50 @@ def test_definite_failure_continues_later_leg_and_is_partial_failed(tmp_path):
     ]
 
 
+def test_independent_position_success_is_never_replayed_after_sibling_failure(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+    first = _FakeClient(
+        session_factory,
+        [
+            {"code": "0", "data": {"ordId": "close-1"}},
+            DeepcoinDefiniteRejection("second position rejected"),
+        ],
+    )
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=first,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "partial_failed"
+    assert [leg.status for leg in load_management_batch(
+        session_factory, batch.id
+    ).legs] == ["submitted", "failed"]
+
+    restarted = _FakeClient(session_factory)
+    with pytest.raises(
+        ManagementBatchExecutionError,
+        match="batch_not_executable:partial_failed",
+    ):
+        execute_management_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=restarted,
+            executed_at=NOW,
+        )
+    assert restarted.calls == []
+
+
 def test_unexpected_exception_after_request_is_unknown_and_continues(tmp_path):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
 
