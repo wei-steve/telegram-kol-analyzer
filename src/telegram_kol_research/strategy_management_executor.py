@@ -57,6 +57,7 @@ from telegram_kol_research.strategy_management_batches import (
     transition_leg,
 )
 from telegram_kol_research.strategy_management_market_decisions import (
+    BreakEvenMarketDecisionConflict,
     BreakEvenMarketDecisionRecord,
     load_break_even_market_decision,
     reserve_break_even_market_decision,
@@ -495,6 +496,25 @@ def _execute_break_even_by_market_batch(
     if batch.status != "executing":
         raise ManagementBatchExecutionError(
             f"batch_not_executable:{batch.status}"
+        )
+    if any(
+        leg.status in {"submitted", "submit_unknown", "partial", "confirmed"}
+        for leg in batch.legs
+    ):
+        if not transition_batch(
+            session_factory,
+            batch.id,
+            expected_statuses={"executing"},
+            new_status="reconciling",
+            transitioned_at=executed_at,
+            reason_code="break_even_market_restart_requires_reconciliation",
+        ):
+            raise ManagementBatchExecutionError(
+                "management_batch_restart_handoff_conflict"
+            )
+        return _result(
+            load_management_batch(session_factory, batch.id),
+            reason="break_even_market_restart_requires_reconciliation",
         )
 
     decision = reserve_break_even_market_actions(
@@ -947,12 +967,23 @@ def execute_management_batch(
             )
             raise
     if batch.effective_action == "break_even_by_market":
-        return _execute_break_even_by_market_batch(
-            session_factory,
-            batch=batch,
-            deepcoin_client=deepcoin_client,
-            executed_at=now,
-        )
+        try:
+            return _execute_break_even_by_market_batch(
+                session_factory,
+                batch=batch,
+                deepcoin_client=deepcoin_client,
+                executed_at=now,
+            )
+        except BreakEvenMarketDecisionConflict:
+            transition_batch(
+                session_factory,
+                batch.id,
+                expected_statuses={"executing"},
+                new_status="recovery_required",
+                transitioned_at=now,
+                reason_code="break_even_market_decision_missing_or_invalid",
+            )
+            raise
     if batch.effective_action in _PROTECTION_ACTIONS or (
         batch.effective_action == "partial_then_break_even"
         and (

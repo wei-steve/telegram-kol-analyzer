@@ -95,12 +95,17 @@ def resolve_proven_restored_protection_failure_for_market_successor_in_session(
         str(pos_id) for pos_id in live_pos_ids
     }:
         return "blocked"
-    pending_by_order_id = {
-        order_id: row
+    pending_rows_with_ids = [
+        (order_id, row)
         for row in pending_tpsl_rows
         if isinstance(row, dict)
         and (order_id := _pending_order_id(row)) is not None
-    }
+    ]
+    if len({order_id for order_id, _row in pending_rows_with_ids}) != len(
+        pending_rows_with_ids
+    ):
+        return "blocked"
+    pending_by_order_id = dict(pending_rows_with_ids)
     for leg in legs:
         if leg.status != "restored" or not _has_restored_protection_evidence(
             leg
@@ -211,7 +216,7 @@ def _ledger_matches_pending_tpsl(
     row_pos_id = str(
         row.get("posId") or row.get("pos_id") or row.get("positionId") or ""
     ).strip()
-    if row_pos_id and row_pos_id != expected_pos_id:
+    if row_pos_id != expected_pos_id:
         return False
     if str(row.get("instId") or "").upper() != str(
         ledger.instrument_id or ""

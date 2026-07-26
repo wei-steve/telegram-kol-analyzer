@@ -795,6 +795,101 @@ def test_break_even_market_reservation_retry_rejects_protection_drift(
     assert client.call_log == []
 
 
+def test_break_even_by_market_submitted_restart_hands_off_to_reconciliation(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+    close_leg = next(leg for leg in batch.legs if leg.pos_id == "pos-1")
+    transition_leg(
+        session_factory,
+        close_leg.id,
+        expected_statuses={"planned"},
+        new_status="submitted",
+        transitioned_at=NOW,
+        client_order_id="TMRESTART",
+        exchange_order_id="close-restart",
+    )
+    client.positions = [client.positions[1]]
+    client.call_log.clear()
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "reconciling"
+    assert result["reason"] == "break_even_market_restart_requires_reconciliation"
+    assert client.call_log == []
+
+
+def test_break_even_by_market_corrupt_decision_freezes_executor(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+        reserve_break_even_market_actions,
+    )
+    from telegram_kol_research.strategy_management_market_decisions import (
+        BreakEvenMarketDecisionConflict,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+    with session_factory() as session:
+        row = session.query(StrategyManagementMarketDecision).one()
+        row.decision_fingerprint = "d" * 64
+        session.commit()
+
+    with pytest.raises(BreakEvenMarketDecisionConflict):
+        execute_management_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=client,
+            executed_at=NOW,
+        )
+
+    stored = load_management_batch(session_factory, batch.id)
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "break_even_market_decision_missing_or_invalid"
+    assert client.call_log == []
+
+
 def test_break_even_by_market_executes_mixed_close_and_protection_legs(
     tmp_path,
 ):

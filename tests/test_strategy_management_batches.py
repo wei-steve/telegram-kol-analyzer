@@ -235,6 +235,45 @@ def test_proven_restored_predecessor_blocks_incomplete_or_drifted_proof(
     assert result == "blocked"
 
 
+@pytest.mark.parametrize("proof_drift", ["missing_pos_id", "duplicate_order_id"])
+def test_proven_restored_predecessor_requires_unambiguous_position_proof(
+    tmp_path, proof_drift
+):
+    repository = _repository()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_restored_break_even_predecessor(session_factory)
+    row = {
+        "ordId": "restored-sl",
+        "posId": "pos-restored",
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "short",
+        "triggerOrderType": "TPSL",
+        "slTriggerPx": "65200",
+        "sz": "16",
+    }
+    if proof_drift == "missing_pos_id":
+        row.pop("posId")
+        pending_rows = [row]
+    else:
+        pending_rows = [row, dict(row)]
+
+    with session_factory() as session:
+        result = (
+            repository.resolve_proven_restored_protection_failure_for_market_successor_in_session(
+                session,
+                strategy_instance_id="strategy-restored",
+                target_lifecycle_id=302,
+                execution_binding_id=402,
+                live_pos_ids={"pos-restored"},
+                pending_tpsl_rows=pending_rows,
+                pending_tpsl_snapshot_complete=True,
+                resolved_at=datetime(2026, 7, 26, 1, tzinfo=UTC),
+            )
+        )
+
+    assert result == "blocked"
+
+
 def test_race_resolved_successor_fingerprint_is_stable_and_distinct():
     repository = _repository()
 
