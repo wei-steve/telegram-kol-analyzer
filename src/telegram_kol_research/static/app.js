@@ -34,6 +34,7 @@ const workbenchLoadState = {
 };
 
 const MESSAGE_TOP_THRESHOLD = 24;
+const MESSAGE_LOAD_MORE_THRESHOLD = 320;
 
 function setMutationBusy(control, busy) {
   if (!control) return;
@@ -849,6 +850,44 @@ function bindDetailPanelControls() {
   }
 }
 
+async function loadMoreMessages(panel) {
+  const loadMoreButton = panel?.querySelector('[data-load-more]');
+  if (!loadMoreButton || loadMoreButton.dataset.loading === 'true') return;
+
+  const { chatId, searchText, senderName } = getMessageFilterState(panel);
+  const beforeMessageId = Number(loadMoreButton.dataset.beforeMessageId || '0');
+  if (!chatId || !beforeMessageId) return;
+
+  loadMoreButton.dataset.loading = 'true';
+  loadMoreButton.disabled = true;
+  loadMoreButton.textContent = '加载中…';
+  try {
+    const nextPanel = await fetchMessagePanel(chatId, {
+      beforeMessageId,
+      searchText,
+      senderName,
+    });
+    if (!panel.isConnected || Number(panel.dataset.chatId || '0') !== chatId) return;
+
+    const nextList = nextPanel?.querySelector('[data-message-list]');
+    const currentList = panel.querySelector('[data-message-list]');
+    const currentFooter = panel.querySelector('[data-message-list-footer]');
+    const nextFooter = nextPanel?.querySelector('[data-message-list-footer]');
+    if (!currentList || !nextList || !currentFooter || !nextFooter) {
+      throw new Error('message history response incomplete');
+    }
+
+    currentList.insertAdjacentHTML('beforeend', nextList.innerHTML);
+    currentFooter.replaceWith(nextFooter);
+    bindMessagePanelControls(panel);
+  } catch {
+    if (!panel.isConnected) return;
+    loadMoreButton.dataset.loading = 'false';
+    loadMoreButton.disabled = false;
+    loadMoreButton.textContent = '加载失败，点击重试';
+  }
+}
+
 function bindMessagePanelControls(panel = getMessagePanel()) {
   if (!panel) {
     return;
@@ -872,6 +911,17 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
         setNewMessagesButtonVisible(panel, true);
       }
     });
+  }
+  if (scrollContainer && scrollContainer.dataset.historyScrollBound !== 'true') {
+    scrollContainer.dataset.historyScrollBound = 'true';
+    scrollContainer.addEventListener('scroll', () => {
+      const remaining = (
+        scrollContainer.scrollHeight
+        - scrollContainer.scrollTop
+        - scrollContainer.clientHeight
+      );
+      if (remaining <= MESSAGE_LOAD_MORE_THRESHOLD) loadMoreMessages(panel);
+    }, { passive: true });
   }
 
   const newMessagesButton = panel.querySelector('[data-new-messages-button]');
@@ -927,7 +977,8 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
   }
 
   const filterForm = panel.querySelector('[data-message-filters]');
-  if (filterForm) {
+  if (filterForm && filterForm.dataset.messageFiltersBound !== 'true') {
+    filterForm.dataset.messageFiltersBound = 'true';
     filterForm.addEventListener('submit', async (event) => {
       event.preventDefault();
       const { chatId, searchText, senderName } = getMessageFilterState(panel);
@@ -942,7 +993,12 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
   }
 
   const clearButton = panel.querySelector('[data-clear-message-filters]');
-  if (clearButton && filterForm) {
+  if (
+    clearButton
+    && filterForm
+    && clearButton.dataset.clearMessageFiltersBound !== 'true'
+  ) {
+    clearButton.dataset.clearMessageFiltersBound = 'true';
     clearButton.addEventListener('click', async () => {
       const searchInput = filterForm.querySelector('[name="search_text"]');
       const senderInput = filterForm.querySelector('[name="sender_name"]');
@@ -964,31 +1020,14 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
   }
 
   const loadMoreButton = panel.querySelector('[data-load-more]');
-  if (loadMoreButton) {
-    loadMoreButton.addEventListener('click', async () => {
-      const { chatId, searchText, senderName } = getMessageFilterState(panel);
-      const nextPanel = await fetchMessagePanel(chatId, {
-        beforeMessageId: Number(loadMoreButton.dataset.beforeMessageId),
-        searchText,
-        senderName,
-      });
-      const nextList = nextPanel ? nextPanel.querySelector('[data-message-list]') : null;
-      const currentList = panel.querySelector('[data-message-list]');
-      if (currentList && nextList) {
-        currentList.insertAdjacentHTML('beforeend', nextList.innerHTML);
-      }
-      const nextLoadMore = nextPanel ? nextPanel.querySelector('[data-load-more]') : null;
-      const currentFooter = panel.querySelector('.message-list-footer');
-      const nextFooter = nextPanel ? nextPanel.querySelector('.message-list-footer') : null;
-      if (currentFooter && nextFooter) {
-        currentFooter.replaceWith(nextFooter);
-      }
-      bindMessagePanelControls(panel);
-    });
+  if (loadMoreButton && loadMoreButton.dataset.loadMoreBound !== 'true') {
+    loadMoreButton.dataset.loadMoreBound = 'true';
+    loadMoreButton.addEventListener('click', () => loadMoreMessages(panel));
   }
 
   const refreshButton = panel.querySelector('[data-refresh-now]');
-  if (refreshButton) {
+  if (refreshButton && refreshButton.dataset.refreshNowBound !== 'true') {
+    refreshButton.dataset.refreshNowBound = 'true';
     refreshButton.addEventListener('click', async () => {
       refreshButton.disabled = true;
       setAiStatus('Refreshing Telegram data...');
@@ -1016,6 +1055,8 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
   }
 
   panel.querySelectorAll('[data-recognize-message]').forEach((button) => {
+    if (button.dataset.recognizeMessageBound === 'true') return;
+    button.dataset.recognizeMessageBound = 'true';
     button.addEventListener('click', async () => {
       const rawMessageId = Number(button.dataset.rawMessageId || '0');
       const status = button

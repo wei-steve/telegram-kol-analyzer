@@ -377,6 +377,24 @@ def test_app_js_appends_loaded_history_below_current_messages(tmp_path):
     assert "currentList.insertAdjacentHTML('afterbegin', nextList.innerHTML);" not in response.text
 
 
+def test_app_js_loads_older_messages_once_near_scroll_boundary(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    js = client.get("/static/app.js").text
+
+    assert "const MESSAGE_LOAD_MORE_THRESHOLD = 320;" in js
+    assert "async function loadMoreMessages(panel)" in js
+    assert "loadMoreButton.dataset.loading === 'true'" in js
+    assert "const remaining =" in js
+    assert "scrollContainer.scrollHeight" in js
+    assert "remaining <= MESSAGE_LOAD_MORE_THRESHOLD" in js
+    assert "loadMoreButton.addEventListener('click', () => loadMoreMessages(panel));" in js
+    assert "加载失败，点击重试" in js
+    assert "currentList.insertAdjacentHTML('beforeend', nextList.innerHTML);" in js
+    assert "filterForm.dataset.messageFiltersBound" in js
+    assert "button.dataset.recognizeMessageBound" in js
+
+
 def test_app_css_keeps_message_header_sticky(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
@@ -385,6 +403,15 @@ def test_app_css_keeps_message_header_sticky(tmp_path):
     assert response.status_code == 200
     assert ".messages-panel-header" in response.text
     assert "position: sticky" in response.text
+
+
+def test_app_css_collapses_empty_message_history_footer(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    css = client.get("/static/app.css").text
+
+    assert ".message-list-footer:empty" in css
+    assert "min-height: 0" in css
 
 
 def test_app_css_keeps_panels_from_forcing_mobile_horizontal_scroll(tmp_path):

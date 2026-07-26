@@ -3518,7 +3518,14 @@ body {
 .message-recognition-status { color: #93c5fd; font-size: 0.72rem; }
 .message-recognition-status.is-error { color: #fca5a5; }
 
-.message-list-footer { padding: 10px 14px; }
+.message-list-footer {
+  min-height: 48px;
+  padding: 10px 14px;
+}
+.message-list-footer:empty {
+  min-height: 0;
+  padding: 0;
+}
 
 /* ── Message card highlight ── */
 .message-card-highlight {
