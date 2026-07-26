@@ -497,6 +497,117 @@ def test_deepcoin_client_lists_swap_symbols_from_market_tickers():
     assert http_client.requests[-1]["request_path"] == "/deepcoin/market/tickers?instType=SWAP"
 
 
+def test_get_ticker_quote_returns_structured_last_price_evidence():
+    http_client = _CapturingHttpClient(
+        {
+            "code": "0",
+            "data": [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "last": "64688.6",
+                    "lastPx": "64687.1",
+                },
+            ],
+        }
+    )
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+    )
+
+    assert client.get_ticker_quote(inst_id="BTC-USDT-SWAP") == {
+        "instrument_id": "BTC-USDT-SWAP",
+        "price": "64688.6",
+        "price_field": "last",
+    }
+    assert client.get_ticker_price(inst_id="BTC-USDT-SWAP") == 64688.6
+
+
+def test_get_ticker_quote_falls_back_to_last_px_when_last_is_missing():
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient(
+            {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "lastPx": "64688.7",
+                        "markPx": "64680",
+                    },
+                ],
+            }
+        ),
+    )
+
+    assert client.get_ticker_quote(inst_id="BTC-USDT-SWAP") == {
+        "instrument_id": "BTC-USDT-SWAP",
+        "price": "64688.7",
+        "price_field": "lastPx",
+    }
+
+
+def test_get_ticker_quote_rejects_duplicate_target_instruments():
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient(
+            {
+                "code": "0",
+                "data": [
+                    {"instId": "BTC-USDT-SWAP", "last": "64688.6"},
+                    {"instId": "btc-usdt-swap", "last": "64688.7"},
+                ],
+            }
+        ),
+    )
+
+    with pytest.raises(DeepcoinClientError, match="duplicate ticker rows"):
+        client.get_ticker_quote(inst_id="BTC-USDT-SWAP")
+
+
+@pytest.mark.parametrize(
+    ("ticker", "error"),
+    [
+        ({"markPx": "64688.6"}, "ticker price missing"),
+        ({"last": "not-a-price"}, "invalid ticker last"),
+        ({"last": "0"}, "invalid ticker last"),
+        ({"last": "-1"}, "invalid ticker last"),
+        ({"last": "NaN"}, "invalid ticker last"),
+        ({"last": "Infinity"}, "invalid ticker last"),
+        ({"lastPx": "NaN"}, "invalid ticker lastPx"),
+        ({"last": "not-a-price", "lastPx": "64688.6"}, "invalid ticker last"),
+    ],
+)
+def test_get_ticker_quote_rejects_missing_or_unsafe_price_evidence(ticker, error):
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient(
+            {
+                "code": "0",
+                "data": [{"instId": "BTC-USDT-SWAP", **ticker}],
+            }
+        ),
+    )
+
+    with pytest.raises(DeepcoinClientError, match=error):
+        client.get_ticker_quote(inst_id="BTC-USDT-SWAP")
+
+
+def test_get_ticker_quote_returns_none_when_target_instrument_is_absent():
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient(
+            {
+                "code": "0",
+                "data": [{"instId": "ETH-USDT-SWAP", "last": "3500"}],
+            }
+        ),
+    )
+
+    assert client.get_ticker_quote(inst_id="BTC-USDT-SWAP") is None
+    assert client.get_ticker_price(inst_id="BTC-USDT-SWAP") is None
+
+
 def test_deepcoin_client_finds_historical_orders_by_exchange_or_client_id():
     http_client = _CapturingHttpClient(
         {

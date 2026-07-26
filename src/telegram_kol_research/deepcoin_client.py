@@ -11,11 +11,12 @@ import time
 import threading
 from collections import deque
 from collections.abc import Callable
-from urllib.parse import urlencode
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlencode
 
 import httpx
 
@@ -123,6 +124,9 @@ class DeepcoinTradingClientProtocol(Protocol):
 
     def get_ticker_price(self, *, inst_id: str) -> float | None:
         """Return the latest ticker price for one instrument."""
+
+    def get_ticker_quote(self, *, inst_id: str) -> dict[str, str] | None:
+        """Return structured latest-price evidence for one instrument."""
 
     def list_swap_symbols(self) -> list[dict[str, str]]:
         """Return tradable SWAP base symbols and instrument ids."""
@@ -408,22 +412,55 @@ class DeepcoinRestClient:
             client_order_id=client_order_id,
         )
 
-    def get_ticker_price(self, *, inst_id: str) -> float | None:
+    def get_ticker_quote(self, *, inst_id: str) -> dict[str, str] | None:
         payload = self._request("GET", f"{DEEPCOIN_MARKET_TICKERS_PATH}?instType=SWAP")
-        for item in _iter_deepcoin_payload_items(payload.get("data")):
-            if str(item.get("instId") or "").upper() != inst_id.upper():
-                continue
-            for key in ("last", "lastPx", "markPx", "askPx", "bidPx"):
-                value = item.get(key)
-                if value in (None, ""):
-                    continue
-                try:
-                    price = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if price > 0:
-                    return price
-        return None
+        target_instrument_id = inst_id.strip().upper()
+        matches = [
+            item
+            for item in _iter_deepcoin_payload_items(payload.get("data"))
+            if str(item.get("instId") or "").strip().upper() == target_instrument_id
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise DeepcoinClientError(
+                f"duplicate ticker rows for instrument: {target_instrument_id}"
+            )
+
+        ticker = matches[0]
+        price_field = next(
+            (
+                field
+                for field in ("last", "lastPx")
+                if ticker.get(field) not in (None, "")
+            ),
+            None,
+        )
+        if price_field is None:
+            raise DeepcoinClientError(
+                f"ticker price missing for instrument: {target_instrument_id}"
+            )
+
+        price = str(ticker[price_field]).strip()
+        try:
+            decimal_price = Decimal(price)
+        except (InvalidOperation, ValueError):
+            decimal_price = Decimal("NaN")
+        if not decimal_price.is_finite() or decimal_price <= 0:
+            raise DeepcoinClientError(
+                f"invalid ticker {price_field} for instrument: {target_instrument_id}"
+            )
+        return {
+            "instrument_id": target_instrument_id,
+            "price": price,
+            "price_field": price_field,
+        }
+
+    def get_ticker_price(self, *, inst_id: str) -> float | None:
+        quote = self.get_ticker_quote(inst_id=inst_id)
+        if quote is None:
+            return None
+        return float(quote["price"])
 
     def list_swap_symbols(self) -> list[dict[str, str]]:
         payload = self._request("GET", f"{DEEPCOIN_MARKET_TICKERS_PATH}?instType=SWAP")
