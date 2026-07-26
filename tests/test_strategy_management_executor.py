@@ -1811,6 +1811,35 @@ def test_partial_take_profit_allows_already_cancelled_unfilled_entry_leg(tmp_pat
     _require_exact_entry_legs(session_factory, load_management_batch(session_factory, batch.id))
 
 
+def test_partial_then_break_even_protection_allows_snapshotted_management_cancelled_entry(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        _require_exact_entry_legs,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("1", "2"),
+        intent="partial_then_break_even",
+        effective_action="partial_then_break_even",
+    )
+    deferred_ids, _ = _configure_deferred_full_exit(session_factory, batch)
+    with session_factory() as session:
+        deferred = session.get(ExecutionOrderLeg, deferred_ids[0])
+        deferred.status = "cancelled"
+        deferred.terminal_reason = (
+            "management_full_close_cancelled_unfilled_entry_leg"
+        )
+        session.commit()
+
+    _require_exact_entry_legs(
+        session_factory,
+        load_management_batch(session_factory, batch.id),
+    )
+
+
 def test_full_close_does_not_submit_when_deferred_entry_leg_is_not_live(tmp_path):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
 

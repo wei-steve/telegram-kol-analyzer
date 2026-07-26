@@ -3190,6 +3190,7 @@ def _require_exact_entry_legs(
         }
         current_identity: set[tuple[int, str]] = set()
         current_deferred_ids: set[int] = set()
+        accepted_cancelled_deferred_ids: set[int] = set()
         if not all_entries:
             raise ManagementBatchExecutionError("batch_entry_set_not_exact")
         for entry in all_entries:
@@ -3207,6 +3208,12 @@ def _require_exact_entry_legs(
                     raise ManagementBatchExecutionError("batch_entry_set_not_exact")
                 current_identity.add(identity)
                 continue
+            if (
+                int(entry.id) in deferred_snapshot_ids
+                and _is_management_cancelled_deferred_entry_leg(entry)
+            ):
+                accepted_cancelled_deferred_ids.add(int(entry.id))
+                continue
             if status in TERMINAL_ENTRY_LEG_STATES:
                 continue
             if _is_deferred_pending_entry_leg(entry):
@@ -3215,7 +3222,10 @@ def _require_exact_entry_legs(
             raise ManagementBatchExecutionError("batch_entry_set_not_exact")
         if (
             current_identity != batch_identity
-            or current_deferred_ids != deferred_snapshot_ids
+            or (
+                current_deferred_ids | accepted_cancelled_deferred_ids
+            )
+            != deferred_snapshot_ids
         ):
             raise ManagementBatchExecutionError("batch_entry_set_not_exact")
         for leg in batch.legs:
@@ -3233,6 +3243,17 @@ def _require_exact_entry_legs(
                 raise ManagementBatchExecutionError(
                     f"batch_entry_leg_not_exact_or_active:{leg.id}"
                 )
+
+
+def _is_management_cancelled_deferred_entry_leg(
+    entry: ExecutionOrderLeg,
+) -> bool:
+    return bool(
+        str(entry.status or "").lower() == "cancelled"
+        and entry.terminal_reason
+        == "management_full_close_cancelled_unfilled_entry_leg"
+        and not entry.pos_id
+    )
 
 
 def _deferred_entry_identity_diagnostics(
