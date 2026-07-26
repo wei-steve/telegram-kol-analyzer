@@ -1448,11 +1448,22 @@ def test_canonical_source_with_shadow_projects_distinct_remediation_candidate(
         session_factory,
         action=action,
     )
+    retried_projected_id = _project_canonical_remediation_candidate(
+        session_factory,
+        action=action,
+    )
 
     with session_factory() as session:
         source = session.get(SignalCandidate, source_id)
         projected = session.get(SignalCandidate, projected_id)
         assert projected_id != source_id
+        assert retried_projected_id == projected_id
+        assert (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.review_status == "approved_remediation")
+            .count()
+            == 1
+        )
         assert source.review_status == "pending"
         assert projected.review_status == "approved_remediation"
         assert projected.recognition_generation == (

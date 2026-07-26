@@ -1022,6 +1022,24 @@ def _project_canonical_remediation_candidate(
         )
         expected_fraction = action.expected_effect.get("fraction")
         expected_stop = action.expected_effect.get("stop_loss")
+        remediation_generation = f"remediation:{action.fingerprint[:32]}"
+        existing_projected = (
+            session.query(SignalCandidate)
+            .filter(
+                SignalCandidate.raw_message_id == int(action.raw_message_id),
+                SignalCandidate.event_type == expected_event_type,
+                SignalCandidate.target_lifecycle_id == action.lifecycle_id,
+                SignalCandidate.management_action == action.action_kind,
+                SignalCandidate.management_fraction == expected_fraction,
+                SignalCandidate.stop_loss_text == expected_stop,
+                SignalCandidate.recognition_generation == remediation_generation,
+                SignalCandidate.review_status == "approved_remediation",
+            )
+            .order_by(SignalCandidate.id)
+            .first()
+        )
+        if existing_projected is not None:
+            return int(existing_projected.id)
         projected = SignalCandidate(
             raw_message_id=int(action.raw_message_id),
             symbol=source.symbol,
@@ -1030,7 +1048,7 @@ def _project_canonical_remediation_candidate(
             target_lifecycle_id=action.lifecycle_id,
             management_action=action.action_kind,
             management_fraction=expected_fraction,
-            recognition_generation=f"remediation:{action.fingerprint[:32]}",
+            recognition_generation=remediation_generation,
             entry_text=source.entry_text,
             stop_loss_text=expected_stop,
             take_profit_text=source.take_profit_text,
