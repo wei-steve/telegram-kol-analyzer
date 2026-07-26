@@ -130,8 +130,10 @@ def test_worker_runs_ready_take_profit_convergence_only_when_execution_enabled()
 def test_worker_reconciles_backup_stops_before_running_take_profit_lane():
     calls = []
 
-    def binding_reconciler(*_args, **_kwargs):
-        calls.append("backup_reconcile")
+    provider = object()
+
+    def binding_reconciler(*_args, **kwargs):
+        calls.append(("backup_reconcile", kwargs))
 
     def convergence_runner(*_args, **_kwargs):
         calls.append("take_profit")
@@ -144,12 +146,14 @@ def test_worker_reconciles_backup_stops_before_running_take_profit_lane():
         batch_lister=lambda *_args, **_kwargs: [],
         snapshot_loader=lambda *_args, **_kwargs: object(),
         binding_reconciler=binding_reconciler,
-        contract_spec_provider=object(),
+        contract_spec_provider=provider,
         processed_at=NOW,
         take_profit_convergence_runner=convergence_runner,
     )
 
-    assert calls == ["backup_reconcile", "take_profit"]
+    assert calls[0][0] == "backup_reconcile"
+    assert calls[0][1]["contract_spec_provider"] is provider
+    assert calls[1] == "take_profit"
 
 
 def test_worker_claims_ready_batch_once_across_racing_ticks(tmp_path):

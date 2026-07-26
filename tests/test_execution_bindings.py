@@ -435,11 +435,11 @@ def test_reconcile_submits_one_exact_backup_stop_when_explicitly_enabled(tmp_pat
 
     reconcile_deepcoin_execution_bindings(
         session_factory, client=client, recovered_at=datetime(2026, 7, 20, 8, 5),
-        contract_spec_provider=provider, backup_stop_submission_enabled=True,
+        contract_spec_provider=provider,
     )
     reconcile_deepcoin_execution_bindings(
         session_factory, client=client, recovered_at=datetime(2026, 7, 20, 8, 6),
-        contract_spec_provider=provider, backup_stop_submission_enabled=True,
+        contract_spec_provider=provider,
     )
 
     assert len(client.sltp_payloads) == 1
@@ -452,7 +452,7 @@ def test_reconcile_submits_one_exact_backup_stop_when_explicitly_enabled(tmp_pat
         assert session.query(ExecutionEvent).filter(ExecutionEvent.action == "create_backup_stop").count() == 1
 
 
-def test_reconcile_keeps_second_stop_submission_disabled_by_default(tmp_path):
+def test_reconcile_always_submits_missing_backup_stop_when_provider_is_available(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_exact_backup_candidate(session_factory, order_kind="market")
     client = _BackupStopSubmissionClient([{
@@ -467,9 +467,19 @@ def test_reconcile_keeps_second_stop_submission_disabled_by_default(tmp_path):
         contract_spec_provider=_backup_stop_provider(),
     )
 
-    assert client.sltp_payloads == []
+    assert len(client.sltp_payloads) == 1
     with session_factory() as session:
-        assert session.query(PositionBackupStopOrder).count() == 0
+        row = session.query(PositionBackupStopOrder).one()
+    assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=client,
+        recovered_at=datetime(2026, 7, 20, 8, 6),
+        contract_spec_provider=_backup_stop_provider(),
+    )
+
+    assert len(client.sltp_payloads) == 1
 
 
 def test_backup_submission_creates_stop_for_verified_market_entry(tmp_path):

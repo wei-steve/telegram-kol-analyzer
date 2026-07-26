@@ -1122,7 +1122,7 @@ def test_execution_dashboard_does_not_treat_stale_binding_as_persisted_ownership
     assert "system_attribution_conflict" not in response.text
 
 
-def test_execution_dashboard_uses_pending_tpsl_orders_for_live_protection(tmp_path):
+def test_execution_dashboard_keeps_unscoped_pending_tpsl_orders_unattributed(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):
             return [
@@ -1147,7 +1147,8 @@ def test_execution_dashboard_uses_pending_tpsl_orders_for_live_protection(tmp_pa
             ]
 
         def list_trigger_orders_pending(self, *, inst_id):
-            assert inst_id == "BTC-USDT-SWAP"
+            if inst_id != "BTC-USDT-SWAP":
+                return []
             return [
                 {
                     "instId": "BTC-USDT-SWAP",
@@ -1166,14 +1167,15 @@ def test_execution_dashboard_uses_pending_tpsl_orders_for_live_protection(tmp_pa
     )
 
     client = TestClient(app)
-    response = client.get("/execution")
+    response = client.get("/positions-panel")
 
     assert response.status_code == 200
-    assert response.text.count("止损: 61500") == 1
-    assert response.text.count("止盈: 57300") == 1
     assert "pos-protected" in response.text
     assert "pos-unprotected" in response.text
-    assert response.text.count("无保护单") == 1
+    assert "未归属交易所保护单" in response.text
+    assert "止盈</span>\n                    <span>57300" in response.text
+    assert "止损</span>\n                    <span>61500" in response.text
+    assert response.text.count("暂无已验证交易所止盈止损") >= 2
 
 
 def test_exchange_protection_display_rows_preserve_all_pending_tpsl_sides():
@@ -1320,7 +1322,7 @@ def test_conflicting_exact_order_owners_fail_closed():
     assert conflicting_order_ids == {"shared-order-1"}
 
 
-def test_execution_dashboard_uses_position_tpsl_fields_for_live_protection(tmp_path):
+def test_execution_dashboard_does_not_treat_position_summary_fields_as_verified_orders(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):
             return [
@@ -1337,7 +1339,8 @@ def test_execution_dashboard_uses_position_tpsl_fields_for_live_protection(tmp_p
             ]
 
         def list_trigger_orders_pending(self, *, inst_id):
-            assert inst_id == "BTC-USDT-SWAP"
+            if inst_id != "BTC-USDT-SWAP":
+                return []
             return []
 
     app = create_web_app(
@@ -1346,15 +1349,16 @@ def test_execution_dashboard_uses_position_tpsl_fields_for_live_protection(tmp_p
     )
 
     client = TestClient(app)
-    response = client.get("/execution")
+    response = client.get("/positions-panel")
 
     assert response.status_code == 200
     assert "pos-with-position-fields" in response.text
-    assert "62440" in response.text
-    assert "59588" in response.text
+    assert "62440" not in response.text
+    assert "59588" not in response.text
+    assert "止盈止损(0)" in response.text
 
 
-def test_execution_dashboard_matches_zero_size_tpsl_orders_by_position_time(tmp_path):
+def test_execution_dashboard_does_not_match_zero_size_tpsl_orders_by_position_time(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):
             return [
@@ -1369,7 +1373,8 @@ def test_execution_dashboard_matches_zero_size_tpsl_orders_by_position_time(tmp_
             ]
 
         def list_trigger_orders_pending(self, *, inst_id):
-            assert inst_id == "ETH-USDT-SWAP"
+            if inst_id != "ETH-USDT-SWAP":
+                return []
             return [
                 {
                     "instId": "ETH-USDT-SWAP",
@@ -1397,15 +1402,16 @@ def test_execution_dashboard_matches_zero_size_tpsl_orders_by_position_time(tmp_
     )
 
     client = TestClient(app)
-    response = client.get("/execution")
+    response = client.get("/positions-panel")
 
     assert response.status_code == 200
-    assert "止损: 1555" in response.text
-    assert "止盈: 1680" in response.text
-    assert "无保护单" not in response.text
+    assert "未归属交易所保护单" in response.text
+    assert "1555" in response.text
+    assert "1680" in response.text
+    assert "止盈止损(0)" in response.text
 
 
-def test_execution_dashboard_matches_tpsl_one_second_after_position(tmp_path):
+def test_execution_dashboard_does_not_match_tpsl_by_nearby_creation_time(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):
             return [
@@ -1420,9 +1426,11 @@ def test_execution_dashboard_matches_tpsl_one_second_after_position(tmp_path):
             ]
 
         def list_trigger_orders_pending(self, *, inst_id):
+            if inst_id != "ETH-USDT-SWAP":
+                return []
             return [
                 {
-                    "instId": inst_id,
+                    "instId": "ETH-USDT-SWAP",
                     "posSide": "long",
                     "sz": "0",
                     "cTime": "1782788877000",
@@ -1437,12 +1445,13 @@ def test_execution_dashboard_matches_tpsl_one_second_after_position(tmp_path):
         deepcoin_client_factory=FakeDeepcoinClient,
     )
 
-    response = TestClient(app).get("/execution")
+    response = TestClient(app).get("/positions-panel")
 
     assert response.status_code == 200
     assert "pos-smart-market" in response.text
-    assert "止损: 1820" in response.text
-    assert "无止损" not in response.text
+    assert "未归属交易所保护单" in response.text
+    assert "order sl-smart-market" in response.text
+    assert "止盈止损(0)" in response.text
 
 
 def test_execution_dashboard_uses_exact_ledger_evidence_for_late_managed_stop(tmp_path):
@@ -1540,7 +1549,6 @@ def test_execution_dashboard_marks_absent_legacy_backup_stop_unverified(tmp_path
             }]
 
         def list_trigger_orders_pending(self, *, inst_id):
-            assert inst_id == "BTC-USDT-SWAP"
             return []
 
     app = create_web_app(
@@ -1596,8 +1604,8 @@ def test_execution_dashboard_marks_absent_legacy_backup_stop_unverified(tmp_path
 
     assert response.status_code == 200
     assert "pos-legacy-backup" in response.text
-    assert "交易所未验证（旧通用条件单）" in response.text
-    assert "63073.6 · active" not in response.text
+    assert "legacy-generic-backup" not in response.text
+    assert "暂无已验证交易所止盈止损" in response.text
 
 
 def test_execution_dashboard_does_not_use_ledger_for_closed_entry_leg(tmp_path):
@@ -1695,7 +1703,7 @@ def test_execution_dashboard_renders_ambiguous_stop_truthfully(tmp_path):
     assert "无止损" not in response.text
 
 
-def test_execution_dashboard_shows_inline_stop_while_pending_tpsl_is_ambiguous(tmp_path):
+def test_execution_dashboard_keeps_ambiguous_pending_tpsl_orders_unattributed(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):
             return [
@@ -1738,11 +1746,13 @@ def test_execution_dashboard_shows_inline_stop_while_pending_tpsl_is_ambiguous(t
         deepcoin_client_factory=FakeDeepcoinClient,
     )
 
-    response = TestClient(app).get("/execution")
+    response = TestClient(app).get("/positions-panel")
 
     assert response.status_code == 200
-    assert "止损: 66500" in response.text
-    assert "止损存在，归属待确认" not in response.text
+    assert "未归属交易所保护单" in response.text
+    assert "order position-tpsl" in response.text
+    assert "order other-tpsl" in response.text
+    assert "止盈止损(0)" in response.text
 
 
 def test_execution_dashboard_renders_tpsl_evidence_error_truthfully(tmp_path):
