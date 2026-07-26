@@ -28,6 +28,8 @@ class _Client:
         cancel_response=None,
         mutate_other_after_cancel=False,
         after_cancel=None,
+        fail_next_position_read=False,
+        fail_position_read_after_cancel=False,
     ):
         self.positions = [
             {
@@ -84,9 +86,16 @@ class _Client:
         self.cancel_response = cancel_response
         self.mutate_other_after_cancel = mutate_other_after_cancel
         self.after_cancel = after_cancel
+        self.fail_next_position_read = fail_next_position_read
+        self.fail_position_read_after_cancel = (
+            fail_position_read_after_cancel
+        )
         self.cancel_payloads = []
 
     def list_positions(self, *, inst_id=None):
+        if self.fail_next_position_read:
+            self.fail_next_position_read = False
+            raise RuntimeError("temporary readback failure")
         return list(self.positions)
 
     def list_trigger_orders_pending(self, *, inst_id):
@@ -105,6 +114,8 @@ class _Client:
                 )["sz"] = "30"
             if self.after_cancel is not None:
                 self.after_cancel()
+            if self.fail_position_read_after_cancel:
+                self.fail_next_position_read = True
             return {"code": "0", "data": order_id}
         return self.cancel_response
 
@@ -592,3 +603,50 @@ def test_apply_does_not_mark_cancelled_on_unconfirmed_response(tmp_path):
             .one()
         )
         assert backup.status == "active"
+
+
+def test_reconcile_submitted_cancel_from_exact_later_readback(tmp_path):
+    from telegram_kol_research.legacy_conditional_cancel import (
+        apply_reviewed_legacy_conditional_cancel_plan,
+        build_reviewed_legacy_conditional_cancel_plan,
+        reconcile_submitted_reviewed_legacy_conditional_cancel,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed(session_factory)
+    client = _Client(fail_position_read_after_cancel=True)
+    plan = build_reviewed_legacy_conditional_cancel_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=_targets(),
+        now=NOW,
+    )
+    action = next(item for item in plan.actions if item.order_id == "legacy-owned")
+    result = apply_reviewed_legacy_conditional_cancel_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        targets=_targets(),
+        pos_id=action.pos_id,
+        action_id=action.action_id,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="cancel-later-readback",
+        now=NOW,
+    )
+    assert result.status == "cancel_confirmed_pending_readback"
+
+    reconciled = reconcile_submitted_reviewed_legacy_conditional_cancel(
+        session_factory,
+        deepcoin_client=client,
+        target=_targets()[0],
+        reviewed_plan_fingerprint=plan.fingerprint,
+        now=NOW,
+    )
+
+    assert reconciled.status == "cancelled"
+    assert client.cancel_payloads == [
+        {"instId": "BTC-USDT-SWAP", "ordId": "legacy-owned"}
+    ]
+    with session_factory() as session:
+        assert session.query(PositionMutationIntent).one().status == "confirmed"
+        assert session.query(PositionBackupStopOrder).one().status == "cancelled"

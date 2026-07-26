@@ -758,6 +758,186 @@ def apply_reviewed_legacy_conditional_cancel_plan(
     )
 
 
+def reconcile_submitted_reviewed_legacy_conditional_cancel(
+    session_factory,
+    *,
+    deepcoin_client,
+    target: ReviewedLegacyConditionalTarget,
+    reviewed_plan_fingerprint: str,
+    now: datetime | None = None,
+) -> ReviewedLegacyConditionalCancelResult:
+    """Confirm a submitted cancel from a later exact readback without retrying."""
+
+    observed_at = now or datetime.now(UTC)
+    clean_reviewed_fingerprint = str(reviewed_plan_fingerprint or "").strip()
+    if len(clean_reviewed_fingerprint) != 64:
+        raise ValueError("reviewed_plan_fingerprint is required")
+    with session_factory() as session:
+        intents = (
+            session.query(PositionMutationIntent)
+            .filter(
+                PositionMutationIntent.venue == "deepcoin",
+                PositionMutationIntent.operation == "cancel_trigger_order",
+                PositionMutationIntent.order_id == target.order_id,
+                PositionMutationIntent.pos_id == target.pos_id,
+                PositionMutationIntent.status == "submitted",
+            )
+            .all()
+        )
+    if len(intents) != 1:
+        raise ValueError("exactly one submitted cancel intent is required")
+    intent = intents[0]
+    response = _load_json(intent.response_json)
+    if not _confirmed_cancel_response(response, order_id=target.order_id):
+        raise ValueError("submitted cancel response is not explicitly confirmed")
+    try:
+        positions = [
+            row
+            for row in deepcoin_client.list_positions(
+                inst_id=target.instrument_id
+            )
+            if isinstance(row, dict)
+        ]
+        pending = [
+            row
+            for row in deepcoin_client.list_trigger_orders_pending(
+                inst_id=target.instrument_id
+            )
+            if isinstance(row, dict)
+        ]
+    except Exception as exc:
+        raise ValueError("cancel reconciliation snapshot unavailable") from exc
+    if any(_order_id(row) == target.order_id for row in pending):
+        raise ValueError("cancelled legacy order is still pending")
+    synthetic_pending = [
+        *pending,
+        {
+            "ordId": target.order_id,
+            "instId": target.instrument_id,
+            "triggerOrderType": "Conditional",
+            "posSide": target.side,
+            "side": "sell" if target.side == "long" else "buy",
+            "sz": target.size,
+            "triggerPx": target.trigger_price,
+        },
+    ]
+    candidate_plan = build_reviewed_legacy_conditional_cancel_plan(
+        session_factory,
+        deepcoin_client=_SnapshotClient(positions, synthetic_pending),
+        targets=(target,),
+        now=observed_at,
+    )
+    if candidate_plan.conflicts or len(candidate_plan.actions) != 1:
+        raise ValueError("cancel reconciliation authority changed")
+    action = candidate_plan.actions[0]
+    authority_fingerprint = _fingerprint(
+        {
+            "action_id": action.action_id,
+            "position_fingerprint": action.position_fingerprint,
+            "native_stop_fingerprint": action.native_stop_fingerprint,
+        }
+    )
+    request = {"instId": action.instrument_id, "ordId": action.order_id}
+    if (
+        str(intent.authority_fingerprint or "") != authority_fingerprint
+        or str(intent.request_fingerprint or "") != _fingerprint(request)
+        or int(intent.execution_binding_id) != action.execution_binding_id
+        or int(intent.execution_order_leg_id)
+        != action.execution_order_leg_id
+        or str(intent.strategy_instance_id or "")
+        != action.strategy_instance_id
+        or not exact_position_write_gate(
+            session_factory, pos_id=action.pos_id
+        )
+    ):
+        raise ValueError("cancel reconciliation fingerprint changed")
+
+    with session_factory() as session:
+        persisted_intent = session.get(PositionMutationIntent, int(intent.id))
+        backup = (
+            session.get(PositionBackupStopOrder, action.backup_row_id)
+            if action.backup_row_id is not None
+            else None
+        )
+        if (
+            persisted_intent is None
+            or persisted_intent.status != "submitted"
+            or (
+                action.backup_row_id is not None
+                and (
+                    backup is None
+                    or backup.status != "active"
+                    or backup.order_id != action.order_id
+                )
+            )
+        ):
+            raise ValueError("cancel reconciliation database state changed")
+        if backup is not None:
+            backup.status = "cancelled"
+            backup.completed_at = observed_at
+            backup.updated_at = observed_at
+            backup.error_json = json.dumps(
+                {
+                    "reason": "reviewed_legacy_conditional_cancelled",
+                    "cancel_response": response,
+                    "reconciled_from_later_readback": True,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        persisted_intent.status = "confirmed"
+        persisted_intent.confirmed_at = observed_at
+        persisted_intent.updated_at = observed_at
+        record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                action="cancel_reviewed_legacy_conditional",
+                status="confirmed",
+                execution_binding_id=action.execution_binding_id,
+                venue="deepcoin",
+                symbol=action.instrument_id.split("-")[0],
+                side=action.side,
+                order_id=action.order_id,
+                pos_id=action.pos_id,
+                related_order_id=action.native_stop_order_id,
+                reason="reviewed_legacy_conditional_cancelled",
+                before={
+                    "trigger_price": action.trigger_price,
+                    "size": action.size,
+                    "orphan": action.orphan,
+                    "operator_supplied_reviewed_plan_fingerprint": (
+                        clean_reviewed_fingerprint
+                    ),
+                    "recovery_candidate_fingerprint": (
+                        candidate_plan.fingerprint
+                    ),
+                    "position_fingerprint": action.position_fingerprint,
+                    "native_pending_fingerprint": (
+                        action.native_pending_fingerprint
+                    ),
+                    "native_stop_fingerprint": (
+                        action.native_stop_fingerprint
+                    ),
+                    "native_stop_order_id": action.native_stop_order_id,
+                    "native_stop_price": action.native_stop_price,
+                },
+                after={
+                    "legacy_pending": False,
+                    "native_stop_pending": True,
+                    "reconciled_from_later_readback": True,
+                },
+                request=request,
+                response=response,
+                created_at=observed_at,
+            ),
+            session=session,
+        )
+        session.commit()
+    return ReviewedLegacyConditionalCancelResult(
+        "cancelled", action.order_id, action.pos_id
+    )
+
+
 def _plan(
     created_at: datetime,
     actions: Iterable[ReviewedLegacyConditionalCancelAction],
@@ -1163,6 +1343,16 @@ class _SnapshotClient:
 
 def _response_evidence(response: Any) -> dict[str, Any]:
     return response if isinstance(response, dict) else {"response": repr(response)[:512]}
+
+
+def _load_json(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        loaded = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def _position_id(row: dict[str, Any]) -> str:
