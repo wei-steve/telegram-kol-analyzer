@@ -497,25 +497,13 @@ def _execute_break_even_by_market_batch(
         raise ManagementBatchExecutionError(
             f"batch_not_executable:{batch.status}"
         )
-    if any(
-        leg.status in {"submitted", "submit_unknown", "partial", "confirmed"}
-        for leg in batch.legs
-    ):
-        if not transition_batch(
-            session_factory,
-            batch.id,
-            expected_statuses={"executing"},
-            new_status="reconciling",
-            transitioned_at=executed_at,
-            reason_code="break_even_market_restart_requires_reconciliation",
-        ):
-            raise ManagementBatchExecutionError(
-                "management_batch_restart_handoff_conflict"
-            )
-        return _result(
-            load_management_batch(session_factory, batch.id),
-            reason="break_even_market_restart_requires_reconciliation",
-        )
+    restart_result = _recover_break_even_post_write_restart(
+        session_factory,
+        batch=batch,
+        recovered_at=executed_at,
+    )
+    if restart_result is not None:
+        return restart_result
 
     decision = reserve_break_even_market_actions(
         session_factory,
@@ -928,6 +916,98 @@ def _execute_break_even_by_market_batch(
             session_factory,
             batch=result_batch,
             confirmed_at=executed_at,
+        )
+    return _result(result_batch, reason=reason)
+
+
+def _recover_break_even_post_write_restart(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+    recovered_at: datetime,
+) -> dict[str, Any] | None:
+    """Stop all writes once any durable leg proves a prior write boundary."""
+
+    if all(leg.status == "planned" for leg in batch.legs):
+        return None
+    decision = load_break_even_market_decision(
+        session_factory, batch_id=batch.id
+    )
+    if decision is None:
+        raise BreakEvenMarketDecisionConflict(
+            "break_even_market_decision_missing"
+        )
+    actions = {
+        int(row["management_leg_id"]): str(row["action"])
+        for row in decision.decisions
+    }
+    if set(actions) != {int(leg.id) for leg in batch.legs}:
+        raise BreakEvenMarketDecisionConflict(
+            "break_even_market_decision_leg_set_not_exact"
+        )
+    for leg in batch.legs:
+        if leg.status != "reserved":
+            continue
+        action = actions[int(leg.id)]
+        transition_leg(
+            session_factory,
+            leg.id,
+            expected_statuses={"reserved"},
+            new_status=(
+                "submit_unknown"
+                if action == "full_exit"
+                else "recovery_required"
+            ),
+            transitioned_at=recovered_at,
+            last_error={
+                "reason": (
+                    "reserved_submission_outcome_unknown"
+                    if action == "full_exit"
+                    else "reserved_protection_outcome_unknown"
+                )
+            },
+        )
+    recovered = load_management_batch(session_factory, batch.id)
+    has_close_evidence = any(
+        actions[int(leg.id)] == "full_exit"
+        and leg.status
+        in {"submitted", "submit_unknown", "partial", "confirmed"}
+        for leg in recovered.legs
+    )
+    statuses = {leg.status for leg in recovered.legs}
+    if has_close_evidence:
+        final_status = "reconciling"
+        reason = "break_even_market_restart_requires_reconciliation"
+    elif all(
+        actions[int(leg.id)] == "set_break_even"
+        and leg.status == "succeeded"
+        for leg in recovered.legs
+    ):
+        final_status = "succeeded"
+        reason = "all_position_protection_replaced"
+    elif "restored" in statuses or "failed" in statuses:
+        final_status = "partial_failed"
+        reason = "break_even_market_partial_failed"
+    else:
+        final_status = "recovery_required"
+        reason = "break_even_market_post_write_recovery_required"
+    if not transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"executing"},
+        new_status=final_status,
+        transitioned_at=recovered_at,
+        reason_code=reason,
+    ):
+        raise ManagementBatchExecutionError(
+            "management_batch_restart_handoff_conflict"
+        )
+    result_batch = load_management_batch(session_factory, batch.id)
+    if final_status == "succeeded":
+        _confirm_protection_lifecycle(
+            session_factory,
+            batch=result_batch,
+            confirmed_at=recovered_at,
         )
     return _result(result_batch, reason=reason)
 

@@ -551,9 +551,7 @@ def _has_submission_evidence(batch: ManagementBatchRecord) -> bool:
 
 def _is_composite_protection_phase(batch: ManagementBatchRecord) -> bool:
     if batch.effective_action == "break_even_by_market":
-        return batch.status == "executing" and not _has_submission_evidence(
-            batch
-        )
+        return batch.status == "executing"
     if batch.effective_action in _PROTECTION_ACTIONS:
         return True
     if batch.effective_action != "partial_then_break_even":

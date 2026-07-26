@@ -660,7 +660,7 @@ def test_composite_protection_phase_is_not_sent_to_close_reconciliation():
     assert events == ["exchange-read", "protection-executor"]
 
 
-def test_break_even_post_write_restart_is_sent_to_close_reconciliation():
+def test_break_even_post_write_restart_is_sent_to_state_aware_executor():
     batch = _batch(
         batch_id=11,
         strategy="deepcoin:100:10:BTC:short",
@@ -685,7 +685,7 @@ def test_break_even_post_write_restart_is_sent_to_close_reconciliation():
         processed_at=NOW,
     )
 
-    assert events == ["exchange-read", "close-reconcile"]
+    assert events == ["exchange-read", "market-executor"]
 
 
 def test_composite_protection_leg_state_survives_missing_reason_after_restart():
