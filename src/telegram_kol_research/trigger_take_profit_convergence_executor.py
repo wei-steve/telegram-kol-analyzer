@@ -551,19 +551,20 @@ def _has_verified_native_primary_stop(
     for row in stop_rows:
         if not row.order_id or row.trigger_price is None:
             continue
-        match = match_native_tpsl_order(
-            position,
-            [item for item in pending if isinstance(item, dict)],
-            NativeTpslExpectation(
-                purpose="stop_loss",
-                trigger_price=str(row.trigger_price),
-                size=position_size,
-                ord_id=str(row.order_id),
-            ),
-            open_positions=[item for item in open_positions if isinstance(item, dict)],
-        )
-        if match.status == "verified" and match.order is not None:
-            return True
+        for size in (position_size, Decimal("0")):
+            match = match_native_tpsl_order(
+                position,
+                [item for item in pending if isinstance(item, dict)],
+                NativeTpslExpectation(
+                    purpose="stop_loss",
+                    trigger_price=str(row.trigger_price),
+                    size=size,
+                    ord_id=str(row.order_id),
+                ),
+                open_positions=[item for item in open_positions if isinstance(item, dict)],
+            )
+            if match.status == "verified" and match.order is not None:
+                return True
     return False
 
 

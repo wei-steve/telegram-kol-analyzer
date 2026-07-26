@@ -241,6 +241,24 @@ def test_plan_replaces_only_exact_leg_take_profits(tmp_path):
     assert [payload["sz"] for payload in plan.payloads] == ["5", "3", "2"]
 
 
+def test_plan_accepts_exact_full_position_primary_stop_with_zero_size(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
+    client = _Client()
+    client.pending[0]["sz"] = "0"
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory, convergence_id=convergence_id, deepcoin_client=client, planned_at=NOW
+    )
+
+    assert plan.status == "ready"
+
+
 def test_plan_requires_native_primary_and_backup_stop_readback(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.trigger_take_profit_convergence_executor import (
