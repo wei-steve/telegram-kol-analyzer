@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -141,6 +141,89 @@ def _persist_failed_partial_management(session_factory):
         session.add(item)
         session.commit()
         return raw.id, lifecycle.id
+
+
+def _persist_failed_management_step(
+    session_factory,
+    *,
+    lifecycle_id,
+    posted_at,
+    message_id,
+    text,
+    event_type,
+    management_action,
+    sequence,
+):
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        raw = RawMessage(
+            chat_id=lifecycle.chat_id,
+            message_id=message_id,
+            posted_at=posted_at,
+            text=text,
+        )
+        session.add(raw)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol=lifecycle.symbol,
+            side=lifecycle.side,
+            event_type=event_type,
+            target_lifecycle_id=lifecycle.id,
+            management_action=management_action,
+            recognition_generation=f"repair-generation-{message_id}",
+            parse_source="mimo_authoritative",
+            confidence=0.95,
+        )
+        session.add(candidate)
+        session.flush()
+        item = MessageInstructionItem(
+            raw_message_id=raw.id,
+            signal_candidate_id=candidate.id,
+            sequence=sequence,
+            instruction_kind="management",
+            strategy_instance_id=binding.strategy_instance_id,
+            idempotency_key=f"{raw.id}:{candidate.id}:{sequence}".ljust(64, "x"),
+            status="failed",
+            error_json='{"reason":"target_strategy_binding_not_visible_yet"}',
+        )
+        session.add(item)
+        session.commit()
+        return raw.id
+
+
+def test_plan_groups_steps_by_strategy_and_orders_by_source_time(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    second_raw_id = _persist_failed_management_step(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        posted_at=NOW + timedelta(minutes=1),
+        message_id=301,
+        text="BTC多单全部平仓",
+        event_type="close_signal",
+        management_action="full_exit",
+        sequence=0,
+    )
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert len(plan.chains) == 1
+    chain = plan.chains[0]
+    assert [step.raw_message_id for step in chain.steps] == [
+        first_raw_id,
+        second_raw_id,
+    ]
+    assert [step.state for step in chain.steps] == [
+        "ready_for_approval",
+        "waiting_for_predecessor",
+    ]
+    assert [action.raw_message_id for action in plan.actions] == [first_raw_id]
 
 
 def test_build_remediation_plan_is_read_only_and_fingerprinted(tmp_path):

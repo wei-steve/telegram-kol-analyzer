@@ -50,10 +50,34 @@ class PositionRemediationAction:
 
 
 @dataclass(frozen=True, slots=True)
+class PositionRemediationStep:
+    raw_message_id: int
+    instruction_item_id: int | None
+    candidate_id: int
+    sequence: int
+    posted_at: datetime
+    action_kind: str
+    state: str
+    reason: str | None
+    action: PositionRemediationAction | None
+
+
+@dataclass(frozen=True, slots=True)
+class PositionRemediationChain:
+    strategy_instance_id: str
+    lifecycle_id: int
+    execution_binding_id: int
+    steps: tuple[PositionRemediationStep, ...]
+    conflicts: tuple[dict[str, Any], ...]
+    fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
 class PositionRemediationPlan:
     snapshot_fingerprint: str
     actions: tuple[PositionRemediationAction, ...]
     conflicts: tuple[dict[str, Any], ...]
+    chains: tuple[PositionRemediationChain, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +129,7 @@ def build_position_management_remediation_plan(
             ),
             actions=(),
             conflicts=conflicts,
+            chains=(),
         )
     live_positions = {
         str(pos_id): dict(row)
@@ -273,6 +298,8 @@ def build_position_management_remediation_plan(
                     "instruction_status": item.status if item is not None else "missing",
                     "source_chat_id": int(raw_message.chat_id),
                     "source_message_id": int(raw_message.message_id),
+                    "source_posted_at": raw_message.posted_at,
+                    "instruction_sequence": int(item.sequence) if item is not None else 0,
                     "scope_source": target.scope_source,
                     "reason_code": directive.reason_code,
                     "exchange_snapshot_fingerprint": exchange_snapshot_fingerprint,
@@ -312,8 +339,12 @@ def build_position_management_remediation_plan(
                     )
                 )
 
+    chains = _build_remediation_chains(actions)
     ordered_actions = tuple(
-        sorted(actions, key=lambda row: (row.raw_message_id or 0, row.lifecycle_id))
+        step.action
+        for chain in chains
+        for step in chain.steps
+        if step.state == "ready_for_approval" and step.action is not None
     )
     ordered_conflicts = tuple(
         sorted(
@@ -331,10 +362,68 @@ def build_position_management_remediation_plan(
                 "exchange": snapshot_payload,
                 "actions": [asdict(action) for action in ordered_actions],
                 "conflicts": list(ordered_conflicts),
+                "chains": [asdict(chain) for chain in chains],
             }
         ),
         actions=ordered_actions,
         conflicts=ordered_conflicts,
+        chains=chains,
+    )
+
+
+def _build_remediation_chains(
+    actions: list[PositionRemediationAction],
+) -> tuple[PositionRemediationChain, ...]:
+    grouped: dict[str, list[PositionRemediationAction]] = {}
+    for action in actions:
+        grouped.setdefault(action.strategy_instance_id, []).append(action)
+    chains: list[PositionRemediationChain] = []
+    for strategy_instance_id, grouped_actions in grouped.items():
+        ordered = sorted(
+            grouped_actions,
+            key=lambda action: (
+                str(action.evidence.get("source_posted_at") or ""),
+                int(action.raw_message_id or 0),
+                int(action.evidence.get("instruction_sequence") or 0),
+                int(action.evidence.get("candidate_id") or 0),
+            ),
+        )
+        steps = tuple(
+            PositionRemediationStep(
+                raw_message_id=int(action.raw_message_id),
+                instruction_item_id=action.evidence.get("instruction_item_id"),
+                candidate_id=int(action.evidence["candidate_id"]),
+                sequence=int(action.evidence.get("instruction_sequence") or 0),
+                posted_at=action.evidence["source_posted_at"],
+                action_kind=action.action_kind,
+                state=(
+                    "ready_for_approval"
+                    if index == 0
+                    else "waiting_for_predecessor"
+                ),
+                reason=None if index == 0 else "predecessor_not_resolved",
+                action=action,
+            )
+            for index, action in enumerate(ordered)
+        )
+        first = ordered[0]
+        chains.append(
+            PositionRemediationChain(
+                strategy_instance_id=strategy_instance_id,
+                lifecycle_id=first.lifecycle_id,
+                execution_binding_id=int(first.evidence["execution_binding_id"]),
+                steps=steps,
+                conflicts=(),
+                fingerprint=_fingerprint(
+                    {
+                        "strategy_instance_id": strategy_instance_id,
+                        "steps": [asdict(step) for step in steps],
+                    }
+                ),
+            )
+        )
+    return tuple(
+        sorted(chains, key=lambda chain: (chain.strategy_instance_id, chain.lifecycle_id))
     )
 
 
