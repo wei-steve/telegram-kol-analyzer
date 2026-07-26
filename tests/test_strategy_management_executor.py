@@ -15,6 +15,7 @@ from telegram_kol_research.execution_events import list_execution_events
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionProtectionLedger,
     RawMessage,
     RecognitionDecision,
     StrategyLifecycle,
@@ -3354,6 +3355,32 @@ def test_replacement_failure_restores_complete_position_and_stops_later_legs(tmp
 
     session_factory = create_session_factory(tmp_path / "research.db")
     batch, rows_by_pos = _persist_protection_batch(session_factory)
+    with session_factory() as session:
+        for leg in batch.legs:
+            for row in rows_by_pos[leg.pos_id]:
+                purpose = (
+                    "take_profit" if row.get("tpTriggerPx") else "stop_loss"
+                )
+                upsert_protection_ledger_row(
+                    session,
+                    venue="deepcoin",
+                    execution_binding_id=batch.execution_binding_id,
+                    execution_order_leg_id=leg.execution_order_leg_id,
+                    strategy_instance_id=batch.strategy_instance_id,
+                    pos_id=leg.pos_id,
+                    instrument_id="BTC-USDT-SWAP",
+                    side="short",
+                    order_id=row["ordId"],
+                    purpose=purpose,
+                    trigger_price=row.get("tpTriggerPx")
+                    or row.get("slTriggerPx"),
+                    size_text=row["sz"],
+                    status="verified",
+                    evidence_source="official_ui_supervised",
+                    evidence={"match": "reviewed_current_order"},
+                    seen_at=NOW,
+                )
+        session.commit()
     client = _ProtectionClient(
         session_factory,
         rows_by_pos,
@@ -3382,6 +3409,26 @@ def test_replacement_failure_restores_complete_position_and_stops_later_legs(tmp
         "pos-2",
     ]
     assert client.set_calls[-1]["slTriggerPx"] == "65700"
+    with session_factory() as session:
+        old_rows = session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id.in_(
+                {"tp-1a", "tp-1b", "sl-1", "tp-2", "sl-2"}
+            )
+        ).all()
+        restored = session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id.in_(
+                {"restore-tp2", "restore-sl2"}
+            )
+        ).all()
+    assert {row.status for row in old_rows} == {"cancelled"}
+    assert {row.order_id for row in restored} == {
+        "restore-tp2",
+        "restore-sl2",
+    }
+    assert {row.status for row in restored} == {"verified"}
+    assert {row.evidence_source for row in restored} == {
+        "management_tpsl_restore"
+    }
 
 
 def test_restore_failure_marks_recovery_required_and_continues_independent_legs(

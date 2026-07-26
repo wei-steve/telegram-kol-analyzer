@@ -29,6 +29,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    PositionProtectionLedger,
     RawMessage,
     StrategyLifecycle,
     StrategyManagementBatch,
@@ -862,6 +863,13 @@ def _execute_protection_batch(
                             "ordId": str(row["order_id"]),
                         }
                     )
+                    _mark_management_tpsl_ledger_cancelled(
+                        session_factory,
+                        batch=batch,
+                        leg=leg,
+                        order_id=str(row["order_id"]),
+                        seen_at=executed_at,
+                    )
             except Exception as exc:
                 transition_leg(
                     session_factory,
@@ -959,6 +967,22 @@ def _execute_protection_batch(
             restore_responses = []
 
         if restoration_error is None:
+            restored_order_ids = [
+                order_id
+                for response in restore_responses
+                if (order_id := _extract_order_id(response))
+            ]
+            _record_management_tpsl_ledger_rows(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                leg=leg,
+                inst_id=inst_id,
+                rows=old_rows,
+                order_ids=restored_order_ids,
+                seen_at=executed_at,
+                evidence_source="management_tpsl_restore",
+            )
             leg_status = "restored"
             if failed_status is None:
                 failed_status = "partial_failed"
@@ -2128,6 +2152,7 @@ def _record_management_tpsl_ledger_rows(
     rows: list[dict[str, Any]],
     order_ids: list[str],
     seen_at: datetime,
+    evidence_source: str = "management_tpsl_replacement",
 ) -> None:
     with session_factory() as session:
         for row, order_id in zip(rows, order_ids, strict=False):
@@ -2145,7 +2170,7 @@ def _record_management_tpsl_ledger_rows(
                 trigger_price=_ledger_trigger_price(row),
                 size_text=str(row.get("size")) if row.get("size") is not None else None,
                 status="verified",
-                evidence_source="management_tpsl_replacement",
+                evidence_source=evidence_source,
                 evidence={
                     "match": "exchange_returned_order_id",
                     "management_batch_id": batch.id,
@@ -2160,10 +2185,39 @@ def _record_management_tpsl_ledger_rows(
             execution_order_leg_id=int(leg.execution_order_leg_id),
             strategy_instance_id=batch.strategy_instance_id,
             pos_id=str(leg.pos_id),
-            source="management_tpsl_replacement",
+            source=evidence_source,
             protection_json={"order_ids": [str(value) for value in order_ids], "rows": rows, "management_batch_id": batch.id},
         )
         session.commit()
+
+
+def _mark_management_tpsl_ledger_cancelled(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+    leg: Any,
+    order_id: str,
+    seen_at: datetime,
+) -> None:
+    with session_factory() as session:
+        row = (
+            session.query(PositionProtectionLedger)
+            .filter(
+                PositionProtectionLedger.venue == "deepcoin",
+                PositionProtectionLedger.order_id == str(order_id),
+                PositionProtectionLedger.execution_binding_id
+                == batch.execution_binding_id,
+                PositionProtectionLedger.execution_order_leg_id
+                == int(leg.execution_order_leg_id),
+                PositionProtectionLedger.pos_id == str(leg.pos_id),
+            )
+            .one_or_none()
+        )
+        if row is not None:
+            row.status = "cancelled"
+            row.last_seen_at = seen_at
+            row.updated_at = seen_at
+            session.commit()
 
 
 def _ledger_trigger_price(row: dict[str, Any]) -> str | None:
