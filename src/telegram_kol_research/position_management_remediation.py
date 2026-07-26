@@ -51,6 +51,9 @@ class PositionRemediationAction:
 
 @dataclass(frozen=True, slots=True)
 class PositionRemediationStep:
+    strategy_instance_id: str
+    lifecycle_id: int
+    execution_binding_id: int
     raw_message_id: int
     instruction_item_id: int | None
     candidate_id: int
@@ -138,6 +141,7 @@ def build_position_management_remediation_plan(
     }
 
     actions: list[PositionRemediationAction] = []
+    static_steps: list[PositionRemediationStep] = []
     conflicts: list[dict[str, Any]] = []
     with session_factory() as session:
         candidates = (
@@ -187,54 +191,6 @@ def build_position_management_remediation_plan(
                 continue
             for target in targets:
                 lifecycle = session.get(StrategyLifecycle, target.lifecycle_id)
-                existing_batches = (
-                    session.query(StrategyManagementBatch)
-                    .filter(
-                        StrategyManagementBatch.raw_message_id == raw_message.id,
-                        StrategyManagementBatch.target_lifecycle_id
-                        == target.lifecycle_id,
-                    )
-                    .order_by(StrategyManagementBatch.id.desc())
-                    .all()
-                )
-                if any(
-                    batch.status
-                    in {
-                        "ready",
-                        "executing",
-                        "reserved",
-                        "submitted",
-                        "reconciling",
-                        "protection_ready",
-                        "succeeded",
-                    }
-                    for batch in existing_batches
-                ):
-                    continue
-                unresolved_batch = next(
-                    (
-                        batch
-                        for batch in existing_batches
-                        if batch.status
-                        in {
-                            "partial_failed",
-                            "submit_unknown",
-                            "recovery_required",
-                        }
-                    ),
-                    None,
-                )
-                if unresolved_batch is not None:
-                    conflicts.append(
-                        {
-                            "raw_message_id": int(raw_message.id),
-                            "candidate_id": int(candidate.id),
-                            "lifecycle_id": target.lifecycle_id,
-                            "management_batch_id": int(unresolved_batch.id),
-                            "reason": "existing_management_batch_unresolved",
-                        }
-                    )
-                    continue
                 binding = (
                     session.get(ExecutionBinding, lifecycle.execution_binding_id)
                     if lifecycle is not None
@@ -253,6 +209,150 @@ def build_position_management_remediation_plan(
                             "candidate_id": int(candidate.id),
                             "lifecycle_id": target.lifecycle_id,
                             "reason": "target_strategy_binding_not_verified",
+                        }
+                    )
+                    continue
+                existing_batches = (
+                    session.query(StrategyManagementBatch)
+                    .filter(
+                        StrategyManagementBatch.raw_message_id == raw_message.id,
+                        StrategyManagementBatch.target_lifecycle_id
+                        == target.lifecycle_id,
+                    )
+                    .order_by(StrategyManagementBatch.id.desc())
+                    .all()
+                )
+                terminal_batch = (
+                    session.query(StrategyManagementBatch)
+                    .filter(
+                        StrategyManagementBatch.target_lifecycle_id
+                        == target.lifecycle_id,
+                        StrategyManagementBatch.effective_action == "full_exit",
+                        StrategyManagementBatch.status == "succeeded",
+                    )
+                    .order_by(StrategyManagementBatch.id)
+                    .first()
+                )
+                if terminal_batch is not None:
+                    is_terminal_source = (
+                        int(terminal_batch.raw_message_id) == int(raw_message.id)
+                    )
+                    static_steps.append(
+                        PositionRemediationStep(
+                            strategy_instance_id=str(binding.strategy_instance_id),
+                            lifecycle_id=int(lifecycle.id),
+                            execution_binding_id=int(binding.id),
+                            raw_message_id=int(raw_message.id),
+                            instruction_item_id=(
+                                int(item.id) if item is not None else None
+                            ),
+                            candidate_id=int(candidate.id),
+                            sequence=int(item.sequence) if item is not None else 0,
+                            posted_at=raw_message.posted_at,
+                            action_kind=(
+                                "full_exit"
+                                if is_terminal_source
+                                else directive.intent
+                            ),
+                            state=(
+                                "resolved"
+                                if is_terminal_source
+                                else "terminally_skipped"
+                            ),
+                            reason=(
+                                "confirmed_full_exit"
+                                if is_terminal_source
+                                else "old_lifecycle_already_fully_exited"
+                            ),
+                            action=None,
+                        )
+                    )
+                    continue
+                active_batch = next(
+                    (
+                        batch
+                        for batch in existing_batches
+                        if batch.status
+                        in {
+                            "ready",
+                            "executing",
+                            "reserved",
+                            "submitted",
+                            "reconciling",
+                            "protection_ready",
+                        }
+                    ),
+                    None,
+                )
+                if active_batch is not None:
+                    static_steps.append(
+                        _batch_backed_static_step(
+                            binding=binding,
+                            lifecycle=lifecycle,
+                            raw_message=raw_message,
+                            candidate=candidate,
+                            item=item,
+                            action_kind=directive.intent,
+                            state="waiting_for_reconciliation",
+                            reason=f"management_batch_{active_batch.status}",
+                        )
+                    )
+                    continue
+                succeeded_batch = next(
+                    (
+                        batch
+                        for batch in existing_batches
+                        if batch.status == "succeeded"
+                    ),
+                    None,
+                )
+                if succeeded_batch is not None:
+                    static_steps.append(
+                        _batch_backed_static_step(
+                            binding=binding,
+                            lifecycle=lifecycle,
+                            raw_message=raw_message,
+                            candidate=candidate,
+                            item=item,
+                            action_kind=directive.intent,
+                            state="resolved",
+                            reason="management_batch_succeeded",
+                        )
+                    )
+                    continue
+                unresolved_batch = next(
+                    (
+                        batch
+                        for batch in existing_batches
+                        if batch.status
+                        in {
+                            "partial_failed",
+                            "submit_unknown",
+                            "recovery_required",
+                        }
+                    ),
+                    None,
+                )
+                if unresolved_batch is not None:
+                    static_steps.append(
+                        _batch_backed_static_step(
+                            binding=binding,
+                            lifecycle=lifecycle,
+                            raw_message=raw_message,
+                            candidate=candidate,
+                            item=item,
+                            action_kind=directive.intent,
+                            state="blocked",
+                            reason="existing_management_batch_unresolved",
+                        )
+                    )
+                    conflicts.append(
+                        {
+                            "raw_message_id": int(raw_message.id),
+                            "candidate_id": int(candidate.id),
+                            "lifecycle_id": target.lifecycle_id,
+                            "management_batch_id": int(unresolved_batch.id),
+                            "reason": "existing_management_batch_unresolved",
                         }
                     )
                     continue
@@ -351,7 +451,7 @@ def build_position_management_remediation_plan(
                     )
                 )
 
-    chains = _build_remediation_chains(actions)
+    chains = _build_remediation_chains(actions, static_steps=static_steps)
     ordered_actions = tuple(
         step.action
         for chain in chains
@@ -385,45 +485,83 @@ def build_position_management_remediation_plan(
 
 def _build_remediation_chains(
     actions: list[PositionRemediationAction],
+    *,
+    static_steps: list[PositionRemediationStep] | None = None,
 ) -> tuple[PositionRemediationChain, ...]:
-    grouped: dict[str, list[PositionRemediationAction]] = {}
+    grouped: dict[str, list[PositionRemediationStep]] = {}
     for action in actions:
-        grouped.setdefault(action.strategy_instance_id, []).append(action)
-    chains: list[PositionRemediationChain] = []
-    for strategy_instance_id, grouped_actions in grouped.items():
-        ordered = sorted(
-            grouped_actions,
-            key=lambda action: (
-                str(action.evidence.get("source_posted_at") or ""),
-                int(action.raw_message_id or 0),
-                int(action.evidence.get("instruction_sequence") or 0),
-                int(action.evidence.get("candidate_id") or 0),
-            ),
-        )
-        steps = tuple(
+        grouped.setdefault(action.strategy_instance_id, []).append(
             PositionRemediationStep(
+                strategy_instance_id=action.strategy_instance_id,
+                lifecycle_id=action.lifecycle_id,
+                execution_binding_id=int(action.evidence["execution_binding_id"]),
                 raw_message_id=int(action.raw_message_id),
                 instruction_item_id=action.evidence.get("instruction_item_id"),
                 candidate_id=int(action.evidence["candidate_id"]),
                 sequence=int(action.evidence.get("instruction_sequence") or 0),
                 posted_at=action.evidence["source_posted_at"],
                 action_kind=action.action_kind,
-                state=(
-                    "ready_for_approval"
-                    if index == 0
-                    else "waiting_for_predecessor"
-                ),
-                reason=None if index == 0 else "predecessor_not_resolved",
+                state="unclassified",
+                reason=None,
                 action=action,
             )
-            for index, action in enumerate(ordered)
         )
+    for step in static_steps or []:
+        grouped.setdefault(step.strategy_instance_id, []).append(step)
+    chains: list[PositionRemediationChain] = []
+    for strategy_instance_id, grouped_steps in grouped.items():
+        ordered = sorted(
+            grouped_steps,
+            key=lambda step: (
+                step.posted_at,
+                step.raw_message_id,
+                step.sequence,
+                step.candidate_id,
+            ),
+        )
+        steps_list: list[PositionRemediationStep] = []
+        ready_assigned = False
+        predecessor_blocking = False
+        for step in ordered:
+            if step.action is None:
+                steps_list.append(step)
+                if step.state not in {"resolved", "terminally_skipped"}:
+                    predecessor_blocking = True
+                continue
+            state = (
+                "ready_for_approval"
+                if not ready_assigned and not predecessor_blocking
+                else "waiting_for_predecessor"
+            )
+            steps_list.append(
+                PositionRemediationStep(
+                    strategy_instance_id=step.strategy_instance_id,
+                    lifecycle_id=step.lifecycle_id,
+                    execution_binding_id=step.execution_binding_id,
+                    raw_message_id=step.raw_message_id,
+                    instruction_item_id=step.instruction_item_id,
+                    candidate_id=step.candidate_id,
+                    sequence=step.sequence,
+                    posted_at=step.posted_at,
+                    action_kind=step.action_kind,
+                    state=state,
+                    reason=(
+                        None
+                        if state == "ready_for_approval"
+                        else "predecessor_not_resolved"
+                    ),
+                    action=step.action,
+                )
+            )
+            ready_assigned = True
+            predecessor_blocking = True
+        steps = tuple(steps_list)
         first = ordered[0]
         chains.append(
             PositionRemediationChain(
                 strategy_instance_id=strategy_instance_id,
                 lifecycle_id=first.lifecycle_id,
-                execution_binding_id=int(first.evidence["execution_binding_id"]),
+                execution_binding_id=first.execution_binding_id,
                 steps=steps,
                 conflicts=(),
                 fingerprint=_fingerprint(
@@ -436,6 +574,33 @@ def _build_remediation_chains(
         )
     return tuple(
         sorted(chains, key=lambda chain: (chain.strategy_instance_id, chain.lifecycle_id))
+    )
+
+
+def _batch_backed_static_step(
+    *,
+    binding: ExecutionBinding,
+    lifecycle: StrategyLifecycle,
+    raw_message: RawMessage,
+    candidate: SignalCandidate,
+    item: MessageInstructionItem | None,
+    action_kind: str,
+    state: str,
+    reason: str,
+) -> PositionRemediationStep:
+    return PositionRemediationStep(
+        strategy_instance_id=str(binding.strategy_instance_id),
+        lifecycle_id=int(lifecycle.id),
+        execution_binding_id=int(binding.id),
+        raw_message_id=int(raw_message.id),
+        instruction_item_id=int(item.id) if item is not None else None,
+        candidate_id=int(candidate.id),
+        sequence=int(item.sequence) if item is not None else 0,
+        posted_at=raw_message.posted_at,
+        action_kind=action_kind,
+        state=state,
+        reason=reason,
+        action=None,
     )
 
 
@@ -464,6 +629,15 @@ def apply_position_management_remediation_action(
         raise ValueError("remediation plan has unresolved conflicts")
     matches = [action for action in plan.actions if action.action_id == action_id]
     if len(matches) != 1:
+        waiting_match = any(
+            step.action is not None
+            and step.action.action_id == action_id
+            and step.state != "ready_for_approval"
+            for chain in plan.chains
+            for step in chain.steps
+        )
+        if waiting_match:
+            raise ValueError("remediation action is not executable chain head")
         raise ValueError("remediation action not found or not unique")
     action = matches[0]
     if action.fingerprint != expected_fingerprint:

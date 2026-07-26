@@ -12,6 +12,7 @@ from telegram_kol_research.models import (
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
+    StrategyManagementBatch,
 )
 from telegram_kol_research.position_management_remediation import (
     _require_exchange_snapshot_fingerprint,
@@ -275,6 +276,168 @@ def test_cancel_entry_without_exact_live_fill_never_becomes_full_exit(tmp_path):
         conflict["reason"] == "late_fill_identity_not_exact"
         for conflict in plan.conflicts
     )
+
+
+def test_confirmed_full_exit_terminalizes_later_old_lifecycle_steps(tmp_path):
+    class NoPositionClient(_ReadOnlyClient):
+        def list_positions(self):
+            return []
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    with session_factory() as session:
+        first_raw = session.get(RawMessage, first_raw_id)
+        first_candidate = (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == first_raw_id)
+            .one()
+        )
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        first_raw.text = "BTC多单全部平仓"
+        first_candidate.event_type = "close_signal"
+        first_candidate.management_action = "full_exit"
+        first_candidate.management_fraction = None
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="f" * 64,
+                raw_message_id=first_raw_id,
+                recognition_decision_id=1,
+                recognition_generation="resolved-generation",
+                target_lifecycle_id=lifecycle_id,
+                strategy_instance_id=binding.strategy_instance_id,
+                execution_binding_id=binding.id,
+                intent="full_exit",
+                effective_action="full_exit",
+                execution_mode="live",
+                effective_fraction=1.0,
+                partial_round_before=0,
+                status="succeeded",
+                target_fingerprint="t" * 64,
+                target_snapshot_json="{}",
+                planned_at=NOW,
+            )
+        )
+        session.commit()
+    later_raw_id = _persist_failed_management_step(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        posted_at=NOW + timedelta(minutes=1),
+        message_id=302,
+        text="BTC空单移动止损到开仓价",
+        event_type="position_update",
+        management_action="move_stop_to_break_even",
+        sequence=0,
+    )
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=NoPositionClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert len(plan.chains) == 1
+    assert [step.raw_message_id for step in plan.chains[0].steps] == [
+        first_raw_id,
+        later_raw_id,
+    ]
+    assert [step.state for step in plan.chains[0].steps] == [
+        "resolved",
+        "terminally_skipped",
+    ]
+
+
+def test_waiting_step_cannot_be_applied_before_predecessor(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _first_raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    _persist_failed_management_step(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        posted_at=NOW + timedelta(minutes=1),
+        message_id=303,
+        text="BTC多单全部平仓",
+        event_type="close_signal",
+        management_action="full_exit",
+        sequence=0,
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+        },
+    )
+    client = _ReadOnlyClient()
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=NOW,
+    )
+    waiting = plan.chains[0].steps[1]
+
+    with pytest.raises(ValueError, match="not executable chain head"):
+        apply_position_management_remediation_action(
+            session_factory,
+            deepcoin_client=client,
+            action_id=waiting.action.action_id,
+            expected_fingerprint=waiting.action.fingerprint,
+            now=NOW,
+        )
+
+    assert client.write_calls == []
+
+
+def test_reconciling_predecessor_blocks_later_chain_step(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="p" * 64,
+                raw_message_id=first_raw_id,
+                recognition_decision_id=1,
+                recognition_generation="pending-generation",
+                target_lifecycle_id=lifecycle_id,
+                strategy_instance_id=binding.strategy_instance_id,
+                execution_binding_id=binding.id,
+                intent="partial_take_profit",
+                effective_action="partial_close",
+                execution_mode="live",
+                requested_fraction=0.5,
+                effective_fraction=0.5,
+                partial_round_before=0,
+                status="reconciling",
+                target_fingerprint="q" * 64,
+                target_snapshot_json="{}",
+                planned_at=NOW,
+            )
+        )
+        session.commit()
+    _persist_failed_management_step(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        posted_at=NOW + timedelta(minutes=1),
+        message_id=304,
+        text="BTC多单全部平仓",
+        event_type="close_signal",
+        management_action="full_exit",
+        sequence=0,
+    )
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert [step.state for step in plan.chains[0].steps] == [
+        "waiting_for_reconciliation",
+        "waiting_for_predecessor",
+    ]
 
 
 def test_build_remediation_plan_is_read_only_and_fingerprinted(tmp_path):
