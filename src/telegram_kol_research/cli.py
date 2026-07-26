@@ -34,6 +34,10 @@ from telegram_kol_research.entry_protection_ledger_repair import (
     apply_entry_protection_ledger_repair_plan,
     build_entry_protection_ledger_repair_plan,
 )
+from telegram_kol_research.current_protection_backfill import (
+    SupervisedProtectionMapping,
+    build_current_protection_backfill_plan,
+)
 from telegram_kol_research.backup_stop_repair import (
     BackupStopRepairPlan,
     apply_backup_stop_repair_plan,
@@ -61,6 +65,7 @@ from telegram_kol_research.media_retention import cleanup_media_files
 from telegram_kol_research.media_dedupe import dedupe_media_assets
 from telegram_kol_research.models import (
     ExecutionBinding,
+    PositionProtectionLedger,
     StrategyLifecycle,
     StrategyManagementBatch,
     TradeIdea,
@@ -1988,6 +1993,66 @@ def repair_position_attribution(
         expected_fingerprint=expected_fingerprint,
     )
     typer.echo(f"Applied {result.applied} repair action(s).")
+
+
+@app.command("plan-current-protection-backfill")
+def plan_current_protection_backfill(
+    mapping_file: Path = typer.Option(..., "--mapping-file", exists=True, readable=True),
+    database_path: Path = Path("data/research.db"),
+) -> None:
+    """Emit a read-only plan for explicitly supervised current TPSL mappings."""
+
+    try:
+        payload = json.loads(mapping_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter("mapping file must contain JSON") from exc
+    rows = payload.get("mappings") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise typer.BadParameter("mapping file must be a list or {'mappings': [...]}")
+    mappings = [
+        SupervisedProtectionMapping(
+            order_id=str(row.get("order_id") or ""),
+            pos_id=str(row.get("pos_id") or ""),
+            evidence_hash=str(row.get("evidence_hash") or ""),
+        )
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    client = build_deepcoin_client_from_env()
+    positions = list(client.list_positions())
+    instrument_ids = sorted(
+        {
+            str(row.get("instId") or row.get("instrumentId") or "").upper()
+            for row in positions
+            if isinstance(row, dict)
+            and str(row.get("instId") or row.get("instrumentId") or "").strip()
+        }
+    )
+    pending_orders: list[dict] = []
+    for instrument_id in instrument_ids:
+        pending_orders.extend(client.list_trigger_orders_pending(inst_id=instrument_id))
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        verified_order_ids = {
+            str(row.order_id)
+            for row in session.query(PositionProtectionLedger)
+            .filter(PositionProtectionLedger.venue == "deepcoin")
+            .filter(PositionProtectionLedger.status == "verified")
+            .all()
+        }
+    plan = build_current_protection_backfill_plan(
+        mappings=mappings,
+        positions=positions,
+        pending_orders=pending_orders,
+        verified_order_ids=verified_order_ids,
+    )
+    typer.echo(
+        json.dumps(
+            {"mode": "dry_run", "database_path": str(database_path), "plan": asdict(plan)},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 @app.command("repair-entry-protection-ledger")
