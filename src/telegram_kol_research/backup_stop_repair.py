@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -19,6 +19,13 @@ from telegram_kol_research.native_tpsl import NativeTpslExpectation
 from telegram_kol_research.native_tpsl import match_native_tpsl_order
 from telegram_kol_research.native_tpsl import normalize_native_tpsl
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
+from telegram_kol_research.position_mutation_gateway import (
+    submit_exact_position_sltp,
+)
+from telegram_kol_research.repair_confirmation import (
+    consume_repair_confirmation_token,
+    require_repair_confirmation_token_unused,
+)
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trigger_backup_stop import (
     BackupStopError,
@@ -42,6 +49,7 @@ class BackupStopRepairAction:
     client_order_id: str
     request_payload: dict[str, str]
     open_positions: tuple[dict[str, Any], ...]
+    action_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +181,10 @@ def build_backup_stop_repair_plan(
                     request_payload=payload,
                     open_positions=tuple(row for row in positions if isinstance(row, dict)),
                 )
+                action = replace(
+                    action,
+                    action_id=_fingerprint(asdict(action)),
+                )
                 if (
                     str(existing.status) == "active"
                     and str(existing.order_id or "").strip()
@@ -209,7 +221,7 @@ def build_backup_stop_repair_plan(
             ):
                 conflicts.append(_conflict(pos_id, "backup_similar_unscoped_order"))
                 continue
-            actions.append(BackupStopRepairAction(
+            action = BackupStopRepairAction(
                 binding_id=int(binding.id), leg_id=int(leg.id), pos_id=pos_id,
                 instrument_id=instrument_id, side=str(binding.side).lower(), size=size,
                 primary_order_id=str(primary.order_id), primary_stop=str(primary.trigger_price),
@@ -220,7 +232,10 @@ def build_backup_stop_repair_plan(
                 ),
                 request_payload=payload,
                 open_positions=tuple(row for row in positions if isinstance(row, dict)),
-            ))
+            )
+            actions.append(
+                replace(action, action_id=_fingerprint(asdict(action)))
+            )
             exchange_evidence.append({
                 "pos_id": pos_id, "size": size, "liquidation_price": liquidation,
                 "pending_order_ids": ",".join(sorted(_order_id(row) for row in pending if _order_id(row))),
@@ -247,7 +262,9 @@ def apply_backup_stop_repair_plan(
     deepcoin_client,
     contract_spec_provider,
     pos_id: str,
+    action_id: str,
     expected_fingerprint: str,
+    confirmation_token: str,
     now: datetime | None = None,
 ) -> BackupStopRepairResult:
     """Apply exactly one reviewed action; unknown outcomes are never retried."""
@@ -255,21 +272,53 @@ def apply_backup_stop_repair_plan(
     clean_pos_id = str(pos_id or "").strip()
     if not clean_pos_id:
         raise ValueError("pos_id is required")
+    if not str(action_id or "").strip():
+        raise ValueError("action_id is required")
     if not expected_fingerprint:
         raise ValueError("expected fingerprint is required")
+    if len(str(confirmation_token or "").strip()) < 8:
+        raise ValueError("confirmation_token is required")
     if expected_fingerprint != plan.fingerprint:
         raise ValueError("repair plan fingerprint mismatch")
+    reviewed = [
+        action
+        for action in plan.actions
+        if action.pos_id == clean_pos_id and action.action_id == action_id
+    ]
+    if len(reviewed) != 1:
+        raise ValueError("exactly one reviewed repair action is required")
+    confirmation_key = _confirmation_idempotency_key(
+        "backup-stop-repair",
+        action_id=action_id,
+        confirmation_token=confirmation_token,
+    )
+    require_repair_confirmation_token_unused(
+        session_factory,
+        confirmation_token=confirmation_token,
+    )
     fresh = build_backup_stop_repair_plan(
         session_factory, deepcoin_client=deepcoin_client,
         contract_spec_provider=contract_spec_provider, now=now,
     )
     if fresh.fingerprint != expected_fingerprint:
         raise ValueError("repair plan fingerprint changed")
-    selected = [action for action in fresh.actions if action.pos_id == clean_pos_id]
+    selected = [
+        action
+        for action in fresh.actions
+        if action.pos_id == clean_pos_id and action.action_id == action_id
+    ]
     if len(selected) != 1:
         raise ValueError("exactly one repair action is required for pos_id")
     action = selected[0]
     observed_at = now or datetime.now(UTC)
+    consume_repair_confirmation_token(
+        session_factory,
+        confirmation_token=confirmation_token,
+        action_kind="backup_stop_repair",
+        action_id=action.action_id,
+        pos_id=action.pos_id,
+        consumed_at=observed_at,
+    )
     with session_factory() as session:
         row = PositionBackupStopOrder(
             venue="deepcoin", execution_binding_id=action.binding_id,
@@ -283,7 +332,17 @@ def apply_backup_stop_repair_plan(
         session.commit()
         row_id = int(row.id)
     try:
-        response = deepcoin_client.set_position_sltp(dict(action.request_payload))
+        response = submit_exact_position_sltp(
+            session_factory=session_factory,
+            deepcoin_client=deepcoin_client,
+            pos_id=action.pos_id,
+            payload=action.request_payload,
+            idempotency_key=confirmation_key,
+            live_execution_gate=lambda: _repair_submission_still_reserved(
+                session_factory, row_id
+            ),
+            now_provider=lambda: observed_at,
+        )
         order_id = _response_order_id(response)
     except Exception as exc:
         return _mark_unknown(
@@ -352,6 +411,26 @@ def _primary(session, *, binding_id: int, leg_id: int, pos_id: str):
         .order_by(PositionProtectionLedger.id.asc())
         .first()
     )
+
+
+def _repair_submission_still_reserved(session_factory, row_id: int) -> bool:
+    """Recheck that this reviewed repair has not been cancelled or superseded."""
+
+    with session_factory() as session:
+        row = session.get(PositionBackupStopOrder, row_id)
+        return row is not None and row.status == "submitting"
+
+
+def _confirmation_idempotency_key(
+    prefix: str,
+    *,
+    action_id: str,
+    confirmation_token: str,
+) -> str:
+    token_hash = hashlib.sha256(
+        str(confirmation_token).encode("utf-8")
+    ).hexdigest()
+    return f"{prefix}:{action_id}:confirmation:{token_hash}"
 
 
 def _existing_backup(session, *, pos_id: str) -> PositionBackupStopOrder | None:

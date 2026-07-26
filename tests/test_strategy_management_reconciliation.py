@@ -14,6 +14,7 @@ from telegram_kol_research.execution_bindings import (
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionMutationIntent,
     RawMessage,
     RecognitionDecision,
     StrategyLifecycle,
@@ -1185,6 +1186,82 @@ def test_composite_protection_unknown_is_never_reprocessed_as_close_phase(tmp_pa
     assert stored.legs[0].last_error == {
         "stage": "replace_protection_outcome_unknown"
     }
+
+
+def test_confirmed_protection_intent_unfreezes_recovery_batch(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action="partial_then_break_even")
+    assert transition_batch(
+        sf,
+        batch.id,
+        expected_statuses={"reconciling"},
+        new_status="recovery_required",
+        reason_code="protection_recovery_required",
+    )
+    assert transition_leg(
+        sf,
+        batch.legs[0].id,
+        expected_statuses={"submitted"},
+        new_status="recovery_required",
+        request={"expected_replacement_count": 1},
+        last_error={"stage": "replace_protection_outcome_unknown"},
+    )
+    with sf() as session:
+        leg = session.get(StrategyManagementLeg, batch.legs[0].id)
+        session.add(
+            PositionMutationIntent(
+                idempotency_key=(
+                    f"management:{batch.id}:{leg.id}:set:stop_loss:0"
+                ),
+                venue="deepcoin",
+                operation="set_position_sltp",
+                strategy_instance_id=batch.strategy_instance_id,
+                execution_binding_id=batch.execution_binding_id,
+                execution_order_leg_id=leg.execution_order_leg_id,
+                pos_id=leg.pos_id,
+                authority_fingerprint="a" * 64,
+                request_fingerprint="b" * 64,
+                status="submitted",
+                request_json=json.dumps(
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "posId": "pos-1",
+                        "posSide": "short",
+                        "slTriggerPx": "64000",
+                    }
+                ),
+                response_json='{"data":{"ordId":"new-stop-1"}}',
+                reserved_at=NOW,
+                submitted_at=NOW,
+            )
+        )
+        session.commit()
+
+    reconcile_strategy_management_batches(
+        sf,
+        snapshot=SimpleNamespace(
+            positions=[_position("pos-1", "1")],
+            open_orders=[],
+            pending_trigger_orders=[
+                {
+                    "ordId": "new-stop-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-1",
+                    "posSide": "short",
+                    "slTriggerPx": "64000.0",
+                }
+            ],
+            order_history=[],
+            trade_fills=[],
+            errors={},
+        ),
+        reconciled_at=NOW,
+    )
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "protection_ready"
+    assert stored.reason_code == "protection_intent_readback_confirmed"
+    assert stored.legs[0].status == "succeeded"
 
 
 def test_close_recovery_required_is_permanently_paused_from_auto_reconcile(tmp_path):

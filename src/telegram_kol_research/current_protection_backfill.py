@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 import hashlib
 import json
 from typing import Any, Iterable
@@ -28,6 +29,27 @@ class CurrentProtectionBackfillAction:
     instrument_id: str
     side: str
     evidence_hash: str
+    action_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.action_id:
+            return
+        payload = {
+            "order_id": self.order_id,
+            "pos_id": self.pos_id,
+            "classification": self.classification,
+            "instrument_id": self.instrument_id,
+            "side": self.side,
+            "evidence_hash": self.evidence_hash,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        )
+        object.__setattr__(
+            self,
+            "action_id",
+            hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +157,10 @@ def apply_current_protection_backfill_plan(
     session_factory,
     plan: CurrentProtectionBackfillPlan,
     *,
+    action_id: str,
+    pos_id: str,
     expected_fingerprint: str,
+    confirmation_token: str,
 ) -> CurrentProtectionBackfillApplyResult:
     """Write a reviewed plan only when its exact fingerprint was confirmed."""
 
@@ -143,44 +168,63 @@ def apply_current_protection_backfill_plan(
         raise ValueError("current protection backfill fingerprint mismatch")
     if plan.refusals:
         raise ValueError("current protection backfill plan contains refusals")
-    applied = 0
+    selected = [
+        action
+        for action in plan.actions
+        if action.action_id == str(action_id)
+        and action.pos_id == str(pos_id)
+    ]
+    if len(selected) != 1:
+        raise ValueError("exactly one current protection action is required")
+    action = selected[0]
+    from telegram_kol_research.repair_confirmation import (
+        consume_repair_confirmation_token,
+    )
+
+    consume_repair_confirmation_token(
+        session_factory,
+        confirmation_token=confirmation_token,
+        action_kind="current_protection_backfill",
+        action_id=action.action_id,
+        pos_id=action.pos_id,
+        consumed_at=datetime.now(UTC),
+    )
     with session_factory() as session:
-        for action in plan.actions:
-            leg = (
-                session.query(ExecutionOrderLeg)
-                .filter(ExecutionOrderLeg.venue == "deepcoin")
-                .filter(ExecutionOrderLeg.pos_id == action.pos_id)
-                .filter(ExecutionOrderLeg.purpose == "entry")
-                .filter(ExecutionOrderLeg.attribution_status == "verified")
-                .one_or_none()
-            )
-            if leg is None:
-                raise ValueError(f"verified entry leg missing for position {action.pos_id}")
-            row = upsert_protection_ledger_row(
-                session,
-                venue="deepcoin",
-                execution_binding_id=int(leg.execution_binding_id),
-                execution_order_leg_id=int(leg.id),
-                strategy_instance_id=leg.strategy_instance_id,
-                pos_id=action.pos_id,
-                instrument_id=action.instrument_id,
-                side=action.side,
-                order_id=action.order_id,
-                purpose="supervised_current_tpsl",
-                trigger_price=None,
-                size_text=None,
-                status="verified",
-                evidence_source="official_ui_supervised",
-                evidence={
-                    "classification": action.classification,
-                    "evidence_hash": action.evidence_hash,
-                    "plan_fingerprint": plan.fingerprint,
-                },
-            )
-            if row is not None:
-                applied += 1
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.venue == "deepcoin")
+            .filter(ExecutionOrderLeg.pos_id == action.pos_id)
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .filter(ExecutionOrderLeg.attribution_status == "verified")
+            .one_or_none()
+        )
+        if leg is None:
+            raise ValueError(f"verified entry leg missing for position {action.pos_id}")
+        row = upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=int(leg.execution_binding_id),
+            execution_order_leg_id=int(leg.id),
+            strategy_instance_id=leg.strategy_instance_id,
+            pos_id=action.pos_id,
+            instrument_id=action.instrument_id,
+            side=action.side,
+            order_id=action.order_id,
+            purpose="supervised_current_tpsl",
+            trigger_price=None,
+            size_text=None,
+            status="verified",
+            evidence_source="official_ui_supervised",
+            evidence={
+                "classification": action.classification,
+                "evidence_hash": action.evidence_hash,
+                "plan_fingerprint": plan.fingerprint,
+            },
+        )
         session.commit()
-    return CurrentProtectionBackfillApplyResult(applied=applied)
+    return CurrentProtectionBackfillApplyResult(
+        applied=1 if row is not None else 0
+    )
 
 
 def _text(payload: dict[str, Any], *keys: str) -> str:

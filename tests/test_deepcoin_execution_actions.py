@@ -36,6 +36,7 @@ from telegram_kol_research.position_attribution_repair import (
     build_position_attribution_repair_plan,
 )
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
+from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import save_trading_settings
 
@@ -48,6 +49,9 @@ class _FakeDeepcoinClient:
                 "instId": "ETH-USDT-SWAP",
                 "posSide": "long",
                 "pos": "0.1",
+                "avgPx": "1580",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
                 "cTime": "1000",
             }
         ]
@@ -115,8 +119,31 @@ class _FakeDeepcoinClient:
             outcome = self.protection_outcomes.pop(0)
             if isinstance(outcome, BaseException):
                 raise outcome
-            return outcome
-        return {"code": "0", "data": {"ordId": "tpsl-new"}}
+            response = outcome
+        else:
+            response = {"code": "0", "data": {"ordId": "tpsl-new"}}
+        data = response.get("data") if isinstance(response, dict) else None
+        order_id = (
+            data.get("ordId") if isinstance(data, dict)
+            else data if isinstance(data, str)
+            else None
+        )
+        if order_id:
+            self.trigger_pending.append(
+                {
+                    "ordId": order_id,
+                    "instId": protection_payload["instId"],
+                    "posId": protection_payload["posId"],
+                    "posSide": protection_payload["posSide"],
+                    **(
+                        {"slTriggerPx": protection_payload["slTriggerPx"]}
+                        if protection_payload.get("slTriggerPx") not in (None, "")
+                        else {"tpTriggerPx": protection_payload["tpTriggerPx"]}
+                    ),
+                    "sz": protection_payload.get("sz", "0"),
+                }
+            )
+        return response
 
     def place_order(self, order_payload):
         self.order_payloads.append(order_payload)
@@ -199,7 +226,7 @@ def _binding(session_factory, **overrides):
         if item.strip()
     ]
     for leg_index, pos_id in enumerate(pos_ids, start=1):
-        upsert_execution_order_leg(
+        leg_id = upsert_execution_order_leg(
             session_factory,
             ExecutionOrderLegRecord(
                 execution_binding_id=binding_id,
@@ -220,6 +247,31 @@ def _binding(session_factory, **overrides):
                 last_verified_at=datetime.now(UTC),
             ),
         )
+        if pos_id == "pos-1":
+            with session_factory() as session:
+                for order_id, purpose, trigger in (
+                    ("tp-old", "take_profit", "1605.6"),
+                    ("sl-old", "stop_loss", "1567.52"),
+                ):
+                    upsert_protection_ledger_row(
+                        session,
+                        venue="deepcoin",
+                        execution_binding_id=binding_id,
+                        execution_order_leg_id=leg_id,
+                        strategy_instance_id=values.get("strategy_instance_id"),
+                        pos_id=pos_id,
+                        instrument_id="ETH-USDT-SWAP",
+                        side="long",
+                        order_id=order_id,
+                        purpose=purpose,
+                        trigger_price=trigger,
+                        size_text="0.1",
+                        status="verified",
+                        evidence_source="test_exact_owner",
+                        evidence={},
+                        seen_at=datetime.now(UTC),
+                    )
+                session.commit()
     return binding_id
 
 
@@ -763,11 +815,6 @@ def test_reviewed_equivalent_assignments_authorize_close_and_tpsl_management(tmp
     client = _FakeDeepcoinClient()
     client.positions = _complete_equivalent_live_positions()
 
-    close = close_bound_position_market(
-        session_factory,
-        pos_id="pos-1",
-        deepcoin_client=client,
-    )
     protection = adjust_position_tpsl(
         session_factory,
         trade_signal=_signal(
@@ -781,10 +828,16 @@ def test_reviewed_equivalent_assignments_authorize_close_and_tpsl_management(tmp
         ),
         deepcoin_client=client,
     )
-
     assert protection["submitted"] is True
-    assert close["submitted"] is True
-    assert close["pos_id"] == "pos-1"
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="position_ownership_evidence_not_authoritative",
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+        )
 
 
 def test_repair_produced_equivalent_evidence_authorizes_complete_live_management(
@@ -870,11 +923,6 @@ def test_repair_produced_equivalent_evidence_authorizes_complete_live_management
         expected_fingerprint=plan.fingerprint,
     )
 
-    close = close_bound_position_market(
-        session_factory,
-        pos_id="pos-1",
-        deepcoin_client=client,
-    )
     protection = adjust_position_tpsl(
         session_factory,
         trade_signal=_signal(
@@ -888,9 +936,16 @@ def test_repair_produced_equivalent_evidence_authorizes_complete_live_management
         ),
         deepcoin_client=client,
     )
-
-    assert close["submitted"] is True
     assert protection["submitted"] is True
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="position_ownership_evidence_not_authoritative",
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1523,6 +1578,31 @@ def test_adjust_position_tpsl_preserves_multiple_take_profit_rows(tmp_path):
             "cTime": "1000",
         },
     )
+    with session_factory() as session:
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.pos_id == "pos-1")
+            .one()
+        )
+        upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=binding_id,
+            execution_order_leg_id=leg.id,
+            strategy_instance_id=leg.strategy_instance_id,
+            pos_id="pos-1",
+            instrument_id="ETH-USDT-SWAP",
+            side="long",
+            order_id="tp-old-2",
+            purpose="take_profit",
+            trigger_price="1615.6",
+            size_text="0.06",
+            status="verified",
+            evidence_source="test_exact_owner",
+            evidence={},
+            seen_at=datetime.now(UTC),
+        )
+        session.commit()
 
     adjust_position_tpsl(
         session_factory,

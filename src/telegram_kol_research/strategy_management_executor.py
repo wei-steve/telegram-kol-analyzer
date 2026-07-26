@@ -40,6 +40,12 @@ from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
+from telegram_kol_research.position_mutation_gateway import (
+    cancel_exact_position_sltp,
+    close_exact_position,
+    exact_position_write_gate,
+    submit_exact_position_sltp,
+)
 from telegram_kol_research.remediation_snapshot import remediation_snapshot_payload
 from telegram_kol_research.protection_attribution import (
     match_position_protection,
@@ -179,7 +185,18 @@ def execute_trigger_protection_stop_rescue(
         session.commit()
 
     try:
-        response = deepcoin_client.set_position_sltp(payload)
+        response = submit_exact_position_sltp(
+            session_factory=session_factory,
+            deepcoin_client=deepcoin_client,
+            pos_id=rescue.pos_id,
+            payload=payload,
+            idempotency_key=f"rescue:{rescue_id}:set:stop_loss",
+            live_execution_gate=lambda: exact_position_write_gate(
+                session_factory, pos_id=rescue.pos_id
+            ),
+            now_provider=lambda: now,
+            require_readback=True,
+        )
     except DeepcoinDefiniteRejection as exc:
         return _complete_trigger_protection_rescue_failure(
             session_factory, rescue_id=int(rescue_id), now=now,
@@ -585,7 +602,19 @@ def _execute_break_even_by_market_batch(
             )
         try:
             _require_remediation_live_gate(session_factory, batch=batch)
-            response = deepcoin_client.place_order(request)
+            response = close_exact_position(
+                session_factory=session_factory,
+                deepcoin_client=deepcoin_client,
+                pos_id=str(leg.pos_id),
+                instrument_id=str(request["instId"]),
+                size=str(request["sz"]),
+                client_order_id=client_order_id,
+                idempotency_key=f"management:{batch.id}:{leg.id}:close:{client_order_id}",
+                live_execution_gate=lambda: exact_position_write_gate(
+                    session_factory, pos_id=str(leg.pos_id)
+                ),
+                now_provider=lambda: executed_at,
+            )
         except DeepcoinDefiniteRejection as exc:
             transition_leg(
                 session_factory,
@@ -706,7 +735,10 @@ def _execute_break_even_by_market_batch(
             expected_statuses={"planned"},
             new_status="reserved",
             transitioned_at=executed_at,
-            request={"cancel_order_ids": old_order_ids},
+            request={
+                "cancel_order_ids": old_order_ids,
+                "expected_replacement_count": len(new_rows),
+            },
         ):
             raise ManagementBatchExecutionError(
                 f"management_protection_leg_reservation_conflict:{leg.id}"
@@ -714,12 +746,19 @@ def _execute_break_even_by_market_batch(
         try:
             for order_id in old_order_ids:
                 _require_remediation_live_gate(session_factory, batch=batch)
-                deepcoin_client.cancel_position_sltp(
-                    {
-                        "instType": "SWAP",
-                        "instId": inst_id,
-                        "ordId": str(order_id),
-                    }
+                cancel_exact_position_sltp(
+                    session_factory=session_factory,
+                    deepcoin_client=deepcoin_client,
+                    pos_id=str(leg.pos_id),
+                    order_id=str(order_id),
+                    instrument_id=inst_id,
+                    idempotency_key=(
+                        f"management:{batch.id}:{leg.id}:cancel:{order_id}"
+                    ),
+                    live_execution_gate=lambda: exact_position_write_gate(
+                        session_factory, pos_id=str(leg.pos_id)
+                    ),
+                    now_provider=lambda: executed_at,
                 )
                 _mark_management_tpsl_ledger_cancelled(
                     session_factory,
@@ -754,10 +793,23 @@ def _execute_break_even_by_market_batch(
         for protection_row in new_rows:
             try:
                 _require_remediation_live_gate(session_factory, batch=batch)
-                response = deepcoin_client.set_position_sltp(
-                    _protection_row_payload(
-                        common=common, row=protection_row
-                    )
+                payload = _protection_row_payload(
+                    common=common, row=protection_row
+                )
+                response = submit_exact_position_sltp(
+                    session_factory=session_factory,
+                    deepcoin_client=deepcoin_client,
+                    pos_id=str(leg.pos_id),
+                    payload=payload,
+                    idempotency_key=(
+                        f"management:{batch.id}:{leg.id}:set:"
+                        f"{protection_row['purpose']}:{len(responses)}"
+                    ),
+                    live_execution_gate=lambda: exact_position_write_gate(
+                        session_factory, pos_id=str(leg.pos_id)
+                    ),
+                    now_provider=lambda: executed_at,
+                    require_readback=True,
                 )
                 order_id = _extract_order_id(response)
                 if not order_id:
@@ -766,6 +818,16 @@ def _execute_break_even_by_market_batch(
                     )
                 created_order_ids.append(order_id)
                 responses.append(response)
+                _record_management_tpsl_ledger_rows(
+                    session_factory,
+                    batch=batch,
+                    binding=binding,
+                    leg=leg,
+                    inst_id=inst_id,
+                    rows=[protection_row],
+                    order_ids=[order_id],
+                    seen_at=executed_at,
+                )
             except Exception as exc:
                 replacement_error = exc
                 break
@@ -815,19 +877,46 @@ def _execute_break_even_by_market_batch(
         try:
             for order_id in created_order_ids:
                 _require_remediation_live_gate(session_factory, batch=batch)
-                deepcoin_client.cancel_position_sltp(
-                    {
-                        "instType": "SWAP",
-                        "instId": inst_id,
-                        "ordId": order_id,
-                    }
+                cancel_exact_position_sltp(
+                    session_factory=session_factory,
+                    deepcoin_client=deepcoin_client,
+                    pos_id=str(leg.pos_id),
+                    order_id=order_id,
+                    instrument_id=inst_id,
+                    idempotency_key=(
+                        f"management:{batch.id}:{leg.id}:rollback_cancel:{order_id}"
+                    ),
+                    live_execution_gate=lambda: exact_position_write_gate(
+                        session_factory, pos_id=str(leg.pos_id)
+                    ),
+                    now_provider=lambda: executed_at,
+                )
+                _mark_management_tpsl_ledger_cancelled(
+                    session_factory,
+                    batch=batch,
+                    leg=leg,
+                    order_id=order_id,
+                    seen_at=executed_at,
                 )
             for protection_row in old_rows:
                 _require_remediation_live_gate(session_factory, batch=batch)
-                response = deepcoin_client.set_position_sltp(
-                    _protection_row_payload(
-                        common=common, row=protection_row
-                    )
+                payload = _protection_row_payload(
+                    common=common, row=protection_row
+                )
+                response = submit_exact_position_sltp(
+                    session_factory=session_factory,
+                    deepcoin_client=deepcoin_client,
+                    pos_id=str(leg.pos_id),
+                    payload=payload,
+                    idempotency_key=(
+                        f"management:{batch.id}:{leg.id}:restore:"
+                        f"{protection_row['purpose']}:{len(restore_responses)}"
+                    ),
+                    live_execution_gate=lambda: exact_position_write_gate(
+                        session_factory, pos_id=str(leg.pos_id)
+                    ),
+                    now_provider=lambda: executed_at,
+                    require_readback=True,
                 )
                 if not _extract_order_id(response):
                     raise ManagementBatchExecutionError(
@@ -1238,7 +1327,19 @@ def execute_management_batch(
             )
         try:
             _require_remediation_live_gate(session_factory, batch=batch)
-            response = deepcoin_client.place_order(request)
+            response = close_exact_position(
+                session_factory=session_factory,
+                deepcoin_client=deepcoin_client,
+                pos_id=str(leg.pos_id),
+                instrument_id=str(request["instId"]),
+                size=str(request["sz"]),
+                client_order_id=client_order_id,
+                idempotency_key=f"management:{batch.id}:{leg.id}:close:{client_order_id}",
+                live_execution_gate=lambda: exact_position_write_gate(
+                    session_factory, pos_id=str(leg.pos_id)
+                ),
+                now_provider=lambda: now,
+            )
         except ManagementBatchExecutionError as exc:
             if str(exc) != "remediation_live_management_gate_closed":
                 raise
@@ -1268,6 +1369,17 @@ def execute_management_batch(
                 expected_statuses={"reserved"},
                 new_status=failed_leg_status,
                 transitioned_at=now,
+                request={
+                    **request,
+                    "recovery_phase": (
+                        "rejected_close_restore"
+                        if restore_error is not None
+                        else None
+                    ),
+                    "expected_replacement_count": len(
+                        (leg.old_tpsl or {}).get("row_snapshots") or []
+                    ),
+                },
                 last_error={
                     "type": type(exc).__name__,
                     "message": str(exc),
@@ -1603,7 +1715,10 @@ def _execute_protection_batch(
             expected_statuses=expected_leg_statuses,
             new_status="reserved",
             transitioned_at=executed_at,
-            request={"cancel_order_ids": [row["order_id"] for row in old_rows]},
+            request={
+                "cancel_order_ids": [row["order_id"] for row in old_rows],
+                "expected_replacement_count": len(new_rows),
+            },
         ):
             raise ManagementBatchExecutionError(
                 f"management_protection_leg_reservation_conflict:{leg.id}"
@@ -1615,12 +1730,20 @@ def _execute_protection_batch(
                     _require_remediation_live_gate(
                         session_factory, batch=batch
                     )
-                    deepcoin_client.cancel_position_sltp(
-                        {
-                            "instType": "SWAP",
-                            "instId": inst_id,
-                            "ordId": str(row["order_id"]),
-                        }
+                    cancel_exact_position_sltp(
+                        session_factory=session_factory,
+                        deepcoin_client=deepcoin_client,
+                        pos_id=str(leg.pos_id),
+                        order_id=str(row["order_id"]),
+                        instrument_id=inst_id,
+                        idempotency_key=(
+                            f"management:{batch.id}:{leg.id}:cancel:"
+                            f"{row['order_id']}"
+                        ),
+                        live_execution_gate=lambda: exact_position_write_gate(
+                            session_factory, pos_id=str(leg.pos_id)
+                        ),
+                        now_provider=lambda: executed_at,
                     )
                     _mark_management_tpsl_ledger_cancelled(
                         session_factory,
@@ -1652,7 +1775,21 @@ def _execute_protection_batch(
             payload = _protection_row_payload(common=common, row=row)
             try:
                 _require_remediation_live_gate(session_factory, batch=batch)
-                response = deepcoin_client.set_position_sltp(payload)
+                response = submit_exact_position_sltp(
+                    session_factory=session_factory,
+                    deepcoin_client=deepcoin_client,
+                    pos_id=str(leg.pos_id),
+                    payload=payload,
+                    idempotency_key=(
+                        f"management:{batch.id}:{leg.id}:set:"
+                        f"{row['purpose']}:{len(replacement_responses)}"
+                    ),
+                    live_execution_gate=lambda: exact_position_write_gate(
+                        session_factory, pos_id=str(leg.pos_id)
+                    ),
+                    now_provider=lambda: executed_at,
+                    require_readback=True,
+                )
                 order_id = _extract_order_id(response)
                 if not order_id:
                     raise ManagementBatchExecutionError(
@@ -1660,6 +1797,16 @@ def _execute_protection_batch(
                     )
                 created_order_ids.append(order_id)
                 replacement_responses.append(response)
+                _record_management_tpsl_ledger_rows(
+                    session_factory,
+                    batch=batch,
+                    binding=binding,
+                    leg=leg,
+                    inst_id=inst_id,
+                    rows=[row],
+                    order_ids=[order_id],
+                    seen_at=executed_at,
+                )
             except Exception as exc:
                 replacement_error = exc
                 break
@@ -1707,14 +1854,45 @@ def _execute_protection_batch(
         try:
             for order_id in created_order_ids:
                 _require_remediation_live_gate(session_factory, batch=batch)
-                deepcoin_client.cancel_position_sltp(
-                    {"instType": "SWAP", "instId": inst_id, "ordId": order_id}
+                cancel_exact_position_sltp(
+                    session_factory=session_factory,
+                    deepcoin_client=deepcoin_client,
+                    pos_id=str(leg.pos_id),
+                    order_id=order_id,
+                    instrument_id=inst_id,
+                    idempotency_key=(
+                        f"management:{batch.id}:{leg.id}:rollback_cancel:{order_id}"
+                    ),
+                    live_execution_gate=lambda: exact_position_write_gate(
+                        session_factory, pos_id=str(leg.pos_id)
+                    ),
+                    now_provider=lambda: executed_at,
+                )
+                _mark_management_tpsl_ledger_cancelled(
+                    session_factory,
+                    batch=batch,
+                    leg=leg,
+                    order_id=order_id,
+                    seen_at=executed_at,
                 )
             restore_responses = []
             for row in old_rows:
                 _require_remediation_live_gate(session_factory, batch=batch)
-                response = deepcoin_client.set_position_sltp(
-                    _protection_row_payload(common=common, row=row)
+                payload = _protection_row_payload(common=common, row=row)
+                response = submit_exact_position_sltp(
+                    session_factory=session_factory,
+                    deepcoin_client=deepcoin_client,
+                    pos_id=str(leg.pos_id),
+                    payload=payload,
+                    idempotency_key=(
+                        f"management:{batch.id}:{leg.id}:restore:"
+                        f"{row['purpose']}:{len(restore_responses)}"
+                    ),
+                    live_execution_gate=lambda: exact_position_write_gate(
+                        session_factory, pos_id=str(leg.pos_id)
+                    ),
+                    now_provider=lambda: executed_at,
+                    require_readback=True,
                 )
                 if not _extract_order_id(response):
                     raise ManagementBatchExecutionError(
@@ -2110,8 +2288,19 @@ def _cancel_exact_risk_reduction_protection_before_close(
                 )
                 session.commit()
             _require_remediation_live_gate(session_factory, batch=batch)
-            response = deepcoin_client.cancel_position_sltp(
-                {"instType": "SWAP", "instId": inst_id, "ordId": order_id}
+            response = cancel_exact_position_sltp(
+                session_factory=session_factory,
+                deepcoin_client=deepcoin_client,
+                pos_id=str(leg.pos_id),
+                order_id=order_id,
+                instrument_id=inst_id,
+                idempotency_key=(
+                    f"management:{batch.id}:{leg.id}:precancel:{order_id}"
+                ),
+                live_execution_gate=lambda: exact_position_write_gate(
+                    session_factory, pos_id=str(leg.pos_id)
+                ),
+                now_provider=lambda: cancelled_at,
             )
             record_execution_event(
                 session_factory,
@@ -2390,8 +2579,20 @@ def _restore_precancelled_protection_for_rejected_close(
                 session.commit()
             _require_remediation_live_gate(session_factory, batch=batch)
             payload = _protection_row_payload(common=common, row=row)
-            response = deepcoin_client.set_position_sltp(
-                payload
+            response = submit_exact_position_sltp(
+                session_factory=session_factory,
+                deepcoin_client=deepcoin_client,
+                pos_id=str(leg.pos_id),
+                payload=payload,
+                idempotency_key=(
+                    f"management:{batch.id}:{leg.id}:rejected_close_restore:"
+                    f"{row.get('purpose')}:{len(restored_order_ids)}"
+                ),
+                live_execution_gate=lambda: exact_position_write_gate(
+                    session_factory, pos_id=str(leg.pos_id)
+                ),
+                now_provider=lambda: datetime.now(UTC),
+                require_readback=True,
             )
             order_id = _extract_order_id(response)
             if not order_id:

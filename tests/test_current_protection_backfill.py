@@ -133,7 +133,10 @@ def test_apply_supervised_plan_writes_verified_ledger_after_fingerprint_confirma
     result = apply_current_protection_backfill_plan(
         session_factory,
         plan,
+        action_id=plan.actions[0].action_id,
+        pos_id=plan.actions[0].pos_id,
         expected_fingerprint=plan.fingerprint,
+        confirmation_token="current-protection-confirm",
     )
 
     assert result.applied == 1

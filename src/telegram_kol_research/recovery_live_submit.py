@@ -33,6 +33,10 @@ from telegram_kol_research.position_protection_legs import (
     bind_parent_entry_order,
     create_or_get_protection_leg,
 )
+from telegram_kol_research.position_mutation_gateway import (
+    exact_position_write_gate,
+    submit_exact_position_sltp,
+)
 from telegram_kol_research.protection_revisions import activate_protection_revision
 from telegram_kol_research.trigger_protection_intents import (
     create_or_get_trigger_protection_intent,
@@ -388,6 +392,35 @@ def _submit_recovery_signal_direct(
                 side=side_key,
                 exclude_pos_ids=pre_submit_position_ids,
             )
+            provisional_order = {
+                "leg_index": index,
+                "execution_type": "market",
+                "client_order_id": client_order_id,
+                "order_id": order_id,
+                "pos_id": pos_id,
+                "request": _persisted_order_request(order_payload, leg),
+                "response": response,
+            }
+            provisional_binding_id = _upsert_protection_failed_binding(
+                session_factory,
+                trade_signal=trade_signal,
+                draft=draft,
+                source=source,
+                kol_id=kol_id,
+                symbol_key=symbol_key,
+                side_key=side_key,
+                order=provisional_order,
+            )
+            _record_submitted_order_legs(
+                session_factory,
+                binding_id=provisional_binding_id,
+                strategy_instance_id=str(
+                    draft.get("strategy_instance_id")
+                    or trade_signal.strategy_instance_id
+                    or ""
+                ),
+                submitted_orders=[provisional_order],
+            )
             try:
                 protection_payloads = build_deepcoin_position_sltp_payloads(
                     draft,
@@ -396,8 +429,24 @@ def _submit_recovery_signal_direct(
                     include_take_profit=False,
                 )
                 protection_responses = []
-                for payload in protection_payloads:
-                    protection_responses.append(deepcoin_client.set_position_sltp(payload))
+                for protection_index, payload in enumerate(protection_payloads):
+                    protection_responses.append(
+                        submit_exact_position_sltp(
+                            session_factory=session_factory,
+                            deepcoin_client=deepcoin_client,
+                            pos_id=str(pos_id),
+                            payload=payload,
+                            idempotency_key=(
+                                f"recovery:{trade_signal.id}:{index}:set:"
+                                f"{protection_index}"
+                            ),
+                            live_execution_gate=lambda: exact_position_write_gate(
+                                session_factory, pos_id=str(pos_id)
+                            ),
+                            now_provider=lambda: now,
+                            require_readback=True,
+                        )
+                    )
                 protection_payload = (
                     protection_payloads[0] if len(protection_payloads) == 1 else protection_payloads
                 )
@@ -980,6 +1029,13 @@ def _record_submitted_order_legs(
     for order in submitted_orders:
         execution_type = str(order.get("execution_type") or "unknown").lower()
         pos_id = str(order.get("pos_id") or "") or None
+        stored_response = (
+            dict(order.get("response"))
+            if isinstance(order.get("response"), dict)
+            else {}
+        )
+        if pos_id:
+            stored_response["posId"] = pos_id
         upsert_execution_order_leg(
             session_factory,
             ExecutionOrderLegRecord(
@@ -992,8 +1048,9 @@ def _record_submitted_order_legs(
                 client_order_id=str(order.get("client_order_id") or "") or None,
                 pos_id=pos_id,
                 status="active" if pos_id else "open",
+                attribution_status="verified" if pos_id else None,
                 request=order.get("request") if isinstance(order.get("request"), dict) else None,
-                response=order.get("response") if isinstance(order.get("response"), dict) else None,
+                response=stored_response or None,
             ),
         )
 
@@ -1125,18 +1182,18 @@ def _entry_protection_ledger_rows(
     expected_rows = _expected_protection_rows(protection_request)
     if not expected_rows:
         return []
-    combined_row = _combined_entry_protection_ledger_row(
-        expected_rows=expected_rows,
-        pending_tpsl_rows=pending_tpsl_rows,
-        inst_id=inst_id,
-        side=side,
-        pos_id=pos_id,
-    )
-    if combined_row is not None:
-        return [combined_row]
     response_order_ids = _protection_response_order_ids(protection_response)
     response_ids_align_with_rows = len(response_order_ids) == len(expected_rows)
-    if response_order_ids and not response_ids_align_with_rows:
+    if response_ids_align_with_rows:
+        return [
+            {
+                **expected,
+                "order_id": response_order_ids[index],
+                "evidence_match": "exchange_returned_order_id_exact_readback",
+            }
+            for index, expected in enumerate(expected_rows)
+        ]
+    if response_order_ids:
         anchored_rows = _response_anchored_entry_protection_rows(
             expected_rows=expected_rows,
             response_order_ids=response_order_ids,
@@ -1148,37 +1205,7 @@ def _entry_protection_ledger_rows(
         )
         if anchored_rows:
             return anchored_rows
-    resolved: list[dict[str, str | None]] = []
-    used_order_ids: set[str] = set()
-    for index, expected in enumerate(expected_rows):
-        order_id = (
-            response_order_ids[index]
-            if response_ids_align_with_rows and index < len(response_order_ids)
-            else None
-        )
-        evidence_match = "exchange_returned_order_id"
-        pending_order_id = _match_pending_tpsl_order_id(
-            pending_tpsl_rows,
-            inst_id=inst_id,
-            side=side,
-            pos_id=pos_id,
-            purpose=str(expected["purpose"]),
-            trigger_price=str(expected["trigger_price"]),
-        )
-        if pending_order_id:
-            order_id = pending_order_id
-            evidence_match = "pending_tpsl_unique_price"
-        if not order_id or order_id in used_order_ids:
-            continue
-        used_order_ids.add(order_id)
-        resolved.append(
-            {
-                **expected,
-                "order_id": order_id,
-                "evidence_match": evidence_match,
-            }
-        )
-    return resolved
+    return []
 
 
 def _response_anchored_entry_protection_rows(
@@ -1552,8 +1579,8 @@ def _upsert_protection_failed_binding(
     symbol_key: str,
     side_key: str,
     order: dict[str, Any],
-) -> None:
-    upsert_execution_binding(
+) -> int:
+    return upsert_execution_binding(
         session_factory,
         ExecutionBindingRecord(
             kol_id=kol_id,
@@ -2053,11 +2080,16 @@ def _load_matching_position_ids(
     *,
     draft: dict[str, Any],
     side: str,
-) -> set[str] | None:
+) -> set[str]:
     try:
         positions = deepcoin_client.list_positions(inst_id=str(draft["instrument_id"]))
-    except Exception:
-        return None
+    except Exception as exc:
+        # A market entry may share symbol and side with an older position.  Without
+        # a successful pre-submit snapshot, a later lookup cannot prove which
+        # position was created by this order, so fail before placing the order.
+        raise RecoveryLiveSubmitError(
+            "pre_submit_position_snapshot_unavailable"
+        ) from exc
     result: set[str] = set()
     for position in _matching_positions(positions, draft=draft, side=side):
         pos_id = _first_payload_string(position, "posId", "pos_id", "id")

@@ -39,7 +39,8 @@ class _Client:
     def list_positions(self, *, inst_id=None):
         return [{
             "instId": "BTC-USDT-SWAP", "posId": "pos-10", "posSide": "short",
-            "pos": "10", "mrgPosition": "split", "mgnMode": "cross", "cTime": "1000",
+            "pos": "10", "avgPx": "65000", "mrgPosition": "split",
+            "mgnMode": "cross", "cTime": "1000",
         }]
 
     def list_trigger_orders_pending(self, *, inst_id):
@@ -96,12 +97,14 @@ def _ready_convergence(
         session_factory,
         ExecutionOrderLegRecord(
             execution_binding_id=binding_id, leg_index=1, purpose="entry",
+            strategy_instance_id="deepcoin:1:1:BTC:short",
             order_kind=order_kind, venue="deepcoin", pos_id="pos-10", status="active",
         ),
     )
     with session_factory() as session:
         leg = session.get(ExecutionOrderLeg, leg_id)
         leg.attribution_status = "verified"
+        leg.attribution_evidence_json = '{"policy_version":2}'
         convergence = create_or_get_trigger_take_profit_convergence(
             session, venue="deepcoin", execution_order_leg_id=leg_id,
             desired_take_profits=desired_take_profits or [
@@ -632,12 +635,14 @@ def test_execution_verifies_returned_unscoped_native_take_profit_with_same_side_
         def list_positions(self, *, inst_id=None):
             return [
                 {
-                    "instId": "BTC-USDT-SWAP", "posId": "pos-10", "posSide": "short",
-                    "pos": "10", "mrgPosition": "split", "mgnMode": "cross", "cTime": "1000",
+                        "instId": "BTC-USDT-SWAP", "posId": "pos-10", "posSide": "short",
+                        "pos": "10", "avgPx": "65000", "mrgPosition": "split",
+                        "mgnMode": "cross", "cTime": "1000",
                 },
                 {
-                    "instId": "BTC-USDT-SWAP", "posId": "pos-11", "posSide": "short",
-                    "pos": "10", "mrgPosition": "split", "mgnMode": "cross", "cTime": "1000",
+                        "instId": "BTC-USDT-SWAP", "posId": "pos-11", "posSide": "short",
+                        "pos": "10", "avgPx": "65000", "mrgPosition": "split",
+                        "mgnMode": "cross", "cTime": "1000",
                 },
             ]
 

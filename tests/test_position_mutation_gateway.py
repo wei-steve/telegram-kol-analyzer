@@ -13,6 +13,7 @@ from telegram_kol_research.position_mutation_authority import (
 from telegram_kol_research.position_mutation_gateway import (
     PositionMutationGateway,
     position_authority_fingerprint,
+    reconcile_submitted_position_mutation_intents,
 )
 from telegram_kol_research.position_mutation_intents import (
     reserve_position_mutation_intent,
@@ -230,6 +231,151 @@ def test_exact_owner_cancellation_is_submitted_once(tmp_path):
     ]
 
 
+def test_cancel_and_close_intents_confirm_from_terminal_snapshots(tmp_path):
+    session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
+    client = FakeDeepcoinClient()
+    gateway = PositionMutationGateway(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+    )
+    authority = _authority(
+        binding_id=binding_id,
+        leg_id=leg_id,
+        position=SISTER_POSITION,
+        strategy="strategy-sister",
+    )
+    cancelled = gateway.cancel_owned_position_sltp(
+        authority=authority,
+        order_id="ord-sister-stop",
+        idempotency_key="management:65:49:cancel:reconcile",
+    )
+    closed = gateway.close_exact_position(
+        authority=authority,
+        size="10",
+        client_order_id="close-reconcile",
+        idempotency_key="management:65:49:close:reconcile",
+    )
+    with session_factory() as session:
+        close_intent = session.get(
+            PositionMutationIntent, closed.intent_id
+        )
+        close_intent.status = "recovery_required"
+        close_intent.response_json = None
+        session.commit()
+
+    assert (
+        reconcile_submitted_position_mutation_intents(
+            session_factory,
+            pending_trigger_orders=None,
+            order_history=[],
+            trade_fills=[],
+            reconciled_at=NOW,
+        )
+        == 0
+    )
+    with session_factory() as session:
+        assert session.get(
+            PositionMutationIntent, cancelled.intent_id
+        ).status == "submitted"
+
+    confirmed = reconcile_submitted_position_mutation_intents(
+        session_factory,
+        pending_trigger_orders=[],
+        order_history=[
+            {
+                "ordId": "ord-close",
+                "clOrdId": "close-reconcile",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "closePosId": "pos-sister",
+                "sz": "10.0",
+                "status": "filled",
+            }
+        ],
+        trade_fills=[
+            {
+                "ordId": "ord-close",
+                "clOrdId": "close-reconcile",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "closePosId": "pos-sister",
+                "sz": "10.0",
+            }
+        ],
+        reconciled_at=NOW,
+    )
+
+    assert confirmed == 2
+    with session_factory() as session:
+        assert session.get(
+            PositionMutationIntent, cancelled.intent_id
+        ).status == "confirmed"
+        assert session.get(
+            PositionMutationIntent, closed.intent_id
+        ).status == "confirmed"
+        assert (
+            session.query(PositionProtectionLedger)
+            .filter(
+                PositionProtectionLedger.order_id == "ord-sister-stop"
+            )
+            .one()
+            .status
+            == "cancelled"
+        )
+
+
+def test_rejected_close_readback_never_confirms_intent(tmp_path):
+    session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
+    client = FakeDeepcoinClient()
+    gateway = PositionMutationGateway(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+    )
+    result = gateway.close_exact_position(
+        authority=_authority(
+            binding_id=binding_id,
+            leg_id=leg_id,
+            position=SISTER_POSITION,
+            strategy="strategy-sister",
+        ),
+        size="10",
+        client_order_id="close-rejected",
+        idempotency_key="management:65:49:close:rejected",
+    )
+    with session_factory() as session:
+        intent = session.get(PositionMutationIntent, result.intent_id)
+        intent.status = "recovery_required"
+        intent.response_json = None
+        session.commit()
+
+    reconcile_submitted_position_mutation_intents(
+        session_factory,
+        pending_trigger_orders=None,
+        order_history=[
+            {
+                "ordId": "ord-close-rejected",
+                "clOrdId": "close-rejected",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "closePosId": "pos-sister",
+                "sz": "10",
+                "status": "rejected",
+            }
+        ],
+        trade_fills=[],
+        reconciled_at=NOW,
+    )
+
+    with session_factory() as session:
+        intent = session.get(PositionMutationIntent, result.intent_id)
+        assert intent.status == "rejected"
+        assert intent.order_id == "ord-close-rejected"
+
+
 def test_stale_position_fingerprint_blocks_write(tmp_path):
     session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
     client = FakeDeepcoinClient()
@@ -374,9 +520,77 @@ def test_set_sltp_uses_exact_position_and_verified_binding_modes(tmp_path):
             "posId": "pos-sister",
             "tdMode": "cross",
             "slTriggerPx": "62000",
-            "slSize": "0",
+            "sz": "0",
         }
     ]
+
+
+def test_submitted_set_intent_is_confirmed_only_by_exact_pending_readback(
+    tmp_path,
+):
+    session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
+    client = FakeDeepcoinClient()
+    gateway = PositionMutationGateway(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+    )
+    result = gateway.set_exact_position_sltp(
+        authority=_authority(
+            binding_id=binding_id,
+            leg_id=leg_id,
+            position=SISTER_POSITION,
+            strategy="strategy-sister",
+        ),
+        purpose="stop_loss",
+        trigger_price="62000",
+        size="0",
+        idempotency_key="management:65:49:set:readback",
+    )
+    assert result.status == "submitted"
+
+    confirmed = reconcile_submitted_position_mutation_intents(
+        session_factory,
+        pending_trigger_orders=[
+            {
+                "ordId": "ord-new-stop",
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-sister",
+                "posSide": "long",
+                "slTriggerPx": "62000.000",
+                "sz": "0",
+            }
+        ],
+        reconciled_at=NOW,
+    )
+
+    assert confirmed == 1
+    with session_factory() as session:
+        intent = session.get(PositionMutationIntent, result.intent_id)
+        assert intent.status == "confirmed"
+        assert intent.order_id == "ord-new-stop"
+        ledger = (
+            session.query(PositionProtectionLedger)
+            .filter(PositionProtectionLedger.order_id == "ord-new-stop")
+            .one()
+        )
+        assert ledger.status == "verified"
+
+    replay = gateway.set_exact_position_sltp(
+        authority=_authority(
+            binding_id=binding_id,
+            leg_id=leg_id,
+            position=SISTER_POSITION,
+            strategy="strategy-sister",
+        ),
+        purpose="stop_loss",
+        trigger_price="62000",
+        size="0",
+        idempotency_key="management:65:49:set:readback",
+    )
+    assert replay.status == "confirmed"
+    assert len(client.set_position_sltp_calls) == 1
 
 
 def test_close_uses_exact_close_position_id(tmp_path):

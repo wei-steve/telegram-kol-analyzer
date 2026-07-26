@@ -16,6 +16,7 @@ from telegram_kol_research.deepcoin_normalization import (
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionMutationIntent,
     RawMessage,
     StrategyLifecycle,
     StrategyManagementBatch,
@@ -25,6 +26,9 @@ from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
 from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
+from telegram_kol_research.position_mutation_gateway import (
+    reconcile_submitted_position_mutation_intents,
+)
 from telegram_kol_research.strategy_management_market_decisions import (
     BreakEvenMarketDecisionConflict,
     load_break_even_market_decision_in_session,
@@ -80,7 +84,28 @@ def reconcile_strategy_management_batches(
     """Apply exchange truth without submitting or retrying any order."""
 
     now = reconciled_at or datetime.now(UTC)
-    if getattr(snapshot, "errors", {}).get("positions"):
+    snapshot_errors = getattr(snapshot, "errors", {})
+    pending_snapshot_failed = any(
+        key == "pending_trigger_orders"
+        or str(key).startswith("pending_trigger_orders:")
+        for key in snapshot_errors
+    )
+    reconcile_submitted_position_mutation_intents(
+        session_factory,
+        pending_trigger_orders=(
+            list(snapshot.pending_trigger_orders)
+            if (
+                hasattr(snapshot, "pending_trigger_orders")
+                and not pending_snapshot_failed
+            )
+            else None
+        ),
+        order_history=list(getattr(snapshot, "order_history", [])),
+        trade_fills=list(getattr(snapshot, "trade_fills", [])),
+        reconciled_at=now,
+    )
+    _recover_confirmed_protection_legs(session_factory, now=now)
+    if snapshot_errors.get("positions"):
         return ManagementReconciliationResult()
 
     position_rows = _positions_by_id(getattr(snapshot, "positions", []))
@@ -323,6 +348,126 @@ def reconcile_strategy_management_batches(
         session.commit()
 
     return ManagementReconciliationResult(**counts)
+
+
+def _recover_confirmed_protection_legs(
+    session_factory: sessionmaker,
+    *,
+    now: datetime,
+) -> None:
+    """Unfreeze protection legs only when every expected set intent is confirmed."""
+
+    with session_factory() as session:
+        batches = (
+            session.query(StrategyManagementBatch)
+            .filter(
+                StrategyManagementBatch.status == "recovery_required",
+                StrategyManagementBatch.reason_code.like("%protection%"),
+            )
+            .all()
+        )
+        for batch in batches:
+            rejected_close_recovered = False
+            legs = (
+                session.query(StrategyManagementLeg)
+                .filter(
+                    StrategyManagementLeg.management_batch_id == batch.id
+                )
+                .all()
+            )
+            for leg in legs:
+                if leg.status != "recovery_required":
+                    continue
+                request = _load_json_object(leg.request_json)
+                expected_count = int(
+                    request.get("expected_replacement_count") or 0
+                )
+                if expected_count <= 0:
+                    continue
+                last_error = _load_json_object(leg.last_error)
+                recovery_phase = str(
+                    request.get("recovery_phase") or ""
+                )
+                rejected_close_restore = (
+                    recovery_phase == "rejected_close_restore"
+                )
+                restoring = (
+                    rejected_close_restore
+                    or bool(last_error.get("restore_error"))
+                )
+                intent_phases = (
+                    ("restore", "rejected_close_restore")
+                    if restoring
+                    else ("set",)
+                )
+                prefixes = tuple(
+                    f"management:{batch.id}:{leg.id}:{phase}:"
+                    for phase in intent_phases
+                )
+                intents = (
+                    session.query(PositionMutationIntent)
+                    .filter(
+                        PositionMutationIntent.operation
+                        == "set_position_sltp",
+                    )
+                    .all()
+                )
+                intents = [
+                    intent
+                    for intent in intents
+                    if any(
+                        intent.idempotency_key.startswith(prefix)
+                        for prefix in prefixes
+                    )
+                ]
+                if (
+                    len(intents) == expected_count
+                    and all(
+                        intent.status == "confirmed" for intent in intents
+                    )
+                ):
+                    if rejected_close_restore:
+                        leg.status = "failed"
+                        leg.last_error = json.dumps(
+                            {
+                                "reason": (
+                                    "close_rejected_protection_restored"
+                                )
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        rejected_close_recovered = True
+                    else:
+                        leg.status = "restored" if restoring else "succeeded"
+                        leg.last_error = None
+                    leg.updated_at = now
+            if rejected_close_recovered:
+                batch.status = "partial_failed"
+                batch.reason_code = "close_rejected_protection_restored"
+                batch.updated_at = now
+                continue
+            terminal_leg_statuses = {
+                "succeeded",
+                "restored",
+                "confirmed",
+                "closed",
+            }
+            if legs and all(
+                leg.status in terminal_leg_statuses for leg in legs
+            ):
+                batch.status = "protection_ready"
+                batch.reason_code = "protection_intent_readback_confirmed"
+                batch.updated_at = now
+        session.commit()
+
+
+def _load_json_object(value: str | None) -> dict[str, Any]:
+    try:
+        loaded = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def _composite_protection_phase_started(batch, legs) -> bool:

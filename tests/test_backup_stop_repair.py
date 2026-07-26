@@ -32,7 +32,8 @@ class _Client:
     def list_positions(self, *, inst_id=None):
         return [{
             "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
-            "pos": "4.4", "liqPx": "2000", "mrgPosition": "split",
+            "pos": "4.4", "avgPx": "1800", "liqPx": "2000",
+            "mgnMode": "cross", "mrgPosition": "split",
         }]
 
     def list_trigger_orders_pending(self, *, inst_id):
@@ -71,6 +72,7 @@ def _seed(session_factory):
         session_factory,
         ExecutionOrderLegRecord(
             execution_binding_id=binding_id, leg_index=1, purpose="entry", order_kind="market",
+            strategy_instance_id="deepcoin:1:1:ETH:short",
             venue="deepcoin", pos_id="pos-1", status="active", attribution_status="verified",
         ),
     )
@@ -178,12 +180,16 @@ def test_repair_apply_requires_one_position_and_exact_fingerprint(tmp_path):
     with pytest.raises(ValueError, match="pos_id"):
         apply_backup_stop_repair_plan(
             session_factory, plan, deepcoin_client=client, contract_spec_provider=_provider(),
-            pos_id="", expected_fingerprint=plan.fingerprint, now=NOW,
+            pos_id="", action_id=plan.actions[0].action_id,
+            expected_fingerprint=plan.fingerprint,
+            confirmation_token="confirm-test-1", now=NOW,
         )
     with pytest.raises(ValueError, match="fingerprint"):
         apply_backup_stop_repair_plan(
             session_factory, plan, deepcoin_client=client, contract_spec_provider=_provider(),
-            pos_id="pos-1", expected_fingerprint="wrong", now=NOW,
+            pos_id="pos-1", action_id=plan.actions[0].action_id,
+            expected_fingerprint="wrong",
+            confirmation_token="confirm-test-2", now=NOW,
         )
     assert client.set_position_sltp_payloads == []
 
@@ -203,10 +209,25 @@ def test_repair_apply_marks_submitted_native_tpsl_pending_readback_without_retry
 
     result = apply_backup_stop_repair_plan(
         session_factory, plan, deepcoin_client=client, contract_spec_provider=_provider(),
-        pos_id="pos-1", expected_fingerprint=plan.fingerprint, now=NOW,
+        pos_id="pos-1", action_id=plan.actions[0].action_id,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="confirm-test-3", now=NOW,
     )
 
     assert result.status == "pending_readback"
+    assert len(client.set_position_sltp_payloads) == 1
+    with pytest.raises(ValueError, match="confirmation_token already consumed"):
+        apply_backup_stop_repair_plan(
+            session_factory,
+            plan,
+            deepcoin_client=client,
+            contract_spec_provider=_provider(),
+            pos_id="pos-1",
+            action_id=plan.actions[0].action_id,
+            expected_fingerprint=plan.fingerprint,
+            confirmation_token="confirm-test-3",
+            now=NOW,
+        )
     assert len(client.set_position_sltp_payloads) == 1
     assert client.set_position_sltp_payloads[0]["slTriggerPx"] == "1903.8"
     assert "triggerPrice" not in client.set_position_sltp_payloads[0]
@@ -231,7 +252,9 @@ def test_repair_apply_activates_only_after_native_tpsl_readback_matches(tmp_path
 
     result = apply_backup_stop_repair_plan(
         session_factory, plan, deepcoin_client=client, contract_spec_provider=_provider(),
-        pos_id="pos-1", expected_fingerprint=plan.fingerprint, now=NOW,
+        pos_id="pos-1", action_id=plan.actions[0].action_id,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="confirm-test-4", now=NOW,
     )
 
     assert result.status == "active"
@@ -353,12 +376,14 @@ class _TwoSplitPositionsClient(_Client):
         self.position_read_calls.append((self.submitted, inst_id))
         positions = [{
             "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
-            "pos": "4.4", "liqPx": "2000", "mrgPosition": "split", "cTime": "1000",
+            "pos": "4.4", "avgPx": "1800", "liqPx": "2000",
+            "mgnMode": "cross", "mrgPosition": "split", "cTime": "1000",
         }]
         if self.second_revealed:
             positions.append({
                 "instId": "ETH-USDT-SWAP", "posId": "pos-2", "posSide": "short",
-                "pos": "4.4", "liqPx": "2000", "mrgPosition": "split", "cTime": "1000",
+                "pos": "4.4", "avgPx": "1800", "liqPx": "2000",
+                "mgnMode": "cross", "mrgPosition": "split", "cTime": "1000",
             })
         return positions
 
@@ -378,7 +403,8 @@ class _SingleSplitNativeReadbackClient(_Client):
     def list_positions(self, *, inst_id=None):
         return [{
             "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
-            "pos": "4.4", "liqPx": "2000", "mrgPosition": "split", "cTime": "1000",
+            "pos": "4.4", "avgPx": "1800", "liqPx": "2000",
+            "mgnMode": "cross", "mrgPosition": "split", "cTime": "1000",
         }]
 
     def set_position_sltp(self, payload):
@@ -488,7 +514,9 @@ def test_repair_apply_verifies_returned_unscoped_native_tpsl_with_two_split_posi
 
     result = apply_backup_stop_repair_plan(
         session_factory, plan, deepcoin_client=client, contract_spec_provider=_provider(),
-        pos_id="pos-1", expected_fingerprint=plan.fingerprint, now=NOW,
+        pos_id="pos-1", action_id=plan.actions[0].action_id,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="confirm-test-5", now=NOW,
     )
 
     assert result.status == "active"
@@ -511,7 +539,9 @@ def test_repair_apply_does_not_activate_native_tpsl_when_response_has_no_order_i
 
     result = apply_backup_stop_repair_plan(
         session_factory, plan, deepcoin_client=client, contract_spec_provider=_provider(),
-        pos_id="pos-1", expected_fingerprint=plan.fingerprint, now=NOW,
+        pos_id="pos-1", action_id=plan.actions[0].action_id,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="confirm-test-6", now=NOW,
     )
 
     assert result.status == "pending_readback"
@@ -537,7 +567,9 @@ def test_repair_rereads_full_positions_after_submit_race_without_order_id(tmp_pa
 
     result = apply_backup_stop_repair_plan(
         session_factory, plan, deepcoin_client=client, contract_spec_provider=_provider(),
-        pos_id="pos-1", expected_fingerprint=plan.fingerprint, now=NOW,
+        pos_id="pos-1", action_id=plan.actions[0].action_id,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="confirm-test-7", now=NOW,
     )
 
     assert result.status == "pending_readback"
@@ -559,7 +591,9 @@ def test_repair_apply_freezes_when_live_position_readback_is_unavailable(tmp_pat
 
     result = apply_backup_stop_repair_plan(
         session_factory, plan, deepcoin_client=client, contract_spec_provider=_provider(),
-        pos_id="pos-1", expected_fingerprint=plan.fingerprint, now=NOW,
+        pos_id="pos-1", action_id=plan.actions[0].action_id,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="confirm-test-8", now=NOW,
     )
 
     assert result.status == "pending_readback"

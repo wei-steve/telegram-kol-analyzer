@@ -20,6 +20,10 @@ from telegram_kol_research.models import (
     utc_now,
 )
 from telegram_kol_research.position_authority_lock import serialized_position_authority_mutation
+from telegram_kol_research.position_mutation_gateway import (
+    exact_position_write_gate,
+    submit_exact_position_sltp,
+)
 from telegram_kol_research.position_take_profit_orders import (
     record_take_profit_order,
 )
@@ -132,9 +136,23 @@ def execute_trigger_take_profit_convergence(
         convergence.updated_at = now
         session.commit()
 
-    for payload in plan.payloads:
+    for payload_index, payload in enumerate(plan.payloads):
         try:
-            response = deepcoin_client.set_position_sltp(dict(payload))
+            response = submit_exact_position_sltp(
+                session_factory=session_factory,
+                deepcoin_client=deepcoin_client,
+                pos_id=str(payload["posId"]),
+                payload=payload,
+                idempotency_key=(
+                    f"tp-convergence:{convergence_id}:set:{payload_index}"
+                ),
+                live_execution_gate=lambda target_pos_id=str(
+                    payload["posId"]
+                ): exact_position_write_gate(
+                    session_factory, pos_id=target_pos_id
+                ),
+                now_provider=lambda: now,
+            )
         except Exception as exc:
             return _freeze(session_factory, convergence_id, now, "convergence_submit_unknown", error=exc)
         order_id = _response_order_id(response)

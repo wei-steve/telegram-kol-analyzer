@@ -32,6 +32,31 @@ class EntryProtectionLedgerRepairAction:
     trigger_price: str | None
     size_text: str | None
     evidence: dict[str, Any] = field(default_factory=dict)
+    action_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.action_id:
+            return
+        payload = {
+            "event_id": self.event_id,
+            "binding_id": self.binding_id,
+            "leg_id": self.leg_id,
+            "pos_id": self.pos_id,
+            "order_id": self.order_id,
+            "purpose": self.purpose,
+            "trigger_price": self.trigger_price,
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        object.__setattr__(
+            self,
+            "action_id",
+            hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,28 +271,50 @@ def apply_entry_protection_ledger_repair_plan(
     session_factory,
     plan: EntryProtectionLedgerRepairPlan,
     *,
+    action_id: str,
+    pos_id: str,
     expected_fingerprint: str,
+    confirmation_token: str,
     seen_at: datetime | None = None,
 ) -> EntryProtectionLedgerRepairResult:
-    """Apply a previously reviewed plan, guarded by its fingerprint."""
+    """Apply one response-anchored action guarded by a single-use token."""
 
     if not expected_fingerprint:
         raise ValueError("expected_fingerprint is required")
     if expected_fingerprint != plan.fingerprint:
         raise ValueError("repair plan fingerprint mismatch")
-    applied = 0
+    selected = [
+        action
+        for action in plan.actions
+        if action.action_id == str(action_id)
+        and action.pos_id == str(pos_id)
+        and action.evidence.get("match") == "response_anchored_order"
+    ]
+    if len(selected) != 1:
+        raise ValueError("exactly one response-anchored repair action is required")
+    action = selected[0]
+    consumed_at = seen_at or datetime.now(UTC)
+    from telegram_kol_research.repair_confirmation import (
+        consume_repair_confirmation_token,
+    )
+
+    consume_repair_confirmation_token(
+        session_factory,
+        confirmation_token=confirmation_token,
+        action_kind="entry_protection_ledger_repair",
+        action_id=action.action_id,
+        pos_id=action.pos_id,
+        consumed_at=consumed_at,
+    )
     with session_factory() as session:
-        for action in plan.actions:
-            row = upsert_entry_protection_ledger_action(
-                session,
-                action,
-                evidence_source="entry_protection_event_repair",
-                seen_at=seen_at,
-            )
-            if row is not None:
-                applied += 1
+        row = upsert_entry_protection_ledger_action(
+            session,
+            action,
+            evidence_source="entry_protection_event_repair",
+            seen_at=consumed_at,
+        )
         session.commit()
-    return EntryProtectionLedgerRepairResult(applied=applied)
+    return EntryProtectionLedgerRepairResult(applied=1 if row is not None else 0)
 
 
 def _plan_event_repair(
@@ -364,42 +411,15 @@ def _plan_event_repair(
     missing_purposes = [
         purpose for purpose in expected_by_purpose if purpose not in matched_purposes
     ]
-    for purpose in missing_purposes:
-        candidates = [
-            row
-            for row in pending_rows
-            if _row_order_id(row) not in returned_order_id_set
-            and _row_matches_exchange_identity(
-                row, instrument_id=instrument_id, side=side, pos_id=pos_id
-            )
-            and _row_matches_expected(row, expected_by_purpose[purpose])
-            and _row_time_within(row, returned_times, max_sibling_time_seconds)
-            and _row_time_within(row, [event_time], max_event_to_order_seconds)
-        ]
-        unique_order_ids = sorted({_row_order_id(row) for row in candidates if _row_order_id(row)})
-        if len(unique_order_ids) != 1:
-            return [], _refusal(
-                event,
-                "sibling_tpsl_not_unique" if unique_order_ids else "sibling_tpsl_missing",
-                {
-                    "purpose": purpose,
-                    "candidate_order_ids": unique_order_ids,
-                    "anchor_order_ids": response_order_ids,
-                },
-            )
-        row = next(row for row in candidates if _row_order_id(row) == unique_order_ids[0])
-        if unique_order_ids[0] not in existing_order_ids:
-            planned.append(
-                _action_from_expected(
-                    event,
-                    leg,
-                    expected_by_purpose[purpose],
-                    row,
-                    order_id=unique_order_ids[0],
-                    match="response_anchored_sibling_tpsl",
-                    anchor_order_ids=response_order_ids,
-                )
-            )
+    if missing_purposes:
+        return [], _refusal(
+            event,
+            "response_order_id_missing_for_purpose",
+            {
+                "missing_purposes": missing_purposes,
+                "anchor_order_ids": response_order_ids,
+            },
+        )
     return planned, None
 
 

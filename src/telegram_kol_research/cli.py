@@ -2006,7 +2006,10 @@ def plan_current_protection_backfill(
     mapping_file: Path = typer.Option(..., "--mapping-file", exists=True, readable=True),
     database_path: Path = Path("data/research.db"),
     apply: bool = typer.Option(False, "--apply"),
+    action_id: str | None = typer.Option(None, "--action-id"),
+    pos_id: str | None = typer.Option(None, "--pos-id"),
     expected_fingerprint: str | None = typer.Option(None, "--expected-fingerprint"),
+    confirmation_token: str | None = typer.Option(None, "--confirmation-token"),
 ) -> None:
     """Plan or apply explicitly supervised current TPSL mappings."""
 
@@ -2067,12 +2070,23 @@ def plan_current_protection_backfill(
     )
     if not apply:
         return
-    if plan.actions and not expected_fingerprint:
-        raise typer.BadParameter("--expected-fingerprint is required for a nonempty plan")
+    if plan.actions and (
+        not action_id
+        or not pos_id
+        or not expected_fingerprint
+        or not confirmation_token
+    ):
+        raise typer.BadParameter(
+            "--action-id, --pos-id, --expected-fingerprint, and "
+            "--confirmation-token are required for apply"
+        )
     result = apply_current_protection_backfill_plan(
         session_factory,
         plan,
+        action_id=action_id or "",
+        pos_id=pos_id or "",
         expected_fingerprint=expected_fingerprint or "",
+        confirmation_token=confirmation_token or "",
     )
     typer.echo(f"Applied {result.applied} supervised current protection ledger row(s).")
 
@@ -2081,6 +2095,10 @@ def plan_current_protection_backfill(
 def repair_entry_protection_ledger(
     database_path: Path = Path("data/research.db"),
     apply: bool = typer.Option(False, "--apply"),
+    action_id: str | None = typer.Option(None, "--action-id"),
+    confirmation_token: str | None = typer.Option(
+        None, "--confirmation-token"
+    ),
     expected_fingerprint: str | None = typer.Option(
         None, "--expected-fingerprint"
     ),
@@ -2116,16 +2134,25 @@ def repair_entry_protection_ledger(
     )
     if not apply:
         return
-    if plan.has_actions and not expected_fingerprint:
+    if plan.has_actions and (
+        not action_id
+        or not pos_id
+        or not expected_fingerprint
+        or not confirmation_token
+    ):
         typer.echo(
-            "Refusing apply: --expected-fingerprint is required for a nonempty plan.",
+            "Refusing apply: --action-id, --pos-id, "
+            "--expected-fingerprint, and --confirmation-token are required.",
             err=True,
         )
         raise typer.Exit(code=2)
     result = apply_entry_protection_ledger_repair_plan(
         session_factory,
         plan,
+        action_id=action_id or "",
+        pos_id=pos_id or "",
         expected_fingerprint=expected_fingerprint or "",
+        confirmation_token=confirmation_token or "",
     )
     typer.echo(f"Applied {result.applied} entry protection ledger repair(s).")
 
@@ -2147,8 +2174,10 @@ def repair_backup_stops(
     database_path: Path = Path("data/research.db"),
     deepcoin_contract_specs_path: Path = Path("config/deepcoin_contract_specs.yaml"),
     pos_id: str | None = typer.Option(None, "--pos-id"),
+    action_id: str | None = typer.Option(None, "--action-id"),
     apply: bool = typer.Option(False, "--apply"),
     expected_fingerprint: str | None = typer.Option(None, "--expected-fingerprint"),
+    confirmation_token: str | None = typer.Option(None, "--confirmation-token"),
 ) -> None:
     """Dry-run or apply one fingerprinted exact-position backup stop repair."""
 
@@ -2169,9 +2198,15 @@ def repair_backup_stops(
     if not apply:
         return
     clean_pos_id = str(pos_id or "").strip()
-    if not clean_pos_id or not expected_fingerprint:
+    if (
+        not clean_pos_id
+        or not action_id
+        or not expected_fingerprint
+        or not confirmation_token
+    ):
         typer.echo(
-            "Refusing apply: --apply requires both --pos-id and --expected-fingerprint.",
+            "Refusing apply: --apply requires --action-id, --pos-id, "
+            "--expected-fingerprint, and --confirmation-token.",
             err=True,
         )
         raise typer.Exit(code=2)
@@ -2187,7 +2222,9 @@ def repair_backup_stops(
         deepcoin_client=client,
         contract_spec_provider=contract_spec_provider,
         pos_id=clean_pos_id,
+        action_id=action_id,
         expected_fingerprint=expected_fingerprint,
+        confirmation_token=confirmation_token,
         now=datetime.now(UTC),
     )
     typer.echo(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -27,6 +27,14 @@ from telegram_kol_research.native_tpsl import (
     match_native_tpsl_order,
     normalize_native_tpsl,
 )
+from telegram_kol_research.position_mutation_gateway import (
+    exact_position_write_gate,
+    submit_exact_position_sltp,
+)
+from telegram_kol_research.repair_confirmation import (
+    consume_repair_confirmation_token,
+    require_repair_confirmation_token_unused,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +50,7 @@ class NativeTpslMigrationAction:
     legacy_order_id: str
     native_stop: str
     request_payload: dict[str, str]
+    action_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +158,10 @@ def build_native_tpsl_migration_plan(
                     "slTriggerPx": native_stop, "slTriggerPxType": "last", "slOrdPx": "-1",
                 },
             )
+            action = replace(
+                action,
+                action_id=_fingerprint(asdict(action)),
+            )
             legacy_rows = [row for row in pending if _order_id(row) == legacy_order_id]
             if len(legacy_rows) != 1 or normalize_native_tpsl(legacy_rows[0]) is not None:
                 conflicts.append(_conflict(pos_id, "legacy_backup_not_pending"))
@@ -181,7 +194,9 @@ def apply_native_tpsl_migration_plan(
     *,
     deepcoin_client,
     pos_id: str,
+    action_id: str,
     expected_fingerprint: str,
+    confirmation_token: str,
     now: datetime | None = None,
 ) -> NativeTpslMigrationResult:
     """Migrate exactly one reviewed legacy backup; never retry uncertain writes."""
@@ -189,20 +204,61 @@ def apply_native_tpsl_migration_plan(
     clean_pos_id = str(pos_id or "").strip()
     if not clean_pos_id:
         raise ValueError("pos_id is required")
+    if not str(action_id or "").strip():
+        raise ValueError("action_id is required")
     if not expected_fingerprint:
         raise ValueError("expected fingerprint is required")
+    if len(str(confirmation_token or "").strip()) < 8:
+        raise ValueError("confirmation_token is required")
     if expected_fingerprint != plan.fingerprint:
         raise ValueError("migration plan fingerprint mismatch")
+    reviewed = [
+        action
+        for action in plan.actions
+        if action.pos_id == clean_pos_id and action.action_id == action_id
+    ]
+    if len(reviewed) != 1:
+        raise ValueError("exactly one reviewed migration action is required")
+    confirmation_key = (
+        f"native-tpsl-migration:{action_id}:confirmation:"
+        f"{hashlib.sha256(str(confirmation_token).encode('utf-8')).hexdigest()}"
+    )
+    require_repair_confirmation_token_unused(
+        session_factory,
+        confirmation_token=confirmation_token,
+    )
     fresh = build_native_tpsl_migration_plan(session_factory, deepcoin_client=deepcoin_client, now=now)
     if fresh.fingerprint != expected_fingerprint:
         raise ValueError("migration plan fingerprint changed")
-    selected = [action for action in fresh.actions if action.pos_id == clean_pos_id]
+    selected = [
+        action
+        for action in fresh.actions
+        if action.pos_id == clean_pos_id and action.action_id == action_id
+    ]
     if len(selected) != 1:
         raise ValueError("exactly one migration action is required for pos_id")
     action = selected[0]
     observed_at = now or datetime.now(UTC)
+    consume_repair_confirmation_token(
+        session_factory,
+        confirmation_token=confirmation_token,
+        action_kind="native_tpsl_migration",
+        action_id=action.action_id,
+        pos_id=action.pos_id,
+        consumed_at=observed_at,
+    )
     try:
-        response = deepcoin_client.set_position_sltp(dict(action.request_payload))
+        response = submit_exact_position_sltp(
+            session_factory=session_factory,
+            deepcoin_client=deepcoin_client,
+            pos_id=action.pos_id,
+            payload=action.request_payload,
+            idempotency_key=confirmation_key,
+            live_execution_gate=lambda: exact_position_write_gate(
+                session_factory, pos_id=action.pos_id
+            ),
+            now_provider=lambda: observed_at,
+        )
         response_order_id = _response_order_id(response)
     except Exception as exc:
         _record_event(

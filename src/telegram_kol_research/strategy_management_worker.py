@@ -352,6 +352,24 @@ def run_strategy_management_worker_tick(
                 resolve_race_successor(batch_id=batch.id, current_snapshot=current_snapshot)
                 counts["recovered"] += 1
                 continue
+            if (
+                batch.status == "recovery_required"
+                and "protection" in str(batch.reason_code or "")
+            ):
+                reconciler(
+                    session_factory,
+                    snapshot=get_snapshot(),
+                    reconciled_at=now,
+                    batch_ids={batch.id},
+                )
+                refreshed = load_management_batch(
+                    session_factory, batch.id
+                )
+                if refreshed.status != "recovery_required":
+                    counts["recovered"] += 1
+                else:
+                    counts["paused"] += 1
+                continue
             if batch.status in _PAUSED_STATUSES:
                 counts["paused"] += 1
                 continue

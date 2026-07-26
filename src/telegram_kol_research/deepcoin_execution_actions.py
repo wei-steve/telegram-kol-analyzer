@@ -29,11 +29,18 @@ from telegram_kol_research.models import (
     BoundPositionCloseReservation,
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionProtectionLedger,
     RawMessage,
     StrategyLifecycle,
 )
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
+)
+from telegram_kol_research.position_mutation_gateway import (
+    cancel_exact_position_sltp,
+    close_exact_position,
+    exact_position_write_gate,
+    submit_exact_position_sltp,
 )
 from telegram_kol_research.position_attribution import (
     PositionAttributionError,
@@ -258,36 +265,44 @@ def adjust_position_tpsl(
         cancel_payload = {
             "instType": "SWAP", "instId": inst_id, "ordId": str(order_id)
         }
-        response = deepcoin_client.cancel_position_sltp(cancel_payload)
-        cancel_responses.append({"order_id": str(order_id), "response": response})
-        record_execution_event(
-            session_factory,
-            ExecutionEventRecord(
-                execution_binding_id=binding.id,
-                trade_signal_id=trade_signal.id,
-                strategy_instance_id=binding.strategy_instance_id,
-                kol_id=binding.kol_id,
-                chat_id=binding.chat_id,
-                message_id=binding.message_id,
-                source_message_id=trade_signal.message_id,
-                symbol=binding.symbol,
-                side=binding.side,
-                action="cancel_position_tpsl",
-                order_id=str(order_id),
-                pos_id=_first_string(position, "posId", "pos_id", "id"),
-                reason=trade_signal.action,
-                before=before,
-                request=cancel_payload,
-                response=response,
-                created_at=now,
+        response = cancel_exact_position_sltp(
+            session_factory=session_factory,
+            deepcoin_client=deepcoin_client,
+            pos_id=str(pos_id),
+            order_id=str(order_id),
+            instrument_id=inst_id,
+            idempotency_key=(
+                f"signal:{trade_signal.id}:cancel:{order_id}"
             ),
+            live_execution_gate=lambda: exact_position_write_gate(
+                session_factory, pos_id=str(pos_id)
+            ),
+            now_provider=lambda: now,
         )
-
+        _mark_position_tpsl_ledger_cancelled(
+            session_factory,
+            order_id=str(order_id),
+            seen_at=now,
+        )
+        cancel_responses.append({"order_id": str(order_id), "response": response})
     set_responses: list[dict[str, Any]] = []
     new_order_ids: list[str] = []
     try:
         for set_payload in set_payloads:
-            set_response = deepcoin_client.set_position_sltp(set_payload)
+            set_response = submit_exact_position_sltp(
+                session_factory=session_factory,
+                deepcoin_client=deepcoin_client,
+                pos_id=str(pos_id),
+                payload=set_payload,
+                idempotency_key=(
+                    f"signal:{trade_signal.id}:set:{len(set_responses)}"
+                ),
+                live_execution_gate=lambda: exact_position_write_gate(
+                    session_factory, pos_id=str(pos_id)
+                ),
+                now_provider=lambda: now,
+                require_readback=True,
+            )
             new_order_id = _extract_order_id(set_response)
             if not new_order_id:
                 raise DeepcoinExecutionActionError(
@@ -295,6 +310,16 @@ def adjust_position_tpsl(
                 )
             set_responses.append(set_response)
             new_order_ids.append(new_order_id)
+            _record_position_tpsl_ledger_rows(
+                session_factory,
+                binding=binding,
+                position=position,
+                inst_id=inst_id,
+                rows=[adjusted_row_snapshots[len(new_order_ids) - 1]],
+                order_ids=[new_order_id],
+                evidence_source="tpsl_write_response",
+                seen_at=now,
+            )
     except Exception as replacement_error:
         if not isinstance(replacement_error, DeepcoinDefiniteRejection):
             raise DeepcoinExecutionActionError(
@@ -302,12 +327,42 @@ def adjust_position_tpsl(
             ) from replacement_error
         try:
             for new_order_id in new_order_ids:
-                deepcoin_client.cancel_position_sltp(
-                    {"instType": "SWAP", "instId": inst_id, "ordId": new_order_id}
+                cancel_exact_position_sltp(
+                    session_factory=session_factory,
+                    deepcoin_client=deepcoin_client,
+                    pos_id=str(pos_id),
+                    order_id=new_order_id,
+                    instrument_id=inst_id,
+                    idempotency_key=(
+                        f"signal:{trade_signal.id}:rollback_cancel:{new_order_id}"
+                    ),
+                    live_execution_gate=lambda: exact_position_write_gate(
+                        session_factory, pos_id=str(pos_id)
+                    ),
+                    now_provider=lambda: now,
                 )
-            for old_row in old_row_snapshots:
-                restore_response = deepcoin_client.set_position_sltp(
-                    _build_position_tpsl_row_payload(common_payload, old_row)
+                _mark_position_tpsl_ledger_cancelled(
+                    session_factory,
+                    order_id=new_order_id,
+                    seen_at=now,
+                )
+            for restore_index, old_row in enumerate(old_row_snapshots):
+                restore_payload = _build_position_tpsl_row_payload(
+                    common_payload, old_row
+                )
+                restore_response = submit_exact_position_sltp(
+                    session_factory=session_factory,
+                    deepcoin_client=deepcoin_client,
+                    pos_id=str(pos_id),
+                    payload=restore_payload,
+                    idempotency_key=(
+                        f"signal:{trade_signal.id}:restore:{restore_index}"
+                    ),
+                    live_execution_gate=lambda: exact_position_write_gate(
+                        session_factory, pos_id=str(pos_id)
+                    ),
+                    now_provider=lambda: now,
+                    require_readback=True,
                 )
                 if not _extract_order_id(restore_response):
                     raise DeepcoinExecutionActionError(
@@ -333,6 +388,34 @@ def adjust_position_tpsl(
         evidence_source="tpsl_write_response",
         seen_at=now,
     )
+    for cancelled in cancel_responses:
+        cancelled_order_id = str(cancelled["order_id"])
+        record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                execution_binding_id=binding.id,
+                trade_signal_id=trade_signal.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                kol_id=binding.kol_id,
+                chat_id=binding.chat_id,
+                message_id=binding.message_id,
+                source_message_id=trade_signal.message_id,
+                symbol=binding.symbol,
+                side=binding.side,
+                action="cancel_position_tpsl",
+                order_id=cancelled_order_id,
+                pos_id=_first_string(position, "posId", "pos_id", "id"),
+                reason=trade_signal.action,
+                before=before,
+                request={
+                    "instType": "SWAP",
+                    "instId": inst_id,
+                    "ordId": cancelled_order_id,
+                },
+                response=cancelled["response"],
+                created_at=now,
+            ),
+        )
     record_execution_event(
         session_factory,
         ExecutionEventRecord(
@@ -559,7 +642,21 @@ def close_bound_position_market(
         now=now,
     )
     try:
-        response = deepcoin_client.place_order(payload)
+        response = close_exact_position(
+            session_factory=session_factory,
+            deepcoin_client=deepcoin_client,
+            pos_id=normalized_pos_id,
+            instrument_id=inst_id,
+            size=f"{close_size:g}",
+            client_order_id=None,
+            idempotency_key=(
+                f"bound-close:{binding.id}:{normalized_pos_id}"
+            ),
+            live_execution_gate=lambda: exact_position_write_gate(
+                session_factory, pos_id=normalized_pos_id
+            ),
+            now_provider=lambda: now,
+        )
     except Exception as exc:
         _mark_bound_position_close_reservation(
             session_factory,
@@ -1488,6 +1585,31 @@ def _record_position_tpsl_ledger_rows(
                 evidence={"match": "exchange_returned_order_id"},
                 seen_at=seen_at,
             )
+        session.commit()
+
+
+def _mark_position_tpsl_ledger_cancelled(
+    session_factory: sessionmaker,
+    *,
+    order_id: str,
+    seen_at: datetime,
+) -> None:
+    with session_factory() as session:
+        row = (
+            session.query(PositionProtectionLedger)
+            .filter(
+                PositionProtectionLedger.venue == "deepcoin",
+                PositionProtectionLedger.order_id == str(order_id),
+            )
+            .one_or_none()
+        )
+        if row is None:
+            raise DeepcoinExecutionActionError(
+                "position_tpsl_ledger_owner_missing"
+            )
+        row.status = "cancelled"
+        row.last_seen_at = seen_at
+        row.updated_at = seen_at
         session.commit()
 
 

@@ -64,7 +64,18 @@ def reserve_position_mutation_intent(
             .one_or_none()
         )
         if existing is not None:
-            if _intent_identity(existing) != identity:
+            existing_identity = _intent_identity(existing)
+            if (
+                existing.status == "confirmed"
+                and order_id is None
+                and existing.order_id
+            ):
+                existing_identity = (
+                    *existing_identity[:5],
+                    None,
+                    *existing_identity[6:],
+                )
+            if existing_identity != identity:
                 raise PositionMutationIntentError(
                     "position_mutation_intent_conflict"
                 )

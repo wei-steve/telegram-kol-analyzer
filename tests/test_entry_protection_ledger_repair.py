@@ -6,10 +6,13 @@ import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_protection_ledger_repair import (
+    EntryProtectionLedgerRepairAction,
+    EntryProtectionLedgerRepairPlan,
     apply_entry_protection_ledger_repair_plan,
     build_entry_protection_ledger_repair_plan,
     plan_trigger_protection_intent_adoption,
     plan_verified_trigger_entry_protection_adoption,
+    upsert_entry_protection_ledger_action,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -28,8 +31,55 @@ class FakeDeepcoinClient:
     def list_trigger_orders_pending(self, *, inst_id):
         self.pending_calls.append(inst_id)
         return [
-            row for row in self.rows if str(row.get("instId") or "").upper() == inst_id
+            row
+            for row in self.rows
+            if str(row.get("instId") or "").upper() == inst_id
         ]
+
+
+def test_entry_repair_apply_accepts_only_one_response_anchored_action(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    leg_ids = []
+    _seed_entry_protection_event(
+        session_factory,
+        binding_id=149,
+        leg_id_holder=leg_ids,
+        pos_id="1001124189941220",
+        returned_order_id="1001124189941227",
+    )
+    action = EntryProtectionLedgerRepairAction(
+        event_id=1,
+        binding_id=149,
+        leg_id=leg_ids[0],
+        strategy_instance_id="deepcoin:1",
+        pos_id="1001124189941220",
+        instrument_id="ETH-USDT-SWAP",
+        side="long",
+        order_id="1001124189941227",
+        purpose="take_profit",
+        trigger_price="1955",
+        size_text="4.4",
+        evidence={"match": "response_anchored_order"},
+    )
+    plan = EntryProtectionLedgerRepairPlan(
+        created_at=datetime(2026, 7, 18, 8, 0, tzinfo=UTC),
+        actions=(action,),
+        refusals=(),
+        fingerprint="f" * 64,
+    )
+
+    result = apply_entry_protection_ledger_repair_plan(
+        session_factory,
+        plan,
+        action_id=action.action_id,
+        pos_id=action.pos_id,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="entry-exact-confirm",
+    )
+
+    assert result.applied == 1
 
 
 def test_entry_protection_repair_anchors_returned_order_and_sibling_tpsl(tmp_path):
@@ -64,38 +114,16 @@ def test_entry_protection_repair_anchors_returned_order_and_sibling_tpsl(tmp_pat
         now=datetime(2026, 7, 18, 8, 0, tzinfo=UTC),
     )
 
-    assert plan.refusals == ()
-    assert [(row.order_id, row.purpose, row.trigger_price) for row in plan.actions] == [
-        ("1001124189941227", "take_profit", "1955"),
-        ("1001124189941228", "stop_loss", "1788"),
-    ]
+    assert plan.actions == ()
+    assert plan.refusals[0].reason == (
+        "response_order_id_missing_for_purpose"
+    )
+    assert plan.refusals[0].evidence == {
+        "missing_purposes": ["stop_loss"],
+        "anchor_order_ids": ["1001124189941227"],
+    }
     with session_factory() as session:
         assert session.query(PositionProtectionLedger).count() == 0
-
-    result = apply_entry_protection_ledger_repair_plan(
-        session_factory,
-        plan,
-        expected_fingerprint=plan.fingerprint,
-    )
-
-    assert result.applied == 2
-    with session_factory() as session:
-        rows = (
-            session.query(PositionProtectionLedger)
-            .order_by(PositionProtectionLedger.order_id.asc())
-            .all()
-        )
-    assert [(row.order_id, row.purpose, row.pos_id) for row in rows] == [
-        ("1001124189941227", "take_profit", "1001124189941220"),
-        ("1001124189941228", "stop_loss", "1001124189941220"),
-    ]
-    assert {row.evidence_source for row in rows} == {
-        "entry_protection_event_repair"
-    }
-    assert {json.loads(row.evidence_json)["match"] for row in rows} == {
-        "response_anchored_order",
-        "response_anchored_sibling_tpsl",
-    }
 
 
 def test_entry_protection_repair_refuses_when_returned_order_missing(tmp_path):
@@ -195,7 +223,9 @@ def test_entry_protection_repair_refuses_ambiguous_sibling(tmp_path):
     )
 
     assert plan.actions == ()
-    assert plan.refusals[0].reason == "sibling_tpsl_not_unique"
+    assert plan.refusals[0].reason == (
+        "response_order_id_missing_for_purpose"
+    )
 
 
 def test_entry_protection_repair_refuses_unverified_entry_leg(tmp_path):
@@ -346,11 +376,14 @@ def test_entry_protection_repair_skips_already_repaired_trigger_entry(tmp_path):
         binding_id=152,
         include_trigger_entries=True,
     )
-    apply_entry_protection_ledger_repair_plan(
-        session_factory,
-        initial_plan,
-        expected_fingerprint=initial_plan.fingerprint,
-    )
+    with session_factory() as session:
+        upsert_entry_protection_ledger_action(
+            session,
+            initial_plan.actions[0],
+            evidence_source="test_existing_trigger_protection",
+            seen_at=datetime(2026, 7, 20, 2, 0, tzinfo=UTC),
+        )
+        session.commit()
 
     followup_plan = build_entry_protection_ledger_repair_plan(
         session_factory,

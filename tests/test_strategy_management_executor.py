@@ -262,6 +262,32 @@ def _persist_protection_batch(
             leg.planned_tpsl_json = json.dumps(
                 {"intent": action, "stop_loss_text": stop_loss}
             )
+            for row in rows:
+                purpose = (
+                    "take_profit"
+                    if row.get("tpTriggerPx")
+                    else "stop_loss"
+                )
+                upsert_protection_ledger_row(
+                    session,
+                    venue="deepcoin",
+                    execution_binding_id=stored_batch.execution_binding_id,
+                    execution_order_leg_id=leg.execution_order_leg_id,
+                    strategy_instance_id=stored_batch.strategy_instance_id,
+                    pos_id=pos_id,
+                    instrument_id="BTC-USDT-SWAP",
+                    side="short",
+                    order_id=row["ordId"],
+                    purpose=purpose,
+                    trigger_price=(
+                        row.get("tpTriggerPx") or row.get("slTriggerPx")
+                    ),
+                    size_text=row.get("sz"),
+                    status="verified",
+                    evidence_source="test_exact_owner",
+                    evidence={"source": "management_fixture"},
+                    seen_at=NOW,
+                )
         session.commit()
     return load_management_batch(session_factory, batch.id), rows_by_pos
 
@@ -315,6 +341,9 @@ class _FakeClient:
                     "instId": "BTC-USDT-SWAP",
                     "posSide": binding.side,
                     "pos": leg.preflight_size,
+                    "avgPx": "64000",
+                    "mgnMode": binding.margin_mode,
+                    "mrgPosition": binding.position_mode,
                 }
                 for leg in legs
             ]
@@ -375,6 +404,8 @@ class _ProtectionClient:
                 "posSide": "short",
                 "pos": "2",
                 "avgPx": "64000",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
                 "cTime": "1000",
             },
             {
@@ -383,6 +414,8 @@ class _ProtectionClient:
                 "posSide": "short",
                 "pos": "4",
                 "avgPx": "64500",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
                 "cTime": "1001",
             },
         ]
@@ -461,8 +494,35 @@ class _ProtectionClient:
             outcome = self.set_outcomes.pop(0)
             if isinstance(outcome, BaseException):
                 raise outcome
-            return outcome
-        return {"code": "0", "data": {"ordId": f"new-{len(self.set_calls)}"}}
+            response = outcome
+        else:
+            response = {"code": "0", "data": {"ordId": f"new-{len(self.set_calls)}"}}
+        order_id = _response_order_id_for_test(response)
+        if order_id:
+            self.pending.append(
+                {
+                    "ordId": order_id,
+                    "instId": payload["instId"],
+                    "posId": payload["posId"],
+                    "posSide": payload["posSide"],
+                    **(
+                        {"slTriggerPx": payload["slTriggerPx"]}
+                        if payload.get("slTriggerPx") not in (None, "")
+                        else {"tpTriggerPx": payload["tpTriggerPx"]}
+                    ),
+                    "sz": payload.get("sz", "0"),
+                }
+            )
+        return response
+
+
+def _response_order_id_for_test(response):
+    data = response.get("data") if isinstance(response, dict) else None
+    if isinstance(data, str):
+        return data
+    if isinstance(data, dict):
+        return data.get("ordId")
+    return None
 
 
 def _legacy_close_signal(session_factory, batch, **overrides):
@@ -1381,6 +1441,7 @@ def test_break_even_by_market_rejected_protection_restores_only_that_leg(
         rows = (
             session.query(PositionProtectionLedger)
             .filter(PositionProtectionLedger.pos_id == "pos-2")
+            .filter(PositionProtectionLedger.status == "verified")
             .order_by(PositionProtectionLedger.order_id)
             .all()
         )
@@ -3400,6 +3461,30 @@ def test_partial_then_break_even_uses_explicit_stop_and_ignores_zero_combined_si
                 "row_snapshots": legacy_snapshots,
             }
         )
+        for row, purpose in zip(
+            rows_by_pos["pos-1"],
+            ("take_profit", "stop_loss"),
+        ):
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=batch.execution_binding_id,
+                execution_order_leg_id=leg.execution_order_leg_id,
+                strategy_instance_id=batch.strategy_instance_id,
+                pos_id="pos-1",
+                instrument_id="BTC-USDT-SWAP",
+                side="short",
+                order_id=row["ordId"],
+                purpose=purpose,
+                trigger_price=(
+                    row.get("tpTriggerPx") or row.get("slTriggerPx")
+                ),
+                size_text=row.get("sz"),
+                status="verified",
+                evidence_source="test_exact_owner",
+                evidence={"source": "legacy_combined_fixture"},
+                seen_at=NOW,
+            )
         session.commit()
 
     client = _ProtectionClient(session_factory, rows_by_pos)
@@ -3424,16 +3509,20 @@ def test_partial_then_break_even_uses_explicit_stop_and_ignores_zero_combined_si
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "short",
                 "pos": "1",
-                "avgPx": "64103.8",
-                "cTime": "1000",
+                    "avgPx": "64103.8",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                    "cTime": "1000",
             },
             {
                 "posId": "pos-2",
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "short",
                 "pos": "2",
-                "avgPx": "64500",
-                "cTime": "1001",
+                    "avgPx": "64500",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                    "cTime": "1001",
             },
         ],
         open_orders=[],
@@ -3593,16 +3682,20 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "short",
                 "pos": "1",
-                "avgPx": "64000",
-                "cTime": "1000",
+                    "avgPx": "64000",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                    "cTime": "1000",
             },
             {
                 "posId": "pos-2",
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "short",
                 "pos": "2",
-                "avgPx": "64500",
-                "cTime": "1001",
+                    "avgPx": "64500",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                    "cTime": "1001",
             },
         ],
         open_orders=[],
@@ -3938,16 +4031,20 @@ def test_partial_then_break_even_replaces_protection_after_exchange_resizes_old_
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "short",
                 "pos": "1",
-                "avgPx": "64000",
-                "cTime": "1000",
+                    "avgPx": "64000",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                    "cTime": "1000",
             },
             {
                 "posId": "pos-2",
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "short",
                 "pos": "2",
-                "avgPx": "64500",
-                "cTime": "1001",
+                    "avgPx": "64500",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                    "cTime": "1001",
             },
         ],
         open_orders=[],

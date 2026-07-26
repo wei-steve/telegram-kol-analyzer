@@ -168,7 +168,7 @@ def run_market_position_tpsl_probe(
 
     print_step("market-position-add-tpsl")
     protection_payload = build_deepcoin_position_sltp_payload(draft, pos_id=pos_id)
-    response = submit(ctx, "set_position_sltp", protection_payload)
+    response = dry_run_position_write(ctx, protection_payload)
     print_json("response", _summarize_response(response))
 
     print_step("market-position-adjust-tpsl")
@@ -177,9 +177,23 @@ def run_market_position_tpsl_probe(
         _draft(stop_loss=adjusted_sl, take_profit=adjusted_tp),
         pos_id=pos_id,
     )
-    response = submit(ctx, "set_position_sltp", adjusted_payload)
+    response = dry_run_position_write(ctx, adjusted_payload)
     print_json("response", _summarize_response(response))
     return pos_id
+
+
+def dry_run_position_write(
+    ctx: ProbeContext,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep this diagnostic probe read-only for exact-position mutations."""
+
+    print_json("request", payload)
+    if ctx.live:
+        raise DeepcoinClientError(
+            "live exact-position TPSL writes must use PositionMutationGateway"
+        )
+    return {"code": "0", "data": [{"ordId": "dry-run-position-tpsl"}]}
 
 
 def cancel_existing_position_tpsl(ctx: ProbeContext, *, pos_id: str) -> None:

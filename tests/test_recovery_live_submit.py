@@ -21,6 +21,7 @@ from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_si
 from telegram_kol_research.recovery_live_submit import process_next_trade_signal_live
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
 from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
+from telegram_kol_research.recovery_live_submit import _load_matching_position_ids
 from telegram_kol_research.deepcoin_execution_actions import _exact_exchange_order_id
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_scan import RecoveryDecision
@@ -61,6 +62,7 @@ class _FakeDeepcoinClient:
         self.position_protection_payloads = []
         self.cancel_payloads = []
         self.positions = []
+        self.pending_tpsl = []
 
     def place_order(self, order_payload):
         self.payloads.append(order_payload)
@@ -72,6 +74,20 @@ class _FakeDeepcoinClient:
 
     def set_position_sltp(self, protection_payload):
         self.position_protection_payloads.append(protection_payload)
+        self.pending_tpsl.append(
+            {
+                "ordId": "sltp-1",
+                "instId": protection_payload["instId"],
+                "posId": protection_payload["posId"],
+                "posSide": protection_payload["posSide"],
+                **(
+                    {"slTriggerPx": protection_payload["slTriggerPx"]}
+                    if protection_payload.get("slTriggerPx") not in (None, "")
+                    else {"tpTriggerPx": protection_payload["tpTriggerPx"]}
+                ),
+                "sz": protection_payload.get("sz", "0"),
+            }
+        )
         return {"code": "0", "data": {"ordId": "sltp-1"}}
 
     def replace_order_sltp(self, protection_payload):
@@ -83,10 +99,21 @@ class _FakeDeepcoinClient:
         return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
 
     def list_positions(self, *, inst_id=None):
-        return self.positions
+        return [
+            {
+                "avgPx": "64000",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
+                **row,
+            }
+            for row in self.positions
+        ]
 
     def list_trigger_orders_pending(self, *, inst_id):
-        return []
+        return [
+            row for row in self.pending_tpsl
+            if row["instId"] == inst_id
+        ]
 
     def get_ticker_price(self, *, inst_id):
         return 68100.0
@@ -119,6 +146,28 @@ class _InsufficientMoneyDeepcoinClient(_FakeDeepcoinClient):
         raise DeepcoinClientError("Deepcoin API error 36: InsufficientMoney")
 
 
+def test_market_entry_fails_before_submit_when_position_baseline_is_unavailable():
+    class _UnavailableBaselineClient(_FakeDeepcoinClient):
+        def list_positions(self, *, inst_id=None):
+            raise TimeoutError("positions unavailable")
+
+    client = _UnavailableBaselineClient()
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="pre_submit_position_snapshot_unavailable",
+    ):
+        _load_matching_position_ids(
+            client,
+            draft={
+                "instrument_id": "BTC-USDT-SWAP",
+                "margin_mode": "cross",
+                "position_mode": "split",
+            },
+            side="short",
+        )
+    assert client.payloads == []
+
+
 class _OrderProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
     def __init__(self):
         super().__init__()
@@ -128,6 +177,7 @@ class _OrderProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "long",
                 "pos": "7",
+                "avgPx": "64000",
                 "mrgPosition": "split",
                 "mgnMode": "cross",
             }
@@ -154,6 +204,7 @@ class _DelayedFilledPositionDeepcoinClient(_OrderProtectionFailingDeepcoinClient
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "short",
                 "pos": "7",
+                "avgPx": "64000",
                 "mrgPosition": "split",
                 "mgnMode": "cross",
             },
@@ -1280,7 +1331,7 @@ def test_market_submit_uses_filled_position_id_even_when_different_from_order_id
 
     assert result["submitted"] is True
     assert fake_client.position_protection_payloads[0]["posId"] == "pos-filled-1"
-    assert fake_client.position_calls == 2
+    assert fake_client.position_calls == 4
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
     assert binding.pos_id == "pos-filled-1"

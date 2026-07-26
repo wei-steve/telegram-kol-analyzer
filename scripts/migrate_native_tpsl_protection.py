@@ -32,12 +32,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--database-path", type=Path, default=Path("data/research.db"))
     parser.add_argument("--execute", action="store_true", help="Apply one reviewed migration.")
     parser.add_argument("--position-id", help="Exact DeepCoin split position id to migrate.")
+    parser.add_argument("--action-id", help="Exact action id emitted by the reviewed plan.")
     parser.add_argument("--expected-fingerprint", help="Fingerprint emitted by a prior dry run.")
+    parser.add_argument("--confirmation-token", help="Single-use operator confirmation token.")
     args = parser.parse_args(argv)
     if args.execute and not str(args.position_id or "").strip():
         parser.error("--execute requires one exact --position-id")
     if args.execute and not str(args.expected_fingerprint or "").strip():
         parser.error("--execute requires --expected-fingerprint from a reviewed dry run")
+    if args.execute and not str(args.action_id or "").strip():
+        parser.error("--execute requires --action-id from a reviewed dry run")
+    if args.execute and not str(args.confirmation_token or "").strip():
+        parser.error("--execute requires --confirmation-token")
     return args
 
 
@@ -73,7 +79,9 @@ def main(argv: list[str] | None = None) -> int:
         plan,
         deepcoin_client=client,
         pos_id=args.position_id,
+        action_id=args.action_id,
         expected_fingerprint=args.expected_fingerprint,
+        confirmation_token=args.confirmation_token,
         now=datetime.now(UTC),
     )
     print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True, default=str))

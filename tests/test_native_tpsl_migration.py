@@ -56,7 +56,8 @@ class _Client:
     def list_positions(self, *, inst_id=None):
         return [{
             "instId": "BTC-USDT-SWAP", "posId": "pos-1", "posSide": "long",
-            "pos": "6", "mrgPosition": "split", "cTime": "1000",
+            "pos": "6", "avgPx": "62930", "mgnMode": "cross",
+            "mrgPosition": "split", "cTime": "1000",
         }]
 
     def list_trigger_orders_pending(self, *, inst_id):
@@ -94,6 +95,7 @@ def _seed(session_factory, *, primary: bool = True):
         session_factory,
         ExecutionOrderLegRecord(
             execution_binding_id=binding_id, leg_index=1, purpose="entry", order_kind="market",
+            strategy_instance_id="deepcoin:1:1:BTC:long",
             venue="deepcoin", pos_id="pos-1", status="active", attribution_status="verified",
         ),
     )
@@ -133,7 +135,9 @@ def _apply(session_factory, client, plan):
 
     return apply_native_tpsl_migration_plan(
         session_factory, plan, deepcoin_client=client, pos_id="pos-1",
-        expected_fingerprint=plan.fingerprint, now=NOW,
+        action_id=plan.actions[0].action_id,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="migration-confirm-test", now=NOW,
     )
 
 
@@ -360,8 +364,18 @@ def test_migration_cli_is_dry_run_by_default_and_execute_requires_exact_target()
         module._parse_args(["--execute"])
     with pytest.raises(SystemExit, match="2"):
         module._parse_args(["--execute", "--position-id", "pos-1"])
+    with pytest.raises(SystemExit, match="2"):
+        module._parse_args([
+            "--execute", "--position-id", "pos-1",
+            "--expected-fingerprint", "fingerprint",
+        ])
     args = module._parse_args([
-        "--execute", "--position-id", "pos-1", "--expected-fingerprint", "fingerprint",
+        "--execute", "--position-id", "pos-1",
+        "--action-id", "action-1",
+        "--expected-fingerprint", "fingerprint",
+        "--confirmation-token", "confirm-once",
     ])
     assert args.execute is True
     assert args.position_id == "pos-1"
+    assert args.action_id == "action-1"
+    assert args.confirmation_token == "confirm-once"

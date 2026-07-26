@@ -23,6 +23,7 @@ from telegram_kol_research.native_tpsl import NativeTpslExpectation
 from telegram_kol_research.native_tpsl import match_native_tpsl_order
 from telegram_kol_research.native_tpsl import normalize_native_tpsl
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
+from telegram_kol_research.position_mutation_gateway import submit_exact_position_sltp
 from telegram_kol_research.position_protection_legs import bind_verified_exchange_order
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.trading_settings import load_trading_settings
@@ -61,10 +62,9 @@ def submit_verified_trigger_backup_stops(
     ambiguous network outcome cannot be blindly retried.
     """
 
-    set_position_sltp = getattr(client, "set_position_sltp", None)
     list_positions = getattr(client, "list_positions", None)
     list_pending = getattr(client, "list_trigger_orders_pending", None)
-    if not callable(set_position_sltp) or not callable(list_positions) or not callable(list_pending):
+    if not callable(list_positions) or not callable(list_pending):
         return 0
     backup_stop_buffer_bps = load_trading_settings(session_factory).trigger_backup_stop_buffer_bps
     with session_factory() as session:
@@ -97,7 +97,20 @@ def submit_verified_trigger_backup_stops(
             row_id = int(row.id)
             session.commit()
         try:
-            response = set_position_sltp(plan.payload)
+            response = submit_exact_position_sltp(
+                session_factory=session_factory,
+                deepcoin_client=client,
+                pos_id=str(plan.pos_id),
+                payload=plan.payload,
+                idempotency_key=(
+                    f"trigger-backup-stop:{plan.binding_id}:"
+                    f"{plan.leg_id}:{plan.pos_id}:set"
+                ),
+                live_execution_gate=lambda: _submission_still_reserved(
+                    session_factory, row_id
+                ),
+                now_provider=lambda: submitted_at,
+            )
             order_id = _response_order_id(response)
         except Exception as exc:
             with session_factory() as session:
@@ -470,6 +483,17 @@ def _reserve_submission(session, *, plan: BackupStopPlan, submitted_at: datetime
     session.add(row)
     session.flush()
     return row
+
+
+def _submission_still_reserved(
+    session_factory: sessionmaker,
+    row_id: int,
+) -> bool:
+    """Recheck the durable operation gate immediately before the REST write."""
+
+    with session_factory() as session:
+        row = session.get(PositionBackupStopOrder, row_id)
+        return row is not None and row.status == "submitting"
 
 
 def _blocked_plan(binding_id: int, leg_id: int, pos_id: str, reason_code: str) -> BackupStopPlan:

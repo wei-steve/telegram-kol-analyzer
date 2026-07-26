@@ -1205,6 +1205,26 @@ class PositionMutationIntent(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class RepairConfirmationToken(Base):
+    """Globally single-use operator confirmation token hash."""
+
+    __tablename__ = "repair_confirmation_tokens"
+    __table_args__ = (
+        Index(
+            "uq_repair_confirmation_tokens_hash",
+            "token_hash",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    action_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    action_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    consumed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class ExecutionEvent(Base):
     __tablename__ = "execution_events"
     __table_args__ = (
