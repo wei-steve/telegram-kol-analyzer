@@ -25,6 +25,10 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyManagementBatch,
 )
+from telegram_kol_research.remediation_snapshot import (
+    remediation_snapshot_payload,
+    stable_position_payload,
+)
 from telegram_kol_research.strategy_management_executor import (
     execute_management_batch,
 )
@@ -137,7 +141,7 @@ def build_position_management_remediation_plan(
             chains=(),
         )
     live_position_rows = [
-        dict(row)
+        stable_position_payload(dict(row))
         for row in snapshot.positions
         if _first_text(row, "posId", "pos_id", "id")
     ]
@@ -1557,16 +1561,7 @@ def _normalize_position_side(value: Any) -> str | None:
 
 
 def _snapshot_payload(snapshot) -> dict[str, Any]:
-    return {
-        "positions": list(snapshot.positions),
-        "pending_trigger_orders": list(snapshot.pending_trigger_orders),
-        "open_orders": list(snapshot.open_orders),
-        "order_history": list(snapshot.order_history),
-        "trade_fills": list(snapshot.trade_fills),
-        "trigger_history": list(snapshot.trigger_history),
-        "pending_tpsl_observations": list(snapshot.pending_tpsl_observations),
-        "errors": dict(snapshot.errors),
-    }
+    return remediation_snapshot_payload(snapshot)
 
 
 def _fingerprint(value: Any) -> str:

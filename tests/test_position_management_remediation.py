@@ -1175,6 +1175,70 @@ def test_snapshot_change_invalidates_action_fingerprint(tmp_path):
     assert first.snapshot_fingerprint != second.snapshot_fingerprint
 
 
+def test_market_price_noise_does_not_invalidate_action_fingerprint(tmp_path):
+    class MarketNoiseClient(_ReadOnlyClient):
+        def __init__(self):
+            super().__init__()
+            self.last_price = "64490"
+            self.unrealized = "1.25"
+
+        def list_positions(self):
+            rows = super().list_positions()
+            rows[0]["lastPx"] = self.last_price
+            rows[0]["unrealizedProfit"] = self.unrealized
+            rows[0]["useMargin"] = "5.1"
+            return rows
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+    client = MarketNoiseClient()
+    first = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=NOW,
+    )
+    client.last_price = "64520"
+    client.unrealized = "3.75"
+    second = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=NOW,
+    )
+
+    assert first.actions[0].fingerprint == second.actions[0].fingerprint
+    assert first.chains[0].fingerprint == second.chains[0].fingerprint
+    assert first.snapshot_fingerprint == second.snapshot_fingerprint
+
+
+def test_position_protection_change_invalidates_action_fingerprint(tmp_path):
+    class ProtectionClient(_ReadOnlyClient):
+        def __init__(self):
+            super().__init__()
+            self.stop_loss = "63000"
+
+        def list_positions(self):
+            rows = super().list_positions()
+            rows[0]["slTriggerPx"] = self.stop_loss
+            return rows
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+    client = ProtectionClient()
+    first = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=NOW,
+    )
+    client.stop_loss = "63500"
+    second = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=NOW,
+    )
+
+    assert first.actions[0].fingerprint != second.actions[0].fingerprint
+
+
 def test_tpsl_change_invalidates_action_fingerprint(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _persist_failed_partial_management(session_factory)

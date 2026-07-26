@@ -39,6 +39,7 @@ from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
+from telegram_kol_research.remediation_snapshot import remediation_snapshot_payload
 from telegram_kol_research.protection_attribution import (
     match_position_protection,
     normalize_protection_snapshot_rows,
@@ -1627,16 +1628,7 @@ def _require_remediation_confirmation_snapshot(
         raise ManagementBatchExecutionError(
             "remediation_confirmation_snapshot_incomplete"
         )
-    payload = {
-        "positions": list(snapshot.positions),
-        "pending_trigger_orders": list(snapshot.pending_trigger_orders),
-        "open_orders": list(snapshot.open_orders),
-        "order_history": list(snapshot.order_history),
-        "trade_fills": list(snapshot.trade_fills),
-        "trigger_history": list(snapshot.trigger_history),
-        "pending_tpsl_observations": list(snapshot.pending_tpsl_observations),
-        "errors": dict(snapshot.errors),
-    }
+    payload = remediation_snapshot_payload(snapshot)
     current_fingerprint = hashlib.sha256(
         json.dumps(
             payload,
