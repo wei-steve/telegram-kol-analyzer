@@ -226,6 +226,57 @@ def test_plan_groups_steps_by_strategy_and_orders_by_source_time(tmp_path):
     assert [action.raw_message_id for action in plan.actions] == [first_raw_id]
 
 
+def _convert_only_instruction_to_cancel_entry(session_factory):
+    with session_factory() as session:
+        raw = session.query(RawMessage).one()
+        candidate = session.query(SignalCandidate).one()
+        raw.text = "BTC策略先取消"
+        candidate.event_type = "close_signal"
+        candidate.management_action = None
+        candidate.management_fraction = None
+        session.commit()
+
+
+def test_cancel_entry_with_exact_live_fill_becomes_full_exit(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+    _convert_only_instruction_to_cancel_entry(session_factory)
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    action = plan.actions[0]
+    assert action.action_kind == "full_exit"
+    assert action.evidence["original_action_kind"] == "cancel_entry"
+    assert action.evidence["late_fill_conversion"] is True
+    assert action.pos_ids == ("pos-1",)
+
+
+def test_cancel_entry_without_exact_live_fill_never_becomes_full_exit(tmp_path):
+    class MissingPositionClient(_ReadOnlyClient):
+        def list_positions(self):
+            return []
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+    _convert_only_instruction_to_cancel_entry(session_factory)
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=MissingPositionClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert any(
+        conflict["reason"] == "late_fill_identity_not_exact"
+        for conflict in plan.conflicts
+    )
+
+
 def test_build_remediation_plan_is_read_only_and_fingerprinted(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)

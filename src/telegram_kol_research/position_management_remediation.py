@@ -281,15 +281,25 @@ def build_position_management_remediation_plan(
                             "raw_message_id": int(raw_message.id),
                             "candidate_id": int(candidate.id),
                             "lifecycle_id": target.lifecycle_id,
-                            "reason": "target_live_position_not_exact",
+                            "reason": (
+                                "late_fill_identity_not_exact"
+                                if directive.intent == "cancel_entry"
+                                else "target_live_position_not_exact"
+                            ),
                         }
                     )
                     continue
+                effective_intent = (
+                    "full_exit"
+                    if directive.intent == "cancel_entry"
+                    else directive.intent
+                )
+                late_fill_conversion = directive.intent == "cancel_entry"
                 expected_effect = {
                     "fraction": directive.fraction,
                     "stop_loss": directive.stop_loss,
                     "cancel_deferred_entries": directive.cancel_deferred_entries,
-                    "preserve_quantity": directive.intent
+                    "preserve_quantity": effective_intent
                     in {"move_stop_to_break_even", "adjust_stop_loss"},
                 }
                 evidence = {
@@ -302,6 +312,8 @@ def build_position_management_remediation_plan(
                     "instruction_sequence": int(item.sequence) if item is not None else 0,
                     "scope_source": target.scope_source,
                     "reason_code": directive.reason_code,
+                    "original_action_kind": directive.intent,
+                    "late_fill_conversion": late_fill_conversion,
                     "exchange_snapshot_fingerprint": exchange_snapshot_fingerprint,
                     "instrument_scope": sorted(instruments),
                     "execution_binding_id": int(binding.id),
@@ -309,7 +321,7 @@ def build_position_management_remediation_plan(
                     "positions": [live_positions[pos_id] for pos_id in pos_ids],
                 }
                 action_core = {
-                    "action_kind": directive.intent,
+                    "action_kind": effective_intent,
                     "raw_message_id": int(raw_message.id),
                     "lifecycle_id": int(lifecycle.id),
                     "strategy_instance_id": str(binding.strategy_instance_id),
@@ -325,10 +337,10 @@ def build_position_management_remediation_plan(
                                 "raw_message_id": raw_message.id,
                                 "candidate_id": candidate.id,
                                 "lifecycle_id": lifecycle.id,
-                                "action_kind": directive.intent,
+                                "action_kind": effective_intent,
                             }
                         )[:20],
-                        action_kind=directive.intent,
+                        action_kind=effective_intent,
                         raw_message_id=int(raw_message.id),
                         lifecycle_id=int(lifecycle.id),
                         strategy_instance_id=str(binding.strategy_instance_id),
