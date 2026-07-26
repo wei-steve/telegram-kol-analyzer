@@ -23,6 +23,7 @@ from telegram_kol_research.recovery_decisions import apply_recovery_review_decis
 from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
+from telegram_kol_research.web_app import _summarize_verified_exchange_protection_rows
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.web_queries import list_exited_strategies
 from telegram_kol_research.web_queries import list_verified_deepcoin_history_positions
@@ -1665,9 +1666,79 @@ def test_positions_panel_summary_uses_ordered_verified_exchange_protection(tmp_p
     ).get("/positions-panel")
 
     assert response.status_code == 200
-    assert "<dt>止损</dt><dd>61000</dd>" in response.text
-    assert "<dt>第二止损</dt><dd>60878</dd>" in response.text
-    assert "<dt>止盈</dt><dd>67100/68500/70300</dd>" in response.text
+    assert _summarize_verified_exchange_protection_rows(
+        [
+            {"kind": "take_profit", "trigger_price_text": "70300", "ownership_state": "已验证归属"},
+            {"kind": "stop_loss", "trigger_price_text": "60878", "ownership_state": "已验证归属"},
+            {"kind": "take_profit", "trigger_price_text": "67100", "ownership_state": "已验证归属"},
+            {"kind": "stop_loss", "trigger_price_text": "61000", "ownership_state": "已验证归属"},
+            {"kind": "take_profit", "trigger_price_text": "68500", "ownership_state": "已验证归属"},
+        ],
+        side="long",
+    ) == ("61000", "60878", ("67100", "68500", "70300"))
+    assert "止盈止损(5)" in response.text
+
+
+def test_positions_panel_keeps_tpsl_out_of_compact_summary(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-compact-1",
+                    "posSide": "long",
+                    "pos": "3",
+                    "avgPx": "63894.1",
+                }
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return [
+                {
+                    "ordId": "compact-stop",
+                    "triggerOrderType": "TPSL",
+                    "posId": "pos-compact-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "slTriggerPx": "61000",
+                },
+                {
+                    "ordId": "compact-tp",
+                    "triggerOrderType": "TPSL",
+                    "posId": "pos-compact-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "tpTriggerPx": "67200",
+                },
+            ]
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+        def list_position_history(self, *, inst_id=None):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=FakeDeepcoinClient,
+        )
+    ).get("/positions-panel")
+
+    assert response.status_code == 200
+    summary_markup = response.text.split('<section class="exchange-protection-orders"', 1)[0]
+    assert "<dt>止损</dt>" not in summary_markup
+    assert "<dt>第二止损</dt>" not in summary_markup
+    assert "<dt>止盈</dt>" not in summary_markup
+    assert "止盈止损(2)" in response.text
+    assert "67200" in response.text
+    assert "61000" in response.text
 
 
 def test_positions_panel_keeps_available_protection_when_another_instrument_fails(tmp_path):
