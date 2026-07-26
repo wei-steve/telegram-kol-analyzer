@@ -161,6 +161,11 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "visibility_first_failed_at": "ALTER TABLE strategy_management_batches ADD COLUMN visibility_first_failed_at DATETIME",
         "visibility_retry_attempts": "ALTER TABLE strategy_management_batches ADD COLUMN visibility_retry_attempts INTEGER NOT NULL DEFAULT 0",
         "visibility_next_attempt_at": "ALTER TABLE strategy_management_batches ADD COLUMN visibility_next_attempt_at DATETIME",
+        "execution_deadline_at": "ALTER TABLE strategy_management_batches ADD COLUMN execution_deadline_at DATETIME",
+        "operator_escalation_at": "ALTER TABLE strategy_management_batches ADD COLUMN operator_escalation_at DATETIME",
+        "last_progress_at": "ALTER TABLE strategy_management_batches ADD COLUMN last_progress_at DATETIME",
+        "escalation_state": "ALTER TABLE strategy_management_batches ADD COLUMN escalation_state VARCHAR(32)",
+        "escalation_notified_at": "ALTER TABLE strategy_management_batches ADD COLUMN escalation_notified_at DATETIME",
     },
     "message_instruction_items": {
         "visibility_first_failed_at": (
@@ -174,6 +179,24 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "visibility_next_attempt_at": (
             "ALTER TABLE message_instruction_items "
             "ADD COLUMN visibility_next_attempt_at DATETIME"
+        ),
+        "execution_deadline_at": (
+            "ALTER TABLE message_instruction_items "
+            "ADD COLUMN execution_deadline_at DATETIME"
+        ),
+        "operator_escalation_at": (
+            "ALTER TABLE message_instruction_items "
+            "ADD COLUMN operator_escalation_at DATETIME"
+        ),
+        "last_progress_at": (
+            "ALTER TABLE message_instruction_items ADD COLUMN last_progress_at DATETIME"
+        ),
+        "escalation_state": (
+            "ALTER TABLE message_instruction_items ADD COLUMN escalation_state VARCHAR(32)"
+        ),
+        "escalation_notified_at": (
+            "ALTER TABLE message_instruction_items "
+            "ADD COLUMN escalation_notified_at DATETIME"
         ),
     },
     "strategy_management_notifications": {

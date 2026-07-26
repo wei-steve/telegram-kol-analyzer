@@ -37,6 +37,66 @@ def test_message_instruction_items_have_visibility_retry_columns(tmp_path):
     } <= columns
 
 
+def test_position_mutation_and_management_sla_schema(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        table_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        mutation_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(position_mutation_intents)"
+            )
+        }
+        batch_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(strategy_management_batches)"
+            )
+        }
+        item_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(message_instruction_items)"
+            )
+        }
+
+    assert "position_mutation_intents" in table_names
+    assert {
+        "idempotency_key",
+        "operation",
+        "strategy_instance_id",
+        "execution_binding_id",
+        "execution_order_leg_id",
+        "pos_id",
+        "order_id",
+        "authority_fingerprint",
+        "request_fingerprint",
+        "status",
+        "request_json",
+        "response_json",
+        "error_json",
+        "reserved_at",
+        "submitted_at",
+        "confirmed_at",
+    } <= mutation_columns
+    sla_columns = {
+        "execution_deadline_at",
+        "operator_escalation_at",
+        "last_progress_at",
+        "escalation_state",
+        "escalation_notified_at",
+    }
+    assert sla_columns <= batch_columns
+    assert sla_columns <= item_columns
+
+
 def test_database_bootstrap_creates_prompt_registry_tables(tmp_path):
     database_path = tmp_path / "research.db"
     create_session_factory(database_path)

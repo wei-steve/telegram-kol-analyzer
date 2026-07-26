@@ -141,6 +141,17 @@ class MessageInstructionItem(Base):
     visibility_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, index=True
     )
+    execution_deadline_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    operator_escalation_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    last_progress_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    escalation_state: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    escalation_notified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
     summary_notification_claimed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime,
         nullable=True,
@@ -604,6 +615,17 @@ class StrategyManagementBatch(Base):
         Integer, nullable=False, default=0, server_default=text("0")
     )
     visibility_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    execution_deadline_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    operator_escalation_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    last_progress_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    escalation_state: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    escalation_notified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
@@ -1116,6 +1138,60 @@ class PositionProtectionIncident(Base):
     delivery_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     delivery_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class PositionMutationIntent(Base):
+    """Durable idempotency and outcome record for one exact position write."""
+
+    __tablename__ = "position_mutation_intents"
+    __table_args__ = (
+        Index(
+            "uq_position_mutation_intents_idempotency",
+            "idempotency_key",
+            unique=True,
+        ),
+        Index(
+            "ix_position_mutation_intents_status_updated",
+            "status",
+            "updated_at",
+        ),
+        Index(
+            "ix_position_mutation_intents_position",
+            "venue",
+            "pos_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    venue: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="deepcoin"
+    )
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    strategy_instance_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    order_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+    authority_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="reserved", index=True
+    )
+    request_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reserved_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
