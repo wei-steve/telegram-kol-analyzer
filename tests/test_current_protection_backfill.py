@@ -1,10 +1,17 @@
 from telegram_kol_research.current_protection_backfill import (
     SupervisedProtectionMapping,
+    apply_current_protection_backfill_plan,
     build_current_protection_backfill_plan,
 )
 from typer.testing import CliRunner
 
 from telegram_kol_research.cli import app
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    PositionProtectionLedger,
+)
 
 
 def test_review_plan_accepts_only_explicit_order_to_position_mapping():
@@ -78,9 +85,62 @@ def test_review_plan_refuses_an_order_that_already_has_verified_ledger_evidence(
     assert plan.refusals[0].reason == "already_verified"
 
 
-def test_cli_exposes_read_only_current_protection_backfill_plan_command():
+def test_cli_exposes_fingerprint_guarded_current_protection_backfill_command():
     result = CliRunner().invoke(app, ["plan-current-protection-backfill", "--help"])
 
     assert result.exit_code == 0
     assert "--mapping-file" in result.stdout
-    assert "--apply" not in result.stdout
+    assert "--apply" in result.stdout
+    assert "--expected-fingerprint" in result.stdout
+
+
+def test_apply_supervised_plan_writes_verified_ledger_after_fingerprint_confirmation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="kol",
+            chat_id=1,
+            message_id=2,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="open",
+        )
+        session.add(binding)
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id="deepcoin:1:2:BTC:long",
+                leg_index=1,
+                purpose="entry",
+                order_kind="limit",
+                order_id="entry-1",
+                pos_id="pos-1",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="active",
+            )
+        )
+        session.commit()
+    plan = build_current_protection_backfill_plan(
+        mappings=[SupervisedProtectionMapping("order-1", "pos-1", "evidence")],
+        positions=[{"posId": "pos-1", "instId": "BTC-USDT-SWAP", "posSide": "long", "pos": "3"}],
+        pending_orders=[{"ordId": "order-1", "instId": "BTC-USDT-SWAP", "posSide": "long"}],
+        verified_order_ids=set(),
+    )
+
+    result = apply_current_protection_backfill_plan(
+        session_factory,
+        plan,
+        expected_fingerprint=plan.fingerprint,
+    )
+
+    assert result.applied == 1
+    with session_factory() as session:
+        row = session.query(PositionProtectionLedger).one()
+    assert (row.order_id, row.pos_id, row.evidence_source) == (
+        "order-1",
+        "pos-1",
+        "official_ui_supervised",
+    )

@@ -7,6 +7,9 @@ import hashlib
 import json
 from typing import Any, Iterable
 
+from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+
 
 @dataclass(frozen=True, slots=True)
 class SupervisedProtectionMapping:
@@ -40,6 +43,11 @@ class CurrentProtectionBackfillPlan:
     actions: tuple[CurrentProtectionBackfillAction, ...]
     refusals: tuple[CurrentProtectionBackfillRefusal, ...]
     fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentProtectionBackfillApplyResult:
+    applied: int
 
 
 def build_current_protection_backfill_plan(
@@ -121,6 +129,58 @@ def build_current_protection_backfill_plan(
         refusals_tuple,
         _fingerprint(actions_tuple, refusals_tuple),
     )
+
+
+def apply_current_protection_backfill_plan(
+    session_factory,
+    plan: CurrentProtectionBackfillPlan,
+    *,
+    expected_fingerprint: str,
+) -> CurrentProtectionBackfillApplyResult:
+    """Write a reviewed plan only when its exact fingerprint was confirmed."""
+
+    if not expected_fingerprint or expected_fingerprint != plan.fingerprint:
+        raise ValueError("current protection backfill fingerprint mismatch")
+    if plan.refusals:
+        raise ValueError("current protection backfill plan contains refusals")
+    applied = 0
+    with session_factory() as session:
+        for action in plan.actions:
+            leg = (
+                session.query(ExecutionOrderLeg)
+                .filter(ExecutionOrderLeg.venue == "deepcoin")
+                .filter(ExecutionOrderLeg.pos_id == action.pos_id)
+                .filter(ExecutionOrderLeg.purpose == "entry")
+                .filter(ExecutionOrderLeg.attribution_status == "verified")
+                .one_or_none()
+            )
+            if leg is None:
+                raise ValueError(f"verified entry leg missing for position {action.pos_id}")
+            row = upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=int(leg.execution_binding_id),
+                execution_order_leg_id=int(leg.id),
+                strategy_instance_id=leg.strategy_instance_id,
+                pos_id=action.pos_id,
+                instrument_id=action.instrument_id,
+                side=action.side,
+                order_id=action.order_id,
+                purpose="supervised_current_tpsl",
+                trigger_price=None,
+                size_text=None,
+                status="verified",
+                evidence_source="official_ui_supervised",
+                evidence={
+                    "classification": action.classification,
+                    "evidence_hash": action.evidence_hash,
+                    "plan_fingerprint": plan.fingerprint,
+                },
+            )
+            if row is not None:
+                applied += 1
+        session.commit()
+    return CurrentProtectionBackfillApplyResult(applied=applied)
 
 
 def _text(payload: dict[str, Any], *keys: str) -> str:

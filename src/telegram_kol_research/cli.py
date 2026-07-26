@@ -36,6 +36,7 @@ from telegram_kol_research.entry_protection_ledger_repair import (
 )
 from telegram_kol_research.current_protection_backfill import (
     SupervisedProtectionMapping,
+    apply_current_protection_backfill_plan,
     build_current_protection_backfill_plan,
 )
 from telegram_kol_research.backup_stop_repair import (
@@ -1999,8 +2000,10 @@ def repair_position_attribution(
 def plan_current_protection_backfill(
     mapping_file: Path = typer.Option(..., "--mapping-file", exists=True, readable=True),
     database_path: Path = Path("data/research.db"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(None, "--expected-fingerprint"),
 ) -> None:
-    """Emit a read-only plan for explicitly supervised current TPSL mappings."""
+    """Plan or apply explicitly supervised current TPSL mappings."""
 
     try:
         payload = json.loads(mapping_file.read_text(encoding="utf-8"))
@@ -2048,11 +2051,25 @@ def plan_current_protection_backfill(
     )
     typer.echo(
         json.dumps(
-            {"mode": "dry_run", "database_path": str(database_path), "plan": asdict(plan)},
+            {
+                "mode": "apply" if apply else "dry_run",
+                "database_path": str(database_path),
+                "plan": asdict(plan),
+            },
             ensure_ascii=False,
             indent=2,
         )
     )
+    if not apply:
+        return
+    if plan.actions and not expected_fingerprint:
+        raise typer.BadParameter("--expected-fingerprint is required for a nonempty plan")
+    result = apply_current_protection_backfill_plan(
+        session_factory,
+        plan,
+        expected_fingerprint=expected_fingerprint or "",
+    )
+    typer.echo(f"Applied {result.applied} supervised current protection ledger row(s).")
 
 
 @app.command("repair-entry-protection-ledger")
