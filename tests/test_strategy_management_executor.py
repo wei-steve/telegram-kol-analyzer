@@ -368,6 +368,7 @@ class _ProtectionClient:
         self.set_calls = []
         self.pending_reads = 0
         self.close_calls = []
+        self.call_log = []
 
     def list_positions(self, *, inst_id=None):
         return [dict(row) for row in self.positions]
@@ -378,6 +379,7 @@ class _ProtectionClient:
 
     def place_order(self, payload):
         self.close_calls.append(dict(payload))
+        self.call_log.append(("place_order", str(payload.get("posId"))))
         return {
             "code": "0",
             "data": {"ordId": f"close-{len(self.close_calls)}"},
@@ -385,15 +387,24 @@ class _ProtectionClient:
 
     def cancel_position_sltp(self, payload):
         self.cancel_calls.append(dict(payload))
+        self.call_log.append(("cancel_position_sltp", str(payload.get("ordId"))))
         if self.cancel_outcomes:
             outcome = self.cancel_outcomes.pop(0)
             if isinstance(outcome, BaseException):
                 raise outcome
-            return outcome
-        return {"code": "0", "data": {"ordId": payload["ordId"]}}
+            response = outcome
+        else:
+            response = {"code": "0", "data": {"ordId": payload["ordId"]}}
+        self.pending = [
+            row
+            for row in self.pending
+            if str(row.get("ordId")) != str(payload.get("ordId"))
+        ]
+        return response
 
     def set_position_sltp(self, payload):
         self.set_calls.append(dict(payload))
+        self.call_log.append(("set_position_sltp", str(payload.get("posId"))))
         if self.set_outcomes:
             outcome = self.set_outcomes.pop(0)
             if isinstance(outcome, BaseException):
@@ -465,6 +476,39 @@ def test_close_legs_are_committed_reserved_before_exact_market_submission(tmp_pa
         assert binding.status == "active"
         assert lifecycle.lifecycle_status == "entered"
         assert [entry.status for entry in entries] == ["active", "active"]
+
+
+def test_closed_remediation_gate_never_rewrites_reconciling_batch(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+    with session_factory() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored.target_snapshot_json)
+        snapshot["remediation_confirmation"] = {
+            "action_id": "test-action",
+            "action_fingerprint": "f" * 64,
+            "exchange_snapshot_fingerprint": "e" * 64,
+            "instrument_scope": ["BTC-USDT-SWAP"],
+        }
+        stored.target_snapshot_json = json.dumps(snapshot)
+        stored.execution_mode = "live"
+        stored.status = "reconciling"
+        session.commit()
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=_FakeClient(session_factory),
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "reconciling"
+    assert result["reason"] == "batch_already_reconciling"
+    assert load_management_batch(session_factory, batch.id).status == "reconciling"
 
 
 def test_protection_recovery_full_exit_requires_exact_immutable_bypass_marker(
@@ -2402,6 +2446,11 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
             "positions": [
                 {
                     "pos_id": pos_id,
+                    "execution_order_leg_id": next(
+                        leg.execution_order_leg_id
+                        for leg in batch.legs
+                        if leg.pos_id == pos_id
+                    ),
                     "owned_order_ids": [
                         row["ordId"] for row in rows_by_pos[pos_id]
                     ],
@@ -2419,7 +2468,17 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
 
     assert close_result["status"] == "reconciling"
     assert len(client.close_calls) == 2
-    assert client.cancel_calls == []
+    assert [call[0] for call in client.call_log[:5]] == [
+        "cancel_position_sltp",
+        "cancel_position_sltp",
+        "cancel_position_sltp",
+        "cancel_position_sltp",
+        "cancel_position_sltp",
+    ]
+    assert [call[0] for call in client.call_log[5:]] == [
+        "place_order",
+        "place_order",
+    ]
     assert client.set_calls == []
 
     stored = load_management_batch(session_factory, batch.id)
@@ -2460,7 +2519,7 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
     )
     assert reconciled.pending == 1
     assert load_management_batch(session_factory, batch.id).status == "protection_ready"
-    assert client.cancel_calls == []
+    assert len(client.cancel_calls) == 5
     assert client.set_calls == []
 
     client.positions = list(snapshot.positions)
@@ -2469,11 +2528,218 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
     )
 
     assert protection_result["status"] == "succeeded"
+    assert len(client.cancel_calls) == 5
     stops = [row for row in client.set_calls if "slTriggerPx" in row]
     assert [(row["posId"], row["slTriggerPx"]) for row in stops] == [
         ("pos-1", "64000"),
         ("pos-2", "64500"),
     ]
+
+
+def test_partial_then_break_even_cancel_unknown_never_submits_close(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory,
+        action="partial_then_break_even",
+        stop_loss=None,
+        keep_close_plan=True,
+    )
+    with session_factory() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored.target_snapshot_json)
+        snapshot["protection_recovery"] = {
+            "version": 1,
+            "mode": "replace_after_reduction",
+            "positions": [
+                {
+                    "pos_id": leg.pos_id,
+                    "execution_order_leg_id": leg.execution_order_leg_id,
+                    "owned_order_ids": [
+                        row["ordId"] for row in rows_by_pos[leg.pos_id]
+                    ],
+                }
+                for leg in batch.legs
+            ],
+        }
+        stored.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+    client = _ProtectionClient(
+        session_factory,
+        rows_by_pos,
+        cancel_outcomes=[DeepcoinRequestOutcomeUnknown("response lost")],
+    )
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert client.close_calls == []
+    events = list_execution_events(
+        session_factory,
+        action="strategy_management_protection_precancel",
+    )
+    assert [event.status for event in events] == ["reserved"]
+
+
+@pytest.mark.parametrize(
+    ("close_gate_after_cancel", "expected_cancel_count", "expected_leg_statuses"),
+    [
+        (1, 1, ["planned", "planned"]),
+        (5, 5, ["recovery_required", "planned"]),
+    ],
+)
+def test_remediation_gate_is_rechecked_before_every_exchange_write(
+    close_gate_after_cancel,
+    expected_cancel_count,
+    expected_leg_statuses,
+    tmp_path,
+):
+    from telegram_kol_research.execution_bindings import _load_reconcile_snapshot
+    from telegram_kol_research.position_management_remediation import (
+        _fingerprint,
+        _snapshot_payload,
+    )
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory,
+        action="partial_then_break_even",
+        stop_loss=None,
+        keep_close_plan=True,
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+        },
+    )
+
+    class GateClosingClient(_ProtectionClient):
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id):
+            return []
+
+        def list_trade_fills(self, *, inst_id):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
+            return []
+
+        def cancel_position_sltp(self, payload):
+            response = super().cancel_position_sltp(payload)
+            if len(self.cancel_calls) == close_gate_after_cancel:
+                save_trading_settings(
+                    session_factory,
+                    {
+                        "auto_trade_enabled": True,
+                        "management_execution_mode": "disabled",
+                    },
+                )
+            return response
+
+    client = GateClosingClient(session_factory, rows_by_pos)
+    exchange_snapshot = _load_reconcile_snapshot(
+        client, instruments={"BTC-USDT-SWAP"}
+    )
+    with session_factory() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored.target_snapshot_json)
+        snapshot["protection_recovery"] = {
+            "version": 1,
+            "mode": "replace_after_reduction",
+            "positions": [
+                {
+                    "pos_id": leg.pos_id,
+                    "execution_order_leg_id": leg.execution_order_leg_id,
+                    "owned_order_ids": [
+                        row["ordId"] for row in rows_by_pos[leg.pos_id]
+                    ],
+                }
+                for leg in batch.legs
+            ],
+        }
+        snapshot["remediation_confirmation"] = {
+            "action_id": "test-action",
+            "action_fingerprint": "f" * 64,
+            "exchange_snapshot_fingerprint": _fingerprint(
+                _snapshot_payload(exchange_snapshot)
+            ),
+            "instrument_scope": ["BTC-USDT-SWAP"],
+        }
+        stored.target_snapshot_json = json.dumps(snapshot)
+        stored.execution_mode = "live"
+        session.commit()
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+    assert len(client.cancel_calls) == expected_cancel_count
+    assert client.close_calls == []
+    assert [leg["status"] for leg in result["legs"]] == expected_leg_statuses
+
+
+def test_rejected_close_restores_protection_with_durable_ledger(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory,
+        action="partial_then_break_even",
+        stop_loss=None,
+        keep_close_plan=True,
+    )
+    with session_factory() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored.target_snapshot_json)
+        snapshot["protection_recovery"] = {
+            "version": 1,
+            "mode": "replace_after_reduction",
+            "positions": [
+                {
+                    "pos_id": leg.pos_id,
+                    "execution_order_leg_id": leg.execution_order_leg_id,
+                    "owned_order_ids": [
+                        row["ordId"] for row in rows_by_pos[leg.pos_id]
+                    ],
+                }
+                for leg in batch.legs
+            ],
+        }
+        stored.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+    class FirstCloseRejectedClient(_ProtectionClient):
+        def place_order(self, payload):
+            if not self.close_calls:
+                self.close_calls.append(dict(payload))
+                self.call_log.append(("place_order", str(payload.get("posId"))))
+                raise DeepcoinDefiniteRejection("close rejected")
+            return super().place_order(payload)
+
+    client = FirstCloseRejectedClient(session_factory, rows_by_pos)
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "partial_failed"
+    restore_events = list_execution_events(
+        session_factory,
+        action="strategy_management_protection_restore",
+    )
+    assert [event.status for event in restore_events].count("reserved") == 3
+    assert [event.status for event in restore_events].count("succeeded") == 3
+    with session_factory() as session:
+        verified = list_verified_ledger_rows_for_positions(session, ["pos-1"])
+    assert {row.order_id for row in verified} == {"new-1", "new-2", "new-3"}
 
 
 def test_partial_then_break_even_replaces_protection_after_exchange_resizes_old_tpsl(
@@ -3056,7 +3322,9 @@ def test_replacement_failure_restores_complete_position_and_stops_later_legs(tmp
     assert client.set_calls[-1]["slTriggerPx"] == "65700"
 
 
-def test_restore_failure_marks_recovery_required_and_stops_later_legs(tmp_path):
+def test_restore_failure_marks_recovery_required_and_continues_independent_legs(
+    tmp_path,
+):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
 
     session_factory = create_session_factory(tmp_path / "research.db")
@@ -3077,12 +3345,14 @@ def test_restore_failure_marks_recovery_required_and_stops_later_legs(tmp_path):
     assert result["status"] == "recovery_required"
     assert [leg["status"] for leg in result["legs"]] == [
         "recovery_required",
-        "planned",
+        "succeeded",
     ]
     assert [call["ordId"] for call in client.cancel_calls] == [
         "tp-1a",
         "tp-1b",
         "sl-1",
+        "tp-2",
+        "sl-2",
     ]
 
 
@@ -3112,16 +3382,18 @@ def test_unknown_protection_replacement_never_cancels_or_restores(outcome, tmp_p
     assert result["status"] == "recovery_required"
     assert [leg["status"] for leg in result["legs"]] == [
         "recovery_required",
-        "planned",
+        "succeeded",
     ]
-    # Only the known old IDs were cancelled before the replacement call. No
-    # speculative cancel of a new ID and no restore write is permitted.
+    # The uncertain leg is never restored or retried, while the independent
+    # sibling still completes from its own durable state.
     assert [call["ordId"] for call in client.cancel_calls] == [
         "tp-1a",
         "tp-1b",
         "sl-1",
+        "tp-2",
+        "sl-2",
     ]
-    assert len(client.set_calls) == 1
+    assert len(client.set_calls) == 3
 
 
 @pytest.mark.parametrize(

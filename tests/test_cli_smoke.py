@@ -32,9 +32,45 @@ def test_cli_help_renders():
     assert "recovery-dry-run" in result.stdout
     assert "repair-position-attribution" in result.stdout
     assert "repair-entry-protection-ledger" in result.stdout
+    assert "repair-position-management" in result.stdout
     assert "audit-management-batches" in result.stdout
     assert "archive-unbound-holdings" in result.stdout
     assert "monitor-production-safety" in result.stdout
+
+
+def test_repair_position_management_apply_requires_exact_action_and_fingerprint(
+    tmp_path,
+):
+    result = CliRunner().invoke(
+        app,
+        [
+            "repair-position-management",
+            "--database-path",
+            str(tmp_path / "research.db"),
+            "--apply",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--action-id" in result.stdout + result.stderr
+    assert "--expected-fingerprint" in result.stdout + result.stderr
+
+
+def test_repair_position_management_dry_run_never_creates_database(tmp_path):
+    database_path = tmp_path / "missing.db"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "repair-position-management",
+            "--database-path",
+            str(database_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "no file was created" in result.stdout + result.stderr
+    assert not database_path.exists()
 
 
 def test_archive_unbound_holdings_dry_run_then_apply(tmp_path):

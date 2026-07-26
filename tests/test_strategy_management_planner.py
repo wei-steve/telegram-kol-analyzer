@@ -1701,10 +1701,12 @@ def test_risk_reduction_protection_recovery_snapshots_exact_owned_orders(
 
     assert result.status == "ready"
     recovery = result.batch.target_snapshot["protection_recovery"]
+    assert "protection_recovery_bypass" not in result.batch.target_snapshot
     assert recovery["mode"] == "replace_after_reduction"
     assert recovery["positions"] == [
         {
             "pos_id": "pos-b",
+            "execution_order_leg_id": result.batch.legs[0].execution_order_leg_id,
             "owned_order_ids": ["tp-old", "sl-old"],
         }
     ]

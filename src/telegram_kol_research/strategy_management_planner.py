@@ -538,10 +538,21 @@ def _plan_strategy_management_batch_locked(
                 "evidence": protection.evidence,
             }
             if protection_recovery_for_risk_reduction:
+                target_leg = target_legs_by_pos_id[position["pos_id"]]
                 exact_ledger_order_ids = {
                     str(row.order_id)
                     for row in ledger_rows_by_pos_id.get(position["pos_id"], [])
-                    if row.order_id and str(row.status or "").lower() == "verified"
+                    if (
+                        row.order_id
+                        and str(row.status or "").lower() == "verified"
+                        and row.execution_binding_id == binding.id
+                        and row.execution_order_leg_id == target_leg.id
+                        and row.strategy_instance_id == binding.strategy_instance_id
+                        and str(row.instrument_id or "").upper()
+                        == instrument_id.upper()
+                        and str(row.side or "").lower()
+                        == str(lifecycle.side or "").lower()
+                    )
                 }
                 if exact_ledger_order_ids != set(protection.order_ids):
                     return _persist_blocked(
@@ -611,6 +622,9 @@ def _plan_strategy_management_batch_locked(
             "positions": [
                 {
                     "pos_id": str(position["pos_id"]),
+                    "execution_order_leg_id": int(
+                        target_legs_by_pos_id[str(position["pos_id"])].id
+                    ),
                     "owned_order_ids": list(
                         protection_by_pos_id[str(position["pos_id"])]["order_ids"]
                     ),
@@ -618,7 +632,7 @@ def _plan_strategy_management_batch_locked(
                 for position in economics
             ],
         }
-    if protection_recovery_bypass:
+    if protection_recovery_bypass and intent == "full_exit":
         target_snapshot["protection_recovery_bypass"] = {
             "version": 1,
             "reason": "protection_recovery_required",

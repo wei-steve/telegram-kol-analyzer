@@ -17,7 +17,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import typer
-from sqlalchemy import tuple_
+from sqlalchemy import create_engine, tuple_
+from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.backfill import build_backfill_windows
 from telegram_kol_research.ai_recognition_config import load_ai_recognition_config
@@ -47,6 +48,10 @@ from telegram_kol_research.backup_stop_repair import (
 from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
+)
+from telegram_kol_research.position_management_remediation import (
+    apply_position_management_remediation_action,
+    build_position_management_remediation_plan,
 )
 from telegram_kol_research.production_safety_monitor import (
     MonitorExpectations,
@@ -2185,6 +2190,86 @@ def repair_backup_stops(
         expected_fingerprint=expected_fingerprint,
         now=datetime.now(UTC),
     )
+    typer.echo(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+
+
+@app.command("repair-position-management")
+def repair_position_management(
+    database_path: Path = Path("data/research.db"),
+    deepcoin_contract_specs_path: Path = Path("config/deepcoin_contract_specs.yaml"),
+    apply: bool = typer.Option(False, "--apply"),
+    action_id: str | None = typer.Option(None, "--action-id"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+) -> None:
+    """Dry-run or apply one exact fingerprinted management remediation."""
+
+    if apply and (not action_id or not expected_fingerprint):
+        typer.echo(
+            "Refusing apply: --action-id and --expected-fingerprint are required.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if apply:
+        session_factory = create_session_factory(database_path)
+    else:
+        resolved_database_path = database_path.resolve()
+        if not resolved_database_path.is_file():
+            typer.echo(
+                "Refusing dry-run: database does not exist; no file was created.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        engine = create_engine(
+            "sqlite+pysqlite://",
+            creator=lambda: sqlite3.connect(
+                f"file:{resolved_database_path}?mode=ro",
+                uri=True,
+            ),
+        )
+        session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    client = build_deepcoin_client_from_env()
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime.now(UTC),
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "mode": "apply" if apply else "dry_run",
+                "database_path": str(database_path),
+                "plan": asdict(plan),
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
+    if not apply:
+        return
+    if plan.conflicts:
+        typer.echo(
+            "Refusing apply: unresolved position-management conflicts remain.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    contract_spec_provider = load_deepcoin_contract_specs(
+        deepcoin_contract_specs_path
+    )
+    try:
+        result = apply_position_management_remediation_action(
+            session_factory,
+            deepcoin_client=client,
+            action_id=str(action_id),
+            expected_fingerprint=str(expected_fingerprint),
+            now=datetime.now(UTC),
+            contract_spec_provider=contract_spec_provider,
+        )
+    except ValueError as exc:
+        typer.echo(f"Refusing apply: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
     typer.echo(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
 
 
