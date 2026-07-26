@@ -33,3 +33,14 @@ reports/*.json
 *.log
 .worktrees/
 data/logs/
+
+# Alpha Farm local-only video inputs and outputs
+videos/alpha-farm/assets/private/
+videos/alpha-farm/audio/generated/
+videos/alpha-farm/data/private/
+videos/alpha-farm/renders/
+videos/alpha-farm/.hyperframes/
+
+# Keep the redacted Alpha Farm example manifest versioned.
+!videos/alpha-farm/data/
+!videos/alpha-farm/data/kol-showcase.example.json

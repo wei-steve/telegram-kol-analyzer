@@ -1,0 +1,15 @@
+{
+  "kol_count": 12,
+  "membership_usd_per_six_months": 1000,
+  "featured": [
+    {
+      "display_name": "KOL 示例",
+      "style_label": "低频趋势",
+      "avatar_file": "assets/private/avatars/example.png",
+      "message_excerpt": "BTC 62000-62400 做多，止损 61500，目标 63500 / 64800",
+      "entry_range": [62000, 62400],
+      "stop_loss": 61500,
+      "take_profit": [63500, 64800]
+    }
+  ]
+}
