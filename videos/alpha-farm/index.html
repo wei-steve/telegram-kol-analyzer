@@ -98,7 +98,7 @@
         data-start="0"
         data-duration="180"
         data-track-index="3"
-        src="audio/generated/narration-timed.wav"
+        src="audio/generated/narration-v2.wav"
         data-volume="1"
       ></audio>
       <audio
@@ -174,8 +174,33 @@
         [176.9, 179.7, "让 KOL 提供 Alpha，让 AI 负责执行"]
       ];
 
+      const CAPTION_WINDOWS = [
+        [0.5, 14.62, 0.4, 11.464],
+        [15.5, 31.88, 15.4, 29.848],
+        [33.5, 45.08, 33.4, 45.28],
+        [46.5, 66.16, 46.4, 65.288],
+        [67.5, 84.18, 67.4, 84.32],
+        [85.5, 126.18, 85.4, 125.072],
+        [127.5, 146.44, 127.4, 146.456],
+        [147.5, 162.79, 147.4, 160.456],
+        [163.3, 179.7, 163.4, 179.192]
+      ];
+
+      function retimeCaption(cue) {
+        const window = CAPTION_WINDOWS.find(function (item) {
+          return cue[0] >= item[0] && cue[0] <= item[1];
+        });
+        if (!window) return cue;
+        const scale = (window[3] - window[2]) / (window[1] - window[0]);
+        return [
+          window[2] + (cue[0] - window[0]) * scale,
+          window[2] + (cue[1] - window[0]) * scale,
+          cue[2]
+        ];
+      }
+
       const captionLayer = document.getElementById("caption-layer");
-      CAPTIONS.forEach(function (cue, index) {
+      CAPTIONS.map(retimeCaption).forEach(function (cue, index) {
         const el = document.createElement("div");
         el.id = "caption-" + index;
         el.className = "caption-cue";

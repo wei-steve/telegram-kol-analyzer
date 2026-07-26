@@ -1,11 +1,11 @@
 {
   "version": 2,
   "language": "zh-CN",
-  "timing_status": "locked_to_timed_tts",
+  "timing_status": "retimed_to_xiaoxiao_neural_tts",
   "timebase": "seconds",
   "duration": 180.0,
   "cue_count": 56,
-  "authoritative_cues": "../index.html#CAPTIONS",
+  "authoritative_cues": "../index.html#CAPTIONS+CAPTION_WINDOWS",
   "style": {
     "mode": "measured_technical",
     "position": "bottom_center",
