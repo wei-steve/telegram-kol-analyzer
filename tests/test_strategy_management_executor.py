@@ -1040,6 +1040,54 @@ def test_break_even_reserved_protection_restart_never_writes(tmp_path):
     assert client.call_log == []
 
 
+def test_break_even_post_write_unknown_has_priority_over_restored(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.quote["price"] = "63000"
+    reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+    for leg, status in zip(
+        batch.legs, ("restored", "recovery_required"), strict=True
+    ):
+        transition_leg(
+            session_factory,
+            leg.id,
+            expected_statuses={"planned"},
+            new_status=status,
+            transitioned_at=NOW,
+        )
+    client.call_log.clear()
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "recovery_required"
+    assert result["reason"] == "break_even_market_post_write_recovery_required"
+    assert client.call_log == []
+
+
 def test_break_even_by_market_executes_mixed_close_and_protection_legs(
     tmp_path,
 ):

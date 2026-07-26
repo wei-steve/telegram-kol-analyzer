@@ -985,6 +985,9 @@ def _recover_break_even_post_write_restart(
     ):
         final_status = "succeeded"
         reason = "all_position_protection_replaced"
+    elif "recovery_required" in statuses:
+        final_status = "recovery_required"
+        reason = "break_even_market_post_write_recovery_required"
     elif "restored" in statuses or "failed" in statuses:
         final_status = "partial_failed"
         reason = "break_even_market_partial_failed"
