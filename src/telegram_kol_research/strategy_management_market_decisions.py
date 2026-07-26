@@ -226,9 +226,46 @@ def _normalize_decisions(
             raise BreakEvenMarketDecisionConflict(
                 "break_even_market_decision_leg_invalid"
             )
+        protection = row.get("protection")
+        normalized_protection = None
+        if action == "set_break_even":
+            if not isinstance(protection, Mapping):
+                raise BreakEvenMarketDecisionConflict(
+                    "break_even_market_decision_protection_invalid"
+                )
+            order_ids = [
+                str(order_id)
+                for order_id in protection.get("order_ids") or []
+                if str(order_id)
+            ]
+            row_snapshots = protection.get("row_snapshots")
+            if (
+                not order_ids
+                or len(order_ids) != len(set(order_ids))
+                or not isinstance(row_snapshots, list)
+                or len(row_snapshots) != len(order_ids)
+                or [
+                    str(snapshot.get("order_id") or "")
+                    for snapshot in row_snapshots
+                    if isinstance(snapshot, Mapping)
+                ]
+                != order_ids
+            ):
+                raise BreakEvenMarketDecisionConflict(
+                    "break_even_market_decision_protection_invalid"
+                )
+            normalized_protection = {
+                "order_ids": order_ids,
+                "row_snapshots": [
+                    dict(snapshot) for snapshot in row_snapshots
+                ],
+            }
+        elif protection not in (None, {}):
+            raise BreakEvenMarketDecisionConflict(
+                "break_even_market_decision_protection_invalid"
+            )
         seen.add(identity)
-        normalized.append(
-            {
+        normalized_row = {
                 "management_leg_id": identity[0],
                 "execution_order_leg_id": identity[1],
                 "pos_id": identity[2],
@@ -237,7 +274,9 @@ def _normalize_decisions(
                 "comparison": comparison,
                 "action": action,
             }
-        )
+        if normalized_protection is not None:
+            normalized_row["protection"] = normalized_protection
+        normalized.append(normalized_row)
     if seen != set(legs_by_identity):
         raise BreakEvenMarketDecisionConflict(
             "break_even_market_decision_leg_set_not_exact"
@@ -267,6 +306,21 @@ def _to_record(
 ) -> BreakEvenMarketDecisionRecord:
     decisions = json.loads(row.decisions_json)
     if not isinstance(decisions, list):
+        raise BreakEvenMarketDecisionConflict(
+            "break_even_market_decision_corrupt"
+        )
+    expected_fingerprint = _fingerprint(
+        {
+            "version": DECISION_VERSION,
+            "management_batch_id": int(row.management_batch_id),
+            "strategy_instance_id": str(row.strategy_instance_id),
+            "instrument_id": str(row.instrument_id),
+            "quote_price": str(row.quote_price),
+            "quote_price_field": str(row.quote_price_field),
+            "positions": decisions,
+        }
+    )
+    if expected_fingerprint != str(row.decision_fingerprint):
         raise BreakEvenMarketDecisionConflict(
             "break_even_market_decision_corrupt"
         )

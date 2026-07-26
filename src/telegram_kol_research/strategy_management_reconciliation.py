@@ -20,6 +20,7 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
+    StrategyManagementMarketDecision,
 )
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
@@ -38,7 +39,13 @@ _ACTIVE_RECONCILIATION_STATUSES = frozenset(
     }
 )
 _CLOSE_ACTIONS = frozenset(
-    {"partial_close", "full_close", "full_exit", "partial_then_break_even"}
+    {
+        "partial_close",
+        "full_close",
+        "full_exit",
+        "partial_then_break_even",
+        "break_even_by_market",
+    }
 )
 _ORDER_ID_KEYS = ("ordId", "orderId", "order_id", "id")
 _CLIENT_ORDER_ID_KEYS = ("clOrdId", "clientOrderId", "client_order_id")
@@ -100,6 +107,22 @@ def reconcile_strategy_management_batches(
                 .order_by(StrategyManagementLeg.leg_index.asc(), StrategyManagementLeg.id.asc())
                 .all()
             )
+            market_actions = (
+                _market_actions_by_leg_id(session, batch=batch, legs=legs)
+                if batch.effective_action == "break_even_by_market"
+                else None
+            )
+            if batch.effective_action == "break_even_by_market" and market_actions is None:
+                counts["checked"] += 1
+                _freeze_batch(
+                    session,
+                    batch,
+                    status="recovery_required",
+                    reason="break_even_market_decision_missing_or_invalid",
+                    now=now,
+                )
+                counts["frozen"] += 1
+                continue
             if _composite_protection_phase_started(batch, legs):
                 continue
             counts["checked"] += 1
@@ -115,10 +138,23 @@ def reconcile_strategy_management_batches(
                 continue
 
             deferred_leg_ids = _snapshot_deferred_entry_leg_ids(batch)
+            close_legs = (
+                [
+                    leg
+                    for leg in legs
+                    if market_actions[int(leg.id)] == "full_exit"
+                ]
+                if market_actions is not None
+                else legs
+            )
             if (
-                batch.effective_action in {"full_close", "full_exit"}
+                batch.effective_action
+                in {"full_close", "full_exit", "break_even_by_market"}
                 and deferred_leg_ids
-                and all(str(leg.status or "") == "planned" for leg in legs)
+                and close_legs
+                and all(
+                    str(leg.status or "") == "planned" for leg in close_legs
+                )
             ):
                 # Deferred cancellations are durable exchange writes. If no
                 # close leg was subsequently reserved, a crash occurred in the
@@ -137,7 +173,7 @@ def reconcile_strategy_management_batches(
             binding = session.get(ExecutionBinding, batch.execution_binding_id)
             expected_instrument = normalize_deepcoin_swap_instrument(binding.symbol)
 
-            for leg in legs:
+            for leg in close_legs:
                 _reconcile_leg(
                     leg,
                     position_rows=position_rows,
@@ -145,7 +181,78 @@ def reconcile_strategy_management_batches(
                     snapshot=snapshot,
                     expected_instrument=expected_instrument,
                     now=now,
+                    planned_close_size=(
+                        leg.preflight_size
+                        if market_actions is not None
+                        else leg.planned_close_size
+                    ),
                 )
+
+            if market_actions is not None:
+                protection_legs = [
+                    leg
+                    for leg in legs
+                    if market_actions[int(leg.id)] == "set_break_even"
+                ]
+                close_statuses = [str(leg.status or "") for leg in close_legs]
+                protection_statuses = [
+                    str(leg.status or "") for leg in protection_legs
+                ]
+                if close_legs and all(
+                    status == "confirmed" for status in close_statuses
+                ):
+                    _terminalize_selected_market_close_legs(
+                        session,
+                        batch=batch,
+                        close_legs=close_legs,
+                        now=now,
+                    )
+                    batch.reconciled_at = now
+                    batch.updated_at = now
+                    if all(
+                        status == "succeeded"
+                        for status in protection_statuses
+                    ):
+                        batch.status = "succeeded"
+                        batch.reason_code = (
+                            "break_even_market_exchange_confirmed"
+                        )
+                        batch.completed_at = now
+                        counts["succeeded"] += 1
+                    else:
+                        _freeze_batch(
+                            session,
+                            batch,
+                            status=(
+                                "recovery_required"
+                                if "recovery_required" in protection_statuses
+                                else "partial_failed"
+                            ),
+                            reason="break_even_market_protection_not_confirmed",
+                            now=now,
+                        )
+                        counts["frozen"] += 1
+                elif any(
+                    status
+                    in {"failed", "partial", "inconsistent", "submit_unknown"}
+                    for status in close_statuses
+                ):
+                    _freeze_batch(
+                        session,
+                        batch,
+                        status="recovery_required",
+                        reason="break_even_market_close_requires_recovery",
+                        now=now,
+                    )
+                    counts["frozen"] += 1
+                else:
+                    batch.status = "reconciling"
+                    batch.reason_code = (
+                        "break_even_market_close_pending_confirmation"
+                    )
+                    batch.updated_at = now
+                    counts["pending"] += 1
+                continue
 
             statuses = [str(leg.status or "") for leg in legs]
             if all(status == "confirmed" for status in statuses):
@@ -229,6 +336,114 @@ def _composite_protection_phase_started(batch, legs) -> bool:
     )
 
 
+def _market_actions_by_leg_id(session, *, batch, legs) -> dict[int, str] | None:
+    row = (
+        session.query(StrategyManagementMarketDecision)
+        .filter(
+            StrategyManagementMarketDecision.management_batch_id == batch.id
+        )
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    try:
+        decisions = json.loads(row.decisions_json)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(decisions, list):
+        return None
+    actions: dict[int, str] = {}
+    expected = {
+        (int(leg.id), int(leg.execution_order_leg_id), str(leg.pos_id))
+        for leg in legs
+    }
+    observed: set[tuple[int, int, str]] = set()
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            return None
+        try:
+            identity = (
+                int(decision["management_leg_id"]),
+                int(decision["execution_order_leg_id"]),
+                str(decision["pos_id"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        action = str(decision.get("action") or "")
+        if (
+            identity in observed
+            or action not in {"full_exit", "set_break_even"}
+        ):
+            return None
+        observed.add(identity)
+        actions[identity[0]] = action
+    return actions if observed == expected else None
+
+
+def _terminalize_selected_market_close_legs(
+    session,
+    *,
+    batch,
+    close_legs,
+    now: datetime,
+) -> None:
+    binding = session.get(ExecutionBinding, batch.execution_binding_id)
+    lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+    raw = session.get(RawMessage, batch.raw_message_id)
+    if binding is None or lifecycle is None:
+        raise RuntimeError("management_reconciliation_identity_disappeared")
+    for leg in close_legs:
+        entry = session.get(ExecutionOrderLeg, leg.execution_order_leg_id)
+        if entry is None:
+            raise RuntimeError("management_entry_leg_disappeared")
+        entry.status = "closed"
+        entry.terminal_reason = "management_full_close_confirmed"
+        entry.last_verified_at = now
+        entry.updated_at = now
+    remaining = (
+        session.query(ExecutionOrderLeg)
+        .filter(
+            ExecutionOrderLeg.execution_binding_id
+            == batch.execution_binding_id,
+            ExecutionOrderLeg.purpose == "entry",
+            ExecutionOrderLeg.pos_id.is_not(None),
+        )
+        .order_by(ExecutionOrderLeg.leg_index.asc(), ExecutionOrderLeg.id.asc())
+        .all()
+    )
+    remaining_pos_ids = [
+        str(entry.pos_id)
+        for entry in remaining
+        if (
+            str(entry.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
+            and entry.terminal_reason is None
+            and entry.attribution_status == "verified"
+        )
+    ]
+    if remaining_pos_ids:
+        binding.status = "active"
+        binding.pos_id = ",".join(dict.fromkeys(remaining_pos_ids))
+        binding.last_exchange_status = "management_selected_close_confirmed"
+        lifecycle.lifecycle_status = "entered"
+        lifecycle.exit_reason = None
+        lifecycle.exited_at = None
+        lifecycle.management_action = "break_even_market_confirmed"
+    else:
+        binding.status = "closed"
+        binding.pos_id = None
+        binding.last_exchange_status = "management_full_close_confirmed"
+        lifecycle.lifecycle_status = "exited"
+        lifecycle.exit_reason = "kol_signal"
+        lifecycle.exited_at = now
+        lifecycle.management_action = "full_close_confirmed"
+    binding.recovered_at = now
+    binding.updated_at = now
+    lifecycle.management_signal_message_id = (
+        int(raw.message_id) if raw is not None else None
+    )
+    lifecycle.updated_at = now
+
+
 def _reconcile_leg(
     leg: StrategyManagementLeg,
     *,
@@ -237,6 +452,7 @@ def _reconcile_leg(
     snapshot: Any,
     expected_instrument: str,
     now: datetime,
+    planned_close_size: Any = None,
 ) -> None:
     if leg.status == "failed":
         return
@@ -310,7 +526,11 @@ def _reconcile_leg(
 
     try:
         before = _positive_decimal(leg.preflight_size)
-        planned = _positive_decimal(leg.planned_close_size)
+        planned = _positive_decimal(
+            leg.planned_close_size
+            if planned_close_size is None
+            else planned_close_size
+        )
         current = Decimal("0") if not rows else _position_size(rows[0])
     except (InvalidOperation, ValueError):
         leg.status = "inconsistent"

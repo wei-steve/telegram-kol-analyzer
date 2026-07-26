@@ -364,23 +364,60 @@ def reserve_break_even_market_actions(
             allowed_legs.append(leg)
 
     if allowed_legs:
-        if any(
-            not isinstance(leg.old_tpsl, dict)
-            or not leg.old_tpsl.get("order_ids")
-            for leg in allowed_legs
-        ):
-            raise ManagementBatchExecutionError(
-                "protection_preflight_rows_ambiguous_or_drifted"
-            )
         pending = list(
             deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
         )
-        _preflight_exact_protection_rows(
-            session_factory=session_factory,
-            batch=replace(batch, legs=tuple(allowed_legs)),
-            live_positions=live_positions,
-            pending=pending,
-        )
+        if all(
+            isinstance(leg.old_tpsl, dict)
+            and leg.old_tpsl.get("order_ids")
+            for leg in allowed_legs
+        ):
+            protection_rows = _preflight_exact_protection_rows(
+                session_factory=session_factory,
+                batch=replace(batch, legs=tuple(allowed_legs)),
+                live_positions=live_positions,
+                pending=pending,
+            )
+        else:
+            matches = match_position_protection(live_positions, pending)
+            protection_rows = {}
+            seen_order_ids: set[str] = set()
+            for leg in allowed_legs:
+                protection = matches.by_pos_id.get(str(leg.pos_id))
+                current_rows = (
+                    snapshot_protection_rows(protection.rows)
+                    if protection is not None
+                    else []
+                )
+                order_ids = [
+                    str(row.get("order_id") or "") for row in current_rows
+                ]
+                if (
+                    protection is None
+                    or protection.status != "verified"
+                    or not current_rows
+                    or [str(order_id) for order_id in protection.order_ids]
+                    != order_ids
+                    or not all(order_ids)
+                    or len(order_ids) != len(set(order_ids))
+                    or bool(seen_order_ids.intersection(order_ids))
+                ):
+                    raise ManagementBatchExecutionError(
+                        "protection_preflight_rows_ambiguous_or_drifted"
+                    )
+                seen_order_ids.update(order_ids)
+                protection_rows[str(leg.pos_id)] = current_rows
+        decisions_by_pos_id = {
+            str(row["pos_id"]): row for row in decisions
+        }
+        for leg in allowed_legs:
+            current_rows = protection_rows[str(leg.pos_id)]
+            decisions_by_pos_id[str(leg.pos_id)]["protection"] = {
+                "order_ids": [
+                    str(row["order_id"]) for row in current_rows
+                ],
+                "row_snapshots": current_rows,
+            }
 
     return reserve_break_even_market_decision(
         session_factory,
@@ -391,6 +428,420 @@ def reserve_break_even_market_actions(
         observed_at=observed_at,
         decisions=decisions,
     )
+
+
+def _execute_break_even_by_market_batch(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    executed_at: datetime,
+) -> dict[str, Any]:
+    """Execute one durable per-position close/protection decision."""
+
+    if batch.status == "ready":
+        claimed = claim_ready_batch(
+            session_factory, batch.id, claimed_at=executed_at
+        )
+        batch = claimed or load_management_batch(session_factory, batch.id)
+    if batch.status == "reconciling":
+        return _result(batch, reason="batch_already_reconciling")
+    if batch.status != "executing":
+        raise ManagementBatchExecutionError(
+            f"batch_not_executable:{batch.status}"
+        )
+
+    decision = reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=deepcoin_client,
+        observed_at=executed_at,
+    )
+    decisions_by_leg_id = {
+        int(row["management_leg_id"]): row for row in decision.decisions
+    }
+    if set(decisions_by_leg_id) != {int(leg.id) for leg in batch.legs}:
+        raise ManagementBatchExecutionError(
+            "break_even_market_decision_leg_set_not_exact"
+        )
+    for leg in batch.legs:
+        if leg.status != "reserved":
+            continue
+        action = decisions_by_leg_id[int(leg.id)]["action"]
+        transition_leg(
+            session_factory,
+            leg.id,
+            expected_statuses={"reserved"},
+            new_status=(
+                "submit_unknown"
+                if action == "full_exit"
+                else "recovery_required"
+            ),
+            transitioned_at=executed_at,
+            last_error={
+                "reason": (
+                    "reserved_submission_outcome_unknown"
+                    if action == "full_exit"
+                    else "reserved_protection_outcome_unknown"
+                )
+            },
+        )
+    batch = load_management_batch(session_factory, batch.id)
+    binding = _load_exact_binding(session_factory, batch)
+    close_decisions = {
+        leg_id: row
+        for leg_id, row in decisions_by_leg_id.items()
+        if row["action"] == "full_exit"
+    }
+    if close_decisions:
+        _cancel_deferred_entry_legs(
+            session_factory,
+            batch=batch,
+            binding=binding,
+            deepcoin_client=deepcoin_client,
+            cancelled_at=executed_at,
+        )
+
+    batch = load_management_batch(session_factory, batch.id)
+    for leg in batch.legs:
+        row = decisions_by_leg_id[int(leg.id)]
+        if row["action"] != "full_exit" or leg.status != "planned":
+            continue
+        client_order_id = build_management_client_order_id(
+            batch_id=batch.id, leg_id=leg.id
+        )
+        request = _close_payload(
+            binding=binding,
+            pos_id=leg.pos_id,
+            close_size=str(leg.preflight_size),
+            client_order_id=client_order_id,
+        )
+        if not transition_leg(
+            session_factory,
+            leg.id,
+            expected_statuses={"planned"},
+            new_status="reserved",
+            transitioned_at=executed_at,
+            client_order_id=client_order_id,
+            request=request,
+            last_error=None,
+        ):
+            raise ManagementBatchExecutionError(
+                f"management_leg_reservation_conflict:{leg.id}"
+            )
+        try:
+            _require_remediation_live_gate(session_factory, batch=batch)
+            response = deepcoin_client.place_order(request)
+        except DeepcoinDefiniteRejection as exc:
+            transition_leg(
+                session_factory,
+                leg.id,
+                expected_statuses={"reserved"},
+                new_status="failed",
+                transitioned_at=executed_at,
+                last_error={"type": type(exc).__name__, "message": str(exc)},
+            )
+            _record_leg_event(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                leg_id=leg.id,
+                pos_id=leg.pos_id,
+                client_order_id=client_order_id,
+                request=request,
+                response=None,
+                order_id=None,
+                status="failed",
+                reason="submission_rejected",
+                created_at=executed_at,
+            )
+            continue
+        except Exception as exc:
+            transition_leg(
+                session_factory,
+                leg.id,
+                expected_statuses={"reserved"},
+                new_status="submit_unknown",
+                transitioned_at=executed_at,
+                last_error={"type": type(exc).__name__, "message": str(exc)},
+            )
+            _record_leg_event(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                leg_id=leg.id,
+                pos_id=leg.pos_id,
+                client_order_id=client_order_id,
+                request=request,
+                response=None,
+                order_id=None,
+                status="submit_unknown",
+                reason="submission_outcome_unknown",
+                created_at=executed_at,
+            )
+            continue
+        order_id = _extract_order_id(response)
+        next_status = "submitted" if order_id else "submit_unknown"
+        transition_leg(
+            session_factory,
+            leg.id,
+            expected_statuses={"reserved"},
+            new_status=next_status,
+            transitioned_at=executed_at,
+            exchange_order_id=order_id,
+            response=response,
+            last_error=(
+                None
+                if order_id
+                else {"reason": "submission_response_missing_order_id"}
+            ),
+        )
+        _record_leg_event(
+            session_factory,
+            batch=batch,
+            binding=binding,
+            leg_id=leg.id,
+            pos_id=leg.pos_id,
+            client_order_id=client_order_id,
+            request=request,
+            response=response,
+            order_id=order_id,
+            status=next_status,
+            reason=(
+                "management_close_submitted"
+                if order_id
+                else "submission_response_missing_order_id"
+            ),
+            created_at=executed_at,
+        )
+
+    batch = load_management_batch(session_factory, batch.id)
+    inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
+    for leg in batch.legs:
+        row = decisions_by_leg_id[int(leg.id)]
+        if row["action"] != "set_break_even" or leg.status != "planned":
+            continue
+        protection = row.get("protection")
+        old_rows = list((protection or {}).get("row_snapshots") or [])
+        old_order_ids = list((protection or {}).get("order_ids") or [])
+        if not old_rows or [item.get("order_id") for item in old_rows] != old_order_ids:
+            raise ManagementBatchExecutionError(
+                "break_even_market_decision_protection_invalid"
+            )
+        execution_leg = replace(
+            leg,
+            old_tpsl={
+                "order_ids": old_order_ids,
+                "row_snapshots": old_rows,
+            },
+            planned_tpsl={
+                "intent": "move_stop_to_break_even",
+                "stop_loss_text": None,
+            },
+        )
+        new_rows = _adjusted_protection_rows(
+            batch=replace(
+                batch, effective_action="move_stop_to_break_even"
+            ),
+            leg=execution_leg,
+            old_rows=old_rows,
+        )
+        if not transition_leg(
+            session_factory,
+            leg.id,
+            expected_statuses={"planned"},
+            new_status="reserved",
+            transitioned_at=executed_at,
+            request={"cancel_order_ids": old_order_ids},
+        ):
+            raise ManagementBatchExecutionError(
+                f"management_protection_leg_reservation_conflict:{leg.id}"
+            )
+        try:
+            for order_id in old_order_ids:
+                _require_remediation_live_gate(session_factory, batch=batch)
+                deepcoin_client.cancel_position_sltp(
+                    {
+                        "instType": "SWAP",
+                        "instId": inst_id,
+                        "ordId": str(order_id),
+                    }
+                )
+                _mark_management_tpsl_ledger_cancelled(
+                    session_factory,
+                    batch=batch,
+                    leg=leg,
+                    order_id=str(order_id),
+                    seen_at=executed_at,
+                )
+        except Exception as exc:
+            transition_leg(
+                session_factory,
+                leg.id,
+                expected_statuses={"reserved"},
+                new_status="recovery_required",
+                transitioned_at=executed_at,
+                last_error={
+                    "stage": "cancel_old_protection",
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            continue
+
+        common = _protection_payload_common(
+            binding=binding,
+            position={"posId": str(leg.pos_id)},
+            inst_id=inst_id,
+        )
+        created_order_ids: list[str] = []
+        responses: list[dict[str, Any]] = []
+        replacement_error: Exception | None = None
+        for protection_row in new_rows:
+            try:
+                _require_remediation_live_gate(session_factory, batch=batch)
+                response = deepcoin_client.set_position_sltp(
+                    _protection_row_payload(
+                        common=common, row=protection_row
+                    )
+                )
+                order_id = _extract_order_id(response)
+                if not order_id:
+                    raise ManagementBatchExecutionError(
+                        "protection_replacement_missing_order_id"
+                    )
+                created_order_ids.append(order_id)
+                responses.append(response)
+            except Exception as exc:
+                replacement_error = exc
+                break
+        if replacement_error is None:
+            _record_management_tpsl_ledger_rows(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                leg=leg,
+                inst_id=inst_id,
+                rows=new_rows,
+                order_ids=created_order_ids,
+                seen_at=executed_at,
+            )
+            transition_leg(
+                session_factory,
+                leg.id,
+                expected_statuses={"reserved"},
+                new_status="succeeded",
+                transitioned_at=executed_at,
+                response={"rows": responses},
+                last_error=None,
+            )
+            continue
+
+        restoration_error: Exception | None = None
+        restore_responses: list[dict[str, Any]] = []
+        try:
+            for order_id in created_order_ids:
+                _require_remediation_live_gate(session_factory, batch=batch)
+                deepcoin_client.cancel_position_sltp(
+                    {
+                        "instType": "SWAP",
+                        "instId": inst_id,
+                        "ordId": order_id,
+                    }
+                )
+            for protection_row in old_rows:
+                _require_remediation_live_gate(session_factory, batch=batch)
+                response = deepcoin_client.set_position_sltp(
+                    _protection_row_payload(
+                        common=common, row=protection_row
+                    )
+                )
+                if not _extract_order_id(response):
+                    raise ManagementBatchExecutionError(
+                        "protection_restore_missing_order_id"
+                    )
+                restore_responses.append(response)
+        except Exception as exc:
+            restoration_error = exc
+        if restoration_error is None:
+            restored_order_ids = [
+                str(_extract_order_id(response))
+                for response in restore_responses
+            ]
+            _record_management_tpsl_ledger_rows(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                leg=leg,
+                inst_id=inst_id,
+                rows=old_rows,
+                order_ids=restored_order_ids,
+                seen_at=executed_at,
+                evidence_source="management_tpsl_restore",
+            )
+            leg_status = "restored"
+        else:
+            leg_status = "recovery_required"
+        transition_leg(
+            session_factory,
+            leg.id,
+            expected_statuses={"reserved"},
+            new_status=leg_status,
+            transitioned_at=executed_at,
+            response={"restore_rows": restore_responses},
+            last_error={
+                "stage": "replace_protection",
+                "type": type(replacement_error).__name__,
+                "message": str(replacement_error),
+                "restore_error": (
+                    None
+                    if restoration_error is None
+                    else {
+                        "type": type(restoration_error).__name__,
+                        "message": str(restoration_error),
+                    }
+                ),
+            },
+        )
+
+    completed = load_management_batch(session_factory, batch.id)
+    statuses = {leg.status for leg in completed.legs}
+    has_close = bool(close_decisions)
+    if "recovery_required" in statuses:
+        final_status = "recovery_required"
+        reason = "break_even_market_recovery_required"
+    elif "restored" in statuses or "failed" in statuses:
+        final_status = "partial_failed"
+        reason = "break_even_market_partial_failed"
+    elif has_close:
+        final_status = "reconciling"
+        reason = (
+            "one_or_more_close_submissions_unknown"
+            if "submit_unknown" in statuses
+            else "close_submissions_pending_reconciliation"
+        )
+    else:
+        final_status = "succeeded"
+        reason = "all_position_protection_replaced"
+    if not transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"executing"},
+        new_status=final_status,
+        transitioned_at=executed_at,
+        reason_code=reason,
+    ):
+        raise ManagementBatchExecutionError(
+            "management_batch_finalization_conflict"
+        )
+    result_batch = load_management_batch(session_factory, batch.id)
+    if final_status == "succeeded":
+        _confirm_protection_lifecycle(
+            session_factory,
+            batch=result_batch,
+            confirmed_at=executed_at,
+        )
+    return _result(result_batch, reason=reason)
 
 
 @serialized_position_authority_mutation
@@ -427,6 +878,13 @@ def execute_management_batch(
                 reason_code="remediation_confirmation_expired",
             )
             raise
+    if batch.effective_action == "break_even_by_market":
+        return _execute_break_even_by_market_batch(
+            session_factory,
+            batch=batch,
+            deepcoin_client=deepcoin_client,
+            executed_at=now,
+        )
     if batch.effective_action in _PROTECTION_ACTIONS or (
         batch.effective_action == "partial_then_break_even"
         and (

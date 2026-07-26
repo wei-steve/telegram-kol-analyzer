@@ -277,6 +277,7 @@ def _persist_market_break_even_batch(session_factory):
             .filter(StrategyManagementLeg.management_batch_id == batch.id)
             .all()
         ):
+            leg.old_tpsl_json = None
             leg.planned_tpsl_json = None
         session.commit()
     return load_management_batch(session_factory, batch.id), rows_by_pos
@@ -396,6 +397,10 @@ class _ProtectionClient:
             "price_field": "last",
         }
         self.quote_reads = []
+        self.trigger_pending = []
+        self.open_orders = []
+        self.cancel_trigger_calls = []
+        self.cancel_order_calls = []
 
     def list_positions(self, *, inst_id=None):
         return [dict(row) for row in self.positions]
@@ -407,6 +412,19 @@ class _ProtectionClient:
     def get_ticker_quote(self, *, inst_id):
         self.quote_reads.append(inst_id)
         return None if self.quote is None else dict(self.quote)
+
+    def list_open_orders(self, *, inst_id=None):
+        return [dict(row) for row in self.open_orders]
+
+    def cancel_trigger_order(self, payload):
+        self.cancel_trigger_calls.append(dict(payload))
+        self.call_log.append(("cancel_trigger_order", str(payload.get("ordId"))))
+        return {"code": "0", "data": {"ordId": payload.get("ordId")}}
+
+    def cancel_order(self, payload):
+        self.cancel_order_calls.append(dict(payload))
+        self.call_log.append(("cancel_order", str(payload.get("ordId"))))
+        return {"code": "0", "data": {"ordId": payload.get("ordId")}}
 
     def place_order(self, payload):
         self.close_calls.append(dict(payload))
@@ -685,6 +703,307 @@ def test_break_even_market_reservation_retry_reuses_decision_without_ticker(
 
     assert second == first
     assert client.call_log == []
+
+
+def test_break_even_by_market_executes_mixed_close_and_protection_legs(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "reconciling"
+    assert [
+        (call["closePosId"], call["sz"], call["ordType"])
+        for call in client.close_calls
+    ] == [("pos-1", "2", "market")]
+    assert [call["ordId"] for call in client.cancel_calls] == [
+        "tp-2",
+        "sl-2",
+    ]
+    assert {call["posId"] for call in client.set_calls} == {"pos-2"}
+    stop_payloads = [
+        call for call in client.set_calls if call.get("slTriggerPx") not in (None, "")
+    ]
+    assert len(stop_payloads) == 1
+    assert stop_payloads[0]["slTriggerPx"] == "64500"
+    stored = load_management_batch(session_factory, batch.id)
+    assert {leg.pos_id: leg.status for leg in stored.legs} == {
+        "pos-1": "submitted",
+        "pos-2": "succeeded",
+    }
+
+
+def test_break_even_by_market_all_allowed_replaces_each_positions_protection(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.quote["price"] = "63000"
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "succeeded"
+    assert client.close_calls == []
+    assert len(client.cancel_calls) == 5
+    assert len(client.set_calls) == 5
+    stop_by_pos = {
+        call["posId"]: call["slTriggerPx"]
+        for call in client.set_calls
+        if call.get("slTriggerPx") not in (None, "")
+    }
+    assert stop_by_pos == {"pos-1": "64000", "pos-2": "64500"}
+    assert {leg.status for leg in load_management_batch(session_factory, batch.id).legs} == {
+        "succeeded"
+    }
+
+
+def test_break_even_by_market_all_invalid_market_closes_exact_positions(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.quote["price"] = "65000"
+    client.pending = []
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "reconciling"
+    assert [
+        (call["closePosId"], call["sz"]) for call in client.close_calls
+    ] == [("pos-1", "2"), ("pos-2", "4")]
+    assert client.cancel_calls == []
+    assert client.set_calls == []
+
+
+def test_break_even_by_market_cancels_deferred_entry_before_market_close(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    deferred_ids, _ = _configure_deferred_full_exit(session_factory, batch)
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.positions = [client.positions[0]]
+    client.pending = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "ordId": "deferred-order-1",
+            "clOrdId": "deferred-client-1",
+            "posSide": "short",
+        }
+    ]
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "reconciling"
+    assert client.cancel_trigger_calls == [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "ordId": "deferred-order-1",
+            "clOrdId": "deferred-client-1",
+        }
+    ]
+    assert [call["closePosId"] for call in client.close_calls] == ["pos-1"]
+    cancel_index = next(
+        index
+        for index, (operation, _value) in enumerate(client.call_log)
+        if operation == "cancel_trigger_order"
+    )
+    close_index = next(
+        index
+        for index, (operation, _value) in enumerate(client.call_log)
+        if operation == "place_order"
+    )
+    assert cancel_index < close_index
+    with session_factory() as session:
+        deferred = session.get(ExecutionOrderLeg, deferred_ids[0])
+        assert deferred.status == "cancelled"
+
+
+def test_break_even_by_market_unknown_close_is_never_resubmitted(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.quote["price"] = "65000"
+    client.pending = []
+    calls = []
+
+    def place_order(payload):
+        calls.append(dict(payload))
+        if len(calls) == 1:
+            raise DeepcoinRequestOutcomeUnknown("timeout")
+        return {"code": "0", "data": {"ordId": "close-2"}}
+
+    client.place_order = place_order
+
+    first = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+    second = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert first["status"] == "reconciling"
+    assert second["reason"] == "batch_already_reconciling"
+    assert len(calls) == 2
+    assert {
+        leg.pos_id: leg.status
+        for leg in load_management_batch(session_factory, batch.id).legs
+    } == {"pos-1": "submit_unknown", "pos-2": "submitted"}
+
+
+def test_break_even_by_market_reserved_close_restart_becomes_submit_unknown(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+    close_leg = next(leg for leg in batch.legs if leg.pos_id == "pos-1")
+    transition_leg(
+        session_factory,
+        close_leg.id,
+        expected_statuses={"planned"},
+        new_status="reserved",
+        transitioned_at=NOW,
+        client_order_id="TMRESERVED",
+        request={"closePosId": "pos-1", "sz": "2"},
+    )
+    client.close_calls.clear()
+    client.call_log.clear()
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "reconciling"
+    assert client.close_calls == []
+    assert {
+        leg.pos_id: leg.status
+        for leg in load_management_batch(session_factory, batch.id).legs
+    } == {"pos-1": "submit_unknown", "pos-2": "succeeded"}
+
+
+def test_break_even_by_market_rejected_protection_restores_only_that_leg(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    client = _ProtectionClient(
+        session_factory,
+        rows_by_pos,
+        set_outcomes=[
+            {"code": "0", "data": {"ordId": "new-tp"}},
+            DeepcoinDefiniteRejection("invalid stop"),
+            {"code": "0", "data": {"ordId": "restore-tp"}},
+            {"code": "0", "data": {"ordId": "restore-sl"}},
+        ],
+    )
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "partial_failed"
+    assert {
+        leg.pos_id: leg.status
+        for leg in load_management_batch(session_factory, batch.id).legs
+    } == {"pos-1": "submitted", "pos-2": "restored"}
+    assert [call["ordId"] for call in client.cancel_calls] == [
+        "tp-2",
+        "sl-2",
+        "new-tp",
+    ]
+    with session_factory() as session:
+        rows = (
+            session.query(PositionProtectionLedger)
+            .filter(PositionProtectionLedger.pos_id == "pos-2")
+            .order_by(PositionProtectionLedger.order_id)
+            .all()
+        )
+        assert [row.order_id for row in rows] == ["restore-sl", "restore-tp"]
+        assert {row.evidence_source for row in rows} == {
+            "management_tpsl_restore"
+        }
 
 
 def test_close_legs_are_committed_reserved_before_exact_market_submission(tmp_path):

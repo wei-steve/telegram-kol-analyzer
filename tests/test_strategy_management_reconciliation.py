@@ -18,6 +18,8 @@ from telegram_kol_research.models import (
     RecognitionDecision,
     StrategyLifecycle,
     StrategyManagementBatch,
+    StrategyManagementLeg,
+    StrategyManagementMarketDecision,
 )
 from telegram_kol_research.strategy_management_batches import (
     ManagementLegCreate,
@@ -213,6 +215,96 @@ def test_submitted_order_with_unchanged_position_stays_pending_on_one_snapshot(t
     assert stored.legs[0].status == "submitted"
     assert stored.reconciled_at is None
     assert client.calls == {"positions": 1, "open": 1, "history": 1, "fills": 1}
+
+
+def test_break_even_by_market_reconciles_only_close_decisions(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(
+        sf,
+        action="full_exit",
+        sizes=("2", "4"),
+        preflight=("2", "4"),
+    )
+    with sf() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        stored.intent = "move_stop_to_break_even"
+        stored.effective_action = "break_even_by_market"
+        legs = (
+            session.query(StrategyManagementLeg)
+            .filter(StrategyManagementLeg.management_batch_id == batch.id)
+            .order_by(StrategyManagementLeg.leg_index)
+            .all()
+        )
+        legs[0].status = "submitted"
+        legs[1].status = "succeeded"
+        legs[1].client_order_id = None
+        legs[1].exchange_order_id = None
+        session.add(
+            StrategyManagementMarketDecision(
+                management_batch_id=batch.id,
+                strategy_instance_id=batch.strategy_instance_id,
+                instrument_id="BTC-USDT-SWAP",
+                quote_price="64200",
+                quote_price_field="last",
+                observed_at=NOW,
+                decisions_json=json.dumps(
+                    [
+                        {
+                            "management_leg_id": legs[0].id,
+                            "execution_order_leg_id": legs[0].execution_order_leg_id,
+                            "pos_id": "pos-1",
+                            "side": "short",
+                            "entry_price": "64000",
+                            "comparison": "entry_below_market",
+                            "action": "full_exit",
+                        },
+                        {
+                            "management_leg_id": legs[1].id,
+                            "execution_order_leg_id": legs[1].execution_order_leg_id,
+                            "pos_id": "pos-2",
+                            "side": "short",
+                            "entry_price": "64500",
+                            "comparison": "entry_above_market",
+                            "action": "set_break_even",
+                            "protection": {
+                                "order_ids": ["tp-2", "sl-2"],
+                                "row_snapshots": [],
+                            },
+                        },
+                    ]
+                ),
+                decision_fingerprint="d" * 64,
+                created_at=NOW,
+            )
+        )
+        session.commit()
+
+    result = _reconcile_management(
+        sf,
+        positions=[_position("pos-2", "4")],
+        orders=[{"ordId": "close-1", "clOrdId": "TMCLIENT1"}],
+    )
+
+    assert result.succeeded == 1
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "succeeded"
+    assert {leg.pos_id: leg.status for leg in stored.legs} == {
+        "pos-1": "confirmed",
+        "pos-2": "succeeded",
+    }
+    with sf() as session:
+        entries = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == batch.execution_binding_id)
+            .order_by(ExecutionOrderLeg.leg_index)
+            .all()
+        )
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+        assert [entry.status for entry in entries] == ["closed", "active"]
+        assert binding.status == "active"
+        assert binding.pos_id == "pos-2"
+        assert lifecycle.lifecycle_status == "entered"
 
 
 def test_submission_phase_does_not_stamp_exchange_reconciliation_time(tmp_path):

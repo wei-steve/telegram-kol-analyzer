@@ -9,6 +9,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     StrategyManagementBatch,
     StrategyManagementLeg,
+    StrategyManagementMarketDecision,
 )
 from telegram_kol_research.strategy_management_market_decisions import (
     BreakEvenMarketDecisionConflict,
@@ -95,6 +96,23 @@ def _decisions(leg_ids):
             "entry_price": "64700",
             "comparison": "entry_above_market",
             "action": "set_break_even",
+            "protection": {
+                "order_ids": ["tp-pos-a", "sl-pos-a"],
+                "row_snapshots": [
+                    {
+                        "order_id": "tp-pos-a",
+                        "purpose": "take_profit",
+                        "trigger_price": "63000",
+                        "size": "4",
+                    },
+                    {
+                        "order_id": "sl-pos-a",
+                        "purpose": "stop_loss",
+                        "trigger_price": "65200",
+                        "size": "0",
+                    },
+                ],
+            },
         },
     ]
 
@@ -157,6 +175,10 @@ def test_reserve_market_decision_is_sorted_fingerprinted_and_idempotent(tmp_path
     assert first.quote_price == "64688.6"
     assert first.quote_price_field == "last"
     assert [row["pos_id"] for row in first.decisions] == ["pos-a", "pos-b"]
+    assert first.decisions[0]["protection"]["order_ids"] == [
+        "tp-pos-a",
+        "sl-pos-a",
+    ]
     assert len(first.decision_fingerprint) == 64
     assert load_break_even_market_decision(
         session_factory, batch_id=batch_id
@@ -189,6 +211,27 @@ def test_reserve_market_decision_rejects_conflicting_second_choice(tmp_path):
             observed_at=NOW,
             decisions=changed,
         )
+
+
+def test_load_market_decision_rejects_tampered_payload(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch_id, leg_ids = _persist_batch(session_factory)
+    reserve_break_even_market_decision(
+        session_factory,
+        batch_id=batch_id,
+        instrument_id="BTC-USDT-SWAP",
+        quote_price="64688.6",
+        quote_price_field="last",
+        observed_at=NOW,
+        decisions=_decisions(leg_ids),
+    )
+    with session_factory() as session:
+        row = session.query(StrategyManagementMarketDecision).one()
+        row.decisions_json = "[]"
+        session.commit()
+
+    with pytest.raises(BreakEvenMarketDecisionConflict):
+        load_break_even_market_decision(session_factory, batch_id=batch_id)
 
 
 @pytest.mark.parametrize(
