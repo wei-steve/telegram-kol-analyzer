@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
@@ -29,6 +29,7 @@ MAX_TELEGRAM_MESSAGE_CHARS = 3900
 EXPIRY_CONTINUE_COMMAND = "expiry_continue"
 EXPIRY_EXPIRE_CANCEL_COMMAND = "expiry_expire_cancel"
 EXPIRY_EXPIRE_KEEP_COMMAND = "expiry_expire_keep"
+EXPIRY_REVIEW_CONTINUE_HOURS = 3
 logger = logging.getLogger(__name__)
 
 
@@ -270,10 +271,14 @@ def _process_expiry_action(
                 else "人工确认继续等待，暂不标记过期。"
             )
             lifecycle.last_checked_at = event_at
+            lifecycle.expiry_review_next_at = event_at + timedelta(
+                hours=EXPIRY_REVIEW_CONTINUE_HOURS
+            )
             lifecycle.updated_at = event_at
             session.commit()
             return f"策略 #{lifecycle_id} 已继续等待。"
 
+        lifecycle.expiry_review_next_at = None
         if lifecycle_was_entered:
             if command == EXPIRY_EXPIRE_CANCEL_COMMAND and deepcoin_client is not None:
                 binding = (

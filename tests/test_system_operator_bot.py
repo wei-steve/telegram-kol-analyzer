@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
@@ -1226,6 +1226,7 @@ def test_build_pending_entry_expiry_review_reply_markup_uses_lifecycle_id_callba
 
 
 def test_process_expiry_continue_keeps_pending_and_suppresses_repeat_review(tmp_path):
+    continued_at = datetime(2026, 7, 3, 0, 0, tzinfo=UTC)
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         lifecycle = StrategyLifecycle(
@@ -1244,7 +1245,7 @@ def test_process_expiry_continue_keeps_pending_and_suppresses_repeat_review(tmp_
     response = process_system_operator_command(
         session_factory,
         f"/expiry_continue {lifecycle_id}",
-        now=datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
+        now=continued_at,
     )
 
     with session_factory() as session:
@@ -1253,6 +1254,9 @@ def test_process_expiry_continue_keeps_pending_and_suppresses_repeat_review(tmp_
     assert "继续等待" in response
     assert lifecycle.lifecycle_status == "pending_entry"
     assert lifecycle.management_action == "expiry_review_continued"
+    assert lifecycle.expiry_review_next_at == (
+        continued_at + timedelta(hours=3)
+    ).replace(tzinfo=None)
 
 
 def test_process_expiry_continue_accepts_strategy_code_message_id(tmp_path):
@@ -1314,6 +1318,7 @@ def test_process_system_operator_callback_data_dispatches_expiry_action(tmp_path
 
 
 def test_process_expiry_continue_does_not_revert_already_entered_strategy(tmp_path):
+    continued_at = datetime(2026, 7, 3, 0, 0, tzinfo=UTC)
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         lifecycle = StrategyLifecycle(
@@ -1333,7 +1338,7 @@ def test_process_expiry_continue_does_not_revert_already_entered_strategy(tmp_pa
     response = process_system_operator_callback_data(
         session_factory,
         f"expiry_continue:{lifecycle_id}",
-        now=datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
+        now=continued_at,
     )
 
     with session_factory() as session:
@@ -1343,6 +1348,9 @@ def test_process_expiry_continue_does_not_revert_already_entered_strategy(tmp_pa
     assert lifecycle.lifecycle_status == "entered"
     assert lifecycle.entered_at is not None
     assert lifecycle.management_action == "expiry_review_continued"
+    assert lifecycle.expiry_review_next_at == (
+        continued_at + timedelta(hours=3)
+    ).replace(tzinfo=None)
 
 
 def test_process_entered_expiry_expire_cancel_cancels_only_pending_entry_leg(tmp_path):
@@ -1482,6 +1490,7 @@ def test_process_entered_expiry_expire_keep_preserves_live_strategy(tmp_path):
             signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
             entered_at=datetime(2026, 7, 2, 21, 0, tzinfo=UTC),
             management_action="expiry_review_requested",
+            expiry_review_next_at=datetime(2026, 7, 3, 3, 0, tzinfo=UTC),
         )
         session.add(lifecycle)
         session.commit()
@@ -1501,6 +1510,7 @@ def test_process_entered_expiry_expire_keep_preserves_live_strategy(tmp_path):
     assert lifecycle.entered_at is not None
     assert lifecycle.exited_at is None
     assert lifecycle.management_action == "expiry_pending_leg_keep_order"
+    assert lifecycle.expiry_review_next_at is None
 
 
 def test_process_expiry_expire_cancel_does_not_expire_while_live_binding_needs_cancel(tmp_path):
@@ -1706,6 +1716,7 @@ def test_process_expiry_expire_keep_marks_expired_without_cancelling_binding(tmp
             lifecycle_status="pending_entry",
             signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
             management_action="expiry_review_requested",
+            expiry_review_next_at=datetime(2026, 7, 3, 3, 0, tzinfo=UTC),
         )
         session.add(lifecycle)
         session.commit()
@@ -1723,3 +1734,4 @@ def test_process_expiry_expire_keep_marks_expired_without_cancelling_binding(tmp
     assert "已标记过期" in response
     assert lifecycle.lifecycle_status == "expired"
     assert lifecycle.exit_reason == "expired"
+    assert lifecycle.expiry_review_next_at is None

@@ -810,6 +810,12 @@ def test_lifecycle_monitor_continued_expiry_review_repeats_after_interval(tmp_pa
     assert review_requests[0]["expiry_at"] == datetime(2026, 6, 30, 12, 0, tzinfo=UTC)
     assert lifecycle.expiry_review_notified_at == datetime(2026, 6, 30, 12, 0)
     assert lifecycle.expiry_review_next_at is None
+    asyncio.run(
+        monitor._request_pending_expiry_reviews(
+            datetime(2026, 6, 30, 18, 0, tzinfo=UTC)
+        )
+    )
+    assert len(review_requests) == 1
 
 
 def test_lifecycle_monitor_does_not_reopen_review_after_management_action_changes(
