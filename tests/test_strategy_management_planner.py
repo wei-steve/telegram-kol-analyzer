@@ -1096,6 +1096,106 @@ def test_ledger_backed_unscoped_protection_allows_plan(monkeypatch, tmp_path):
     assert second_leg.old_tpsl["evidence"]["match"] == "ledger_confirmed_current_order"
 
 
+def test_inline_price_without_order_id_falls_back_to_exact_ledger(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_then_break_even",
+        management_fraction=0.5,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=binding_id
+        ).one()
+        upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=binding_id,
+            execution_order_leg_id=leg.id,
+            strategy_instance_id=leg.strategy_instance_id,
+            pos_id="pos-b",
+            instrument_id="BTC-USDT-SWAP",
+            side="short",
+            order_id="ledger-current-sl",
+            purpose="stop_loss",
+            trigger_price="63000",
+            size_text="0",
+            status="verified",
+            evidence_source="official_ui_supervised",
+            evidence={"match": "reviewed_current_order"},
+            seen_at=PLANNED_AT,
+        )
+        upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=binding_id,
+            execution_order_leg_id=leg.id,
+            strategy_instance_id=leg.strategy_instance_id,
+            pos_id="pos-b",
+            instrument_id="BTC-USDT-SWAP",
+            side="short",
+            order_id="ledger-current-tp",
+            purpose="take_profit",
+            trigger_price="60000",
+            size_text="0",
+            status="verified",
+            evidence_source="official_ui_supervised",
+            evidence={"match": "reviewed_current_order"},
+            seen_at=PLANNED_AT,
+        )
+        session.commit()
+
+    position = {
+        **_position(),
+        "slTriggerPx": "63000",
+        "tpTriggerPx": "",
+    }
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [position],
+            tpsl_orders=[
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "short",
+                    "triggerOrderType": "TPSL",
+                    "slTriggerPx": "63000",
+                    "sz": "0",
+                    "ordId": "ledger-current-sl",
+                    "cTime": "1721000640000",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "short",
+                    "triggerOrderType": "TPSL",
+                    "tpTriggerPx": "60000",
+                    "sz": "0",
+                    "ordId": "ledger-current-tp",
+                    "cTime": "1721001280000",
+                }
+            ],
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+        shadow_only=True,
+    )
+
+    assert result.status == "ready"
+    assert set(result.batch.legs[0].old_tpsl["order_ids"]) == {
+        "ledger-current-sl",
+        "ledger-current-tp",
+    }
+    assert (
+        result.batch.legs[0].old_tpsl["evidence"]["match"]
+        == "ledger_confirmed_current_order"
+    )
+
+
 def test_ledger_backed_protection_requires_current_order_id(monkeypatch, tmp_path):
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "research.db")

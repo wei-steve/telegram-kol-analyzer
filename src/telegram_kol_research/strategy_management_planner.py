@@ -467,6 +467,16 @@ def _plan_strategy_management_batch_locked(
         seen_protection_order_ids: set[str] = set()
         for position in economics:
             protection = matches.by_pos_id.get(position["pos_id"])
+            position_only_without_order_ids = bool(
+                protection is not None
+                and protection.status == "verified"
+                and protection.rows
+                and not protection.order_ids
+                and all(
+                    row.get("_evidence_source") == "position"
+                    for row in protection.rows
+                )
+            )
             if protection is None or protection.status != "verified":
                 protection = _ledger_confirmed_position_protection(
                     position=position,
@@ -476,6 +486,17 @@ def _plan_strategy_management_batch_locked(
                     ledger_rows=ledger_rows_by_pos_id.get(position["pos_id"], []),
                     global_order_id_counts=global_protection_order_id_counts,
                 )
+            elif position_only_without_order_ids:
+                ledger_protection = _ledger_confirmed_position_protection(
+                    position=position,
+                    entry_leg=target_legs_by_pos_id[position["pos_id"]],
+                    binding=binding,
+                    tpsl_orders=tpsl_orders,
+                    ledger_rows=ledger_rows_by_pos_id.get(position["pos_id"], []),
+                    global_order_id_counts=global_protection_order_id_counts,
+                )
+                if ledger_protection is not None:
+                    protection = ledger_protection
             if protection is None or protection.status != "verified":
                 reason_code = _unverified_protection_reason(
                     protection=protection,
