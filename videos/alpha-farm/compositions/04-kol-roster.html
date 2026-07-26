@@ -179,8 +179,8 @@
         flex-direction: column;
         width: 100%;
         height: 100%;
-        padding: 78px 112px 66px;
-        gap: 34px;
+        padding: 58px 112px 180px;
+        gap: 24px;
         background:
           radial-gradient(circle at 86% 12%, rgba(139, 92, 246, 0.13), transparent 28%),
           linear-gradient(rgba(53, 194, 255, 0.035) 1px, transparent 1px),
@@ -367,5 +367,60 @@
         font-size: 16px;
       }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const kolRosterTimeline = gsap.timeline({ paused: true });
+
+      kolRosterTimeline.addLabel("roster-build", 0.2);
+      kolRosterTimeline.from("#scene-kol-roster .eyebrow", { x: -34, opacity: 0, duration: 0.42, ease: "expo.out" }, "roster-build");
+      kolRosterTimeline.from("#scene-kol-roster h1", { y: 38, opacity: 0, duration: 0.72, ease: "power4.out" }, "roster-build+=0.16");
+      kolRosterTimeline.from("#scene-kol-roster .signal-note", { x: 42, opacity: 0, duration: 0.54, ease: "circ.out" }, "roster-build+=0.34");
+      kolRosterTimeline.from(
+        "#scene-kol-roster .kol-card",
+        { y: 54, opacity: 0, scale: 0.97, duration: 0.68, stagger: 0.12, ease: "back.out(1.22)" },
+        "roster-build+=0.78",
+      );
+      kolRosterTimeline.from(
+        "#scene-kol-roster .kol-identity",
+        { x: -24, opacity: 0, duration: 0.38, stagger: 0.1, ease: "power3.out" },
+        "roster-build+=1.18",
+      );
+      kolRosterTimeline.from(
+        "#scene-kol-roster .message-card",
+        { y: 28, opacity: 0, scale: 0.985, duration: 0.56, stagger: 0.11, ease: "expo.out" },
+        "roster-build+=1.66",
+      );
+      kolRosterTimeline.from(
+        "#scene-kol-roster .mini-roster span",
+        {
+          scale: 0.5,
+          opacity: 0,
+          rotation: -8,
+          duration: 0.34,
+          stagger: 0.055,
+          transformOrigin: "50% 50%",
+          ease: "back.out(1.8)",
+        },
+        "roster-build+=2.7",
+      );
+      kolRosterTimeline.from("#scene-kol-roster .roster-footer p", { y: 22, opacity: 0, duration: 0.46, ease: "power2.out" }, "roster-build+=3");
+      kolRosterTimeline.from("#scene-kol-roster .roster-footer small", { opacity: 0, duration: 0.82, ease: "sine.out" }, "roster-build+=3.22");
+      kolRosterTimeline.from(
+        "#scene-kol-roster .signal-dot",
+        {
+          scale: 0.45,
+          opacity: 0.35,
+          duration: 0.7,
+          repeat: 2,
+          yoyo: true,
+          transformOrigin: "50% 50%",
+          ease: "sine.inOut",
+        },
+        4.2,
+      );
+
+      window.__timelines["alpha-farm-kol-roster"] = kolRosterTimeline;
+    </script>
   </div>
 </template>

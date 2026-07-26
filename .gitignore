@@ -39,6 +39,7 @@ videos/alpha-farm/assets/private/
 videos/alpha-farm/audio/generated/
 videos/alpha-farm/data/private/
 videos/alpha-farm/renders/
+videos/alpha-farm/snapshots/
 videos/alpha-farm/.hyperframes/
 
 # Keep the redacted Alpha Farm example manifest versioned.

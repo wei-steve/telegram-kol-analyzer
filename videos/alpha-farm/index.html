@@ -88,15 +88,11 @@
         data-track-index="1"
       ></div>
 
-      <!-- Track 2 is reserved for captions once narration timing is locked. -->
-      <div
-        id="captions-track-reserved"
-        class="clip"
-        data-start="0"
-        data-duration="180"
-        data-track-index="2"
-        aria-hidden="true"
-      ></div>
+      <div id="caption-layer" class="caption-layer" aria-live="off"></div>
+      <div class="transition-layer" aria-hidden="true">
+        <div id="transition-wipe-a" class="transition-wipe" data-layout-allow-overflow></div>
+        <div id="transition-wipe-b" class="transition-wipe" data-layout-allow-overflow></div>
+      </div>
       <audio
         id="narration"
         data-start="0"
@@ -105,12 +101,120 @@
         src="audio/generated/narration-timed.wav"
         data-volume="1"
       ></audio>
-      <!-- Track 4 is reserved for background music. -->
+      <audio
+        id="background-music"
+        data-start="0"
+        data-duration="180"
+        data-track-index="4"
+        src="audio/generated/background-ambient.wav"
+        data-volume="1"
+      ></audio>
     </div>
 
     <script>
       window.__timelines = window.__timelines || {};
       const tl = gsap.timeline({ paused: true });
+
+      const CAPTIONS = [
+        [0.5, 3.1, "我没有雇交易员"],
+        [3.2, 6.2, "但我有十几个 KOL"],
+        [6.3, 9.1, "全天替我寻找机会"],
+        [9.2, 11.8, "这就是《Alpha 牧场》"],
+        [11.9, 14.62, "Telegram 策略进入 AI 流水线"],
+        [15.5, 18.7, "这些优质 KOL 群"],
+        [18.8, 22.5, "每一个半年都接近一千美元"],
+        [22.6, 25.7, "十几个群就是上万美元门槛"],
+        [25.8, 29.3, "低成本信息聚合渠道接入系统"],
+        [29.4, 31.88, "“信息搬运工”负责修路"],
+        [33.5, 36.2, "消息不会直接照抄"],
+        [36.3, 39.3, "系统负责理解、过滤与风控"],
+        [39.4, 42.0, "再完成执行和保护"],
+        [42.1, 45.08, "变成可检查、可拒绝的指令"],
+        [46.5, 49.8, "很多群有数百条聊天"],
+        [49.9, 53.1, "入场信号却只有少数"],
+        [53.2, 55.4, "不是每句话都在喊单"],
+        [55.5, 58.4, "大镖客：BTC 区间和多目标"],
+        [58.5, 61.4, "飞扬简短，峰哥提示轻仓"],
+        [61.5, 66.16, "比特智智哥管理挂单"],
+        [67.5, 70.4, "AI 从一条策略中"],
+        [70.5, 73.6, "识别币种、方向、入场范围"],
+        [73.7, 76.2, "固定止损、止盈"],
+        [76.3, 78.5, "以及管理指令"],
+        [78.6, 81.1, "表达模糊或字段矛盾时"],
+        [81.2, 84.18, "拒绝猜测，转交人工复核"],
+        [85.5, 88.1, "下单前先定最大亏损"],
+        [88.2, 91.8, "演示上限：100 USDT"],
+        [91.9, 95.0, "BTC 做多区间 62,000 到 62,400"],
+        [95.1, 98.0, "固定止损 61,500"],
+        [98.1, 100.7, "每腿分配 50 USDT 风险"],
+        [100.8, 104.3, "贪婪腿：50 除以 500"],
+        [104.4, 107.0, "得到 0.1 BTC"],
+        [107.1, 110.6, "保守腿：50 除以 900"],
+        [110.7, 113.7, "约 0.0556 BTC"],
+        [113.8, 117.2, "两腿都止损，合计仍是 100 USDT"],
+        [117.3, 120.2, "仓位不靠感觉"],
+        [120.3, 123.1, "按风险与止损距离反推数量"],
+        [123.2, 126.18, "杠杆不改变预设风险"],
+        [127.5, 130.2, "范围入场拆成两条路线"],
+        [130.3, 133.5, "贪婪腿等待更好的价格"],
+        [133.6, 136.3, "但成交概率较低"],
+        [136.4, 139.5, "保守腿优先参与行情"],
+        [139.6, 142.9, "两条腿分别记录状态"],
+        [143.0, 146.44, "在同一风险上限内独立执行"],
+        [147.5, 150.2, "自动化不放松底线"],
+        [150.3, 153.5, "缺少固定止损"],
+        [153.6, 156.2, "仓位公式无法成立"],
+        [156.3, 159.2, "安全门立即落下"],
+        [159.3, 162.79, "没有止损，就不执行交易"],
+        [163.3, 166.2, "系统不能消除风险"],
+        [166.3, 169.1, "也不保证盈利"],
+        [169.2, 172.1, "只把信息、纪律和执行"],
+        [172.2, 174.4, "放进可验证的流程"],
+        [174.5, 176.8, "贵的是信息，难的是执行"],
+        [176.9, 179.7, "让 KOL 提供 Alpha，让 AI 负责执行"]
+      ];
+
+      const captionLayer = document.getElementById("caption-layer");
+      CAPTIONS.forEach(function (cue, index) {
+        const el = document.createElement("div");
+        el.id = "caption-" + index;
+        el.className = "caption-cue";
+        el.textContent = cue[2];
+        captionLayer.appendChild(el);
+
+        tl.set(el, { visibility: "visible" }, cue[0]);
+        tl.fromTo(
+          el,
+          { opacity: 0, y: 14 },
+          { opacity: 1, y: 0, duration: 0.24, ease: "power3.out" },
+          cue[0]
+        );
+        tl.to(
+          el,
+          { opacity: 0, scale: 0.98, duration: 0.12, ease: "power2.in" },
+          cue[1] - 0.12
+        );
+        tl.set(el, { opacity: 0, visibility: "hidden" }, cue[1]);
+      });
+
+      function addDataPush(time, colorA, colorB) {
+        tl.set("#transition-wipe-a", { x: -1920, backgroundColor: colorA }, time - 0.3);
+        tl.set("#transition-wipe-b", { x: -1920, backgroundColor: colorB }, time - 0.3);
+        tl.to("#transition-wipe-a", { x: 0, duration: 0.28, ease: "power3.inOut" }, time - 0.28);
+        tl.to("#transition-wipe-b", { x: 0, duration: 0.28, ease: "power3.inOut" }, time - 0.21);
+        tl.to("#transition-wipe-a", { x: 1920, duration: 0.28, ease: "power3.inOut" }, time + 0.07);
+        tl.to("#transition-wipe-b", { x: 1920, duration: 0.28, ease: "power3.inOut" }, time + 0.14);
+      }
+
+      addDataPush(15, "#35c2ff", "#111a36");
+      addDataPush(33, "#35c2ff", "#111a36");
+      addDataPush(46, "#35c2ff", "#111a36");
+      addDataPush(67, "#35c2ff", "#111a36");
+      addDataPush(85, "#8b5cf6", "#261d4a");
+      addDataPush(127, "#35c2ff", "#111a36");
+      addDataPush(147, "#ff4d67", "#35131d");
+      addDataPush(163, "#8b5cf6", "#070a12");
+
       window.__timelines["main"] = tl;
     </script>
   </body>

@@ -144,8 +144,8 @@
         justify-content: space-between;
         width: 100%;
         height: 100%;
-        padding: 66px 96px 62px;
-        gap: 32px;
+        padding: 50px 96px 180px;
+        gap: 22px;
         box-sizing: border-box;
       }
 
@@ -488,5 +488,176 @@
         font-size: 18px;
       }
     </style>
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+
+      const s07Timeline = gsap.timeline({ paused: true });
+
+      s07Timeline.addLabel("range-build", 0.2);
+      s07Timeline.from(
+        "#s07-root .s07-grid",
+        { opacity: 0, scale: 1.04, duration: 1.25, ease: "sine.out" },
+        "range-build",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-glow-left",
+        { x: -90, opacity: 0, duration: 1.45, ease: "circ.out" },
+        "range-build+=0.08",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-glow-right",
+        { x: 110, opacity: 0, duration: 1.15, ease: "power1.out" },
+        "range-build+=0.16",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-kicker",
+        { x: -42, opacity: 0, duration: 0.46, ease: "expo.out" },
+        "range-build+=0.18",
+      );
+      s07Timeline.from(
+        "#s07-root h1",
+        { y: 44, opacity: 0, duration: 0.78, ease: "power4.out" },
+        "range-build+=0.34",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-risk-cap",
+        { scale: 0.82, opacity: 0, duration: 0.62, ease: "back.out(1.35)" },
+        "range-build+=0.62",
+      );
+
+      s07Timeline.addLabel("route-split", 1.55);
+      s07Timeline.from(
+        "#s07-root .s07-divider span",
+        {
+          scaleY: 0,
+          transformOrigin: "center",
+          duration: 0.72,
+          stagger: 0.09,
+          ease: "power3.out",
+        },
+        "route-split",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-divider b",
+        { scale: 0.55, opacity: 0, duration: 0.38, ease: "back.out(1.7)" },
+        "route-split+=0.28",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-greedy-leg",
+        { x: 118, opacity: 0, duration: 0.82, ease: "expo.out" },
+        "route-split+=0.32",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-conservative-leg",
+        { x: -118, opacity: 0, duration: 0.68, ease: "power3.out" },
+        "route-split+=0.47",
+      );
+
+      s07Timeline.addLabel("leg-details", 2.45);
+      s07Timeline.from(
+        "#s07-root .s07-leg-top",
+        {
+          y: -18,
+          opacity: 0,
+          duration: 0.36,
+          stagger: 0.12,
+          ease: "circ.out",
+        },
+        "leg-details",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-title-row",
+        {
+          x: -28,
+          opacity: 0,
+          duration: 0.52,
+          stagger: 0.14,
+          ease: "power2.out",
+        },
+        "leg-details+=0.18",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-price",
+        {
+          scaleX: 0.88,
+          opacity: 0,
+          transformOrigin: "center",
+          duration: 0.44,
+          stagger: 0.16,
+          ease: "back.out(1.2)",
+        },
+        "leg-details+=0.48",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-metrics > div",
+        {
+          y: 24,
+          opacity: 0,
+          duration: 0.42,
+          stagger: 0.09,
+          ease: "power1.out",
+        },
+        "leg-details+=0.78",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-track",
+        {
+          scaleX: 0,
+          opacity: 0,
+          transformOrigin: "left center",
+          duration: 0.76,
+          stagger: 0.16,
+          ease: "expo.out",
+        },
+        "leg-details+=1.12",
+      );
+      s07Timeline.from(
+        "#s07-root .s07-footer span",
+        {
+          y: 20,
+          opacity: 0,
+          duration: 0.34,
+          stagger: 0.08,
+          ease: "power4.out",
+        },
+        "leg-details+=1.62",
+      );
+
+      s07Timeline.addLabel("independent-hold", 5.2);
+      s07Timeline.to(
+        "#s07-root .s07-glow-left",
+        { x: 52, duration: 7.4, ease: "sine.inOut" },
+        "independent-hold",
+      );
+      s07Timeline.to(
+        "#s07-root .s07-glow-right",
+        { x: -64, duration: 6.8, ease: "sine.inOut" },
+        "independent-hold+=0.3",
+      );
+      s07Timeline.to(
+        "#s07-root .s07-ready",
+        {
+          scale: 1.05,
+          backgroundColor: "rgba(47, 230, 166, 0.22)",
+          duration: 0.5,
+          ease: "power2.inOut",
+        },
+        8.4,
+      );
+      s07Timeline.to(
+        "#s07-root .s07-waiting",
+        {
+          scale: 1.04,
+          backgroundColor: "rgba(139, 92, 246, 0.24)",
+          duration: 0.58,
+          ease: "circ.inOut",
+        },
+        10.1,
+      );
+
+      window.__timelines["scene-07-two-leg-entry"] = s07Timeline;
+    </script>
   </div>
 </template>

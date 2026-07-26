@@ -425,5 +425,67 @@
         letter-spacing: 0.08em;
       }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const aiParsingTimeline = gsap.timeline({ paused: true });
+
+      aiParsingTimeline.addLabel("source-in", 0.2);
+      aiParsingTimeline.from("#scene-ai-parsing .eyebrow", { x: -32, opacity: 0, duration: 0.38, ease: "expo.out" }, "source-in");
+      aiParsingTimeline.from("#scene-ai-parsing h1", { y: 34, opacity: 0, duration: 0.68, ease: "power4.out" }, "source-in+=0.14");
+      aiParsingTimeline.from("#scene-ai-parsing .model-state", { x: 40, opacity: 0, duration: 0.5, ease: "circ.out" }, "source-in+=0.32");
+      aiParsingTimeline.from("#scene-ai-parsing .source-panel", { x: -58, opacity: 0, duration: 0.72, ease: "power3.out" }, "source-in+=0.7");
+      aiParsingTimeline.from("#scene-ai-parsing .source-author", { y: 20, opacity: 0, duration: 0.36, ease: "back.out(1.35)" }, "source-in+=1.08");
+      aiParsingTimeline.from("#scene-ai-parsing .source-message", { scale: 0.965, opacity: 0, duration: 0.58, ease: "expo.out" }, "source-in+=1.34");
+
+      aiParsingTimeline.addLabel("scan", 2);
+      aiParsingTimeline.from(
+        "#scene-ai-parsing .scan-rail",
+        { scaleY: 0, opacity: 0, duration: 0.48, transformOrigin: "50% 0%", ease: "power2.out" },
+        "scan",
+      );
+      aiParsingTimeline.from("#scene-ai-parsing .ai-core", { scale: 0.72, opacity: 0, rotation: -5, duration: 0.62, ease: "back.out(1.7)" }, "scan+=0.18");
+      aiParsingTimeline.from("#scene-ai-parsing .scanner-panel p", { opacity: 0, y: 14, duration: 0.34, ease: "sine.out" }, "scan+=0.5");
+      aiParsingTimeline.from("#scene-ai-parsing .flow-arrow", { x: -28, opacity: 0, duration: 0.42, ease: "expo.out" }, "scan+=0.66");
+
+      aiParsingTimeline.addLabel("fields-lock", 2.82);
+      aiParsingTimeline.from("#scene-ai-parsing .fields-panel", { x: 62, opacity: 0, duration: 0.7, ease: "power4.out" }, "fields-lock");
+      aiParsingTimeline.from("#scene-ai-parsing .fields-panel .panel-label", { y: -16, opacity: 0, duration: 0.32, ease: "circ.out" }, "fields-lock+=0.2");
+      aiParsingTimeline.from(
+        "#scene-ai-parsing .field-card",
+        { y: 22, opacity: 0, scale: 0.975, duration: 0.44, stagger: 0.08, ease: "back.out(1.28)" },
+        "fields-lock+=0.46",
+      );
+      aiParsingTimeline.from(
+        "#scene-ai-parsing .field-card i",
+        { x: 12, opacity: 0, duration: 0.28, stagger: 0.07, ease: "power3.out" },
+        "fields-lock+=0.9",
+      );
+
+      aiParsingTimeline.addLabel("review", 5.1);
+      aiParsingTimeline.from("#scene-ai-parsing .review-branch", { y: 42, opacity: 0, duration: 0.62, ease: "expo.out" }, "review");
+      aiParsingTimeline.from(
+        "#scene-ai-parsing .branch-icon",
+        { scale: 0.55, opacity: 0, rotation: -12, duration: 0.46, ease: "back.out(2)" },
+        "review+=0.18",
+      );
+      aiParsingTimeline.from("#scene-ai-parsing .review-branch div:nth-child(2)", { x: -18, opacity: 0, duration: 0.38, ease: "power2.out" }, "review+=0.32");
+      aiParsingTimeline.from("#scene-ai-parsing .branch-state", { x: 26, opacity: 0, duration: 0.4, ease: "circ.out" }, "review+=0.48");
+      aiParsingTimeline.from(
+        "#scene-ai-parsing .model-state span",
+        {
+          scale: 0.45,
+          opacity: 0.3,
+          duration: 0.65,
+          repeat: 2,
+          yoyo: true,
+          transformOrigin: "50% 50%",
+          ease: "sine.inOut",
+        },
+        6,
+      );
+
+      window.__timelines["alpha-farm-ai-parsing"] = aiParsingTimeline;
+    </script>
   </div>
 </template>
