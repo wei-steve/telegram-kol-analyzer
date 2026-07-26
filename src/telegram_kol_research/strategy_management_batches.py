@@ -7,6 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Sequence
 
 from sqlalchemy import inspect, update
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from telegram_kol_research.db import MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME
+from telegram_kol_research.db import MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME
 from telegram_kol_research.db import REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES
 from telegram_kol_research.models import ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE
 from telegram_kol_research.models import StrategyManagementBatch
@@ -41,7 +43,8 @@ def resolve_proven_restored_protection_failure_for_market_successor_in_session(
     target_lifecycle_id: int,
     execution_binding_id: int,
     live_pos_ids: set[str],
-    pending_order_ids_by_pos: dict[str, set[str]],
+    pending_tpsl_rows: Sequence[dict[str, Any]],
+    pending_tpsl_snapshot_complete: bool,
     resolved_at: datetime,
 ) -> str:
     """Resolve one restored predecessor only from current exchange and ledger proof."""
@@ -63,6 +66,8 @@ def resolve_proven_restored_protection_failure_for_market_successor_in_session(
     )
     if not active:
         return "clear"
+    if not pending_tpsl_snapshot_complete:
+        return "blocked"
     if len(active) != 1:
         return "blocked"
     batch = active[0]
@@ -90,6 +95,12 @@ def resolve_proven_restored_protection_failure_for_market_successor_in_session(
         str(pos_id) for pos_id in live_pos_ids
     }:
         return "blocked"
+    pending_by_order_id = {
+        order_id: row
+        for row in pending_tpsl_rows
+        if isinstance(row, dict)
+        and (order_id := _pending_order_id(row)) is not None
+    }
     for leg in legs:
         if leg.status != "restored" or not _has_restored_protection_evidence(
             leg
@@ -115,19 +126,11 @@ def resolve_proven_restored_protection_failure_for_market_successor_in_session(
         }
         if (
             len(restored_order_ids) != len(old_order_ids)
-            or restored_order_ids
-            != {
-                str(order_id)
-                for order_id in pending_order_ids_by_pos.get(
-                    str(leg.pos_id), set()
-                )
-                if str(order_id) in restored_order_ids
-            }
-            or bool(
-                old_order_ids.intersection(
-                    pending_order_ids_by_pos.get(str(leg.pos_id), set())
-                )
+            or any(
+                order_id not in pending_by_order_id
+                for order_id in restored_order_ids
             )
+            or any(order_id in pending_by_order_id for order_id in old_order_ids)
         ):
             return "blocked"
         ledger_rows = (
@@ -157,6 +160,11 @@ def resolve_proven_restored_protection_failure_for_market_successor_in_session(
             != str(strategy_instance_id)
             or ledger_by_order_id[order_id].evidence_source
             != "management_tpsl_restore"
+            or not _ledger_matches_pending_tpsl(
+                ledger_by_order_id[order_id],
+                pending_by_order_id[order_id],
+                expected_pos_id=str(leg.pos_id),
+            )
             for order_id in restored_order_ids
         ):
             return "blocked"
@@ -182,6 +190,71 @@ def _response_order_id(response: Any) -> str | None:
     if isinstance(data, list) and len(data) == 1:
         return _response_order_id(data[0])
     return None
+
+
+def _pending_order_id(row: dict[str, Any]) -> str | None:
+    for key in ("ordId", "orderId", "order_id"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _ledger_matches_pending_tpsl(
+    ledger: PositionProtectionLedger,
+    row: dict[str, Any],
+    *,
+    expected_pos_id: str,
+) -> bool:
+    if str(row.get("triggerOrderType") or "TPSL").upper() != "TPSL":
+        return False
+    row_pos_id = str(
+        row.get("posId") or row.get("pos_id") or row.get("positionId") or ""
+    ).strip()
+    if row_pos_id and row_pos_id != expected_pos_id:
+        return False
+    if str(row.get("instId") or "").upper() != str(
+        ledger.instrument_id or ""
+    ).upper():
+        return False
+    side = str(row.get("posSide") or row.get("side") or "").lower()
+    side = {"buy": "long", "sell": "short"}.get(side, side)
+    if side != str(ledger.side or "").lower():
+        return False
+    ledger_price = _decimal_or_none(ledger.trigger_price)
+    current_price = _pending_trigger_price(row, str(ledger.purpose or ""))
+    if ledger_price is None or current_price != ledger_price:
+        return False
+    ledger_size = _decimal_or_none(ledger.size_text)
+    row_size = _decimal_or_none(row.get("sz") or row.get("size"))
+    return (
+        ledger_size is not None
+        and row_size is not None
+        and row_size == ledger_size
+    )
+
+
+def _pending_trigger_price(
+    row: dict[str, Any], purpose: str
+) -> Decimal | None:
+    keys = (
+        ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+        if purpose in {"stop_loss", "sl", "loss"}
+        else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
+    )
+    for key in keys:
+        value = _decimal_or_none(row.get(key))
+        if value is not None and value != 0:
+            return value
+    return None
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return result if result.is_finite() else None
 
 
 def resolve_restored_protection_failure_for_full_exit_in_session(
@@ -942,6 +1015,10 @@ def _require_management_unique_indexes(session) -> None:
         MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME: (
             "strategy_management_legs",
             ["management_batch_id", "pos_id"],
+        ),
+        MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME: (
+            "strategy_management_market_decisions",
+            ["management_batch_id"],
         ),
     }
     inspector = inspect(session.connection())

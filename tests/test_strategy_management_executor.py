@@ -35,6 +35,9 @@ from telegram_kol_research.strategy_management_batches import (
     transition_batch,
     transition_leg,
 )
+from telegram_kol_research.strategy_management_reconciliation import (
+    reconcile_strategy_management_batches,
+)
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import save_trading_settings
 
@@ -705,6 +708,93 @@ def test_break_even_market_reservation_retry_reuses_decision_without_ticker(
     assert client.call_log == []
 
 
+def test_break_even_market_reservation_retry_rejects_live_economics_drift(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+    client.positions[0]["pos"] = "3"
+    client.get_ticker_quote = lambda *, inst_id: (_ for _ in ()).throw(
+        AssertionError("reserved decision must not reread ticker")
+    )
+
+    with pytest.raises(
+        ManagementBatchExecutionError,
+        match="protection_preflight_position_economics_drift",
+    ):
+        reserve_break_even_market_actions(
+            session_factory,
+            batch=batch,
+            deepcoin_client=client,
+            observed_at=NOW,
+        )
+
+    assert client.call_log == []
+
+
+def test_break_even_market_reservation_retry_rejects_protection_drift(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+    for row in client.pending:
+        if row.get("ordId") == "sl-2":
+            row["slTriggerPx"] = "66000"
+
+    with pytest.raises(
+        ManagementBatchExecutionError,
+        match="protection_preflight_rows_ambiguous_or_drifted",
+    ):
+        reserve_break_even_market_actions(
+            session_factory,
+            batch=batch,
+            deepcoin_client=client,
+            observed_at=NOW,
+        )
+
+    assert client.call_log == []
+
+
 def test_break_even_by_market_executes_mixed_close_and_protection_legs(
     tmp_path,
 ):
@@ -1004,6 +1094,99 @@ def test_break_even_by_market_rejected_protection_restores_only_that_leg(
         assert {row.evidence_source for row in rows} == {
             "management_tpsl_restore"
         }
+
+
+def test_break_even_by_market_unknown_protection_write_never_compensates(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    client = _ProtectionClient(
+        session_factory,
+        rows_by_pos,
+        set_outcomes=[DeepcoinRequestOutcomeUnknown("response lost")],
+    )
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "reconciling"
+    assert {
+        leg.pos_id: leg.status
+        for leg in load_management_batch(session_factory, batch.id).legs
+    } == {"pos-1": "submitted", "pos-2": "recovery_required"}
+    assert [call["ordId"] for call in client.cancel_calls] == ["tp-2", "sl-2"]
+    assert len(client.set_calls) == 1
+
+
+def test_break_even_by_market_protection_recovery_keeps_close_reconcilable(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    client = _ProtectionClient(
+        session_factory,
+        rows_by_pos,
+        set_outcomes=[DeepcoinRequestOutcomeUnknown("response lost")],
+    )
+    execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+    submitted = load_management_batch(session_factory, batch.id)
+    close_leg = next(leg for leg in submitted.legs if leg.pos_id == "pos-1")
+
+    result = reconcile_strategy_management_batches(
+        session_factory,
+        snapshot=SimpleNamespace(
+            positions=[client.positions[1]],
+            open_orders=[],
+            order_history=[
+                {
+                    "ordId": close_leg.exchange_order_id,
+                    "clOrdId": close_leg.client_order_id,
+                }
+            ],
+            trade_fills=[],
+            errors={},
+        ),
+        reconciled_at=NOW,
+        batch_ids={batch.id},
+    )
+
+    assert result.frozen == 1
+    stored = load_management_batch(session_factory, batch.id)
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "break_even_market_protection_not_confirmed"
+    assert {leg.pos_id: leg.status for leg in stored.legs} == {
+        "pos-1": "confirmed",
+        "pos-2": "recovery_required",
+    }
+    with session_factory() as session:
+        entries = (
+            session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.execution_binding_id
+                == batch.execution_binding_id
+            )
+            .order_by(ExecutionOrderLeg.leg_index)
+            .all()
+        )
+        assert [entry.status for entry in entries] == ["closed", "active"]
 
 
 def test_close_legs_are_committed_reserved_before_exact_market_submission(tmp_path):

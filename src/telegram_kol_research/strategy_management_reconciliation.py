@@ -20,12 +20,15 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
-    StrategyManagementMarketDecision,
 )
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
 from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
+from telegram_kol_research.strategy_management_market_decisions import (
+    BreakEvenMarketDecisionConflict,
+    load_break_even_market_decision_in_session,
+)
 
 
 _ACTIVE_RECONCILIATION_STATUSES = frozenset(
@@ -337,20 +340,13 @@ def _composite_protection_phase_started(batch, legs) -> bool:
 
 
 def _market_actions_by_leg_id(session, *, batch, legs) -> dict[int, str] | None:
-    row = (
-        session.query(StrategyManagementMarketDecision)
-        .filter(
-            StrategyManagementMarketDecision.management_batch_id == batch.id
-        )
-        .one_or_none()
-    )
-    if row is None:
-        return None
     try:
-        decisions = json.loads(row.decisions_json)
-    except (TypeError, json.JSONDecodeError):
+        record = load_break_even_market_decision_in_session(
+            session, batch_id=batch.id
+        )
+    except BreakEvenMarketDecisionConflict:
         return None
-    if not isinstance(decisions, list):
+    if record is None:
         return None
     actions: dict[int, str] = {}
     expected = {
@@ -358,9 +354,7 @@ def _market_actions_by_leg_id(session, *, batch, legs) -> dict[int, str] | None:
         for leg in legs
     }
     observed: set[tuple[int, int, str]] = set()
-    for decision in decisions:
-        if not isinstance(decision, dict):
-            return None
+    for decision in record.decisions:
         try:
             identity = (
                 int(decision["management_leg_id"]),

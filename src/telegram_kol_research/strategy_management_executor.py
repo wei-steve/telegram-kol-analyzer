@@ -305,6 +305,52 @@ def reserve_break_even_market_actions(
         session_factory, batch_id=batch.id
     )
     if existing is not None:
+        binding = _load_exact_binding(session_factory, batch)
+        _require_exact_entry_legs(session_factory, batch)
+        inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
+        if existing.instrument_id.upper() != inst_id.upper():
+            raise ManagementBatchExecutionError(
+                "break_even_market_decision_instrument_drift"
+            )
+        live_positions = list(
+            deepcoin_client.list_positions(inst_id=inst_id)
+        )
+        _preflight_exact_protection_positions(
+            session_factory=session_factory,
+            batch=batch,
+            binding=binding,
+            live_positions=live_positions,
+            inst_id=inst_id,
+            after_partial_close=False,
+        )
+        decisions_by_leg_id = {
+            int(row["management_leg_id"]): row
+            for row in existing.decisions
+        }
+        protected_legs = []
+        for leg in batch.legs:
+            decision_row = decisions_by_leg_id.get(int(leg.id))
+            if decision_row is None:
+                raise ManagementBatchExecutionError(
+                    "break_even_market_decision_leg_set_not_exact"
+                )
+            if decision_row["action"] == "set_break_even":
+                protected_legs.append(
+                    replace(
+                        leg,
+                        old_tpsl=dict(decision_row["protection"]),
+                    )
+                )
+        if protected_legs:
+            pending = list(
+                deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
+            )
+            _preflight_exact_protection_rows(
+                session_factory=session_factory,
+                batch=replace(batch, legs=tuple(protected_legs)),
+                live_positions=live_positions,
+                pending=pending,
+            )
         return existing
 
     binding = _load_exact_binding(session_factory, batch)
@@ -737,6 +783,25 @@ def _execute_break_even_by_market_batch(
             )
             continue
 
+        if not isinstance(replacement_error, DeepcoinDefiniteRejection):
+            transition_leg(
+                session_factory,
+                leg.id,
+                expected_statuses={"reserved"},
+                new_status="recovery_required",
+                transitioned_at=executed_at,
+                response={
+                    "accepted_rows": responses,
+                    "known_created_order_ids": created_order_ids,
+                },
+                last_error={
+                    "stage": "replace_protection_outcome_unknown",
+                    "type": type(replacement_error).__name__,
+                    "message": str(replacement_error),
+                },
+            )
+            continue
+
         restoration_error: Exception | None = None
         restore_responses: list[dict[str, Any]] = []
         try:
@@ -807,7 +872,10 @@ def _execute_break_even_by_market_batch(
     completed = load_management_batch(session_factory, batch.id)
     statuses = {leg.status for leg in completed.legs}
     has_close = bool(close_decisions)
-    if "recovery_required" in statuses:
+    if "recovery_required" in statuses and has_close:
+        final_status = "reconciling"
+        reason = "close_reconciliation_pending_protection_recovery"
+    elif "recovery_required" in statuses:
         final_status = "recovery_required"
         reason = "break_even_market_recovery_required"
     elif "restored" in statuses or "failed" in statuses:

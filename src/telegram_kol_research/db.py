@@ -33,11 +33,15 @@ MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_SQL = (
 MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME = (
     "uq_strategy_management_legs_batch_pos"
 )
+MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME = (
+    "uq_strategy_management_market_decisions_batch"
+)
 REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES = frozenset(
     {
         MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME,
         MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME,
         MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME,
+        MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME,
     }
 )
 
@@ -345,6 +349,11 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
         "uq_strategy_management_legs_batch_pos "
         "ON strategy_management_legs (management_batch_id, pos_id)"
     ),
+    MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME: (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_strategy_management_market_decisions_batch "
+        "ON strategy_management_market_decisions (management_batch_id)"
+    ),
     "ix_execution_events_strategy_created": (
         "CREATE INDEX IF NOT EXISTS ix_execution_events_strategy_created "
         "ON execution_events (strategy_instance_id, created_at)"
@@ -485,6 +494,10 @@ def _management_unique_index_has_duplicates(connection, index_name: str) -> bool
         MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME: (
             "SELECT 1 FROM strategy_management_legs "
             "GROUP BY management_batch_id, pos_id HAVING COUNT(*) > 1 LIMIT 1"
+        ),
+        MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME: (
+            "SELECT 1 FROM strategy_management_market_decisions "
+            "GROUP BY management_batch_id HAVING COUNT(*) > 1 LIMIT 1"
         ),
     }
     query = duplicate_queries.get(index_name)

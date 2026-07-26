@@ -5,12 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from telegram_kol_research.models import (
     StrategyManagementBatch,
@@ -18,6 +18,7 @@ from telegram_kol_research.models import (
     StrategyManagementMarketDecision,
 )
 from telegram_kol_research.strategy_management_market_policy import (
+    BreakEvenMarketPolicyError,
     assess_break_even_market,
 )
 
@@ -50,15 +51,37 @@ def load_break_even_market_decision(
     """Load a previously reserved decision without consulting market data."""
 
     with session_factory() as session:
-        row = (
-            session.query(StrategyManagementMarketDecision)
-            .filter(
-                StrategyManagementMarketDecision.management_batch_id
-                == int(batch_id)
-            )
-            .one_or_none()
+        return load_break_even_market_decision_in_session(
+            session, batch_id=batch_id
         )
-        return None if row is None else _to_record(row)
+
+
+def load_break_even_market_decision_in_session(
+    session: Session, *, batch_id: int
+) -> BreakEvenMarketDecisionRecord | None:
+    """Load and fully validate one decision against its immutable batch target."""
+
+    row = (
+        session.query(StrategyManagementMarketDecision)
+        .filter(
+            StrategyManagementMarketDecision.management_batch_id
+            == int(batch_id)
+        )
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    batch = session.get(StrategyManagementBatch, int(batch_id))
+    if batch is None:
+        raise BreakEvenMarketDecisionConflict(
+            "break_even_market_decision_corrupt"
+        )
+    legs = (
+        session.query(StrategyManagementLeg)
+        .filter(StrategyManagementLeg.management_batch_id == batch.id)
+        .all()
+    )
+    return _to_record(row, batch=batch, legs=legs)
 
 
 def reserve_break_even_market_decision(
@@ -112,9 +135,13 @@ def reserve_break_even_market_decision(
             "version": DECISION_VERSION,
             "management_batch_id": int(batch.id),
             "strategy_instance_id": str(batch.strategy_instance_id),
+            "target_fingerprint": str(batch.target_fingerprint),
+            "target_lifecycle_id": int(batch.target_lifecycle_id),
+            "execution_binding_id": int(batch.execution_binding_id),
             "instrument_id": normalized_instrument,
             "quote_price": normalized_price,
             "quote_price_field": normalized_field,
+            "observed_at": _canonical_datetime(observed_at),
             "positions": normalized_decisions,
         }
         fingerprint = _fingerprint(payload)
@@ -126,7 +153,12 @@ def reserve_break_even_market_decision(
             .one_or_none()
         )
         if existing is not None:
-            return _require_same_decision(existing, fingerprint=fingerprint)
+            return _require_same_decision(
+                existing,
+                fingerprint=fingerprint,
+                batch=batch,
+                legs=legs,
+            )
         row = StrategyManagementMarketDecision(
             management_batch_id=batch.id,
             strategy_instance_id=str(batch.strategy_instance_id),
@@ -160,9 +192,14 @@ def reserve_break_even_market_decision(
                 raise BreakEvenMarketDecisionConflict(
                     "break_even_market_decision_reservation_conflict"
                 ) from None
-            return _require_same_decision(existing, fingerprint=fingerprint)
+            return _require_same_decision(
+                existing,
+                fingerprint=fingerprint,
+                batch=batch,
+                legs=legs,
+            )
         session.refresh(row)
-        return _to_record(row)
+        return _to_record(row, batch=batch, legs=legs)
 
 
 def _normalize_decisions(
@@ -200,11 +237,16 @@ def _normalize_decisions(
             raise BreakEvenMarketDecisionConflict(
                 "break_even_market_decision_leg_invalid"
             )
-        policy = assess_break_even_market(
-            side=side,
-            entry_price=entry_price,
-            market_price=quote_price,
-        )
+        try:
+            policy = assess_break_even_market(
+                side=side,
+                entry_price=entry_price,
+                market_price=quote_price,
+            )
+        except BreakEvenMarketPolicyError:
+            raise BreakEvenMarketDecisionConflict(
+                "break_even_market_decision_leg_invalid"
+            ) from None
         expected_action = "set_break_even" if policy.allowed else "full_exit"
         if (
             leg is None
@@ -292,20 +334,57 @@ def _normalize_decisions(
 
 
 def _require_same_decision(
-    row: StrategyManagementMarketDecision, *, fingerprint: str
+    row: StrategyManagementMarketDecision,
+    *,
+    fingerprint: str,
+    batch: StrategyManagementBatch,
+    legs: list[StrategyManagementLeg],
 ) -> BreakEvenMarketDecisionRecord:
     if row.decision_fingerprint != fingerprint:
         raise BreakEvenMarketDecisionConflict(
             "break_even_market_decision_conflict"
         )
-    return _to_record(row)
+    return _to_record(row, batch=batch, legs=legs)
 
 
 def _to_record(
     row: StrategyManagementMarketDecision,
+    *,
+    batch: StrategyManagementBatch,
+    legs: list[StrategyManagementLeg],
 ) -> BreakEvenMarketDecisionRecord:
-    decisions = json.loads(row.decisions_json)
+    try:
+        decisions = json.loads(row.decisions_json)
+    except (TypeError, json.JSONDecodeError):
+        raise BreakEvenMarketDecisionConflict(
+            "break_even_market_decision_corrupt"
+        ) from None
     if not isinstance(decisions, list):
+        raise BreakEvenMarketDecisionConflict(
+            "break_even_market_decision_corrupt"
+        )
+    if (
+        int(row.management_batch_id) != int(batch.id)
+        or str(row.strategy_instance_id) != str(batch.strategy_instance_id)
+        or batch.intent != "move_stop_to_break_even"
+        or batch.effective_action != "break_even_by_market"
+        or str(row.instrument_id or "").strip().upper()
+        != str(row.instrument_id or "")
+        or not str(row.instrument_id).endswith("-USDT-SWAP")
+        or str(row.quote_price_field) not in _QUOTE_FIELDS
+    ):
+        raise BreakEvenMarketDecisionConflict(
+            "break_even_market_decision_corrupt"
+        )
+    quote_price = _positive_decimal(
+        row.quote_price, reason="break_even_market_decision_corrupt"
+    )
+    normalized_decisions = _normalize_decisions(
+        decisions,
+        legs=legs,
+        quote_price=quote_price,
+    )
+    if normalized_decisions != decisions:
         raise BreakEvenMarketDecisionConflict(
             "break_even_market_decision_corrupt"
         )
@@ -314,9 +393,13 @@ def _to_record(
             "version": DECISION_VERSION,
             "management_batch_id": int(row.management_batch_id),
             "strategy_instance_id": str(row.strategy_instance_id),
+            "target_fingerprint": str(batch.target_fingerprint),
+            "target_lifecycle_id": int(batch.target_lifecycle_id),
+            "execution_binding_id": int(batch.execution_binding_id),
             "instrument_id": str(row.instrument_id),
-            "quote_price": str(row.quote_price),
+            "quote_price": quote_price,
             "quote_price_field": str(row.quote_price_field),
+            "observed_at": _canonical_datetime(row.observed_at),
             "positions": decisions,
         }
     )
@@ -356,3 +439,13 @@ def _fingerprint(payload: Mapping[str, Any]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_datetime(value: datetime) -> str:
+    if not isinstance(value, datetime):
+        raise BreakEvenMarketDecisionConflict(
+            "break_even_market_decision_quote_invalid"
+        )
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC).replace(tzinfo=None)
+    return value.isoformat(timespec="microseconds")

@@ -146,6 +146,27 @@ def test_bootstrap_creates_unique_market_decision_table(tmp_path):
     assert "uq_strategy_management_market_decisions_batch" in indexes
 
 
+def test_bootstrap_repairs_missing_market_decision_unique_index(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.execute(
+            text("DROP INDEX uq_strategy_management_market_decisions_batch")
+        )
+        session.commit()
+
+    repaired = create_session_factory(database_path)
+    with repaired() as session:
+        indexes = {
+            row[1]
+            for row in session.execute(
+                text("PRAGMA index_list(strategy_management_market_decisions)")
+            ).all()
+        }
+
+    assert "uq_strategy_management_market_decisions_batch" in indexes
+
+
 def test_reserve_market_decision_is_sorted_fingerprinted_and_idempotent(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     batch_id, leg_ids = _persist_batch(session_factory)
@@ -228,6 +249,34 @@ def test_load_market_decision_rejects_tampered_payload(tmp_path):
     with session_factory() as session:
         row = session.query(StrategyManagementMarketDecision).one()
         row.decisions_json = "[]"
+        session.commit()
+
+    with pytest.raises(BreakEvenMarketDecisionConflict):
+        load_break_even_market_decision(session_factory, batch_id=batch_id)
+
+
+@pytest.mark.parametrize("field", ["observed_at", "target_fingerprint"])
+def test_load_market_decision_rejects_tampered_decision_context(
+    tmp_path, field
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch_id, leg_ids = _persist_batch(session_factory)
+    reserve_break_even_market_decision(
+        session_factory,
+        batch_id=batch_id,
+        instrument_id="BTC-USDT-SWAP",
+        quote_price="64688.6",
+        quote_price_field="last",
+        observed_at=NOW,
+        decisions=_decisions(leg_ids),
+    )
+    with session_factory() as session:
+        if field == "observed_at":
+            row = session.query(StrategyManagementMarketDecision).one()
+            row.observed_at = datetime(2026, 7, 26, 16, 0, tzinfo=UTC)
+        else:
+            batch = session.get(StrategyManagementBatch, batch_id)
+            batch.target_fingerprint = "c" * 64
         session.commit()
 
     with pytest.raises(BreakEvenMarketDecisionConflict):

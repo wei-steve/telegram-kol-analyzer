@@ -721,8 +721,14 @@ def _plan_strategy_management_batch_locked(
                         live_pos_ids={
                             str(position["pos_id"]) for position in economics
                         },
-                        pending_order_ids_by_pos=_pending_order_ids_by_pos(
+                        pending_tpsl_rows=list(
                             reconciliation_snapshot.pending_trigger_orders
+                        ),
+                        pending_tpsl_snapshot_complete=(
+                            _pending_tpsl_snapshot_complete(
+                                reconciliation_snapshot,
+                                instrument_id=instrument_id,
+                            )
                         ),
                         resolved_at=now,
                     )

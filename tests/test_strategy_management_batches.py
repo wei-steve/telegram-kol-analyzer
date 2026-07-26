@@ -152,9 +152,18 @@ def test_proven_restored_predecessor_resolves_inside_caller_transaction(tmp_path
                 target_lifecycle_id=302,
                 execution_binding_id=402,
                 live_pos_ids={"pos-restored"},
-                pending_order_ids_by_pos={
-                    "pos-restored": {"restored-sl"}
-                },
+                pending_tpsl_rows=[
+                    {
+                        "ordId": "restored-sl",
+                        "posId": "pos-restored",
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "short",
+                        "triggerOrderType": "TPSL",
+                        "slTriggerPx": "65200",
+                        "sz": "16",
+                    }
+                ],
+                pending_tpsl_snapshot_complete=True,
                 resolved_at=now,
             )
         )
@@ -179,7 +188,46 @@ def test_proven_restored_predecessor_blocks_without_current_exchange_proof(tmp_p
                 target_lifecycle_id=302,
                 execution_binding_id=402,
                 live_pos_ids={"pos-restored"},
-                pending_order_ids_by_pos={"pos-restored": set()},
+                pending_tpsl_rows=[],
+                pending_tpsl_snapshot_complete=True,
+                resolved_at=datetime(2026, 7, 26, 1, tzinfo=UTC),
+            )
+        )
+
+    assert result == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("complete", "trigger_price"),
+    [(False, "65200"), (True, "65199")],
+)
+def test_proven_restored_predecessor_blocks_incomplete_or_drifted_proof(
+    tmp_path, complete, trigger_price
+):
+    repository = _repository()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_restored_break_even_predecessor(session_factory)
+
+    with session_factory() as session:
+        result = (
+            repository.resolve_proven_restored_protection_failure_for_market_successor_in_session(
+                session,
+                strategy_instance_id="strategy-restored",
+                target_lifecycle_id=302,
+                execution_binding_id=402,
+                live_pos_ids={"pos-restored"},
+                pending_tpsl_rows=[
+                    {
+                        "ordId": "restored-sl",
+                        "posId": "pos-restored",
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "short",
+                        "triggerOrderType": "TPSL",
+                        "slTriggerPx": trigger_price,
+                        "sz": "16",
+                    }
+                ],
+                pending_tpsl_snapshot_complete=complete,
                 resolved_at=datetime(2026, 7, 26, 1, tzinfo=UTC),
             )
         )
