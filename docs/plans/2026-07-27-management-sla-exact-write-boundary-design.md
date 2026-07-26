@@ -283,12 +283,12 @@ planning/executing/reconciling
 
 ## 生产发布门禁
 
-发布分四步：
+发布分四步，不使用 shadow，也不中断新消息操作：
 
-1. 部署代码但保持 entry、management 和 repair 写入禁用。
+1. 读取并记录现有 entry、management 配置；部署期间保持原值，repair 写入保持禁用。
 2. 在服务器运行只读全账户审计，确认每个 live `posId` 的策略和保护所有权。
-3. 使用 fake/sandbox 回放三姐和另一 BTC long 的事故场景；确认跨仓取消请求在客户端调用前被拒绝。
-4. 逐步启用：先 shadow，再单个 operator-confirmed repair，最后才恢复 live management；新开仓最后恢复。
+3. 使用 fake 回放三姐和另一 BTC long 的事故场景；确认跨仓取消请求在客户端调用前被拒绝。
+4. 以兼容替换方式直接启用新的管理写入边界；单个异常只阻断对应 mutation intent，不全局关闭无关的新消息处理。
 
 恢复 live 之前必须记录：
 

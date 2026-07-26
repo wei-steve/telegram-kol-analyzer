@@ -16,7 +16,8 @@
 - Make all code changes locally; use fake Deepcoin clients for local tests.
 - Do not send a live order, cancel a live order, modify a live TPSL, or restore the real stop during implementation.
 - Real verification runs only on the server because account identity and API allowlisting are server-bound.
-- Keep `auto_trade_enabled=false`, `management_execution_mode=disabled`, and the new repair mode disabled throughout deployment until the production gate explicitly enables one action.
+- Preserve the current new-message and entry execution settings throughout deployment. Do not pause or downgrade new-message handling as part of this repair.
+- Do not use a shadow phase. Roll out the management write boundary as a compatibility-preserving replacement, with focused server tests and a read-only account audit before the service restart.
 - Preserve `ExecutionOrderLeg.pos_id` with `attribution_status="verified"` as the position authority.
 - Preserve unknown or unattributed exchange orders; unknown is never permission to cancel.
 - A write with an unknown result is reconciled by its persisted ID and never blindly retried.
@@ -1299,7 +1300,7 @@ git add <reviewed-files>
 git commit -m "fix: address exact mutation boundary review"
 ```
 
-### Task 14: Push and Deploy With All Writes Disabled
+### Task 14: Push and Deploy Without Interrupting New Messages
 
 **Files:**
 - Modify: `docs/migration-handoff.md`
@@ -1321,18 +1322,19 @@ git push origin codex/deepcoin-auto-trading-v1
 
 Expected: success.
 
-**Step 3: Set production writes disabled before deployment**
+**Step 3: Read and preserve production execution settings**
 
-Use the existing authenticated settings path or a reviewed server command to ensure:
+Use the existing authenticated settings path or a reviewed server command to record:
 
 ```text
-auto_trade_enabled=false
-entry_execution_mode=disabled
-management_execution_mode=disabled
 position_repair_execution_mode=disabled
+auto_trade_enabled=<unchanged>
+entry_execution_mode=<unchanged>
+management_execution_mode=<unchanged>
 ```
 
-Read back and record the settings. Do not proceed if they cannot be proven disabled.
+Do not change the new-message, entry, or management settings during deployment. The
+repair mode must remain disabled. Stop if the existing settings cannot be read back.
 
 **Step 4: Deploy**
 
@@ -1377,7 +1379,7 @@ Expected: exactly one test notification and successful monitor state.
 Update `docs/migration-handoff.md` with:
 
 - deployed commit;
-- disabled mode readback;
+- before/after execution-setting readback proving new-message behavior was unchanged;
 - focused server test output;
 - read-only account audit timestamp;
 - identified current protection gaps;
@@ -1469,16 +1471,12 @@ Set `position_repair_execution_mode=disabled` and read it back.
 
 Append the action ID, fingerprint, returned order ID, exact readback result, non-target audit, and disabled repair mode to `docs/migration-handoff.md`. Do not record secrets.
 
-### Task 16: Shadow Burn-In and Controlled Re-Enablement
+### Task 16: Direct Compatibility Rollout and Live Verification
 
 **Files:**
 - Append evidence to `docs/migration-handoff.md`.
 
-**Step 1: Run management in shadow**
-
-Keep new entry disabled. Set management to shadow for at least one full monitoring window. Confirm management plans, deadlines, and alerts without exchange writes.
-
-**Step 2: Replay the two-position incident with fakes on the server**
+**Step 1: Replay the two-position incident with fakes on the server**
 
 Expected:
 
@@ -1487,11 +1485,12 @@ Expected:
 - overdue action reaches operator-required at 90 seconds;
 - notification is exactly once.
 
-**Step 3: Enable live management only after explicit approval**
+**Step 2: Restart with the existing production modes unchanged**
 
-Keep entry disabled. Enable live management for a bounded observation window.
+Do not introduce a shadow interval and do not disable new entries. The gateway
+replacement must be backward-compatible with ordinary new-message processing.
 
-**Step 4: Verify every live management action**
+**Step 3: Verify every live management action**
 
 For each action verify:
 
@@ -1503,13 +1502,11 @@ For each action verify:
 - non-target invariants;
 - notification state.
 
-Any SLA breach or protection drift disables management immediately.
+Any SLA breach or protection drift escalates immediately and blocks only the
+affected exact mutation intent. It must not globally stop unrelated new-message
+processing.
 
-**Step 5: Enable entry last**
-
-Only after live management completes the agreed burn-in without anomaly, request explicit approval to enable new entries.
-
-**Step 6: Final production gate**
+**Step 4: Final production gate**
 
 Run:
 
