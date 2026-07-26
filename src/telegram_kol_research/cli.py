@@ -45,6 +45,11 @@ from telegram_kol_research.backup_stop_repair import (
     apply_backup_stop_repair_plan,
     build_backup_stop_repair_plan,
 )
+from telegram_kol_research.legacy_conditional_cancel import (
+    REVIEWED_LEGACY_CONDITIONAL_TARGETS,
+    apply_reviewed_legacy_conditional_cancel_plan,
+    build_reviewed_legacy_conditional_cancel_plan,
+)
 from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
@@ -2228,6 +2233,74 @@ def repair_backup_stops(
         now=datetime.now(UTC),
     )
     typer.echo(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+
+
+@app.command("cancel-reviewed-legacy-conditionals")
+def cancel_reviewed_legacy_conditionals(
+    database_path: Path = Path("data/research.db"),
+    pos_id: str | None = typer.Option(None, "--pos-id"),
+    action_id: str | None = typer.Option(None, "--action-id"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+    confirmation_token: str | None = typer.Option(
+        None, "--confirmation-token"
+    ),
+) -> None:
+    """Plan or cancel one explicitly reviewed legacy conditional order."""
+
+    session_factory = create_session_factory(database_path)
+    client = build_deepcoin_client_from_env()
+    plan = build_reviewed_legacy_conditional_cancel_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=REVIEWED_LEGACY_CONDITIONAL_TARGETS,
+        now=datetime.now(UTC),
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "mode": "apply" if apply else "dry_run",
+                "database_path": str(database_path),
+                "plan": asdict(plan),
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
+    if not apply:
+        return
+    clean_pos_id = str(pos_id or "").strip()
+    if (
+        not clean_pos_id
+        or not action_id
+        or not expected_fingerprint
+        or not confirmation_token
+    ):
+        raise typer.BadParameter(
+            "--apply requires --action-id, --pos-id, "
+            "--expected-fingerprint, and --confirmation-token"
+        )
+    if plan.conflicts:
+        raise typer.BadParameter(
+            "reviewed target set has unresolved cancellation conflicts"
+        )
+    result = apply_reviewed_legacy_conditional_cancel_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        targets=REVIEWED_LEGACY_CONDITIONAL_TARGETS,
+        pos_id=clean_pos_id,
+        action_id=action_id,
+        expected_fingerprint=expected_fingerprint,
+        confirmation_token=confirmation_token,
+        now=datetime.now(UTC),
+    )
+    typer.echo(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+    if result.status != "cancelled":
+        raise typer.Exit(code=2)
 
 
 @app.command("repair-position-management")

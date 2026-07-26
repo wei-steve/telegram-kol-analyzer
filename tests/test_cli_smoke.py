@@ -24,6 +24,19 @@ from telegram_kol_research.production_safety_monitor import (
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
+def test_reviewed_legacy_conditional_cancel_help_exposes_fail_closed_inputs():
+    result = CliRunner().invoke(
+        app,
+        ["cancel-reviewed-legacy-conditionals", "--help"],
+    )
+
+    assert result.exit_code == 0
+    assert "--expected-fingerprint" in result.output
+    assert "--confirmation-token" in result.output
+    assert "--action-id" in result.output
+    assert "--pos-id" in result.output
+
+
 def test_cli_help_renders():
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
