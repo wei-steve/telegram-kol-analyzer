@@ -254,7 +254,7 @@ def test_group_messages_route_supports_search_and_sender_filters(tmp_path):
     assert "BTC short" not in response.text
 
 
-def test_group_messages_route_renders_filter_state_and_load_more_button(tmp_path):
+def test_group_messages_route_renders_filter_state_without_final_page_footer(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
     with session_factory() as session:
@@ -274,12 +274,70 @@ def test_group_messages_route_renders_filter_state_and_load_more_button(tmp_path
     assert response.status_code == 200
     assert 'value=""' in response.text
     assert 'value="Ali"' in response.text
-    assert "data-load-more" in response.text
-    assert 'data-before-message-id="1"' in response.text
+    assert "data-load-more" not in response.text
     assert 'data-latest-message-id="2"' in response.text
     assert response.text.index('data-message-list') < response.text.index('message-list-footer')
     assert response.text.index("second") < response.text.index("first")
     assert "data-message-select" not in response.text
+
+
+def test_group_message_routes_render_twenty_messages_and_more_footer(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(
+                    chat_id=88,
+                    message_id=message_id,
+                    text=f"message-{message_id:02d}",
+                )
+                for message_id in range(1, 22)
+            ]
+        )
+        session.commit()
+
+    client = TestClient(create_web_app(database_path=database_path))
+    for path in (
+        "/groups/88/messages",
+        "/groups/88/detail",
+        "/groups/88/detail/tab/messages",
+    ):
+        response = client.get(path)
+
+        assert response.status_code == 200
+        assert response.text.count("\n        data-message-card\n") == 20
+        assert "message-21" in response.text
+        assert "message-02" in response.text
+        assert "message-01" not in response.text
+        assert 'data-before-message-id="2"' in response.text
+        assert "data-load-more" in response.text
+        assert 'data-message-page-size="20"' in response.text
+
+
+def test_group_messages_route_omits_more_footer_for_exact_final_page(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(
+                    chat_id=88,
+                    message_id=message_id,
+                    text=f"message-{message_id:02d}",
+                )
+                for message_id in range(1, 21)
+            ]
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/88/messages"
+    )
+
+    assert response.status_code == 200
+    assert response.text.count("\n        data-message-card\n") == 20
+    assert "data-load-more" not in response.text
 
 
 def test_group_messages_route_renders_messages_newest_first(tmp_path):

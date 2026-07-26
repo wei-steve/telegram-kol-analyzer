@@ -160,6 +160,7 @@ from telegram_kol_research.trading_settings import (
 from telegram_kol_research.trade_signals import list_pending_trade_signals
 from telegram_kol_research.web_queries import (
     load_database_freshness,
+    load_group_message_page,
     load_group_messages,
     load_group_rows,
     load_home_event_rows,
@@ -200,6 +201,7 @@ from telegram_kol_research.telegram_session_lock import (
 
 
 REFRESH_TIMEOUT_SECONDS = 180
+MESSAGE_PAGE_SIZE = 20
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
 logger = logging.getLogger(__name__)
 _TELEGRAM_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -4178,8 +4180,10 @@ def create_web_app(
         )
         lookup_group_ms = _elapsed_ms(step_started_at)
         step_started_at = time.perf_counter()
-        messages = load_group_messages(
-            app.state.session_factory, chat_id=chat_id, limit=50
+        messages, has_more = load_group_message_page(
+            app.state.session_factory,
+            chat_id=chat_id,
+            page_size=MESSAGE_PAGE_SIZE,
         )
         messages_ms = _elapsed_ms(step_started_at)
         step_started_at = time.perf_counter()
@@ -4199,6 +4203,8 @@ def create_web_app(
                 "selected_group": selected_group,
                 "selected_chat_id": chat_id,
                 "messages": messages,
+                "has_more": has_more,
+                "message_page_size": MESSAGE_PAGE_SIZE,
                 "monitor_status": monitor_status,
                 "live_listener_enabled": monitor_status["state"] == "monitoring",
                 "live_listener_status_reason": app.state.live_listener_status_reason,
@@ -4265,8 +4271,10 @@ def create_web_app(
     @app.get("/groups/{chat_id}/detail/tab/messages")
     def group_detail_tab_messages(request: Request, chat_id: int):
         """Return only the messages tab content."""
-        messages = load_group_messages(
-            app.state.session_factory, chat_id=chat_id, limit=50
+        messages, has_more = load_group_message_page(
+            app.state.session_factory,
+            chat_id=chat_id,
+            page_size=MESSAGE_PAGE_SIZE,
         )
         monitor_status = build_monitor_status()
         freshness = load_database_freshness(
@@ -4284,6 +4292,8 @@ def create_web_app(
             "_messages.html",
             {
                 "messages": messages,
+                "has_more": has_more,
+                "message_page_size": MESSAGE_PAGE_SIZE,
                 "selected_chat_id": chat_id,
                 "selected_group": selected_group,
                 "search_text": "",
@@ -5073,10 +5083,10 @@ def create_web_app(
         sender_name: str | None = None,
     ):
         monitor_status = build_monitor_status()
-        messages = load_group_messages(
+        messages, has_more = load_group_message_page(
             app.state.session_factory,
             chat_id=chat_id,
-            limit=50,
+            page_size=MESSAGE_PAGE_SIZE,
             before_message_id=before_message_id,
             search_text=search_text,
             sender_name=sender_name,
@@ -5096,6 +5106,8 @@ def create_web_app(
             "_messages.html",
             {
                 "messages": messages,
+                "has_more": has_more,
+                "message_page_size": MESSAGE_PAGE_SIZE,
                 "selected_chat_id": chat_id,
                 "selected_group": selected_group,
                 "search_text": search_text or "",

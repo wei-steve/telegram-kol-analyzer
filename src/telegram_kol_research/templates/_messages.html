@@ -4,6 +4,7 @@
   data-layout-scroll-panel
   data-chat-id="{{ selected_chat_id or 0 }}"
   data-latest-message-id="{{ messages[0].message_id if messages else 0 }}"
+  data-message-page-size="{{ message_page_size }}"
 >
   <div class="messages-panel-header" data-message-sticky-header>
     <div class="message-sync-meta">
@@ -366,14 +367,14 @@
   </div>
 
   {% set next_before_message_id = messages[-1].message_id if messages else None %}
-  <div class="message-list-footer">
-    {% if next_before_message_id %}
+  <div class="message-list-footer" data-message-list-footer>
+    {% if has_more and next_before_message_id %}
       <button
         type="button"
         data-load-more
         data-before-message-id="{{ next_before_message_id }}"
       >
-        Load more
+        加载更多
       </button>
     {% endif %}
   </div>
