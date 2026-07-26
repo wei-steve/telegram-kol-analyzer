@@ -371,21 +371,10 @@ def _unowned_similar_backup(
     position: dict[str, Any],
     open_positions: list[dict[str, Any]],
 ) -> bool:
-    match = match_native_tpsl_order(
-        position,
-        pending,
-        NativeTpslExpectation(
-            purpose="stop_loss",
-            trigger_price=payload["slTriggerPx"],
-            size="0",
-        ),
-        open_positions=open_positions,
-    )
-    if match.status in {"verified", "ambiguous"}:
-        return True
     # A full-position native TPSL without posId cannot be safely assigned when
-    # the exchange omits the creation-time identity fields. Freeze rather than
-    # create a second stop beside a potentially manual one.
+    # the exchange omits the creation-time identity fields. Freeze only when
+    # it is an exact duplicate of the backup stop we intend to create; other
+    # unowned full-position stops must not make a distinct target ambiguous.
     for raw in pending:
         if not isinstance(raw, dict):
             continue

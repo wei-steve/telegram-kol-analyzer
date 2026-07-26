@@ -298,7 +298,7 @@ def test_plan_allows_unscoped_full_position_native_backup_only_with_complete_uni
     assert plan.status == "ready"
 
 
-def test_plan_freezes_unscoped_full_position_backup_when_complete_snapshot_is_not_unique(tmp_path):
+def test_plan_accepts_persisted_unscoped_full_position_backup_with_same_side_splits(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.trigger_take_profit_convergence_executor import (
         plan_trigger_take_profit_convergence,
@@ -327,9 +327,7 @@ def test_plan_freezes_unscoped_full_position_backup_when_complete_snapshot_is_no
         session_factory, convergence_id=convergence_id, deepcoin_client=client, planned_at=NOW
     )
 
-    assert (plan.status, plan.reason_code, plan.payloads) == (
-        "waiting_backup_stop", "convergence_waiting_backup_stop", ()
-    )
+    assert plan.status == "ready"
 
 
 def test_plan_accepts_native_primary_stop_without_position_id_when_scope_is_unique(tmp_path):
@@ -353,6 +351,44 @@ def test_plan_accepts_native_primary_stop_without_position_id_when_scope_is_uniq
             "triggerOrderType": "TPSL", "slTriggerPx": "67334.4", "slOrdPx": "-1", "sz": "0",
         },
     ]
+    plan = plan_trigger_take_profit_convergence(
+        session_factory, convergence_id=convergence_id, deepcoin_client=client, planned_at=NOW
+    )
+
+    assert plan.status == "ready"
+
+
+def test_plan_accepts_persisted_unscoped_primary_stop_with_same_side_splits(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    class _SameSideSplitClient(_Client):
+        def list_positions(self, *, inst_id=None):
+            return [
+                *super().list_positions(inst_id=inst_id),
+                {
+                    "instId": "BTC-USDT-SWAP", "posId": "pos-11", "posSide": "short",
+                    "pos": "7", "mrgPosition": "split", "mgnMode": "cross", "cTime": "1000",
+                },
+            ]
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
+    client = _SameSideSplitClient()
+    client.pending = [
+        {
+            "instId": "BTC-USDT-SWAP", "ordId": "sl-1", "posSide": "short",
+            "triggerOrderType": "TPSL", "slTriggerPx": "67200", "slOrdPx": "-1", "sz": "10",
+            "cTime": "1000",
+        },
+        {
+            "instId": "BTC-USDT-SWAP", "posId": "pos-10", "ordId": "backup-1", "posSide": "short",
+            "triggerOrderType": "TPSL", "slTriggerPx": "67334.4", "slOrdPx": "-1", "sz": "0",
+        },
+    ]
+
     plan = plan_trigger_take_profit_convergence(
         session_factory, convergence_id=convergence_id, deepcoin_client=client, planned_at=NOW
     )
@@ -508,7 +544,7 @@ def test_execution_rejects_native_take_profit_with_nonmarket_tp_price(tmp_path):
         assert session.query(PositionTakeProfitOrder).count() == 0
 
 
-def test_execution_freezes_unscoped_native_take_profit_when_two_positions_match(tmp_path):
+def test_execution_verifies_returned_unscoped_native_take_profit_with_same_side_splits(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import PositionTakeProfitOrder
     from telegram_kol_research.trigger_take_profit_convergence_executor import (
@@ -530,13 +566,14 @@ def test_execution_freezes_unscoped_native_take_profit_when_two_positions_match(
 
         def set_position_sltp(self, payload):
             self.submit_calls.append(dict(payload))
+            order_id = f"tp-unscoped-{len(self.submit_calls)}"
             self.pending.append({
-                "ordId": "tp-unscoped-1", "instId": payload["instId"],
+                "ordId": order_id, "instId": payload["instId"],
                 "posSide": payload["posSide"], "triggerOrderType": "TPSL",
                 "tpTriggerPx": payload["tpTriggerPx"], "tpOrdPx": "-1", "sz": payload["sz"],
                 "cTime": "1000",
             })
-            return {"code": "0", "data": {"ordId": "tp-unscoped-1"}}
+            return {"code": "0", "data": {"ordId": order_id}}
 
     session_factory = create_session_factory(tmp_path / "research.db")
     convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
@@ -548,10 +585,9 @@ def test_execution_freezes_unscoped_native_take_profit_when_two_positions_match(
         executed_at=NOW,
     )
 
-    assert result["status"] == "conflicted"
-    assert result["reason"] == "convergence_take_profit_pending_readback"
+    assert result["status"] == "submitted"
     with session_factory() as session:
-        assert session.query(PositionTakeProfitOrder).count() == 0
+        assert session.query(PositionTakeProfitOrder).count() == 3
 
 
 def test_plan_allocates_decimal_position_quantity_at_verified_contract_step(tmp_path):

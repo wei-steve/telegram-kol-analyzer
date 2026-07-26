@@ -488,11 +488,7 @@ def _has_verified_native_primary_stop(
             ),
             open_positions=[item for item in open_positions if isinstance(item, dict)],
         )
-        if match.status == "verified" and match.order is not None and _native_tpsl_is_scoped_to_position(
-            match.order,
-            position=position,
-            open_positions=open_positions,
-        ):
+        if match.status == "verified" and match.order is not None:
             return True
     return False
 
@@ -517,12 +513,6 @@ def _verified_native_take_profit(
     if match.status != "verified" or match.order is None:
         return None
     if not native_tpsl_take_profit_is_market(match.order.raw):
-        return None
-    if not _native_tpsl_is_scoped_to_position(
-        match.order,
-        position=position,
-        open_positions=open_positions,
-    ):
         return None
     return match.order
 

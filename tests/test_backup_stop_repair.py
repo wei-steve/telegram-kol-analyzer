@@ -282,6 +282,38 @@ def test_unscoped_native_manual_full_position_stop_freezes_backup_repair(tmp_pat
     assert plan.conflicts == ({"pos_id": "pos-1", "reason": "backup_similar_unscoped_order"},)
 
 
+def test_unrelated_unscoped_full_position_stops_do_not_block_backup_repair(tmp_path):
+    from telegram_kol_research.backup_stop_repair import build_backup_stop_repair_plan
+
+    class _TimestampedClient(_Client):
+        def list_positions(self, *, inst_id=None):
+            return [{
+                **super().list_positions(inst_id=inst_id)[0],
+                "cTime": "1000",
+            }]
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed(session_factory)
+    client = _TimestampedClient()
+    client.pending_rows.extend([
+        {
+            "ordId": "manual-stop-1", "instId": "ETH-USDT-SWAP", "posSide": "short",
+            "triggerOrderType": "TPSL", "slTriggerPrice": "1904", "sz": "0", "cTime": "1000",
+        },
+        {
+            "ordId": "manual-stop-2", "instId": "ETH-USDT-SWAP", "posSide": "short",
+            "triggerOrderType": "TPSL", "slTriggerPrice": "1905", "sz": "0", "cTime": "1000",
+        },
+    ])
+
+    plan = build_backup_stop_repair_plan(
+        session_factory, deepcoin_client=client, contract_spec_provider=_provider(), now=NOW
+    )
+
+    assert plan.conflicts == ()
+    assert [action.pos_id for action in plan.actions] == ["pos-1"]
+
+
 def test_background_submission_uses_native_tpsl_and_waits_for_readback(tmp_path):
     from telegram_kol_research.trigger_backup_stop_executor import (
         submit_verified_trigger_backup_stops,
@@ -374,7 +406,7 @@ class _PositionReadbackUnavailableClient(_Client):
         return super().set_position_sltp(payload)
 
 
-def test_background_submission_freezes_unscoped_native_tpsl_when_two_split_positions_match(tmp_path):
+def test_background_submission_verifies_returned_unscoped_native_tpsl_with_two_split_positions(tmp_path):
     from telegram_kol_research.trigger_backup_stop_executor import (
         submit_verified_trigger_backup_stops,
     )
@@ -390,9 +422,9 @@ def test_background_submission_freezes_unscoped_native_tpsl_when_two_split_posit
         submitted_at=NOW,
     )
 
-    assert submitted == 0
+    assert submitted == 1
     with session_factory() as session:
-        assert session.query(PositionBackupStopOrder).one().status == "pending_readback"
+        assert session.query(PositionBackupStopOrder).one().status == "active"
 
 
 def test_background_submission_does_not_activate_fallback_without_response_order_id(tmp_path):
@@ -441,7 +473,7 @@ def test_background_submission_rereads_full_positions_after_submit_race_without_
         assert session.query(PositionBackupStopOrder).one().status == "pending_readback"
 
 
-def test_repair_apply_freezes_unscoped_native_tpsl_when_two_split_positions_match(tmp_path):
+def test_repair_apply_verifies_returned_unscoped_native_tpsl_with_two_split_positions(tmp_path):
     from telegram_kol_research.backup_stop_repair import (
         apply_backup_stop_repair_plan,
         build_backup_stop_repair_plan,
@@ -459,9 +491,9 @@ def test_repair_apply_freezes_unscoped_native_tpsl_when_two_split_positions_matc
         pos_id="pos-1", expected_fingerprint=plan.fingerprint, now=NOW,
     )
 
-    assert result.status == "pending_readback"
+    assert result.status == "active"
     with session_factory() as session:
-        assert session.query(PositionBackupStopOrder).one().status == "pending_readback"
+        assert session.query(PositionBackupStopOrder).one().status == "active"
 
 
 def test_repair_apply_does_not_activate_native_tpsl_when_response_has_no_order_id(tmp_path):
