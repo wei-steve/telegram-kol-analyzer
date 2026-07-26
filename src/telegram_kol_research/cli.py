@@ -2249,12 +2249,6 @@ def repair_position_management(
     )
     if not apply:
         return
-    if plan.conflicts:
-        typer.echo(
-            "Refusing apply: unresolved position-management conflicts remain.",
-            err=True,
-        )
-        raise typer.Exit(code=2)
     contract_spec_provider = load_deepcoin_contract_specs(
         deepcoin_contract_specs_path
     )

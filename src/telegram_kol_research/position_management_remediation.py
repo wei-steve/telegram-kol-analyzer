@@ -352,6 +352,9 @@ def build_position_management_remediation_plan(
                             "candidate_id": int(candidate.id),
                             "lifecycle_id": target.lifecycle_id,
                             "management_batch_id": int(unresolved_batch.id),
+                            "strategy_instance_id": str(
+                                binding.strategy_instance_id
+                            ),
                             "reason": "existing_management_batch_unresolved",
                         }
                     )
@@ -451,7 +454,11 @@ def build_position_management_remediation_plan(
                     )
                 )
 
-    chains = _build_remediation_chains(actions, static_steps=static_steps)
+    chains = _build_remediation_chains(
+        actions,
+        static_steps=static_steps,
+        conflicts=conflicts,
+    )
     ordered_actions = tuple(
         step.action
         for chain in chains
@@ -487,6 +494,7 @@ def _build_remediation_chains(
     actions: list[PositionRemediationAction],
     *,
     static_steps: list[PositionRemediationStep] | None = None,
+    conflicts: list[dict[str, Any]] | None = None,
 ) -> tuple[PositionRemediationChain, ...]:
     grouped: dict[str, list[PositionRemediationStep]] = {}
     for action in actions:
@@ -557,17 +565,23 @@ def _build_remediation_chains(
             predecessor_blocking = True
         steps = tuple(steps_list)
         first = ordered[0]
+        chain_conflicts = tuple(
+            conflict
+            for conflict in conflicts or []
+            if conflict.get("strategy_instance_id") == strategy_instance_id
+        )
         chains.append(
             PositionRemediationChain(
                 strategy_instance_id=strategy_instance_id,
                 lifecycle_id=first.lifecycle_id,
                 execution_binding_id=first.execution_binding_id,
                 steps=steps,
-                conflicts=(),
+                conflicts=chain_conflicts,
                 fingerprint=_fingerprint(
                     {
                         "strategy_instance_id": strategy_instance_id,
                         "steps": [asdict(step) for step in steps],
+                        "conflicts": list(chain_conflicts),
                     }
                 ),
             )
@@ -625,21 +639,7 @@ def apply_position_management_remediation_action(
         deepcoin_client=deepcoin_client,
         now=now,
     )
-    if plan.conflicts:
-        raise ValueError("remediation plan has unresolved conflicts")
-    matches = [action for action in plan.actions if action.action_id == action_id]
-    if len(matches) != 1:
-        waiting_match = any(
-            step.action is not None
-            and step.action.action_id == action_id
-            and step.state != "ready_for_approval"
-            for chain in plan.chains
-            for step in chain.steps
-        )
-        if waiting_match:
-            raise ValueError("remediation action is not executable chain head")
-        raise ValueError("remediation action not found or not unique")
-    action = matches[0]
+    action = _select_executable_action(plan, action_id=action_id)
     if action.fingerprint != expected_fingerprint:
         raise ValueError("remediation action fingerprint mismatch")
     candidate_id = _project_canonical_remediation_candidate(
@@ -716,6 +716,26 @@ def apply_position_management_remediation_action(
         batch_id=promoted_batch.id,
         result=execution_result,
     )
+
+
+def _select_executable_action(
+    plan: PositionRemediationPlan,
+    *,
+    action_id: str,
+) -> PositionRemediationAction:
+    matches = [action for action in plan.actions if action.action_id == action_id]
+    if len(matches) == 1:
+        return matches[0]
+    waiting_match = any(
+        step.action is not None
+        and step.action.action_id == action_id
+        and step.state != "ready_for_approval"
+        for chain in plan.chains
+        for step in chain.steps
+    )
+    if waiting_match:
+        raise ValueError("remediation action is not executable chain head")
+    raise ValueError("remediation action not found or not unique")
 
 
 def _project_canonical_remediation_candidate(

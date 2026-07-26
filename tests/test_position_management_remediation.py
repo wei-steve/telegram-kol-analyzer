@@ -16,6 +16,7 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.position_management_remediation import (
     _require_exchange_snapshot_fingerprint,
+    _select_executable_action,
     apply_position_management_remediation_action,
     build_position_management_remediation_plan,
 )
@@ -438,6 +439,113 @@ def test_reconciling_predecessor_blocks_later_chain_step(tmp_path):
         "waiting_for_reconciliation",
         "waiting_for_predecessor",
     ]
+
+
+def test_unrelated_historical_conflict_does_not_block_exact_chain_head(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=999,
+            message_id=999,
+            posted_at=NOW - timedelta(days=1),
+            text="全部平仓",
+        )
+        session.add(raw)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="BTC",
+            side="long",
+            event_type="close_signal",
+            target_lifecycle_id=999999,
+            management_action="full_exit",
+            recognition_generation="orphan-conflict",
+            parse_source="mimo_authoritative",
+            confidence=0.95,
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            MessageInstructionItem(
+                raw_message_id=raw.id,
+                signal_candidate_id=candidate.id,
+                sequence=0,
+                instruction_kind="management",
+                idempotency_key="orphan".ljust(64, "x"),
+                status="failed",
+                error_json='{"reason":"target_missing"}',
+            )
+        )
+        session.commit()
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert len(plan.actions) == 1
+    assert plan.conflicts
+    selected = _select_executable_action(
+        plan,
+        action_id=plan.actions[0].action_id,
+    )
+    assert selected == plan.actions[0]
+
+
+def test_unresolved_batch_conflict_is_owned_by_its_strategy_chain(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="u" * 64,
+                raw_message_id=first_raw_id,
+                recognition_decision_id=1,
+                recognition_generation="unresolved-generation",
+                target_lifecycle_id=lifecycle_id,
+                strategy_instance_id=binding.strategy_instance_id,
+                execution_binding_id=binding.id,
+                intent="partial_take_profit",
+                effective_action="partial_close",
+                execution_mode="live",
+                requested_fraction=0.5,
+                effective_fraction=0.5,
+                partial_round_before=0,
+                status="recovery_required",
+                target_fingerprint="v" * 64,
+                target_snapshot_json="{}",
+                planned_at=NOW,
+            )
+        )
+        session.commit()
+    _persist_failed_management_step(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        posted_at=NOW + timedelta(minutes=1),
+        message_id=305,
+        text="BTC多单全部平仓",
+        event_type="close_signal",
+        management_action="full_exit",
+        sequence=0,
+    )
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert plan.chains[0].conflicts[0]["reason"] == (
+        "existing_management_batch_unresolved"
+    )
+    assert plan.chains[0].conflicts[0]["strategy_instance_id"] == (
+        plan.chains[0].strategy_instance_id
+    )
 
 
 def test_build_remediation_plan_is_read_only_and_fingerprinted(tmp_path):
