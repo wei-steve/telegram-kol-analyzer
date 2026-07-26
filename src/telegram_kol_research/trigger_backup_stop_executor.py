@@ -383,6 +383,22 @@ def _plan_submission(
         )
     except BackupStopError:
         return _blocked_plan(binding_id, leg_id, pos_id, "backup_stop_unsafe")
+    try:
+        from telegram_kol_research.position_protection_legs import (
+            materialize_verified_position_protection,
+        )
+
+        materialize_verified_position_protection(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=int(leg.id),
+            pos_id=pos_id,
+            primary_order_id=primary_order_id,
+            primary_stop=primary_stop,
+            backup_stop=str(backup_price),
+        )
+    except ValueError:
+        return _blocked_plan(binding_id, leg_id, pos_id, "protection_leg_conflict")
     if existing is not None:
         try:
             pending = _read_pending_trigger_orders(client, instrument_id=instrument_id)

@@ -85,6 +85,7 @@ def plan_trigger_take_profit_convergence(
             session.commit()
             return TriggerTakeProfitConvergencePlan(convergence.status, prepared)
         cancel_order_ids, payloads = prepared
+        session.commit()
         return TriggerTakeProfitConvergencePlan(
             "ready", cancel_order_ids=tuple(cancel_order_ids), payloads=tuple(payloads)
         )
@@ -399,6 +400,41 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
     ]
     if not payloads:
         return "convergence_target_size_invalid"
+    existing_protection_targets = (
+        session.query(PositionProtectionLeg.id)
+        .filter(PositionProtectionLeg.execution_order_leg_id == leg.id)
+        .filter(PositionProtectionLeg.role == "take_profit")
+        .count()
+    )
+    if existing_protection_targets == 0:
+        primary = next(
+            (
+                row
+                for row in stop_rows
+                if str(row.order_id or "").strip() and row.trigger_price is not None
+            ),
+            None,
+        )
+        if primary is None:
+            return "convergence_verified_stop_missing"
+        try:
+            from telegram_kol_research.position_protection_legs import (
+                materialize_verified_position_protection,
+            )
+
+            materialize_verified_position_protection(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=int(leg.id),
+                pos_id=pos_id,
+                primary_order_id=str(primary.order_id),
+                primary_stop=str(primary.trigger_price),
+                take_profits=[
+                    (payload["tpTriggerPx"], payload["sz"]) for payload in payloads
+                ],
+            )
+        except ValueError:
+            return "convergence_protection_leg_conflict"
     active_orders = (
         session.query(PositionTakeProfitOrder)
         .filter(PositionTakeProfitOrder.execution_binding_id == binding.id)

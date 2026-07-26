@@ -14,6 +14,7 @@ from telegram_kol_research.position_protection_legs import (
     bind_parent_entry_order,
     bind_verified_exchange_order,
     create_or_get_protection_leg,
+    materialize_verified_position_protection,
 )
 
 
@@ -130,3 +131,33 @@ def test_verified_protection_leg_rejects_conflicting_exchange_identity(tmp_path)
                 exchange_order_id="backup-2",
                 readback_evidence={"ordId": "backup-2", "posId": "pos-1"},
             )
+
+
+def test_materialize_verified_position_protection_creates_one_legacy_leg_per_role(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    entry_leg_id = _entry_leg_id(session_factory)
+
+    with session_factory() as session:
+        rows = materialize_verified_position_protection(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=entry_leg_id,
+            pos_id="pos-1",
+            primary_order_id="primary-1",
+            primary_stop="62500",
+            backup_stop="62375",
+            take_profits=[("65100", "3"), ("65800", "1"), ("66400", "1")],
+        )
+        session.commit()
+        observed = [
+            (row.role, row.leg_index, row.planned_trigger_price, row.planned_size, row.status)
+            for row in rows
+        ]
+
+    assert observed == [
+        ("primary_stop", 1, "62500", None, "verified"),
+        ("backup_stop", 1, "62375", "0", "waiting_fill"),
+        ("take_profit", 1, "65100", "3", "waiting_fill"),
+        ("take_profit", 2, "65800", "1", "waiting_fill"),
+        ("take_profit", 3, "66400", "1", "waiting_fill"),
+    ]
