@@ -25,6 +25,7 @@ from telegram_kol_research.models import (
     AiPromptInvocation,
     ExecutionBinding,
     ExecutionEvent,
+    ExecutionOrderLeg,
     MediaAsset,
     MessageInstructionItem,
     MessageRecognition,
@@ -547,6 +548,107 @@ def test_authoritative_multi_target_partial_take_profit_persists_one_candidate_p
     } == {
         (btc_id, "BTC", "short", 0.5),
         (eth_id, "ETH", "short", 0.5),
+    }
+    assert [item.instruction_kind for item in items] == ["management", "management"]
+
+
+def test_authoritative_unscoped_break_even_fans_out_to_verified_same_group_positions(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=9719,
+            posted_at=datetime(2026, 7, 26, 4, 29, tzinfo=UTC),
+            text="BTC多单浮盈700点左右，修改止损好成本保护，继续持有。",
+        )
+        session.add(raw_message)
+        target_ids = []
+        for message_id, pos_id in ((9654, "pos-1"), (9701, "pos-2")):
+            strategy_id = f"deepcoin:88:{message_id}:BTC:long"
+            binding = ExecutionBinding(
+                strategy_instance_id=strategy_id,
+                kol_id="group:88",
+                chat_id=88,
+                message_id=message_id,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                pos_id=pos_id,
+                status="active",
+            )
+            session.add(binding)
+            session.flush()
+            lifecycle = StrategyLifecycle(
+                chat_id=88,
+                message_id=message_id,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 25, 8, tzinfo=UTC),
+                entered_at=datetime(2026, 7, 25, 8, 1, tzinfo=UTC),
+                execution_binding_id=binding.id,
+            )
+            session.add(lifecycle)
+            session.add(
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=strategy_id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id=f"order-{pos_id}",
+                    pos_id=pos_id,
+                    status="active",
+                    attribution_status="verified",
+                )
+            )
+            session.flush()
+            target_ids.append(lifecycle.id)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    for _ in range(2):
+        apply_authoritative_mimo_payload(
+            session_factory,
+            raw_message_id=raw_message_id,
+            payload={
+                "recognition_result": "非策略",
+                "reason": "当前消息是对已有仓位的管理",
+                "lifecycle_event": {
+                    "event_type": "position_update",
+                    "target_lifecycle_id": None,
+                    "symbol": "BTC",
+                    "side": "long",
+                    "management_action": "move_stop_to_protect",
+                    "confidence": 0.9,
+                    "reason": "修改止损保护成本，但未指定具体策略",
+                },
+            },
+            model="mimo-v2.5",
+            authoritative_generation="group-break-even-9719",
+        )
+
+    with session_factory() as session:
+        candidates = (
+            session.query(SignalCandidate)
+            .filter_by(raw_message_id=raw_message_id)
+            .order_by(SignalCandidate.target_lifecycle_id)
+            .all()
+        )
+        items = (
+            session.query(MessageInstructionItem)
+            .filter_by(raw_message_id=raw_message_id)
+            .order_by(MessageInstructionItem.sequence)
+            .all()
+        )
+
+    assert [candidate.target_lifecycle_id for candidate in candidates] == sorted(
+        target_ids
+    )
+    assert {candidate.management_action for candidate in candidates} == {
+        "move_stop_to_break_even"
     }
     assert [item.instruction_kind for item in items] == ["management", "management"]
 

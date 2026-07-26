@@ -42,6 +42,10 @@ from telegram_kol_research.message_instruction_items import (
 from telegram_kol_research.management_directives import (
     resolve_management_directive,
 )
+from telegram_kol_research.management_scope import (
+    ManagementScopeError,
+    resolve_management_scope_in_session,
+)
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 from telegram_kol_research.recognition_profiles import BITCOIN_JUNZHANG_PROFILE
 from telegram_kol_research.parsing.text_parser import parse_signal_text
@@ -1754,6 +1758,100 @@ def _apply_low_confidence_group_exit_if_matched(
     return applied
 
 
+def _apply_deterministic_management_scope_if_matched(
+    session,
+    raw_message: RawMessage,
+    decision: dict[str, Any],
+    *,
+    parse_source: str,
+    authoritative_generation: str | None,
+    applied_candidate_ids: set[int] | None,
+) -> bool:
+    """Fan out only deterministic risk reductions to verified live positions."""
+
+    try:
+        confidence = float(decision.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence < 0.7 or _looks_like_trading_education_content(
+        raw_message.text or ""
+    ):
+        return False
+
+    scoped_decision = dict(decision)
+    if str(scoped_decision.get("event_type") or "") == "exit_position" and (
+        _exit_decision_looks_like_management_update(
+            raw_message.text,
+            scoped_decision,
+        )
+    ):
+        scoped_decision["event_type"] = "position_update"
+        if not str(scoped_decision.get("management_action") or "").strip():
+            scoped_decision["management_action"] = (
+                _management_action_for_exit_downgrade(
+                    raw_message.text,
+                    scoped_decision,
+                )
+            )
+        if (
+            not scoped_decision.get("take_profit")
+            and scoped_decision.get("exit_price")
+        ):
+            scoped_decision["take_profit"] = scoped_decision.get("exit_price")
+        scoped_decision["exit_price"] = None
+
+    directive = resolve_management_directive(
+        text=raw_message.text or "",
+        lifecycle_event=scoped_decision,
+    )
+    reply_target = _resolve_reply_lifecycle_target(session, raw_message)
+    try:
+        targets = resolve_management_scope_in_session(
+            session,
+            raw_message=raw_message,
+            directive=directive,
+            explicit_target_lifecycle_id=_int_or_none(
+                scoped_decision.get("target_lifecycle_id")
+            ),
+            reply_target_lifecycle_id=(
+                int(reply_target.id) if reply_target is not None else None
+            ),
+        )
+    except ManagementScopeError:
+        return False
+
+    applied = False
+    for target in targets:
+        target_decision = dict(scoped_decision)
+        target_decision.update(
+            {
+                "target_lifecycle_id": target.lifecycle_id,
+                "symbol": target.symbol,
+                "side": target.side,
+                "_explicit_multi_target": len(targets) > 1,
+                "management_scope_source": target.scope_source,
+            }
+        )
+        if directive.intent == "cancel_entry":
+            target_decision["event_type"] = "cancel_entry"
+        elif directive.intent == "full_exit":
+            target_decision["event_type"] = "exit_position"
+            target_decision["management_action"] = "full_exit"
+        else:
+            target_decision["event_type"] = "position_update"
+            target_decision["management_action"] = directive.intent
+            target_decision["management_fraction"] = directive.fraction
+        applied = _apply_lifecycle_event_decision(
+            session,
+            raw_message,
+            target_decision,
+            parse_source=parse_source,
+            authoritative_generation=authoritative_generation,
+            applied_candidate_ids=applied_candidate_ids,
+        ) or applied
+    return applied
+
+
 def _low_confidence_group_exit_is_enabled(session, raw_message: RawMessage) -> bool:
     row = session.query(TradingSetting).filter(
         TradingSetting.key == LOW_CONFIDENCE_GROUP_EXIT_CUTOFF_KEY
@@ -2130,6 +2228,15 @@ def apply_authoritative_mimo_payload(
         )
         if not lifecycle_applied and event_type != "none":
             lifecycle_applied = _apply_lifecycle_event_decision(
+                session,
+                raw_message,
+                lifecycle_event,
+                parse_source="mimo_authoritative",
+                authoritative_generation=authoritative_generation,
+                applied_candidate_ids=accepted_candidate_ids,
+            )
+        if not lifecycle_applied and event_type != "none":
+            lifecycle_applied = _apply_deterministic_management_scope_if_matched(
                 session,
                 raw_message,
                 lifecycle_event,
