@@ -17,6 +17,7 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.position_management_remediation import (
     _candidate_strategy_instance_id,
+    _project_canonical_remediation_candidate,
     _require_exchange_snapshot_fingerprint,
     _require_batch_matches_confirmed_action,
     _select_executable_action,
@@ -1402,3 +1403,60 @@ def test_apply_respects_global_live_management_gate(tmp_path):
         )
 
     assert client.write_calls == []
+
+
+def test_canonical_source_with_shadow_projects_distinct_remediation_candidate(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    action = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    ).actions[0]
+    with session_factory() as session:
+        source = session.query(SignalCandidate).one()
+        source_id = source.id
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="s" * 64,
+                raw_message_id=raw_id,
+                recognition_decision_id=1,
+                recognition_generation=source.recognition_generation,
+                target_lifecycle_id=lifecycle_id,
+                strategy_instance_id=binding.strategy_instance_id,
+                execution_binding_id=binding.id,
+                intent="partial_take_profit",
+                effective_action="partial_close",
+                execution_mode="shadow",
+                requested_fraction=0.5,
+                effective_fraction=0.5,
+                partial_round_before=0,
+                status="blocked",
+                reason_code="management_shadow_plan_only",
+                target_fingerprint="t" * 64,
+                target_snapshot_json="{}",
+                planned_at=NOW,
+            )
+        )
+        session.commit()
+
+    projected_id = _project_canonical_remediation_candidate(
+        session_factory,
+        action=action,
+    )
+
+    with session_factory() as session:
+        source = session.get(SignalCandidate, source_id)
+        projected = session.get(SignalCandidate, projected_id)
+        assert projected_id != source_id
+        assert source.review_status == "pending"
+        assert projected.review_status == "approved_remediation"
+        assert projected.recognition_generation == (
+            f"remediation:{action.fingerprint[:32]}"
+        )
+        assert projected.management_action == action.action_kind
+        assert projected.management_fraction == action.expected_effect["fraction"]

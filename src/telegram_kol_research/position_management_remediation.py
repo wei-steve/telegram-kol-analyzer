@@ -1022,14 +1022,6 @@ def _project_canonical_remediation_candidate(
         )
         expected_fraction = action.expected_effect.get("fraction")
         expected_stop = action.expected_effect.get("stop_loss")
-        if (
-            source.event_type == expected_event_type
-            and source.target_lifecycle_id == action.lifecycle_id
-            and str(source.management_action or "") == action.action_kind
-            and source.management_fraction == expected_fraction
-            and (source.stop_loss_text or None) == (expected_stop or None)
-        ):
-            return int(source.id)
         projected = SignalCandidate(
             raw_message_id=int(action.raw_message_id),
             symbol=source.symbol,
