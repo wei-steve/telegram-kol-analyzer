@@ -418,7 +418,7 @@ def test_plan_allocates_a_single_take_profit_to_the_full_position(tmp_path):
     assert plan.payloads[0]["sz"] == "10"
 
 
-def test_initial_take_profit_plan_blocks_when_a_take_profit_is_already_present(tmp_path):
+def test_plan_submits_only_missing_targets_after_exact_owned_target_is_verified(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.trigger_take_profit_convergence_executor import (
         plan_trigger_take_profit_convergence,
@@ -427,17 +427,72 @@ def test_initial_take_profit_plan_blocks_when_a_take_profit_is_already_present(t
     session_factory = create_session_factory(tmp_path / "research.db")
     convergence_id = _ready_convergence(session_factory)
     client = _Client()
+    with session_factory() as session:
+        from telegram_kol_research.models import PositionTakeProfitOrder
+
+        row = session.query(PositionTakeProfitOrder).filter_by(order_id="tp-old-1").one()
+        row.size_text = "5"
+        session.commit()
     client.pending.append({
-        "instId": "BTC-USDT-SWAP", "posId": "pos-10", "ordId": "tp-old-1",
-        "tpTriggerPx": "64500", "sz": "10",
+        "instId": "BTC-USDT-SWAP", "posId": "pos-10", "posSide": "short", "ordId": "tp-old-1",
+        "triggerOrderType": "TPSL", "tpTriggerPx": "64500", "tpOrdPx": "-1", "tpPrice": "0", "sz": "5",
     })
 
     plan = plan_trigger_take_profit_convergence(
         session_factory, convergence_id=convergence_id, deepcoin_client=client, planned_at=NOW
     )
 
-    assert plan.status == "conflicted"
-    assert plan.reason_code == "convergence_take_profit_already_present"
+    assert plan.status == "ready"
+    assert plan.cancel_order_ids == ()
+    assert [(payload["tpTriggerPx"], payload["sz"]) for payload in plan.payloads] == [
+        ("63800", "3"),
+        ("63100", "2"),
+    ]
+
+
+def test_execution_marks_already_verified_take_profit_set_submitted_without_write(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import PositionTakeProfitOrder, TriggerTakeProfitConvergence
+    from telegram_kol_research.position_take_profit_orders import record_take_profit_order
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory)
+    client = _Client()
+    pending_targets = [("tp-old-1", "64500", "5"), ("tp-old-2", "63800", "3"), ("tp-old-3", "63100", "2")]
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        first = session.query(PositionTakeProfitOrder).filter_by(order_id="tp-old-1").one()
+        first.size_text = "5"
+        for order_id, price, size in pending_targets[1:]:
+            record_take_profit_order(
+                session,
+                venue="deepcoin",
+                execution_binding_id=convergence.execution_binding_id,
+                execution_order_leg_id=convergence.execution_order_leg_id,
+                trigger_take_profit_convergence_id=convergence.id,
+                pos_id="pos-10",
+                order_id=order_id,
+                trigger_price=price,
+                size_text=size,
+                created_at=NOW,
+                evidence={"source": "native_tpsl_pending_readback", "native_tpsl": {"triggerOrderType": "TPSL", "ordId": order_id, "tpTriggerPx": price, "tpOrdPx": "-1", "tpPrice": "0", "sz": size}},
+            )
+        session.commit()
+    client.pending.extend([
+        {"instId": "BTC-USDT-SWAP", "posId": "pos-10", "posSide": "short", "ordId": order_id,
+         "triggerOrderType": "TPSL", "tpTriggerPx": price, "tpOrdPx": "-1", "tpPrice": "0", "sz": size}
+        for order_id, price, size in pending_targets
+    ])
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory, convergence_id=convergence_id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result == {"convergence_id": convergence_id, "status": "submitted", "reason": None}
+    assert client.submit_calls == []
 
 
 def test_execution_submits_initial_take_profits_without_cancelling_any_order(tmp_path):

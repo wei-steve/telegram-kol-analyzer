@@ -72,6 +72,8 @@ def plan_trigger_take_profit_convergence(
             ),
         )
         if isinstance(prepared, str):
+            if prepared == "convergence_take_profit_already_converged":
+                return TriggerTakeProfitConvergencePlan("already_converged", prepared)
             convergence.status = (
                 "waiting_backup_stop"
                 if prepared == "convergence_waiting_backup_stop"
@@ -108,6 +110,16 @@ def execute_trigger_take_profit_convergence(
         planned_at=now,
     )
     if plan.status != "ready":
+        if plan.status == "already_converged":
+            with session_factory() as session:
+                convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+                if convergence is not None and convergence.status == "ready":
+                    convergence.status = "submitted"
+                    convergence.reason_code = None
+                    convergence.completed_at = now
+                    convergence.updated_at = now
+                    session.commit()
+                    return {"convergence_id": convergence_id, "status": "submitted", "reason": None}
         return {"convergence_id": convergence_id, "status": plan.status, "reason": plan.reason_code}
     with session_factory() as session:
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
@@ -351,23 +363,6 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
         open_positions=positions,
     ):
         return "convergence_waiting_backup_stop"
-    active_orders = (
-        session.query(PositionTakeProfitOrder)
-        .filter(PositionTakeProfitOrder.execution_binding_id == binding.id)
-        .filter(PositionTakeProfitOrder.execution_order_leg_id == leg.id)
-        .filter(PositionTakeProfitOrder.pos_id == pos_id)
-        .filter(PositionTakeProfitOrder.status == "active")
-        .order_by(PositionTakeProfitOrder.id.asc())
-        .all()
-    )
-    pending_ids = _native_pending_take_profit_ids(
-        position=matches[0],
-        open_positions=positions,
-        pending=pending,
-    )
-    ledger_ids = {str(row.order_id) for row in active_orders}
-    if pending_ids or ledger_ids:
-        return "convergence_take_profit_already_present"
     targets = _targets(convergence.desired_take_profits_json)
     if isinstance(targets, str):
         return targets
@@ -404,7 +399,49 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
     ]
     if not payloads:
         return "convergence_target_size_invalid"
-    return [], payloads
+    active_orders = (
+        session.query(PositionTakeProfitOrder)
+        .filter(PositionTakeProfitOrder.execution_binding_id == binding.id)
+        .filter(PositionTakeProfitOrder.execution_order_leg_id == leg.id)
+        .filter(PositionTakeProfitOrder.pos_id == pos_id)
+        .filter(PositionTakeProfitOrder.status == "active")
+        .order_by(PositionTakeProfitOrder.id.asc())
+        .all()
+    )
+    desired_by_price = {payload["tpTriggerPx"]: payload for payload in payloads}
+    satisfied_order_ids: set[str] = set()
+    for order in active_orders:
+        payload = desired_by_price.get(str(order.trigger_price))
+        if payload is None or str(order.size_text or "") != payload["sz"]:
+            return "convergence_owned_take_profit_mismatch"
+        if _verified_native_take_profit(
+            position=matches[0],
+            open_positions=positions,
+            pending=pending,
+            order_id=str(order.order_id),
+            payload=payload,
+        ) is None:
+            return "convergence_take_profit_missing_on_exchange"
+        satisfied_order_ids.add(str(order.order_id))
+    if _unowned_pending_take_profit_present(
+        pending=pending,
+        inst_id=inst_id,
+        side=str(binding.side).lower(),
+        owned_order_ids=satisfied_order_ids,
+    ):
+        return "convergence_unowned_take_profit_present"
+    missing_payloads = [
+        payload
+        for payload in payloads
+        if not any(
+            str(order.trigger_price) == payload["tpTriggerPx"]
+            and str(order.size_text or "") == payload["sz"]
+            for order in active_orders
+        )
+    ]
+    if not missing_payloads:
+        return "convergence_take_profit_already_converged"
+    return [], missing_payloads
 
 
 def has_verified_exact_backup_stop(
@@ -543,6 +580,31 @@ def _native_pending_take_profit_ids(
             if order.ord_id:
                 ids.add(order.ord_id)
     return ids
+
+
+def _unowned_pending_take_profit_present(
+    *,
+    pending: list[dict[str, object]],
+    inst_id: str,
+    side: str,
+    owned_order_ids: set[str],
+) -> bool:
+    """Fail closed on any TP that could affect this exact side but lacks local ownership."""
+
+    for raw in pending:
+        if not isinstance(raw, dict):
+            continue
+        order = normalize_native_tpsl(raw)
+        if (
+            order is None
+            or order.take_profit_trigger_price is None
+            or order.inst_id != inst_id
+            or order.pos_side != side
+        ):
+            continue
+        if order.ord_id not in owned_order_ids:
+            return True
+    return False
 
 
 def _native_tpsl_is_scoped_to_position(
