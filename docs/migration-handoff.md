@@ -228,6 +228,16 @@ Design and implementation references:
 
 Production deployment and controlled server verification for this change remain pending. Use the read-only audit in `docs/runbook.md`; never place a real order merely to test semantic-review notification.
 
+Sequential position-management remediation is dry-run-first and chain-scoped.
+Missed instructions are ordered by source time, raw-message ID, instruction
+sequence, and candidate ID within each exact strategy. Only one chain head can
+be approved at a time. Reconcile that action and rebuild the plan before
+considering the next step. A confirmed full exit terminates later instructions
+for the same old lifecycle. Conflicts freeze their own chain and do not grant
+permission to guess ownership or fan out by symbol/side. Production rollout
+must begin in management shadow mode and prove zero exchange writes during
+historical replay.
+
 ## Web-managed AI prompts
 
 All AI business prompts now belong to the versioned database registry. The shared trading template A covers new-strategy judgment and the full strategy lifecycle; MiMo alone adds image template B. Runtime context C remains dynamically generated. Therefore DeepSeek uses `A + C`, while authoritative MiMo uses `A + B + C`.

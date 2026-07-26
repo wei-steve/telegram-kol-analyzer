@@ -15,6 +15,7 @@ from telegram_kol_research.models import (
     StrategyManagementBatch,
 )
 from telegram_kol_research.position_management_remediation import (
+    _candidate_strategy_instance_id,
     _require_exchange_snapshot_fingerprint,
     _select_executable_action,
     apply_position_management_remediation_action,
@@ -279,6 +280,162 @@ def test_cancel_entry_without_exact_live_fill_never_becomes_full_exit(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("instId", "ETH-USDT-SWAP"),
+        ("posSide", "short"),
+    ],
+)
+def test_cancel_entry_late_fill_requires_exact_instrument_and_side(
+    field,
+    value,
+    tmp_path,
+):
+    class DriftedIdentityClient(_ReadOnlyClient):
+        def list_positions(self):
+            rows = super().list_positions()
+            rows[0][field] = value
+            return rows
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+    _convert_only_instruction_to_cancel_entry(session_factory)
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=DriftedIdentityClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert any(
+        conflict["reason"] == "late_fill_identity_not_exact"
+        for conflict in plan.conflicts
+    )
+
+
+def test_cancel_entry_late_fill_requires_binding_pos_id_match(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+    _convert_only_instruction_to_cancel_entry(session_factory)
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        binding.pos_id = "different-pos"
+        session.commit()
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert plan.conflicts[0]["reason"] == "late_fill_identity_not_exact"
+
+
+def test_cancel_entry_late_fill_rejects_duplicate_live_pos_id(tmp_path):
+    class DuplicatePositionClient(_ReadOnlyClient):
+        def list_positions(self):
+            row = super().list_positions()[0]
+            return [row, dict(row)]
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+    _convert_only_instruction_to_cancel_entry(session_factory)
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=DuplicatePositionClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert plan.conflicts[0]["reason"] == "late_fill_identity_not_exact"
+
+
+def test_cancel_entry_late_fill_never_includes_unrelated_position(tmp_path):
+    class ExtraPositionClient(_ReadOnlyClient):
+        def list_positions(self):
+            rows = super().list_positions()
+            rows.append(
+                {
+                    **rows[0],
+                    "posId": "unrelated-pos",
+                    "pos": "3",
+                }
+            )
+            return rows
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+    _convert_only_instruction_to_cancel_entry(session_factory)
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=ExtraPositionClient(),
+        now=NOW,
+    )
+
+    assert plan.actions[0].pos_ids == ("pos-1",)
+    assert [
+        row["posId"] for row in plan.actions[0].evidence["positions"]
+    ] == ["pos-1"]
+
+
+def test_confirmed_late_fill_full_exit_resolves_original_cancel_step(tmp_path):
+    class NoPositionClient(_ReadOnlyClient):
+        def list_positions(self):
+            return []
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    _convert_only_instruction_to_cancel_entry(session_factory)
+    action = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    ).actions[0]
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="k" * 64,
+                raw_message_id=raw_id,
+                recognition_decision_id=1,
+                recognition_generation=f"remediation:{action.fingerprint[:32]}",
+                target_lifecycle_id=lifecycle_id,
+                strategy_instance_id=binding.strategy_instance_id,
+                execution_binding_id=binding.id,
+                intent="full_exit",
+                effective_action="full_exit",
+                execution_mode="live",
+                effective_fraction=1.0,
+                partial_round_before=0,
+                status="succeeded",
+                target_fingerprint="l" * 64,
+                target_snapshot_json=(
+                    '{"remediation_confirmation":{"action_id":"'
+                    + action.action_id
+                    + '"}}'
+                ),
+                planned_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=NoPositionClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert plan.chains[0].steps[0].state == "resolved"
+    assert plan.chains[0].steps[0].reason == "confirmed_full_exit"
+
+
 def test_confirmed_full_exit_terminalizes_later_old_lifecycle_steps(tmp_path):
     class NoPositionClient(_ReadOnlyClient):
         def list_positions(self):
@@ -304,7 +461,7 @@ def test_confirmed_full_exit_terminalizes_later_old_lifecycle_steps(tmp_path):
                 idempotency_fingerprint="f" * 64,
                 raw_message_id=first_raw_id,
                 recognition_decision_id=1,
-                recognition_generation="resolved-generation",
+                recognition_generation="repair-generation",
                 target_lifecycle_id=lifecycle_id,
                 strategy_instance_id=binding.strategy_instance_id,
                 execution_binding_id=binding.id,
@@ -376,6 +533,7 @@ def test_waiting_step_cannot_be_applied_before_predecessor(tmp_path):
         now=NOW,
     )
     waiting = plan.chains[0].steps[1]
+    assert waiting.action.fingerprint == "not-executable"
 
     with pytest.raises(ValueError, match="not executable chain head"):
         apply_position_management_remediation_action(
@@ -400,7 +558,7 @@ def test_reconciling_predecessor_blocks_later_chain_step(tmp_path):
                 idempotency_fingerprint="p" * 64,
                 raw_message_id=first_raw_id,
                 recognition_decision_id=1,
-                recognition_generation="pending-generation",
+                recognition_generation="repair-generation",
                 target_lifecycle_id=lifecycle_id,
                 strategy_instance_id=binding.strategy_instance_id,
                 execution_binding_id=binding.id,
@@ -505,7 +663,7 @@ def test_unresolved_batch_conflict_is_owned_by_its_strategy_chain(tmp_path):
                 idempotency_fingerprint="u" * 64,
                 raw_message_id=first_raw_id,
                 recognition_decision_id=1,
-                recognition_generation="unresolved-generation",
+                recognition_generation="repair-generation",
                 target_lifecycle_id=lifecycle_id,
                 strategy_instance_id=binding.strategy_instance_id,
                 execution_binding_id=binding.id,
@@ -546,6 +704,434 @@ def test_unresolved_batch_conflict_is_owned_by_its_strategy_chain(tmp_path):
     assert plan.chains[0].conflicts[0]["strategy_instance_id"] == (
         plan.chains[0].strategy_instance_id
     )
+
+
+def test_early_same_chain_directive_conflict_blocks_later_action(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    with session_factory() as session:
+        raw = session.get(RawMessage, first_raw_id)
+        raw.text = "BTC多单止盈30%，保留50%"
+        session.commit()
+    later_raw_id = _persist_failed_management_step(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        posted_at=NOW + timedelta(minutes=1),
+        message_id=308,
+        text="BTC多单全部平仓",
+        event_type="close_signal",
+        management_action="full_exit",
+        sequence=0,
+    )
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert [step.raw_message_id for step in plan.chains[0].steps] == [
+        first_raw_id,
+        later_raw_id,
+    ]
+    assert [step.state for step in plan.chains[0].steps] == [
+        "blocked",
+        "waiting_for_predecessor",
+    ]
+    assert plan.chains[0].conflicts[0]["strategy_instance_id"] == (
+        plan.chains[0].strategy_instance_id
+    )
+
+
+def test_item_strategy_identity_blocks_chain_when_candidate_lifecycle_drifts(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        candidate.target_lifecycle_id = 999999
+        session.commit()
+    later_raw_id = _persist_failed_management_step(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        posted_at=NOW + timedelta(minutes=1),
+        message_id=309,
+        text="BTC多单全部平仓",
+        event_type="close_signal",
+        management_action="full_exit",
+        sequence=0,
+    )
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert [step.raw_message_id for step in plan.chains[0].steps] == [
+        first_raw_id,
+        later_raw_id,
+    ]
+    assert [step.state for step in plan.chains[0].steps] == [
+        "blocked",
+        "waiting_for_predecessor",
+    ]
+    assert plan.conflicts[0]["strategy_instance_id"] == (
+        plan.chains[0].strategy_instance_id
+    )
+
+
+def test_valid_candidate_and_item_strategy_mismatch_fails_closed(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_raw_id, first_lifecycle_id = _persist_failed_partial_management(
+        session_factory
+    )
+    with session_factory() as session:
+        second_binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:88:201:BTC:long",
+            kol_id="group:88",
+            chat_id=88,
+            message_id=201,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            pos_id="pos-2",
+            status="active",
+        )
+        session.add(second_binding)
+        session.flush()
+        second_lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=201,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            entered_at=NOW,
+            execution_binding_id=second_binding.id,
+        )
+        session.add(second_lifecycle)
+        session.flush()
+        candidate = session.query(SignalCandidate).one()
+        candidate.target_lifecycle_id = second_lifecycle.id
+        session.commit()
+        item = session.query(MessageInstructionItem).one()
+        assert _candidate_strategy_instance_id(
+            session=session,
+            candidate=candidate,
+            item=item,
+        ) == "deepcoin:88:200:BTC:long"
+    later_raw_id = _persist_failed_management_step(
+        session_factory,
+        lifecycle_id=first_lifecycle_id,
+        posted_at=NOW + timedelta(minutes=1),
+        message_id=310,
+        text="BTC多单全部平仓",
+        event_type="close_signal",
+        management_action="full_exit",
+        sequence=0,
+    )
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert [step.raw_message_id for step in plan.chains[0].steps] == [
+        first_raw_id,
+        later_raw_id,
+    ]
+    assert [step.state for step in plan.chains[0].steps] == [
+        "blocked",
+        "waiting_for_predecessor",
+    ]
+    assert plan.conflicts[0]["reason"] == "candidate_item_strategy_mismatch"
+
+
+def test_predecessor_signature_includes_candidate_without_instruction_item(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    first_plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+    original = first_plan.actions[0]
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        raw = RawMessage(
+            chat_id=88,
+            message_id=199,
+            posted_at=NOW - timedelta(minutes=1),
+            text="BTC多单移动止损到开仓价",
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="long",
+                event_type="position_update",
+                target_lifecycle_id=lifecycle.id,
+                management_action="move_stop_to_break_even",
+                recognition_generation="missing-item-generation",
+                parse_source="mimo_authoritative",
+                confidence=0.95,
+            )
+        )
+        session.commit()
+
+    second_plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+    original_waiting = next(
+        step.action
+        for step in second_plan.chains[0].steps
+        if step.action is not None and step.action.action_id == original.action_id
+    )
+
+    assert (
+        original_waiting.evidence["predecessor_signature"]
+        != original.evidence["predecessor_signature"]
+    )
+    assert original_waiting.fingerprint == "not-executable"
+
+
+@pytest.mark.parametrize(
+    ("batch_status", "expected_state"),
+    [
+        ("reconciling", "waiting_for_reconciliation"),
+        ("recovery_required", "blocked"),
+        ("succeeded", "resolved"),
+    ],
+)
+def test_remediation_confirmation_attributes_non_terminal_batch_to_source(
+    batch_status,
+    expected_state,
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    action = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    ).actions[0]
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint=(batch_status[0] * 64),
+                raw_message_id=raw_id,
+                recognition_decision_id=1,
+                recognition_generation=f"remediation:{action.fingerprint[:32]}",
+                target_lifecycle_id=lifecycle_id,
+                strategy_instance_id=binding.strategy_instance_id,
+                execution_binding_id=binding.id,
+                intent="partial_take_profit",
+                effective_action="partial_close",
+                execution_mode="live",
+                requested_fraction=0.5,
+                effective_fraction=0.5,
+                partial_round_before=0,
+                status=batch_status,
+                target_fingerprint=(expected_state[0] * 64),
+                target_snapshot_json=(
+                    '{"remediation_confirmation":{"action_id":"'
+                    + action.action_id
+                    + '"}}'
+                ),
+                planned_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert plan.chains[0].steps[0].state == expected_state
+
+
+def test_batch_from_other_recognition_generation_does_not_resolve_candidate(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="g" * 64,
+                raw_message_id=raw_id,
+                recognition_decision_id=1,
+                recognition_generation="different-generation",
+                target_lifecycle_id=lifecycle_id,
+                strategy_instance_id=binding.strategy_instance_id,
+                execution_binding_id=binding.id,
+                intent="partial_take_profit",
+                effective_action="partial_close",
+                execution_mode="live",
+                requested_fraction=0.5,
+                effective_fraction=0.5,
+                partial_round_before=0,
+                status="succeeded",
+                target_fingerprint="h" * 64,
+                target_snapshot_json="{}",
+                planned_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert [action.raw_message_id for action in plan.actions] == [raw_id]
+
+
+def test_batch_is_not_attributed_when_candidate_sequence_is_ambiguous(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    with session_factory() as session:
+        original = session.query(SignalCandidate).one()
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        duplicate = SignalCandidate(
+            raw_message_id=raw_id,
+            symbol="BTC",
+            side="long",
+            event_type="position_update",
+            target_lifecycle_id=lifecycle_id,
+            management_action="partial_take_profit",
+            management_fraction=0.5,
+            recognition_generation=original.recognition_generation,
+            parse_source="mimo_authoritative",
+            confidence=0.95,
+        )
+        session.add(duplicate)
+        session.flush()
+        session.add(
+            MessageInstructionItem(
+                raw_message_id=raw_id,
+                signal_candidate_id=duplicate.id,
+                sequence=1,
+                instruction_kind="management",
+                strategy_instance_id=binding.strategy_instance_id,
+                idempotency_key="duplicate-sequence".ljust(64, "x"),
+                status="failed",
+                error_json='{"reason":"target_not_visible"}',
+            )
+        )
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="i" * 64,
+                raw_message_id=raw_id,
+                recognition_decision_id=1,
+                recognition_generation=original.recognition_generation,
+                target_lifecycle_id=lifecycle_id,
+                strategy_instance_id=binding.strategy_instance_id,
+                execution_binding_id=binding.id,
+                intent="partial_take_profit",
+                effective_action="partial_close",
+                execution_mode="live",
+                requested_fraction=0.5,
+                effective_fraction=0.5,
+                partial_round_before=0,
+                status="succeeded",
+                target_fingerprint="j" * 64,
+                target_snapshot_json="{}",
+                planned_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert all(step.state == "blocked" for step in plan.chains[0].steps)
+    assert {
+        conflict["reason"] for conflict in plan.chains[0].conflicts
+    } == {"management_batch_candidate_ambiguous"}
+
+
+def test_production_shape_replays_break_even_exit_then_old_followup_in_order(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first_raw_id, lifecycle_id = _persist_failed_partial_management(session_factory)
+    with session_factory() as session:
+        first_raw = session.get(RawMessage, first_raw_id)
+        first_candidate = session.query(SignalCandidate).one()
+        first_raw.text = "BTC多单移动止损到开仓价"
+        first_candidate.management_action = "move_stop_to_break_even"
+        first_candidate.management_fraction = None
+        session.commit()
+    second_raw_id = _persist_failed_management_step(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        posted_at=NOW + timedelta(minutes=1),
+        message_id=306,
+        text="BTC多单全部平仓",
+        event_type="close_signal",
+        management_action="full_exit",
+        sequence=0,
+    )
+    third_raw_id = _persist_failed_management_step(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        posted_at=NOW + timedelta(minutes=2),
+        message_id=307,
+        text="BTC多单继续移动止损到开仓价",
+        event_type="position_update",
+        management_action="move_stop_to_break_even",
+        sequence=0,
+    )
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    chain = plan.chains[0]
+    assert [step.raw_message_id for step in chain.steps] == [
+        first_raw_id,
+        second_raw_id,
+        third_raw_id,
+    ]
+    assert [step.action_kind for step in chain.steps] == [
+        "move_stop_to_break_even",
+        "full_exit",
+        "move_stop_to_break_even",
+    ]
+    assert [step.state for step in chain.steps] == [
+        "ready_for_approval",
+        "waiting_for_predecessor",
+        "waiting_for_predecessor",
+    ]
+    assert [action.raw_message_id for action in plan.actions] == [first_raw_id]
 
 
 def test_build_remediation_plan_is_read_only_and_fingerprinted(tmp_path):

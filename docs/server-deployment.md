@@ -469,6 +469,51 @@ cd /opt/telegram-kol-analyzer
 telegram-kol-research media-cleanup --dry-run
 ```
 
+## Sequential position-management remediation
+
+Missed management instructions are repaired in original message order per
+`strategy_instance_id`. The dry run may show several steps for one strategy,
+but only the `ready_for_approval` chain head is executable. Every later step
+must remain `waiting_for_predecessor`.
+
+Before production validation:
+
+1. back up `data/research.db`;
+2. deploy the reviewed commit;
+3. set `management_execution_mode` to `shadow`;
+4. confirm the API and database both report shadow mode;
+5. replay the approved historical regression messages;
+6. verify the exchange write count remains zero.
+
+Generate the read-only plan:
+
+```bash
+cd /opt/telegram-kol-analyzer
+.venv/bin/telegram-kol-research repair-position-management \
+  --database-path data/research.db
+```
+
+Inspect every chain's source message, exact binding, entry-leg IDs, `posId`,
+current economics, step state, conflicts, and fingerprint. A missed
+`cancel_entry` may become `full_exit` only when the exact verified entry has
+filled and the coherent live snapshot proves the same position identity.
+
+Never bulk apply a chain. After explicit approval, apply only its current head:
+
+```bash
+.venv/bin/telegram-kol-research repair-position-management \
+  --database-path data/research.db \
+  --apply \
+  --action-id '<READY_HEAD_ACTION_ID>' \
+  --expected-fingerprint '<READY_HEAD_FINGERPRINT>'
+```
+
+Read back positions, orders, TPSL, management batch legs, execution events, and
+notifications. Wait for reconciliation to reach a durable outcome, then
+regenerate the dry run and obtain separate approval for the next head. A
+confirmed full exit terminates the old lifecycle; later steps for that
+lifecycle must be `terminally_skipped`.
+
 Apply cleanup:
 
 ```bash

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -62,6 +62,8 @@ class PositionRemediationStep:
     action_kind: str
     state: str
     reason: str | None
+    management_batch_id: int | None
+    batch_status: str | None
     action: PositionRemediationAction | None
 
 
@@ -134,9 +136,14 @@ def build_position_management_remediation_plan(
             conflicts=conflicts,
             chains=(),
         )
+    live_position_rows = [
+        dict(row)
+        for row in snapshot.positions
+        if _first_text(row, "posId", "pos_id", "id")
+    ]
     live_positions = {
         str(pos_id): dict(row)
-        for row in snapshot.positions
+        for row in live_position_rows
         if (pos_id := _first_text(row, "posId", "pos_id", "id"))
     }
 
@@ -147,6 +154,7 @@ def build_position_management_remediation_plan(
         candidates = (
             session.query(SignalCandidate)
             .filter(SignalCandidate.parse_source == "mimo_authoritative")
+            .filter(SignalCandidate.review_status != "approved_remediation")
             .filter(
                 SignalCandidate.event_type.in_(("close_signal", "position_update"))
             )
@@ -167,6 +175,35 @@ def build_position_management_remediation_plan(
             raw_message = session.get(RawMessage, candidate.raw_message_id)
             if raw_message is None:
                 continue
+            identity_conflict = _candidate_item_strategy_conflict(
+                session=session,
+                candidate=candidate,
+                item=item,
+            )
+            if identity_conflict is not None:
+                lifecycle, binding, target_strategy_instance_id = identity_conflict
+                conflict = {
+                    "raw_message_id": int(raw_message.id),
+                    "candidate_id": int(candidate.id),
+                    "lifecycle_id": int(lifecycle.id),
+                    "strategy_instance_id": str(binding.strategy_instance_id),
+                    "target_strategy_instance_id": target_strategy_instance_id,
+                    "reason": "candidate_item_strategy_mismatch",
+                }
+                conflicts.append(conflict)
+                static_steps.append(
+                    _batch_backed_static_step(
+                        binding=binding,
+                        lifecycle=lifecycle,
+                        raw_message=raw_message,
+                        candidate=candidate,
+                        item=item,
+                        action_kind=_candidate_action_kind(candidate),
+                        state="blocked",
+                        reason="candidate_item_strategy_mismatch",
+                    )
+                )
+                continue
             decision = _candidate_decision(candidate)
             try:
                 directive = resolve_management_directive(
@@ -181,13 +218,39 @@ def build_position_management_remediation_plan(
                     reply_target_lifecycle_id=None,
                 )
             except (ManagementScopeError, ValueError) as exc:
-                conflicts.append(
-                    {
-                        "raw_message_id": int(raw_message.id),
-                        "candidate_id": int(candidate.id),
-                        "reason": str(exc),
-                    }
+                conflict = {
+                    "raw_message_id": int(raw_message.id),
+                    "candidate_id": int(candidate.id),
+                    "reason": str(exc),
+                }
+                explicit_context = _load_candidate_conflict_context(
+                    session=session,
+                    candidate=candidate,
+                    item=item,
                 )
+                if explicit_context is not None:
+                    lifecycle, binding = explicit_context
+                    conflict.update(
+                        {
+                            "lifecycle_id": int(lifecycle.id),
+                            "strategy_instance_id": str(
+                                binding.strategy_instance_id
+                            ),
+                        }
+                    )
+                    static_steps.append(
+                        _batch_backed_static_step(
+                            binding=binding,
+                            lifecycle=lifecycle,
+                            raw_message=raw_message,
+                            candidate=candidate,
+                            item=item,
+                            action_kind=_candidate_action_kind(candidate),
+                            state="blocked",
+                            reason=str(exc),
+                        )
+                    )
+                conflicts.append(conflict)
                 continue
             for target in targets:
                 lifecycle = session.get(StrategyLifecycle, target.lifecycle_id)
@@ -203,14 +266,33 @@ def build_position_management_remediation_plan(
                     or str(binding.strategy_instance_id or "")
                     != target.strategy_instance_id
                 ):
-                    conflicts.append(
-                        {
-                            "raw_message_id": int(raw_message.id),
-                            "candidate_id": int(candidate.id),
-                            "lifecycle_id": target.lifecycle_id,
-                            "reason": "target_strategy_binding_not_verified",
-                        }
-                    )
+                    conflict = {
+                        "raw_message_id": int(raw_message.id),
+                        "candidate_id": int(candidate.id),
+                        "lifecycle_id": target.lifecycle_id,
+                        "reason": "target_strategy_binding_not_verified",
+                    }
+                    if (
+                        lifecycle is not None
+                        and binding is not None
+                        and str(binding.strategy_instance_id or "").strip()
+                    ):
+                        conflict["strategy_instance_id"] = str(
+                            binding.strategy_instance_id
+                        )
+                        static_steps.append(
+                            _batch_backed_static_step(
+                                binding=binding,
+                                lifecycle=lifecycle,
+                                raw_message=raw_message,
+                                candidate=candidate,
+                                item=item,
+                                action_kind=directive.intent,
+                                state="blocked",
+                                reason="target_strategy_binding_not_verified",
+                            )
+                        )
+                    conflicts.append(conflict)
                     continue
                 existing_batches = (
                     session.query(StrategyManagementBatch)
@@ -222,6 +304,42 @@ def build_position_management_remediation_plan(
                     .order_by(StrategyManagementBatch.id.desc())
                     .all()
                 )
+                existing_batches = [
+                    batch
+                    for batch in existing_batches
+                    if _batch_matches_candidate_action(
+                        batch=batch,
+                        candidate=candidate,
+                        directive_intent=directive.intent,
+                        lifecycle_id=int(lifecycle.id),
+                    )
+                ]
+                if existing_batches and not _batch_candidate_association_is_unique(
+                    session=session,
+                    candidate=candidate,
+                ):
+                    conflict = {
+                        "raw_message_id": int(raw_message.id),
+                        "candidate_id": int(candidate.id),
+                        "lifecycle_id": int(lifecycle.id),
+                        "strategy_instance_id": str(binding.strategy_instance_id),
+                        "reason": "management_batch_candidate_ambiguous",
+                    }
+                    conflicts.append(conflict)
+                    static_steps.append(
+                        _batch_backed_static_step(
+                            binding=binding,
+                            lifecycle=lifecycle,
+                            raw_message=raw_message,
+                            candidate=candidate,
+                            item=item,
+                            action_kind=directive.intent,
+                            state="blocked",
+                            reason="management_batch_candidate_ambiguous",
+                            batch=existing_batches[0],
+                        )
+                    )
+                    continue
                 terminal_batch = (
                     session.query(StrategyManagementBatch)
                     .filter(
@@ -236,6 +354,16 @@ def build_position_management_remediation_plan(
                 if terminal_batch is not None:
                     is_terminal_source = (
                         int(terminal_batch.raw_message_id) == int(raw_message.id)
+                        and _terminal_batch_resolves_candidate(
+                            batch=terminal_batch,
+                            candidate=candidate,
+                            directive_intent=directive.intent,
+                            lifecycle_id=int(lifecycle.id),
+                        )
+                        and _batch_candidate_association_is_unique(
+                            session=session,
+                            candidate=candidate,
+                        )
                     )
                     static_steps.append(
                         PositionRemediationStep(
@@ -264,6 +392,8 @@ def build_position_management_remediation_plan(
                                 if is_terminal_source
                                 else "old_lifecycle_already_fully_exited"
                             ),
+                            management_batch_id=int(terminal_batch.id),
+                            batch_status=str(terminal_batch.status),
                             action=None,
                         )
                     )
@@ -295,6 +425,7 @@ def build_position_management_remediation_plan(
                             action_kind=directive.intent,
                             state="waiting_for_reconciliation",
                             reason=f"management_batch_{active_batch.status}",
+                            batch=active_batch,
                         )
                     )
                     continue
@@ -317,6 +448,7 @@ def build_position_management_remediation_plan(
                             action_kind=directive.intent,
                             state="resolved",
                             reason="management_batch_succeeded",
+                            batch=succeeded_batch,
                         )
                     )
                     continue
@@ -344,6 +476,7 @@ def build_position_management_remediation_plan(
                             action_kind=directive.intent,
                             state="blocked",
                             reason="existing_management_batch_unresolved",
+                            batch=unresolved_batch,
                         )
                     )
                     conflicts.append(
@@ -378,18 +511,46 @@ def build_position_management_remediation_plan(
                     for leg in entry_legs
                     if str(leg.pos_id) in live_positions
                 )
-                if not pos_ids or len(pos_ids) != len(entry_legs):
+                exact_live_identity = _entry_positions_match_exact_live_identity(
+                    binding=binding,
+                    entry_legs=entry_legs,
+                    live_rows=live_position_rows,
+                )
+                if (
+                    not pos_ids
+                    or len(pos_ids) != len(entry_legs)
+                    or not exact_live_identity
+                ):
                     conflicts.append(
                         {
                             "raw_message_id": int(raw_message.id),
                             "candidate_id": int(candidate.id),
                             "lifecycle_id": target.lifecycle_id,
+                            "strategy_instance_id": str(
+                                binding.strategy_instance_id
+                            ),
                             "reason": (
                                 "late_fill_identity_not_exact"
                                 if directive.intent == "cancel_entry"
                                 else "target_live_position_not_exact"
                             ),
                         }
+                    )
+                    static_steps.append(
+                        _batch_backed_static_step(
+                            binding=binding,
+                            lifecycle=lifecycle,
+                            raw_message=raw_message,
+                            candidate=candidate,
+                            item=item,
+                            action_kind=directive.intent,
+                            state="blocked",
+                            reason=(
+                                "late_fill_identity_not_exact"
+                                if directive.intent == "cancel_entry"
+                                else "target_live_position_not_exact"
+                            ),
+                        )
                     )
                     continue
                 effective_intent = (
@@ -422,6 +583,14 @@ def build_position_management_remediation_plan(
                     "execution_binding_id": int(binding.id),
                     "execution_order_leg_ids": [int(leg.id) for leg in entry_legs],
                     "positions": [live_positions[pos_id] for pos_id in pos_ids],
+                    "predecessor_signature": _predecessor_signature(
+                        session=session,
+                        strategy_instance_id=str(binding.strategy_instance_id),
+                        current_raw_message=raw_message,
+                        current_candidate=candidate,
+                        current_item=item,
+                        current_effective_intent=effective_intent,
+                    ),
                 }
                 action_core = {
                     "action_kind": effective_intent,
@@ -511,6 +680,8 @@ def _build_remediation_chains(
                 action_kind=action.action_kind,
                 state="unclassified",
                 reason=None,
+                management_batch_id=None,
+                batch_status=None,
                 action=action,
             )
         )
@@ -541,6 +712,31 @@ def _build_remediation_chains(
                 if not ready_assigned and not predecessor_blocking
                 else "waiting_for_predecessor"
             )
+            predecessor_state = [
+                {
+                    "raw_message_id": prior.raw_message_id,
+                    "instruction_item_id": prior.instruction_item_id,
+                    "candidate_id": prior.candidate_id,
+                    "state": prior.state,
+                    "reason": prior.reason,
+                    "management_batch_id": prior.management_batch_id,
+                    "batch_status": prior.batch_status,
+                }
+                for prior in steps_list
+            ]
+            classified_action = (
+                replace(
+                    step.action,
+                    fingerprint=_fingerprint(
+                        {
+                            "action_fingerprint": step.action.fingerprint,
+                            "predecessors": predecessor_state,
+                        }
+                    ),
+                )
+                if state == "ready_for_approval"
+                else replace(step.action, fingerprint="not-executable")
+            )
             steps_list.append(
                 PositionRemediationStep(
                     strategy_instance_id=step.strategy_instance_id,
@@ -558,7 +754,9 @@ def _build_remediation_chains(
                         if state == "ready_for_approval"
                         else "predecessor_not_resolved"
                     ),
-                    action=step.action,
+                    management_batch_id=None,
+                    batch_status=None,
+                    action=classified_action,
                 )
             )
             ready_assigned = True
@@ -601,6 +799,7 @@ def _batch_backed_static_step(
     action_kind: str,
     state: str,
     reason: str,
+    batch: StrategyManagementBatch | None = None,
 ) -> PositionRemediationStep:
     return PositionRemediationStep(
         strategy_instance_id=str(binding.strategy_instance_id),
@@ -614,6 +813,8 @@ def _batch_backed_static_step(
         action_kind=action_kind,
         state=state,
         reason=reason,
+        management_batch_id=int(batch.id) if batch is not None else None,
+        batch_status=str(batch.status) if batch is not None else None,
         action=None,
     )
 
@@ -642,6 +843,7 @@ def apply_position_management_remediation_action(
     action = _select_executable_action(plan, action_id=action_id)
     if action.fingerprint != expected_fingerprint:
         raise ValueError("remediation action fingerprint mismatch")
+    approved_chain = _chain_for_action(plan, action_id=action.action_id)
     candidate_id = _project_canonical_remediation_candidate(
         session_factory,
         action=action,
@@ -663,6 +865,24 @@ def apply_position_management_remediation_action(
             f"remediation planning did not become ready:{result.reason_code}"
         )
     _require_batch_matches_confirmed_action(action=action, batch=result.batch)
+    refreshed_plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=deepcoin_client,
+        now=now,
+    )
+    refreshed_action = _select_executable_action(
+        refreshed_plan,
+        action_id=action.action_id,
+    )
+    refreshed_chain = _chain_for_action(
+        refreshed_plan,
+        action_id=action.action_id,
+    )
+    if (
+        refreshed_action.fingerprint != action.fingerprint
+        or refreshed_chain.fingerprint != approved_chain.fingerprint
+    ):
+        raise ValueError("remediation chain changed before promotion")
     if not load_trading_settings(
         session_factory
     ).live_management_execution_enabled:
@@ -680,6 +900,34 @@ def apply_position_management_remediation_action(
             or stored_batch.reason_code != "management_disabled_plan_only"
         ):
             raise ValueError("remediation batch changed before promotion")
+        source_candidate = session.get(
+            SignalCandidate,
+            int(action.evidence["candidate_id"]),
+        )
+        source_raw = session.get(RawMessage, int(action.raw_message_id))
+        source_item = (
+            session.get(
+                MessageInstructionItem,
+                int(action.evidence["instruction_item_id"]),
+            )
+            if action.evidence.get("instruction_item_id") is not None
+            else None
+        )
+        if source_candidate is None or source_raw is None:
+            raise ValueError("remediation source changed before promotion")
+        current_predecessor_signature = _predecessor_signature(
+            session=session,
+            strategy_instance_id=action.strategy_instance_id,
+            current_raw_message=source_raw,
+            current_candidate=source_candidate,
+            current_item=source_item,
+            current_effective_intent=action.action_kind,
+            excluded_batch_id=int(result.batch.id),
+        )
+        if current_predecessor_signature != action.evidence.get(
+            "predecessor_signature"
+        ):
+            raise ValueError("remediation predecessors changed before promotion")
         target_snapshot = json.loads(stored_batch.target_snapshot_json)
         target_snapshot["remediation_confirmation"] = {
             "action_id": action.action_id,
@@ -736,6 +984,24 @@ def _select_executable_action(
     if waiting_match:
         raise ValueError("remediation action is not executable chain head")
     raise ValueError("remediation action not found or not unique")
+
+
+def _chain_for_action(
+    plan: PositionRemediationPlan,
+    *,
+    action_id: str,
+) -> PositionRemediationChain:
+    matches = [
+        chain
+        for chain in plan.chains
+        if any(
+            step.action is not None and step.action.action_id == action_id
+            for step in chain.steps
+        )
+    ]
+    if len(matches) != 1:
+        raise ValueError("remediation action chain not found or not unique")
+    return matches[0]
 
 
 def _project_canonical_remediation_candidate(
@@ -866,6 +1132,270 @@ def _candidate_decision(candidate: SignalCandidate) -> dict[str, Any]:
     }
 
 
+def _load_candidate_conflict_context(
+    *,
+    session,
+    candidate: SignalCandidate,
+    item: MessageInstructionItem | None,
+) -> tuple[StrategyLifecycle, ExecutionBinding] | None:
+    if candidate.target_lifecycle_id is not None:
+        lifecycle = session.get(
+            StrategyLifecycle,
+            int(candidate.target_lifecycle_id),
+        )
+        if lifecycle is not None and lifecycle.execution_binding_id is not None:
+            binding = session.get(
+                ExecutionBinding,
+                int(lifecycle.execution_binding_id),
+            )
+            if binding is not None and str(
+                binding.strategy_instance_id or ""
+            ).strip():
+                return lifecycle, binding
+    return _load_item_strategy_context(session=session, item=item)
+
+
+def _load_item_strategy_context(
+    *,
+    session,
+    item: MessageInstructionItem | None,
+) -> tuple[StrategyLifecycle, ExecutionBinding] | None:
+    strategy_instance_id = str(
+        item.strategy_instance_id if item is not None else ""
+    ).strip()
+    if not strategy_instance_id:
+        return None
+    bindings = (
+        session.query(ExecutionBinding)
+        .filter(
+            ExecutionBinding.strategy_instance_id == strategy_instance_id,
+            ExecutionBinding.venue == "deepcoin",
+        )
+        .all()
+    )
+    if len(bindings) != 1:
+        return None
+    binding = bindings[0]
+    lifecycles = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.execution_binding_id == binding.id)
+        .all()
+    )
+    if len(lifecycles) != 1:
+        return None
+    return lifecycles[0], binding
+
+
+def _candidate_item_strategy_conflict(
+    *,
+    session,
+    candidate: SignalCandidate,
+    item: MessageInstructionItem | None,
+) -> tuple[StrategyLifecycle, ExecutionBinding, str] | None:
+    item_context = _load_item_strategy_context(session=session, item=item)
+    if item_context is None or candidate.target_lifecycle_id is None:
+        return None
+    target_lifecycle = session.get(
+        StrategyLifecycle,
+        int(candidate.target_lifecycle_id),
+    )
+    if (
+        target_lifecycle is None
+        or target_lifecycle.execution_binding_id is None
+    ):
+        return None
+    target_binding = session.get(
+        ExecutionBinding,
+        int(target_lifecycle.execution_binding_id),
+    )
+    if target_binding is None:
+        return None
+    item_lifecycle, item_binding = item_context
+    target_strategy_instance_id = str(
+        target_binding.strategy_instance_id or ""
+    ).strip()
+    if (
+        not target_strategy_instance_id
+        or target_strategy_instance_id
+        == str(item_binding.strategy_instance_id)
+    ):
+        return None
+    return item_lifecycle, item_binding, target_strategy_instance_id
+
+
+def _candidate_action_kind(candidate: SignalCandidate) -> str:
+    if str(candidate.management_action or "").strip():
+        return str(candidate.management_action)
+    return "full_exit" if candidate.event_type == "close_signal" else "position_update"
+
+
+def _predecessor_signature(
+    *,
+    session,
+    strategy_instance_id: str,
+    current_raw_message: RawMessage,
+    current_candidate: SignalCandidate,
+    current_item: MessageInstructionItem | None,
+    current_effective_intent: str,
+    excluded_batch_id: int | None = None,
+) -> str:
+    current_key = (
+        current_raw_message.posted_at,
+        int(current_raw_message.id),
+        int(current_item.sequence) if current_item is not None else 0,
+        int(current_candidate.id),
+    )
+    rows = (
+        session.query(SignalCandidate, RawMessage)
+        .join(RawMessage, RawMessage.id == SignalCandidate.raw_message_id)
+        .filter(
+            SignalCandidate.parse_source == "mimo_authoritative",
+            SignalCandidate.review_status != "approved_remediation",
+            SignalCandidate.event_type.in_(("close_signal", "position_update")),
+        )
+        .all()
+    )
+    predecessors: list[dict[str, Any]] = []
+    for candidate, raw_message in rows:
+        item = (
+            session.query(MessageInstructionItem)
+            .filter(
+                MessageInstructionItem.signal_candidate_id == candidate.id,
+                MessageInstructionItem.retired_at.is_(None),
+            )
+            .one_or_none()
+        )
+        candidate_strategy_id = _candidate_strategy_instance_id(
+            session=session,
+            candidate=candidate,
+            item=item,
+        )
+        if candidate_strategy_id != strategy_instance_id:
+            continue
+        key = (
+            raw_message.posted_at,
+            int(raw_message.id),
+            int(item.sequence) if item is not None else 0,
+            int(candidate.id),
+        )
+        if key >= current_key:
+            continue
+        predecessors.append(
+            {
+                "key": key,
+                "instruction_item_id": int(item.id) if item is not None else None,
+                "status": item.status if item is not None else "missing",
+                "result_json": item.result_json if item is not None else None,
+                "error_json": item.error_json if item is not None else None,
+                "candidate_state": {
+                    "event_type": candidate.event_type,
+                    "target_lifecycle_id": candidate.target_lifecycle_id,
+                    "management_action": candidate.management_action,
+                    "management_fraction": candidate.management_fraction,
+                    "recognition_generation": candidate.recognition_generation,
+                },
+                "raw_text": raw_message.text,
+            }
+        )
+    predecessors.sort(key=lambda row: tuple(row["key"]))
+    batches = (
+        session.query(StrategyManagementBatch, RawMessage)
+        .join(RawMessage, RawMessage.id == StrategyManagementBatch.raw_message_id)
+        .filter(
+            StrategyManagementBatch.strategy_instance_id == strategy_instance_id
+        )
+        .all()
+    )
+    batch_state = []
+    for batch, raw_message in batches:
+        is_current_plan_only_batch = (
+            int(batch.raw_message_id) == int(current_raw_message.id)
+            and str(batch.intent) == current_effective_intent
+            and str(batch.execution_mode) == "disabled"
+            and str(batch.status) == "blocked"
+            and str(batch.reason_code) == "management_disabled_plan_only"
+        )
+        if (
+            excluded_batch_id is not None
+            and int(batch.id) == excluded_batch_id
+        ) or is_current_plan_only_batch:
+            continue
+        batch_state.append(
+            {
+                "id": int(batch.id),
+                "raw_message_id": int(batch.raw_message_id),
+                "raw_posted_at": raw_message.posted_at,
+                "recognition_generation": batch.recognition_generation,
+                "target_lifecycle_id": int(batch.target_lifecycle_id),
+                "intent": batch.intent,
+                "effective_action": batch.effective_action,
+                "status": batch.status,
+                "reason_code": batch.reason_code,
+                "updated_at": batch.updated_at,
+            }
+        )
+    batch_state.sort(key=lambda row: int(row["id"]))
+    current_state = {
+        "raw_message_id": int(current_raw_message.id),
+        "raw_posted_at": current_raw_message.posted_at,
+        "raw_text": current_raw_message.text,
+        "candidate_id": int(current_candidate.id),
+        "candidate_event_type": current_candidate.event_type,
+        "candidate_target_lifecycle_id": current_candidate.target_lifecycle_id,
+        "candidate_management_action": current_candidate.management_action,
+        "candidate_management_fraction": current_candidate.management_fraction,
+        "candidate_recognition_generation": current_candidate.recognition_generation,
+        "instruction_item_id": (
+            int(current_item.id) if current_item is not None else None
+        ),
+        "instruction_status": (
+            current_item.status if current_item is not None else "missing"
+        ),
+        "instruction_result_json": (
+            current_item.result_json if current_item is not None else None
+        ),
+        "instruction_error_json": (
+            current_item.error_json if current_item is not None else None
+        ),
+        "effective_intent": current_effective_intent,
+    }
+    return _fingerprint(
+        {
+            "current": current_state,
+            "predecessors": predecessors,
+            "batches": batch_state,
+        }
+    )
+
+
+def _candidate_strategy_instance_id(
+    *,
+    session,
+    candidate: SignalCandidate,
+    item: MessageInstructionItem | None,
+) -> str | None:
+    identity_conflict = _candidate_item_strategy_conflict(
+        session=session,
+        candidate=candidate,
+        item=item,
+    )
+    if identity_conflict is not None:
+        return str(identity_conflict[1].strategy_instance_id)
+    explicit_context = _load_candidate_conflict_context(
+        session=session,
+        candidate=candidate,
+        item=None,
+    )
+    if explicit_context is not None:
+        return str(explicit_context[1].strategy_instance_id)
+    item_strategy_id = str(
+        item.strategy_instance_id if item is not None else ""
+    ).strip()
+    if item_strategy_id:
+        return item_strategy_id
+    return None
+
+
 def _item_requires_remediation(item: MessageInstructionItem) -> bool:
     if item.status in {"failed", "unknown"}:
         return True
@@ -879,6 +1409,151 @@ def _item_requires_remediation(item: MessageInstructionItem) -> bool:
         "skipped",
         "shadow_planned",
     }
+
+
+def _batch_matches_candidate_action(
+    *,
+    batch: StrategyManagementBatch,
+    candidate: SignalCandidate,
+    directive_intent: str,
+    lifecycle_id: int,
+) -> bool:
+    generation = str(candidate.recognition_generation or "").strip()
+    if (
+        bool(generation)
+        and str(batch.recognition_generation) == generation
+        and str(batch.intent) == directive_intent
+    ):
+        return True
+    effective_intent = (
+        "full_exit" if directive_intent == "cancel_entry" else directive_intent
+    )
+    if str(batch.intent) != effective_intent:
+        return False
+    return _batch_remediation_action_id(batch) == _candidate_action_id(
+        candidate=candidate,
+        lifecycle_id=lifecycle_id,
+        action_kind=effective_intent,
+    )
+
+
+def _terminal_batch_resolves_candidate(
+    *,
+    batch: StrategyManagementBatch,
+    candidate: SignalCandidate,
+    directive_intent: str,
+    lifecycle_id: int,
+) -> bool:
+    return _batch_matches_candidate_action(
+        batch=batch,
+        candidate=candidate,
+        directive_intent=directive_intent,
+        lifecycle_id=lifecycle_id,
+    )
+
+
+def _batch_remediation_action_id(
+    batch: StrategyManagementBatch,
+) -> str | None:
+    try:
+        confirmation = json.loads(batch.target_snapshot_json).get(
+            "remediation_confirmation",
+            {},
+        )
+    except (TypeError, json.JSONDecodeError):
+        return None
+    action_id = str(confirmation.get("action_id") or "").strip()
+    return action_id or None
+
+
+def _candidate_action_id(
+    *,
+    candidate: SignalCandidate,
+    lifecycle_id: int,
+    action_kind: str,
+) -> str:
+    return _fingerprint(
+        {
+            "raw_message_id": candidate.raw_message_id,
+            "candidate_id": candidate.id,
+            "lifecycle_id": lifecycle_id,
+            "action_kind": action_kind,
+        }
+    )[:20]
+
+
+def _batch_candidate_association_is_unique(
+    *,
+    session,
+    candidate: SignalCandidate,
+) -> bool:
+    matching_ids = [
+        int(candidate_id)
+        for (candidate_id,) in (
+            session.query(SignalCandidate.id)
+            .filter(
+                SignalCandidate.raw_message_id == candidate.raw_message_id,
+                SignalCandidate.recognition_generation
+                == candidate.recognition_generation,
+                SignalCandidate.target_lifecycle_id
+                == candidate.target_lifecycle_id,
+                SignalCandidate.parse_source == "mimo_authoritative",
+                SignalCandidate.review_status != "approved_remediation",
+            )
+            .all()
+        )
+    ]
+    return matching_ids == [int(candidate.id)]
+
+
+def _entry_positions_match_exact_live_identity(
+    *,
+    binding: ExecutionBinding,
+    entry_legs: list[ExecutionOrderLeg],
+    live_rows: list[dict[str, Any]],
+) -> bool:
+    leg_pos_ids = [str(leg.pos_id or "").strip() for leg in entry_legs]
+    if not leg_pos_ids or any(not value for value in leg_pos_ids):
+        return False
+    binding_pos_ids = {
+        value.strip()
+        for value in str(binding.pos_id or "").replace(";", ",").split(",")
+        if value.strip()
+    }
+    if binding_pos_ids != set(leg_pos_ids):
+        return False
+    expected_instrument = f"{str(binding.symbol).upper()}-USDT-SWAP"
+    expected_side = _normalize_position_side(binding.side)
+    if expected_side is None:
+        return False
+    for pos_id in leg_pos_ids:
+        matches = [
+            row
+            for row in live_rows
+            if _first_text(row, "posId", "pos_id", "id") == pos_id
+        ]
+        if len(matches) != 1:
+            return False
+        row = matches[0]
+        if (
+            str(_first_text(row, "instId", "inst_id", "instrument_id") or "").upper()
+            != expected_instrument
+            or _normalize_position_side(
+                _first_text(row, "posSide", "pos_side", "side")
+            )
+            != expected_side
+        ):
+            return False
+    return True
+
+
+def _normalize_position_side(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"long", "buy"}:
+        return "long"
+    if normalized in {"short", "sell"}:
+        return "short"
+    return None
 
 
 def _snapshot_payload(snapshot) -> dict[str, Any]:
