@@ -902,13 +902,27 @@ def _ready_verified_trigger_take_profit_convergences(
         .filter(TriggerTakeProfitConvergence.execution_order_leg_id.in_(leg_ids))
         .filter(
             TriggerTakeProfitConvergence.status.in_(
-                ("waiting_position", "waiting_backup_stop", "ready")
+                (
+                    "waiting_position",
+                    "waiting_backup_stop",
+                    "ready",
+                    "conflicted",
+                )
             )
         )
         .order_by(TriggerTakeProfitConvergence.id.asc())
         .all()
     )
     for row in rows:
+        # Earlier releases treated a full-position (``sz=0``) primary stop as
+        # missing and terminalized the convergence.  That is now a verified
+        # native stop shape, so only this precise historical reason may be
+        # re-evaluated.  All other conflicts stay fail-closed.
+        if (
+            str(row.status) == "conflicted"
+            and str(row.reason_code) != "convergence_verified_stop_missing"
+        ):
+            continue
         leg = next((item for item in legs if int(item.id) == int(row.execution_order_leg_id)), None)
         if leg is None or _trigger_leg_child_fill_incomplete(leg, snapshot=snapshot):
             continue
@@ -945,6 +959,9 @@ def _ready_verified_trigger_take_profit_convergences(
             row.reason_code = "convergence_waiting_backup_stop"
             row.updated_at = recovered_at
             continue
+        if str(row.status) == "conflicted":
+            row.status = "waiting_backup_stop"
+            row.reason_code = "convergence_waiting_backup_stop"
         mark_trigger_take_profit_convergence_ready(session, row, ready_at=recovered_at)
 
 
