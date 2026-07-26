@@ -23,6 +23,8 @@ from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionAttributionAudit
 from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.models import StrategyManagementBatch
+from telegram_kol_research.models import StrategyManagementLeg
 from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.protection_snapshot import (
     observe_pending_tpsl,
@@ -49,6 +51,17 @@ from telegram_kol_research.position_authority_lock import (
 )
 
 PENDING_ENTRY_RECOVERY_WINDOW_HOURS = 3
+_MANAGEMENT_POSITION_RESERVATION_STATUSES = frozenset(
+    {
+        "executing",
+        "reserved",
+        "submitted",
+        "submit_unknown",
+        "reconciling",
+        "partial_failed",
+        "recovery_required",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -629,6 +642,7 @@ def _apply_reconcile_snapshot(
                 .all()
             )
         }
+        reserved_pos_ids.update(_active_management_reserved_pos_ids(session))
 
         if snapshot.errors:
             result.protection_snapshot_unavailable = _trigger_protection_exposure_count(
@@ -2467,6 +2481,9 @@ def sync_manual_closed_deepcoin_positions(
     }
     result = ManualCloseSyncResult()
     with session_factory() as session:
+        management_reserved_pos_ids = _active_management_reserved_pos_ids(
+            session
+        )
         rows = (
             session.query(ExecutionBinding)
             .filter(ExecutionBinding.venue == "deepcoin")
@@ -2481,6 +2498,8 @@ def sync_manual_closed_deepcoin_positions(
             pos_ids = _split_ids(row.pos_id) or _entry_leg_position_ids(entry_legs)
             if not pos_ids:
                 result.skipped_without_pos_id += 1
+                continue
+            if any(pos_id in management_reserved_pos_ids for pos_id in pos_ids):
                 continue
             result.checked += 1
             if str(row.status or "") == "unknown" and not entry_legs:
@@ -2552,6 +2571,27 @@ def sync_manual_closed_deepcoin_positions(
                         trade_idea.closed_at = now
         session.commit()
     return result
+
+
+def _active_management_reserved_pos_ids(session) -> set[str]:
+    return {
+        str(pos_id)
+        for (pos_id,) in (
+            session.query(StrategyManagementLeg.pos_id)
+            .join(
+                StrategyManagementBatch,
+                StrategyManagementBatch.id
+                == StrategyManagementLeg.management_batch_id,
+            )
+            .filter(
+                StrategyManagementBatch.status.in_(
+                    _MANAGEMENT_POSITION_RESERVATION_STATUSES
+                )
+            )
+            .all()
+        )
+        if str(pos_id or "").strip()
+    }
 
 
 def _entry_legs_for_binding(

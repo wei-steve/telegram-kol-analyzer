@@ -396,6 +396,12 @@ def _identity_is_exact(session, batch, legs) -> bool:
         if row_identity in managed_identity:
             continue
         if (
+            row.pos_id
+            and str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+            and row.terminal_reason is not None
+        ):
+            continue
+        if (
             batch.effective_action not in {"full_close", "full_exit"}
             and not row.pos_id
             and str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES

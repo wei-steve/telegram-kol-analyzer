@@ -9,6 +9,7 @@ import pytest
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
     reconcile_deepcoin_execution_bindings,
+    sync_manual_closed_deepcoin_positions,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -470,6 +471,85 @@ def test_full_close_terminalizes_only_after_every_exact_position_disappears(tmp_
     assert lifecycle.exited_at.replace(tzinfo=UTC) == NOW
     assert all(entry.status == "closed" for entry in entries)
     assert all(entry.terminal_reason == "management_full_close_confirmed" for entry in entries)
+
+
+def test_full_close_ignores_prior_terminal_entry_leg_and_wins_reconcile_race(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(
+        sf,
+        action="full_close",
+        sizes=("2",),
+        preflight=("2",),
+    )
+    with sf() as session:
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=batch.execution_binding_id,
+                strategy_instance_id=batch.strategy_instance_id,
+                leg_index=99,
+                purpose="entry",
+                order_kind="market",
+                order_id="historical-entry",
+                pos_id="historical-pos",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="closed",
+                terminal_reason="position_closed",
+            )
+        )
+        session.commit()
+
+    _reconcile(sf, _Client(positions=[]))
+
+    stored = load_management_batch(sf, batch.id)
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+
+    assert stored.status == "succeeded"
+    assert stored.legs[0].status == "confirmed"
+    assert binding.status == "closed"
+    assert binding.last_exchange_status == "management_full_close_confirmed"
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "kol_signal"
+
+
+def test_manual_close_sync_defers_to_active_management_batch(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(
+        sf,
+        action="full_close",
+        sizes=("2",),
+        preflight=("2",),
+    )
+    client = _Client(positions=[])
+
+    sync_manual_closed_deepcoin_positions(
+        sf,
+        client=client,
+        synced_at=NOW,
+    )
+
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+        entry = session.get(
+            ExecutionOrderLeg,
+            batch.legs[0].execution_order_leg_id,
+        )
+        assert binding.status == "active"
+        assert lifecycle.lifecycle_status == "entered"
+        assert entry.status == "active"
+        assert entry.terminal_reason is None
+
+    result = _reconcile_management(sf, positions=[])
+    stored = load_management_batch(sf, batch.id)
+
+    assert result.succeeded == 1
+    assert stored.status == "succeeded"
+    assert stored.legs[0].status == "confirmed"
 
 
 def test_full_close_reconciliation_accepts_only_snapshotted_management_cancelled_deferred_entry(
