@@ -1,9 +1,12 @@
 import pytest
 
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg
 from telegram_kol_research.position_mutation_authority import (
     PositionMutationAuthority,
     PositionMutationAuthorityError,
     ProtectionOrderOwner,
+    build_position_mutation_authority,
     require_order_owned_by_authority,
 )
 
@@ -95,3 +98,74 @@ def test_exact_owner_is_accepted():
         authority=_authority(),
         owner=_owner(),
     )
+
+
+def test_authority_builder_requires_authoritative_live_entry_leg(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="strategy-other",
+            kol_id="other",
+            chat_id=-1002,
+            message_id=1466,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            margin_mode="cross",
+            position_mode="split",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id="strategy-other",
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            pos_id="pos-other",
+            venue="deepcoin",
+            attribution_status="verified",
+            response_json='{"data":{"posId":"pos-other"}}',
+            status="active",
+        )
+        session.add(leg)
+        session.commit()
+
+        authority = build_position_mutation_authority(
+            session,
+            venue="deepcoin",
+            pos_id="pos-other",
+            live_position={
+                "posId": "pos-other",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "pos": "2",
+                "avgPx": "63900",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
+            },
+        )
+
+        assert authority.execution_binding_id == binding.id
+        assert authority.execution_order_leg_id == leg.id
+        assert authority.position_fingerprint
+
+        with pytest.raises(
+            PositionMutationAuthorityError,
+            match="target_live_position_size_invalid",
+        ):
+            build_position_mutation_authority(
+                session,
+                venue="deepcoin",
+                pos_id="pos-other",
+                live_position={
+                    "posId": "pos-other",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "",
+                    "avgPx": "63900",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                },
+            )

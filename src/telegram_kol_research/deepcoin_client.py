@@ -260,10 +260,22 @@ class DeepcoinRestClient:
         return self._request("POST", DEEPCOIN_TRIGGER_ORDER_PATH, order_payload)
 
     def set_position_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
+        """Compatibility wrapper; new callers must use PositionMutationGateway."""
+        return self._set_position_sltp_unchecked(protection_payload)
+
+    def _set_position_sltp_unchecked(
+        self, protection_payload: dict[str, Any]
+    ) -> dict[str, Any]:
         self._tpsl_rate_limiter.acquire()
         return self._request("POST", DEEPCOIN_SET_POSITION_SLTP_PATH, protection_payload)
 
     def cancel_position_sltp(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
+        """Compatibility wrapper; new callers must use PositionMutationGateway."""
+        return self._cancel_position_sltp_unchecked(cancel_payload)
+
+    def _cancel_position_sltp_unchecked(
+        self, cancel_payload: dict[str, Any]
+    ) -> dict[str, Any]:
         required = {"instType", "instId", "ordId"}
         if any(cancel_payload.get(key) in (None, "") for key in required):
             raise DeepcoinClientError(
@@ -272,6 +284,16 @@ class DeepcoinRestClient:
         payload = {key: cancel_payload[key] for key in ("instType", "instId", "ordId")}
         self._tpsl_rate_limiter.acquire()
         return self._request("POST", DEEPCOIN_CANCEL_POSITION_SLTP_PATH, payload)
+
+    def _place_position_close_unchecked(
+        self, close_payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        required = {"instId", "closePosId", "ordType", "sz"}
+        if any(close_payload.get(key) in (None, "") for key in required):
+            raise DeepcoinClientError(
+                "position close requires instId, closePosId, ordType, and sz"
+            )
+        return self._request("POST", DEEPCOIN_PLACE_ORDER_PATH, close_payload)
 
     def replace_order_sltp(self, protection_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_REPLACE_ORDER_SLTP_PATH, protection_payload)

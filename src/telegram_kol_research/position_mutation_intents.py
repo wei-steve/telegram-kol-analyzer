@@ -69,6 +69,25 @@ def reserve_position_mutation_intent(
                     "position_mutation_intent_conflict"
                 )
             return existing
+        if order_id:
+            existing_write = (
+                session.query(PositionMutationIntent)
+                .filter(
+                    PositionMutationIntent.venue
+                    == str(venue or "deepcoin").lower(),
+                    PositionMutationIntent.operation == operation,
+                    PositionMutationIntent.order_id == order_id,
+                    PositionMutationIntent.request_fingerprint
+                    == request_fingerprint,
+                )
+                .one_or_none()
+            )
+            if existing_write is not None:
+                if _intent_identity(existing_write) != identity:
+                    raise PositionMutationIntentError(
+                        "position_mutation_intent_conflict"
+                    )
+                return existing_write
         row = PositionMutationIntent(
             idempotency_key=idempotency_key,
             venue=str(venue or "deepcoin").lower(),
@@ -98,9 +117,28 @@ def reserve_position_mutation_intent(
             session.rollback()
             existing = (
                 session.query(PositionMutationIntent)
-                .filter(PositionMutationIntent.idempotency_key == idempotency_key)
-                .one()
+                .filter(
+                    (
+                        PositionMutationIntent.idempotency_key
+                        == idempotency_key
+                    )
+                    | (
+                        (
+                            PositionMutationIntent.venue
+                            == str(venue or "deepcoin").lower()
+                        )
+                        & (PositionMutationIntent.operation == operation)
+                        & (PositionMutationIntent.order_id == order_id)
+                        & (
+                            PositionMutationIntent.request_fingerprint
+                            == request_fingerprint
+                        )
+                    )
+                )
+                .first()
             )
+            if existing is None:
+                raise
             if _intent_identity(existing) != identity:
                 raise PositionMutationIntentError(
                     "position_mutation_intent_conflict"
@@ -128,7 +166,7 @@ def transition_position_mutation_intent(
         PositionMutationIntent.status: new_status,
         PositionMutationIntent.updated_at: transitioned_at,
     }
-    if new_status in {"submitted", "confirmed"}:
+    if new_status == "submitted":
         values[PositionMutationIntent.submitted_at] = transitioned_at
     if new_status == "confirmed":
         values[PositionMutationIntent.confirmed_at] = transitioned_at

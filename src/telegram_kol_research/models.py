@@ -1153,6 +1153,15 @@ class PositionMutationIntent(Base):
             unique=True,
         ),
         Index(
+            "uq_position_mutation_intents_exchange_cancel",
+            "venue",
+            "operation",
+            "order_id",
+            "request_fingerprint",
+            unique=True,
+            sqlite_where=text("order_id IS NOT NULL AND order_id != ''"),
+        ),
+        Index(
             "ix_position_mutation_intents_status_updated",
             "status",
             "updated_at",

@@ -252,6 +252,46 @@ def test_cancel_position_sltp_rejects_nested_business_error():
         )
 
 
+def test_unchecked_position_write_adapter_methods_use_exact_endpoints():
+    http_client = _CapturingHttpClient(
+        {"code": "0", "data": [{"ordId": "write-1", "sCode": "0"}]}
+    )
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+    )
+
+    client._set_position_sltp_unchecked(
+        {
+            "instType": "SWAP",
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-1",
+            "slTriggerPx": "62000",
+        }
+    )
+    client._cancel_position_sltp_unchecked(
+        {
+            "instType": "SWAP",
+            "instId": "BTC-USDT-SWAP",
+            "ordId": "stop-1",
+        }
+    )
+    client._place_position_close_unchecked(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "closePosId": "pos-1",
+            "ordType": "market",
+            "sz": "1",
+        }
+    )
+
+    assert [row["request_path"] for row in http_client.requests] == [
+        "/deepcoin/trade/set-position-sltp",
+        "/deepcoin/trade/cancel-position-sltp",
+        "/deepcoin/trade/order",
+    ]
+
+
 def test_two_clients_share_one_injected_tpsl_credential_limiter():
     clock = _FakeMonotonicClock(0.0)
     limiter = DeepcoinTpslWriteLimiter(

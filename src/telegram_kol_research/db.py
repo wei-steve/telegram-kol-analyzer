@@ -430,6 +430,13 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
         "ix_trigger_protection_intents_recovery_next_attempt "
         "ON trigger_protection_intents (recovery_state, next_attempt_at)"
     ),
+    "uq_position_mutation_intents_exchange_cancel": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_position_mutation_intents_exchange_cancel "
+        "ON position_mutation_intents "
+        "(venue, operation, order_id, request_fingerprint) "
+        "WHERE order_id IS NOT NULL AND order_id != ''"
+    ),
 }
 
 

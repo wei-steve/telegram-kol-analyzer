@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -118,6 +118,35 @@ def test_reservation_rejects_idempotency_conflict(tmp_path):
         )
 
 
+def test_same_exchange_cancellation_is_deduplicated_across_idempotency_keys(
+    tmp_path,
+):
+    session_factory, binding_id, leg_id = _session_factory(tmp_path)
+    common = {
+        "session_factory": session_factory,
+        "operation": "cancel_position_sltp",
+        "strategy_instance_id": "strategy-1",
+        "execution_binding_id": binding_id,
+        "execution_order_leg_id": leg_id,
+        "pos_id": "pos-1",
+        "order_id": "ord-1",
+        "authority_fingerprint": "authority-fp",
+        "request_fingerprint": "request-fp",
+        "request": {"instId": "BTC-USDT-SWAP", "ordId": "ord-1"},
+        "reserved_at": NOW,
+    }
+    first = reserve_position_mutation_intent(
+        idempotency_key="management:1:cancel:ord-1",
+        **common,
+    )
+    second = reserve_position_mutation_intent(
+        idempotency_key="recovery:99:cancel:ord-1",
+        **common,
+    )
+
+    assert second.id == first.id
+
+
 def test_transition_is_compare_and_set(tmp_path):
     session_factory, binding_id, leg_id = _session_factory(tmp_path)
     intent = reserve_position_mutation_intent(
@@ -149,3 +178,42 @@ def test_transition_is_compare_and_set(tmp_path):
         new_status="submitted",
         transitioned_at=NOW,
     )
+
+
+def test_confirmation_preserves_original_submission_time(tmp_path):
+    session_factory, binding_id, leg_id = _session_factory(tmp_path)
+    intent = reserve_position_mutation_intent(
+        session_factory,
+        idempotency_key="management:1:1:set:stop:confirm",
+        operation="set_position_sltp",
+        strategy_instance_id="strategy-1",
+        execution_binding_id=binding_id,
+        execution_order_leg_id=leg_id,
+        pos_id="pos-1",
+        order_id=None,
+        authority_fingerprint="authority-fp",
+        request_fingerprint="request-fp-confirm",
+        request={"posId": "pos-1", "slTriggerPx": "63895.725"},
+        reserved_at=NOW,
+    )
+    submitted_at = NOW + timedelta(seconds=1)
+    confirmed_at = NOW + timedelta(seconds=5)
+    assert transition_position_mutation_intent(
+        session_factory,
+        intent.id,
+        expected_statuses={"reserved"},
+        new_status="submitted",
+        transitioned_at=submitted_at,
+    )
+    assert transition_position_mutation_intent(
+        session_factory,
+        intent.id,
+        expected_statuses={"submitted"},
+        new_status="confirmed",
+        transitioned_at=confirmed_at,
+    )
+
+    with session_factory() as session:
+        stored = session.get(PositionMutationIntent, intent.id)
+        assert stored.submitted_at == submitted_at.replace(tzinfo=None)
+        assert stored.confirmed_at == confirmed_at.replace(tzinfo=None)
