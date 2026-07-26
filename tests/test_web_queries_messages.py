@@ -14,6 +14,7 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.web_queries import (
     _build_message_decision_card,
+    load_group_message_page,
     load_group_messages,
     load_messages_in_time_window,
 )
@@ -162,6 +163,99 @@ def test_load_group_messages_can_filter_by_text_and_sender(tmp_path):
 
     assert len(rows) == 1
     assert rows[0]["text"] == "BTC long"
+
+
+def test_load_group_message_page_returns_twenty_rows_and_has_more(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(
+                    chat_id=88,
+                    message_id=message_id,
+                    text=f"message {message_id}",
+                )
+                for message_id in range(1, 22)
+            ]
+        )
+        session.commit()
+
+    messages, has_more = load_group_message_page(
+        session_factory,
+        chat_id=88,
+        page_size=20,
+    )
+
+    assert len(messages) == 20
+    assert [message["message_id"] for message in messages] == list(range(21, 1, -1))
+    assert has_more is True
+
+
+@pytest.mark.parametrize("message_count", [19, 20])
+def test_load_group_message_page_omits_has_more_on_final_page(
+    tmp_path,
+    message_count,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(
+                    chat_id=88,
+                    message_id=message_id,
+                    text=f"message {message_id}",
+                )
+                for message_id in range(1, message_count + 1)
+            ]
+        )
+        session.commit()
+
+    messages, has_more = load_group_message_page(
+        session_factory,
+        chat_id=88,
+        page_size=20,
+    )
+
+    assert len(messages) == message_count
+    assert has_more is False
+
+
+def test_load_group_message_page_applies_cursor_and_filters_before_has_more(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(chat_id=88, message_id=1, sender_name="Alice", text="BTC 1"),
+                RawMessage(chat_id=88, message_id=2, sender_name="Alice", text="BTC 2"),
+                RawMessage(chat_id=88, message_id=3, sender_name="Alice", text="BTC 3"),
+                RawMessage(chat_id=88, message_id=4, sender_name="Bob", text="BTC 4"),
+                RawMessage(chat_id=88, message_id=5, sender_name="Alice", text="ETH 5"),
+                RawMessage(chat_id=88, message_id=6, sender_name="Alice", text="BTC 6"),
+            ]
+        )
+        session.commit()
+
+    first_page, first_has_more = load_group_message_page(
+        session_factory,
+        chat_id=88,
+        page_size=2,
+        before_message_id=6,
+        search_text="BTC",
+        sender_name="Alice",
+    )
+    final_page, final_has_more = load_group_message_page(
+        session_factory,
+        chat_id=88,
+        page_size=2,
+        before_message_id=3,
+        search_text="BTC",
+        sender_name="Alice",
+    )
+
+    assert [message["message_id"] for message in first_page] == [3, 2]
+    assert first_has_more is True
+    assert [message["message_id"] for message in final_page] == [2, 1]
+    assert final_has_more is False
 
 
 def test_load_messages_in_time_window_normalizes_aware_local_bounds_to_utc(tmp_path):

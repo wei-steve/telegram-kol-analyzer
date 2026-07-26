@@ -278,6 +278,31 @@ def load_database_freshness(
     }
 
 
+def _group_messages_query(
+    session,
+    *,
+    chat_id: int,
+    before_message_id: int | None = None,
+    search_text: str | None = None,
+    sender_name: str | None = None,
+):
+    query = session.query(RawMessage).filter(RawMessage.chat_id == chat_id)
+    if before_message_id is not None:
+        query = query.filter(RawMessage.message_id < before_message_id)
+    if search_text:
+        search_value = f"%{search_text.strip()}%"
+        query = query.filter(
+            or_(
+                RawMessage.text.ilike(search_value),
+                RawMessage.sender_name.ilike(search_value),
+            )
+        )
+    if sender_name:
+        sender_value = f"%{sender_name.strip()}%"
+        query = query.filter(RawMessage.sender_name.ilike(sender_value))
+    return query.order_by(RawMessage.posted_at.desc(), RawMessage.message_id.desc())
+
+
 def load_group_messages(
     session_factory: sessionmaker,
     *,
@@ -290,28 +315,46 @@ def load_group_messages(
     """Load message timeline rows for a single group."""
 
     with session_factory() as session:
-        query = session.query(RawMessage).filter(RawMessage.chat_id == chat_id)
-        if before_message_id is not None:
-            query = query.filter(RawMessage.message_id < before_message_id)
-        if search_text:
-            search_value = f"%{search_text.strip()}%"
-            query = query.filter(
-                or_(
-                    RawMessage.text.ilike(search_value),
-                    RawMessage.sender_name.ilike(search_value),
-                )
-            )
-        if sender_name:
-            sender_value = f"%{sender_name.strip()}%"
-            query = query.filter(RawMessage.sender_name.ilike(sender_value))
-
         raw_messages = (
-            query.order_by(RawMessage.posted_at.desc(), RawMessage.message_id.desc())
+            _group_messages_query(
+                session,
+                chat_id=chat_id,
+                before_message_id=before_message_id,
+                search_text=search_text,
+                sender_name=sender_name,
+            )
             .limit(limit)
             .all()
         )
 
         return _serialize_raw_messages(session, raw_messages)
+
+
+def load_group_message_page(
+    session_factory: sessionmaker,
+    *,
+    chat_id: int,
+    page_size: int,
+    before_message_id: int | None = None,
+    search_text: str | None = None,
+    sender_name: str | None = None,
+) -> tuple[list[dict[str, object | None]], bool]:
+    """Load one message page and report whether an older matching page exists."""
+
+    with session_factory() as session:
+        raw_messages = (
+            _group_messages_query(
+                session,
+                chat_id=chat_id,
+                before_message_id=before_message_id,
+                search_text=search_text,
+                sender_name=sender_name,
+            )
+            .limit(page_size + 1)
+            .all()
+        )
+        has_more = len(raw_messages) > page_size
+        return _serialize_raw_messages(session, raw_messages[:page_size]), has_more
 
 
 def load_selected_messages(
