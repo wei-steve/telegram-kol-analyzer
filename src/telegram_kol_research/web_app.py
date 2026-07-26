@@ -1021,17 +1021,20 @@ def _load_deepcoin_live_position_rows(
         rows: list[dict[str, object]] = []
         for position in active_positions:
             pos_id = _first_position_string(position, "posId", "pos_id", "id")
+            exchange_protection_orders = direct_protection_rows.get(pos_id or "", [])
+            position_side = _normalize_deepcoin_position_side(
+                position.get("posSide") or position.get("side")
+            )
+            (
+                exchange_stop_loss,
+                exchange_backup_stop,
+                exchange_take_profits,
+            ) = _summarize_verified_exchange_protection_rows(
+                exchange_protection_orders, side=position_side
+            )
             protection = protection_match.by_pos_id.get(pos_id or "")
-            stop_loss_value = (
-                protection.stop_loss
-                if protection is not None
-                else None
-            )
-            take_profit_values = (
-                protection.take_profits
-                if protection is not None
-                else []
-            )
+            stop_loss_value = exchange_stop_loss
+            take_profit_values = exchange_take_profits
             take_profit_value = take_profit_values[0] if take_profit_values else None
             has_protection = stop_loss_value is not None or take_profit_value is not None
             protection_status = protection.status if protection is not None else "absent"
@@ -1055,28 +1058,6 @@ def _load_deepcoin_live_position_rows(
                 else "unassigned"
             )
             ownership_verified = ownership_state == "verified"
-            backup_stop = (
-                backup_by_leg_id.get(int(ownership_leg.id))
-                if ownership_verified and ownership_leg is not None and ownership_leg.id is not None
-                else None
-            )
-            backup_stop_audit = (
-                build_position_protection_audit(
-                    position=position,
-                    protection_ledger=[],
-                    backup_stops=[backup_stop],
-                    take_profit_orders=[],
-                    pending_trigger_orders=tpsl_orders,
-                    open_positions=active_positions,
-                )["backup_stop"]
-                if backup_stop is not None and tpsl_evidence_available
-                else None
-            )
-            backup_stop_verified = bool(
-                backup_stop_audit is not None
-                and backup_stop_audit["protocol"] == "native"
-                and backup_stop_audit["verification_status"] == "verified"
-            )
             binding = (
                 bindings_by_id.get(int(ownership_leg.execution_binding_id))
                 if ownership_leg is not None
@@ -1126,32 +1107,12 @@ def _load_deepcoin_live_position_rows(
                     "entry_price_actual": _float_or_none(position.get("avgPx")),
                     "stop_loss_text": _position_text_value(stop_loss_value),
                     "stop_loss_state_text": stop_loss_state_text,
-                    "backup_stop_text": (
-                        _position_text_value(backup_stop.trigger_price)
-                        if backup_stop_verified
-                        else None
-                    ),
-                    "backup_stop_status": (
-                        str(backup_stop.status) if backup_stop_verified else "not_created"
-                    ),
-                    "backup_stop_state_text": (
-                        "交易所未验证（旧通用条件单）"
-                        if backup_stop_audit is not None
-                        and backup_stop_audit["verification_status"] == "unverified_exchange"
-                        else "第二止损证据暂不可用"
-                        if backup_stop is not None and not tpsl_evidence_available
-                        else "第二止损交易所未验证"
-                        if backup_stop is not None
-                        else "第二止损未创建"
-                        if ownership_verified
-                        else None
-                    ),
+                    "backup_stop_text": exchange_backup_stop,
+                    "backup_stop_state_text": "第二止损未设置" if ownership_verified else None,
                     "take_profit_text": "/".join(
                         _position_text_value(value) or "" for value in take_profit_values
                     ) or None,
-                    "exchange_protection_orders": (
-                        direct_protection_rows.get(pos_id or "", [])
-                    ),
+                    "exchange_protection_orders": exchange_protection_orders,
                     "protection_status": (
                         "protected"
                         if protection_status == "verified" and has_protection
@@ -2389,6 +2350,38 @@ def _split_exchange_protection_display_rows(
             for pos_id, rows in display.by_pos_id.items()
         },
         [row.as_dict() for row in display.unattributed],
+    )
+
+
+def _summarize_verified_exchange_protection_rows(
+    rows: list[dict[str, str]], *, side: str | None
+) -> tuple[str | None, str | None, tuple[str, ...]]:
+    """Project exact-position verified TPSL rows into the compact summary."""
+
+    prices_by_kind = {"stop_loss": [], "take_profit": []}
+    for row in rows:
+        if str(row.get("ownership_state") or "") != "已验证归属":
+            continue
+        kind = str(row.get("kind") or "")
+        price = _position_text_value(row.get("trigger_price_text"))
+        if kind not in prices_by_kind or price is None:
+            continue
+        try:
+            float(price)
+        except ValueError:
+            continue
+        if price not in prices_by_kind[kind]:
+            prices_by_kind[kind].append(price)
+
+    is_long = str(side or "").lower() == "long"
+    ordered_stops = sorted(prices_by_kind["stop_loss"], key=float, reverse=is_long)
+    ordered_take_profits = sorted(
+        prices_by_kind["take_profit"], key=float, reverse=not is_long
+    )
+    return (
+        ordered_stops[0] if ordered_stops else None,
+        ordered_stops[1] if len(ordered_stops) > 1 else None,
+        tuple(ordered_take_profits),
     )
 
 

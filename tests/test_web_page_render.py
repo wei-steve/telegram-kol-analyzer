@@ -1588,6 +1588,88 @@ def test_positions_panel_renders_all_exchange_protection_orders(tmp_path):
     assert "order legacy-stop-1" in response.text
 
 
+def test_positions_panel_summary_uses_ordered_verified_exchange_protection(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-summary-1",
+                    "posSide": "long",
+                    "pos": "3",
+                    "avgPx": "63894.1",
+                }
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return [
+                {
+                    "ordId": "tp-high",
+                    "triggerOrderType": "TPSL",
+                    "posId": "pos-summary-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "tpTriggerPx": "70300",
+                },
+                {
+                    "ordId": "stop-secondary",
+                    "triggerOrderType": "TPSL",
+                    "posId": "pos-summary-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "slTriggerPx": "60878",
+                },
+                {
+                    "ordId": "tp-low",
+                    "triggerOrderType": "TPSL",
+                    "posId": "pos-summary-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "tpTriggerPx": "67100",
+                },
+                {
+                    "ordId": "stop-primary",
+                    "triggerOrderType": "TPSL",
+                    "posId": "pos-summary-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "slTriggerPx": "61000",
+                },
+                {
+                    "ordId": "tp-middle",
+                    "triggerOrderType": "TPSL",
+                    "posId": "pos-summary-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "tpTriggerPx": "68500",
+                },
+            ]
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+        def list_position_history(self, *, inst_id=None):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=FakeDeepcoinClient,
+        )
+    ).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "<dt>止损</dt><dd>61000</dd>" in response.text
+    assert "<dt>第二止损</dt><dd>60878</dd>" in response.text
+    assert "<dt>止盈</dt><dd>67100/68500/70300</dd>" in response.text
+
+
 def test_positions_panel_keeps_available_protection_when_another_instrument_fails(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self, *, inst_id=None):
