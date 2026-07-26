@@ -33,3 +33,13 @@ live execution.
 - Run the focused remediation and management test suites.
 - Deploy through the reviewed Git branch, rerun a production dry-run, and apply
   each approved action with a freshly generated fingerprint.
+
+## Composite reconciliation follow-up
+
+Production execution exposed a second fail-closed mismatch: a
+`partial_then_break_even` batch cancels its snapshotted deferred entry before
+submitting the reduction, but reconciliation accepted that durable cancelled
+identity only for full exits. Reconciliation must accept the same exact,
+snapshotted, management-cancelled deferred entry for the composite action. It
+must continue rejecting unsnapshotted, operator-cancelled, malformed, or
+cross-strategy deferred identities.

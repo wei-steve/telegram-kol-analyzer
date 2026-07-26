@@ -619,14 +619,17 @@ def _identity_is_exact(session, batch, legs) -> bool:
             batch.effective_action not in {"full_close", "full_exit"}
             and not row.pos_id
             and str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+            and int(row.id) not in deferred_leg_ids
         ):
             continue
         if int(row.id) in deferred_leg_ids:
-            if batch.effective_action in {"full_close", "full_exit"}:
-                if _is_management_cancelled_deferred_entry_leg(row):
-                    accepted_deferred_ids.add(int(row.id))
-                    continue
-            elif _is_deferred_pending_entry_leg(row):
+            if _is_management_cancelled_deferred_entry_leg(row):
+                accepted_deferred_ids.add(int(row.id))
+                continue
+            if (
+                batch.effective_action not in {"full_close", "full_exit"}
+                and _is_deferred_pending_entry_leg(row)
+            ):
                 accepted_deferred_ids.add(int(row.id))
                 continue
         return False

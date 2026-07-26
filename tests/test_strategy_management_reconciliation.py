@@ -553,6 +553,54 @@ def test_planned_deferred_range_entry_leg_allows_partial_then_break_even_handoff
     assert stored.legs[0].status == "confirmed"
 
 
+def test_management_cancelled_deferred_entry_allows_partial_then_break_even_handoff(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(
+        sf,
+        action="partial_then_break_even",
+        sizes=("1",),
+        preflight=("2",),
+    )
+    with sf() as session:
+        deferred = ExecutionOrderLeg(
+            execution_binding_id=batch.execution_binding_id,
+            strategy_instance_id=batch.strategy_instance_id,
+            leg_index=2,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="entry-cancelled-by-management",
+            pos_id=None,
+            venue="deepcoin",
+            attribution_status="unassigned",
+            status="cancelled",
+            terminal_reason="management_full_close_cancelled_unfilled_entry_leg",
+            last_verified_at=NOW,
+        )
+        session.add(deferred)
+        session.flush()
+        row = session.get(StrategyManagementBatch, batch.id)
+        row.target_snapshot_json = json.dumps(
+            {
+                "identity": {
+                    "execution_binding_id": batch.execution_binding_id,
+                    "deferred_entry_leg_ids": [deferred.id],
+                }
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        session.commit()
+
+    _reconcile_management(sf, positions=[_position("pos-1", "1")])
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "protection_ready"
+    assert stored.reason_code == "management_close_confirmed_protection_ready"
+    assert stored.legs[0].status == "confirmed"
+
+
 def test_definite_failure_is_preserved_when_other_leg_confirms(tmp_path):
     sf = create_session_factory(tmp_path / "research.db")
     batch = _persist_batch(sf, sizes=("1", "1"), preflight=("2", "2"))
