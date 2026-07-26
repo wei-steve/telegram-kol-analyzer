@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.deepcoin_contract_specs import StaticDeepcoinContractSpecProvider
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import MediaAsset
@@ -1587,6 +1589,135 @@ def test_positions_panel_renders_all_exchange_protection_orders(tmp_path):
     assert "无法归属" in response.text
     assert "order combined-1" in response.text
     assert "order legacy-stop-1" in response.text
+
+
+def test_positions_panel_renders_full_position_tpsl_quantity_semantics(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-full-1",
+                    "posSide": "long",
+                    "pos": "10",
+                    "avgPx": "63895.725",
+                }
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return [
+                {
+                    "ordId": "tp-full-1",
+                    "triggerOrderType": "TPSL",
+                    "posId": "pos-full-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "sz": "0",
+                    "tpTriggerPx": "66330",
+                },
+                {
+                    "ordId": "tp-partial-1",
+                    "triggerOrderType": "TPSL",
+                    "posId": "pos-full-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "sz": "2",
+                    "tpTriggerPx": "67000",
+                },
+            ]
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+        def list_position_history(self, *, inst_id=None):
+            return []
+
+    contract_specs = StaticDeepcoinContractSpecProvider(
+        specs_by_instrument_id={
+            "BTC-USDT-SWAP": DeepcoinContractSpec(
+                instrument_id="BTC-USDT-SWAP",
+                contract_value=0.001,
+                quantity_step=1,
+                min_quantity=1,
+                price_tick=0.1,
+            )
+        }
+    )
+    response = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=FakeDeepcoinClient,
+            deepcoin_contract_spec_provider=contract_specs,
+        )
+    ).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "数量 全部剩余仓位（当前 10 contracts / 0.01 BTC）" in response.text
+    assert "数量 2 contracts / 0.002 BTC" in response.text
+    assert "数量 0 contracts" not in response.text
+
+
+def test_positions_panel_renders_unattributed_full_position_tpsl_without_snapshot(
+    tmp_path,
+):
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-a",
+                    "posSide": "long",
+                    "pos": "10",
+                    "avgPx": "63895.725",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-b",
+                    "posSide": "long",
+                    "pos": "20",
+                    "avgPx": "64000",
+                },
+            ]
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return [
+                {
+                    "ordId": "unknown-full-stop",
+                    "triggerOrderType": "TPSL",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "sz": "0",
+                    "slTriggerPx": "61000",
+                }
+            ]
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+        def list_position_history(self, *, inst_id=None):
+            return []
+
+    response = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=FakeDeepcoinClient,
+        )
+    ).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "全部仓位（具体仓位未归属）" in response.text
+    assert "全部剩余仓位（当前 10 contracts）" not in response.text
+    assert "全部剩余仓位（当前 20 contracts）" not in response.text
 
 
 def test_positions_panel_summary_uses_ordered_verified_exchange_protection(tmp_path):

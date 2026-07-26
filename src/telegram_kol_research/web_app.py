@@ -851,6 +851,7 @@ def _load_deepcoin_live_position_rows(
     *,
     deepcoin_client_factory,
     group_label_by_chat_id: dict[int, str],
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     error_state: dict[str, str] | None = None,
     deepcoin_client=None,
     unattributed_protection_rows: list[dict[str, str]] | None = None,
@@ -974,6 +975,7 @@ def _load_deepcoin_live_position_rows(
                 positions=active_positions,
                 pending_orders=tpsl_orders,
                 exact_order_position_ids=exact_order_position_ids,
+                contract_spec_provider=contract_spec_provider,
             )
         )
         if unattributed_protection_rows is not None:
@@ -1198,6 +1200,7 @@ def _load_exchange_position_snapshot(
         session_factory,
         deepcoin_client_factory=deepcoin_client_factory,
         group_label_by_chat_id=group_label_by_chat_id,
+        contract_spec_provider=contract_spec_provider,
         error_state=position_error,
         deepcoin_client=client,
         unattributed_protection_rows=unattributed_protection_orders,
@@ -2335,6 +2338,7 @@ def _split_exchange_protection_display_rows(
     positions: list[dict[str, Any]],
     pending_orders: list[dict[str, Any]],
     exact_order_position_ids: dict[str, str] | None = None,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
 ) -> tuple[dict[str, list[dict[str, str]]], list[dict[str, str]]]:
     """Separate exact position TPSL rows from exchange rows without an owner."""
     from telegram_kol_research.position_tpsl_display import build_position_tpsl_display
@@ -2343,6 +2347,7 @@ def _split_exchange_protection_display_rows(
         positions=positions,
         pending_orders=pending_orders,
         exact_order_position_ids=exact_order_position_ids or {},
+        contract_spec_provider=contract_spec_provider,
     )
     return (
         {

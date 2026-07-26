@@ -70,7 +70,7 @@
             <li class="exchange-protection-order-row">
               <span class="exchange-protection-order-kind">{{ '止盈' if order.kind == 'take_profit' else '止损' }}</span>
               <span>触发价 {{ order.trigger_price_text }}</span>
-              <span>数量 {{ order.size_text }} contracts</span>
+              <span>数量 {{ order.size_display_text }}</span>
               <code>order {{ order.order_id }}</code>
               <span class="exchange-attribution-chip">{{ order.ownership_state }}</span>
             </li>
@@ -257,7 +257,7 @@
                     <span>{{ '多' if order.side == 'long' else '空' if order.side == 'short' else '方向未知' }}</span>
                     <span>{{ '止盈' if order.kind == 'take_profit' else '止损' }}</span>
                     <span>{{ order.trigger_price_text }}</span>
-                    <span>{{ order.size_text }} contracts</span>
+                    <span>{{ order.size_display_text }}</span>
                     <code>order {{ order.order_id }}</code>
                     <span class="exchange-attribution-chip">无法归属</span>
                   </li>
