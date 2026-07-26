@@ -1827,8 +1827,22 @@ def _preflight_exact_protection_rows(
         current_rows = (
             snapshot_protection_rows(protection.rows) if protection is not None else []
         )
+        position_only_without_order_ids = bool(
+            protection is not None
+            and protection.status == "verified"
+            and protection.rows
+            and not protection.order_ids
+            and all(
+                row.get("_evidence_source") == "position"
+                for row in protection.rows
+            )
+        )
         if (
-            (protection is None or protection.status != "verified")
+            (
+                protection is None
+                or protection.status != "verified"
+                or position_only_without_order_ids
+            )
             and expected.get("order_ids")
         ):
             current_rows = _ledger_confirmed_current_snapshots(

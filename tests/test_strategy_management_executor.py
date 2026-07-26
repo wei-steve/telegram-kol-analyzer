@@ -2536,6 +2536,68 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
     ]
 
 
+def test_close_preflight_falls_back_from_inline_price_to_exact_ledger(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        _preflight_exact_protection_rows,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory,
+        action="partial_then_break_even",
+        stop_loss=None,
+        keep_close_plan=True,
+    )
+    with session_factory() as session:
+        for leg in batch.legs:
+            for row in rows_by_pos[leg.pos_id]:
+                purpose = (
+                    "take_profit" if row.get("tpTriggerPx") else "stop_loss"
+                )
+                trigger_price = row.get("tpTriggerPx") or row.get("slTriggerPx")
+                upsert_protection_ledger_row(
+                    session,
+                    venue="deepcoin",
+                    execution_binding_id=batch.execution_binding_id,
+                    execution_order_leg_id=leg.execution_order_leg_id,
+                    strategy_instance_id=batch.strategy_instance_id,
+                    pos_id=leg.pos_id,
+                    instrument_id="BTC-USDT-SWAP",
+                    side="short",
+                    order_id=row["ordId"],
+                    purpose=purpose,
+                    trigger_price=trigger_price,
+                    size_text=row["sz"],
+                    status="verified",
+                    evidence_source="official_ui_supervised",
+                    evidence={"match": "reviewed_current_order"},
+                    seen_at=NOW,
+                )
+        session.commit()
+
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    for position in client.positions:
+        position["slTriggerPx"] = "65500"
+        position["tpTriggerPx"] = ""
+    for index, row in enumerate(client.pending):
+        row.pop("posId", None)
+        row["cTime"] = str(100_000 + index * 10_000)
+
+    current = _preflight_exact_protection_rows(
+        session_factory=session_factory,
+        batch=batch,
+        live_positions=client.positions,
+        pending=client.pending,
+    )
+
+    assert {
+        row["order_id"] for row in current["pos-1"]
+    } == {"tp-1a", "tp-1b", "sl-1"}
+    assert {
+        row["order_id"] for row in current["pos-2"]
+    } == {"tp-2", "sl-2"}
+
+
 def test_partial_then_break_even_cancel_unknown_never_submits_close(tmp_path):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
 
