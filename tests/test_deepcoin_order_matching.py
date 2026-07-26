@@ -309,9 +309,13 @@ def test_native_tpsl_match_prefers_the_persisted_exchange_order_id():
     assert match.order.ord_id == "system-stop-1"
 
 
-def test_native_tpsl_exact_order_id_requires_open_position_scope_for_zero_size_order():
+def test_native_tpsl_exact_persisted_order_id_survives_missing_position_id():
+    first_position = _native_tpsl_position(posId="pos-btc-1")
+    second_position = _native_tpsl_position(posId="pos-btc-2")
+
     match = match_native_tpsl_order(
-        position=_native_tpsl_position(),
+        position=first_position,
+        open_positions=[first_position, second_position],
         orders=[
             {
                 "ordId": "system-zero-stop-1",
@@ -331,8 +335,9 @@ def test_native_tpsl_exact_order_id_requires_open_position_scope_for_zero_size_o
         ),
     )
 
-    assert match.status == "ambiguous"
-    assert match.order is None
+    assert match.status == "verified"
+    assert match.order is not None
+    assert match.order.ord_id == "system-zero-stop-1"
 
 
 def test_native_tpsl_match_refuses_zero_size_order_without_full_open_position_context():

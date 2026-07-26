@@ -130,11 +130,13 @@ def match_native_tpsl_order(
 ) -> NativeTpslMatch:
     """Find a single verified native TPSL order without guessing ownership.
 
-    A persisted exchange order id is authoritative.  Without it, matching needs
-    one and only one row with the exact instrument, side, creation-time window,
-    and quantity. DeepCoin's ``sz=0`` full-position form additionally requires
-    the caller to provide the complete ``open_positions`` scope so it cannot be
-    attributed to an arbitrary split.
+    A caller-supplied persisted exchange order id is authoritative after the
+    exact order still matches the target position's instrument, side, purpose,
+    trigger price, and size. Without that ID, matching needs one and only one
+    row with the exact instrument, side, creation-time window, and quantity.
+    DeepCoin's ``sz=0`` full-position form additionally requires the caller to
+    provide the complete ``open_positions`` scope so it cannot be attributed to
+    an arbitrary split.
     """
 
     normalized = [order for raw in orders if (order := normalize_native_tpsl(raw))]
@@ -145,11 +147,6 @@ def match_native_tpsl_order(
         if not exact:
             return NativeTpslMatch(status="not_found", order=None)
         order = exact[0]
-        if _requires_open_position_scope(order):
-            if not _has_unique_open_position_scope(order, open_positions):
-                return NativeTpslMatch(status="ambiguous", order=None)
-            if not native_tpsl_belongs_to_position(position, order):
-                return NativeTpslMatch(status="mismatch", order=order)
         return NativeTpslMatch(
             status="verified" if _exact_order_matches(position, order, expected) else "mismatch",
             order=order,
