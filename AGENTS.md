@@ -3,6 +3,7 @@
 - Make code changes locally. Local checks are useful for syntax/unit coverage that does not require secrets or network identity, but real project verification must run on the server because the Telegram session, Deepcoin API IP allowlist, and production keys only work there.
 - Push reviewed local commits to GitHub on `codex/deepcoin-auto-trading-v1`.
 - Update production by pulling from GitHub on the server, reinstalling the editable package, and restarting `telegram-kol.service`.
+- At the end of every completed task in this project, before the final response, run `python3 scripts/codex_telegram_notify.py "<short non-sensitive completion summary>"`. Telegram is the primary completion notification. Never include credentials or sensitive values in the summary. If Telegram delivery fails, use `osascript -e 'display notification "任务已完成，请查看 Codex。" with title "Telegram 获取消息项目"'` as the fallback and clearly report the Telegram failure in the final response. If both notification methods are unavailable, state that clearly in the final response.
 - Prefer the existing helper after pushing:
 
 ```powershell
