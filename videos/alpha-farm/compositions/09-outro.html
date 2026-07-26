@@ -1,0 +1,267 @@
+<template id="scene-09-outro-template">
+  <div
+    id="s09-root"
+    data-composition-id="scene-09-outro"
+    data-width="1920"
+    data-height="1080"
+    data-duration="17"
+  >
+    <div class="s09-orbit s09-orbit-one" aria-hidden="true"></div>
+    <div class="s09-orbit s09-orbit-two" aria-hidden="true"></div>
+    <div class="s09-center-glow" aria-hidden="true"></div>
+
+    <main class="scene-content">
+      <div class="s09-system">
+        <div class="s09-node s09-kol-node">
+          <span>KOL</span>
+          <b>信息源</b>
+        </div>
+        <div class="s09-link s09-link-left" aria-hidden="true"></div>
+
+        <div class="s09-core">
+          <span>AI</span>
+          <b>纪律中枢</b>
+        </div>
+
+        <div class="s09-link s09-link-right" aria-hidden="true"></div>
+        <div class="s09-node s09-order-node">
+          <span>ORDER</span>
+          <b>受控执行</b>
+        </div>
+      </div>
+
+      <div class="s09-copy">
+        <p class="s09-process">信息 <span>→</span> 纪律 <span>→</span> 执行</p>
+        <h1>《Alpha 牧场》</h1>
+        <p class="s09-tagline">让 KOL 提供 Alpha，让 AI 负责执行</p>
+      </div>
+
+      <footer class="s09-footer">
+        <p>贵的是信息，难的是执行。</p>
+        <div class="s09-disclaimer">
+          <span>不保证盈利</span>
+          <i></i>
+          <span>市场有风险</span>
+        </div>
+      </footer>
+    </main>
+
+    <style>
+      @font-face {
+        font-family: "PingFang SC";
+        src: local("PingFang SC");
+      }
+
+      @font-face {
+        font-family: "Source Han Sans SC";
+        src: local("Source Han Sans SC");
+      }
+
+      @font-face {
+        font-family: "Space Grotesk";
+        src: local("Space Grotesk");
+      }
+
+      #s09-root {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        color: #f4f7ff;
+        background-color: #070a12;
+        font-family: "PingFang SC", "Source Han Sans SC", sans-serif;
+      }
+
+      #s09-root * {
+        box-sizing: border-box;
+      }
+
+      #s09-root .scene-content {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+        height: 100%;
+        padding: 68px 120px 54px;
+        gap: 28px;
+        box-sizing: border-box;
+        text-align: center;
+      }
+
+      #s09-root .s09-center-glow {
+        position: absolute;
+        left: 50%;
+        top: 43%;
+        width: 800px;
+        height: 620px;
+        border-radius: 50%;
+        background: #8b5cf6;
+        filter: blur(190px);
+        opacity: 0.13;
+        transform: translate(-50%, -50%);
+      }
+
+      #s09-root .s09-orbit {
+        position: absolute;
+        left: 50%;
+        top: 42%;
+        border: 1px solid rgba(53, 194, 255, 0.13);
+        border-radius: 50%;
+        transform: translate(-50%, -50%);
+      }
+
+      #s09-root .s09-orbit-one {
+        width: 1050px;
+        height: 520px;
+      }
+
+      #s09-root .s09-orbit-two {
+        width: 1420px;
+        height: 720px;
+        border-color: rgba(139, 92, 246, 0.1);
+      }
+
+      #s09-root .s09-system {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        gap: 22px;
+      }
+
+      #s09-root .s09-node,
+      #s09-root .s09-core {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        border-radius: 50%;
+      }
+
+      #s09-root .s09-node {
+        width: 126px;
+        height: 126px;
+        border: 1px solid rgba(53, 194, 255, 0.36);
+        background: rgba(53, 194, 255, 0.07);
+      }
+
+      #s09-root .s09-core {
+        width: 174px;
+        height: 174px;
+        border: 2px solid rgba(139, 92, 246, 0.74);
+        background: rgba(139, 92, 246, 0.12);
+        box-shadow: 0 0 48px rgba(139, 92, 246, 0.2), inset 0 0 28px rgba(139, 92, 246, 0.12);
+      }
+
+      #s09-root .s09-node span,
+      #s09-root .s09-core span {
+        font-family: "Space Grotesk", "JetBrains Mono", monospace;
+        font-size: 22px;
+        font-weight: 900;
+        letter-spacing: 0.1em;
+      }
+
+      #s09-root .s09-core span {
+        color: #c4a8ff;
+        font-size: 40px;
+      }
+
+      #s09-root .s09-node b,
+      #s09-root .s09-core b {
+        margin-top: 7px;
+        color: rgba(244, 247, 255, 0.64);
+        font-size: 17px;
+        font-weight: 350;
+      }
+
+      #s09-root .s09-link {
+        width: 220px;
+        height: 2px;
+        background: linear-gradient(90deg, rgba(53, 194, 255, 0.15), #35c2ff, rgba(139, 92, 246, 0.52));
+        box-shadow: 0 0 10px rgba(53, 194, 255, 0.24);
+      }
+
+      #s09-root .s09-link-right {
+        background: linear-gradient(90deg, rgba(139, 92, 246, 0.52), #2fe6a6, rgba(47, 230, 166, 0.15));
+      }
+
+      #s09-root .s09-order-node {
+        border-color: rgba(47, 230, 166, 0.42);
+        background: rgba(47, 230, 166, 0.07);
+      }
+
+      #s09-root .s09-copy {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+
+      #s09-root .s09-process {
+        margin: 0 0 14px;
+        color: rgba(244, 247, 255, 0.7);
+        font-family: "JetBrains Mono", monospace;
+        font-size: 20px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+      }
+
+      #s09-root .s09-process span {
+        padding: 0 12px;
+        color: #35c2ff;
+      }
+
+      #s09-root h1 {
+        margin: 0;
+        font-size: 104px;
+        font-weight: 900;
+        line-height: 1.06;
+        letter-spacing: -0.035em;
+        text-shadow: 0 0 34px rgba(139, 92, 246, 0.16);
+      }
+
+      #s09-root .s09-tagline {
+        margin: 20px 0 0;
+        color: #f4f7ff;
+        font-size: 31px;
+        font-weight: 350;
+        letter-spacing: 0.03em;
+      }
+
+      #s09-root .s09-footer {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+      }
+
+      #s09-root .s09-footer > p {
+        margin: 0;
+        color: rgba(244, 247, 255, 0.72);
+        font-size: 22px;
+      }
+
+      #s09-root .s09-disclaimer {
+        display: flex;
+        align-items: center;
+        padding: 9px 18px;
+        border: 1px solid rgba(255, 77, 103, 0.22);
+        border-radius: 999px;
+        color: #ff9aaa;
+        background: rgba(255, 77, 103, 0.055);
+        font-size: 17px;
+        letter-spacing: 0.06em;
+      }
+
+      #s09-root .s09-disclaimer i {
+        width: 4px;
+        height: 4px;
+        margin: 0 14px;
+        border-radius: 50%;
+        background: #ff4d67;
+      }
+    </style>
+  </div>
+</template>

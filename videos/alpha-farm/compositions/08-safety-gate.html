@@ -1,0 +1,422 @@
+<template id="scene-08-safety-gate-template">
+  <div
+    id="s08-root"
+    data-composition-id="scene-08-safety-gate"
+    data-width="1920"
+    data-height="1080"
+    data-duration="16"
+  >
+    <div class="s08-risk-glow" aria-hidden="true"></div>
+    <div class="s08-scan-grid" aria-hidden="true"></div>
+
+    <main class="scene-content">
+      <header class="s08-header">
+        <p class="s08-kicker">SAFETY GATE · HARD RULE</p>
+        <h1>自动化，不放松底线</h1>
+        <p class="s08-subtitle">缺少固定止损，仓位无法计算，策略立即停止。</p>
+      </header>
+
+      <section class="s08-flow">
+        <article class="s08-signal-card">
+          <div class="s08-anon-row">
+            <div class="s08-avatar">?</div>
+            <div>
+              <strong>匿名策略</strong>
+              <span>SOURCE REDACTED</span>
+            </div>
+            <b>PENDING</b>
+          </div>
+          <div class="s08-field-list">
+            <div><span>SYMBOL</span><strong>BTC</strong><i>✓</i></div>
+            <div><span>SIDE</span><strong>LONG</strong><i>✓</i></div>
+            <div><span>ENTRY</span><strong>RANGE</strong><i>✓</i></div>
+            <div class="s08-missing"><span>STOP LOSS</span><strong>MISSING</strong><i>×</i></div>
+          </div>
+        </article>
+
+        <div class="s08-circuit">
+          <span class="s08-wire"></span>
+          <div class="s08-formula">
+            <span>风险预算</span>
+            <b>÷</b>
+            <span>止损距离</span>
+            <strong>= 无法计算</strong>
+          </div>
+          <div class="s08-break">CIRCUIT OPEN</div>
+        </div>
+
+        <article class="s08-gate">
+          <div class="s08-gate-rail s08-gate-top"></div>
+          <div class="s08-gate-core">
+            <span>EXECUTION REJECTED</span>
+            <h2>NO STOP,<br />NO TRADE</h2>
+            <div class="s08-rejected">拒绝执行</div>
+          </div>
+          <div class="s08-gate-rail s08-gate-bottom"></div>
+        </article>
+      </section>
+
+      <footer class="s08-footer">
+        <strong>没有止损，就没有仓位</strong>
+        <span></span>
+        <strong>没有止损，就不执行交易</strong>
+      </footer>
+    </main>
+
+    <style>
+      @font-face {
+        font-family: "PingFang SC";
+        src: local("PingFang SC");
+      }
+
+      @font-face {
+        font-family: "Source Han Sans SC";
+        src: local("Source Han Sans SC");
+      }
+
+      @font-face {
+        font-family: "Space Grotesk";
+        src: local("Space Grotesk");
+      }
+
+      #s08-root {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        color: #f4f7ff;
+        background-color: #070a12;
+        font-family: "PingFang SC", "Source Han Sans SC", sans-serif;
+      }
+
+      #s08-root * {
+        box-sizing: border-box;
+      }
+
+      #s08-root .scene-content {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: 100%;
+        padding: 64px 96px 58px;
+        gap: 34px;
+        box-sizing: border-box;
+      }
+
+      #s08-root .s08-risk-glow {
+        position: absolute;
+        top: 90px;
+        right: -260px;
+        width: 1000px;
+        height: 900px;
+        border-radius: 50%;
+        background: #ff4d67;
+        filter: blur(190px);
+        opacity: 0.12;
+      }
+
+      #s08-root .s08-scan-grid {
+        position: absolute;
+        inset: 0;
+        opacity: 0.12;
+        background-image:
+          linear-gradient(rgba(255, 77, 103, 0.18) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255, 77, 103, 0.18) 1px, transparent 1px);
+        background-size: 96px 96px;
+      }
+
+      #s08-root .s08-kicker {
+        margin: 0 0 12px;
+        color: #ff4d67;
+        font-family: "Space Grotesk", "JetBrains Mono", monospace;
+        font-size: 20px;
+        font-weight: 800;
+        letter-spacing: 0.16em;
+      }
+
+      #s08-root h1 {
+        margin: 0;
+        font-size: 66px;
+        font-weight: 900;
+        line-height: 1.1;
+        letter-spacing: -0.025em;
+      }
+
+      #s08-root .s08-subtitle {
+        margin: 10px 0 0;
+        color: rgba(244, 247, 255, 0.7);
+        font-size: 24px;
+        line-height: 1.5;
+      }
+
+      #s08-root .s08-flow {
+        display: flex;
+        align-items: stretch;
+        flex: 1;
+        min-height: 0;
+        gap: 40px;
+      }
+
+      #s08-root .s08-signal-card {
+        display: flex;
+        width: 500px;
+        flex: 0 0 500px;
+        flex-direction: column;
+        padding: 30px;
+        border: 1px solid rgba(244, 247, 255, 0.16);
+        border-radius: 24px;
+        background: rgba(12, 19, 34, 0.94);
+      }
+
+      #s08-root .s08-anon-row {
+        display: flex;
+        align-items: center;
+        padding-bottom: 24px;
+        border-bottom: 1px solid rgba(244, 247, 255, 0.1);
+        gap: 16px;
+      }
+
+      #s08-root .s08-avatar {
+        display: grid;
+        width: 58px;
+        height: 58px;
+        flex: 0 0 58px;
+        place-items: center;
+        border: 1px solid rgba(139, 92, 246, 0.48);
+        border-radius: 50%;
+        color: #c4a8ff;
+        background: rgba(139, 92, 246, 0.12);
+        font-family: "JetBrains Mono", monospace;
+        font-size: 28px;
+      }
+
+      #s08-root .s08-anon-row div:nth-child(2) {
+        display: flex;
+        flex: 1;
+        flex-direction: column;
+        gap: 3px;
+      }
+
+      #s08-root .s08-anon-row strong {
+        font-size: 24px;
+      }
+
+      #s08-root .s08-anon-row span,
+      #s08-root .s08-anon-row b {
+        font-family: "JetBrains Mono", monospace;
+        font-size: 15px;
+        letter-spacing: 0.08em;
+      }
+
+      #s08-root .s08-anon-row span {
+        color: rgba(244, 247, 255, 0.48);
+      }
+
+      #s08-root .s08-anon-row b {
+        padding: 8px 12px;
+        border-radius: 999px;
+        color: #ff9aaa;
+        background: rgba(255, 77, 103, 0.12);
+      }
+
+      #s08-root .s08-field-list {
+        display: flex;
+        flex: 1;
+        flex-direction: column;
+        justify-content: center;
+        gap: 12px;
+        padding-top: 22px;
+      }
+
+      #s08-root .s08-field-list div {
+        display: grid;
+        grid-template-columns: 1fr 1fr 32px;
+        align-items: center;
+        min-height: 58px;
+        padding: 0 16px;
+        border: 1px solid rgba(53, 194, 255, 0.13);
+        border-radius: 12px;
+        background: rgba(53, 194, 255, 0.04);
+        font-family: "JetBrains Mono", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #s08-root .s08-field-list span {
+        color: rgba(244, 247, 255, 0.48);
+        font-size: 15px;
+        letter-spacing: 0.08em;
+      }
+
+      #s08-root .s08-field-list strong {
+        font-size: 20px;
+      }
+
+      #s08-root .s08-field-list i {
+        color: #2fe6a6;
+        font-size: 22px;
+        font-style: normal;
+        text-align: right;
+      }
+
+      #s08-root .s08-field-list .s08-missing {
+        border-color: rgba(255, 77, 103, 0.62);
+        color: #ff4d67;
+        background: rgba(255, 77, 103, 0.12);
+        box-shadow: 0 0 28px rgba(255, 77, 103, 0.08);
+      }
+
+      #s08-root .s08-field-list .s08-missing span,
+      #s08-root .s08-field-list .s08-missing i {
+        color: #ff7589;
+      }
+
+      #s08-root .s08-circuit {
+        position: relative;
+        display: flex;
+        width: 330px;
+        flex: 0 0 330px;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 20px;
+      }
+
+      #s08-root .s08-wire {
+        position: absolute;
+        right: -44px;
+        left: -44px;
+        top: 50%;
+        height: 3px;
+        background: repeating-linear-gradient(90deg, rgba(255, 77, 103, 0.7) 0 22px, transparent 22px 36px);
+      }
+
+      #s08-root .s08-formula {
+        position: relative;
+        z-index: 1;
+        display: grid;
+        width: 100%;
+        grid-template-columns: 1fr 32px 1fr;
+        align-items: center;
+        padding: 24px 18px;
+        border: 1px solid rgba(255, 77, 103, 0.34);
+        border-radius: 18px;
+        background: #0d1019;
+        color: rgba(244, 247, 255, 0.72);
+        font-size: 18px;
+        text-align: center;
+      }
+
+      #s08-root .s08-formula b {
+        color: #ff4d67;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 28px;
+      }
+
+      #s08-root .s08-formula strong {
+        grid-column: 1 / -1;
+        margin-top: 18px;
+        padding-top: 16px;
+        border-top: 1px solid rgba(255, 77, 103, 0.2);
+        color: #ff7589;
+        font-size: 22px;
+      }
+
+      #s08-root .s08-break {
+        position: relative;
+        z-index: 1;
+        padding: 8px 13px;
+        border: 1px solid rgba(255, 77, 103, 0.38);
+        border-radius: 999px;
+        color: #ff7589;
+        background: #070a12;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 14px;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+      }
+
+      #s08-root .s08-gate {
+        position: relative;
+        display: flex;
+        flex: 1;
+        min-width: 0;
+        flex-direction: column;
+        padding: 22px;
+        border: 1px solid rgba(255, 77, 103, 0.44);
+        border-radius: 26px;
+        background: rgba(255, 77, 103, 0.05);
+        box-shadow: inset 0 0 90px rgba(255, 77, 103, 0.08), 0 0 60px rgba(255, 77, 103, 0.06);
+      }
+
+      #s08-root .s08-gate-rail {
+        height: 54px;
+        border: 1px solid rgba(255, 77, 103, 0.55);
+        background:
+          repeating-linear-gradient(135deg, rgba(255, 77, 103, 0.18) 0 18px, rgba(7, 10, 18, 0.8) 18px 36px);
+      }
+
+      #s08-root .s08-gate-top {
+        border-radius: 16px 16px 4px 4px;
+      }
+
+      #s08-root .s08-gate-bottom {
+        border-radius: 4px 4px 16px 16px;
+      }
+
+      #s08-root .s08-gate-core {
+        display: flex;
+        flex: 1;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+        text-align: center;
+      }
+
+      #s08-root .s08-gate-core > span {
+        color: #ff7589;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 17px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+      }
+
+      #s08-root h2 {
+        margin: 18px 0 20px;
+        color: #f4f7ff;
+        font-family: "Space Grotesk", "JetBrains Mono", monospace;
+        font-size: 64px;
+        font-weight: 900;
+        line-height: 0.98;
+        letter-spacing: -0.04em;
+      }
+
+      #s08-root .s08-rejected {
+        padding: 11px 34px;
+        border: 3px solid #ff4d67;
+        color: #ff4d67;
+        font-size: 26px;
+        font-weight: 900;
+        letter-spacing: 0.16em;
+        transform: rotate(-4deg);
+      }
+
+      #s08-root .s08-footer {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 28px;
+        color: #f4f7ff;
+        font-size: 25px;
+      }
+
+      #s08-root .s08-footer span {
+        width: 44px;
+        height: 2px;
+        background: #ff4d67;
+      }
+    </style>
+  </div>
+</template>

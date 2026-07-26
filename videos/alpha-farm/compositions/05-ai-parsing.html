@@ -1,0 +1,429 @@
+<template id="alpha-farm-ai-parsing-template">
+  <div
+    id="scene-ai-parsing"
+    data-composition-id="alpha-farm-ai-parsing"
+    data-width="1920"
+    data-height="1080"
+    data-duration="18"
+  >
+    <div class="scene-content">
+      <header class="scene-header">
+        <div>
+          <p class="eyebrow">NATURAL LANGUAGE → EXECUTION SCHEMA</p>
+          <h1>AI 把策略变成可检查的字段</h1>
+        </div>
+        <div class="model-state"><span></span> PARSING COMPLETE</div>
+      </header>
+
+      <main class="parsing-stage">
+        <section class="source-panel">
+          <div class="panel-label">01 · 原始策略消息</div>
+          <div class="source-author">
+            <div class="avatar">
+              <span data-layout-allow-occlusion>镖</span>
+              <img
+                src="assets/private/avatars/dabiaoke-placeholder.svg"
+                alt="大镖客头像"
+                onerror="this.style.display='none'"
+              />
+            </div>
+            <div>
+              <h2>大镖客</h2>
+              <p>脱敏代表消息</p>
+            </div>
+          </div>
+          <div class="source-message">
+            <div class="source-fallback" data-layout-allow-occlusion>
+              <strong>BTC 做空</strong>
+              <p>建仓 71000–71800</p>
+              <p>止损 72300</p>
+              <p>止盈 70300 / 69600 / 68900</p>
+              <p>进场灵活，不必踩点。</p>
+            </div>
+            <img
+              src="assets/private/messages/dabiaoke.svg"
+              alt="大镖客脱敏策略消息"
+              onerror="this.style.display='none'"
+            />
+          </div>
+        </section>
+
+        <section class="scanner-panel" aria-label="AI 扫描">
+          <div class="scan-rail"><span></span></div>
+          <div class="ai-core">AI</div>
+          <p>语义提取</p>
+          <div class="flow-arrow">→</div>
+        </section>
+
+        <section class="fields-panel">
+          <div class="panel-label">02 · 结构化执行字段</div>
+          <div class="field-grid">
+            <article class="field-card">
+              <span>交易标的</span>
+              <strong>BTC</strong>
+              <i>LOCKED</i>
+            </article>
+            <article class="field-card">
+              <span>方向</span>
+              <strong>SHORT</strong>
+              <i>LOCKED</i>
+            </article>
+            <article class="field-card field-wide">
+              <span>入场范围</span>
+              <strong>71,000–71,800</strong>
+              <i>LOCKED</i>
+            </article>
+            <article class="field-card field-stop">
+              <span>固定止损</span>
+              <strong>SL 72,300</strong>
+              <i>REQUIRED</i>
+            </article>
+            <article class="field-card field-wide">
+              <span>止盈目标</span>
+              <strong>70,300 / 69,600 / 68,900</strong>
+              <i>3 TARGETS</i>
+            </article>
+            <article class="field-card field-wide">
+              <span>管理指令</span>
+              <strong>进场灵活，不必踩点</strong>
+              <i>CONTEXT</i>
+            </article>
+          </div>
+        </section>
+      </main>
+
+      <footer class="review-branch">
+        <div class="branch-icon">?</div>
+        <div>
+          <strong>不确定、矛盾或归属不明</strong>
+          <span>拒绝猜测 → 拒绝执行 / 人工复核</span>
+        </div>
+        <div class="branch-state">SAFE FALLBACK</div>
+      </footer>
+    </div>
+
+    <style>
+      @font-face {
+        font-family: "PingFang SC";
+        src: local("PingFang SC");
+      }
+
+      @font-face {
+        font-family: "Source Han Sans SC";
+        src: local("Source Han Sans SC");
+      }
+
+      #scene-ai-parsing {
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        color: #f4f7ff;
+        background-color: #070a12;
+        font-family: "PingFang SC", "Source Han Sans SC", sans-serif;
+      }
+
+      #scene-ai-parsing * {
+        box-sizing: border-box;
+      }
+
+      #scene-ai-parsing .scene-content {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: 100%;
+        padding: 76px 110px 64px;
+        gap: 30px;
+        background:
+          radial-gradient(circle at 52% 46%, rgba(139, 92, 246, 0.16), transparent 24%),
+          linear-gradient(115deg, transparent 66%, rgba(53, 194, 255, 0.035));
+      }
+
+      #scene-ai-parsing .scene-header {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+      }
+
+      #scene-ai-parsing .eyebrow,
+      #scene-ai-parsing .panel-label {
+        color: #35c2ff;
+        font: 700 17px/1.2 "Space Grotesk", sans-serif;
+        letter-spacing: 0.16em;
+      }
+
+      #scene-ai-parsing .eyebrow {
+        margin: 0 0 10px;
+      }
+
+      #scene-ai-parsing h1 {
+        margin: 0;
+        font-size: 66px;
+        line-height: 1.12;
+        letter-spacing: -0.04em;
+      }
+
+      #scene-ai-parsing .model-state {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 14px 20px;
+        color: #2fe6a6;
+        border: 1px solid rgba(47, 230, 166, 0.32);
+        border-radius: 12px;
+        background: rgba(47, 230, 166, 0.06);
+        font: 700 17px/1 "JetBrains Mono", monospace;
+      }
+
+      #scene-ai-parsing .model-state span {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: #2fe6a6;
+        box-shadow: 0 0 16px rgba(47, 230, 166, 0.85);
+      }
+
+      #scene-ai-parsing .parsing-stage {
+        display: grid;
+        grid-template-columns: 0.92fr 150px 1.42fr;
+        flex: 1;
+        gap: 24px;
+        min-height: 0;
+      }
+
+      #scene-ai-parsing .source-panel,
+      #scene-ai-parsing .fields-panel {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        padding: 24px;
+        gap: 18px;
+        border: 1px solid rgba(244, 247, 255, 0.12);
+        border-radius: 24px;
+        background: rgba(13, 19, 33, 0.92);
+      }
+
+      #scene-ai-parsing .source-author {
+        display: flex;
+        align-items: center;
+        gap: 15px;
+      }
+
+      #scene-ai-parsing .avatar {
+        position: relative;
+        display: grid;
+        place-items: center;
+        width: 62px;
+        height: 62px;
+        overflow: hidden;
+        border: 1px solid rgba(53, 194, 255, 0.45);
+        border-radius: 17px;
+        background: linear-gradient(145deg, rgba(53, 194, 255, 0.24), rgba(139, 92, 246, 0.2));
+        font-size: 27px;
+        font-weight: 700;
+      }
+
+      #scene-ai-parsing .avatar img {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      #scene-ai-parsing .source-author h2 {
+        margin: 0 0 4px;
+        font-size: 25px;
+      }
+
+      #scene-ai-parsing .source-author p {
+        margin: 0;
+        color: rgba(244, 247, 255, 0.5);
+        font-size: 16px;
+      }
+
+      #scene-ai-parsing .source-message {
+        position: relative;
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
+        border: 1px solid rgba(53, 194, 255, 0.18);
+        border-radius: 18px;
+        background: #09101f;
+      }
+
+      #scene-ai-parsing .source-message > img {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: #09101f;
+      }
+
+      #scene-ai-parsing .source-fallback {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        height: 100%;
+        padding: 28px;
+        gap: 14px;
+        font: 19px/1.4 "JetBrains Mono", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #scene-ai-parsing .source-fallback strong {
+        color: #35c2ff;
+        font-size: 24px;
+      }
+
+      #scene-ai-parsing .source-fallback p {
+        margin: 0;
+      }
+
+      #scene-ai-parsing .scanner-panel {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 17px;
+      }
+
+      #scene-ai-parsing .scan-rail {
+        position: relative;
+        width: 3px;
+        height: 120px;
+        background: rgba(139, 92, 246, 0.22);
+      }
+
+      #scene-ai-parsing .scan-rail span {
+        position: absolute;
+        left: -7px;
+        top: 48%;
+        width: 17px;
+        height: 17px;
+        border-radius: 50%;
+        background: #8b5cf6;
+        box-shadow: 0 0 26px rgba(139, 92, 246, 0.9);
+      }
+
+      #scene-ai-parsing .ai-core {
+        display: grid;
+        place-items: center;
+        width: 84px;
+        height: 84px;
+        border: 1px solid rgba(139, 92, 246, 0.7);
+        border-radius: 26px;
+        background: rgba(139, 92, 246, 0.14);
+        box-shadow: 0 0 44px rgba(139, 92, 246, 0.2);
+        font: 700 28px/1 "Space Grotesk", sans-serif;
+      }
+
+      #scene-ai-parsing .scanner-panel p {
+        margin: 0;
+        color: rgba(244, 247, 255, 0.58);
+        font-size: 17px;
+      }
+
+      #scene-ai-parsing .flow-arrow {
+        color: #35c2ff;
+        font-size: 40px;
+      }
+
+      #scene-ai-parsing .field-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        flex: 1;
+        gap: 14px;
+        min-height: 0;
+      }
+
+      #scene-ai-parsing .field-card {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        align-content: center;
+        padding: 16px 18px;
+        gap: 7px 12px;
+        border: 1px solid rgba(53, 194, 255, 0.18);
+        border-radius: 16px;
+        background: rgba(53, 194, 255, 0.055);
+      }
+
+      #scene-ai-parsing .field-wide {
+        grid-column: span 2;
+      }
+
+      #scene-ai-parsing .field-stop {
+        border-color: rgba(255, 77, 103, 0.34);
+        background: rgba(255, 77, 103, 0.07);
+      }
+
+      #scene-ai-parsing .field-card span {
+        color: rgba(244, 247, 255, 0.54);
+        font-size: 16px;
+      }
+
+      #scene-ai-parsing .field-card strong {
+        grid-row: 2;
+        color: #f4f7ff;
+        font: 700 23px/1.1 "JetBrains Mono", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #scene-ai-parsing .field-card i {
+        grid-row: 1 / span 2;
+        grid-column: 2;
+        align-self: center;
+        color: #2fe6a6;
+        font: normal 700 14px/1 "JetBrains Mono", monospace;
+      }
+
+      #scene-ai-parsing .field-stop i {
+        color: #ff4d67;
+      }
+
+      #scene-ai-parsing .review-branch {
+        display: flex;
+        align-items: center;
+        min-height: 82px;
+        padding: 15px 22px;
+        gap: 17px;
+        border: 1px solid rgba(255, 77, 103, 0.26);
+        border-radius: 18px;
+        background: rgba(255, 77, 103, 0.055);
+      }
+
+      #scene-ai-parsing .branch-icon {
+        display: grid;
+        place-items: center;
+        width: 45px;
+        height: 45px;
+        border-radius: 13px;
+        color: #ff4d67;
+        background: rgba(255, 77, 103, 0.13);
+        font: 700 24px/1 "Space Grotesk", sans-serif;
+      }
+
+      #scene-ai-parsing .review-branch div:nth-child(2) {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+
+      #scene-ai-parsing .review-branch strong {
+        font-size: 20px;
+      }
+
+      #scene-ai-parsing .review-branch span {
+        color: rgba(244, 247, 255, 0.58);
+        font-size: 17px;
+      }
+
+      #scene-ai-parsing .branch-state {
+        margin-left: auto;
+        color: #ff4d67;
+        font: 700 15px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.08em;
+      }
+    </style>
+  </div>
+</template>

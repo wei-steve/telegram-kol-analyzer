@@ -1,0 +1,492 @@
+<template id="scene-07-two-leg-entry-template">
+  <div
+    id="s07-root"
+    data-composition-id="scene-07-two-leg-entry"
+    data-width="1920"
+    data-height="1080"
+    data-duration="20"
+  >
+    <div class="s07-grid" aria-hidden="true"></div>
+    <div class="s07-glow s07-glow-left" aria-hidden="true"></div>
+    <div class="s07-glow s07-glow-right" aria-hidden="true"></div>
+
+    <main class="scene-content">
+      <header class="s07-header">
+        <div>
+          <p class="s07-kicker">RANGE ENTRY · 62,000—62,400</p>
+          <h1>一个入场区间，两条并列路线</h1>
+        </div>
+        <div class="s07-risk-cap">
+          <span>总风险预算</span>
+          <strong>100 USDT</strong>
+        </div>
+      </header>
+
+      <section class="s07-route-map">
+        <article class="s07-leg s07-greedy-leg">
+          <div class="s07-leg-top">
+            <div class="s07-leg-index">GREEDY</div>
+            <div class="s07-status s07-waiting">WAITING</div>
+          </div>
+          <div class="s07-title-row">
+            <div class="s07-route-icon" aria-hidden="true">↘</div>
+            <div>
+              <h2>贪婪腿</h2>
+              <p>等待更好的价格 · 较低成交概率</p>
+            </div>
+          </div>
+          <div class="s07-price">
+            <span>入场价</span>
+            <strong>62,000</strong>
+            <small>BTC · LONG</small>
+          </div>
+          <dl class="s07-metrics">
+            <div>
+              <dt>独立风险预算</dt>
+              <dd>50 USDT</dd>
+            </div>
+            <div>
+              <dt>独立仓位</dt>
+              <dd>0.1 BTC</dd>
+            </div>
+          </dl>
+          <div class="s07-track">
+            <span class="s07-track-stop">61,500 SL</span>
+            <span class="s07-track-entry">62,000</span>
+            <span class="s07-track-range">62,400</span>
+          </div>
+        </article>
+
+        <div class="s07-divider" aria-hidden="true">
+          <span></span>
+          <b>50 / 50</b>
+          <span></span>
+        </div>
+
+        <article class="s07-leg s07-conservative-leg">
+          <div class="s07-leg-top">
+            <div class="s07-leg-index">CONSERVATIVE</div>
+            <div class="s07-status s07-ready">READY</div>
+          </div>
+          <div class="s07-title-row">
+            <div class="s07-route-icon" aria-hidden="true">↗</div>
+            <div>
+              <h2>保守腿</h2>
+              <p>更易成交 · 优先参与行情</p>
+            </div>
+          </div>
+          <div class="s07-price">
+            <span>入场价</span>
+            <strong>62,400</strong>
+            <small>BTC · LONG</small>
+          </div>
+          <dl class="s07-metrics">
+            <div>
+              <dt>独立风险预算</dt>
+              <dd>50 USDT</dd>
+            </div>
+            <div>
+              <dt>独立仓位</dt>
+              <dd>0.0556 BTC</dd>
+            </div>
+          </dl>
+          <div class="s07-track">
+            <span class="s07-track-stop">61,500 SL</span>
+            <span class="s07-track-entry s07-track-entry-ready">62,000</span>
+            <span class="s07-track-range s07-track-range-ready">62,400</span>
+          </div>
+        </article>
+      </section>
+
+      <footer class="s07-footer">
+        <span>独立入场价</span>
+        <span>独立风险预算</span>
+        <span>独立仓位</span>
+        <span>独立订单状态</span>
+      </footer>
+    </main>
+
+    <style>
+      @font-face {
+        font-family: "PingFang SC";
+        src: local("PingFang SC");
+      }
+
+      @font-face {
+        font-family: "Source Han Sans SC";
+        src: local("Source Han Sans SC");
+      }
+
+      @font-face {
+        font-family: "Space Grotesk";
+        src: local("Space Grotesk");
+      }
+
+      #s07-root {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        color: #f4f7ff;
+        background-color: #070a12;
+        font-family: "PingFang SC", "Source Han Sans SC", sans-serif;
+      }
+
+      #s07-root * {
+        box-sizing: border-box;
+      }
+
+      #s07-root .scene-content {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        width: 100%;
+        height: 100%;
+        padding: 66px 96px 62px;
+        gap: 32px;
+        box-sizing: border-box;
+      }
+
+      #s07-root .s07-grid {
+        position: absolute;
+        inset: 0;
+        opacity: 0.2;
+        background-image:
+          linear-gradient(rgba(53, 194, 255, 0.12) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(53, 194, 255, 0.12) 1px, transparent 1px);
+        background-size: 80px 80px;
+        mask-image: linear-gradient(to bottom, transparent, black 25%, black 78%, transparent);
+      }
+
+      #s07-root .s07-glow {
+        position: absolute;
+        width: 640px;
+        height: 640px;
+        border-radius: 50%;
+        filter: blur(130px);
+        opacity: 0.14;
+      }
+
+      #s07-root .s07-glow-left {
+        left: -260px;
+        top: 240px;
+        background: #8b5cf6;
+      }
+
+      #s07-root .s07-glow-right {
+        right: -260px;
+        top: 220px;
+        background: #35c2ff;
+      }
+
+      #s07-root .s07-header {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 64px;
+      }
+
+      #s07-root .s07-kicker {
+        margin: 0 0 12px;
+        color: #35c2ff;
+        font-family: "Space Grotesk", "JetBrains Mono", monospace;
+        font-size: 20px;
+        font-weight: 700;
+        letter-spacing: 0.16em;
+      }
+
+      #s07-root h1 {
+        max-width: 1180px;
+        margin: 0;
+        font-size: 68px;
+        font-weight: 900;
+        line-height: 1.12;
+        letter-spacing: -0.025em;
+      }
+
+      #s07-root .s07-risk-cap {
+        min-width: 260px;
+        padding: 20px 24px;
+        border: 1px solid rgba(47, 230, 166, 0.4);
+        border-radius: 18px;
+        background: rgba(47, 230, 166, 0.08);
+        text-align: right;
+      }
+
+      #s07-root .s07-risk-cap span {
+        display: block;
+        margin-bottom: 4px;
+        color: rgba(244, 247, 255, 0.74);
+        font-size: 18px;
+      }
+
+      #s07-root .s07-risk-cap strong {
+        color: #2fe6a6;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 34px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #s07-root .s07-route-map {
+        display: flex;
+        align-items: stretch;
+        flex: 1;
+        min-height: 0;
+        gap: 24px;
+      }
+
+      #s07-root .s07-leg {
+        display: flex;
+        flex: 1;
+        flex-direction: column;
+        min-width: 0;
+        padding: 30px 34px 28px;
+        border: 1px solid rgba(244, 247, 255, 0.14);
+        border-radius: 26px;
+        background: rgba(11, 18, 34, 0.9);
+        box-shadow: inset 0 1px 0 rgba(244, 247, 255, 0.05);
+      }
+
+      #s07-root .s07-greedy-leg {
+        border-top: 4px solid #8b5cf6;
+      }
+
+      #s07-root .s07-conservative-leg {
+        border-top: 4px solid #35c2ff;
+      }
+
+      #s07-root .s07-leg-top,
+      #s07-root .s07-title-row,
+      #s07-root .s07-price {
+        display: flex;
+        align-items: center;
+      }
+
+      #s07-root .s07-leg-top {
+        justify-content: space-between;
+        margin-bottom: 20px;
+      }
+
+      #s07-root .s07-leg-index,
+      #s07-root .s07-status,
+      #s07-root .s07-price,
+      #s07-root .s07-metrics {
+        font-family: "JetBrains Mono", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #s07-root .s07-leg-index {
+        color: rgba(244, 247, 255, 0.58);
+        font-size: 16px;
+        font-weight: 700;
+        letter-spacing: 0.18em;
+      }
+
+      #s07-root .s07-status {
+        padding: 8px 14px;
+        border-radius: 999px;
+        font-size: 17px;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+      }
+
+      #s07-root .s07-waiting {
+        color: #c4a8ff;
+        background: rgba(139, 92, 246, 0.16);
+      }
+
+      #s07-root .s07-ready {
+        color: #2fe6a6;
+        background: rgba(47, 230, 166, 0.13);
+      }
+
+      #s07-root .s07-title-row {
+        gap: 18px;
+      }
+
+      #s07-root .s07-route-icon {
+        display: grid;
+        width: 66px;
+        height: 66px;
+        flex: 0 0 66px;
+        place-items: center;
+        border: 1px solid rgba(244, 247, 255, 0.18);
+        border-radius: 18px;
+        color: #f4f7ff;
+        background: rgba(244, 247, 255, 0.05);
+        font-size: 36px;
+      }
+
+      #s07-root h2 {
+        margin: 0;
+        font-size: 44px;
+        font-weight: 900;
+        line-height: 1.12;
+      }
+
+      #s07-root .s07-title-row p {
+        margin: 7px 0 0;
+        color: rgba(244, 247, 255, 0.68);
+        font-size: 21px;
+      }
+
+      #s07-root .s07-price {
+        justify-content: space-between;
+        margin: 25px 0 18px;
+        padding: 22px 24px;
+        border-radius: 18px;
+        background: rgba(244, 247, 255, 0.045);
+      }
+
+      #s07-root .s07-price span {
+        color: rgba(244, 247, 255, 0.64);
+        font-family: "PingFang SC", "Source Han Sans SC", sans-serif;
+        font-size: 19px;
+      }
+
+      #s07-root .s07-price strong {
+        color: #f4f7ff;
+        font-size: 46px;
+      }
+
+      #s07-root .s07-price small {
+        color: #35c2ff;
+        font-size: 16px;
+        font-weight: 700;
+      }
+
+      #s07-root .s07-metrics {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        margin: 0;
+      }
+
+      #s07-root .s07-metrics div {
+        padding: 18px 20px;
+        border-left: 2px solid rgba(244, 247, 255, 0.16);
+      }
+
+      #s07-root .s07-metrics dt {
+        margin-bottom: 9px;
+        color: rgba(244, 247, 255, 0.58);
+        font-family: "PingFang SC", "Source Han Sans SC", sans-serif;
+        font-size: 17px;
+      }
+
+      #s07-root .s07-metrics dd {
+        margin: 0;
+        font-size: 27px;
+        font-weight: 800;
+      }
+
+      #s07-root .s07-track {
+        position: relative;
+        display: flex;
+        justify-content: space-between;
+        margin-top: auto;
+        padding-top: 34px;
+        color: rgba(244, 247, 255, 0.7);
+        font-family: "JetBrains Mono", monospace;
+        font-size: 15px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #s07-root .s07-track::before {
+        position: absolute;
+        top: 17px;
+        right: 0;
+        left: 0;
+        height: 3px;
+        border-radius: 2px;
+        background: linear-gradient(90deg, #ff4d67 0 17%, #8b5cf6 50%, #35c2ff 100%);
+        content: "";
+      }
+
+      #s07-root .s07-track span::before {
+        position: absolute;
+        top: 11px;
+        width: 14px;
+        height: 14px;
+        border: 3px solid #070a12;
+        border-radius: 50%;
+        background: currentColor;
+        content: "";
+      }
+
+      #s07-root .s07-track-stop {
+        color: #ff7589;
+      }
+
+      #s07-root .s07-track-stop::before {
+        left: 0;
+      }
+
+      #s07-root .s07-track-entry {
+        color: #c4a8ff;
+      }
+
+      #s07-root .s07-track-entry::before {
+        left: 49%;
+      }
+
+      #s07-root .s07-track-range {
+        color: #69d3ff;
+      }
+
+      #s07-root .s07-track-range::before {
+        right: 0;
+      }
+
+      #s07-root .s07-track-entry-ready {
+        color: rgba(196, 168, 255, 0.75);
+      }
+
+      #s07-root .s07-track-range-ready {
+        color: #2fe6a6;
+      }
+
+      #s07-root .s07-divider {
+        display: flex;
+        width: 56px;
+        flex: 0 0 56px;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+      }
+
+      #s07-root .s07-divider span {
+        width: 1px;
+        flex: 1;
+        background: rgba(244, 247, 255, 0.12);
+      }
+
+      #s07-root .s07-divider b {
+        color: rgba(244, 247, 255, 0.62);
+        font-family: "JetBrains Mono", monospace;
+        font-size: 16px;
+        white-space: nowrap;
+        transform: rotate(-90deg);
+      }
+
+      #s07-root .s07-footer {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+      }
+
+      #s07-root .s07-footer span {
+        padding: 10px 18px;
+        border: 1px solid rgba(53, 194, 255, 0.22);
+        border-radius: 999px;
+        color: rgba(244, 247, 255, 0.76);
+        background: rgba(53, 194, 255, 0.06);
+        font-size: 18px;
+      }
+    </style>
+  </div>
+</template>

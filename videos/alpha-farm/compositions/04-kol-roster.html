@@ -1,0 +1,371 @@
+<template id="alpha-farm-kol-roster-template">
+  <div
+    id="scene-kol-roster"
+    data-composition-id="alpha-farm-kol-roster"
+    data-width="1920"
+    data-height="1080"
+    data-duration="21"
+  >
+    <div class="scene-content">
+      <header class="scene-header">
+        <div>
+          <p class="eyebrow">12 SOURCES · 4 FEATURED</p>
+          <h1>聊天很多，策略很克制</h1>
+        </div>
+        <div class="signal-note">
+          <span class="signal-dot"></span>
+          数据库内信号相对稀疏
+        </div>
+      </header>
+
+      <section class="featured-grid" aria-label="重点 KOL 阵容">
+        <article class="kol-card kol-card-blue">
+          <div class="kol-identity">
+            <div class="avatar">
+              <span data-layout-allow-occlusion>镖</span>
+              <img
+                src="assets/private/avatars/dabiaoke-placeholder.svg"
+                alt="大镖客头像"
+                onerror="this.style.display='none'"
+              />
+            </div>
+            <div>
+              <h2>大镖客</h2>
+              <p>区间入场 · 多目标</p>
+            </div>
+          </div>
+          <div class="message-card">
+            <div class="message-fallback" data-layout-allow-occlusion>
+              <strong>BTC · SHORT</strong>
+              <span>71000–71800</span>
+              <span>SL 72300</span>
+              <span>TP 70300 / 69600 / 68900</span>
+            </div>
+            <img
+              src="assets/private/messages/dabiaoke.svg"
+              alt="大镖客脱敏策略消息"
+              onerror="this.style.display='none'"
+            />
+          </div>
+        </article>
+
+        <article class="kol-card kol-card-violet">
+          <div class="kol-identity">
+            <div class="avatar">
+              <span data-layout-allow-occlusion>飞</span>
+              <img
+                src="assets/private/avatars/bitcoin-feiyang-placeholder.svg"
+                alt="比特币飞扬头像"
+                onerror="this.style.display='none'"
+              />
+            </div>
+            <div>
+              <h2>比特币飞扬</h2>
+              <p>极简模板 · 字段明确</p>
+            </div>
+          </div>
+          <div class="message-card">
+            <div class="message-fallback" data-layout-allow-occlusion>
+              <strong>BTC · SHORT</strong>
+              <span>72250 附近</span>
+              <span>SL 74141</span>
+              <span>TP 68800</span>
+            </div>
+            <img
+              src="assets/private/messages/bitcoin-feiyang.svg"
+              alt="比特币飞扬脱敏策略消息"
+              onerror="this.style.display='none'"
+            />
+          </div>
+        </article>
+
+        <article class="kol-card kol-card-green">
+          <div class="kol-identity">
+            <div class="avatar">
+              <span data-layout-allow-occlusion>峰</span>
+              <img
+                src="assets/private/avatars/fengge-placeholder.svg"
+                alt="峰哥头像"
+                onerror="this.style.display='none'"
+              />
+            </div>
+            <div>
+              <h2>峰哥</h2>
+              <p>ETH 现价 · 轻仓提示</p>
+            </div>
+          </div>
+          <div class="message-card">
+            <div class="message-fallback" data-layout-allow-occlusion>
+              <strong>ETH · SHORT</strong>
+              <span>现价 1688</span>
+              <span>SL 1730</span>
+              <span>TP 1610 · 轻仓</span>
+            </div>
+            <img
+              src="assets/private/messages/fengge.svg"
+              alt="峰哥脱敏策略消息"
+              onerror="this.style.display='none'"
+            />
+          </div>
+        </article>
+
+        <article class="kol-card kol-card-red">
+          <div class="kol-identity">
+            <div class="avatar">
+              <span data-layout-allow-occlusion>智</span>
+              <img
+                src="assets/private/avatars/bitezhi-zhige-placeholder.svg"
+                alt="比特智智哥头像"
+                onerror="this.style.display='none'"
+              />
+            </div>
+            <div>
+              <h2>比特智 智哥</h2>
+              <p>左侧挂单 · 后续管理</p>
+            </div>
+          </div>
+          <div class="message-card">
+            <div class="message-fallback" data-layout-allow-occlusion>
+              <strong>BTC · LIMIT SHORT</strong>
+              <span>65720</span>
+              <span>SL 67200</span>
+              <span>TP 63800 / 62800</span>
+            </div>
+            <img
+              src="assets/private/messages/bitezhi-zhige.svg"
+              alt="比特智智哥脱敏策略消息"
+              onerror="this.style.display='none'"
+            />
+          </div>
+        </article>
+      </section>
+
+      <footer class="roster-footer">
+        <div class="mini-roster" aria-label="其余信息源">
+          <span>橙</span><span>林</span><span>海</span><span>链</span>
+          <span>量</span><span>航</span><span>辰</span><span>川</span>
+        </div>
+        <p>数百条聊天 <b>≠</b> 数百条策略</p>
+        <small>只展示脱敏样本，不代表胜率或收益承诺</small>
+      </footer>
+    </div>
+
+    <style>
+      @font-face {
+        font-family: "PingFang SC";
+        src: local("PingFang SC");
+      }
+
+      @font-face {
+        font-family: "Source Han Sans SC";
+        src: local("Source Han Sans SC");
+      }
+
+      #scene-kol-roster {
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        color: #f4f7ff;
+        background-color: #070a12;
+        font-family: "PingFang SC", "Source Han Sans SC", sans-serif;
+      }
+
+      #scene-kol-roster * {
+        box-sizing: border-box;
+      }
+
+      #scene-kol-roster .scene-content {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: 100%;
+        padding: 78px 112px 66px;
+        gap: 34px;
+        background:
+          radial-gradient(circle at 86% 12%, rgba(139, 92, 246, 0.13), transparent 28%),
+          linear-gradient(rgba(53, 194, 255, 0.035) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(53, 194, 255, 0.035) 1px, transparent 1px);
+        background-size: auto, 64px 64px, 64px 64px;
+      }
+
+      #scene-kol-roster .scene-header,
+      #scene-kol-roster .roster-footer {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+      }
+
+      #scene-kol-roster .eyebrow {
+        margin: 0 0 10px;
+        color: #35c2ff;
+        font: 700 18px/1.2 "Space Grotesk", sans-serif;
+        letter-spacing: 0.18em;
+      }
+
+      #scene-kol-roster h1 {
+        margin: 0;
+        font-size: 68px;
+        line-height: 1.12;
+        letter-spacing: -0.04em;
+      }
+
+      #scene-kol-roster .signal-note {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 14px 20px;
+        color: #2fe6a6;
+        border: 1px solid rgba(47, 230, 166, 0.34);
+        border-radius: 999px;
+        background: rgba(47, 230, 166, 0.07);
+        font-size: 20px;
+      }
+
+      #scene-kol-roster .signal-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #2fe6a6;
+        box-shadow: 0 0 18px rgba(47, 230, 166, 0.8);
+      }
+
+      #scene-kol-roster .featured-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        flex: 1;
+        gap: 22px;
+        min-height: 0;
+      }
+
+      #scene-kol-roster .kol-card {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        padding: 24px;
+        gap: 20px;
+        border: 1px solid rgba(244, 247, 255, 0.12);
+        border-radius: 24px;
+        background: rgba(14, 20, 35, 0.9);
+        box-shadow: 0 22px 58px rgba(0, 0, 0, 0.24);
+      }
+
+      #scene-kol-roster .kol-card-blue { border-top-color: #35c2ff; }
+      #scene-kol-roster .kol-card-violet { border-top-color: #8b5cf6; }
+      #scene-kol-roster .kol-card-green { border-top-color: #2fe6a6; }
+      #scene-kol-roster .kol-card-red { border-top-color: #ff4d67; }
+
+      #scene-kol-roster .kol-identity {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+
+      #scene-kol-roster .avatar {
+        position: relative;
+        display: grid;
+        place-items: center;
+        flex: 0 0 74px;
+        width: 74px;
+        height: 74px;
+        overflow: hidden;
+        color: #f4f7ff;
+        border: 1px solid rgba(53, 194, 255, 0.42);
+        border-radius: 20px;
+        background: linear-gradient(145deg, rgba(53, 194, 255, 0.24), rgba(139, 92, 246, 0.2));
+        font-size: 30px;
+        font-weight: 700;
+      }
+
+      #scene-kol-roster .avatar img {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      #scene-kol-roster h2 {
+        margin: 0 0 6px;
+        font-size: 27px;
+        line-height: 1.15;
+      }
+
+      #scene-kol-roster .kol-identity p {
+        margin: 0;
+        color: rgba(244, 247, 255, 0.58);
+        font-size: 17px;
+      }
+
+      #scene-kol-roster .message-card {
+        position: relative;
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
+        border: 1px solid rgba(53, 194, 255, 0.13);
+        border-radius: 18px;
+        background: #0a1020;
+      }
+
+      #scene-kol-roster .message-card > img {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: #0a1020;
+      }
+
+      #scene-kol-roster .message-fallback {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        height: 100%;
+        padding: 22px;
+        gap: 13px;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 17px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #scene-kol-roster .message-fallback strong {
+        color: #35c2ff;
+        font-size: 19px;
+      }
+
+      #scene-kol-roster .roster-footer {
+        min-height: 68px;
+      }
+
+      #scene-kol-roster .mini-roster {
+        display: flex;
+      }
+
+      #scene-kol-roster .mini-roster span {
+        display: grid;
+        place-items: center;
+        width: 46px;
+        height: 46px;
+        margin-right: -9px;
+        color: rgba(244, 247, 255, 0.78);
+        border: 2px solid #070a12;
+        border-radius: 50%;
+        background: #172039;
+        font-size: 17px;
+      }
+
+      #scene-kol-roster .roster-footer p {
+        margin: 0;
+        font-size: 26px;
+      }
+
+      #scene-kol-roster .roster-footer b {
+        color: #ff4d67;
+      }
+
+      #scene-kol-roster .roster-footer small {
+        color: rgba(244, 247, 255, 0.5);
+        font-size: 16px;
+      }
+    </style>
+  </div>
+</template>

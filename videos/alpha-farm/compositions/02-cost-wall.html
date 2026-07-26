@@ -1,0 +1,338 @@
+<template id="alpha-farm-cost-wall-template">
+  <div
+    id="alpha-farm-cost-wall-root"
+    data-composition-id="alpha-farm-cost-wall"
+    data-width="1920"
+    data-height="1080"
+  >
+    <div class="scene-content cost-scene">
+      <div class="decorative-grid" data-layout-ignore></div>
+      <div class="decorative-glow cost-glow" data-layout-ignore></div>
+
+      <header class="cost-heading">
+        <div>
+          <p class="scene-kicker">ACCESS COST / SIX MONTHS</p>
+          <h1 class="scene-title">上万美元的信息门槛</h1>
+        </div>
+        <div class="cost-period data-text">每个群 · 约 $1,000 / 半年</div>
+      </header>
+
+      <main class="cost-flow">
+        <section class="fee-wall panel" aria-label="十几个 KOL 群费用">
+          <div class="fee-wall-header">
+            <span>KOL GROUPS</span>
+            <span class="data-text">10+ SOURCES</span>
+          </div>
+          <div class="fee-grid">
+            <div class="fee-card"><strong>KOL 01</strong><span>$1,000</span></div>
+            <div class="fee-card"><strong>KOL 02</strong><span>$1,000</span></div>
+            <div class="fee-card"><strong>KOL 03</strong><span>$1,000</span></div>
+            <div class="fee-card"><strong>KOL 04</strong><span>$1,000</span></div>
+            <div class="fee-card"><strong>KOL 05</strong><span>$1,000</span></div>
+            <div class="fee-card"><strong>KOL 06</strong><span>$1,000</span></div>
+            <div class="fee-card"><strong>KOL 07</strong><span>$1,000</span></div>
+            <div class="fee-card"><strong>KOL 08</strong><span>$1,000</span></div>
+            <div class="fee-card"><strong>KOL 09</strong><span>$1,000</span></div>
+            <div class="fee-card"><strong>KOL 10+</strong><span>$1,000</span></div>
+          </div>
+        </section>
+
+        <section class="cost-equation" aria-label="费用累加公式">
+          <div class="equation-step data-text">$1,000 / 6个月</div>
+          <div class="equation-operator data-text">× 10+ KOL</div>
+          <div class="equation-rule"></div>
+          <div class="equation-total data-text">$10,000+</div>
+          <div class="equation-caption">正常信息门槛 / 半年</div>
+        </section>
+
+        <section class="aggregation panel" aria-label="低成本信息聚合渠道">
+          <div class="aggregation-badge data-text">LOW-COST ACCESS</div>
+          <div class="aggregation-icon">
+            <span></span>
+            <span></span>
+            <span></span>
+            <strong>Σ</strong>
+          </div>
+          <h2>低成本信息聚合渠道</h2>
+          <p>把十几个经过筛选的付费信息源，汇入同一套 AI 流程。</p>
+          <div class="worker-note">
+            <span class="status-dot"></span>
+            <span>信息搬运工：通路已建立</span>
+          </div>
+          <div class="destination data-text">
+            <span>10+ INPUTS</span>
+            <span>→</span>
+            <strong>ALPHA FARM</strong>
+          </div>
+        </section>
+      </main>
+
+      <footer class="cost-disclaimer">
+        聚合的是信息入口；交易前仍需 AI 理解、规则过滤与统一风控。
+      </footer>
+    </div>
+
+    <style>
+      #alpha-farm-cost-wall-root .cost-scene {
+        gap: 34px;
+      }
+
+      #alpha-farm-cost-wall-root .cost-glow {
+        right: 130px;
+        bottom: -180px;
+        width: 620px;
+        height: 620px;
+        background: rgba(139, 92, 246, 0.2);
+      }
+
+      #alpha-farm-cost-wall-root .cost-heading {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+      }
+
+      #alpha-farm-cost-wall-root .cost-heading > div:first-child {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+
+      #alpha-farm-cost-wall-root .cost-period {
+        padding: 15px 20px;
+        border: 1px solid rgba(255, 77, 103, 0.5);
+        border-radius: 10px;
+        color: var(--primary-text);
+        background: rgba(255, 77, 103, 0.08);
+        font-size: 20px;
+        font-weight: 700;
+      }
+
+      #alpha-farm-cost-wall-root .cost-flow {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        align-items: stretch;
+        flex: 1;
+        gap: 32px;
+        min-height: 0;
+      }
+
+      #alpha-farm-cost-wall-root .fee-wall {
+        display: flex;
+        flex: 1.15;
+        flex-direction: column;
+        padding: 30px;
+        gap: 22px;
+      }
+
+      #alpha-farm-cost-wall-root .fee-wall-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        color: var(--primary-text);
+        font-family: var(--font-latin);
+        font-size: 17px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+      }
+
+      #alpha-farm-cost-wall-root .fee-wall-header span:last-child {
+        color: var(--electric-blue);
+      }
+
+      #alpha-farm-cost-wall-root .fee-grid {
+        display: grid;
+        flex: 1;
+        grid-template-columns: repeat(2, 1fr);
+        grid-template-rows: repeat(5, 1fr);
+        gap: 12px;
+      }
+
+      #alpha-farm-cost-wall-root .fee-card {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 68px;
+        padding: 0 18px;
+        border-left: 3px solid var(--electric-blue);
+        border-radius: 8px;
+        color: var(--primary-text);
+        background: rgba(53, 194, 255, 0.07);
+        font-family: var(--font-data);
+        font-size: 16px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #alpha-farm-cost-wall-root .fee-card strong {
+        color: var(--primary-text);
+        font-size: 14px;
+        letter-spacing: 0.08em;
+      }
+
+      #alpha-farm-cost-wall-root .fee-card span {
+        color: var(--electric-blue);
+        font-size: 21px;
+        font-weight: 800;
+      }
+
+      #alpha-farm-cost-wall-root .cost-equation {
+        display: flex;
+        flex: 0.82;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        padding: 30px 18px;
+        gap: 18px;
+        text-align: center;
+      }
+
+      #alpha-farm-cost-wall-root .equation-step {
+        color: var(--primary-text);
+        font-size: 26px;
+        font-weight: 700;
+      }
+
+      #alpha-farm-cost-wall-root .equation-operator {
+        color: var(--ai-violet);
+        font-size: 29px;
+        font-weight: 800;
+      }
+
+      #alpha-farm-cost-wall-root .equation-rule {
+        width: 100%;
+        height: 2px;
+        background: var(--electric-blue);
+        box-shadow: 0 0 18px rgba(53, 194, 255, 0.7);
+      }
+
+      #alpha-farm-cost-wall-root .equation-total {
+        color: var(--primary-text);
+        font-size: 58px;
+        font-weight: 900;
+        letter-spacing: -0.06em;
+        text-shadow: 0 0 30px rgba(255, 77, 103, 0.32);
+      }
+
+      #alpha-farm-cost-wall-root .equation-caption {
+        color: var(--risk-red);
+        font-size: 19px;
+        font-weight: 700;
+      }
+
+      #alpha-farm-cost-wall-root .aggregation {
+        display: flex;
+        flex: 1;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        padding: 32px;
+        gap: 20px;
+        text-align: center;
+        border-color: rgba(139, 92, 246, 0.55);
+      }
+
+      #alpha-farm-cost-wall-root .aggregation-badge {
+        padding: 8px 13px;
+        border-radius: 7px;
+        color: var(--ai-violet);
+        background: rgba(139, 92, 246, 0.11);
+        font-size: 14px;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+      }
+
+      #alpha-farm-cost-wall-root .aggregation-icon {
+        position: relative;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 132px;
+        height: 132px;
+        border: 2px solid var(--ai-violet);
+        border-radius: 50%;
+        background: var(--canvas);
+        box-shadow: 0 0 44px rgba(139, 92, 246, 0.36);
+      }
+
+      #alpha-farm-cost-wall-root .aggregation-icon span {
+        position: absolute;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: var(--electric-blue);
+        box-shadow: 0 0 12px rgba(53, 194, 255, 0.8);
+      }
+
+      #alpha-farm-cost-wall-root .aggregation-icon span:nth-child(1) {
+        top: 14px;
+        left: 25px;
+      }
+
+      #alpha-farm-cost-wall-root .aggregation-icon span:nth-child(2) {
+        top: 14px;
+        right: 25px;
+      }
+
+      #alpha-farm-cost-wall-root .aggregation-icon span:nth-child(3) {
+        bottom: 15px;
+      }
+
+      #alpha-farm-cost-wall-root .aggregation-icon strong {
+        color: var(--primary-text);
+        font-family: var(--font-data);
+        font-size: 60px;
+      }
+
+      #alpha-farm-cost-wall-root .aggregation h2 {
+        color: var(--primary-text);
+        font-size: 32px;
+        font-weight: 900;
+        line-height: 1.25;
+      }
+
+      #alpha-farm-cost-wall-root .aggregation p {
+        max-width: 390px;
+        color: var(--primary-text);
+        font-size: 20px;
+        line-height: 1.55;
+      }
+
+      #alpha-farm-cost-wall-root .worker-note {
+        display: flex;
+        align-items: center;
+        padding: 10px 14px;
+        border: 1px solid rgba(47, 230, 166, 0.35);
+        border-radius: 8px;
+        color: var(--safety-green);
+        background: rgba(47, 230, 166, 0.07);
+        font-size: 17px;
+        font-weight: 700;
+      }
+
+      #alpha-farm-cost-wall-root .destination {
+        display: flex;
+        align-items: center;
+        margin-top: 4px;
+        gap: 12px;
+        color: var(--electric-blue);
+        font-size: 16px;
+        font-weight: 700;
+      }
+
+      #alpha-farm-cost-wall-root .destination strong {
+        color: var(--primary-text);
+      }
+
+      #alpha-farm-cost-wall-root .cost-disclaimer {
+        position: relative;
+        z-index: 2;
+        padding-left: 18px;
+        border-left: 3px solid var(--safety-green);
+        color: var(--primary-text);
+        font-size: 19px;
+      }
+    </style>
+  </div>
+</template>

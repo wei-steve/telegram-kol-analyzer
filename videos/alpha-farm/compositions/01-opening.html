@@ -1,0 +1,293 @@
+<template id="alpha-farm-opening-template">
+  <div
+    id="alpha-farm-opening-root"
+    data-composition-id="alpha-farm-opening"
+    data-width="1920"
+    data-height="1080"
+  >
+    <div class="scene-content opening-scene">
+      <div class="decorative-grid" data-layout-ignore></div>
+      <div class="decorative-glow opening-glow-blue" data-layout-ignore></div>
+      <div class="decorative-glow opening-glow-violet" data-layout-ignore></div>
+
+      <header class="opening-header">
+        <div class="scene-kicker">AI-NATIVE TRADING CONTROL ROOM</div>
+        <div class="status-pill">
+          <span class="status-dot"></span>
+          10+ KOL ONLINE
+        </div>
+      </header>
+
+      <main class="opening-hero">
+        <section class="opening-copy">
+          <p class="opening-hook">我没有雇交易员</p>
+          <h1 class="opening-title">Alpha 牧场</h1>
+          <p class="opening-subtitle">让 KOL 提供 Alpha，让 AI 负责执行</p>
+          <div class="opening-route data-text">
+            <span>TELEGRAM SIGNALS</span>
+            <span class="route-arrow">→</span>
+            <span>AI PIPELINE</span>
+          </div>
+        </section>
+
+        <section class="kol-network panel" aria-label="十几个 KOL 汇入 AI 中枢">
+          <div class="avatar-grid">
+            <div class="avatar-node"><span>大镖客</span><small>BTC</small></div>
+            <div class="avatar-node"><span>飞扬</span><small>BTC</small></div>
+            <div class="avatar-node"><span>峰哥</span><small>ETH</small></div>
+            <div class="avatar-node"><span>智哥</span><small>ORDER</small></div>
+            <div class="avatar-node"><span>K05</span><small>ONLINE</small></div>
+            <div class="avatar-node"><span>K06</span><small>ONLINE</small></div>
+            <div class="avatar-node"><span>K07</span><small>ONLINE</small></div>
+            <div class="avatar-node"><span>K08</span><small>ONLINE</small></div>
+            <div class="avatar-node"><span>K09</span><small>ONLINE</small></div>
+            <div class="avatar-node"><span>K10</span><small>ONLINE</small></div>
+            <div class="avatar-node"><span>K11</span><small>ONLINE</small></div>
+            <div class="avatar-node"><span>K12</span><small>ONLINE</small></div>
+          </div>
+
+          <div class="ai-core">
+            <span class="core-orbit"></span>
+            <span class="core-label data-text">AI</span>
+            <small>REASONING CORE</small>
+          </div>
+
+          <div class="message-stack" aria-label="策略消息流">
+            <div class="message-chip data-text">BTC / SHORT / SL ✓</div>
+            <div class="message-chip data-text">ETH / ENTRY / TP ✓</div>
+            <div class="message-chip data-text">ORDER UPDATE / ✓</div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="opening-footer data-text">
+        <span>INFORMATION</span>
+        <span>→</span>
+        <span>DISCIPLINE</span>
+        <span>→</span>
+        <span>EXECUTION</span>
+      </footer>
+    </div>
+
+    <style>
+      #alpha-farm-opening-root .opening-scene {
+        justify-content: space-between;
+      }
+
+      #alpha-farm-opening-root .opening-glow-blue {
+        top: 80px;
+        right: 60px;
+        width: 520px;
+        height: 520px;
+        background: rgba(53, 194, 255, 0.2);
+      }
+
+      #alpha-farm-opening-root .opening-glow-violet {
+        right: 530px;
+        bottom: -160px;
+        width: 500px;
+        height: 500px;
+        background: rgba(139, 92, 246, 0.18);
+      }
+
+      #alpha-farm-opening-root .opening-header,
+      #alpha-farm-opening-root .opening-footer {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      #alpha-farm-opening-root .opening-hero {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        align-items: center;
+        flex: 1;
+        gap: 72px;
+        min-height: 0;
+      }
+
+      #alpha-farm-opening-root .opening-copy {
+        display: flex;
+        flex: 0 0 650px;
+        flex-direction: column;
+        gap: 22px;
+      }
+
+      #alpha-farm-opening-root .opening-hook {
+        color: var(--electric-blue);
+        font-size: 30px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+      }
+
+      #alpha-farm-opening-root .opening-title {
+        color: var(--primary-text);
+        font-size: 126px;
+        font-weight: 900;
+        letter-spacing: -0.055em;
+        line-height: 0.98;
+        text-shadow:
+          5px 0 0 rgba(53, 194, 255, 0.14),
+          -5px 0 0 rgba(139, 92, 246, 0.15);
+      }
+
+      #alpha-farm-opening-root .opening-subtitle {
+        max-width: 610px;
+        color: var(--primary-text);
+        font-size: 33px;
+        font-weight: 350;
+        line-height: 1.5;
+      }
+
+      #alpha-farm-opening-root .opening-route {
+        display: flex;
+        align-items: center;
+        width: max-content;
+        margin-top: 18px;
+        padding: 14px 18px;
+        gap: 15px;
+        border-left: 3px solid var(--ai-violet);
+        color: var(--primary-text);
+        background: rgba(139, 92, 246, 0.08);
+        font-size: 16px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+      }
+
+      #alpha-farm-opening-root .route-arrow {
+        color: var(--ai-violet);
+        font-size: 24px;
+      }
+
+      #alpha-farm-opening-root .kol-network {
+        position: relative;
+        display: flex;
+        flex: 1;
+        align-items: center;
+        justify-content: center;
+        align-self: stretch;
+        min-width: 0;
+        min-height: 590px;
+        padding: 42px;
+        overflow: hidden;
+      }
+
+      #alpha-farm-opening-root .avatar-grid {
+        display: grid;
+        width: 100%;
+        height: 100%;
+        grid-template-columns: repeat(6, 1fr);
+        grid-template-rows: repeat(2, 1fr);
+        column-gap: 14px;
+        row-gap: 220px;
+      }
+
+      #alpha-farm-opening-root .avatar-node {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        gap: 6px;
+        min-height: 0;
+        border: 1px solid rgba(53, 194, 255, 0.36);
+        border-radius: 18px;
+        color: var(--primary-text);
+        background: rgba(7, 10, 18, 0.82);
+        box-shadow: inset 0 0 22px rgba(53, 194, 255, 0.05);
+        font-size: 22px;
+        font-weight: 700;
+      }
+
+      #alpha-farm-opening-root .avatar-node small {
+        color: var(--electric-blue);
+        font-family: var(--font-data);
+        font-size: 13px;
+        letter-spacing: 0.08em;
+      }
+
+      #alpha-farm-opening-root .avatar-node:nth-child(3),
+      #alpha-farm-opening-root .avatar-node:nth-child(4),
+      #alpha-farm-opening-root .avatar-node:nth-child(9),
+      #alpha-farm-opening-root .avatar-node:nth-child(10) {
+        border-color: rgba(139, 92, 246, 0.62);
+      }
+
+      #alpha-farm-opening-root .ai-core {
+        position: absolute;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        width: 196px;
+        height: 196px;
+        gap: 8px;
+        border: 2px solid var(--ai-violet);
+        border-radius: 50%;
+        color: var(--primary-text);
+        background: var(--canvas);
+        box-shadow:
+          0 0 0 18px rgba(139, 92, 246, 0.08),
+          0 0 72px rgba(139, 92, 246, 0.42);
+      }
+
+      #alpha-farm-opening-root .core-orbit {
+        position: absolute;
+        inset: 18px;
+        border: 1px solid rgba(53, 194, 255, 0.5);
+        border-radius: 50%;
+      }
+
+      #alpha-farm-opening-root .core-label {
+        color: var(--primary-text);
+        font-size: 74px;
+        font-weight: 900;
+        letter-spacing: -0.08em;
+        line-height: 1;
+      }
+
+      #alpha-farm-opening-root .ai-core small {
+        color: var(--ai-violet);
+        font-family: var(--font-data);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+      }
+
+      #alpha-farm-opening-root .message-stack {
+        position: absolute;
+        right: 34px;
+        top: 50%;
+        display: flex;
+        align-items: flex-end;
+        flex-direction: column;
+        gap: 8px;
+        transform: translateY(-50%);
+      }
+
+      #alpha-farm-opening-root .message-chip {
+        padding: 8px 12px;
+        border: 1px solid rgba(47, 230, 166, 0.3);
+        border-radius: 8px;
+        color: var(--safety-green);
+        background: var(--canvas);
+        font-size: 12px;
+      }
+
+      #alpha-farm-opening-root .opening-footer {
+        justify-content: flex-start;
+        gap: 22px;
+        color: var(--primary-text);
+        font-size: 16px;
+        font-weight: 700;
+        letter-spacing: 0.16em;
+      }
+
+      #alpha-farm-opening-root .opening-footer span:nth-child(even) {
+        color: var(--electric-blue);
+      }
+    </style>
+  </div>
+</template>

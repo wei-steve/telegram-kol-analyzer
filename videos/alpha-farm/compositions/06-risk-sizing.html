@@ -1,0 +1,448 @@
+<template id="alpha-farm-risk-sizing-template">
+  <div
+    id="scene-risk-sizing"
+    data-composition-id="alpha-farm-risk-sizing"
+    data-width="1920"
+    data-height="1080"
+    data-duration="42"
+  >
+    <div class="scene-content">
+      <header class="scene-header">
+        <div>
+          <p class="eyebrow">MAXIMUM LOSS FIRST</p>
+          <h1>先确定能亏多少，再反推仓位</h1>
+        </div>
+        <div class="demo-badge">演示数字 · 非账户规模</div>
+      </header>
+
+      <section class="risk-budget">
+        <div class="budget-label">
+          <span>单笔最大预设亏损</span>
+          <strong>100 <small>USDT</small></strong>
+        </div>
+        <div class="budget-split">
+          <div><span>贪婪腿风险</span><strong>50 USDT</strong></div>
+          <div class="split-mark">50 / 50</div>
+          <div><span>保守腿风险</span><strong>50 USDT</strong></div>
+        </div>
+      </section>
+
+      <main class="calculation-area">
+        <section class="price-ruler" aria-label="价格与固定止损距离">
+          <div class="ruler-title">
+            <span>BTC LONG · 价格距离</span>
+            <strong>固定止损决定仓位</strong>
+          </div>
+          <div class="axis">
+            <div class="axis-line"></div>
+            <div class="tick stop">
+              <i></i>
+              <strong>61,500</strong>
+              <span>固定止损</span>
+            </div>
+            <div class="tick greedy">
+              <i></i>
+              <strong>62,000</strong>
+              <span>贪婪入场</span>
+            </div>
+            <div class="tick conservative">
+              <i></i>
+              <strong>62,400</strong>
+              <span>保守入场</span>
+            </div>
+            <div class="distance distance-one" data-layout-allow-overflow><b>500 USDT 距离</b></div>
+            <div class="distance distance-two" data-layout-allow-overflow><b>900 USDT 距离</b></div>
+          </div>
+        </section>
+
+        <section class="formula-grid">
+          <article class="formula-card greedy-card">
+            <div class="formula-heading">
+              <span>贪婪腿</span>
+              <b>RISK 50 USDT</b>
+            </div>
+            <div class="formula">50 ÷ (62,000 − 61,500)</div>
+            <div class="result">= 0.1 <small>BTC</small></div>
+          </article>
+
+          <article class="formula-card conservative-card">
+            <div class="formula-heading">
+              <span>保守腿</span>
+              <b>RISK 50 USDT</b>
+            </div>
+            <div class="formula">50 ÷ (62,400 − 61,500)</div>
+            <div class="result">≈ 0.0556 <small>BTC</small></div>
+          </article>
+        </section>
+      </main>
+
+      <footer class="risk-total">
+        <div class="verified">✓</div>
+        <div>
+          <span>两腿全部成交并触发止损</span>
+          <strong>50 + 50 = 100 USDT 最大预设亏损</strong>
+        </div>
+        <p>杠杆只影响保证金占用，<b>不改变预设风险</b></p>
+      </footer>
+    </div>
+
+    <style>
+      @font-face {
+        font-family: "PingFang SC";
+        src: local("PingFang SC");
+      }
+
+      @font-face {
+        font-family: "Source Han Sans SC";
+        src: local("Source Han Sans SC");
+      }
+
+      #scene-risk-sizing {
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        color: #f4f7ff;
+        background-color: #070a12;
+        font-family: "PingFang SC", "Source Han Sans SC", sans-serif;
+      }
+
+      #scene-risk-sizing * {
+        box-sizing: border-box;
+      }
+
+      #scene-risk-sizing .scene-content {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: 100%;
+        padding: 58px 110px 190px;
+        gap: 18px;
+        background:
+          radial-gradient(circle at 22% 40%, rgba(53, 194, 255, 0.11), transparent 27%),
+          radial-gradient(circle at 79% 53%, rgba(139, 92, 246, 0.1), transparent 27%);
+      }
+
+      #scene-risk-sizing .scene-header {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+      }
+
+      #scene-risk-sizing .eyebrow {
+        margin: 0 0 10px;
+        color: #35c2ff;
+        font: 700 18px/1.2 "Space Grotesk", sans-serif;
+        letter-spacing: 0.18em;
+      }
+
+      #scene-risk-sizing h1 {
+        margin: 0;
+        font-size: 64px;
+        line-height: 1.12;
+        letter-spacing: -0.04em;
+      }
+
+      #scene-risk-sizing .demo-badge {
+        padding: 13px 19px;
+        color: #f4f7ff;
+        border: 1px solid rgba(244, 247, 255, 0.18);
+        border-radius: 999px;
+        background: rgba(244, 247, 255, 0.05);
+        font-size: 17px;
+      }
+
+      #scene-risk-sizing .risk-budget {
+        display: grid;
+        grid-template-columns: 0.7fr 1.3fr;
+        min-height: 112px;
+        border: 1px solid rgba(53, 194, 255, 0.24);
+        border-radius: 22px;
+        background: rgba(12, 19, 34, 0.92);
+      }
+
+      #scene-risk-sizing .budget-label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 22px 30px;
+        border-right: 1px solid rgba(53, 194, 255, 0.16);
+      }
+
+      #scene-risk-sizing .budget-label span {
+        color: rgba(244, 247, 255, 0.62);
+        font-size: 20px;
+      }
+
+      #scene-risk-sizing .budget-label strong {
+        color: #35c2ff;
+        font: 700 48px/1 "JetBrains Mono", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #scene-risk-sizing .budget-label small,
+      #scene-risk-sizing .result small {
+        font-size: 19px;
+      }
+
+      #scene-risk-sizing .budget-split {
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        padding: 18px 30px;
+        gap: 26px;
+      }
+
+      #scene-risk-sizing .budget-split > div:not(.split-mark) {
+        display: flex;
+        flex-direction: column;
+        gap: 9px;
+      }
+
+      #scene-risk-sizing .budget-split span {
+        color: rgba(244, 247, 255, 0.55);
+        font-size: 17px;
+      }
+
+      #scene-risk-sizing .budget-split strong {
+        font: 700 27px/1.1 "JetBrains Mono", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #scene-risk-sizing .split-mark {
+        display: grid;
+        place-items: center;
+        width: 84px;
+        height: 44px;
+        color: #9367f7;
+        border: 1px solid rgba(139, 92, 246, 0.4);
+        border-radius: 999px;
+        background: rgba(139, 92, 246, 0.09);
+        font: 700 16px/1 "JetBrains Mono", monospace;
+      }
+
+      #scene-risk-sizing .calculation-area {
+        display: grid;
+        grid-template-columns: 0.84fr 1.16fr;
+        flex: 1;
+        gap: 24px;
+        min-height: 0;
+      }
+
+      #scene-risk-sizing .price-ruler,
+      #scene-risk-sizing .formula-card {
+        border: 1px solid rgba(244, 247, 255, 0.12);
+        border-radius: 22px;
+        background: rgba(12, 18, 31, 0.91);
+      }
+
+      #scene-risk-sizing .price-ruler {
+        display: flex;
+        flex-direction: column;
+        padding: 23px 28px;
+      }
+
+      #scene-risk-sizing .ruler-title {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+
+      #scene-risk-sizing .ruler-title span {
+        color: #35c2ff;
+        font: 700 16px/1 "Space Grotesk", sans-serif;
+        letter-spacing: 0.1em;
+      }
+
+      #scene-risk-sizing .ruler-title strong {
+        color: rgba(244, 247, 255, 0.55);
+        font-size: 16px;
+      }
+
+      #scene-risk-sizing .axis {
+        position: relative;
+        flex: 1;
+        margin: 34px 30px 0;
+      }
+
+      #scene-risk-sizing .axis-line {
+        position: absolute;
+        left: 18%;
+        right: 18%;
+        top: 50%;
+        height: 3px;
+        background: linear-gradient(90deg, #ff4d67, #35c2ff, #8b5cf6);
+        box-shadow: 0 0 18px rgba(53, 194, 255, 0.24);
+      }
+
+      #scene-risk-sizing .tick {
+        position: absolute;
+        top: calc(50% - 10px);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 7px;
+        transform: translateX(-50%);
+      }
+
+      #scene-risk-sizing .tick i {
+        width: 20px;
+        height: 20px;
+        border: 4px solid #070a12;
+        border-radius: 50%;
+      }
+
+      #scene-risk-sizing .tick strong {
+        margin-top: 10px;
+        font: 700 21px/1 "JetBrains Mono", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #scene-risk-sizing .tick span {
+        color: rgba(244, 247, 255, 0.58);
+        font-size: 16px;
+      }
+
+      #scene-risk-sizing .stop { left: 18%; }
+      #scene-risk-sizing .greedy { left: 52%; }
+      #scene-risk-sizing .conservative { left: 82%; }
+      #scene-risk-sizing .stop i { background: #ff4d67; }
+      #scene-risk-sizing .greedy i { background: #35c2ff; }
+      #scene-risk-sizing .conservative i { background: #8b5cf6; }
+
+      #scene-risk-sizing .distance {
+        position: absolute;
+        top: 25%;
+        height: 28px;
+        border-top: 1px solid rgba(244, 247, 255, 0.2);
+        border-left: 1px solid rgba(244, 247, 255, 0.2);
+        border-right: 1px solid rgba(244, 247, 255, 0.2);
+      }
+
+      #scene-risk-sizing .distance b {
+        position: absolute;
+        left: 50%;
+        bottom: 35px;
+        width: max-content;
+        transform: translateX(-50%);
+        color: rgba(244, 247, 255, 0.68);
+        font: 700 14px/1 "JetBrains Mono", monospace;
+      }
+
+      #scene-risk-sizing .distance-one {
+        left: 18%;
+        width: 34%;
+      }
+
+      #scene-risk-sizing .distance-two {
+        left: 18%;
+        width: 64%;
+        top: 15%;
+      }
+
+      #scene-risk-sizing .formula-grid {
+        display: grid;
+        grid-template-rows: repeat(2, minmax(0, 1fr));
+        gap: 18px;
+        min-height: 0;
+      }
+
+      #scene-risk-sizing .formula-card {
+        display: grid;
+        grid-template-columns: 1.3fr auto;
+        align-items: center;
+        padding: 22px 28px;
+        gap: 12px 24px;
+      }
+
+      #scene-risk-sizing .greedy-card {
+        border-left: 4px solid #35c2ff;
+      }
+
+      #scene-risk-sizing .conservative-card {
+        border-left: 4px solid #8b5cf6;
+      }
+
+      #scene-risk-sizing .formula-heading {
+        display: flex;
+        align-items: center;
+        grid-column: 1 / -1;
+        justify-content: space-between;
+      }
+
+      #scene-risk-sizing .formula-heading span {
+        font-size: 23px;
+        font-weight: 700;
+      }
+
+      #scene-risk-sizing .formula-heading b {
+        color: #2fe6a6;
+        font: 700 14px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.07em;
+      }
+
+      #scene-risk-sizing .formula {
+        font: 700 23px/1.2 "JetBrains Mono", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #scene-risk-sizing .result {
+        color: #35c2ff;
+        font: 700 34px/1 "JetBrains Mono", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #scene-risk-sizing .conservative-card .result {
+        color: #8b5cf6;
+      }
+
+      #scene-risk-sizing .risk-total {
+        display: flex;
+        align-items: center;
+        min-height: 92px;
+        padding: 18px 24px;
+        gap: 18px;
+        border: 1px solid rgba(47, 230, 166, 0.32);
+        border-radius: 20px;
+        background: rgba(47, 230, 166, 0.065);
+      }
+
+      #scene-risk-sizing .verified {
+        display: grid;
+        place-items: center;
+        width: 50px;
+        height: 50px;
+        color: #070a12;
+        border-radius: 50%;
+        background: #2fe6a6;
+        font-size: 26px;
+        font-weight: 900;
+      }
+
+      #scene-risk-sizing .risk-total > div:nth-child(2) {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      #scene-risk-sizing .risk-total span {
+        color: rgba(244, 247, 255, 0.58);
+        font-size: 16px;
+      }
+
+      #scene-risk-sizing .risk-total strong {
+        font: 700 24px/1.1 "JetBrains Mono", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #scene-risk-sizing .risk-total p {
+        margin-left: auto;
+        color: rgba(244, 247, 255, 0.67);
+        font-size: 19px;
+      }
+
+      #scene-risk-sizing .risk-total b {
+        color: #2fe6a6;
+      }
+    </style>
+  </div>
+</template>
