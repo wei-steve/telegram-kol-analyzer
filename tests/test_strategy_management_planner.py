@@ -54,6 +54,7 @@ class _ReadOnlyDeepcoin:
         self.tpsl_orders = list(tpsl_orders or [])
         self.position_reads = []
         self.tpsl_reads = []
+        self.ticker_reads = []
         self.write_calls = []
 
     def list_positions(self, *, inst_id=None):
@@ -65,6 +66,10 @@ class _ReadOnlyDeepcoin:
     def list_trigger_orders_pending(self, *, inst_id):
         self.tpsl_reads.append(inst_id)
         return [row for row in self.tpsl_orders if row.get("instId") == inst_id]
+
+    def get_ticker_quote(self, *, inst_id):
+        self.ticker_reads.append(inst_id)
+        raise AssertionError("planning must not read a volatile ticker")
 
     def place_order(self, payload):
         self.write_calls.append(("place_order", payload))
@@ -830,7 +835,7 @@ def test_full_exit_replaces_its_zero_leg_protection_recovery_block(
 
 
 @pytest.mark.parametrize(
-    "intent", ["adjust_stop_loss", "move_stop_to_break_even", "partial_take_profit"]
+    "intent", ["adjust_stop_loss", "partial_take_profit"]
 )
 def test_open_protection_incident_still_blocks_non_full_exit(
     monkeypatch, tmp_path, intent
@@ -853,6 +858,83 @@ def test_open_protection_incident_still_blocks_non_full_exit(
 
     assert result.status == "blocked"
     assert result.reason_code == "protection_recovery_required"
+
+
+def test_break_even_plans_one_market_managed_leg_per_exact_position_without_ticker(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="move_stop_to_break_even",
+        pos_ids=("pos-b-1", "pos-b-2"),
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin(
+        [
+            _position("pos-b-1", size="7", avg_px="64103.8"),
+            _position("pos-b-2", size="11", avg_px="64250.4"),
+        ]
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.intent == "move_stop_to_break_even"
+    assert result.batch.effective_action == "break_even_by_market"
+    assert result.batch.requested_fraction is None
+    assert result.batch.effective_fraction is None
+    assert [
+        (
+            leg.pos_id,
+            leg.preflight_size,
+            leg.avg_entry_price,
+            leg.quantity_step,
+            leg.planned_close_size,
+            leg.old_tpsl,
+            leg.planned_tpsl,
+        )
+        for leg in result.batch.legs
+    ] == [
+        ("pos-b-1", "7", "64103.8", "1", None, None, None),
+        ("pos-b-2", "11", "64250.4", "1", None, None, None),
+    ]
+    assert result.batch.target_snapshot["protection"] == {}
+    assert client.ticker_reads == []
+
+
+def test_break_even_planning_defers_open_protection_incident_to_market_decision(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory, intent="move_stop_to_break_even"
+    )
+    _persist_open_protection_incident(session_factory, binding_id=binding_id)
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin([_position()])
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.effective_action == "break_even_by_market"
+    assert result.batch.legs[0].old_tpsl is None
+    assert result.batch.legs[0].planned_tpsl is None
+    assert client.ticker_reads == []
 
 
 @pytest.mark.parametrize(
@@ -2020,7 +2102,7 @@ def test_full_exit_resolves_fully_restored_protection_failure_before_successor(
         reconciled=False,
         leg_statuses=("restored",),
         intent="move_stop_to_break_even",
-        effective_action="move_stop_to_break_even",
+        effective_action="break_even_by_market",
         reason_code="protection_replacement_failed_and_restored",
         protection_evidence=True,
     )

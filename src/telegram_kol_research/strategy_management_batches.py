@@ -62,13 +62,17 @@ def resolve_restored_protection_failure_for_full_exit_in_session(
     if len(active) != 1:
         return "blocked"
     batch = active[0]
+    supported_protection_pairs = {
+        ("adjust_stop_loss", "adjust_stop_loss"),
+        ("move_stop_to_break_even", "move_stop_to_break_even"),
+        ("move_stop_to_break_even", "break_even_by_market"),
+    }
     if (
         batch.status != "partial_failed"
         or batch.reason_code != "protection_replacement_failed_and_restored"
         or batch.target_lifecycle_id != target_lifecycle_id
         or batch.execution_binding_id != execution_binding_id
-        or batch.intent not in {"adjust_stop_loss", "move_stop_to_break_even"}
-        or batch.effective_action not in {"adjust_stop_loss", "move_stop_to_break_even"}
+        or (batch.intent, batch.effective_action) not in supported_protection_pairs
     ):
         return "blocked"
     legs = (

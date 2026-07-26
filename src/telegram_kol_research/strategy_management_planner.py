@@ -89,6 +89,7 @@ RETRYABLE_PREFLIGHT_BLOCK_REASONS = frozenset(
     }
 )
 TEMPORARY_PROTECTION_VISIBILITY_WINDOW = timedelta(minutes=5)
+BREAK_EVEN_BY_MARKET_ACTION = "break_even_by_market"
 
 
 class ManagementTargetChangedError(RuntimeError):
@@ -318,7 +319,7 @@ def _plan_strategy_management_batch_locked(
     )
     if (
         protection_recovery_bypass
-        and intent != "full_exit"
+        and intent not in {"full_exit", "move_stop_to_break_even"}
         and not protection_recovery_for_risk_reduction
     ):
         return _persist_blocked(
@@ -418,13 +419,16 @@ def _plan_strategy_management_batch_locked(
             effective_action_name = "partial_then_break_even"
     elif intent == "full_exit":
         effective_action_name, effective_fraction = intent, 1.0
+    elif intent == "move_stop_to_break_even":
+        effective_action_name, effective_fraction = BREAK_EVEN_BY_MARKET_ACTION, None
     else:
         effective_action_name, effective_fraction = intent, None
 
     protection_by_pos_id: dict[str, dict[str, Any]] = {}
     if (
         intent in PROTECTION_EVIDENCE_INTENTS
-        and effective_action_name not in {"full_close", "full_exit"}
+        and effective_action_name
+        not in {"full_close", "full_exit", BREAK_EVEN_BY_MARKET_ACTION}
     ):
         if not _pending_tpsl_snapshot_complete(
             reconciliation_snapshot, instrument_id=instrument_id
@@ -679,7 +683,8 @@ def _plan_strategy_management_batch_locked(
             planned_tpsl=(
                 {"intent": intent, "stop_loss_text": candidate.stop_loss_text}
                 if intent in PROTECTION_INTENTS
-                and effective_action_name not in {"full_close", "full_exit"}
+                and effective_action_name
+                not in {"full_close", "full_exit", BREAK_EVEN_BY_MARKET_ACTION}
                 else None
             ),
             last_exchange_snapshot=position,
