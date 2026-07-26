@@ -146,6 +146,7 @@ def build_reviewed_legacy_conditional_cancel_plan(
     deepcoin_client,
     targets: Iterable[ReviewedLegacyConditionalTarget],
     now: datetime | None = None,
+    recovering_order_id: str | None = None,
 ) -> ReviewedLegacyConditionalCancelPlan:
     """Build a fresh plan containing only exact, independently protected rows."""
 
@@ -271,7 +272,11 @@ def build_reviewed_legacy_conditional_cancel_plan(
                         PositionBackupStopOrder.venue == "deepcoin",
                         PositionBackupStopOrder.order_id == target.order_id,
                         PositionBackupStopOrder.pos_id == target.pos_id,
-                        PositionBackupStopOrder.status == "active",
+                        PositionBackupStopOrder.status.in_(
+                            ("active", "missing")
+                            if target.order_id == recovering_order_id
+                            else ("active",)
+                        ),
                     )
                     .all()
                 )
@@ -826,6 +831,7 @@ def reconcile_submitted_reviewed_legacy_conditional_cancel(
         deepcoin_client=_SnapshotClient(positions, synthetic_pending),
         targets=(target,),
         now=observed_at,
+        recovering_order_id=target.order_id,
     )
     if candidate_plan.conflicts or len(candidate_plan.actions) != 1:
         raise ValueError("cancel reconciliation authority changed")
@@ -866,7 +872,7 @@ def reconcile_submitted_reviewed_legacy_conditional_cancel(
                 action.backup_row_id is not None
                 and (
                     backup is None
-                    or backup.status != "active"
+                    or backup.status not in {"active", "missing"}
                     or backup.order_id != action.order_id
                 )
             )

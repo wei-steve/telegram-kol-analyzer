@@ -634,6 +634,9 @@ def test_reconcile_submitted_cancel_from_exact_later_readback(tmp_path):
         now=NOW,
     )
     assert result.status == "cancel_confirmed_pending_readback"
+    with session_factory() as session:
+        session.query(PositionBackupStopOrder).one().status = "missing"
+        session.commit()
 
     reconciled = reconcile_submitted_reviewed_legacy_conditional_cancel(
         session_factory,
