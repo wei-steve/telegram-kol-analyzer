@@ -445,6 +445,15 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
         .all()
     )
     desired_by_price = {payload["tpTriggerPx"]: payload for payload in payloads}
+    known_order_position_ids = {
+        str(row.order_id): str(row.pos_id)
+        for row in session.query(PositionProtectionLedger)
+        .filter(PositionProtectionLedger.venue == "deepcoin")
+        .filter(PositionProtectionLedger.status == "verified")
+        .filter(PositionProtectionLedger.order_id.is_not(None))
+        .all()
+        if str(row.order_id or "").strip() and str(row.pos_id or "").strip()
+    }
     satisfied_order_ids: set[str] = set()
     for order in active_orders:
         payload = desired_by_price.get(str(order.trigger_price))
@@ -465,6 +474,7 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
         side=str(binding.side).lower(),
         pos_id=pos_id,
         owned_order_ids=satisfied_order_ids,
+        known_order_position_ids=known_order_position_ids,
     ):
         return "convergence_unowned_take_profit_present"
     missing_payloads = [
@@ -627,6 +637,7 @@ def _unowned_pending_take_profit_present(
     side: str,
     pos_id: str,
     owned_order_ids: set[str],
+    known_order_position_ids: dict[str, str],
 ) -> bool:
     """Fail closed on any TP that could affect this exact side but lacks local ownership."""
 
@@ -642,6 +653,11 @@ def _unowned_pending_take_profit_present(
         ):
             continue
         if order.pos_id is not None and order.pos_id != pos_id:
+            continue
+        if (
+            order.ord_id is not None
+            and known_order_position_ids.get(order.ord_id) not in (None, pos_id)
+        ):
             continue
         if order.ord_id not in owned_order_ids:
             return True
