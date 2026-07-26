@@ -55,6 +55,7 @@ from telegram_kol_research.strategy_management_batches import (
     create_management_batch,
     create_management_batch_in_session,
     load_management_batch,
+    resolve_proven_restored_protection_failure_for_market_successor_in_session,
     resolve_restored_protection_failure_for_full_exit_in_session,
 )
 from telegram_kol_research.strategy_management_sizing import (
@@ -700,6 +701,29 @@ def _plan_strategy_management_batch_locked(
                         strategy_instance_id=str(binding.strategy_instance_id),
                         target_lifecycle_id=lifecycle.id,
                         execution_binding_id=binding.id,
+                        resolved_at=now,
+                    )
+                )
+                if predecessor_state == "blocked":
+                    session.rollback()
+                    return ManagementPlanningResult(
+                        status="blocked",
+                        reason_code="prior_management_batch_unresolved",
+                        target_lifecycle_id=lifecycle.id,
+                    )
+            elif intent == "move_stop_to_break_even":
+                predecessor_state = (
+                    resolve_proven_restored_protection_failure_for_market_successor_in_session(
+                        session,
+                        strategy_instance_id=str(binding.strategy_instance_id),
+                        target_lifecycle_id=lifecycle.id,
+                        execution_binding_id=binding.id,
+                        live_pos_ids={
+                            str(position["pos_id"]) for position in economics
+                        },
+                        pending_order_ids_by_pos=_pending_order_ids_by_pos(
+                            reconciliation_snapshot.pending_trigger_orders
+                        ),
                         resolved_at=now,
                     )
                 )
@@ -1930,6 +1954,23 @@ def _exact_protection_order_id(row: dict[str, Any]) -> str | None:
         if value:
             return value
     return None
+
+
+def _pending_order_ids_by_pos(rows: Any) -> dict[str, set[str]]:
+    result: dict[str, set[str]] = {}
+    for row in rows if isinstance(rows, (list, tuple)) else []:
+        if not isinstance(row, dict):
+            continue
+        pos_id = str(
+            row.get("posId")
+            or row.get("pos_id")
+            or row.get("positionId")
+            or ""
+        ).strip()
+        order_id = _exact_protection_order_id(row)
+        if pos_id and order_id:
+            result.setdefault(pos_id, set()).add(order_id)
+    return result
 
 
 def _leg_by_pos_id(

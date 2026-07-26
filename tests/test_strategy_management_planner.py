@@ -2122,6 +2122,113 @@ def test_full_exit_resolves_fully_restored_protection_failure_before_successor(
         assert session.get(StrategyManagementBatch, predecessor_id).status == "resolved"
 
 
+def test_break_even_market_successor_resolves_only_exchange_proven_restoration(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory, intent="move_stop_to_break_even"
+    )
+    predecessor_id = _persist_prior_partial_batch(
+        session_factory,
+        raw_id=raw_id,
+        lifecycle_id=lifecycle_id,
+        binding_id=binding_id,
+        status="partial_failed",
+        reconciled=False,
+        leg_statuses=("restored",),
+        intent="move_stop_to_break_even",
+        effective_action="move_stop_to_break_even",
+        reason_code="protection_replacement_failed_and_restored",
+        protection_evidence=True,
+    )
+    with session_factory() as session:
+        predecessor_leg = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=predecessor_id)
+            .one()
+        )
+        predecessor_leg.old_tpsl_json = json.dumps(
+            {
+                "order_ids": ["old-sl"],
+                "row_snapshots": [
+                    {
+                        "order_id": "old-sl",
+                        "purpose": "stop_loss",
+                        "trigger_price": "63000",
+                        "size": "10",
+                    }
+                ],
+            }
+        )
+        predecessor_leg.response_json = json.dumps(
+            {
+                "restore_rows": [
+                    {"code": "0", "data": {"ordId": "restored-sl"}}
+                ]
+            }
+        )
+        entry_leg = session.get(
+            ExecutionOrderLeg, predecessor_leg.execution_order_leg_id
+        )
+        for order_id, status, source in (
+            ("old-sl", "cancelled", "management_tpsl_cancel"),
+            ("restored-sl", "verified", "management_tpsl_restore"),
+        ):
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_leg.id,
+                strategy_instance_id=entry_leg.strategy_instance_id,
+                pos_id="pos-b",
+                instrument_id="BTC-USDT-SWAP",
+                side="short",
+                order_id=order_id,
+                purpose="stop_loss",
+                trigger_price="63000",
+                size_text="10",
+                status=status,
+                evidence_source=source,
+                evidence={"match": "exact_exchange_proof"},
+                seen_at=PLANNED_AT,
+            )
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [_position()],
+            tpsl_orders=[
+                {
+                    "triggerOrderType": "TPSL",
+                    "ordId": "restored-sl",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "short",
+                    "posId": "pos-b",
+                    "slTriggerPx": "63000",
+                    "sz": "10",
+                }
+            ],
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.effective_action == "break_even_by_market"
+    with session_factory() as session:
+        predecessor = session.get(StrategyManagementBatch, predecessor_id)
+        assert predecessor.status == "resolved"
+        assert (
+            predecessor.reason_code
+            == "superseded_by_break_even_market_after_protection_restored"
+        )
+
+
 def test_full_exit_keeps_partial_failure_lock_when_a_leg_is_not_restored(
     monkeypatch, tmp_path
 ):

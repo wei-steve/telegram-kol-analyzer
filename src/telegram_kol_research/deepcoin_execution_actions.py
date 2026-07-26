@@ -482,6 +482,7 @@ def _management_action_matches_batch(
         return batch_pair in {
             ("adjust_stop_loss", "adjust_stop_loss"),
             ("move_stop_to_break_even", "move_stop_to_break_even"),
+            ("move_stop_to_break_even", "break_even_by_market"),
         }
     if action == "partial_close_and_move_stop_to_entry":
         return batch_pair == ("partial_then_break_even", "partial_then_break_even")

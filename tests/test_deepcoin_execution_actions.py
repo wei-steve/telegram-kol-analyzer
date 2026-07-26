@@ -134,6 +134,18 @@ class _FakeDeepcoinClient:
         ("close_position", "partial_take_profit", "partial_close", False),
         ("adjust_stop_loss", "adjust_stop_loss", "adjust_stop_loss", True),
         ("adjust_position_tpsl", "move_stop_to_break_even", "move_stop_to_break_even", True),
+        (
+            "adjust_position_tpsl",
+            "move_stop_to_break_even",
+            "break_even_by_market",
+            True,
+        ),
+        (
+            "adjust_position_tpsl",
+            "adjust_stop_loss",
+            "break_even_by_market",
+            False,
+        ),
         ("adjust_stop_loss", "full_exit", "full_exit", False),
         (
             "partial_close_and_move_stop_to_entry",

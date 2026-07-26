@@ -27,6 +27,166 @@ def _repository():
     return importlib.import_module("telegram_kol_research.strategy_management_batches")
 
 
+def _persist_restored_break_even_predecessor(session_factory):
+    batch_model, leg_model = _management_models()
+    now = datetime(2026, 7, 26, tzinfo=UTC)
+    with session_factory() as session:
+        batch = batch_model(
+            **{
+                **_batch_values(
+                    fingerprint="restored-predecessor",
+                    strategy="strategy-restored",
+                ),
+                "target_lifecycle_id": 302,
+                "execution_binding_id": 402,
+                "intent": "move_stop_to_break_even",
+                "effective_action": "move_stop_to_break_even",
+                "status": "partial_failed",
+                "reason_code": "protection_replacement_failed_and_restored",
+            }
+        )
+        session.add(batch)
+        session.flush()
+        session.add(
+            leg_model(
+                management_batch_id=batch.id,
+                execution_order_leg_id=502,
+                pos_id="pos-restored",
+                leg_index=0,
+                status="restored",
+                preflight_size="16",
+                avg_entry_price="64602.9",
+                old_tpsl_json=json.dumps(
+                    {
+                        "order_ids": ["old-sl"],
+                        "row_snapshots": [
+                            {
+                                "order_id": "old-sl",
+                                "purpose": "stop_loss",
+                                "trigger_price": "65200",
+                                "size": "16",
+                            }
+                        ],
+                    }
+                ),
+                planned_tpsl_json=json.dumps(
+                    {"intent": "move_stop_to_break_even"}
+                ),
+                response_json=json.dumps(
+                    {
+                        "restore_rows": [
+                            {"code": "0", "data": {"ordId": "restored-sl"}}
+                        ]
+                    }
+                ),
+                last_error=json.dumps(
+                    {
+                        "stage": "replace_protection",
+                        "restore_error": None,
+                    }
+                ),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        ledger = models.PositionProtectionLedger
+        session.add_all(
+            [
+                ledger(
+                    venue="deepcoin",
+                    execution_binding_id=402,
+                    execution_order_leg_id=502,
+                    strategy_instance_id="strategy-restored",
+                    pos_id="pos-restored",
+                    instrument_id="BTC-USDT-SWAP",
+                    side="short",
+                    order_id="old-sl",
+                    purpose="stop_loss",
+                    trigger_price="65200",
+                    size_text="16",
+                    status="cancelled",
+                    evidence_source="management_tpsl_cancel",
+                    evidence_json="{}",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                ledger(
+                    venue="deepcoin",
+                    execution_binding_id=402,
+                    execution_order_leg_id=502,
+                    strategy_instance_id="strategy-restored",
+                    pos_id="pos-restored",
+                    instrument_id="BTC-USDT-SWAP",
+                    side="short",
+                    order_id="restored-sl",
+                    purpose="stop_loss",
+                    trigger_price="65200",
+                    size_text="16",
+                    status="verified",
+                    evidence_source="management_tpsl_restore",
+                    evidence_json="{}",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ]
+        )
+        session.commit()
+        return batch.id
+
+
+def test_proven_restored_predecessor_resolves_inside_caller_transaction(tmp_path):
+    repository = _repository()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch_id = _persist_restored_break_even_predecessor(session_factory)
+    now = datetime(2026, 7, 26, 1, tzinfo=UTC)
+
+    with session_factory() as session:
+        result = (
+            repository.resolve_proven_restored_protection_failure_for_market_successor_in_session(
+                session,
+                strategy_instance_id="strategy-restored",
+                target_lifecycle_id=302,
+                execution_binding_id=402,
+                live_pos_ids={"pos-restored"},
+                pending_order_ids_by_pos={
+                    "pos-restored": {"restored-sl"}
+                },
+                resolved_at=now,
+            )
+        )
+        assert result == "resolved"
+        session.rollback()
+
+    with session_factory() as session:
+        batch = session.get(_management_models()[0], batch_id)
+        assert batch.status == "partial_failed"
+
+
+def test_proven_restored_predecessor_blocks_without_current_exchange_proof(tmp_path):
+    repository = _repository()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_restored_break_even_predecessor(session_factory)
+
+    with session_factory() as session:
+        result = (
+            repository.resolve_proven_restored_protection_failure_for_market_successor_in_session(
+                session,
+                strategy_instance_id="strategy-restored",
+                target_lifecycle_id=302,
+                execution_binding_id=402,
+                live_pos_ids={"pos-restored"},
+                pending_order_ids_by_pos={"pos-restored": set()},
+                resolved_at=datetime(2026, 7, 26, 1, tzinfo=UTC),
+            )
+        )
+
+    assert result == "blocked"
+
+
 def test_race_resolved_successor_fingerprint_is_stable_and_distinct():
     repository = _repository()
 

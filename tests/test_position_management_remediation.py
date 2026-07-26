@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,7 @@ from telegram_kol_research.models import (
 from telegram_kol_research.position_management_remediation import (
     _candidate_strategy_instance_id,
     _require_exchange_snapshot_fingerprint,
+    _require_batch_matches_confirmed_action,
     _select_executable_action,
     apply_position_management_remediation_action,
     build_position_management_remediation_plan,
@@ -25,6 +27,40 @@ from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 7, 26, 12, tzinfo=UTC)
+
+
+def test_confirmed_break_even_action_requires_market_managed_batch():
+    action = SimpleNamespace(
+        lifecycle_id=1,
+        strategy_instance_id="strategy-1",
+        action_kind="move_stop_to_break_even",
+        expected_effect={"fraction": None},
+        pos_ids=("pos-1",),
+        evidence={
+            "execution_binding_id": 2,
+            "execution_order_leg_ids": [3],
+        },
+    )
+    batch = SimpleNamespace(
+        target_lifecycle_id=1,
+        strategy_instance_id="strategy-1",
+        execution_binding_id=2,
+        intent="move_stop_to_break_even",
+        effective_action="move_stop_to_break_even",
+        requested_fraction=None,
+        legs=(
+            SimpleNamespace(
+                pos_id="pos-1",
+                execution_order_leg_id=3,
+            ),
+        ),
+        target_snapshot={"positions": []},
+    )
+
+    with pytest.raises(
+        ValueError, match="planned batch does not match confirmed remediation action"
+    ):
+        _require_batch_matches_confirmed_action(action=action, batch=batch)
 
 
 class _ReadOnlyClient:

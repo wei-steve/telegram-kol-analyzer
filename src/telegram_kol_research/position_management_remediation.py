@@ -1060,6 +1060,10 @@ def _require_batch_matches_confirmed_action(*, action, batch) -> None:
         or batch.execution_binding_id
         != int(action.evidence["execution_binding_id"])
         or batch.intent != action.action_kind
+        or (
+            action.action_kind == "move_stop_to_break_even"
+            and batch.effective_action != "break_even_by_market"
+        )
         or batch.requested_fraction != action.expected_effect.get("fraction")
         or tuple(sorted(str(leg.pos_id) for leg in batch.legs))
         != tuple(sorted(action.pos_ids))

@@ -19,6 +19,7 @@ from telegram_kol_research.db import REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES
 from telegram_kol_research.models import ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE
 from telegram_kol_research.models import StrategyManagementBatch
 from telegram_kol_research.models import StrategyManagementLeg
+from telegram_kol_research.models import PositionProtectionLedger
 
 
 RECOVERABLE_BATCH_STATUSES = frozenset(
@@ -31,6 +32,156 @@ TEMPORARY_VISIBILITY_REASONS = frozenset(
     }
 )
 UNSET = object()
+
+
+def resolve_proven_restored_protection_failure_for_market_successor_in_session(
+    session: Session,
+    *,
+    strategy_instance_id: str,
+    target_lifecycle_id: int,
+    execution_binding_id: int,
+    live_pos_ids: set[str],
+    pending_order_ids_by_pos: dict[str, set[str]],
+    resolved_at: datetime,
+) -> str:
+    """Resolve one restored predecessor only from current exchange and ledger proof."""
+
+    _require_management_unique_indexes(session)
+    active = (
+        session.query(StrategyManagementBatch)
+        .filter(
+            StrategyManagementBatch.strategy_instance_id
+            == str(strategy_instance_id)
+        )
+        .filter(
+            StrategyManagementBatch.status.not_in(
+                ("succeeded", "blocked", "resolved")
+            )
+        )
+        .order_by(StrategyManagementBatch.id.asc())
+        .all()
+    )
+    if not active:
+        return "clear"
+    if len(active) != 1:
+        return "blocked"
+    batch = active[0]
+    if (
+        batch.status != "partial_failed"
+        or batch.reason_code
+        != "protection_replacement_failed_and_restored"
+        or batch.target_lifecycle_id != int(target_lifecycle_id)
+        or batch.execution_binding_id != int(execution_binding_id)
+        or batch.intent != "move_stop_to_break_even"
+        or batch.effective_action
+        not in {"move_stop_to_break_even", "break_even_by_market"}
+    ):
+        return "blocked"
+    legs = (
+        session.query(StrategyManagementLeg)
+        .filter(StrategyManagementLeg.management_batch_id == batch.id)
+        .order_by(
+            StrategyManagementLeg.leg_index.asc(),
+            StrategyManagementLeg.id.asc(),
+        )
+        .all()
+    )
+    if not legs or {str(leg.pos_id) for leg in legs} != {
+        str(pos_id) for pos_id in live_pos_ids
+    }:
+        return "blocked"
+    for leg in legs:
+        if leg.status != "restored" or not _has_restored_protection_evidence(
+            leg
+        ):
+            return "blocked"
+        try:
+            old_tpsl = json.loads(leg.old_tpsl_json or "")
+            response = json.loads(leg.response_json or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return "blocked"
+        old_order_ids = {
+            str(order_id)
+            for order_id in old_tpsl.get("order_ids") or []
+            if str(order_id)
+        }
+        restore_rows = response.get("restore_rows")
+        if not old_order_ids or not isinstance(restore_rows, list):
+            return "blocked"
+        restored_order_ids = {
+            order_id
+            for restore_row in restore_rows
+            if (order_id := _response_order_id(restore_row)) is not None
+        }
+        if (
+            len(restored_order_ids) != len(old_order_ids)
+            or restored_order_ids
+            != {
+                str(order_id)
+                for order_id in pending_order_ids_by_pos.get(
+                    str(leg.pos_id), set()
+                )
+                if str(order_id) in restored_order_ids
+            }
+            or bool(
+                old_order_ids.intersection(
+                    pending_order_ids_by_pos.get(str(leg.pos_id), set())
+                )
+            )
+        ):
+            return "blocked"
+        ledger_rows = (
+            session.query(PositionProtectionLedger)
+            .filter(
+                PositionProtectionLedger.execution_binding_id
+                == int(execution_binding_id),
+                PositionProtectionLedger.execution_order_leg_id
+                == int(leg.execution_order_leg_id),
+                PositionProtectionLedger.pos_id == str(leg.pos_id),
+            )
+            .all()
+        )
+        ledger_by_order_id = {
+            str(row.order_id): row for row in ledger_rows if row.order_id
+        }
+        if any(
+            order_id not in ledger_by_order_id
+            or str(ledger_by_order_id[order_id].status).lower()
+            != "cancelled"
+            for order_id in old_order_ids
+        ) or any(
+            order_id not in ledger_by_order_id
+            or str(ledger_by_order_id[order_id].status).lower()
+            != "verified"
+            or ledger_by_order_id[order_id].strategy_instance_id
+            != str(strategy_instance_id)
+            or ledger_by_order_id[order_id].evidence_source
+            != "management_tpsl_restore"
+            for order_id in restored_order_ids
+        ):
+            return "blocked"
+    batch.status = "resolved"
+    batch.reason_code = (
+        "superseded_by_break_even_market_after_protection_restored"
+    )
+    batch.completed_at = resolved_at
+    batch.updated_at = resolved_at
+    session.flush()
+    return "resolved"
+
+
+def _response_order_id(response: Any) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    for key in ("ordId", "orderId", "id"):
+        if response.get(key) not in (None, ""):
+            return str(response[key])
+    data = response.get("data")
+    if isinstance(data, dict):
+        return _response_order_id(data)
+    if isinstance(data, list) and len(data) == 1:
+        return _response_order_id(data[0])
+    return None
 
 
 def resolve_restored_protection_failure_for_full_exit_in_session(
