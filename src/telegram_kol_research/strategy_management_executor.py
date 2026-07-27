@@ -3109,16 +3109,23 @@ def _adjusted_protection_rows(
 def _planned_stop_price(*, batch: ManagementBatchRecord, leg: Any) -> str:
     planned_tpsl = leg.planned_tpsl or {}
     explicit = planned_tpsl.get("stop_loss_text")
-    if explicit not in (None, ""):
+    explicit_source = str(
+        planned_tpsl.get("stop_price_source") or ""
+    ).strip().lower()
+    break_even_action = batch.effective_action in {
+        "move_stop_to_break_even",
+        "partial_then_break_even",
+    }
+    if explicit not in (None, "") and (
+        not break_even_action
+        or explicit_source in {"", "current_message_text"}
+    ):
         parsed = _decimal_or_none(explicit)
         if parsed is None or parsed <= 0:
             raise ManagementBatchExecutionError("planned_stop_loss_invalid")
         return str(explicit).strip()
 
-    if batch.effective_action in {
-        "move_stop_to_break_even",
-        "partial_then_break_even",
-    }:
+    if break_even_action:
         parsed = _decimal_or_none(leg.avg_entry_price)
         if parsed is None or parsed <= 0:
             raise ManagementBatchExecutionError("planned_stop_loss_missing")

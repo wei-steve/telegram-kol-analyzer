@@ -75,6 +75,7 @@ class ManagementDirective:
     cancel_deferred_entries: bool
     reason_code: str
     strategy_thread_id: int | None = None
+    stop_price_source: str | None = None
 
 
 def resolve_management_directive(
@@ -100,6 +101,22 @@ def resolve_management_directive(
     strategy_thread_id = _positive_int_or_none(
         lifecycle_event.get("strategy_thread_id")
     )
+    declared_stop_source = str(
+        lifecycle_event.get("stop_price_source") or ""
+    ).strip().lower()
+    current_message_stop = (
+        stop_loss
+        if declared_stop_source == "current_message_text"
+        or (
+            not declared_stop_source
+            and stop_loss is not None
+            and stop_loss in normalized_text
+        )
+        else None
+    )
+    current_message_stop_source = (
+        "current_message_text" if current_message_stop is not None else None
+    )
 
     if any(term in combined for term in _CANCEL_ENTRY_TERMS) or event_type == "cancel_entry":
         return ManagementDirective(
@@ -113,6 +130,7 @@ def resolve_management_directive(
             cancel_deferred_entries=True,
             reason_code="explicit_cancel_entry",
             strategy_thread_id=strategy_thread_id,
+            stop_price_source=current_message_stop_source,
         )
 
     risk_increasing = raw_action in {
@@ -133,6 +151,7 @@ def resolve_management_directive(
             cancel_deferred_entries=False,
             reason_code="risk_increasing_fanout_forbidden",
             strategy_thread_id=strategy_thread_id,
+            stop_price_source=current_message_stop_source,
         )
 
     if raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}:
@@ -156,6 +175,7 @@ def resolve_management_directive(
             stop_loss=stop_loss,
             reason_code="explicit_stop_adjustment_requires_position_validation",
             strategy_thread_id=strategy_thread_id,
+            stop_price_source=current_message_stop_source,
         )
 
     if any(term in combined for term in _TAIL_TERMS):
@@ -220,6 +240,10 @@ def resolve_management_directive(
                 else "partial_risk_reduction"
             ),
             strategy_thread_id=strategy_thread_id,
+            stop_loss=current_message_stop if has_break_even else None,
+            stop_price_source=(
+                current_message_stop_source if has_break_even else None
+            ),
         )
 
     if has_break_even:
@@ -229,6 +253,8 @@ def resolve_management_directive(
             side=side,
             reason_code="break_even_protection",
             strategy_thread_id=strategy_thread_id,
+            stop_loss=current_message_stop,
+            stop_price_source=current_message_stop_source,
         )
 
     if raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"} or (
@@ -279,6 +305,7 @@ def _directive(
     stop_loss: str | None = None,
     reason_code: str,
     strategy_thread_id: int | None = None,
+    stop_price_source: str | None = None,
 ) -> ManagementDirective:
     return ManagementDirective(
         intent=intent,
@@ -296,6 +323,7 @@ def _directive(
         },
         reason_code=reason_code,
         strategy_thread_id=strategy_thread_id,
+        stop_price_source=stop_price_source,
     )
 
 

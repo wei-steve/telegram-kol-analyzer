@@ -187,6 +187,42 @@ def test_cancel_pending_orders_wording_is_a_cancel_entry_directive() -> None:
     assert directive.strategy_thread_id == 42
 
 
+@pytest.mark.parametrize("source", ["image", "historical_context"])
+def test_break_even_ignores_non_current_message_stop_price(source: str) -> None:
+    directive = resolve_management_directive(
+        text="有入场的移动到保本",
+        lifecycle_event={
+            "event_type": "position_update",
+            "symbol": "BTC",
+            "side": "long",
+            "management_action": "move_stop_to_break_even",
+            "stop_loss": "63600",
+            "stop_price_source": source,
+        },
+    )
+
+    assert directive.intent == "move_stop_to_break_even"
+    assert directive.stop_loss is None
+    assert directive.stop_price_source is None
+
+
+def test_break_even_accepts_explicit_current_message_stop_price() -> None:
+    directive = resolve_management_directive(
+        text="有入场的移动保护到 64500",
+        lifecycle_event={
+            "event_type": "position_update",
+            "symbol": "BTC",
+            "side": "long",
+            "management_action": "move_stop_to_break_even",
+            "stop_loss": "64500",
+            "stop_price_source": "current_message_text",
+        },
+    )
+
+    assert directive.stop_loss == "64500"
+    assert directive.stop_price_source == "current_message_text"
+
+
 def test_commentary_and_optional_new_short_do_not_become_actions() -> None:
     directive = resolve_management_directive(
         text="激进的可以在6.5万附近做空，个人会再观察",

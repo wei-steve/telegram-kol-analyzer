@@ -38,11 +38,40 @@ from telegram_kol_research.strategy_management_batches import (
 from telegram_kol_research.strategy_management_reconciliation import (
     reconcile_strategy_management_batches,
 )
+from telegram_kol_research.strategy_management_executor import _planned_stop_price
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
+
+
+def test_break_even_stop_uses_exact_live_average_not_context_support() -> None:
+    batch = SimpleNamespace(effective_action="move_stop_to_break_even")
+    leg = SimpleNamespace(
+        avg_entry_price="64478.5",
+        planned_tpsl={
+            "intent": "move_stop_to_break_even",
+            "stop_loss_text": "63600",
+            "stop_price_source": "historical_context",
+        },
+    )
+
+    assert _planned_stop_price(batch=batch, leg=leg) == "64478.5"
+
+
+def test_break_even_stop_accepts_only_explicit_current_message_price() -> None:
+    batch = SimpleNamespace(effective_action="partial_then_break_even")
+    leg = SimpleNamespace(
+        avg_entry_price="64478.5",
+        planned_tpsl={
+            "intent": "partial_then_break_even",
+            "stop_loss_text": "64500",
+            "stop_price_source": "current_message_text",
+        },
+    )
+
+    assert _planned_stop_price(batch=batch, leg=leg) == "64500"
 
 
 def _persist_close_batch(

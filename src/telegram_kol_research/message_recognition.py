@@ -1864,6 +1864,12 @@ def _apply_deterministic_management_scope_if_matched(
     applied = False
     for target in targets:
         target_decision = dict(scoped_decision)
+        if directive.intent in {
+            "move_stop_to_break_even",
+            "partial_then_break_even",
+        }:
+            target_decision["stop_loss"] = directive.stop_loss
+            target_decision["stop_price_source"] = directive.stop_price_source
         target_decision.update(
             {
                 "target_lifecycle_id": target.lifecycle_id,

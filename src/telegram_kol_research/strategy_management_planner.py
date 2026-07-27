@@ -682,7 +682,22 @@ def _plan_strategy_management_batch_locked(
             quantity_step=str(contract_spec.quantity_step),
             old_tpsl=protection_by_pos_id.get(position["pos_id"]),
             planned_tpsl=(
-                {"intent": intent, "stop_loss_text": candidate.stop_loss_text}
+                {
+                    "intent": intent,
+                    "stop_loss_text": candidate.stop_loss_text,
+                    **(
+                        {
+                            "stop_price_source": (
+                                "current_message_text"
+                                if str(candidate.stop_loss_text)
+                                in str(identity.raw_message.text or "")
+                                else "unverified_context"
+                            )
+                        }
+                        if candidate.stop_loss_text not in (None, "")
+                        else {}
+                    ),
+                }
                 if intent in PROTECTION_INTENTS
                 and effective_action_name
                 not in {"full_close", "full_exit", BREAK_EVEN_BY_MARKET_ACTION}
