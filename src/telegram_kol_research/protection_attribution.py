@@ -198,6 +198,7 @@ def match_position_protection(
     evidence_available: bool = True,
     time_tolerance_ms: int = DEFAULT_PROTECTION_TIME_TOLERANCE_MS,
     exact_order_position_ids: dict[str, str] | None = None,
+    allow_heuristic_attribution: bool = True,
 ) -> ProtectionMatchResult:
     """Match TPSL rows without borrowing strategy-ownership assumptions.
 
@@ -222,6 +223,7 @@ def match_position_protection(
         row.pos_id: _inline_position_protection_rows(row.raw) for row in parsed_positions
     }
     exact_order_position_ids = exact_order_position_ids or {}
+    ledger_confirmed_pos_ids: set[str] = set()
     unscoped_groups: list[_ProtectionGroup] = []
     for order in tpsl_orders:
         if str(order.get("triggerOrderType") or "TPSL").upper() != "TPSL":
@@ -240,7 +242,14 @@ def match_position_protection(
         ledger_pos_id = exact_order_position_ids.get(order_id or "")
         if ledger_pos_id is not None:
             if ledger_pos_id in positions_by_id:
+                if ledger_pos_id not in ledger_confirmed_pos_ids:
+                    exact_rows[ledger_pos_id] = [
+                        row
+                        for row in exact_rows[ledger_pos_id]
+                        if row.get("_evidence_source") != "position"
+                    ]
                 exact_rows[ledger_pos_id].append(order)
+                ledger_confirmed_pos_ids.add(ledger_pos_id)
             # A persisted exact owner that is no longer live must not be
             # re-attributed through the weaker timestamp/size heuristic.
             continue
@@ -297,10 +306,18 @@ def match_position_protection(
 
     for pos_id, rows in exact_rows.items():
         if rows:
+            match = (
+                "ledger_confirmed_current_order"
+                if pos_id in ledger_confirmed_pos_ids
+                else "exact_pos_id"
+            )
             by_pos_id[pos_id] = _verified_protection(
                 rows,
-                evidence={"match": "exact_pos_id", "pos_id": pos_id},
+                evidence={"match": match, "pos_id": pos_id},
             )
+
+    if not allow_heuristic_attribution:
+        return ProtectionMatchResult(by_pos_id=by_pos_id)
 
     groups = list(unscoped_groups)
     edges: list[tuple[int, str, tuple[float, int]]] = []

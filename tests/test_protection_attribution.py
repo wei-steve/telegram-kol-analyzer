@@ -42,6 +42,19 @@ def test_one_second_timestamp_difference_matches_full_position_stop():
     assert protection.can_mutate is True
 
 
+def test_runtime_mode_never_authorizes_unscoped_time_size_candidate():
+    result = match_position_protection(
+        [_position("pos-runtime")],
+        [_tpsl(ordId="sl-guess", slTriggerPrice="1820")],
+        allow_heuristic_attribution=False,
+    )
+
+    protection = result.by_pos_id["pos-runtime"]
+    assert protection.status == "absent"
+    assert protection.order_ids == []
+    assert protection.can_mutate is False
+
+
 def test_zero_size_tpsl_is_full_position_protection():
     result = match_position_protection(
         [_position("pos-zero", size="5.2")],
@@ -52,7 +65,7 @@ def test_zero_size_tpsl_is_full_position_protection():
     assert result.by_pos_id["pos-zero"].status == "verified"
 
 
-def test_exact_managed_tpsl_evidence_merges_late_stop_with_inline_take_profit():
+def test_exact_managed_tpsl_evidence_uses_only_order_bound_rows():
     position = _position(
         "pos-managed",
         size="7",
@@ -75,7 +88,7 @@ def test_exact_managed_tpsl_evidence_merges_late_stop_with_inline_take_profit():
     protection = result.by_pos_id["pos-managed"]
     assert protection.status == "verified"
     assert protection.stop_loss == 67200
-    assert protection.take_profits == [63100]
+    assert protection.take_profits == []
     assert protection.order_ids == ["managed-stop"]
 
 

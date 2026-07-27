@@ -443,7 +443,18 @@ def reserve_break_even_market_actions(
                 pending=pending,
             )
         else:
-            matches = match_position_protection(live_positions, pending)
+            ledger_rows_by_pos_id = _ledger_rows_by_pos_id(
+                session_factory,
+                [leg.pos_id for leg in allowed_legs],
+            )
+            matches = match_position_protection(
+                live_positions,
+                pending,
+                exact_order_position_ids=_exact_order_position_ids(
+                    ledger_rows_by_pos_id
+                ),
+                allow_heuristic_attribution=False,
+            )
             protection_rows = {}
             seen_order_ids: set[str] = set()
             for leg in allowed_legs:
@@ -2893,9 +2904,16 @@ def _preflight_exact_protection_rows(
     live_positions: list[dict[str, Any]],
     pending: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
-    matches = match_position_protection(live_positions, pending)
     ledger_rows_by_pos_id = _ledger_rows_by_pos_id(
         session_factory, [leg.pos_id for leg in batch.legs]
+    )
+    matches = match_position_protection(
+        live_positions,
+        pending,
+        exact_order_position_ids=_exact_order_position_ids(
+            ledger_rows_by_pos_id
+        ),
+        allow_heuristic_attribution=False,
     )
     seen_ids: set[str] = set()
     current_rows_by_pos_id: dict[str, list[dict[str, Any]]] = {}
@@ -3005,6 +3023,17 @@ def _ledger_rows_by_pos_id(session_factory: sessionmaker, pos_ids: list[str]) ->
         for row in rows:
             result.setdefault(str(row.pos_id), []).append(row)
         return result
+
+
+def _exact_order_position_ids(
+    ledger_rows_by_pos_id: dict[str, list[Any]],
+) -> dict[str, str]:
+    return {
+        str(row.order_id): str(row.pos_id)
+        for rows in ledger_rows_by_pos_id.values()
+        for row in rows
+        if str(row.order_id or "").strip()
+    }
 
 
 def _ledger_confirmed_current_snapshots(

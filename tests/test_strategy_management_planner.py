@@ -700,8 +700,39 @@ def test_partial_filled_range_entry_manages_verified_live_leg(
 ):
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "research.db")
-    raw_id, _, _ = _persist_partial_filled_range_management_target(session_factory)
+    raw_id, _, binding_id = _persist_partial_filled_range_management_target(
+        session_factory
+    )
     _disable_reconciliation(monkeypatch, planner)
+    with session_factory() as session:
+        live_leg = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, pos_id="pos-live")
+            .one()
+        )
+        for order_id, purpose, trigger_price in (
+            ("tp-live", "take_profit", "65600"),
+            ("sl-live", "stop_loss", "62800"),
+        ):
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=live_leg.id,
+                strategy_instance_id=live_leg.strategy_instance_id,
+                pos_id="pos-live",
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price=trigger_price,
+                size_text="0",
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence={"match": "exact_written_order"},
+                seen_at=PLANNED_AT,
+            )
+        session.commit()
 
     result = planner.plan_strategy_management_batch(
         session_factory,
@@ -1725,12 +1756,35 @@ def test_unqualified_first_partial_plan_defaults_to_half(
 ):
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "research.db")
-    raw_id, _, _ = _persist_exact_management_target(
+    raw_id, _, binding_id = _persist_exact_management_target(
         session_factory,
         intent="partial_take_profit",
         management_fraction=None,
     )
     _disable_reconciliation(monkeypatch, planner)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=binding_id
+        ).one()
+        upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=binding_id,
+            execution_order_leg_id=leg.id,
+            strategy_instance_id=leg.strategy_instance_id,
+            pos_id="pos-b",
+            instrument_id="BTC-USDT-SWAP",
+            side="short",
+            order_id="sl-partial",
+            purpose="stop_loss",
+            trigger_price="63000",
+            size_text="0",
+            status="verified",
+            evidence_source="entry_protection_response",
+            evidence={"match": "exact_written_order"},
+            seen_at=PLANNED_AT,
+        )
+        session.commit()
 
     result = planner.plan_strategy_management_batch(
         session_factory,
@@ -1965,7 +2019,7 @@ def test_risk_reduction_protection_recovery_snapshots_exact_owned_orders(
         {
             "pos_id": "pos-b",
             "execution_order_leg_id": result.batch.legs[0].execution_order_leg_id,
-            "owned_order_ids": ["tp-old", "sl-old"],
+            "owned_order_ids": ["sl-old", "tp-old"],
         }
     ]
 

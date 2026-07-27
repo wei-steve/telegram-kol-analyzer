@@ -512,15 +512,25 @@ def _plan_strategy_management_batch_locked(
                 planned_at=now,
                 execution_mode=execution_mode,
             )
-        matches = match_position_protection(
-            live_positions, tpsl_orders, evidence_available=True
-        )
         ledger_rows_by_pos_id: dict[str, list[PositionProtectionLedger]] = {}
         with session_factory() as session:
             for row in list_verified_ledger_rows_for_positions(
                 session, [str(position["pos_id"]) for position in economics]
             ):
                 ledger_rows_by_pos_id.setdefault(str(row.pos_id), []).append(row)
+        exact_order_position_ids = {
+            str(row.order_id): str(row.pos_id)
+            for rows in ledger_rows_by_pos_id.values()
+            for row in rows
+            if str(row.order_id or "").strip()
+        }
+        matches = match_position_protection(
+            live_positions,
+            tpsl_orders,
+            evidence_available=True,
+            exact_order_position_ids=exact_order_position_ids,
+            allow_heuristic_attribution=False,
+        )
         global_protection_order_id_counts = Counter(
             order_id
             for row in tpsl_orders
@@ -547,6 +557,21 @@ def _plan_strategy_management_batch_locked(
                     tpsl_orders=tpsl_orders,
                     ledger_rows=ledger_rows_by_pos_id.get(position["pos_id"], []),
                     global_order_id_counts=global_protection_order_id_counts,
+                )
+            elif protection.evidence.get("match") == "ledger_confirmed_current_order":
+                ledger_protection = _ledger_confirmed_position_protection(
+                    position=position,
+                    entry_leg=target_legs_by_pos_id[position["pos_id"]],
+                    binding=binding,
+                    tpsl_orders=tpsl_orders,
+                    ledger_rows=ledger_rows_by_pos_id.get(position["pos_id"], []),
+                    global_order_id_counts=global_protection_order_id_counts,
+                )
+                protection = (
+                    ledger_protection
+                    if ledger_protection is not None
+                    and set(ledger_protection.order_ids) == set(protection.order_ids)
+                    else None
                 )
             elif position_only_without_order_ids:
                 ledger_protection = _ledger_confirmed_position_protection(
