@@ -24,6 +24,45 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.nearby_entry_market_deviation_pct == 0.15
     assert settings.take_profit_allocations == [40.0, 30.0, 30.0]
     assert settings.allow_vision_auto_trade is True
+    assert settings.context_resolution_enabled is False
+    assert settings.context_resolution_live_chat_ids == []
+    assert settings.context_resolution_enabled_for_chat(100) is False
+
+
+def test_context_resolution_requires_live_trading_and_allowlisted_chat():
+    settings = trading_settings_from_payload(
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "context_resolution_enabled": True,
+            "context_resolution_live_chat_ids": [100, 200],
+        }
+    )
+
+    assert settings.context_resolution_enabled_for_chat(100) is True
+    assert settings.context_resolution_enabled_for_chat(300) is False
+
+    disabled = trading_settings_from_payload(
+        {
+            "auto_trade_enabled": False,
+            "management_execution_mode": "live",
+            "context_resolution_enabled": True,
+            "context_resolution_live_chat_ids": [100],
+        }
+    )
+    assert disabled.context_resolution_enabled_for_chat(100) is False
+
+
+@pytest.mark.parametrize("value", ["true", 1, [], {}])
+def test_context_resolution_enabled_is_strict_boolean(value):
+    with pytest.raises(ValueError, match="context_resolution_enabled"):
+        trading_settings_from_payload({"context_resolution_enabled": value})
+
+
+@pytest.mark.parametrize("value", ["100", [0], [100, "200"], [100, 100], {}])
+def test_context_resolution_chat_allowlist_fails_closed(value):
+    with pytest.raises(ValueError, match="context_resolution_live_chat_ids"):
+        trading_settings_from_payload({"context_resolution_live_chat_ids": value})
 
 
 def test_management_execution_mode_defaults_disabled_and_fails_closed(tmp_path):

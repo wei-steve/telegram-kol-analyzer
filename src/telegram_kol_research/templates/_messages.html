@@ -142,6 +142,49 @@
           {% if message.text %}
             <p class="message-text">{{ message.text }}</p>
           {% endif %}
+          {% if message.context_resolution %}
+            {% set context = message.context_resolution %}
+            <section class="message-execution-outcome" aria-label="上下文二次判断">
+              <strong>上下文二次判断</strong>
+              <small>
+                {% if context.linked_threads %}
+                  {% for link in context.linked_threads %}
+                    线程 #{{ link.thread_id }}（根消息 #{{ link.root_message_id }}，{{ link.relation }}，置信度 {{ link.confidence }}）{% if not loop.last %}；{% endif %}
+                  {% endfor %}
+                {% else %}
+                  尚未关联策略线程
+                {% endif %}
+              </small>
+              {% if context.linked_messages %}
+                <small>
+                  关联消息：
+                  {% for linked_message in context.linked_messages %}
+                    #{{ linked_message.message_id }} {{ linked_message.relation }}
+                    {{ linked_message.posted_at.strftime('%Y-%m-%d %H:%M') if linked_message.posted_at else '-' }}{% if not loop.last %}；{% endif %}
+                  {% endfor %}
+                </small>
+              {% endif %}
+              <small>
+                引用消息：{{ '#' ~ context.reply_to_message_id if context.reply_to_message_id else '无' }}
+                · 证据版本：{{ context.evidence_version or '-' }}
+                · 输入：{{ context.evidence_input_kind or '-' }}
+              </small>
+              {% if context.decision %}
+                <small>
+                  决策：{{ context.decision }}
+                  · 置信度：{{ context.confidence if context.confidence is not none else '-' }}
+                  · 支持消息：{{ context.supporting_message_ids | join(', ') if context.supporting_message_ids else '无' }}
+                  · 反对消息：{{ context.opposing_message_ids | join(', ') if context.opposing_message_ids else '无' }}
+                </small>
+              {% endif %}
+              {% if context.unresolved_reason %}
+                <small>
+                  待解决原因：{{ context.unresolved_reason }}
+                  · 下次触发：{{ context.next_triggers | join(', ') if context.next_triggers else '未声明' }}
+                </small>
+              {% endif %}
+            </section>
+          {% endif %}
           {% if message.media_assets %}
             <div class="media-list">
               {% for media in message.media_assets %}

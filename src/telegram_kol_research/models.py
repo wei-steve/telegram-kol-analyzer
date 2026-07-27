@@ -216,6 +216,7 @@ class ContextResolutionAttempt(Base):
         ForeignKey("message_evidence_versions.id"), nullable=True, index=True
     )
     context_fingerprint: Mapped[str] = mapped_column(String(80), nullable=False)
+    state_fingerprint: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
     prompt_versions_json: Mapped[str] = mapped_column(
         Text, nullable=False, default="{}"
@@ -233,6 +234,17 @@ class ContextResolutionAttempt(Base):
     next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, index=True
     )
+    trigger_event_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    claim_token: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    exhausted_notified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=utc_now, nullable=False
     )

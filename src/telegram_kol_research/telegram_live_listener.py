@@ -120,6 +120,8 @@ async def persist_live_message_event(
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
+    context_resolution_scheduler: Callable[..., int] | None = None,
+    context_resolution_worker: Callable[[], Any] | None = None,
     authoritative_failure_retry_delay_seconds: float = (
         AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
     ),
@@ -174,6 +176,32 @@ async def persist_live_message_event(
         sync_kind="live",
         broker=broker,
     )
+    event_chat_id = int(getattr(event, "chat_id"))
+    event_time = getattr(message, "edit_date", None) or getattr(message, "date", None) or utc_now()
+    if context_resolution_scheduler is not None:
+        await asyncio.to_thread(
+            context_resolution_scheduler,
+            event_type="next_same_chat_message",
+            chat_id=event_chat_id,
+            occurred_at=event_time,
+        )
+        if getattr(message, "edit_date", None) is not None:
+            with session_factory() as session:
+                edited_raw_id = (
+                    session.query(RawMessage.id)
+                    .filter(
+                        RawMessage.chat_id == event_chat_id,
+                        RawMessage.message_id == int(getattr(message, "id")),
+                    )
+                    .scalar()
+                )
+            if edited_raw_id is not None:
+                await asyncio.to_thread(
+                    context_resolution_scheduler,
+                    event_type="message_edited",
+                    raw_message_id=int(edited_raw_id),
+                    occurred_at=event_time,
+                )
 
     # ── Immediately run AI recognition on every newly persisted message ──
     inserted_keys = stats.get("inserted_message_keys") or []
@@ -199,6 +227,13 @@ async def persist_live_message_event(
                     media_root=media_root,
                     broker=broker,
                 )
+                if context_resolution_scheduler is not None:
+                    await asyncio.to_thread(
+                        context_resolution_scheduler,
+                        event_type="reply_target_available",
+                        chat_id=int(chat_id),
+                        occurred_at=event_time,
+                    )
             except Exception:
                 logger.exception(
                     "failed to recover Telegram reply target chat_id=%s message_id=%s",
@@ -247,6 +282,13 @@ async def persist_live_message_event(
                     chat_title=chat_title,
                     system_operator_bot_config=system_operator_bot_config,
                 )
+                if context_resolution_scheduler is not None:
+                    await asyncio.to_thread(
+                        context_resolution_scheduler,
+                        event_type="evidence_version_changed",
+                        raw_message_id=int(raw_message.id),
+                        occurred_at=event_time,
+                    )
             else:
                 recog_result = await asyncio.to_thread(
                     recognize_message_now,
@@ -307,6 +349,8 @@ async def persist_live_message_event(
             config=strategy_alert_config,
             recognition_result=recog_result,
         )
+    if context_resolution_worker is not None:
+        await asyncio.to_thread(context_resolution_worker)
     return stats
 
 
@@ -597,6 +641,8 @@ async def run_live_listener(
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
+    context_resolution_scheduler: Callable[..., int] | None = None,
+    context_resolution_worker: Callable[[], Any] | None = None,
     system_operator_bot_config: Any | None = None,
     operation_lock: Any | None = None,
 ) -> None:
@@ -627,6 +673,8 @@ async def run_live_listener(
             "lifecycle_monitor": lifecycle_monitor,
             "auto_trade_executor": auto_trade_executor,
             "authoritative_processor": authoritative_processor,
+            "context_resolution_scheduler": context_resolution_scheduler,
+            "context_resolution_worker": context_resolution_worker,
             "system_operator_bot_config": system_operator_bot_config,
         }
         if operation_lock is None:
@@ -664,6 +712,8 @@ def launch_live_listener_task(
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
+    context_resolution_scheduler: Callable[..., int] | None = None,
+    context_resolution_worker: Callable[[], Any] | None = None,
     system_operator_bot_config: Any | None = None,
     operation_lock: Any | None = None,
 ) -> asyncio.Task[None]:
@@ -684,6 +734,8 @@ def launch_live_listener_task(
             "lifecycle_monitor": lifecycle_monitor,
             "auto_trade_executor": auto_trade_executor,
             "authoritative_processor": authoritative_processor,
+            "context_resolution_scheduler": context_resolution_scheduler,
+            "context_resolution_worker": context_resolution_worker,
             "system_operator_bot_config": system_operator_bot_config,
             "operation_lock": operation_lock,
         },

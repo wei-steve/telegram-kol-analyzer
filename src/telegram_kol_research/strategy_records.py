@@ -16,11 +16,13 @@ from sqlalchemy.orm import aliased
 
 from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 from telegram_kol_research.models import (
+    ContextResolutionAttempt,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
     MediaAsset,
     MessageRecognition,
+    MessageEvidenceVersion,
     PositionAttributionAudit,
     PositionBackupStopOrder,
     PositionProtectionIncident,
@@ -33,6 +35,8 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
+    StrategyMessageLink,
+    StrategyThread,
     TriggerProtectionIntent,
     TriggerProtectionStopRescue,
     TriggerTakeProfitConvergence,
@@ -162,6 +166,105 @@ def load_strategy_record_detail(
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         if lifecycle is None:
             return None
+
+        strategy_thread = (
+            session.get(StrategyThread, int(lifecycle.strategy_thread_id))
+            if lifecycle.strategy_thread_id is not None
+            else None
+        )
+        context_resolution: dict[str, object] | None = None
+        if strategy_thread is not None:
+            from telegram_kol_research.trading_settings import load_trading_settings
+
+            thread_links = (
+                session.query(StrategyMessageLink, RawMessage)
+                .join(RawMessage, RawMessage.id == StrategyMessageLink.raw_message_id)
+                .filter(
+                    StrategyMessageLink.strategy_thread_id == strategy_thread.id,
+                    StrategyMessageLink.status == "active",
+                )
+                .order_by(RawMessage.posted_at, RawMessage.message_id)
+                .all()
+            )
+            linked_raw_ids = [raw.id for _link, raw in thread_links]
+            latest_attempt = (
+                session.query(ContextResolutionAttempt)
+                .filter(ContextResolutionAttempt.raw_message_id.in_(linked_raw_ids))
+                .order_by(ContextResolutionAttempt.id.desc())
+                .first()
+                if linked_raw_ids
+                else None
+            )
+            decision = (
+                _safe_json_value(latest_attempt.decision_json)
+                if latest_attempt is not None
+                else {}
+            )
+            triggers = (
+                _safe_json_value(latest_attempt.reanalysis_triggers_json)
+                if latest_attempt is not None
+                else []
+            )
+            evidence_version = (
+                session.get(
+                    MessageEvidenceVersion,
+                    int(latest_attempt.message_evidence_version_id),
+                )
+                if latest_attempt is not None
+                and latest_attempt.message_evidence_version_id is not None
+                else None
+            )
+            context_resolution = {
+                "thread_id": int(strategy_thread.id),
+                "root_message_id": int(strategy_thread.root_message_id),
+                "thread_status": strategy_thread.status,
+                "automation_enabled": load_trading_settings(
+                    session_factory
+                ).context_resolution_enabled_for_chat(int(lifecycle.chat_id)),
+                "linked_messages": [
+                    {
+                        "message_id": int(raw.message_id),
+                        "relation": link.relation_kind,
+                        "posted_at": _as_utc(raw.posted_at),
+                        "reply_to_message_id": raw.reply_to_message_id,
+                    }
+                    for link, raw in thread_links
+                ],
+                "evidence_version": (
+                    int(evidence_version.version)
+                    if evidence_version is not None
+                    else None
+                ),
+                "evidence_input_kind": (
+                    "text+image"
+                    if evidence_version is not None
+                    and bool(_safe_json_value(evidence_version.image_evidence_json))
+                    else "text" if evidence_version is not None else None
+                ),
+                "decision": (
+                    decision.get("decision") if isinstance(decision, dict) else None
+                ),
+                "confidence": (
+                    decision.get("confidence") if isinstance(decision, dict) else None
+                ),
+                "supporting_message_ids": (
+                    decision.get("supporting_message_ids", [])
+                    if isinstance(decision, dict)
+                    else []
+                ),
+                "opposing_message_ids": (
+                    decision.get("opposing_message_ids", [])
+                    if isinstance(decision, dict)
+                    else []
+                ),
+                "unresolved_reason": (
+                    decision.get("reason")
+                    if isinstance(decision, dict)
+                    and decision.get("decision") in {"unresolved", "hold"}
+                    else None
+                ),
+                "next_triggers": triggers if isinstance(triggers, list) else [],
+            }
 
         candidate_ids = {
             int(value)
@@ -828,6 +931,7 @@ def load_strategy_record_detail(
             "management_signal_message_id": lifecycle.management_signal_message_id,
             "management_action": lifecycle.management_action,
         },
+        "context_resolution": context_resolution,
         "timeline": timeline,
         "execution": {
             "binding": _binding_detail(binding) if binding is not None else None,

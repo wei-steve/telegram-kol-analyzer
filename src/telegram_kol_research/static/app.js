@@ -2511,6 +2511,11 @@ function bindTradingSettingsForm() {
     };
     const payload = {
       auto_trade_enabled: Boolean(form.querySelector('[name="auto_trade_enabled"]')?.checked),
+      context_resolution_enabled: Boolean(form.querySelector('[name="context_resolution_enabled"]')?.checked),
+      context_resolution_live_chat_ids: String(formData.get('context_resolution_live_chat_ids') || '')
+        .split(',')
+        .map((value) => Number(value.trim()))
+        .filter((value) => Number.isSafeInteger(value) && value !== 0),
       management_execution_mode: String(formData.get('management_execution_mode') || 'disabled'),
       default_max_loss_usdt: numericValue('default_max_loss_usdt', 20),
       daily_max_loss_usdt: numericValue('daily_max_loss_usdt', 500),

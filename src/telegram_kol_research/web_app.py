@@ -149,6 +149,7 @@ from telegram_kol_research.system_operator_bot import (
     send_ai_recognition_conflict_review,
     send_pending_entry_expiry_review,
     send_semantic_disagreement_notification,
+    send_system_operator_bot_message,
     run_strategy_management_notification_loop,
     system_operator_bot_enabled,
 )
@@ -156,6 +157,12 @@ from telegram_kol_research.time_utils import DEFAULT_LOCAL_TIMEZONE
 from telegram_kol_research.trading_settings import (
     load_trading_settings,
     save_trading_settings,
+)
+from telegram_kol_research.context_resolution import resolve_contextual_strategy
+from telegram_kol_research.context_resolution_worker import (
+    build_context_state_fingerprint,
+    run_context_resolution_once,
+    schedule_context_reanalysis,
 )
 from telegram_kol_research.trade_signals import list_pending_trade_signals
 from telegram_kol_research.web_queries import (
@@ -2854,12 +2861,86 @@ def _run_auto_trade_executor(app: FastAPI, *, raw_message_id: int) -> dict[str, 
 
 def _run_authoritative_processor(app: FastAPI, *, raw_message_id: int):
     ai_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
+    with app.state.session_factory() as session:
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        chat_id = raw_message.chat_id if raw_message is not None else None
+    settings = load_trading_settings(app.state.session_factory)
+    context_enabled = (
+        chat_id is not None
+        and settings.context_resolution_enabled_for_chat(int(chat_id))
+    )
     return process_authoritative_message(
         app.state.session_factory,
         raw_message_id=raw_message_id,
         ai_recognition_config=ai_config,
         media_root=app.state.media_root,
         auto_trade_executor=app.state.auto_trade_executor,
+        context_resolver=resolve_contextual_strategy if context_enabled else None,
+    )
+
+
+def _schedule_context_resolution_for_app(app: FastAPI, **event: Any) -> int:
+    settings = load_trading_settings(app.state.session_factory)
+    chat_id = event.get("chat_id")
+    if chat_id is None and event.get("raw_message_id") is not None:
+        with app.state.session_factory() as session:
+            raw = session.get(RawMessage, int(event["raw_message_id"]))
+            chat_id = raw.chat_id if raw is not None else None
+    if chat_id is None or not settings.context_resolution_enabled_for_chat(int(chat_id)):
+        return 0
+    return schedule_context_reanalysis(app.state.session_factory, **event)
+
+
+def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
+    settings = load_trading_settings(app.state.session_factory)
+    if not settings.context_resolution_enabled or not settings.live_management_execution_enabled:
+        return {"status": "disabled"}
+
+    def reanalyze(raw_message_id: int, _fingerprint: str) -> dict[str, Any]:
+        result = _run_authoritative_processor(app, raw_message_id=raw_message_id)
+        return {
+            "status": str(result.automation.get("status") or "completed"),
+        }
+
+    def is_eligible(raw_message_id: int) -> bool:
+        with app.state.session_factory() as session:
+            raw = session.get(RawMessage, int(raw_message_id))
+            chat_id = raw.chat_id if raw is not None else None
+        current_settings = load_trading_settings(app.state.session_factory)
+        return (
+            chat_id is not None
+            and current_settings.context_resolution_enabled_for_chat(int(chat_id))
+        )
+
+    def notify_final_failure(payload: dict[str, Any]) -> None:
+        config = app.state.system_operator_bot_config
+        if not isinstance(config, SystemOperatorBotConfig):
+            logger.error(
+                "context resolution retries exhausted raw_message_id=%s",
+                payload.get("raw_message_id"),
+            )
+            return
+        asyncio.run(
+            send_system_operator_bot_message(
+                config=config,
+                text=(
+                    "上下文二次判断重试已耗尽；未自动执行。\n"
+                    f"raw_message_id={payload.get('raw_message_id')}"
+                ),
+            )
+        )
+
+    return run_context_resolution_once(
+        app.state.session_factory,
+        context_fingerprint_factory=lambda raw_message_id: (
+            build_context_state_fingerprint(
+                app.state.session_factory,
+                raw_message_id,
+            )
+        ),
+        reanalyze=reanalyze,
+        notify_final_failure=notify_final_failure,
+        is_eligible=is_eligible,
     )
 
 
@@ -2929,6 +3010,7 @@ def create_web_app(
                 http_client=app.state.lifecycle_monitor_http,
                 now_provider=app.state.now_provider,
                 expiry_review_notifier=expiry_review_notifier,
+                context_resolution_scheduler=app.state.context_resolution_scheduler,
             )
             app.state.lifecycle_monitor_task = asyncio.create_task(
                 app.state.lifecycle_monitor.run_loop()
@@ -3008,6 +3090,8 @@ def create_web_app(
                     lifecycle_monitor=app.state.lifecycle_monitor,
                     auto_trade_executor=app.state.auto_trade_executor,
                     authoritative_processor=app.state.authoritative_processor,
+                    context_resolution_scheduler=app.state.context_resolution_scheduler,
+                    context_resolution_worker=app.state.context_resolution_worker,
                     system_operator_bot_config=app.state.notification_bot_config,
                     operation_lock=app.state.telegram_operation_lock,
                 )
@@ -3194,6 +3278,12 @@ def create_web_app(
         app,
         raw_message_id=raw_message_id,
     )
+    app.state.context_resolution_scheduler = lambda **event: (
+        _schedule_context_resolution_for_app(app, **event)
+    )
+    app.state.context_resolution_worker = lambda: (
+        _run_context_resolution_worker_for_app(app)
+    )
     app.state.reconcile_interval_seconds = reconcile_interval_seconds
     app.state.reconcile_startup_delay_seconds = (
         15
@@ -3241,6 +3331,8 @@ def create_web_app(
                 lifecycle_monitor=app.state.lifecycle_monitor,
                 auto_trade_executor=app.state.auto_trade_executor,
                 authoritative_processor=app.state.authoritative_processor,
+                context_resolution_scheduler=app.state.context_resolution_scheduler,
+                context_resolution_worker=app.state.context_resolution_worker,
                 system_operator_bot_config=app.state.notification_bot_config,
                 operation_lock=app.state.telegram_operation_lock,
             )
@@ -4217,6 +4309,9 @@ def create_web_app(
                 ),
                 "search_text": "",
                 "sender_name": "",
+                "context_resolution_enabled": load_trading_settings(
+                    app.state.session_factory
+                ).context_resolution_enabled_for_chat(chat_id),
             },
         )
         template_ms = _elapsed_ms(step_started_at)

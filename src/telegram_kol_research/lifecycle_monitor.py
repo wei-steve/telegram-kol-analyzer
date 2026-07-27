@@ -270,6 +270,7 @@ class LifecycleMonitor:
         settle: str = "usdt",
         now_provider=None,
         expiry_review_notifier: ExpiryReviewNotifier | None = None,
+        context_resolution_scheduler: Callable[..., int] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._broker = broker
@@ -280,6 +281,7 @@ class LifecycleMonitor:
         self._settle = settle
         self._now = now_provider or (lambda: datetime.now(UTC))
         self._expiry_review_notifier = expiry_review_notifier
+        self._context_resolution_scheduler = context_resolution_scheduler
 
     # ── public API ────────────────────────────────────────────────
 
@@ -590,6 +592,25 @@ class LifecycleMonitor:
                 all_transitions.extend(result)
 
         self._apply_transitions(all_transitions)
+        if self._context_resolution_scheduler is not None:
+            with self._session_factory() as session:
+                chat_ids = dict(
+                    session.query(StrategyLifecycle.id, StrategyLifecycle.chat_id)
+                    .filter(
+                        StrategyLifecycle.id.in_(
+                            [transition.signal_id for transition in all_transitions]
+                        )
+                    )
+                    .all()
+                )
+            for transition in all_transitions:
+                chat_id = chat_ids.get(transition.signal_id)
+                if chat_id is not None:
+                    self._context_resolution_scheduler(
+                        event_type="entry_leg_status_changed",
+                        chat_id=int(chat_id),
+                        occurred_at=transition.occurred_at or now,
+                    )
         return all_transitions
 
     # ── DB queries ─────────────────────────────────────────────────

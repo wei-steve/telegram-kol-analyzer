@@ -324,6 +324,14 @@
             <input type="checkbox" name="auto_trade_enabled" {% if trading_settings.auto_trade_enabled %}checked{% endif %} />
             <span>开启全局自动交易</span>
           </label>
+          <label class="trading-toggle-row">
+            <input type="checkbox" name="context_resolution_enabled" {% if trading_settings.context_resolution_enabled %}checked{% endif %} />
+            <span>开启上下文二次判断（仅实盘模式和白名单群组）</span>
+          </label>
+          <label>
+            上下文二次判断群组 ID（逗号分隔）
+            <input name="context_resolution_live_chat_ids" type="text" value="{{ trading_settings.context_resolution_live_chat_ids|join(',') }}" placeholder="-1001234567890" />
+          </label>
           <label>
             策略管理执行模式
             <select name="management_execution_mode">

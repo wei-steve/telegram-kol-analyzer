@@ -11,11 +11,13 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
+    ContextResolutionAttempt,
     ExecutionBinding,
     ExecutionOrderLeg,
     ExecutionEvent,
     MediaAsset,
     MessageRecognition,
+    MessageEvidenceVersion,
     RawMessage,
     RecognitionDecision,
     PositionAttributionAudit,
@@ -23,6 +25,8 @@ from telegram_kol_research.models import (
     RecognitionExperiment,
     SignalCandidate,
     StrategyLifecycle,
+    StrategyMessageLink,
+    StrategyThread,
     StrategyManagementBatch,
     TriggerProtectionIntent,
     TriggerProtectionStopRescue,
@@ -483,6 +487,56 @@ def _serialize_raw_messages(
     for experiment in all_experiments:
         experiments_by_msg_id.setdefault(experiment.raw_message_id, []).append(experiment)
 
+    context_attempts = (
+        session.query(ContextResolutionAttempt)
+        .filter(ContextResolutionAttempt.raw_message_id.in_(raw_message_ids))
+        .order_by(
+            ContextResolutionAttempt.raw_message_id.asc(),
+            ContextResolutionAttempt.id.desc(),
+        )
+        .all()
+    )
+    context_attempt_by_msg_id: dict[int, ContextResolutionAttempt] = {}
+    for attempt in context_attempts:
+        context_attempt_by_msg_id.setdefault(attempt.raw_message_id, attempt)
+    evidence_rows = (
+        session.query(MessageEvidenceVersion)
+        .filter(
+            MessageEvidenceVersion.raw_message_id.in_(raw_message_ids),
+            MessageEvidenceVersion.superseded_at.is_(None),
+        )
+        .all()
+    )
+    evidence_by_msg_id = {row.raw_message_id: row for row in evidence_rows}
+    context_links = (
+        session.query(StrategyMessageLink, StrategyThread)
+        .join(StrategyThread, StrategyThread.id == StrategyMessageLink.strategy_thread_id)
+        .filter(StrategyMessageLink.raw_message_id.in_(raw_message_ids))
+        .order_by(StrategyMessageLink.raw_message_id.asc(), StrategyMessageLink.id.asc())
+        .all()
+    )
+    context_links_by_msg_id: dict[int, list[tuple[StrategyMessageLink, StrategyThread]]] = {}
+    for link, thread in context_links:
+        context_links_by_msg_id.setdefault(link.raw_message_id, []).append((link, thread))
+    context_thread_ids = {thread.id for _, thread in context_links}
+    thread_history_by_thread_id: dict[int, list[tuple[StrategyMessageLink, RawMessage]]] = {}
+    if context_thread_ids:
+        thread_history = (
+            session.query(StrategyMessageLink, RawMessage)
+            .join(RawMessage, RawMessage.id == StrategyMessageLink.raw_message_id)
+            .filter(StrategyMessageLink.strategy_thread_id.in_(context_thread_ids))
+            .order_by(
+                StrategyMessageLink.strategy_thread_id.asc(),
+                RawMessage.posted_at.asc(),
+                RawMessage.message_id.asc(),
+            )
+            .all()
+        )
+        for link, linked_raw in thread_history:
+            thread_history_by_thread_id.setdefault(
+                link.strategy_thread_id, []
+            ).append((link, linked_raw))
+
     # ── Bulk-load signal candidates ──
     all_candidates = (
         session.query(SignalCandidate)
@@ -568,10 +622,92 @@ def _serialize_raw_messages(
                     experiments=experiments_by_msg_id.get(raw_message.id, []),
                 ),
                 "reply_context": None,
+                "context_resolution": _serialize_context_resolution(
+                    raw_message=raw_message,
+                    attempt=context_attempt_by_msg_id.get(raw_message.id),
+                    evidence=evidence_by_msg_id.get(raw_message.id),
+                    links=context_links_by_msg_id.get(raw_message.id, []),
+                    thread_history_by_thread_id=thread_history_by_thread_id,
+                ),
             }
         )
 
     return rows
+
+
+def _serialize_context_resolution(
+    *,
+    raw_message: RawMessage,
+    attempt: ContextResolutionAttempt | None,
+    evidence: MessageEvidenceVersion | None,
+    links: list[tuple[StrategyMessageLink, StrategyThread]],
+    thread_history_by_thread_id: dict[
+        int, list[tuple[StrategyMessageLink, RawMessage]]
+    ],
+) -> dict[str, object] | None:
+    if attempt is None and evidence is None and not links and raw_message.reply_to_message_id is None:
+        return None
+    decision = _safe_json_dict(attempt.decision_json) if attempt is not None else {}
+    request = _safe_json_dict(attempt.request_summary_json) if attempt is not None else {}
+    image_evidence = _safe_json_dict(evidence.image_evidence_json) if evidence is not None else {}
+    linked = [
+        {
+            "thread_id": int(thread.id),
+            "root_message_id": int(thread.root_message_id),
+            "relation": link.relation_kind,
+            "thread_status": thread.status,
+            "confidence": round(float(link.confidence), 3),
+        }
+        for link, thread in links
+    ]
+    linked_messages = []
+    seen_linked_messages: set[tuple[int, int, str]] = set()
+    for _, thread in links:
+        for history_link, linked_raw in thread_history_by_thread_id.get(thread.id, []):
+            key = (thread.id, linked_raw.id, history_link.relation_kind)
+            if key in seen_linked_messages:
+                continue
+            seen_linked_messages.add(key)
+            linked_messages.append(
+                {
+                    "thread_id": int(thread.id),
+                    "message_id": int(linked_raw.message_id),
+                    "relation": history_link.relation_kind,
+                    "posted_at": utc_naive_to_local(linked_raw.posted_at),
+                }
+            )
+    triggers = []
+    if attempt is not None:
+        try:
+            parsed = json.loads(attempt.reanalysis_triggers_json or "[]")
+            triggers = [str(value) for value in parsed] if isinstance(parsed, list) else []
+        except (TypeError, ValueError):
+            triggers = []
+    return {
+        "reply_to_message_id": raw_message.reply_to_message_id,
+        "evidence_version": evidence.version if evidence is not None else None,
+        "evidence_input_kind": (
+            "text+image" if image_evidence else "text"
+        ) if evidence is not None else None,
+        "decision": str(decision.get("decision") or "") or None,
+        "confidence": decision.get("confidence"),
+        "supporting_message_ids": decision.get("supporting_message_ids") or [],
+        "opposing_message_ids": decision.get("opposing_message_ids") or [],
+        "unresolved_reason": (
+            decision.get("reason")
+            if str(decision.get("decision") or "") in {"unresolved", "hold"}
+            else None
+        ),
+        "next_triggers": triggers,
+        "attempt_status": attempt.status if attempt is not None else None,
+        "linked_threads": linked,
+        "linked_messages": linked_messages,
+        "context_message_count": len(
+            request.get("message_context")
+            if isinstance(request.get("message_context"), list)
+            else []
+        ),
+    }
 
 
 def _serialize_low_confidence_exit_targets(

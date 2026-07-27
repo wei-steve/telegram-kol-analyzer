@@ -34,6 +34,8 @@ class TradingSettings:
     trigger_backup_stop_buffer_bps: float = 20.0
     move_stop_to_breakeven_after_tp1: bool = True
     allow_vision_auto_trade: bool = True
+    context_resolution_enabled: bool = False
+    context_resolution_live_chat_ids: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -57,6 +59,13 @@ class TradingSettings:
             self.management_execution_mode == "live" and self.auto_trade_enabled
         )
 
+    def context_resolution_enabled_for_chat(self, chat_id: int) -> bool:
+        return (
+            self.context_resolution_enabled
+            and self.live_management_execution_enabled
+            and int(chat_id) in self.context_resolution_live_chat_ids
+        )
+
 
 def load_trading_settings(session_factory: sessionmaker) -> TradingSettings:
     """Load global trading settings, returning safe defaults when absent."""
@@ -73,7 +82,10 @@ def load_trading_settings(session_factory: sessionmaker) -> TradingSettings:
             payload = json.loads(row.value_json)
         except json.JSONDecodeError:
             return TradingSettings()
-    return trading_settings_from_payload(payload)
+    try:
+        return trading_settings_from_payload(payload)
+    except ValueError:
+        return TradingSettings()
 
 
 def save_trading_settings(
@@ -193,6 +205,17 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             "allow_vision_auto_trade",
             defaults.allow_vision_auto_trade,
         ),
+        context_resolution_enabled=_boolean_setting(
+            raw,
+            "context_resolution_enabled",
+            defaults.context_resolution_enabled,
+        ),
+        context_resolution_live_chat_ids=_parse_context_resolution_chat_ids(
+            raw.get(
+                "context_resolution_live_chat_ids",
+                defaults.context_resolution_live_chat_ids,
+            )
+        ),
     )
 
 
@@ -232,6 +255,16 @@ def _positive_float(value: Any, fallback: float) -> float:
     if parsed <= 0:
         return float(fallback)
     return parsed
+
+
+def _parse_context_resolution_chat_ids(value: Any) -> list[int]:
+    if not isinstance(value, list):
+        raise ValueError("context_resolution_live_chat_ids must be a list of nonzero integers")
+    if any(isinstance(item, bool) or not isinstance(item, int) or item == 0 for item in value):
+        raise ValueError("context_resolution_live_chat_ids must be a list of nonzero integers")
+    if len(set(value)) != len(value):
+        raise ValueError("context_resolution_live_chat_ids must not contain duplicates")
+    return list(value)
 
 
 def _parse_symbol_list(value: Any, fallback: list[str]) -> list[str]:

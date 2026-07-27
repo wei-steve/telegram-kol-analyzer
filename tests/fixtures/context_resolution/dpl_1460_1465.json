@@ -1,0 +1,39 @@
+{
+  "chat_id": -1009000000001,
+  "messages": [
+    {
+      "message_id": 1460,
+      "posted_at": "2026-07-20T08:00:00Z",
+      "text": "BTC 多，分批入场，止损见图",
+      "image_evidence": {"symbol": "BTC", "side": "long", "stop_loss": 64000}
+    },
+    {
+      "message_id": 1462,
+      "posted_at": "2026-07-20T08:08:00Z",
+      "reply_to_message_id": 1460,
+      "text": "更新：入场改为 65100-65300，其他不变"
+    },
+    {
+      "message_id": 1465,
+      "posted_at": "2026-07-20T08:15:00Z",
+      "reply_to_message_id": 1462,
+      "text": "取消这个计划"
+    }
+  ],
+  "expected": {
+    "thread_root_message_id": 1460,
+    "revision_message_id": 1462,
+    "cancel_message_id": 1465,
+    "final_thread_status": "cancelled",
+    "must_not_create_independent_thread_for": [1462, 1465],
+    "entry_transitions": [
+      {"leg": 1, "before_cancel": "submitted", "after_cancel": "cancelled"},
+      {"leg": 2, "before_cancel": "submitted", "after_cancel": "cancelled"}
+    ],
+    "late_fill": {
+      "leg": 1,
+      "position_id": "redacted-pos-1",
+      "required_path": "exact_position_remediation"
+    }
+  }
+}

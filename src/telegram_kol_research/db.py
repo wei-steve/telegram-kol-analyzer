@@ -80,6 +80,30 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
             "ADD COLUMN advance_claimed_at DATETIME"
         ),
     },
+    "context_resolution_attempts": {
+        "state_fingerprint": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN state_fingerprint VARCHAR(80)"
+        ),
+        "trigger_event_json": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN trigger_event_json TEXT"
+        ),
+        "claim_token": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN claim_token VARCHAR(64)"
+        ),
+        "claimed_at": (
+            "ALTER TABLE context_resolution_attempts ADD COLUMN claimed_at DATETIME"
+        ),
+        "exhausted_notified_at": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN exhausted_notified_at DATETIME"
+        ),
+        "last_error": (
+            "ALTER TABLE context_resolution_attempts ADD COLUMN last_error TEXT"
+        ),
+    },
     "message_instruction_items": {
         "retired_at": (
             "ALTER TABLE message_instruction_items ADD COLUMN retired_at DATETIME"

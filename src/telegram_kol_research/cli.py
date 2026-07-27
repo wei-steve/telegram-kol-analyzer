@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import typer
 from sqlalchemy import create_engine, tuple_
@@ -23,6 +24,11 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.backfill import build_backfill_windows
 from telegram_kol_research.ai_recognition_config import load_ai_recognition_config
 from telegram_kol_research.authoritative_recognition import process_authoritative_message
+from telegram_kol_research.context_resolution import resolve_contextual_strategy
+from telegram_kol_research.context_resolution_worker import (
+    build_context_state_fingerprint,
+    run_context_resolution_once,
+)
 from telegram_kol_research.binance_market_data import BinanceMarketDataProvider
 from telegram_kol_research.dataset_export import export_dataset_jsonl
 from telegram_kol_research.db import create_session_factory
@@ -137,6 +143,7 @@ from telegram_kol_research.telegram_live_listener import (
     run_live_listener,
 )
 from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidates
+from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.web_app import create_web_app
 
 app = typer.Typer(help="Telegram KOL win-rate research CLI.")
@@ -2533,6 +2540,51 @@ def _build_recovery_market_provider(market_provider: str):
     if normalized == "binance":
         return BinanceMarketDataProvider()
     raise typer.BadParameter("market-provider must be one of: none, gate, binance")
+
+
+@app.command("resolve-context-once")
+def resolve_context_once(
+    database_path: Path = Path("data/research.db"),
+    ai_config_path: Path = Path("config/ai_recognition.yaml"),
+    media_root: Path = Path("data/media"),
+) -> None:
+    """Reanalyse at most one scheduled context item without exchange writes."""
+
+    session_factory = create_session_factory(database_path)
+    settings = load_trading_settings(session_factory)
+    if not settings.context_resolution_enabled or not settings.live_management_execution_enabled:
+        typer.echo(json.dumps({"status": "disabled"}, ensure_ascii=False))
+        return
+    ai_config = load_ai_recognition_config(ai_config_path)
+
+    def reanalyze(raw_message_id: int, _fingerprint: str) -> dict[str, Any]:
+        result = process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_message_id,
+            ai_recognition_config=ai_config,
+            media_root=media_root,
+            auto_trade_executor=None,
+            context_resolver=resolve_contextual_strategy,
+        )
+        return {"status": str(result.automation.get("status") or "completed")}
+
+    def is_eligible(raw_message_id: int) -> bool:
+        with session_factory() as session:
+            raw = session.get(RawMessage, int(raw_message_id))
+            return (
+                raw is not None
+                and settings.context_resolution_enabled_for_chat(int(raw.chat_id))
+            )
+
+    outcome = run_context_resolution_once(
+        session_factory,
+        context_fingerprint_factory=lambda raw_message_id: (
+            build_context_state_fingerprint(session_factory, raw_message_id)
+        ),
+        reanalyze=reanalyze,
+        is_eligible=is_eligible,
+    )
+    typer.echo(json.dumps(outcome, ensure_ascii=False, default=str))
 
 
 @app.command("export-dataset")

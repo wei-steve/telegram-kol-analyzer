@@ -343,7 +343,15 @@ def _upsert_attempt(
     error_class: str | None,
     attempts: int,
 ) -> None:
+    from telegram_kol_research.context_resolution_worker import (
+        build_context_state_fingerprint,
+    )
+
     now = utc_now()
+    state_fingerprint = build_context_state_fingerprint(
+        session_factory,
+        int(raw_message_id),
+    )
     with session_factory() as session:
         row = (
             session.query(ContextResolutionAttempt)
@@ -358,6 +366,7 @@ def _upsert_attempt(
                 raw_message_id=int(raw_message_id),
                 message_evidence_version_id=evidence_version_id,
                 context_fingerprint=context_fingerprint,
+                state_fingerprint=state_fingerprint,
                 model=model,
                 prompt_versions_json=_canonical_json(
                     {"context_resolution": CONTEXT_RESOLUTION_PROMPT_VERSION}
@@ -374,6 +383,7 @@ def _upsert_attempt(
             session.add(row)
         else:
             row.message_evidence_version_id = evidence_version_id
+            row.state_fingerprint = state_fingerprint
             row.model = model
             row.request_summary_json = _canonical_json(request_payload)
             row.status = status

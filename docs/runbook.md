@@ -863,3 +863,31 @@ entry-leg state.
 Do not use a missing-position snapshot to perform this transition
 automatically. If strategy identity is uncertain, keep the investigation
 read-only and route the case through the reviewed repair/fingerprint workflow.
+
+## 13. Contextual strategy resolution
+
+Keep contextual resolution disabled unless a reviewed rollout explicitly
+enables one chat:
+
+```json
+{
+  "context_resolution_enabled": false,
+  "context_resolution_live_chat_ids": []
+}
+```
+
+This path never uses shadow mode. Before enabling it, run the redacted replay
+tests and inspect the message/strategy evidence view:
+
+```bash
+uv run --frozen pytest tests/test_context_resolution_replay.py -q
+uv run --frozen telegram-kol-research resolve-context-once \
+  --database-path data/research.db
+```
+
+The one-shot command does not configure an exchange writer. For unresolved
+items, inspect the strategy thread root, reply chain, evidence version,
+decision confidence, supporting/opposing message IDs, and next trigger. Never
+copy raw model responses, credentials, private media, or full exchange JSON
+into an incident report. Full behavior and failure handling are documented in
+[`contextual-strategy-resolution.md`](contextual-strategy-resolution.md).

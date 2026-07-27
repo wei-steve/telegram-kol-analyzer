@@ -144,3 +144,12 @@ The `web` command will only enable Telegram realtime updates when the Telegram
 auth environment variables are present. Otherwise the page still works in
 local-snapshot mode and shows database freshness based on the latest stored
 message.
+
+## Context-aware strategy updates and cancellations
+
+Cross-message updates, cancellations, replies, and text-plus-image evidence are
+handled by the fail-closed contextual strategy resolver. It is disabled by
+default and requires global auto trading, live management mode, the dedicated
+boolean, and an explicit Telegram chat allowlist. See
+[`docs/contextual-strategy-resolution.md`](docs/contextual-strategy-resolution.md)
+for the data flow, safety gates, one-shot command, and troubleshooting.

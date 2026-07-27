@@ -35,3 +35,34 @@
     {% if strategy.status_detail %}<p class="position-lifecycle-detail">{{ strategy.status_detail }}</p>{% endif %}
   </div>
 {% endif %}
+{% if strategy.context_resolution %}
+  <div class="position-lifecycle">
+    <div class="position-lifecycle-title">上下文策略线程</div>
+    <div class="position-lifecycle-row">
+      <strong>线程 #{{ strategy.context_resolution.thread_id }}</strong>
+      <code>根消息 #{{ strategy.context_resolution.root_message_id }}</code>
+      <span>{{ strategy.context_resolution.thread_status }}</span>
+      <span>自动化{{ '已启用' if strategy.context_resolution.automation_enabled else '未启用' }}</span>
+    </div>
+    {% for linked_message in strategy.context_resolution.linked_messages %}
+      <div class="position-lifecycle-row">
+        <code>#{{ linked_message.message_id }}</code>
+        <span>{{ linked_message.relation }}</span>
+        {% if linked_message.posted_at %}<time>{{ linked_message.posted_at }}</time>{% endif %}
+        {% if linked_message.reply_to_message_id %}<span>引用 #{{ linked_message.reply_to_message_id }}</span>{% endif %}
+      </div>
+    {% endfor %}
+    <p class="position-lifecycle-detail">
+      证据版本 {{ strategy.context_resolution.evidence_version or '-' }}
+      · {{ strategy.context_resolution.evidence_input_kind or '-' }}
+      · 决策 {{ strategy.context_resolution.decision or '-' }}
+      · 置信度 {{ strategy.context_resolution.confidence if strategy.context_resolution.confidence is not none else '-' }}
+    </p>
+    {% if strategy.context_resolution.unresolved_reason %}
+      <p class="position-lifecycle-detail">
+        待解决：{{ strategy.context_resolution.unresolved_reason }}
+        · 下次触发 {{ strategy.context_resolution.next_triggers|join(', ') }}
+      </p>
+    {% endif %}
+  </div>
+{% endif %}

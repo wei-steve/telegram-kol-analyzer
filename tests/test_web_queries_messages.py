@@ -7,10 +7,14 @@ from sqlalchemy import event
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
+    ContextResolutionAttempt,
     MediaAsset,
+    MessageEvidenceVersion,
     RawMessage,
     RecognitionDecision,
     StrategyManagementBatch,
+    StrategyMessageLink,
+    StrategyThread,
 )
 from telegram_kol_research.web_queries import (
     _build_message_decision_card,
@@ -49,6 +53,89 @@ def test_load_group_messages_includes_media_and_orders_newest_first_within_page(
 
     assert [row["message_id"] for row in rows] == [2, 1]
     assert rows[0]["media_assets"][0]["local_path"] == "data/media/9/2.jpg"
+
+
+def test_load_group_messages_projects_safe_context_resolution_observability(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=-1009,
+            message_id=1462,
+            reply_to_message_id=1460,
+            posted_at=datetime(2026, 7, 20, 8, 8, tzinfo=UTC),
+            text="更新入场",
+        )
+        session.add(raw)
+        session.flush()
+        evidence = MessageEvidenceVersion(
+            raw_message_id=raw.id,
+            version=2,
+            input_fingerprint="sha256:evidence",
+            model="mimo",
+            extraction_status="completed",
+            confidence=0.95,
+            text_evidence_json='{"observed_text":"更新入场"}',
+            image_evidence_json='{"fields":{"entry":"65100"}}',
+            normalized_evidence_json="{}",
+        )
+        thread = StrategyThread(
+            chat_id=-1009,
+            root_message_id=1460,
+            symbol="BTC",
+            side="long",
+            status="active",
+        )
+        session.add_all([evidence, thread])
+        session.flush()
+        session.add_all(
+            [
+                StrategyMessageLink(
+                    strategy_thread_id=thread.id,
+                    raw_message_id=raw.id,
+                    message_evidence_version_id=evidence.id,
+                    relation_kind="revision",
+                    resolver="deepseek_context",
+                    confidence=0.96,
+                    evidence_json='{"safe":"only"}',
+                    decision_version="v1",
+                    status="active",
+                ),
+                ContextResolutionAttempt(
+                    raw_message_id=raw.id,
+                    message_evidence_version_id=evidence.id,
+                    context_fingerprint="sha256:context",
+                    model="deepseek",
+                    request_summary_json='{"message_context":[{"message_id":1460}]}',
+                    prompt_versions_json="{}",
+                    decision_json=(
+                        '{"decision":"unresolved","confidence":0.61,'
+                        '"supporting_message_ids":[1460,1462],'
+                        '"opposing_message_ids":[],"reason":"等待入场状态"}'
+                    ),
+                    status="completed",
+                    reanalysis_triggers_json='["strategy_state_changed"]',
+                ),
+            ]
+        )
+        session.commit()
+
+    context = load_group_messages(
+        session_factory,
+        chat_id=-1009,
+        limit=10,
+    )[0]["context_resolution"]
+
+    assert context["reply_to_message_id"] == 1460
+    assert context["evidence_version"] == 2
+    assert context["evidence_input_kind"] == "text+image"
+    assert context["linked_threads"][0]["root_message_id"] == 1460
+    assert context["linked_messages"][0]["message_id"] == 1462
+    assert context["linked_messages"][0]["posted_at"] is not None
+    assert context["confidence"] == 0.61
+    assert context["supporting_message_ids"] == [1460, 1462]
+    assert context["unresolved_reason"] == "等待入场状态"
+    assert context["next_triggers"] == ["strategy_state_changed"]
+    assert "request_summary_json" not in context
 
 
 def test_load_group_messages_limits_excessive_media_assets_per_message(tmp_path):
