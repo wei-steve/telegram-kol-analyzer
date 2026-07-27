@@ -1183,6 +1183,7 @@ def test_authoritative_rerecognition_never_mutates_item_linked_candidate_semanti
         active_item = (
             session.query(MessageInstructionItem)
             .filter(MessageInstructionItem.retired_at.is_(None))
+            .filter(MessageInstructionItem.status == "pending")
             .one()
         )
         new_candidate = session.get(
@@ -1200,7 +1201,7 @@ def test_authoritative_rerecognition_never_mutates_item_linked_candidate_semanti
         old_candidate.leverage_text,
         old_candidate.confidence,
     ) == old_semantics
-    assert old_item is not None and old_item.retired_at is not None
+    assert old_item is not None and old_item.retired_at is None
     assert active_item.id != old_item_id
     assert new_candidate is not None
     assert (new_candidate.symbol, new_candidate.side) == ("BTC", "short")

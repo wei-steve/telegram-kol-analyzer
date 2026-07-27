@@ -74,6 +74,23 @@ TARGET_REQUIRED_DECISIONS = frozenset(
     {"revise_thread", "manage_thread", "cancel_thread", "exit_thread"}
 )
 MULTI_TARGET_DECISIONS = frozenset({"cancel_thread", "exit_thread"})
+ALLOWED_ACTIONS_BY_DECISION = {
+    "new_thread": frozenset({None}),
+    "revise_thread": frozenset({None, "replace_entry"}),
+    "manage_thread": frozenset(
+        {
+            None,
+            "partial_take_profit",
+            "move_stop_to_protect",
+            "hold_update",
+            "risk_update",
+        }
+    ),
+    "cancel_thread": frozenset({None, "cancel_pending_entry"}),
+    "exit_thread": frozenset({None, "exit_full", "exit_partial"}),
+    "hold": frozenset({None}),
+    "unresolved": frozenset({None}),
+}
 
 
 class ContextResolutionError(ValueError):
@@ -169,6 +186,8 @@ def parse_context_resolution_decision(
     )
     if management_action is not None and management_action not in MANAGEMENT_ACTIONS:
         raise ContextResolutionError("unknown management action")
+    if management_action not in ALLOWED_ACTIONS_BY_DECISION[decision]:
+        raise ContextResolutionError("management action is incompatible with decision")
     try:
         confidence = float(payload.get("confidence"))
     except (TypeError, ValueError) as exc:
@@ -431,6 +450,22 @@ def resolve_contextual_strategy(
         },
         {"message_id", "source_message_id", "root_message_id"},
     )
+    with session_factory() as session:
+        completed = (
+            session.query(ContextResolutionAttempt)
+            .filter(
+                ContextResolutionAttempt.raw_message_id == int(raw_message_id),
+                ContextResolutionAttempt.context_fingerprint == context_fingerprint,
+                ContextResolutionAttempt.status == "completed",
+            )
+            .one_or_none()
+        )
+        if completed is not None and completed.decision_json:
+            return parse_context_resolution_decision(
+                json.loads(completed.decision_json),
+                allowed_thread_ids=allowed_thread_ids,
+                allowed_message_ids=allowed_message_ids,
+            )
     provider = _select_provider(ai_recognition_config)
     attempts = 0
     for attempt_number in (1, 2):

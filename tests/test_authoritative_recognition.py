@@ -10,7 +10,9 @@ from telegram_kol_research.authoritative_recognition import (
     apply_authoritative_assessment,
     assess_message_authoritatively,
     process_authoritative_message,
+    requires_context_resolution,
 )
+from telegram_kol_research.context_resolution import ContextResolutionDecision
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -20,6 +22,7 @@ from telegram_kol_research.models import (
     RecognitionDecision,
     SignalCandidate,
     StrategyLifecycle,
+    StrategyMessageLink,
 )
 from telegram_kol_research.recognition_experiments import MimoAuthoritativeResult
 from telegram_kol_research.recognition_decisions import (
@@ -28,6 +31,300 @@ from telegram_kol_research.recognition_decisions import (
     finalize_authoritative_automation_outcome,
     save_pending_authoritative_decision,
 )
+from telegram_kol_research.strategy_threads import (
+    create_strategy_thread_for_lifecycle,
+    link_message_to_strategy_thread,
+)
+
+
+def test_context_resolution_triggers_are_closed_and_auditable():
+    required, reasons = requires_context_resolution(
+        first_pass_payload={
+            "recognition_result": "是策略",
+            "strategy": {"symbol": "BTC", "side": "long"},
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "target_lifecycle_id": None,
+            },
+        },
+        evidence={"conflicts": [{"field": "side"}]},
+        context_window={
+            "current": {"text": "更新 BTC 多单，有入场的保护成本"},
+            "reply_chain": [],
+        },
+        candidates=[
+            {"thread_id": 12, "lifecycle_id": 22},
+            {"thread_id": 13, "lifecycle_id": 23},
+        ],
+    )
+
+    assert required is True
+    assert reasons == (
+        "revision_language",
+        "entered_holder_language",
+        "management_without_exact_target",
+        "multiple_same_source_candidates",
+        "text_image_conflict",
+        "apparent_entry_may_be_revision",
+    )
+
+
+def test_unambiguous_independent_entry_does_not_require_second_resolution():
+    required, reasons = requires_context_resolution(
+        first_pass_payload={
+            "recognition_result": "是策略",
+            "strategy": {"symbol": "SOL", "side": "long"},
+            "lifecycle_event": {"event_type": "none"},
+        },
+        evidence={"conflicts": []},
+        context_window={
+            "current": {"text": "SOL 新多单，市价进，止损 180，止盈 200"},
+            "reply_chain": [],
+        },
+        candidates=[],
+    )
+
+    assert required is False
+    assert reasons == ()
+
+
+def test_unambiguous_entry_skips_injected_context_resolver(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "independent-entry.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=92,
+            message_id=1600,
+            text="SOL 新多单，市价进，止损 180，止盈 200",
+        )
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    payload = {
+        "recognition_result": "是策略",
+        "strategy": {
+            "symbol": "SOL",
+            "side": "long",
+            "entry": "市价进",
+            "stop_loss": "180",
+            "take_profit": "200",
+        },
+        "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+        "confidence": 0.95,
+    }
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: MimoAuthoritativeResult(
+            raw_message_id=raw_id,
+            payload=payload,
+            input_kind="text",
+            model="mimo-v2.5",
+            status="是策略",
+        ),
+    )
+
+    assessment = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        context_resolver=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("independent entry must not call the context resolver")
+        ),
+    )
+    result = apply_authoritative_assessment(session_factory, assessment)
+
+    assert assessment.context_resolution is None
+    assert assessment.context_resolution_triggers == ()
+    assert result.status == "是策略"
+
+
+def test_revision_is_resolved_before_instruction_projection(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "context-revision.db")
+    with session_factory() as session:
+        root = RawMessage(chat_id=90, message_id=1460, text="BTC 多单")
+        current = RawMessage(
+            chat_id=90,
+            message_id=1462,
+            text="更新 BTC 多单，入场 65100-65400",
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=90,
+            message_id=1460,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 27, 1, tzinfo=UTC),
+            entry_range_low=65000,
+            entry_range_high=65500,
+        )
+        session.add_all([root, current, lifecycle])
+        session.commit()
+        root_id = root.id
+        current_id = current.id
+        lifecycle_id = lifecycle.id
+    thread = create_strategy_thread_for_lifecycle(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+    )
+    link_message_to_strategy_thread(
+        session_factory,
+        strategy_thread_id=thread.id,
+        raw_message_id=root_id,
+        relation_kind="root",
+        resolver="deterministic",
+        confidence=1.0,
+        decision_version="v1",
+    )
+    mimo_payload = {
+        "recognition_result": "是策略",
+        "reason": "看起来是完整入场参数",
+        "strategy": {
+            "symbol": "BTC",
+            "side": "long",
+            "entry": "65100-65400",
+            "stop_loss": "64500",
+            "take_profit": "66000",
+        },
+        "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+        "confidence": 0.95,
+    }
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: MimoAuthoritativeResult(
+            raw_message_id=current_id,
+            payload=mimo_payload,
+            input_kind="text",
+            model="mimo-v2.5",
+            status="是策略",
+        ),
+    )
+    calls = []
+
+    def resolver(**kwargs):
+        calls.append(kwargs)
+        return ContextResolutionDecision(
+            decision="revise_thread",
+            target_thread_ids=(thread.id,),
+            management_action="replace_entry",
+            confidence=0.94,
+            supporting_message_ids=(1460, 1462),
+            opposing_message_ids=(),
+            conflict_types=("entry_or_revision",),
+            risk_reducing_fanout_allowed=False,
+            reanalysis_triggers=(),
+            reason="explicit update",
+        )
+
+    assessment = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        context_resolver=resolver,
+    )
+    result = apply_authoritative_assessment(session_factory, assessment)
+
+    assert len(calls) == 1
+    assert assessment.context_resolution.decision == "revise_thread"
+    assert result.status == "非策略"
+    with session_factory() as session:
+        assert session.query(MessageInstructionItem).count() == 0
+        link = (
+            session.query(StrategyMessageLink)
+            .filter(StrategyMessageLink.raw_message_id == current_id)
+            .one()
+        )
+    assert link.strategy_thread_id == thread.id
+    assert link.relation_kind == "revision"
+
+
+def test_context_cancel_targets_exact_thread_before_projection(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "context-cancel.db")
+    with session_factory() as session:
+        root = RawMessage(chat_id=93, message_id=1700, text="BTC 限价多单")
+        current = RawMessage(
+            chat_id=93,
+            message_id=1701,
+            text="策略先取消",
+            reply_to_message_id=1700,
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=93,
+            message_id=1700,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 27, 1, tzinfo=UTC),
+        )
+        session.add_all([root, current, lifecycle])
+        session.commit()
+        root_id = root.id
+        current_id = current.id
+        lifecycle_id = lifecycle.id
+    thread = create_strategy_thread_for_lifecycle(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+    )
+    link_message_to_strategy_thread(
+        session_factory,
+        strategy_thread_id=thread.id,
+        raw_message_id=root_id,
+        relation_kind="root",
+        resolver="deterministic",
+        confidence=1.0,
+        decision_version="v1",
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: MimoAuthoritativeResult(
+            raw_message_id=current_id,
+            payload={
+                "recognition_result": "非策略",
+                "strategy": {},
+                "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+                "confidence": 0.8,
+            },
+            input_kind="text",
+            model="mimo-v2.5",
+            status="非策略",
+        ),
+    )
+
+    assessment = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        context_resolver=lambda **kwargs: ContextResolutionDecision(
+            decision="cancel_thread",
+            target_thread_ids=(thread.id,),
+            management_action="cancel_pending_entry",
+            confidence=0.96,
+            supporting_message_ids=(1700, 1701),
+            opposing_message_ids=(),
+            conflict_types=(),
+            risk_reducing_fanout_allowed=False,
+            reanalysis_triggers=(),
+            reason="explicit reply cancellation",
+        ),
+    )
+    result = apply_authoritative_assessment(session_factory, assessment)
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        item = session.query(MessageInstructionItem).one()
+        link = (
+            session.query(StrategyMessageLink)
+            .filter(
+                StrategyMessageLink.raw_message_id == current_id,
+                StrategyMessageLink.relation_kind == "cancellation",
+            )
+            .one()
+        )
+    assert lifecycle.lifecycle_status == "exited"
+    assert item.instruction_kind == "management"
+    assert link.strategy_thread_id == thread.id
 
 
 def test_fengge_exit_applies_mimo_while_execution_gate_is_pending(tmp_path, monkeypatch):

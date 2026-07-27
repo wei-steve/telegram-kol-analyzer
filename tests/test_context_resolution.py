@@ -1,5 +1,4 @@
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -52,6 +51,8 @@ def test_parse_context_resolution_decision_accepts_closed_valid_contract():
         {"target_thread_ids": [999]},
         {"decision": "invented"},
         {"management_action": "invented"},
+        {"decision": "new_thread", "target_thread_ids": [], "management_action": "risk_update"},
+        {"decision": "cancel_thread", "management_action": "replace_entry"},
         {"conflict_types": ["invented"]},
         {"target_thread_ids": []},
         {"target_thread_ids": [12, 13]},
@@ -181,3 +182,48 @@ def test_resolver_rejects_supporting_message_outside_context_and_persists_failur
         attempt = session.query(ContextResolutionAttempt).one()
     assert attempt.status == "failed"
     assert attempt.error_class == "contract_error"
+
+
+def test_completed_context_fingerprint_is_reused_without_recalling_model(tmp_path):
+    session_factory = create_session_factory(tmp_path / "idempotent.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=91, message_id=1500, text="更新 BTC 多单")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    calls = 0
+
+    def model_caller(**kwargs):
+        nonlocal calls
+        calls += 1
+        return _valid_payload(
+            supporting_message_ids=[1499, 1500],
+        )
+
+    kwargs = {
+        "raw_message_id": raw_id,
+        "ai_recognition_config": AiRecognitionConfig(
+            text_provider=AiProviderConfig(
+                base_url="https://api.deepseek.com",
+                model="deepseek-v4-flash",
+            )
+        ),
+        "evidence": {},
+        "context_window": {
+            "current": {"message_id": 1500},
+            "messages": [{"message_id": 1499}],
+            "reply_chain": [],
+        },
+        "candidates": [{"thread_id": 12, "root_message_id": 1499}],
+        "first_pass_payload": {},
+        "exchange_state": {},
+        "model_caller": model_caller,
+    }
+
+    first = resolve_contextual_strategy(session_factory, **kwargs)
+    repeated = resolve_contextual_strategy(session_factory, **kwargs)
+
+    assert repeated == first
+    assert calls == 1
+    with session_factory() as session:
+        assert session.query(ContextResolutionAttempt).count() == 1

@@ -2418,6 +2418,7 @@ def _project_authoritative_instruction_items(
     obsolete_pending_items = (
         session.query(MessageInstructionItem)
         .filter(MessageInstructionItem.raw_message_id == raw_message_id)
+        .filter(MessageInstructionItem.status == "pending")
         .filter(MessageInstructionItem.retired_at.is_(None))
         .filter(
             ~MessageInstructionItem.signal_candidate_id.in_(accepted_candidate_ids)
