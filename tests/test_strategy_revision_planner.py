@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -351,3 +351,36 @@ def test_revision_concurrent_advance_claim_never_enters_writer(tmp_path):
 
     assert result.status == "in_progress"
     assert result.reason_code == "revision_advance_already_claimed"
+
+
+def test_stale_revision_claim_freezes_for_reconciliation_without_writes(tmp_path):
+    session_factory = create_session_factory(tmp_path / "stale-claim.db")
+    raw_id, _, thread_id = _persist_revision_target(session_factory)
+    plan = plan_strategy_revision(
+        session_factory,
+        raw_message_id=raw_id,
+        strategy_thread_id=thread_id,
+        replacement={"entry": "65100-65400"},
+        planned_at=NOW,
+    )
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, plan.batch_id)
+        batch.status = "cancelling_old_entries"
+        batch.advance_claim_token = "crashed-worker"
+        batch.advance_claimed_at = NOW - timedelta(minutes=6)
+        session.commit()
+
+    result = advance_strategy_revision(
+        session_factory,
+        batch_id=plan.batch_id,
+        cancel_leg_writer=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("stale claim must not resume cancellation")
+        ),
+        replacement_writer=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("stale claim must not submit")
+        ),
+        advanced_at=NOW,
+    )
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "revision_advance_claim_stale"

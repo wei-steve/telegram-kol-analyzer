@@ -6,7 +6,7 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
@@ -33,6 +33,7 @@ TERMINAL_REVISION_STATES = frozenset(
 REPLACEMENT_WRITE_BOUNDARY_STATES = frozenset(
     {"submitting_replacements", "reconciling"}
 )
+REVISION_ADVANCE_CLAIM_LEASE = timedelta(minutes=5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +295,27 @@ def advance_strategy_revision(
                 reason_code=batch.reason_code,
             )
         if batch.advance_claim_token:
+            claimed_at = batch.advance_claimed_at
+            comparable_now = now
+            if claimed_at is not None:
+                if claimed_at.tzinfo is None and comparable_now.tzinfo is not None:
+                    claimed_at = claimed_at.replace(tzinfo=UTC)
+                elif claimed_at.tzinfo is not None and comparable_now.tzinfo is None:
+                    comparable_now = comparable_now.replace(tzinfo=UTC)
+            if (
+                claimed_at is not None
+                and comparable_now - claimed_at
+                >= REVISION_ADVANCE_CLAIM_LEASE
+            ):
+                stale_batch_id = int(batch.id)
+                session.rollback()
+                return _mark_recovery_required(
+                    session_factory,
+                    batch_id=stale_batch_id,
+                    revision_leg_id=None,
+                    reason_code="revision_advance_claim_stale",
+                    advanced_at=now,
+                )
             return StrategyRevisionResult(
                 status="in_progress",
                 batch_id=int(batch.id),
