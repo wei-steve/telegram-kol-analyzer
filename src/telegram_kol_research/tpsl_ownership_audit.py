@@ -7,8 +7,9 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterable
 
-
-_ACTIVE_LEDGER_STATUSES = frozenset({"verified", "protected"})
+from telegram_kol_research.protection_ledger import (
+    build_account_protection_ownership,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,7 @@ class TpslOwnershipAudit:
     live_position_count: int
     pending_tpsl_count: int
     owned_pending_count: int
+    owned_pending_order_ids: tuple[str, ...]
     unowned_pending_order_ids: tuple[str, ...]
     conflicts: tuple[TpslOwnershipConflict, ...]
     stale_ledger_order_ids: tuple[str, ...]
@@ -50,20 +52,15 @@ def build_tpsl_ownership_audit(
         pos_id for row in live_positions
         if (pos_id := _text(row, "PositionID", "posId", "pos_id", "id"))
     }
-    normalized_venue = str(venue or "deepcoin").lower()
-    ledger_owners: dict[str, set[str]] = {}
-    for row in ledger_rows:
-        row_venue = str(_field(row, "venue") or "deepcoin").lower()
-        status = str(_field(row, "status") or "").lower()
-        order_id = _object_text(row, "order_id")
-        pos_id = _object_text(row, "pos_id")
-        if (
-            row_venue == normalized_venue
-            and status in _ACTIVE_LEDGER_STATUSES
-            and order_id
-            and pos_id
-        ):
-            ledger_owners.setdefault(order_id, set()).add(pos_id)
+    ownership = build_account_protection_ownership(
+        ledger_rows,
+        venue=venue,
+        live_pos_ids=live_pos_ids,
+    )
+    ownership_conflicts = {
+        conflict.order_id: conflict
+        for conflict in ownership.conflicts
+    }
 
     pending = [
         row for row in pending_orders
@@ -93,7 +90,7 @@ def build_tpsl_ownership_audit(
         )
         for row in pending
     }
-    owned = 0
+    owned: list[str] = []
     unowned: list[str] = []
     conflicts: list[TpslOwnershipConflict] = []
     for row in pending:
@@ -107,7 +104,18 @@ def build_tpsl_ownership_audit(
             "triggerOrderId",
             "id",
         )
-        owners = ledger_owners.get(order_id, set())
+        ledger_conflict = ownership_conflicts.get(order_id)
+        if ledger_conflict is not None:
+            conflicts.append(
+                TpslOwnershipConflict(
+                    order_id=order_id,
+                    ledger_pos_id=",".join(ledger_conflict.pos_ids),
+                    exchange_pos_id=None,
+                    reason="multiple_ledger_position_owners",
+                )
+            )
+            continue
+        owner_row = ownership.owner_for_order(order_id)
         exchange_pos_id = _text(
             row,
             "PositionID",
@@ -118,17 +126,7 @@ def build_tpsl_ownership_audit(
             "pos_id",
             "positionId",
         ) or None
-        if len(owners) > 1:
-            conflicts.append(
-                TpslOwnershipConflict(
-                    order_id=order_id,
-                    ledger_pos_id=",".join(sorted(owners)),
-                    exchange_pos_id=exchange_pos_id,
-                    reason="multiple_ledger_position_owners",
-                )
-            )
-            continue
-        ledger_pos_id = next(iter(owners), None)
+        ledger_pos_id = owner_row.pos_id if owner_row is not None else None
         if (
             ledger_pos_id is not None
             and exchange_pos_id is not None
@@ -157,17 +155,23 @@ def build_tpsl_ownership_audit(
                 )
             )
             continue
-        owned += 1
+        owned.append(order_id)
 
     stale = sorted(
         order_id
-        for order_id in ledger_owners
+        for order_id in ownership.by_order_id
         if order_id not in pending_ids
+    )
+    stale.extend(
+        order_id
+        for order_id in ownership.stale_order_ids
+        if order_id not in stale
     )
     return TpslOwnershipAudit(
         live_position_count=len(live_positions),
         pending_tpsl_count=len(pending),
-        owned_pending_count=owned,
+        owned_pending_count=len(owned),
+        owned_pending_order_ids=tuple(sorted(owned)),
         unowned_pending_order_ids=tuple(sorted(unowned)),
         conflicts=tuple(sorted(conflicts, key=lambda item: (item.order_id, item.reason))),
         stale_ledger_order_ids=tuple(stale),
@@ -201,17 +205,6 @@ def load_readonly_protection_ledger(
         ]
     finally:
         connection.close()
-
-
-def _field(value: object, name: str) -> Any:
-    if isinstance(value, dict):
-        return value.get(name)
-    return getattr(value, name, None)
-
-
-def _object_text(value: object, name: str) -> str:
-    raw = _field(value, name)
-    return str(raw).strip() if raw not in (None, "") else ""
 
 
 def _text(payload: dict[str, Any], *keys: str) -> str:

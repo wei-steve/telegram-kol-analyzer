@@ -77,6 +77,7 @@ def test_account_audit_classifies_every_pending_tpsl_without_guessing():
     assert report.live_position_count == 3
     assert report.pending_tpsl_count == 5
     assert report.owned_pending_count == 3
+    assert report.owned_pending_order_ids == ("owned-a", "owned-b", "owned-c")
     assert report.unowned_pending_order_ids == ("manual-1",)
     assert report.conflicts[0].order_id == "conflict-1"
     assert report.conflicts[0].reason == "exchange_position_conflicts_with_ledger"
