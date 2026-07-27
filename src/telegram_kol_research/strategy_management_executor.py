@@ -717,10 +717,13 @@ def _execute_break_even_by_market_batch(
                 "order_ids": old_order_ids,
                 "row_snapshots": old_rows,
             },
-            planned_tpsl={
-                "intent": "move_stop_to_break_even",
-                "stop_loss_text": None,
-            },
+            planned_tpsl=(
+                leg.planned_tpsl
+                or {
+                    "intent": "move_stop_to_break_even",
+                    "stop_loss_text": None,
+                }
+            ),
         )
         new_rows = _adjusted_protection_rows(
             batch=replace(

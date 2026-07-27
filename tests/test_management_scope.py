@@ -118,11 +118,27 @@ def test_reply_target_wins_over_group_fanout(tmp_path) -> None:
 def test_unscoped_break_even_fans_out_same_chat_symbol_and_side(tmp_path) -> None:
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
+        thread = StrategyThread(
+            chat_id=88,
+            root_message_id=1,
+            symbol="BTC",
+            side="long",
+        )
+        session.add(thread)
+        session.flush()
         first = _persist_live_strategy(
-            session, chat_id=88, message_id=1, pos_id="pos-1"
+            session,
+            chat_id=88,
+            message_id=1,
+            pos_id="pos-1",
+            strategy_thread_id=thread.id,
         )
         second = _persist_live_strategy(
-            session, chat_id=88, message_id=2, pos_id="pos-2"
+            session,
+            chat_id=88,
+            message_id=2,
+            pos_id="pos-2",
+            strategy_thread_id=thread.id,
         )
         message = RawMessage(chat_id=88, message_id=3, text="BTC多单成本保护")
         session.add(message)
@@ -143,8 +159,17 @@ def test_unscoped_break_even_fans_out_same_chat_symbol_and_side(tmp_path) -> Non
 def test_fanout_excludes_other_scope_and_unverified_binding(tmp_path) -> None:
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
+        thread = StrategyThread(
+            chat_id=88, root_message_id=1, symbol="BTC", side="long"
+        )
+        session.add(thread)
+        session.flush()
         included = _persist_live_strategy(
-            session, chat_id=88, message_id=1, pos_id="pos-1"
+            session,
+            chat_id=88,
+            message_id=1,
+            pos_id="pos-1",
+            strategy_thread_id=thread.id,
         )
         _persist_live_strategy(
             session, chat_id=99, message_id=2, pos_id="pos-2"
@@ -161,6 +186,7 @@ def test_fanout_excludes_other_scope_and_unverified_binding(tmp_path) -> None:
             message_id=5,
             pos_id="pos-5",
             attribution_status="unassigned",
+            strategy_thread_id=thread.id,
         )
         message = RawMessage(chat_id=88, message_id=6, text="BTC多单成本保护")
         session.add(message)
@@ -448,11 +474,24 @@ def test_group_stop_update_fails_closed_if_any_verified_target_would_widen(
 ) -> None:
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
+        thread = StrategyThread(
+            chat_id=88, root_message_id=1, symbol="BTC", side="long"
+        )
+        session.add(thread)
+        session.flush()
         tighter = _persist_live_strategy(
-            session, chat_id=88, message_id=1, pos_id="pos-1"
+            session,
+            chat_id=88,
+            message_id=1,
+            pos_id="pos-1",
+            strategy_thread_id=thread.id,
         )
         wider = _persist_live_strategy(
-            session, chat_id=88, message_id=2, pos_id="pos-2"
+            session,
+            chat_id=88,
+            message_id=2,
+            pos_id="pos-2",
+            strategy_thread_id=thread.id,
         )
         tighter.stop_loss = 60000
         wider.stop_loss = 65000

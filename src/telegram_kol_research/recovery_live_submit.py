@@ -24,8 +24,10 @@ from telegram_kol_research.execution_bindings import upsert_execution_binding
 from telegram_kol_research.execution_bindings import upsert_execution_order_leg
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
+from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.models import StrategyRevisionBatch
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
@@ -156,6 +158,120 @@ def submit_recovery_order_live(
         processed_at=submitted_at,
         max_order_legs=max_order_legs,
     )
+
+
+def submit_strategy_revision_replacement_live(
+    session_factory: sessionmaker,
+    *,
+    batch_id: int,
+    draft: dict[str, Any],
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    submitted_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Submit a prevalidated revision draft through the existing entry writer."""
+
+    now = submitted_at or datetime.now(UTC)
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, int(batch_id))
+        if (
+            batch is None
+            or batch.status != "submitting_replacements"
+            or not batch.advance_claim_token
+        ):
+            raise RecoveryLiveSubmitError("revision_batch_not_reserved")
+        binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+        if binding is None:
+            raise RecoveryLiveSubmitError("revision_binding_missing")
+        strategy_instance_id = str(draft.get("strategy_instance_id") or "")
+        source = draft.get("source") if isinstance(draft.get("source"), dict) else {}
+        order_legs = (
+            draft.get("order_legs")
+            if isinstance(draft.get("order_legs"), list)
+            else []
+        )
+        first_order_leg = (
+            order_legs[0]
+            if order_legs and isinstance(order_legs[0], dict)
+            else {}
+        )
+        draft_side = str(
+            draft.get("position_side")
+            or draft.get("side")
+            or first_order_leg.get("position_side")
+            or ""
+        ).lower()
+        if (
+            strategy_instance_id != str(binding.strategy_instance_id)
+            or int(source.get("chat_id") or 0) != int(binding.chat_id)
+            or int(source.get("message_id") or 0) != int(binding.message_id)
+            or str(draft.get("symbol") or "").upper() != str(binding.symbol).upper()
+            or draft_side != str(binding.side).lower()
+        ):
+            raise RecoveryLiveSubmitError("revision_draft_identity_mismatch")
+        max_leg_index = max(
+            (
+                int(value)
+                for (value,) in session.query(ExecutionOrderLeg.leg_index)
+                .filter(
+                    ExecutionOrderLeg.execution_binding_id == int(binding.id),
+                    ExecutionOrderLeg.purpose == "entry",
+                )
+                .all()
+            ),
+            default=0,
+        )
+        binding_context = {
+            "kol_id": binding.kol_id,
+            "chat_id": int(binding.chat_id),
+            "message_id": int(binding.message_id),
+            "symbol": binding.symbol,
+            "side": binding.side,
+            "strategy_instance_id": binding.strategy_instance_id,
+        }
+    validated_draft = dict(draft)
+    validated_draft["_entry_leg_index_offset"] = max_leg_index
+    trade_signal = enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="strategy_revision",
+        kol_id=str(binding_context["kol_id"]),
+        chat_id=int(binding_context["chat_id"]),
+        message_id=int(batch_id),
+        symbol=str(binding_context["symbol"]),
+        side=str(binding_context["side"]),
+        action="open_position",
+        payload={
+            "strategy_revision_batch_id": int(batch_id),
+            "deepcoin_order_draft": validated_draft,
+        },
+        strategy_instance_id=str(binding_context["strategy_instance_id"]),
+        enqueued_at=now,
+    )
+    try:
+        result = _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=trade_signal,
+            deepcoin_client=deepcoin_client,
+            contract_spec_provider=contract_spec_provider,
+            submitted_at=now,
+            validated_draft=validated_draft,
+        )
+    except Exception as exc:
+        mark_trade_signal_failed(
+            session_factory,
+            signal_id=trade_signal.id,
+            error=str(exc),
+            failed_at=now,
+        )
+        raise
+    mark_trade_signal_submitted(
+        session_factory,
+        signal_id=trade_signal.id,
+        result=result,
+        processed_at=now,
+    )
+    return {"status": "submitted", **result}
 
 
 def enqueue_recovery_trade_signal(
@@ -327,22 +443,27 @@ def _submit_recovery_signal_direct(
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     submitted_at: datetime | None = None,
     max_order_legs: int | None = None,
+    validated_draft: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    gate = validate_recovery_live_submit_gate(
-        session_factory,
-        chat_id=trade_signal.chat_id,
-        message_id=trade_signal.message_id,
-        symbol=trade_signal.symbol,
-        side=trade_signal.side,
-        contract_spec_provider=contract_spec_provider,
-    )
-    if not gate["would_submit"]:
-        raise RecoveryLiveSubmitError(
-            "live_submit_blocked:" + ",".join(str(code) for code in gate["reason_codes"])
+    if validated_draft is None:
+        gate = validate_recovery_live_submit_gate(
+            session_factory,
+            chat_id=trade_signal.chat_id,
+            message_id=trade_signal.message_id,
+            symbol=trade_signal.symbol,
+            side=trade_signal.side,
+            contract_spec_provider=contract_spec_provider,
         )
-    draft = gate["deepcoin_order_draft"]
-    if not isinstance(draft, dict):
-        raise RecoveryLiveSubmitError("missing_deepcoin_order_draft")
+        if not gate["would_submit"]:
+            raise RecoveryLiveSubmitError(
+                "live_submit_blocked:"
+                + ",".join(str(code) for code in gate["reason_codes"])
+            )
+        draft = gate["deepcoin_order_draft"]
+        if not isinstance(draft, dict):
+            raise RecoveryLiveSubmitError("missing_deepcoin_order_draft")
+    else:
+        draft = validated_draft
     queued_draft = (
         trade_signal.payload.get("deepcoin_order_draft")
         if isinstance(trade_signal.payload, dict)
@@ -364,7 +485,11 @@ def _submit_recovery_signal_direct(
 
     selected_order_legs = order_legs[:max_order_legs] if max_order_legs else order_legs
     submission_order_legs = _submission_order_legs(draft, selected_order_legs)
-    for index, leg in enumerate(submission_order_legs, start=1):
+    leg_index_offset = int(draft.get("_entry_leg_index_offset") or 0)
+    for index, leg in enumerate(
+        submission_order_legs,
+        start=leg_index_offset + 1,
+    ):
         if not isinstance(leg, dict):
             raise RecoveryLiveSubmitError("invalid_order_leg")
         order_type = str(leg.get("order_type") or "").lower()

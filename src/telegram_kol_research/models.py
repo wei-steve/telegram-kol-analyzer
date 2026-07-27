@@ -283,6 +283,12 @@ class StrategyRevisionBatch(Base):
         Text, nullable=True
     )
     reason_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    advance_claim_token: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    advance_claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
     planned_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     completed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True

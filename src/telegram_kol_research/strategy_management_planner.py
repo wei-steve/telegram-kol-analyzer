@@ -750,8 +750,15 @@ def _plan_strategy_management_batch_locked(
                     ),
                 }
                 if intent in PROTECTION_INTENTS
-                and effective_action_name
-                not in {"full_close", "full_exit", BREAK_EVEN_BY_MARKET_ACTION}
+                and effective_action_name not in {"full_close", "full_exit"}
+                and (
+                    effective_action_name != BREAK_EVEN_BY_MARKET_ACTION
+                    or (
+                        candidate.stop_loss_text not in (None, "")
+                        and candidate.stop_price_source
+                        == "current_message_text"
+                    )
+                )
                 else None
             ),
             last_exchange_snapshot=position,

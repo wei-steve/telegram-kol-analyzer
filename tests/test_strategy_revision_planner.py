@@ -317,5 +317,37 @@ def test_revision_restart_after_replacement_boundary_never_resubmits(
         advanced_at=NOW,
     )
 
-    assert result.status == "recovery_required"
+    assert result.status == interrupted_status
     assert result.reason_code == "revision_replacement_reconciliation_required"
+
+
+def test_revision_concurrent_advance_claim_never_enters_writer(tmp_path):
+    session_factory = create_session_factory(tmp_path / "concurrent-claim.db")
+    raw_id, _, thread_id = _persist_revision_target(session_factory)
+    plan = plan_strategy_revision(
+        session_factory,
+        raw_message_id=raw_id,
+        strategy_thread_id=thread_id,
+        replacement={"entry": "65100-65400"},
+        planned_at=NOW,
+    )
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, plan.batch_id)
+        batch.advance_claim_token = "other-worker"
+        batch.advance_claimed_at = NOW
+        session.commit()
+
+    result = advance_strategy_revision(
+        session_factory,
+        batch_id=plan.batch_id,
+        cancel_leg_writer=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("concurrent worker must not cancel")
+        ),
+        replacement_writer=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("concurrent worker must not submit")
+        ),
+        advanced_at=NOW,
+    )
+
+    assert result.status == "in_progress"
+    assert result.reason_code == "revision_advance_already_claimed"

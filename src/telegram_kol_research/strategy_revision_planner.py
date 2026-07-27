@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
+from sqlalchemy import update
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
@@ -248,6 +250,8 @@ def _mark_recovery_required(
             raise LookupError("strategy revision batch not found")
         batch.status = "recovery_required"
         batch.reason_code = reason_code
+        batch.advance_claim_token = None
+        batch.advance_claimed_at = None
         batch.updated_at = advanced_at
         if revision_leg_id is not None:
             leg = session.get(StrategyRevisionLeg, int(revision_leg_id))
@@ -278,6 +282,7 @@ def advance_strategy_revision(
     """Advance cancellation then replacement, never retrying unknown writes."""
 
     now = advanced_at or datetime.now(UTC)
+    claim_token = uuid.uuid4().hex
     with session_factory() as session:
         batch = session.get(StrategyRevisionBatch, int(batch_id))
         if batch is None:
@@ -288,19 +293,39 @@ def advance_strategy_revision(
                 batch_id=int(batch.id),
                 reason_code=batch.reason_code,
             )
-        if batch.status in REPLACEMENT_WRITE_BOUNDARY_STATES:
-            interrupted_batch_id = int(batch.id)
-            session.expunge(batch)
-            return _mark_recovery_required(
-                session_factory,
-                batch_id=interrupted_batch_id,
-                revision_leg_id=None,
-                reason_code="revision_replacement_reconciliation_required",
-                advanced_at=now,
+        if batch.advance_claim_token:
+            return StrategyRevisionResult(
+                status="in_progress",
+                batch_id=int(batch.id),
+                reason_code="revision_advance_already_claimed",
             )
-        batch.status = "cancelling_old_entries"
-        batch.updated_at = now
+        if batch.status in REPLACEMENT_WRITE_BOUNDARY_STATES:
+            return StrategyRevisionResult(
+                status=str(batch.status),
+                batch_id=int(batch.id),
+                reason_code="revision_replacement_reconciliation_required",
+            )
+        claimed = session.execute(
+            update(StrategyRevisionBatch)
+            .where(
+                StrategyRevisionBatch.id == int(batch_id),
+                StrategyRevisionBatch.status == str(batch.status),
+                StrategyRevisionBatch.advance_claim_token.is_(None),
+            )
+            .values(
+                status="cancelling_old_entries",
+                advance_claim_token=claim_token,
+                advance_claimed_at=now,
+                updated_at=now,
+            )
+        ).rowcount
         session.commit()
+        if claimed != 1:
+            return StrategyRevisionResult(
+                status="in_progress",
+                batch_id=int(batch_id),
+                reason_code="revision_advance_claim_conflict",
+            )
 
     with session_factory() as session:
         revision_legs = (
@@ -483,6 +508,8 @@ def advance_strategy_revision(
         replacement = json.loads(batch.replacement_json)
         if remaining_fraction <= 0:
             batch.status = "succeeded"
+            batch.advance_claim_token = None
+            batch.advance_claimed_at = None
             batch.completed_at = now
             session.commit()
             return StrategyRevisionResult(
@@ -505,6 +532,13 @@ def advance_strategy_revision(
                 if leg.status == "retained"
             ],
         }
+        if batch.advance_claim_token != claim_token:
+            session.rollback()
+            return StrategyRevisionResult(
+                status="in_progress",
+                batch_id=int(batch.id),
+                reason_code="revision_advance_claim_lost",
+            )
         session.commit()
     try:
         replacement_response = replacement_writer(**writer_args)
@@ -523,6 +557,8 @@ def advance_strategy_revision(
         batch.updated_at = now
         if replacement_status in {"confirmed", "succeeded"}:
             batch.status = "succeeded"
+            batch.advance_claim_token = None
+            batch.advance_claimed_at = None
             batch.completed_at = now
             session.commit()
             return StrategyRevisionResult(
@@ -532,6 +568,8 @@ def advance_strategy_revision(
             )
         if replacement_status == "submitted":
             batch.status = "reconciling"
+            batch.advance_claim_token = None
+            batch.advance_claimed_at = None
             session.commit()
             return StrategyRevisionResult(
                 status="reconciling",

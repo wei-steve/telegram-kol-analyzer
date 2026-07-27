@@ -42,6 +42,9 @@ from telegram_kol_research.price_normalization import extract_normalized_prices
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
+from telegram_kol_research.recovery_live_submit import (
+    submit_strategy_revision_replacement_live,
+)
 from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_scan import RecoveryDecision
@@ -739,6 +742,77 @@ def _auto_process_management_signal(
                 and lifecycle.strategy_thread_id is not None
                 else None
             )
+            binding = (
+                session.get(
+                    ExecutionBinding,
+                    int(lifecycle.execution_binding_id),
+                )
+                if lifecycle is not None
+                and lifecycle.execution_binding_id is not None
+                else None
+            )
+            if binding is not None:
+                session.expunge(binding)
+        replacement_writer = revision_replacement_writer
+        if replacement_writer is None:
+            if binding is None:
+                return {
+                    "status": "blocked",
+                    "reason": "revision_binding_missing",
+                }
+            reference_price = _safe_ticker_price(
+                deepcoin_client,
+                inst_id=_to_deepcoin_swap_instrument(str(binding.symbol)),
+            )
+            entry_range = _parse_entry_range(
+                candidate.entry_text,
+                symbol=str(binding.symbol),
+                reference_price=reference_price,
+            )
+            if entry_range is None:
+                return {
+                    "status": "blocked",
+                    "reason": "revision_entry_range_invalid",
+                }
+            max_loss_usdt = _resolve_signal_max_loss_usdt(
+                runtime_config,
+                symbol=str(binding.symbol),
+            )
+
+            def replacement_writer(**kwargs):
+                draft = _build_revision_deepcoin_draft(
+                    binding=binding,
+                    entry_range=entry_range,
+                    stop_loss_text=candidate.stop_loss_text,
+                    take_profit_text=candidate.take_profit_text,
+                    risk_budget_usdt=(
+                        max_loss_usdt * float(kwargs["remaining_fraction"])
+                    ),
+                    contract_spec_provider=contract_spec_provider,
+                )
+                return submit_strategy_revision_replacement_live(
+                    session_factory,
+                    batch_id=int(kwargs["batch_id"]),
+                    draft=draft,
+                    deepcoin_client=deepcoin_client,
+                    contract_spec_provider=contract_spec_provider,
+                    submitted_at=processed_at,
+                )
+
+            try:
+                _build_revision_deepcoin_draft(
+                    binding=binding,
+                    entry_range=entry_range,
+                    stop_loss_text=candidate.stop_loss_text,
+                    take_profit_text=candidate.take_profit_text,
+                    risk_budget_usdt=max_loss_usdt,
+                    contract_spec_provider=contract_spec_provider,
+                )
+            except Exception:
+                return {
+                    "status": "blocked",
+                    "reason": "revision_replacement_preflight_failed",
+                }
         return execute_strategy_revision(
             session_factory,
             raw_message_id=raw_message.id,
@@ -750,7 +824,7 @@ def _auto_process_management_signal(
                 "leverage": candidate.leverage_text,
             },
             deepcoin_client=deepcoin_client,
-            replacement_writer=revision_replacement_writer,
+            replacement_writer=replacement_writer,
             processed_at=processed_at,
         )
 
@@ -907,6 +981,50 @@ def _build_auto_hybrid_deepcoin_draft(
         },
         contract_spec=contract_spec,
     )
+
+
+def _build_revision_deepcoin_draft(
+    *,
+    binding: ExecutionBinding,
+    entry_range: tuple[float, float],
+    stop_loss_text: str | None,
+    take_profit_text: str | None,
+    risk_budget_usdt: float,
+    contract_spec_provider: DeepcoinContractSpecProvider | None,
+) -> dict[str, Any]:
+    instrument_id = _to_deepcoin_swap_instrument(str(binding.symbol))
+    contract_spec = (
+        contract_spec_provider.get_contract_spec(instrument_id)
+        if contract_spec_provider is not None
+        else None
+    )
+    if contract_spec is None:
+        raise ValueError("revision_contract_spec_unavailable")
+    draft = build_deepcoin_order_draft(
+        {
+            "venue": "deepcoin",
+            "contract": f"{str(binding.symbol).upper()}-USDT",
+            "order_type": "limit",
+            "open_side": "buy" if str(binding.side).lower() == "long" else "sell",
+            "position_side": str(binding.side).lower(),
+            "margin_mode": str(binding.margin_mode or "cross"),
+            "position_mode": str(binding.position_mode or "split"),
+            "entry_range": f"{entry_range[0]}-{entry_range[1]}",
+            "stop_loss": stop_loss_text,
+            "take_profit": take_profit_text,
+            "risk_budget_usdt": float(risk_budget_usdt),
+            "strategy_instance_id": str(binding.strategy_instance_id),
+            "source": {
+                "kol_id": str(binding.kol_id),
+                "chat_id": int(binding.chat_id),
+                "message_id": int(binding.message_id),
+            },
+        },
+        contract_spec=contract_spec,
+    )
+    if not draft.get("order_legs"):
+        raise ValueError("revision_order_legs_missing")
+    return draft
 
 
 def _load_best_entry_candidate(

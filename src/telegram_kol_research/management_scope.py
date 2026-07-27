@@ -119,6 +119,14 @@ def resolve_management_scope_in_session(
         for lifecycle in lifecycles
         if lifecycle.strategy_thread_id is not None
     }
+    if (
+        directive.strategy_thread_id is None
+        and not available_thread_ids
+        and len(lifecycles) > 1
+    ):
+        raise ManagementScopeError(
+            "management_scope_strategy_thread_ambiguous"
+        )
     if directive.strategy_thread_id is None and len(available_thread_ids) > 1:
         raise ManagementScopeError(
             "management_scope_strategy_thread_ambiguous"

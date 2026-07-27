@@ -70,6 +70,16 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "stop_price_source": "ALTER TABLE signal_candidates ADD COLUMN stop_price_source VARCHAR(32)",
         "review_note": "ALTER TABLE signal_candidates ADD COLUMN review_note TEXT",
     },
+    "strategy_revision_batches": {
+        "advance_claim_token": (
+            "ALTER TABLE strategy_revision_batches "
+            "ADD COLUMN advance_claim_token VARCHAR(64)"
+        ),
+        "advance_claimed_at": (
+            "ALTER TABLE strategy_revision_batches "
+            "ADD COLUMN advance_claimed_at DATETIME"
+        ),
+    },
     "message_instruction_items": {
         "retired_at": (
             "ALTER TABLE message_instruction_items ADD COLUMN retired_at DATETIME"
