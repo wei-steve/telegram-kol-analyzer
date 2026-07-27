@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import func
@@ -12,6 +13,9 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
+from telegram_kol_research.deepcoin_execution_actions import (
+    cancel_revision_entry_leg,
+)
 from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_draft
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
@@ -55,6 +59,69 @@ from telegram_kol_research.strategy_management_planner import (
 from telegram_kol_research.strategy_management_executor import (
     execute_management_batch,
 )
+from telegram_kol_research.strategy_revision_planner import (
+    advance_strategy_revision,
+    plan_strategy_revision,
+)
+
+
+def execute_strategy_revision(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    strategy_thread_id: int | None,
+    replacement: dict[str, Any],
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    replacement_writer: Callable[..., dict[str, Any]] | None,
+    read_leg_state: Callable[..., dict[str, Any]] | None = None,
+    processed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Run one revision only when both exact cancellation and replacement exist."""
+
+    if replacement_writer is None:
+        return {
+            "status": "blocked",
+            "reason": "revision_replacement_writer_unavailable",
+        }
+    now = processed_at or datetime.now(UTC)
+    planned = plan_strategy_revision(
+        session_factory,
+        raw_message_id=raw_message_id,
+        strategy_thread_id=strategy_thread_id,
+        replacement=replacement,
+        planned_at=now,
+    )
+    if planned.status != "planned" or planned.batch_id is None:
+        return {
+            "status": planned.status,
+            "reason": planned.reason_code,
+            "batch_id": planned.batch_id,
+        }
+
+    def cancel_writer(**kwargs):
+        return cancel_revision_entry_leg(
+            session_factory,
+            strategy_thread_id=kwargs["strategy_thread_id"],
+            execution_binding_id=kwargs["execution_binding_id"],
+            execution_order_leg_id=kwargs["execution_order_leg_id"],
+            deepcoin_client=deepcoin_client,
+            executed_at=now,
+        )
+
+    advanced = advance_strategy_revision(
+        session_factory,
+        batch_id=planned.batch_id,
+        cancel_leg_writer=cancel_writer,
+        replacement_writer=replacement_writer,
+        read_leg_state=read_leg_state,
+        advanced_at=now,
+    )
+    return {
+        "status": advanced.status,
+        "reason": advanced.reason_code,
+        "batch_id": advanced.batch_id,
+        "remaining_fraction": advanced.remaining_fraction,
+    }
 
 
 def auto_process_message_trade_signal(

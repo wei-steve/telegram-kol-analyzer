@@ -241,6 +241,102 @@ class ContextResolutionAttempt(Base):
     )
 
 
+class StrategyRevisionBatch(Base):
+    """Durable replacement of pending entry legs for one strategy thread."""
+
+    __tablename__ = "strategy_revision_batches"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_fingerprint",
+            name="uq_strategy_revision_batches_fingerprint",
+        ),
+        Index(
+            "ix_strategy_revision_batches_thread_status",
+            "strategy_thread_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    idempotency_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    strategy_thread_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_threads.id"), nullable=False, index=True
+    )
+    target_lifecycle_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_lifecycles.id"), nullable=False, index=True
+    )
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="planned", index=True
+    )
+    replacement_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
+    replacement_response_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    reason_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    planned_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
+class StrategyRevisionLeg(Base):
+    __tablename__ = "strategy_revision_legs"
+    __table_args__ = (
+        UniqueConstraint(
+            "revision_batch_id",
+            "execution_order_leg_id",
+            name="uq_strategy_revision_legs_batch_entry_leg",
+        ),
+        Index(
+            "ix_strategy_revision_legs_batch_status",
+            "revision_batch_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    revision_batch_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_revision_batches.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    prior_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="planned", index=True
+    )
+    order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    client_order_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    pos_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
 class SignalCandidate(Base):
     __tablename__ = "signal_candidates"
 

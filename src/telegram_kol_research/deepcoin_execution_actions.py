@@ -916,6 +916,132 @@ def cancel_entry_order(
 
 
 @serialized_position_authority_mutation
+def cancel_revision_entry_leg(
+    session_factory: sessionmaker,
+    *,
+    strategy_thread_id: int,
+    execution_binding_id: int,
+    execution_order_leg_id: int,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    executed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Cancel one exact pending revision leg and confirm absence by readback."""
+
+    now = executed_at or datetime.now(UTC)
+    with session_factory() as session:
+        lifecycle = (
+            session.query(StrategyLifecycle)
+            .filter(
+                StrategyLifecycle.strategy_thread_id == int(strategy_thread_id),
+                StrategyLifecycle.execution_binding_id == int(execution_binding_id),
+            )
+            .one_or_none()
+        )
+        binding = session.get(ExecutionBinding, int(execution_binding_id))
+        leg = session.get(ExecutionOrderLeg, int(execution_order_leg_id))
+        if (
+            lifecycle is None
+            or binding is None
+            or leg is None
+            or int(leg.execution_binding_id) != int(binding.id)
+            or leg.purpose != "entry"
+            or leg.pos_id not in (None, "")
+        ):
+            raise DeepcoinExecutionActionError("revision_entry_leg_identity_mismatch")
+        order_ids = {str(leg.order_id)} if leg.order_id else set()
+        client_order_ids = (
+            {str(leg.client_order_id)} if leg.client_order_id else set()
+        )
+        if not order_ids and not client_order_ids:
+            raise DeepcoinExecutionActionError("missing_cancel_order_id")
+        inst_id = _to_deepcoin_swap_instrument(binding.symbol)
+        margin_position = _deepcoin_position_mode(binding.position_mode)
+        event_identity = {
+            "binding_id": int(binding.id),
+            "strategy_instance_id": binding.strategy_instance_id,
+            "kol_id": binding.kol_id,
+            "chat_id": int(binding.chat_id),
+            "message_id": int(binding.message_id),
+            "symbol": binding.symbol,
+            "side": binding.side,
+        }
+
+    trigger_rows = _select_orders_by_known_ids(
+        deepcoin_client.list_trigger_orders_pending(inst_id=inst_id),
+        order_ids=order_ids,
+        client_order_ids=client_order_ids,
+    )
+    regular_rows = _select_orders_by_known_ids(
+        deepcoin_client.list_open_orders(inst_id=inst_id),
+        order_ids=order_ids,
+        client_order_ids=client_order_ids,
+    )
+    if len(trigger_rows) + len(regular_rows) != 1:
+        raise DeepcoinExecutionActionError(
+            "revision_pending_entry_leg_not_uniquely_visible"
+        )
+    is_trigger = bool(trigger_rows)
+    visible = (trigger_rows or regular_rows)[0]
+    order_id = _order_id_from_payload(visible) or next(iter(order_ids), "")
+    client_order_id = _first_string(
+        visible,
+        "clOrdId",
+        "clientOrderId",
+        "client_order_id",
+    ) or next(iter(client_order_ids), "")
+    payload: dict[str, Any] = {"instId": inst_id}
+    if order_id:
+        payload["ordId"] = order_id
+    if client_order_id:
+        payload["clOrdId"] = client_order_id
+    if is_trigger:
+        response = deepcoin_client.cancel_trigger_order(payload)
+    else:
+        payload["mrgPosition"] = margin_position
+        response = deepcoin_client.cancel_order(payload)
+
+    remaining = _select_orders_by_known_ids(
+        deepcoin_client.list_trigger_orders_pending(inst_id=inst_id),
+        order_ids=order_ids,
+        client_order_ids=client_order_ids,
+    ) + _select_orders_by_known_ids(
+        deepcoin_client.list_open_orders(inst_id=inst_id),
+        order_ids=order_ids,
+        client_order_ids=client_order_ids,
+    )
+    status = "confirmed_cancelled" if not remaining else "submit_unknown"
+    record_execution_event(
+        session_factory,
+        ExecutionEventRecord(
+            execution_binding_id=event_identity["binding_id"],
+            strategy_instance_id=event_identity["strategy_instance_id"],
+            kol_id=event_identity["kol_id"],
+            chat_id=event_identity["chat_id"],
+            message_id=event_identity["message_id"],
+            source_message_id=event_identity["message_id"],
+            symbol=event_identity["symbol"],
+            side=event_identity["side"],
+            action="cancel_revision_entry_leg",
+            status=status,
+            order_id=order_id or None,
+            client_order_id=client_order_id or None,
+            reason="strategy_revision",
+            before=visible,
+            request=payload,
+            response=response,
+            created_at=now,
+        ),
+    )
+    return {
+        "status": status,
+        "order_id": order_id or None,
+        "client_order_id": client_order_id or None,
+        "cancel_type": "trigger" if is_trigger else "regular",
+        "response": response,
+    }
+
+
+@serialized_position_authority_mutation
 def cancel_pending_entry_legs(
     session_factory: sessionmaker,
     *,
