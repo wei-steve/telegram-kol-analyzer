@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from telegram_kol_research.auto_trade_execution import execute_strategy_revision
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
@@ -26,6 +28,7 @@ def _persist_revision_target(
     *,
     leg_states=("submitted", "submitted"),
     pos_ids=(None, None),
+    leg_sizes=(1, 1),
 ):
     with session_factory() as session:
         root = RawMessage(chat_id=101, message_id=1460, text="BTC 多单")
@@ -52,7 +55,9 @@ def _persist_revision_target(
         )
         session.add(lifecycle)
         session.flush()
-        for index, (status, pos_id) in enumerate(zip(leg_states, pos_ids, strict=True)):
+        for index, (status, pos_id, size) in enumerate(
+            zip(leg_states, pos_ids, leg_sizes, strict=True)
+        ):
             session.add(
                 ExecutionOrderLeg(
                     execution_binding_id=binding.id,
@@ -65,7 +70,7 @@ def _persist_revision_target(
                     pos_id=pos_id,
                     attribution_status=("verified" if pos_id else "unassigned"),
                     status=status,
-                    request_json='{"sz":"1"}',
+                    request_json=f'{{"sz":"{size}"}}',
                 )
             )
         session.commit()
@@ -244,3 +249,73 @@ def test_auto_execution_refuses_to_cancel_without_replacement_writer(tmp_path):
     }
     with session_factory() as session:
         assert session.query(StrategyRevisionBatch).count() == 0
+
+
+def test_revision_remaining_exposure_uses_leg_size_not_leg_count(tmp_path):
+    session_factory = create_session_factory(tmp_path / "weighted.db")
+    raw_id, _, thread_id = _persist_revision_target(
+        session_factory,
+        leg_sizes=(1, 3),
+    )
+    plan = plan_strategy_revision(
+        session_factory,
+        raw_message_id=raw_id,
+        strategy_thread_id=thread_id,
+        replacement={"entry": "65100-65400"},
+        planned_at=NOW,
+    )
+    replacements = []
+
+    result = advance_strategy_revision(
+        session_factory,
+        batch_id=plan.batch_id,
+        read_leg_state=lambda **kwargs: (
+            {"status": "filled", "pos_id": "pos-small"}
+            if kwargs["order_id"] == "ord-0"
+            else {"status": "pending"}
+        ),
+        cancel_leg_writer=lambda **kwargs: {"status": "confirmed_cancelled"},
+        replacement_writer=lambda **kwargs: (
+            replacements.append(kwargs["remaining_fraction"])
+            or {"status": "confirmed"}
+        ),
+        advanced_at=NOW,
+    )
+
+    assert result.status == "succeeded"
+    assert replacements == [0.75]
+
+
+@pytest.mark.parametrize("interrupted_status", ["submitting_replacements", "reconciling"])
+def test_revision_restart_after_replacement_boundary_never_resubmits(
+    tmp_path,
+    interrupted_status,
+):
+    session_factory = create_session_factory(tmp_path / f"{interrupted_status}.db")
+    raw_id, _, thread_id = _persist_revision_target(session_factory)
+    plan = plan_strategy_revision(
+        session_factory,
+        raw_message_id=raw_id,
+        strategy_thread_id=thread_id,
+        replacement={"entry": "65100-65400"},
+        planned_at=NOW,
+    )
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, plan.batch_id)
+        batch.status = interrupted_status
+        session.commit()
+
+    result = advance_strategy_revision(
+        session_factory,
+        batch_id=plan.batch_id,
+        cancel_leg_writer=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("cancel must not resume")
+        ),
+        replacement_writer=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("replacement must not resubmit")
+        ),
+        advanced_at=NOW,
+    )
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "revision_replacement_reconciliation_required"

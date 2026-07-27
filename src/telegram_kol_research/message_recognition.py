@@ -1275,6 +1275,11 @@ def _apply_lifecycle_event_decision(
             management_fraction=management_fraction,
             recognition_generation=authoritative_generation,
             requested_stop_loss=requested_stop_loss,
+            stop_price_source=(
+                str(decision.get("stop_price_source"))
+                if decision.get("stop_price_source") not in (None, "")
+                else None
+            ),
             requested_take_profit=explicit_take_profit,
         )
         _remember_applied_candidate(session, candidate, applied_candidate_ids)
@@ -3548,8 +3553,13 @@ def _upsert_management_signal_candidate(
     management_fraction: float | None = None,
     recognition_generation: str | None = None,
     requested_stop_loss: float | None = None,
+    stop_price_source: str | None = None,
     requested_take_profit: str | None = None,
 ) -> SignalCandidate:
+    break_even_intent = str(management_action or "").lower() in {
+        "move_stop_to_break_even",
+        "partial_then_break_even",
+    }
     desired = {
         "symbol": lifecycle.symbol,
         "side": lifecycle.side,
@@ -3561,7 +3571,14 @@ def _upsert_management_signal_candidate(
         "stop_loss_text": (
             _format_number(requested_stop_loss)
             if requested_stop_loss is not None
+            else None
+            if break_even_intent
             else _format_number(lifecycle.stop_loss)
+        ),
+        "stop_price_source": (
+            stop_price_source
+            if requested_stop_loss is not None
+            else None
         ),
         "take_profit_text": requested_take_profit or lifecycle.take_profit,
         "leverage_text": None,

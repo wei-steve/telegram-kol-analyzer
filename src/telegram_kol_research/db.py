@@ -67,6 +67,7 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "management_action": "ALTER TABLE signal_candidates ADD COLUMN management_action VARCHAR(64)",
         "management_fraction": "ALTER TABLE signal_candidates ADD COLUMN management_fraction FLOAT",
         "recognition_generation": "ALTER TABLE signal_candidates ADD COLUMN recognition_generation VARCHAR(64)",
+        "stop_price_source": "ALTER TABLE signal_candidates ADD COLUMN stop_price_source VARCHAR(32)",
         "review_note": "ALTER TABLE signal_candidates ADD COLUMN review_note TEXT",
     },
     "message_instruction_items": {

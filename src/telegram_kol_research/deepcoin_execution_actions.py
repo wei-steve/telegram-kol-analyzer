@@ -1009,7 +1009,44 @@ def cancel_revision_entry_leg(
         order_ids=order_ids,
         client_order_ids=client_order_ids,
     )
-    status = "confirmed_cancelled" if not remaining else "submit_unknown"
+    history_rows = _select_orders_by_known_ids(
+        deepcoin_client.list_order_history(inst_id=inst_id),
+        order_ids=order_ids,
+        client_order_ids=client_order_ids,
+    ) + _select_orders_by_known_ids(
+        deepcoin_client.list_trigger_order_history(inst_id=inst_id),
+        order_ids=order_ids,
+        client_order_ids=client_order_ids,
+    )
+    fill_rows = _select_orders_by_known_ids(
+        deepcoin_client.list_trade_fills(inst_id=inst_id),
+        order_ids=order_ids,
+        client_order_ids=client_order_ids,
+    )
+    terminal_states = {
+        str(_first_string(row, "state", "status", "orderStatus") or "").lower()
+        for row in history_rows
+    }
+    filled = bool(fill_rows) or bool(
+        terminal_states
+        & {"filled", "partially_filled", "partially-filled", "partial_filled"}
+    )
+    cancelled = bool(
+        terminal_states
+        & {"cancelled", "canceled", "cancel", "expired", "rejected"}
+    )
+    status = (
+        "confirmed_cancelled"
+        if not remaining and cancelled and not filled
+        else "submit_unknown"
+    )
+    reason = (
+        "revision_order_filled_during_cancel"
+        if filled
+        else "revision_cancel_not_terminally_confirmed"
+        if status != "confirmed_cancelled"
+        else None
+    )
     record_execution_event(
         session_factory,
         ExecutionEventRecord(
@@ -1025,7 +1062,7 @@ def cancel_revision_entry_leg(
             status=status,
             order_id=order_id or None,
             client_order_id=client_order_id or None,
-            reason="strategy_revision",
+            reason=reason or "strategy_revision",
             before=visible,
             request=payload,
             response=response,
@@ -1038,6 +1075,7 @@ def cancel_revision_entry_leg(
         "client_order_id": client_order_id or None,
         "cancel_type": "trigger" if is_trigger else "regular",
         "response": response,
+        "reason": reason,
     }
 
 

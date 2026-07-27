@@ -354,6 +354,9 @@ class SignalCandidate(Base):
     recognition_generation: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     entry_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     stop_loss_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    stop_price_source: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True
+    )
     take_profit_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     leverage_text: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     parse_source: Mapped[str] = mapped_column(String(32), default="text", nullable=False)

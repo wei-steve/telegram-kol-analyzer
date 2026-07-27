@@ -246,6 +246,59 @@ def test_fanout_is_limited_to_resolved_strategy_thread(tmp_path) -> None:
     }
 
 
+def test_fanout_without_unique_strategy_thread_fails_closed(tmp_path) -> None:
+    session_factory = create_session_factory(tmp_path / "ambiguous-thread.db")
+    with session_factory() as session:
+        first_thread = StrategyThread(
+            chat_id=88, root_message_id=1, symbol="BTC", side="long"
+        )
+        second_thread = StrategyThread(
+            chat_id=88, root_message_id=2, symbol="BTC", side="long"
+        )
+        session.add_all([first_thread, second_thread])
+        session.flush()
+        _persist_live_strategy(
+            session,
+            chat_id=88,
+            message_id=1,
+            pos_id="pos-1",
+            strategy_thread_id=first_thread.id,
+        )
+        _persist_live_strategy(
+            session,
+            chat_id=88,
+            message_id=2,
+            pos_id="pos-2",
+            strategy_thread_id=second_thread.id,
+        )
+        message = RawMessage(
+            chat_id=88,
+            message_id=3,
+            text="有入场的止盈一半带保护",
+        )
+        session.add(message)
+        session.flush()
+
+        with pytest.raises(
+            ManagementScopeError,
+            match="management_scope_strategy_thread_ambiguous",
+        ):
+            resolve_management_scope_in_session(
+                session,
+                raw_message=message,
+                directive=resolve_management_directive(
+                    text=message.text or "",
+                    lifecycle_event={
+                        "event_type": "position_update",
+                        "symbol": "BTC",
+                        "side": "long",
+                    },
+                ),
+                explicit_target_lifecycle_id=None,
+                reply_target_lifecycle_id=None,
+            )
+
+
 def test_explicit_target_must_match_message_scope(tmp_path) -> None:
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

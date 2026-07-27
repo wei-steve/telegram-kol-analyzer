@@ -93,6 +93,18 @@ def test_cancel_revision_entry_leg_requires_exact_readback_confirmation(tmp_path
             self.open_orders = []
             return {"code": "0"}
 
+        def list_order_history(self, *, inst_id=None):
+            return [{"ordId": "revision-order", "state": "canceled"}]
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
+            return []
+
+        def list_positions(self, *, inst_id=None):
+            return []
+
     result = cancel_revision_entry_leg(
         session_factory,
         strategy_thread_id=thread.id,
@@ -104,6 +116,84 @@ def test_cancel_revision_entry_leg_requires_exact_readback_confirmation(tmp_path
 
     assert result["status"] == "confirmed_cancelled"
     assert result["order_id"] == "revision-order"
+
+
+def test_cancel_revision_entry_leg_never_treats_race_fill_as_cancelled(tmp_path):
+    session_factory = create_session_factory(tmp_path / "revision-race-fill.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:201:11:BTC:long",
+            kol_id="group:201",
+            chat_id=201,
+            message_id=11,
+            symbol="BTC",
+            side="long",
+            status="open",
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=201,
+            message_id=11,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 27, 1, tzinfo=UTC),
+        )
+        session.add_all([binding, lifecycle])
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="limit",
+            order_id="race-order",
+            status="submitted",
+        )
+        session.add(leg)
+        session.commit()
+        lifecycle_id, binding_id, leg_id = lifecycle.id, binding.id, leg.id
+    thread = create_strategy_thread_for_lifecycle(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+    )
+
+    class Client:
+        def __init__(self):
+            self.visible = True
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
+        def list_open_orders(self, *, inst_id):
+            return [{"ordId": "race-order"}] if self.visible else []
+
+        def cancel_order(self, payload):
+            self.visible = False
+            return {"code": "0"}
+
+        def list_order_history(self, *, inst_id=None):
+            return [{"ordId": "race-order", "state": "filled", "posId": "pos-race"}]
+
+        def list_trade_fills(self, *, inst_id=None):
+            return [{"ordId": "race-order", "posId": "pos-race"}]
+
+        def list_trigger_order_history(self, *, inst_id):
+            return []
+
+        def list_positions(self, *, inst_id=None):
+            return [{"posId": "pos-race", "pos": "1"}]
+
+    result = cancel_revision_entry_leg(
+        session_factory,
+        strategy_thread_id=thread.id,
+        execution_binding_id=binding_id,
+        execution_order_leg_id=leg_id,
+        deepcoin_client=Client(),
+    )
+
+    assert result["status"] == "submit_unknown"
+    assert result["reason"] == "revision_order_filled_during_cancel"
 from telegram_kol_research.protection_ledger import (
     list_verified_ledger_rows_for_positions,
 )

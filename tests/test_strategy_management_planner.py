@@ -937,6 +937,42 @@ def test_break_even_planning_defers_open_protection_incident_to_market_decision(
     assert client.ticker_reads == []
 
 
+def test_explicit_break_even_stop_must_tighten_exact_live_position(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "explicit-risk.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="move_stop_to_break_even",
+    )
+    with session_factory() as session:
+        raw = session.get(RawMessage, raw_id)
+        raw.text = "BTC 空单移动保护到 65000"
+        candidate = (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == raw_id)
+            .one()
+        )
+        candidate.stop_loss_text = "65000"
+        candidate.stop_price_source = "current_message_text"
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [_position(avg_px="64103.8", side="short")]
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "explicit_break_even_stop_not_risk_tightening"
+
+
 @pytest.mark.parametrize(
     ("status", "attribution_status", "pos_id", "reason_code"),
     [

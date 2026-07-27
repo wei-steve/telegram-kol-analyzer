@@ -114,11 +114,26 @@ def resolve_management_scope_in_session(
         .order_by(StrategyLifecycle.id.asc())
         .all()
     )
-    if directive.strategy_thread_id is not None:
+    available_thread_ids = {
+        int(lifecycle.strategy_thread_id)
+        for lifecycle in lifecycles
+        if lifecycle.strategy_thread_id is not None
+    }
+    if directive.strategy_thread_id is None and len(available_thread_ids) > 1:
+        raise ManagementScopeError(
+            "management_scope_strategy_thread_ambiguous"
+        )
+    inferred_thread_id = (
+        next(iter(available_thread_ids))
+        if directive.strategy_thread_id is None
+        and len(available_thread_ids) == 1
+        else directive.strategy_thread_id
+    )
+    if inferred_thread_id is not None:
         lifecycles = [
             lifecycle
             for lifecycle in lifecycles
-            if lifecycle.strategy_thread_id == directive.strategy_thread_id
+            if lifecycle.strategy_thread_id == inferred_thread_id
         ]
     lifecycles = [
         lifecycle

@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from sqlalchemy.orm import sessionmaker
@@ -27,6 +28,9 @@ FILLED_ENTRY_STATES = frozenset({"filled", "partial_closed"})
 TERMINAL_REVISION_STATES = frozenset(
     {"succeeded", "recovery_required", "failed", "blocked"}
 )
+REPLACEMENT_WRITE_BOUNDARY_STATES = frozenset(
+    {"submitting_replacements", "reconciling"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +48,22 @@ def _canonical_json(value: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _entry_leg_size(leg: ExecutionOrderLeg) -> Decimal | None:
+    try:
+        payload = json.loads(leg.request_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    for key in ("sz", "quantity", "size"):
+        if payload.get(key) in (None, ""):
+            continue
+        try:
+            size = Decimal(str(payload[key]))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        return size if size.is_finite() and size > 0 else None
+    return None
 
 
 def plan_strategy_revision(
@@ -117,6 +137,11 @@ def plan_strategy_revision(
             )
         classified: list[tuple[ExecutionOrderLeg, str]] = []
         for leg in entry_legs:
+            if _entry_leg_size(leg) is None:
+                return StrategyRevisionResult(
+                    status="blocked",
+                    reason_code="revision_entry_leg_size_invalid",
+                )
             state = str(leg.status or "").lower()
             if leg.pos_id and state in FILLED_ENTRY_STATES | {"active", "open"}:
                 classified.append((leg, "retain_filled"))
@@ -262,6 +287,16 @@ def advance_strategy_revision(
                 status=str(batch.status),
                 batch_id=int(batch.id),
                 reason_code=batch.reason_code,
+            )
+        if batch.status in REPLACEMENT_WRITE_BOUNDARY_STATES:
+            interrupted_batch_id = int(batch.id)
+            session.expunge(batch)
+            return _mark_recovery_required(
+                session_factory,
+                batch_id=interrupted_batch_id,
+                revision_leg_id=None,
+                reason_code="revision_replacement_reconciliation_required",
+                advanced_at=now,
             )
         batch.status = "cancelling_old_entries"
         batch.updated_at = now
@@ -409,11 +444,41 @@ def advance_strategy_revision(
             )
         batch.status = "old_entries_terminal"
         batch.updated_at = now
-        retained_count = sum(leg.status == "retained" for leg in legs)
-        total_count = len(legs)
-        remaining_fraction = max(
-            0.0,
-            (total_count - retained_count) / total_count,
+        execution_legs = {
+            int(row.id): row
+            for row in session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.id.in_(
+                    [int(leg.execution_order_leg_id) for leg in legs]
+                )
+            )
+            .all()
+        }
+        sizes = {
+            int(leg.execution_order_leg_id): _entry_leg_size(
+                execution_legs[int(leg.execution_order_leg_id)]
+            )
+            for leg in legs
+        }
+        if any(size is None for size in sizes.values()):
+            return _mark_recovery_required(
+                session_factory,
+                batch_id=batch_id,
+                revision_leg_id=None,
+                reason_code="revision_entry_leg_size_invalid",
+                advanced_at=now,
+            )
+        total_size = sum(sizes.values(), Decimal("0"))
+        retained_size = sum(
+            (
+                sizes[int(leg.execution_order_leg_id)]
+                for leg in legs
+                if leg.status == "retained"
+            ),
+            Decimal("0"),
+        )
+        remaining_fraction = float(
+            max(Decimal("0"), (total_size - retained_size) / total_size)
         )
         replacement = json.loads(batch.replacement_json)
         if remaining_fraction <= 0:

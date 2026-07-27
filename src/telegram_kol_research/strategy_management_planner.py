@@ -7,6 +7,7 @@ import json
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from math import isfinite
 from typing import Any
 
@@ -425,6 +426,62 @@ def _plan_strategy_management_batch_locked(
     else:
         effective_action_name, effective_fraction = intent, None
 
+    if (
+        intent in {"move_stop_to_break_even", "partial_then_break_even"}
+        and candidate.stop_loss_text not in (None, "")
+    ):
+        if candidate.stop_price_source != "current_message_text":
+            candidate.stop_loss_text = None
+        else:
+            try:
+                explicit_stop = Decimal(str(candidate.stop_loss_text))
+                price_tick = Decimal(str(contract_spec.price_tick))
+            except (InvalidOperation, TypeError, ValueError):
+                explicit_stop = Decimal("0")
+                price_tick = Decimal("0")
+            exact_tick = (
+                explicit_stop > 0
+                and price_tick > 0
+                and explicit_stop % price_tick == 0
+            )
+            live_entry_prices = [
+                Decimal(str(position["avg_entry_price"]))
+                for position in economics
+            ]
+            current_stop = (
+                Decimal(str(lifecycle.stop_loss))
+                if lifecycle.stop_loss is not None
+                else None
+            )
+            if str(lifecycle.side).lower() == "long":
+                tightens = (
+                    exact_tick
+                    and all(explicit_stop >= price for price in live_entry_prices)
+                    and (
+                        current_stop is None
+                        or explicit_stop >= current_stop
+                    )
+                )
+            else:
+                tightens = (
+                    exact_tick
+                    and all(explicit_stop <= price for price in live_entry_prices)
+                    and (
+                        current_stop is None
+                        or explicit_stop <= current_stop
+                    )
+                )
+            if not tightens:
+                return _persist_blocked(
+                    session_factory,
+                    identity=identity,
+                    raw_message_id=raw_message_id,
+                    intent=intent,
+                    reason_code="explicit_break_even_stop_not_risk_tightening",
+                    planned_at=now,
+                    execution_mode=execution_mode,
+                )
+
     protection_by_pos_id: dict[str, dict[str, Any]] = {}
     if (
         intent in PROTECTION_EVIDENCE_INTENTS
@@ -686,15 +743,9 @@ def _plan_strategy_management_batch_locked(
                     "intent": intent,
                     "stop_loss_text": candidate.stop_loss_text,
                     **(
-                        {
-                            "stop_price_source": (
-                                "current_message_text"
-                                if str(candidate.stop_loss_text)
-                                in str(identity.raw_message.text or "")
-                                else "unverified_context"
-                            )
-                        }
+                        {"stop_price_source": candidate.stop_price_source}
                         if candidate.stop_loss_text not in (None, "")
+                        and candidate.stop_price_source not in (None, "")
                         else {}
                     ),
                 }
