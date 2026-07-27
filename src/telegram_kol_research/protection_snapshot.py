@@ -13,6 +13,7 @@ from telegram_kol_research.native_tpsl import (
     native_tpsl_belongs_to_position,
     normalize_native_tpsl,
 )
+from telegram_kol_research.protection_ledger import AccountProtectionOwnership
 
 
 _PAGINATION_KEYS = frozenset({"cursor", "nextcursor", "page", "total", "hasmore"})
@@ -27,6 +28,7 @@ def build_position_protection_audit(
     pending_trigger_orders: Iterable[dict[str, Any]],
     freeze_reasons: Iterable[object] = (),
     open_positions: Iterable[dict[str, Any]] | None = None,
+    account_ownership: AccountProtectionOwnership | None = None,
 ) -> dict[str, Any]:
     """Summarize one position's protection from read-only evidence.
 
@@ -61,16 +63,33 @@ def build_position_protection_audit(
         for row in [*ledger_rows, *backup_rows, *take_profit_rows]
         if (order_id := _text(_field(row, "order_id")))
     }
-    manual_order_ids = sorted(
-        {
-            order.ord_id
-            for raw in pending
-            if (order := normalize_native_tpsl(raw))
-            and order.ord_id
-            and order.ord_id not in known_order_ids
-            and _unowned_native_order_can_affect_position(order, position)
-        }
-    )
+    if account_ownership is None:
+        manual_order_ids = sorted(
+            {
+                order.ord_id
+                for raw in pending
+                if (order := normalize_native_tpsl(raw))
+                and order.ord_id
+                and order.ord_id not in known_order_ids
+                and _unowned_native_order_can_affect_position(order, position)
+            }
+        )
+        ownership_conflict = False
+    else:
+        manual_order_ids = sorted(
+            {
+                order.ord_id
+                for raw in pending
+                if (order := normalize_native_tpsl(raw))
+                and order.ord_id
+                and account_ownership.owner_for_order(order.ord_id) is None
+                and order.pos_id == pos_id
+            }
+        )
+        ownership_conflict = any(
+            pos_id in conflict.pos_ids
+            for conflict in account_ownership.conflicts
+        )
     reasons = {
         _text(_field(reason, "reason") or _field(reason, "incident_type") or reason)
         for reason in freeze_reasons
@@ -90,6 +109,8 @@ def build_position_protection_audit(
         reasons.add("take_profit_ambiguous")
     if manual_order_ids:
         reasons.add("manual_or_unowned_native_tpsl")
+    if ownership_conflict:
+        reasons.add("protection_ownership_conflict")
 
     protected = (
         primary["verification_status"] == "verified"
@@ -97,6 +118,7 @@ def build_position_protection_audit(
         and backup["verification_status"] == "verified"
         and all(item["verification_status"] == "verified" for item in take_profits)
         and not manual_order_ids
+        and not ownership_conflict
     )
     matching_strategies = sorted(
         {
@@ -113,6 +135,22 @@ def build_position_protection_audit(
         "matching_strategies": matching_strategies,
         "manual_order_detected": bool(manual_order_ids),
         "manual_order_ids": manual_order_ids,
+        "has_verified_stop": primary["verification_status"] == "verified",
+        "has_verified_backup_stop": (
+            backup["protocol"] == "native"
+            and backup["verification_status"] == "verified"
+        ),
+        "verified_take_profit_count": sum(
+            item["verification_status"] == "verified"
+            for item in take_profits
+        ),
+        "has_unowned_orders": bool(manual_order_ids),
+        "ownership_conflict": ownership_conflict,
+        "readback_complete": all(
+            item["verification_status"] == "verified"
+            for item in [primary, backup, *take_profits]
+        ),
+        "automation_safe": protected,
         "freeze_reasons": sorted(reasons),
         "protected": protected,
     }

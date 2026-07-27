@@ -3,6 +3,9 @@ import pytest
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_contract_specs import StaticDeepcoinContractSpecProvider
 from telegram_kol_research.position_tpsl_display import build_position_tpsl_display
+from telegram_kol_research.protection_ledger import (
+    build_account_protection_ownership,
+)
 
 
 def _btc_specs():
@@ -261,3 +264,57 @@ def test_display_invalid_size_does_not_break_snapshot():
     row = result.by_pos_id["pos-a"][0]
     assert row.size_mode == "partial"
     assert row.size_display_text == "not-a-number contracts"
+
+
+def test_account_ledger_assigns_same_side_full_position_orders_exactly():
+    positions = [
+        {"posId": "pos-a", "instId": "BTC-USDT-SWAP", "posSide": "long", "pos": "3"},
+        {"posId": "pos-b", "instId": "BTC-USDT-SWAP", "posSide": "long", "pos": "5"},
+    ]
+    pending = [
+        {
+            "ordId": "sl-a",
+            "triggerOrderType": "TPSL",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "sz": "0",
+            "slTriggerPrice": "61000",
+        },
+        {
+            "ordId": "sl-b",
+            "triggerOrderType": "TPSL",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "sz": "0",
+            "slTriggerPrice": "60000",
+        },
+    ]
+    ownership = build_account_protection_ownership(
+        [
+            {
+                "venue": "deepcoin",
+                "order_id": "sl-a",
+                "pos_id": "pos-a",
+                "status": "verified",
+                "purpose": "stop_loss",
+            },
+            {
+                "venue": "deepcoin",
+                "order_id": "sl-b",
+                "pos_id": "pos-b",
+                "status": "verified",
+                "purpose": "stop_loss",
+            },
+        ],
+        live_pos_ids={"pos-a", "pos-b"},
+    )
+
+    result = build_position_tpsl_display(
+        positions=positions,
+        pending_orders=pending,
+        account_ownership=ownership,
+    )
+
+    assert [row.order_id for row in result.by_pos_id["pos-a"]] == ["sl-a"]
+    assert [row.order_id for row in result.by_pos_id["pos-b"]] == ["sl-b"]
+    assert result.unattributed == []

@@ -9,6 +9,7 @@ from typing import Any, Literal, Mapping
 from telegram_kol_research.deepcoin_contract_specs import (
     DeepcoinContractSpecProvider,
 )
+from telegram_kol_research.protection_ledger import AccountProtectionOwnership
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +56,8 @@ def build_position_tpsl_display(
     *,
     positions: list[dict[str, Any]],
     pending_orders: list[dict[str, Any]],
-    exact_order_position_ids: Mapping[str, object],
+    exact_order_position_ids: Mapping[str, object] | None = None,
+    account_ownership: AccountProtectionOwnership | None = None,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
 ) -> PositionTpslDisplayResult:
     """Join TPSL rows only by exchange position ID or verified local order ID.
@@ -79,6 +81,12 @@ def build_position_tpsl_display(
     }
     by_pos_id = {position_id: [] for position_id in positions_by_id}
     unattributed: list[PositionTpslDisplayRow] = []
+    legacy_exact_ids = exact_order_position_ids or {}
+    conflicting_order_ids = (
+        {conflict.order_id for conflict in account_ownership.conflicts}
+        if account_ownership is not None
+        else set()
+    )
 
     for order in pending_orders:
         if str(order.get("triggerOrderType") or "").upper() != "TPSL":
@@ -93,7 +101,7 @@ def build_position_tpsl_display(
             "triggerOrderId",
             "id",
         )
-        position_id = _first_text(
+        exchange_position_id = _first_text(
             order,
             "PositionID",
             "closePosId",
@@ -103,8 +111,20 @@ def build_position_tpsl_display(
             "pos_id",
             "positionId",
         )
-        if position_id is None and order_id:
-            candidate = exact_order_position_ids.get(order_id)
+        ledger_position_id = None
+        if order_id and account_ownership is not None:
+            owner = account_ownership.owner_for_order(order_id)
+            ledger_position_id = owner.pos_id if owner is not None else None
+        if order_id in conflicting_order_ids or (
+            exchange_position_id is not None
+            and ledger_position_id is not None
+            and exchange_position_id != ledger_position_id
+        ):
+            position_id = None
+        else:
+            position_id = exchange_position_id or ledger_position_id
+        if position_id is None and order_id and account_ownership is None:
+            candidate = legacy_exact_ids.get(order_id)
             position_id = candidate if isinstance(candidate, str) and candidate.strip() else None
 
         position = positions_by_id.get(position_id or "")

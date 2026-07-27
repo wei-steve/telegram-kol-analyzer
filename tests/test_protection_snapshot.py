@@ -5,6 +5,9 @@ from telegram_kol_research.protection_snapshot import (
     observe_pending_tpsl,
     record_pending_tpsl_observation,
 )
+from telegram_kol_research.protection_ledger import (
+    build_account_protection_ownership,
+)
 
 
 def test_observation_marks_unknown_pagination_as_incomplete():
@@ -182,3 +185,76 @@ def test_position_audit_marks_legacy_generic_backup_as_unprotected():
         "primary_stop_missing",
     ]
     assert audit["protected"] is False
+
+
+def test_position_audit_does_not_borrow_other_positions_ledger_orders():
+    positions = [
+        {"posId": "pos-a", "instId": "BTC-USDT-SWAP", "posSide": "long", "pos": "3"},
+        {"posId": "pos-b", "instId": "BTC-USDT-SWAP", "posSide": "long", "pos": "5"},
+    ]
+    pending = [
+        {
+            "ordId": "sl-a",
+            "triggerOrderType": "TPSL",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "sz": "0",
+            "slTriggerPx": "61000",
+        },
+        {
+            "ordId": "sl-b",
+            "triggerOrderType": "TPSL",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "sz": "0",
+            "slTriggerPx": "60000",
+        },
+    ]
+    ledger = [
+        {
+            "venue": "deepcoin",
+            "order_id": "sl-a",
+            "pos_id": "pos-a",
+            "status": "verified",
+            "purpose": "stop_loss",
+            "trigger_price": "61000",
+            "size_text": "0",
+        },
+        {
+            "venue": "deepcoin",
+            "order_id": "sl-b",
+            "pos_id": "pos-b",
+            "status": "verified",
+            "purpose": "stop_loss",
+            "trigger_price": "60000",
+            "size_text": "0",
+        },
+    ]
+    ownership = build_account_protection_ownership(
+        ledger,
+        live_pos_ids={"pos-a", "pos-b"},
+    )
+
+    audit_a = build_position_protection_audit(
+        position=positions[0],
+        protection_ledger=ledger,
+        backup_stops=[],
+        take_profit_orders=[],
+        pending_trigger_orders=pending,
+        open_positions=positions,
+        account_ownership=ownership,
+    )
+    audit_b = build_position_protection_audit(
+        position=positions[1],
+        protection_ledger=ledger,
+        backup_stops=[],
+        take_profit_orders=[],
+        pending_trigger_orders=pending,
+        open_positions=positions,
+        account_ownership=ownership,
+    )
+
+    assert audit_a["manual_order_ids"] == []
+    assert audit_b["manual_order_ids"] == []
+    assert audit_a["has_verified_stop"] is True
+    assert audit_b["has_verified_stop"] is True
