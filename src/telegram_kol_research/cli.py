@@ -26,6 +26,7 @@ from telegram_kol_research.ai_recognition_config import load_ai_recognition_conf
 from telegram_kol_research.authoritative_recognition import process_authoritative_message
 from telegram_kol_research.context_resolution import resolve_contextual_strategy
 from telegram_kol_research.context_resolution_worker import (
+    build_redacted_exchange_state,
     build_context_state_fingerprint,
     run_context_resolution_once,
 )
@@ -2565,7 +2566,18 @@ def resolve_context_once(
             media_root=media_root,
             auto_trade_executor=None,
             context_resolver=resolve_contextual_strategy,
+            exchange_state_provider=lambda message_id, candidate_thread_ids=None: build_redacted_exchange_state(
+                session_factory,
+                message_id,
+                candidate_thread_ids=candidate_thread_ids,
+            ),
+            reuse_current_evidence=True,
         )
+        if result.assessment.agreement_status == "authoritative_failed":
+            raise RuntimeError(
+                result.assessment.mimo.error_message
+                or "context reanalysis failed"
+            )
         return {"status": str(result.automation.get("status") or "completed")}
 
     def is_eligible(raw_message_id: int) -> bool:

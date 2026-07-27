@@ -120,6 +120,7 @@ async def persist_live_message_event(
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
+    reply_evidence_processor: Callable[[int], Any] | None = None,
     context_resolution_scheduler: Callable[..., int] | None = None,
     context_resolution_worker: Callable[[], Any] | None = None,
     authoritative_failure_retry_delay_seconds: float = (
@@ -219,7 +220,7 @@ async def persist_live_message_event(
             and reply_to_message_id is not None
         ):
             try:
-                await fetch_missing_reply_target(
+                reply_available = await fetch_missing_reply_target(
                     telegram_client,
                     session_factory=session_factory,
                     chat_id=chat_id,
@@ -227,7 +228,22 @@ async def persist_live_message_event(
                     media_root=media_root,
                     broker=broker,
                 )
-                if context_resolution_scheduler is not None:
+                if reply_available and reply_evidence_processor is not None:
+                    with session_factory() as session:
+                        reply_raw_id = (
+                            session.query(RawMessage.id)
+                            .filter(
+                                RawMessage.chat_id == int(chat_id),
+                                RawMessage.message_id == int(reply_to_message_id),
+                            )
+                            .scalar()
+                        )
+                    if reply_raw_id is not None:
+                        await asyncio.to_thread(
+                            reply_evidence_processor,
+                            int(reply_raw_id),
+                        )
+                if reply_available and context_resolution_scheduler is not None:
                     await asyncio.to_thread(
                         context_resolution_scheduler,
                         event_type="reply_target_available",
@@ -641,6 +657,7 @@ async def run_live_listener(
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
+    reply_evidence_processor: Callable[[int], Any] | None = None,
     context_resolution_scheduler: Callable[..., int] | None = None,
     context_resolution_worker: Callable[[], Any] | None = None,
     system_operator_bot_config: Any | None = None,
@@ -673,6 +690,7 @@ async def run_live_listener(
             "lifecycle_monitor": lifecycle_monitor,
             "auto_trade_executor": auto_trade_executor,
             "authoritative_processor": authoritative_processor,
+            "reply_evidence_processor": reply_evidence_processor,
             "context_resolution_scheduler": context_resolution_scheduler,
             "context_resolution_worker": context_resolution_worker,
             "system_operator_bot_config": system_operator_bot_config,
@@ -712,6 +730,7 @@ def launch_live_listener_task(
     lifecycle_monitor: Any | None = None,
     auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
+    reply_evidence_processor: Callable[[int], Any] | None = None,
     context_resolution_scheduler: Callable[..., int] | None = None,
     context_resolution_worker: Callable[[], Any] | None = None,
     system_operator_bot_config: Any | None = None,
@@ -734,6 +753,7 @@ def launch_live_listener_task(
             "lifecycle_monitor": lifecycle_monitor,
             "auto_trade_executor": auto_trade_executor,
             "authoritative_processor": authoritative_processor,
+            "reply_evidence_processor": reply_evidence_processor,
             "context_resolution_scheduler": context_resolution_scheduler,
             "context_resolution_worker": context_resolution_worker,
             "system_operator_bot_config": system_operator_bot_config,

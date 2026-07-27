@@ -14,9 +14,12 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
+    ExecutionBinding,
+    ExecutionOrderLeg,
     MessageEvidenceVersion,
     MessageInstructionItem,
     RawMessage,
+    PositionProtectionLedger,
     StrategyLifecycle,
     StrategyMessageLink,
     StrategyThread,
@@ -130,6 +133,10 @@ def build_context_state_fingerprint(
             if lifecycle_ids
             else []
         )
+        exchange_state = _build_redacted_exchange_state_in_session(
+            session,
+            candidate_threads=candidate_threads,
+        )
         payload = {
             "raw": [
                 raw.id,
@@ -167,6 +174,7 @@ def build_context_state_fingerprint(
                 ]
                 for row in lifecycle_states
             ],
+            "exchange_state": exchange_state,
         }
     encoded = json.dumps(
         payload,
@@ -175,6 +183,141 @@ def build_context_state_fingerprint(
         separators=(",", ":"),
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _hashed_position_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    return "sha256:" + hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _build_redacted_exchange_state_in_session(
+    session,
+    *,
+    candidate_threads: list[StrategyThread],
+) -> dict[str, Any]:
+    lifecycle_ids = [
+        int(thread.current_lifecycle_id)
+        for thread in candidate_threads
+        if thread.current_lifecycle_id is not None
+    ]
+    lifecycles = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.id.in_(lifecycle_ids))
+        .order_by(StrategyLifecycle.id.asc())
+        .all()
+        if lifecycle_ids
+        else []
+    )
+    binding_ids = [
+        int(row.execution_binding_id)
+        for row in lifecycles
+        if row.execution_binding_id is not None
+    ]
+    bindings = (
+        session.query(ExecutionBinding)
+        .filter(ExecutionBinding.id.in_(binding_ids))
+        .order_by(ExecutionBinding.id.asc())
+        .all()
+        if binding_ids
+        else []
+    )
+    legs = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.execution_binding_id.in_(binding_ids))
+        .order_by(
+            ExecutionOrderLeg.execution_binding_id.asc(),
+            ExecutionOrderLeg.leg_index.asc(),
+            ExecutionOrderLeg.id.asc(),
+        )
+        .all()
+        if binding_ids
+        else []
+    )
+    leg_ids = [int(row.id) for row in legs]
+    protections = (
+        session.query(PositionProtectionLedger)
+        .filter(PositionProtectionLedger.execution_order_leg_id.in_(leg_ids))
+        .order_by(PositionProtectionLedger.id.asc())
+        .all()
+        if leg_ids
+        else []
+    )
+    return {
+        "lifecycles": [
+            {
+                "lifecycle_id": int(row.id),
+                "status": row.lifecycle_status,
+                "management_action": row.management_action,
+            }
+            for row in lifecycles
+        ],
+        "bindings": [
+            {
+                "binding_id": int(row.id),
+                "status": row.status,
+                "last_exchange_status": row.last_exchange_status,
+                "position_id_hash": _hashed_position_id(row.pos_id),
+            }
+            for row in bindings
+        ],
+        "entry_legs": [
+            {
+                "leg_id": int(row.id),
+                "binding_id": int(row.execution_binding_id),
+                "status": row.status,
+                "attribution_status": row.attribution_status,
+                "position_id_hash": _hashed_position_id(row.pos_id),
+            }
+            for row in legs
+            if row.purpose == "entry"
+        ],
+        "protection": [
+            {
+                "leg_id": int(row.execution_order_leg_id),
+                "purpose": row.purpose,
+                "status": row.status,
+                "trigger_price": row.trigger_price,
+                "position_id_hash": _hashed_position_id(row.pos_id),
+            }
+            for row in protections
+        ],
+    }
+
+
+def build_redacted_exchange_state(
+    session_factory: sessionmaker,
+    raw_message_id: int,
+    *,
+    candidate_thread_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    """Return current DB-confirmed position/protection state without raw payloads."""
+
+    with session_factory() as session:
+        latest_attempt = (
+            session.query(ContextResolutionAttempt.request_summary_json)
+            .filter(ContextResolutionAttempt.raw_message_id == int(raw_message_id))
+            .order_by(ContextResolutionAttempt.id.desc())
+            .first()
+        )
+        thread_ids = set(candidate_thread_ids or ())
+        thread_ids.update(
+            _collect_candidate_thread_ids(
+                _json_dict(latest_attempt[0]) if latest_attempt is not None else {}
+            )
+        )
+        threads = (
+            session.query(StrategyThread)
+            .filter(StrategyThread.id.in_(sorted(thread_ids)))
+            .order_by(StrategyThread.id.asc())
+            .all()
+            if thread_ids
+            else []
+        )
+        return _build_redacted_exchange_state_in_session(
+            session,
+            candidate_threads=threads,
+        )
 
 
 def _collect_candidate_thread_ids(value: Any) -> set[int]:
@@ -431,21 +574,6 @@ def run_context_resolution_once(
             "raw_message_id": claim.raw_message_id,
         }
     fingerprint = str(context_fingerprint_factory(claim.raw_message_id))
-    if (
-        fingerprint == claim.context_fingerprint
-        and claim.trigger_event.get("event_type") == "exchange_snapshot_changed"
-    ):
-        fingerprint = (
-            fingerprint
-            + ":exchange:"
-            + hashlib.sha256(
-                json.dumps(
-                    claim.trigger_event,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ).encode("utf-8")
-            ).hexdigest()
-        )
     if fingerprint == claim.context_fingerprint:
         _finish_claim(
             session_factory,

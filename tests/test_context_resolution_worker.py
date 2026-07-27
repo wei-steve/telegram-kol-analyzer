@@ -4,6 +4,7 @@ import json
 import pytest
 
 from telegram_kol_research.context_resolution_worker import (
+    build_redacted_exchange_state,
     build_context_state_fingerprint,
     claim_next_context_reanalysis,
     run_context_resolution_once,
@@ -12,7 +13,10 @@ from telegram_kol_research.context_resolution_worker import (
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
+    ExecutionBinding,
+    ExecutionOrderLeg,
     MessageInstructionItem,
+    PositionProtectionLedger,
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
@@ -233,7 +237,7 @@ def test_new_fingerprint_runs_once_and_supersedes_old_attempt(tmp_path):
         assert session.get(ContextResolutionAttempt, attempt_id).status == "superseded"
 
 
-def test_exchange_snapshot_event_forces_a_new_generation(tmp_path):
+def test_unchanged_exchange_snapshot_does_not_force_a_new_generation(tmp_path):
     session_factory = create_session_factory(tmp_path / "exchange-generation.db")
     raw_id, _attempt_id = _persist_unresolved(session_factory)
     schedule_context_reanalysis(
@@ -242,21 +246,16 @@ def test_exchange_snapshot_event_forces_a_new_generation(tmp_path):
         raw_message_id=raw_id,
         occurred_at=NOW,
     )
-    calls = []
-
     result = run_context_resolution_once(
         session_factory,
         context_fingerprint_factory=lambda _: "sha256:old",
-        reanalyze=lambda message_id, fingerprint: calls.append(
-            (message_id, fingerprint)
-        )
-        or {"status": "completed"},
+        reanalyze=lambda *_: (_ for _ in ()).throw(
+            AssertionError("unchanged exchange state must not call AI")
+        ),
         now=NOW,
     )
 
-    assert result["status"] == "completed"
-    assert calls[0][0] == raw_id
-    assert ":exchange:" in calls[0][1]
+    assert result["status"] == "context_unchanged"
 
 
 def test_candidate_thread_lifecycle_change_updates_state_fingerprint(tmp_path):
@@ -302,6 +301,100 @@ def test_candidate_thread_lifecycle_change_updates_state_fingerprint(tmp_path):
     )
 
     assert after != before
+
+
+def test_redacted_exchange_state_uses_confirmed_db_rows_without_raw_payloads(tmp_path):
+    session_factory = create_session_factory(tmp_path / "exchange-state.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=1462, text="有入场的")
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:1460:BTC:long",
+            kol_id="group:100",
+            chat_id=100,
+            message_id=1460,
+            symbol="BTC",
+            side="long",
+            pos_id="secret-pos-id",
+            status="open",
+            payload_json='{"secret":"must-not-leak"}',
+        )
+        session.add_all([raw, binding])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=1460,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.flush()
+        thread = StrategyThread(
+            chat_id=100,
+            root_message_id=1460,
+            symbol="BTC",
+            side="long",
+            status="active",
+            current_lifecycle_id=lifecycle.id,
+        )
+        session.add(thread)
+        session.flush()
+        lifecycle.strategy_thread_id = thread.id
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="market",
+            pos_id="secret-pos-id",
+            attribution_status="verified",
+            status="filled",
+            response_json='{"secret":"must-not-leak"}',
+        )
+        session.add(leg)
+        session.flush()
+        session.add(
+            PositionProtectionLedger(
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="secret-pos-id",
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="sl-redacted",
+                purpose="stop_loss",
+                trigger_price="64000",
+                status="verified",
+                evidence_source="test",
+                evidence_json='{"secret":"must-not-leak"}',
+            )
+        )
+        session.add(
+            ContextResolutionAttempt(
+                raw_message_id=raw.id,
+                context_fingerprint="sha256:context",
+                state_fingerprint="sha256:state",
+                model="deepseek",
+                prompt_versions_json="{}",
+                request_summary_json=json.dumps(
+                    {"candidate_strategy_threads": [{"thread_id": thread.id}]}
+                ),
+                decision_json='{"decision":"unresolved"}',
+                status="completed",
+                reanalysis_triggers_json='["exchange_state_changed"]',
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+
+    state = build_redacted_exchange_state(session_factory, raw_id)
+    rendered = json.dumps(state, ensure_ascii=False)
+
+    assert state["entry_legs"][0]["status"] == "filled"
+    assert state["protection"][0]["trigger_price"] == "64000"
+    assert state["bindings"][0]["position_id_hash"].startswith("sha256:")
+    assert "secret-pos-id" not in rendered
+    assert "must-not-leak" not in rendered
 
 
 @pytest.mark.parametrize(

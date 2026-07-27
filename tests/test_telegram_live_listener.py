@@ -381,8 +381,21 @@ def test_authoritative_live_path_fetches_missing_reply_before_processing(
         assert telegram_client is event.client
         assert chat_id == 123
         assert message_id == 4004
+        with session_factory() as session:
+            session.add(
+                RawMessage(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="BTC 多单，止损见图",
+                )
+            )
+            session.commit()
         events.append("fetch_reply")
         return True
+
+    def reply_evidence_processor(raw_message_id):
+        assert raw_message_id > 0
+        events.append("reply_evidence")
 
     def authoritative_processor(raw_message_id):
         assert raw_message_id > 0
@@ -421,10 +434,11 @@ def test_authoritative_live_path_fetches_missing_reply_before_processing(
             media_root=tmp_path / "media",
             ai_recognition_config=AiRecognitionConfig(),
             authoritative_processor=authoritative_processor,
+            reply_evidence_processor=reply_evidence_processor,
         )
     )
 
-    assert events == ["fetch_reply", "authoritative"]
+    assert events == ["fetch_reply", "reply_evidence", "authoritative"]
 
 
 def test_authoritative_live_path_delivers_instruction_summary_once_after_completion(

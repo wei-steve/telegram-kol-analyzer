@@ -271,6 +271,7 @@ class LifecycleMonitor:
         now_provider=None,
         expiry_review_notifier: ExpiryReviewNotifier | None = None,
         context_resolution_scheduler: Callable[..., int] | None = None,
+        context_resolution_worker: Callable[[], Any] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._broker = broker
@@ -282,6 +283,7 @@ class LifecycleMonitor:
         self._now = now_provider or (lambda: datetime.now(UTC))
         self._expiry_review_notifier = expiry_review_notifier
         self._context_resolution_scheduler = context_resolution_scheduler
+        self._context_resolution_worker = context_resolution_worker
 
     # ── public API ────────────────────────────────────────────────
 
@@ -611,6 +613,14 @@ class LifecycleMonitor:
                         chat_id=int(chat_id),
                         occurred_at=transition.occurred_at or now,
                     )
+            for chat_id in sorted({int(signal.chat_id) for signal in all_signals}):
+                self._context_resolution_scheduler(
+                    event_type="exchange_snapshot_changed",
+                    chat_id=chat_id,
+                    occurred_at=now,
+                )
+        if self._context_resolution_worker is not None:
+            await asyncio.to_thread(self._context_resolution_worker)
         return all_transitions
 
     # ── DB queries ─────────────────────────────────────────────────

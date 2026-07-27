@@ -24,6 +24,7 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyMessageLink,
 )
+from telegram_kol_research.message_evidence import save_message_evidence_version
 from telegram_kol_research.recognition_experiments import MimoAuthoritativeResult
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
@@ -35,6 +36,56 @@ from telegram_kol_research.strategy_threads import (
     create_strategy_thread_for_lifecycle,
     link_message_to_strategy_thread,
 )
+
+
+def test_reanalysis_reuses_saved_mimo_evidence_without_model_call(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "reuse-evidence.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=101, message_id=1462, text="更新上面的计划")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    save_message_evidence_version(
+        session_factory,
+        raw_message_id=raw_id,
+        input_fingerprint="sha256:saved",
+        model="mimo-v2.5",
+        prompt_versions={"mimo": 3},
+        extraction_status="completed",
+        confidence=0.92,
+        text_evidence={"observed_text": "更新上面的计划", "fields": {}},
+        image_evidence={"images": [{"asset_id": 7, "fields": {"entry": "65100"}}]},
+        normalized_evidence={
+            "recognition_result": "非策略",
+            "reason": "management update",
+            "summary": "update",
+            "confidence": 0.92,
+            "strategy": {},
+            "lifecycle_event": {"event_type": "none"},
+            "conflicts": [],
+        },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("MiMo must not run during contextual reanalysis")
+        ),
+    )
+
+    assessment = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path / "media",
+        reuse_current_evidence=True,
+    )
+
+    assert assessment.mimo.model == "mimo-v2.5"
+    assert assessment.mimo.input_kind == "text+image"
+    assert assessment.mimo.payload["evidence"]["images"][0]["asset_id"] == 7
 
 
 def test_context_resolution_triggers_are_closed_and_auditable():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -29,6 +30,7 @@ from telegram_kol_research.message_instruction_items import (
 )
 from telegram_kol_research.message_evidence import persist_mimo_message_evidence
 from telegram_kol_research.models import (
+    MessageEvidenceVersion,
     MessageInstructionItem,
     RawMessage,
     SignalCandidate,
@@ -286,6 +288,89 @@ def _load_resolution_inputs(
     return evidence, window, candidates
 
 
+def _load_exchange_state(provider, raw_message_id: int, candidates) -> Any:
+    if provider is None:
+        return {}
+    signature = inspect.signature(provider)
+    if "candidate_thread_ids" in signature.parameters:
+        return provider(
+            raw_message_id,
+            candidate_thread_ids={
+                int(candidate.thread_id) for candidate in candidates
+            },
+        )
+    return provider(raw_message_id)
+
+
+def _load_current_mimo_evidence_result(
+    session_factory: sessionmaker,
+    raw_message_id: int,
+) -> tuple[MimoAuthoritativeResult, MessageEvidenceVersion] | None:
+    """Reconstruct the first pass from immutable evidence without calling MiMo."""
+
+    with session_factory() as session:
+        row = (
+            session.query(MessageEvidenceVersion)
+            .filter(
+                MessageEvidenceVersion.raw_message_id == int(raw_message_id),
+                MessageEvidenceVersion.superseded_at.is_(None),
+                MessageEvidenceVersion.extraction_status == "completed",
+            )
+            .order_by(MessageEvidenceVersion.version.desc())
+            .first()
+        )
+        if row is None:
+            return None
+        session.expunge(row)
+    normalized = json.loads(row.normalized_evidence_json or "{}")
+    text_evidence = json.loads(row.text_evidence_json or "{}")
+    image_evidence = json.loads(row.image_evidence_json or "{}")
+    images = image_evidence.get("images", [])
+    payload = {
+        "recognition_result": normalized.get("recognition_result"),
+        "reason": normalized.get("reason"),
+        "summary": normalized.get("summary"),
+        "confidence": normalized.get("confidence", row.confidence),
+        "strategy": normalized.get("strategy", {}),
+        "lifecycle_event": normalized.get("lifecycle_event", {}),
+        "evidence": {
+            "text": text_evidence,
+            "images": images if isinstance(images, list) else [],
+            "conflicts": normalized.get("conflicts", []),
+        },
+    }
+    status = str(payload.get("recognition_result") or "")
+    if status not in {"是策略", "非策略"}:
+        lifecycle = payload["lifecycle_event"]
+        status = (
+            "是策略"
+            if payload["strategy"]
+            or (
+                isinstance(lifecycle, dict)
+                and str(lifecycle.get("event_type") or "none") != "none"
+            )
+            else "非策略"
+        )
+        payload["recognition_result"] = status
+    try:
+        prompt_versions = json.loads(row.prompt_versions_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        prompt_versions = {}
+    return (
+        MimoAuthoritativeResult(
+            raw_message_id=int(raw_message_id),
+            payload=payload,
+            input_kind="text+image" if payload["evidence"]["images"] else "text",
+            model=row.model,
+            status=status,
+            prompt_versions=(
+                prompt_versions if isinstance(prompt_versions, dict) else {}
+            ),
+        ),
+        row,
+    )
+
+
 def _resolved_mimo_result(
     mimo: MimoAuthoritativeResult,
     decision: ContextResolutionDecision,
@@ -398,28 +483,37 @@ def assess_message_authoritatively(
     media_root: str | Path,
     context_resolver=None,
     exchange_state_provider=None,
+    reuse_current_evidence: bool = False,
 ) -> AuthoritativeAssessment:
-    context_text = build_authoritative_context_for_message(
-        session_factory,
-        raw_message_id,
+    saved = (
+        _load_current_mimo_evidence_result(session_factory, raw_message_id)
+        if reuse_current_evidence
+        else None
     )
-    mimo = run_mimo_authoritative_for_message(
-        session_factory,
-        raw_message_id=raw_message_id,
-        ai_recognition_config=ai_recognition_config,
-        media_root=media_root,
-        context_text=context_text,
-    )
-    evidence_row = persist_mimo_message_evidence(
-        session_factory,
-        raw_message_id=raw_message_id,
-        payload=mimo.payload,
-        input_kind=mimo.input_kind,
-        model=mimo.model,
-        prompt_versions=mimo.prompt_versions,
-        error_message=mimo.error_message,
-        media_root=media_root,
-    )
+    if saved is not None:
+        mimo, evidence_row = saved
+    else:
+        context_text = build_authoritative_context_for_message(
+            session_factory,
+            raw_message_id,
+        )
+        mimo = run_mimo_authoritative_for_message(
+            session_factory,
+            raw_message_id=raw_message_id,
+            ai_recognition_config=ai_recognition_config,
+            media_root=media_root,
+            context_text=context_text,
+        )
+        evidence_row = persist_mimo_message_evidence(
+            session_factory,
+            raw_message_id=raw_message_id,
+            payload=mimo.payload,
+            input_kind=mimo.input_kind,
+            model=mimo.model,
+            prompt_versions=mimo.prompt_versions,
+            error_message=mimo.error_message,
+            media_root=media_root,
+        )
     context_decision = None
     context_triggers: tuple[str, ...] = ()
     if not mimo.error_message and mimo.status != "识别失败":
@@ -446,9 +540,11 @@ def assess_message_authoritatively(
                     candidates=[asdict(candidate) for candidate in candidates],
                     first_pass_payload=mimo.payload,
                     exchange_state=(
-                        exchange_state_provider(raw_message_id)
-                        if exchange_state_provider is not None
-                        else {}
+                        _load_exchange_state(
+                            exchange_state_provider,
+                            raw_message_id,
+                            candidates,
+                        )
                     ),
                 )
                 mimo = _resolved_mimo_result(mimo, context_decision, candidates)
@@ -644,6 +740,7 @@ def process_authoritative_message(
     auto_trade_executor=None,
     context_resolver=None,
     exchange_state_provider=None,
+    reuse_current_evidence: bool = False,
 ) -> AuthoritativeProcessingResult:
     """Gate review until MiMo application and automation persistence finish."""
 
@@ -654,6 +751,7 @@ def process_authoritative_message(
         media_root=media_root,
         context_resolver=context_resolver,
         exchange_state_provider=exchange_state_provider,
+        reuse_current_evidence=reuse_current_evidence,
     )
     if assessment.agreement_status != "authoritative_failed":
         if assessment.authoritative_generation is None:

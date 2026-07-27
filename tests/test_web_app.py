@@ -26,6 +26,7 @@ from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_si
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import create_web_app
+from telegram_kol_research.web_app import _extract_reply_evidence
 from telegram_kol_research.web_app import _run_auto_trade_executor
 from telegram_kol_research.web_app import _persisted_position_attribution
 from telegram_kol_research.group_config import load_group_config
@@ -34,6 +35,7 @@ from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.models import MessageEvidenceVersion
 from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import SignalCandidate
@@ -98,6 +100,35 @@ def test_web_auto_executor_disabled_management_skips_client_factory(tmp_path):
     with session_factory() as session:
         event = session.query(ExecutionEvent).one()
         assert event.action == "management_auto_trade_skipped"
+
+
+def test_disabled_context_resolution_does_not_extract_reply_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    app = create_web_app(database_path=tmp_path / "disabled-context.db")
+    with app.state.session_factory() as session:
+        raw = RawMessage(chat_id=-1009, message_id=1460, text="止损见图")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    monkeypatch.setattr(
+        "telegram_kol_research.web_app.assess_message_authoritatively",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled context path must not call MiMo")
+        ),
+    )
+
+    result = _extract_reply_evidence(app, raw_message_id=raw_id)
+
+    assert result is None
+    with app.state.session_factory() as session:
+        assert (
+            session.query(MessageEvidenceVersion)
+            .filter(MessageEvidenceVersion.raw_message_id == raw_id)
+            .count()
+            == 0
+        )
 
 
 def test_web_process_next_legacy_management_skips_client_factory(tmp_path):

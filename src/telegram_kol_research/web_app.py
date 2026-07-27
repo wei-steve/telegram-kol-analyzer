@@ -32,7 +32,11 @@ except (
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
 from telegram_kol_research.auto_trade_execution import disabled_management_message_needs_no_client
-from telegram_kol_research.authoritative_recognition import process_authoritative_message
+from telegram_kol_research.authoritative_recognition import (
+    assess_message_authoritatively,
+    process_authoritative_message,
+)
+from telegram_kol_research.message_evidence import build_message_input_fingerprint
 from telegram_kol_research.app_logging import (
     configure_application_logging,
     read_log_page,
@@ -59,6 +63,8 @@ from telegram_kol_research.models import (
     AiPromptTestRun,
     ExecutionBinding,
     ExecutionOrderLeg,
+    MediaAsset,
+    MessageEvidenceVersion,
     PositionBackupStopOrder,
     PositionProtectionLedger,
     PositionTakeProfitOrder,
@@ -160,6 +166,7 @@ from telegram_kol_research.trading_settings import (
 )
 from telegram_kol_research.context_resolution import resolve_contextual_strategy
 from telegram_kol_research.context_resolution_worker import (
+    build_redacted_exchange_state,
     build_context_state_fingerprint,
     run_context_resolution_once,
     schedule_context_reanalysis,
@@ -2876,6 +2883,59 @@ def _run_authoritative_processor(app: FastAPI, *, raw_message_id: int):
         media_root=app.state.media_root,
         auto_trade_executor=app.state.auto_trade_executor,
         context_resolver=resolve_contextual_strategy if context_enabled else None,
+        exchange_state_provider=(
+            lambda message_id, candidate_thread_ids=None: build_redacted_exchange_state(
+                app.state.session_factory,
+                message_id,
+                candidate_thread_ids=candidate_thread_ids,
+            )
+        ) if context_enabled else None,
+    )
+
+
+def _extract_reply_evidence(app: FastAPI, *, raw_message_id: int):
+    """Persist MiMo evidence for a recovered quote without executing it."""
+
+    with app.state.session_factory() as session:
+        raw = session.get(RawMessage, int(raw_message_id))
+        if raw is None:
+            raise LookupError("reply raw message not found")
+        if not load_trading_settings(
+            app.state.session_factory
+        ).context_resolution_enabled_for_chat(int(raw.chat_id)):
+            return None
+        media_assets = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.raw_message_id == int(raw_message_id))
+            .order_by(MediaAsset.id.asc())
+            .all()
+        )
+        fingerprint = build_message_input_fingerprint(
+            raw,
+            media_assets,
+            media_root=app.state.media_root,
+        )
+        current_evidence = (
+            session.query(MessageEvidenceVersion)
+            .filter(
+                MessageEvidenceVersion.raw_message_id == int(raw_message_id),
+                MessageEvidenceVersion.superseded_at.is_(None),
+                MessageEvidenceVersion.input_fingerprint == fingerprint,
+                MessageEvidenceVersion.extraction_status == "completed",
+            )
+            .first()
+        )
+        if current_evidence is not None:
+            session.expunge(current_evidence)
+            return current_evidence
+    return assess_message_authoritatively(
+        app.state.session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=load_ai_recognition_config(
+            app.state.ai_recognition_config_path
+        ),
+        media_root=app.state.media_root,
+        context_resolver=None,
     )
 
 
@@ -2897,7 +2957,26 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
         return {"status": "disabled"}
 
     def reanalyze(raw_message_id: int, _fingerprint: str) -> dict[str, Any]:
-        result = _run_authoritative_processor(app, raw_message_id=raw_message_id)
+        ai_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
+        result = process_authoritative_message(
+            app.state.session_factory,
+            raw_message_id=raw_message_id,
+            ai_recognition_config=ai_config,
+            media_root=app.state.media_root,
+            auto_trade_executor=app.state.auto_trade_executor,
+            context_resolver=resolve_contextual_strategy,
+            exchange_state_provider=lambda message_id, candidate_thread_ids=None: build_redacted_exchange_state(
+                app.state.session_factory,
+                message_id,
+                candidate_thread_ids=candidate_thread_ids,
+            ),
+            reuse_current_evidence=True,
+        )
+        if result.assessment.agreement_status == "authoritative_failed":
+            raise RuntimeError(
+                result.assessment.mimo.error_message
+                or "context reanalysis failed"
+            )
         return {
             "status": str(result.automation.get("status") or "completed"),
         }
@@ -3011,6 +3090,7 @@ def create_web_app(
                 now_provider=app.state.now_provider,
                 expiry_review_notifier=expiry_review_notifier,
                 context_resolution_scheduler=app.state.context_resolution_scheduler,
+                context_resolution_worker=app.state.context_resolution_worker,
             )
             app.state.lifecycle_monitor_task = asyncio.create_task(
                 app.state.lifecycle_monitor.run_loop()
@@ -3090,6 +3170,7 @@ def create_web_app(
                     lifecycle_monitor=app.state.lifecycle_monitor,
                     auto_trade_executor=app.state.auto_trade_executor,
                     authoritative_processor=app.state.authoritative_processor,
+                    reply_evidence_processor=app.state.reply_evidence_processor,
                     context_resolution_scheduler=app.state.context_resolution_scheduler,
                     context_resolution_worker=app.state.context_resolution_worker,
                     system_operator_bot_config=app.state.notification_bot_config,
@@ -3278,6 +3359,10 @@ def create_web_app(
         app,
         raw_message_id=raw_message_id,
     )
+    app.state.reply_evidence_processor = lambda raw_message_id: _extract_reply_evidence(
+        app,
+        raw_message_id=raw_message_id,
+    )
     app.state.context_resolution_scheduler = lambda **event: (
         _schedule_context_resolution_for_app(app, **event)
     )
@@ -3331,6 +3416,7 @@ def create_web_app(
                 lifecycle_monitor=app.state.lifecycle_monitor,
                 auto_trade_executor=app.state.auto_trade_executor,
                 authoritative_processor=app.state.authoritative_processor,
+                reply_evidence_processor=app.state.reply_evidence_processor,
                 context_resolution_scheduler=app.state.context_resolution_scheduler,
                 context_resolution_worker=app.state.context_resolution_worker,
                 system_operator_bot_config=app.state.notification_bot_config,

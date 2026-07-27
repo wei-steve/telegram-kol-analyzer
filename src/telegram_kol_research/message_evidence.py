@@ -8,7 +8,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, update
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
@@ -119,6 +119,10 @@ def normalize_mimo_evidence(
             lifecycle_event if isinstance(lifecycle_event, Mapping) else {}
         ),
         "conflicts": conflicts,
+        "recognition_result": payload.get("recognition_result"),
+        "reason": payload.get("reason"),
+        "summary": payload.get("summary"),
+        "confidence": confidence,
     }
     return (
         extraction_status,
@@ -209,6 +213,33 @@ def save_message_evidence_version(
             .one_or_none()
         )
         if existing is not None:
+            if (
+                existing.extraction_status != "completed"
+                and str(extraction_status) == "completed"
+            ):
+                session.execute(
+                    update(MessageEvidenceVersion)
+                    .where(
+                        MessageEvidenceVersion.id == int(existing.id),
+                        MessageEvidenceVersion.extraction_status != "completed",
+                    )
+                    .values(
+                        model=str(model),
+                        prompt_versions_json=_canonical_json(
+                            dict(prompt_versions)
+                        ),
+                        extraction_status="completed",
+                        confidence=float(confidence),
+                        text_evidence_json=_canonical_json(dict(text_evidence)),
+                        image_evidence_json=_canonical_json(dict(image_evidence)),
+                        normalized_evidence_json=_canonical_json(
+                            dict(normalized_evidence)
+                        ),
+                        superseded_at=None,
+                    )
+                )
+                session.commit()
+                session.refresh(existing)
             session.expunge(existing)
             return existing
 

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_evidence import (
@@ -93,3 +94,84 @@ def test_changed_input_supersedes_prior_evidence_version(tmp_path):
         old = session.get(type(first), first.id)
         assert old.superseded_at is not None
     assert load_current_message_evidence(session_factory, message.id).id == second.id
+
+
+def test_failed_extraction_can_recover_once_for_same_message_input(tmp_path):
+    session_factory = create_session_factory(tmp_path / "recovered.db")
+    message = _message(session_factory)
+    failed = save_message_evidence_version(
+        session_factory,
+        raw_message_id=message.id,
+        input_fingerprint="sha256:same-input",
+        model="mimo-v2.5",
+        prompt_versions={"evidence": "v1"},
+        extraction_status="failed",
+        confidence=0.0,
+        text_evidence={},
+        image_evidence={"images": []},
+        normalized_evidence={},
+    )
+    failed_id = failed.id
+
+    recovered = save_message_evidence_version(
+        session_factory,
+        raw_message_id=message.id,
+        input_fingerprint="sha256:same-input",
+        model="mimo-v2.5",
+        prompt_versions={"evidence": "v1"},
+        extraction_status="completed",
+        confidence=0.91,
+        text_evidence={"observed_text": "BTC 做多"},
+        image_evidence={"images": [{"asset_id": 1}]},
+        normalized_evidence={"recognition_result": "是策略"},
+    )
+
+    assert recovered.id == failed_id
+    assert recovered.version == 1
+    assert recovered.extraction_status == "completed"
+    assert recovered.confidence == 0.91
+
+
+def test_concurrent_same_input_recovery_keeps_one_completed_winner(tmp_path):
+    session_factory = create_session_factory(tmp_path / "concurrent-recovery.db")
+    message = _message(session_factory)
+    failed = save_message_evidence_version(
+        session_factory,
+        raw_message_id=message.id,
+        input_fingerprint="sha256:concurrent",
+        model="mimo-v2.5",
+        prompt_versions={"evidence": "v1"},
+        extraction_status="failed",
+        confidence=0.0,
+        text_evidence={},
+        image_evidence={"images": []},
+        normalized_evidence={},
+    )
+    failed_id = failed.id
+
+    def recover(label: str):
+        return save_message_evidence_version(
+            session_factory,
+            raw_message_id=message.id,
+            input_fingerprint="sha256:concurrent",
+            model="mimo-v2.5",
+            prompt_versions={"evidence": "v1"},
+            extraction_status="completed",
+            confidence=0.9,
+            text_evidence={"observed_text": label},
+            image_evidence={"images": []},
+            normalized_evidence={"winner": label},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        recovered = list(executor.map(recover, ["first", "second"]))
+
+    assert {row.id for row in recovered} == {failed_id}
+    with session_factory() as session:
+        rows = session.query(type(failed)).all()
+        assert len(rows) == 1
+        assert rows[0].extraction_status == "completed"
+        assert rows[0].normalized_evidence_json in {
+            '{"winner":"first"}',
+            '{"winner":"second"}',
+        }
