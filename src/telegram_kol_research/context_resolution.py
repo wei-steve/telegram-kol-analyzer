@@ -351,6 +351,10 @@ def _upsert_attempt(
     state_fingerprint = build_context_state_fingerprint(
         session_factory,
         int(raw_message_id),
+        candidate_thread_ids=_collect_ids(
+            request_payload.get("candidate_strategy_threads"),
+            {"thread_id", "strategy_thread_id"},
+        ),
     )
     with session_factory() as session:
         row = (

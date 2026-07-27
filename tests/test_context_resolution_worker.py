@@ -4,6 +4,7 @@ import json
 import pytest
 
 from telegram_kol_research.context_resolution_worker import (
+    build_context_state_fingerprint,
     claim_next_context_reanalysis,
     run_context_resolution_once,
     schedule_context_reanalysis,
@@ -14,6 +15,8 @@ from telegram_kol_research.models import (
     MessageInstructionItem,
     RawMessage,
     SignalCandidate,
+    StrategyLifecycle,
+    StrategyThread,
 )
 
 
@@ -228,6 +231,77 @@ def test_new_fingerprint_runs_once_and_supersedes_old_attempt(tmp_path):
     assert calls == [(raw_id, "sha256:new")]
     with session_factory() as session:
         assert session.get(ContextResolutionAttempt, attempt_id).status == "superseded"
+
+
+def test_exchange_snapshot_event_forces_a_new_generation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "exchange-generation.db")
+    raw_id, _attempt_id = _persist_unresolved(session_factory)
+    schedule_context_reanalysis(
+        session_factory,
+        event_type="exchange_snapshot_changed",
+        raw_message_id=raw_id,
+        occurred_at=NOW,
+    )
+    calls = []
+
+    result = run_context_resolution_once(
+        session_factory,
+        context_fingerprint_factory=lambda _: "sha256:old",
+        reanalyze=lambda message_id, fingerprint: calls.append(
+            (message_id, fingerprint)
+        )
+        or {"status": "completed"},
+        now=NOW,
+    )
+
+    assert result["status"] == "completed"
+    assert calls[0][0] == raw_id
+    assert ":exchange:" in calls[0][1]
+
+
+def test_candidate_thread_lifecycle_change_updates_state_fingerprint(tmp_path):
+    session_factory = create_session_factory(tmp_path / "candidate-state.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=1462, text="有入场的更新")
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=1460,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=NOW,
+        )
+        session.add_all([raw, lifecycle])
+        session.flush()
+        thread = StrategyThread(
+            chat_id=100,
+            root_message_id=1460,
+            symbol="BTC",
+            side="long",
+            status="active",
+            current_lifecycle_id=lifecycle.id,
+        )
+        session.add(thread)
+        session.commit()
+        raw_id = raw.id
+        thread_id = thread.id
+
+    before = build_context_state_fingerprint(
+        session_factory,
+        raw_id,
+        candidate_thread_ids={thread_id},
+    )
+    with session_factory() as session:
+        lifecycle = session.query(StrategyLifecycle).one()
+        lifecycle.lifecycle_status = "entered"
+        session.commit()
+    after = build_context_state_fingerprint(
+        session_factory,
+        raw_id,
+        candidate_thread_ids={thread_id},
+    )
+
+    assert after != before
 
 
 @pytest.mark.parametrize(

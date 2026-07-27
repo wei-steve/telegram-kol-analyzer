@@ -44,11 +44,14 @@ class ContextReanalysisClaim:
     raw_message_id: int
     context_fingerprint: str
     token: str
+    trigger_event: dict[str, Any]
 
 
 def build_context_state_fingerprint(
     session_factory: sessionmaker,
     raw_message_id: int,
+    *,
+    candidate_thread_ids: set[int] | None = None,
 ) -> str:
     """Fingerprint only durable context that may change a second decision."""
 
@@ -87,9 +90,31 @@ def build_context_state_fingerprint(
             .order_by(StrategyMessageLink.id.asc())
             .all()
         )
+        resolved_thread_ids = {
+            int(row.strategy_thread_id) for row in links
+        }
+        if candidate_thread_ids is None:
+            latest_attempt = (
+                session.query(ContextResolutionAttempt.request_summary_json)
+                .filter(ContextResolutionAttempt.raw_message_id == raw.id)
+                .order_by(ContextResolutionAttempt.id.desc())
+                .first()
+            )
+            candidate_thread_ids = _collect_candidate_thread_ids(
+                _json_dict(latest_attempt[0]) if latest_attempt is not None else {}
+            )
+        resolved_thread_ids.update(int(value) for value in candidate_thread_ids)
+        candidate_threads = (
+            session.query(StrategyThread)
+            .filter(StrategyThread.id.in_(sorted(resolved_thread_ids)))
+            .order_by(StrategyThread.id.asc())
+            .all()
+            if resolved_thread_ids
+            else []
+        )
         lifecycle_ids = {
             int(row.current_lifecycle_id)
-            for row in links
+            for row in candidate_threads
             if row.current_lifecycle_id is not None
         }
         lifecycle_states = (
@@ -124,6 +149,15 @@ def build_context_state_fingerprint(
                 else None
             ),
             "links": [list(row) for row in links],
+            "candidate_threads": [
+                [
+                    row.id,
+                    row.status,
+                    row.current_lifecycle_id,
+                    row.updated_at.isoformat() if row.updated_at else None,
+                ]
+                for row in candidate_threads
+            ],
             "lifecycle_states": [
                 [
                     row.id,
@@ -141,6 +175,22 @@ def build_context_state_fingerprint(
         separators=(",", ":"),
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _collect_candidate_thread_ids(value: Any) -> set[int]:
+    found: set[int] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"thread_id", "strategy_thread_id"}:
+                try:
+                    found.add(int(item))
+                except (TypeError, ValueError):
+                    pass
+            found.update(_collect_candidate_thread_ids(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.update(_collect_candidate_thread_ids(item))
+    return found
 
 
 def _json_dict(value: str | None) -> dict[str, Any]:
@@ -284,6 +334,7 @@ def claim_next_context_reanalysis(
                         row.state_fingerprint or row.context_fingerprint
                     ),
                     token=token,
+                    trigger_event=_json_dict(row.trigger_event_json),
                 )
             session.rollback()
 
@@ -380,6 +431,21 @@ def run_context_resolution_once(
             "raw_message_id": claim.raw_message_id,
         }
     fingerprint = str(context_fingerprint_factory(claim.raw_message_id))
+    if (
+        fingerprint == claim.context_fingerprint
+        and claim.trigger_event.get("event_type") == "exchange_snapshot_changed"
+    ):
+        fingerprint = (
+            fingerprint
+            + ":exchange:"
+            + hashlib.sha256(
+                json.dumps(
+                    claim.trigger_event,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+        )
     if fingerprint == claim.context_fingerprint:
         _finish_claim(
             session_factory,
