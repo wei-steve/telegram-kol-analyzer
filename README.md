@@ -153,3 +153,20 @@ default and requires global auto trading, live management mode, the dedicated
 boolean, and an explicit Telegram chat allowlist. See
 [`docs/contextual-strategy-resolution.md`](docs/contextual-strategy-resolution.md)
 for the data flow, safety gates, one-shot command, and troubleshooting.
+
+Historical messages can be given the same immutable first-pass evidence before
+contextual resolution is enabled. The backfill command is dry-run by default,
+requires an explicit chat scope, and never applies the MiMo result:
+
+```bash
+PYTHONPATH=src python -m telegram_kol_research.cli backfill-mimo-evidence \
+  --database-path data/research.db \
+  --chat-id=-1002805019371 \
+  --limit 25
+```
+
+After reviewing the bounded plan, add `--apply --delay-seconds 2`. Re-running
+the same command skips matching completed evidence and resumes from remaining
+messages. When `next_scan_cursor` is present, pass that opaque value through
+`--scan-cursor` for the next bounded page. See
+[`docs/runbook.md`](docs/runbook.md) before using `--retry-failed`.

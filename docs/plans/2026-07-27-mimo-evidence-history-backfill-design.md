@@ -61,13 +61,17 @@ telegram-kol-research backfill-mimo-evidence \
 
 - 重复的 `--chat-id`；
 - `--start-at` / `--end-at`；
-- `--limit`；
+- `--limit`（限制本批次最多调用 MiMo 的消息数，而不是被跳过的旧记录数）；
+- `--scan-limit` / `--scan-cursor`（限制单次扫描 I/O 并按稳定 keyset 分页续跑）；
 - `--delay-seconds`；
 - `--retry-failed`；
 - `--use-configured-context-chats`。
 
 若最终没有任何群组 ID，命令拒绝运行。`--retry-failed` 只让同一失败指纹在本次
 命令中重新尝试一次；模型内部仍保持现有有界重试。
+
+实时识别和补录共用持久化消息级 claim/lease，避免同一输入被并发付费识别。模型
+返回后必须再次核对输入指纹；发生编辑时丢弃旧结果。对外结果只返回稳定错误码。
 
 ## 验证
 

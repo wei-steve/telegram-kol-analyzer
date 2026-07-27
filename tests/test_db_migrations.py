@@ -8,6 +8,7 @@ def test_context_resolution_schema_is_created(tmp_path):
     inspector = inspect(session_factory.kw["bind"])
 
     assert inspector.has_table("message_evidence_versions")
+    assert inspector.has_table("message_evidence_extraction_claims")
     assert inspector.has_table("strategy_threads")
     assert inspector.has_table("strategy_message_links")
     assert inspector.has_table("context_resolution_attempts")

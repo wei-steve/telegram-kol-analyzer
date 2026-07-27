@@ -59,7 +59,11 @@ def plan_mimo_evidence_backfill(
 ```
 
 Use the current evidence row plus `build_message_input_fingerprint`. Validate non-empty
-chat scope and positive limit.
+chat scope and positive limit. Continue scanning matching completed rows until the
+batch contains `limit` model-call candidates, so resume cannot get stuck on an old
+completed prefix. Bound each scan page with `scan_limit` and return a
+`(posted_at, message_id, id)` keyset `next_scan_cursor`; retain only model-call
+candidates in memory.
 
 **Step 4: Verify planner GREEN**
 

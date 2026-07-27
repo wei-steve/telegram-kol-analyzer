@@ -2580,6 +2580,8 @@ def backfill_mimo_evidence(
     start_at: str | None = typer.Option(None, "--start-at"),
     end_at: str | None = typer.Option(None, "--end-at"),
     limit: int = typer.Option(100, "--limit", min=1),
+    scan_limit: int = typer.Option(1000, "--scan-limit", min=1),
+    scan_cursor: str | None = typer.Option(None, "--scan-cursor"),
     delay_seconds: float = typer.Option(2.0, "--delay-seconds", min=0.0),
     retry_failed: bool = typer.Option(False, "--retry-failed"),
     apply: bool = typer.Option(False, "--apply"),
@@ -2613,6 +2615,8 @@ def backfill_mimo_evidence(
         end_at=parsed_end,
         limit=limit,
         retry_failed=retry_failed,
+        scan_limit=scan_limit,
+        scan_cursor=scan_cursor,
     )
     ai_config = load_ai_recognition_config(ai_config_path) if apply else None
     result = run_mimo_evidence_backfill(
@@ -2634,6 +2638,7 @@ def backfill_mimo_evidence(
                 "status": item.status,
             }
             for item in plan.items
+            if item.status == "process"
         ]
     )
     typer.echo(
@@ -2644,6 +2649,13 @@ def backfill_mimo_evidence(
                 "start_at": plan.start_at,
                 "end_at": plan.end_at,
                 "limit": plan.limit,
+                "scan_limit": plan.scan_limit,
+                "scan_cursor": plan.scan_cursor,
+                "next_scan_cursor": (
+                    plan.scan_cursor
+                    if apply and result.resume_required
+                    else plan.next_scan_cursor
+                ),
                 "retry_failed": plan.retry_failed,
                 "rows": rows,
             },

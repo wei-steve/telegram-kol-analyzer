@@ -891,3 +891,80 @@ decision confidence, supporting/opposing message IDs, and next trigger. Never
 copy raw model responses, credentials, private media, or full exchange JSON
 into an incident report. Full behavior and failure handling are documented in
 [`contextual-strategy-resolution.md`](contextual-strategy-resolution.md).
+
+## 14. Backfill historical MiMo evidence
+
+Keep contextual live resolution disabled throughout this procedure. The
+backfill persists first-pass text/image evidence only; it must not apply a
+recognition result, run DeepSeek, create strategy instructions, or call
+Deepcoin.
+
+Start with a bounded dry run for an explicit chat:
+
+```bash
+cd /opt/telegram-kol-analyzer
+.venv/bin/telegram-kol-research backfill-mimo-evidence \
+  --database-path data/research.db \
+  --chat-id=-1002805019371 \
+  --limit 25
+```
+
+Review `considered`, `planned`, all skip counts, and the bounded message IDs.
+Then run the same immutable scope with a conservative rate:
+
+```bash
+.venv/bin/telegram-kol-research backfill-mimo-evidence \
+  --database-path data/research.db \
+  --chat-id=-1002805019371 \
+  --limit 25 \
+  --delay-seconds 2 \
+  --apply
+```
+
+Both model calls and source scanning are bounded. `--limit` caps MiMo calls;
+`--scan-limit` (default `1000`) caps source rows and media fingerprints examined
+by one invocation. If output includes a non-null `next_scan_cursor`, continue
+the next page with that exact opaque value:
+
+```bash
+.venv/bin/telegram-kol-research backfill-mimo-evidence \
+  --database-path data/research.db \
+  --chat-id=-1002805019371 \
+  --limit 25 \
+  --scan-limit 1000 \
+  --scan-cursor <next_scan_cursor>
+```
+
+Use the same cursor when adding `--apply`; do not mix output from a different
+chat/time scope.
+
+The cursor is a chronological `(posted_at, message_id, database id)` keyset,
+not a row offset. A historical row inserted behind the current cursor is picked
+up by the next full sweep starting without `--scan-cursor`; it cannot shift the
+remaining page or make an already-existing later row disappear.
+
+After every batch:
+
+1. Confirm `telegram-kol.service` is still active.
+2. Confirm matching `message_evidence_versions` contain separate
+   `text_evidence_json` and `image_evidence_json`.
+3. Confirm no new strategy thread, management instruction, execution binding,
+   order leg, or exchange mutation was caused by the batch.
+4. Review failed/image-unavailable rows before retrying.
+5. Re-run the command; matching completed fingerprints must become
+   `skip_completed`.
+
+Use `--start-at` and `--end-at` with ISO-8601 timestamps to fix a historical
+window. `--use-configured-context-chats` reads the saved chat list even while
+the live boolean is disabled, but an empty list still fails closed. Never use a
+whole-database implicit scope.
+
+Failures are durable and skipped on ordinary resume. Use `--retry-failed` only
+when the cause was reviewed as transient (for example a temporary model API
+failure or repaired media path). One command provides only one batch-level
+retry opportunity per failed message; MiMo's internal request retry remains
+bounded. Active evidence claims suppress duplicate MiMo calls across live and
+backfill workers. If the source message changes during inference, the batch
+returns `message_input_changed` and deliberately saves no stale evidence.
+Operator output contains stable error codes only; inspect protected service
+logs for details.

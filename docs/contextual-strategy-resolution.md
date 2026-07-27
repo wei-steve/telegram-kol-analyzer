@@ -32,3 +32,28 @@ telegram-kol-research resolve-context-once
 策略消息页面会显示线程根消息、关联关系、引用消息、证据版本和输入类型、二次决策置信度及证据消息 ID，以及未解决原因和下一触发条件。页面不会显示原始模型响应、图片 base64、密钥或完整交易所响应。
 
 若任务持续失败，检查 `context_resolution_attempts` 的 `status`、`last_error`、`attempts` 和 `trigger_event_json`。达到最大次数后状态为 `exhausted`，只发送一次最终失败提醒。
+
+## 历史 MiMo 证据补录
+
+旧消息不会因为新增证据表而自动拥有 MiMo 证据。使用独立批处理先补齐白名单群组：
+
+```bash
+telegram-kol-research backfill-mimo-evidence \
+  --database-path data/research.db \
+  --chat-id=-1002805019371 \
+  --limit 25
+```
+
+命令默认只做计划。确认范围后增加 `--apply --delay-seconds 2` 才会调用 MiMo。
+补录器只调用首次多模态识别并保存 `message_evidence_versions`，不会调用 DeepSeek，
+不会应用识别结果，不会创建/修改策略线程，也不会调用 Deepcoin。
+
+相同输入指纹已有成功证据时会直接跳过；文字、编辑时间或媒体发生变化时会生成新版本。
+失败或图片不可用记录默认不会反复调用，只有人工检查后显式增加 `--retry-failed` 才会
+在该批次重新尝试。扫描本身也受 `--scan-limit` 限制；输出
+`next_scan_cursor` 时，下一批通过 `--scan-cursor` 继续。每条消息独立提交，因此
+中断后可从当前分页继续。
+
+实时识别与历史补录共享数据库级消息证据 claim。相同消息和输入指纹同时只能有一个
+MiMo 调用；消息在推理期间被编辑时，旧结果会被丢弃，不会绑定到新指纹。命令输出
+只暴露稳定错误码，不输出供应商响应正文。

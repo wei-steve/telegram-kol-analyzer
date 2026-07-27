@@ -28,7 +28,12 @@ from telegram_kol_research.message_recognition import (
 from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
 )
-from telegram_kol_research.message_evidence import persist_mimo_message_evidence
+from telegram_kol_research.message_evidence import (
+    build_current_message_input_fingerprint,
+    claim_message_evidence_extraction,
+    finalize_claimed_mimo_message_evidence,
+    release_message_evidence_extraction_claim,
+)
 from telegram_kol_research.models import (
     MessageEvidenceVersion,
     MessageInstructionItem,
@@ -493,27 +498,60 @@ def assess_message_authoritatively(
     if saved is not None:
         mimo, evidence_row = saved
     else:
-        context_text = build_authoritative_context_for_message(
+        input_fingerprint = build_current_message_input_fingerprint(
             session_factory,
             raw_message_id,
-        )
-        mimo = run_mimo_authoritative_for_message(
-            session_factory,
-            raw_message_id=raw_message_id,
-            ai_recognition_config=ai_recognition_config,
-            media_root=media_root,
-            context_text=context_text,
-        )
-        evidence_row = persist_mimo_message_evidence(
-            session_factory,
-            raw_message_id=raw_message_id,
-            payload=mimo.payload,
-            input_kind=mimo.input_kind,
-            model=mimo.model,
-            prompt_versions=mimo.prompt_versions,
-            error_message=mimo.error_message,
             media_root=media_root,
         )
+        claim_token = claim_message_evidence_extraction(
+            raw_message_id=raw_message_id,
+            session_factory=session_factory,
+            input_fingerprint=input_fingerprint,
+        )
+        if claim_token is None:
+            raise RuntimeError("message evidence extraction already in progress")
+        try:
+            context_text = build_authoritative_context_for_message(
+                session_factory,
+                raw_message_id,
+            )
+            mimo = run_mimo_authoritative_for_message(
+                session_factory,
+                raw_message_id=raw_message_id,
+                ai_recognition_config=ai_recognition_config,
+                media_root=media_root,
+                context_text=context_text,
+            )
+            if build_current_message_input_fingerprint(
+                session_factory,
+                raw_message_id,
+                media_root=media_root,
+            ) != input_fingerprint:
+                raise RuntimeError(
+                    "message input changed during evidence extraction"
+                )
+            evidence_row = finalize_claimed_mimo_message_evidence(
+                session_factory,
+                raw_message_id=raw_message_id,
+                claim_token=claim_token,
+                expected_input_fingerprint=input_fingerprint,
+                payload=mimo.payload,
+                input_kind=mimo.input_kind,
+                model=mimo.model,
+                prompt_versions=mimo.prompt_versions,
+                error_message=mimo.error_message,
+                media_root=media_root,
+            )
+            if evidence_row is None:
+                raise RuntimeError(
+                    "message evidence finalize refused stale input or claim"
+                )
+        finally:
+            release_message_evidence_extraction_claim(
+                session_factory,
+                raw_message_id=raw_message_id,
+                claim_token=claim_token,
+            )
     context_decision = None
     context_triggers: tuple[str, ...] = ()
     if not mimo.error_message and mimo.status != "识别失败":

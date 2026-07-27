@@ -5,18 +5,125 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import func, update
+from sqlalchemy import delete, func, or_, text, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
     MediaAsset,
+    MessageEvidenceExtractionClaim,
     MessageEvidenceVersion,
     RawMessage,
     utc_now,
 )
+
+
+def claim_message_evidence_extraction(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    input_fingerprint: str,
+    lease_seconds: float = 300.0,
+) -> str | None:
+    """Atomically claim one message/input for a bounded MiMo extraction."""
+
+    if float(lease_seconds) <= 0:
+        raise ValueError("lease_seconds must be positive")
+    now = utc_now()
+    expires_at = now + timedelta(seconds=float(lease_seconds))
+    token = uuid4().hex
+    with session_factory() as session:
+        if session.get(RawMessage, int(raw_message_id)) is None:
+            raise LookupError("raw message not found")
+        inserted = session.execute(
+            sqlite_insert(MessageEvidenceExtractionClaim)
+            .values(
+                raw_message_id=int(raw_message_id),
+                input_fingerprint=str(input_fingerprint),
+                claim_token=token,
+                claimed_at=now,
+                lease_expires_at=expires_at,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[MessageEvidenceExtractionClaim.raw_message_id]
+            )
+        )
+        if int(inserted.rowcount or 0) == 1:
+            session.commit()
+            return token
+        replaced = session.execute(
+            update(MessageEvidenceExtractionClaim)
+            .where(
+                MessageEvidenceExtractionClaim.raw_message_id
+                == int(raw_message_id),
+                or_(
+                    MessageEvidenceExtractionClaim.input_fingerprint
+                    != str(input_fingerprint),
+                    MessageEvidenceExtractionClaim.lease_expires_at <= now,
+                ),
+            )
+            .values(
+                input_fingerprint=str(input_fingerprint),
+                claim_token=token,
+                claimed_at=now,
+                lease_expires_at=expires_at,
+            )
+        )
+        session.commit()
+        return token if int(replaced.rowcount or 0) == 1 else None
+
+
+def release_message_evidence_extraction_claim(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    claim_token: str | None,
+) -> bool:
+    """Release only the exact claim generation owned by the caller."""
+
+    if not claim_token:
+        return False
+    with session_factory() as session:
+        result = session.execute(
+            delete(MessageEvidenceExtractionClaim).where(
+                MessageEvidenceExtractionClaim.raw_message_id
+                == int(raw_message_id),
+                MessageEvidenceExtractionClaim.claim_token == str(claim_token),
+            )
+        )
+        session.commit()
+        return int(result.rowcount or 0) == 1
+
+
+def message_evidence_extraction_claim_is_current(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    input_fingerprint: str,
+    claim_token: str,
+) -> bool:
+    """Return whether the caller still owns the exact unexpired claim."""
+
+    now = utc_now()
+    with session_factory() as session:
+        return (
+            session.query(MessageEvidenceExtractionClaim.raw_message_id)
+            .filter(
+                MessageEvidenceExtractionClaim.raw_message_id
+                == int(raw_message_id),
+                MessageEvidenceExtractionClaim.input_fingerprint
+                == str(input_fingerprint),
+                MessageEvidenceExtractionClaim.claim_token == str(claim_token),
+                MessageEvidenceExtractionClaim.lease_expires_at > now,
+            )
+            .first()
+            is not None
+        )
 
 
 def _canonical_json(value: Any) -> str:
@@ -72,6 +179,31 @@ def build_message_input_fingerprint(
     }
     digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
+
+
+def build_current_message_input_fingerprint(
+    session_factory: sessionmaker,
+    raw_message_id: int,
+    *,
+    media_root: str | Path,
+) -> str:
+    """Build the current fingerprint using a short database read."""
+
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        media_assets = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.raw_message_id == int(raw_message_id))
+            .order_by(MediaAsset.id.asc())
+            .all()
+        )
+        return build_message_input_fingerprint(
+            raw_message,
+            media_assets,
+            media_root=media_root,
+        )
 
 
 def normalize_mimo_evidence(
@@ -143,6 +275,7 @@ def persist_mimo_message_evidence(
     prompt_versions: Mapping[str, Any],
     error_message: str | None,
     media_root: str | Path,
+    expected_input_fingerprint: str | None = None,
 ) -> MessageEvidenceVersion:
     """Persist the evidence produced by one authoritative MiMo read."""
 
@@ -156,10 +289,12 @@ def persist_mimo_message_evidence(
             .order_by(MediaAsset.id.asc())
             .all()
         )
-        input_fingerprint = build_message_input_fingerprint(
-            raw_message,
-            media_assets,
-            media_root=media_root,
+        input_fingerprint = expected_input_fingerprint or (
+            build_message_input_fingerprint(
+                raw_message,
+                media_assets,
+                media_root=media_root,
+            )
         )
     (
         extraction_status,
@@ -186,6 +321,88 @@ def persist_mimo_message_evidence(
     )
 
 
+def finalize_claimed_mimo_message_evidence(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    claim_token: str,
+    expected_input_fingerprint: str,
+    payload: Mapping[str, Any],
+    input_kind: str,
+    model: str,
+    prompt_versions: Mapping[str, Any],
+    error_message: str | None,
+    media_root: str | Path,
+) -> MessageEvidenceVersion | None:
+    """Atomically validate the input/claim and persist one MiMo result."""
+
+    (
+        extraction_status,
+        confidence,
+        text_evidence,
+        image_evidence,
+        normalized_evidence,
+    ) = normalize_mimo_evidence(
+        payload,
+        input_kind=input_kind,
+        error_message=error_message,
+    )
+    with session_factory() as session:
+        # Production uses SQLite. An immediate transaction prevents Telegram
+        # ingestion from editing the source row between validation and commit.
+        session.execute(text("BEGIN IMMEDIATE"))
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        if raw_message is None:
+            session.rollback()
+            raise LookupError("raw message not found")
+        media_assets = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.raw_message_id == int(raw_message_id))
+            .order_by(MediaAsset.id.asc())
+            .all()
+        )
+        current_fingerprint = build_message_input_fingerprint(
+            raw_message,
+            media_assets,
+            media_root=media_root,
+        )
+        claim = (
+            session.query(MessageEvidenceExtractionClaim)
+            .filter(
+                MessageEvidenceExtractionClaim.raw_message_id
+                == int(raw_message_id),
+                MessageEvidenceExtractionClaim.claim_token == str(claim_token),
+                MessageEvidenceExtractionClaim.input_fingerprint
+                == str(expected_input_fingerprint),
+                MessageEvidenceExtractionClaim.lease_expires_at > utc_now(),
+            )
+            .one_or_none()
+        )
+        if (
+            claim is None
+            or current_fingerprint != str(expected_input_fingerprint)
+        ):
+            session.rollback()
+            return None
+        row = _save_message_evidence_version_in_session(
+            session,
+            raw_message_id=raw_message_id,
+            input_fingerprint=expected_input_fingerprint,
+            model=model,
+            prompt_versions=prompt_versions,
+            extraction_status=extraction_status,
+            confidence=confidence,
+            text_evidence=text_evidence,
+            image_evidence=image_evidence,
+            normalized_evidence=normalized_evidence,
+        )
+        session.delete(claim)
+        session.commit()
+        session.refresh(row)
+        session.expunge(row)
+        return row
+
+
 def save_message_evidence_version(
     session_factory: sessionmaker,
     *,
@@ -202,81 +419,107 @@ def save_message_evidence_version(
     """Save one immutable version, returning an existing identical version."""
 
     with session_factory() as session:
-        if session.get(RawMessage, int(raw_message_id)) is None:
-            raise LookupError("raw message not found")
-        existing = (
-            session.query(MessageEvidenceVersion)
-            .filter(
-                MessageEvidenceVersion.raw_message_id == int(raw_message_id),
-                MessageEvidenceVersion.input_fingerprint == input_fingerprint,
-            )
-            .one_or_none()
+        row = _save_message_evidence_version_in_session(
+            session,
+            raw_message_id=raw_message_id,
+            input_fingerprint=input_fingerprint,
+            model=model,
+            prompt_versions=prompt_versions,
+            extraction_status=extraction_status,
+            confidence=confidence,
+            text_evidence=text_evidence,
+            image_evidence=image_evidence,
+            normalized_evidence=normalized_evidence,
         )
-        if existing is not None:
-            if (
-                existing.extraction_status != "completed"
-                and str(extraction_status) == "completed"
-            ):
-                session.execute(
-                    update(MessageEvidenceVersion)
-                    .where(
-                        MessageEvidenceVersion.id == int(existing.id),
-                        MessageEvidenceVersion.extraction_status != "completed",
-                    )
-                    .values(
-                        model=str(model),
-                        prompt_versions_json=_canonical_json(
-                            dict(prompt_versions)
-                        ),
-                        extraction_status="completed",
-                        confidence=float(confidence),
-                        text_evidence_json=_canonical_json(dict(text_evidence)),
-                        image_evidence_json=_canonical_json(dict(image_evidence)),
-                        normalized_evidence_json=_canonical_json(
-                            dict(normalized_evidence)
-                        ),
-                        superseded_at=None,
-                    )
-                )
-                session.commit()
-                session.refresh(existing)
-            session.expunge(existing)
-            return existing
-
-        now = utc_now()
-        current_rows = (
-            session.query(MessageEvidenceVersion)
-            .filter(
-                MessageEvidenceVersion.raw_message_id == int(raw_message_id),
-                MessageEvidenceVersion.superseded_at.is_(None),
-            )
-            .all()
-        )
-        for row in current_rows:
-            row.superseded_at = now
-        last_version = (
-            session.query(func.max(MessageEvidenceVersion.version))
-            .filter(MessageEvidenceVersion.raw_message_id == int(raw_message_id))
-            .scalar()
-        )
-        row = MessageEvidenceVersion(
-            raw_message_id=int(raw_message_id),
-            version=int(last_version or 0) + 1,
-            input_fingerprint=str(input_fingerprint),
-            model=str(model),
-            prompt_versions_json=_canonical_json(dict(prompt_versions)),
-            extraction_status=str(extraction_status),
-            confidence=float(confidence),
-            text_evidence_json=_canonical_json(dict(text_evidence)),
-            image_evidence_json=_canonical_json(dict(image_evidence)),
-            normalized_evidence_json=_canonical_json(dict(normalized_evidence)),
-            created_at=now,
-        )
-        session.add(row)
         session.commit()
         session.refresh(row)
         session.expunge(row)
         return row
+
+
+def _save_message_evidence_version_in_session(
+    session,
+    *,
+    raw_message_id: int,
+    input_fingerprint: str,
+    model: str,
+    prompt_versions: Mapping[str, Any],
+    extraction_status: str,
+    confidence: float,
+    text_evidence: Mapping[str, Any],
+    image_evidence: Mapping[str, Any],
+    normalized_evidence: Mapping[str, Any],
+) -> MessageEvidenceVersion:
+    if session.get(RawMessage, int(raw_message_id)) is None:
+        raise LookupError("raw message not found")
+    existing = (
+        session.query(MessageEvidenceVersion)
+        .filter(
+            MessageEvidenceVersion.raw_message_id == int(raw_message_id),
+            MessageEvidenceVersion.input_fingerprint == input_fingerprint,
+        )
+        .one_or_none()
+    )
+    if existing is not None:
+        if (
+            existing.extraction_status != "completed"
+            and str(extraction_status) == "completed"
+        ):
+            session.execute(
+                update(MessageEvidenceVersion)
+                .where(
+                    MessageEvidenceVersion.id == int(existing.id),
+                    MessageEvidenceVersion.extraction_status != "completed",
+                )
+                .values(
+                    model=str(model),
+                    prompt_versions_json=_canonical_json(dict(prompt_versions)),
+                    extraction_status="completed",
+                    confidence=float(confidence),
+                    text_evidence_json=_canonical_json(dict(text_evidence)),
+                    image_evidence_json=_canonical_json(dict(image_evidence)),
+                    normalized_evidence_json=_canonical_json(
+                        dict(normalized_evidence)
+                    ),
+                    superseded_at=None,
+                )
+            )
+            session.flush()
+            session.refresh(existing)
+        return existing
+
+    now = utc_now()
+    current_rows = (
+        session.query(MessageEvidenceVersion)
+        .filter(
+            MessageEvidenceVersion.raw_message_id == int(raw_message_id),
+            MessageEvidenceVersion.superseded_at.is_(None),
+        )
+        .all()
+    )
+    for current in current_rows:
+        current.superseded_at = now
+    last_version = (
+        session.query(func.max(MessageEvidenceVersion.version))
+        .filter(MessageEvidenceVersion.raw_message_id == int(raw_message_id))
+        .scalar()
+    )
+    row = MessageEvidenceVersion(
+        raw_message_id=int(raw_message_id),
+        version=int(last_version or 0) + 1,
+        input_fingerprint=str(input_fingerprint),
+        model=str(model),
+        prompt_versions_json=_canonical_json(dict(prompt_versions)),
+        extraction_status=str(extraction_status),
+        confidence=float(confidence),
+        text_evidence_json=_canonical_json(dict(text_evidence)),
+        image_evidence_json=_canonical_json(dict(image_evidence)),
+        normalized_evidence_json=_canonical_json(dict(normalized_evidence)),
+        created_at=now,
+    )
+    session.add(row)
+    session.flush()
+    return row
 
 
 def load_current_message_evidence(

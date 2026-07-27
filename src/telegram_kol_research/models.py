@@ -115,6 +115,27 @@ class MessageEvidenceVersion(Base):
     )
 
 
+class MessageEvidenceExtractionClaim(Base):
+    __tablename__ = "message_evidence_extraction_claims"
+
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"),
+        primary_key=True,
+    )
+    input_fingerprint: Mapped[str] = mapped_column(String(80), nullable=False)
+    claim_token: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    claimed_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=utc_now,
+        nullable=False,
+    )
+    lease_expires_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        index=True,
+    )
+
+
 class StrategyThread(Base):
     __tablename__ = "strategy_threads"
     __table_args__ = (

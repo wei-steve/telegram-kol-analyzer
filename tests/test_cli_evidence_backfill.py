@@ -202,6 +202,10 @@ def test_backfill_cli_apply_passes_bounds_retry_and_rate_limit(
             "2026-07-21T08:00:00+08:00",
             "--limit",
             "50",
+            "--scan-limit",
+            "400",
+            "--scan-cursor",
+            "cursor-token",
             "--delay-seconds",
             "1.5",
             "--retry-failed",
@@ -217,6 +221,8 @@ def test_backfill_cli_apply_passes_bounds_retry_and_rate_limit(
         "2026-07-21T08:00:00+08:00"
     )
     assert captured["plan"]["retry_failed"] is True
+    assert captured["plan"]["scan_limit"] == 400
+    assert captured["plan"]["scan_cursor"] == "cursor-token"
     assert captured["run"]["ai_recognition_config"] is config
     assert captured["run"]["apply"] is True
     assert captured["run"]["delay_seconds"] == 1.5
