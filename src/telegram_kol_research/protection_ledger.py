@@ -3,10 +3,142 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping
 
 from telegram_kol_research.models import PositionProtectionLedger, utc_now
+
+
+_ACTIVE_OWNERSHIP_STATUSES = frozenset({"verified", "protected"})
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectionOwnership:
+    venue: str
+    order_id: str
+    pos_id: str
+    status: str
+    purpose: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectionOwnershipConflict:
+    order_id: str
+    pos_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AccountProtectionOwnership:
+    by_order_id: Mapping[str, ProtectionOwnership]
+    by_pos_id: Mapping[str, tuple[ProtectionOwnership, ...]]
+    conflicts: tuple[ProtectionOwnershipConflict, ...]
+    stale_order_ids: tuple[str, ...]
+
+    def owner_for_order(self, order_id: object) -> ProtectionOwnership | None:
+        return self.by_order_id.get(str(order_id or "").strip())
+
+    def orders_for_position(self, pos_id: object) -> tuple[str, ...]:
+        return tuple(
+            row.order_id
+            for row in self.by_pos_id.get(str(pos_id or "").strip(), ())
+        )
+
+
+def load_account_protection_ownership(
+    session,
+    *,
+    venue: str = "deepcoin",
+    live_pos_ids: Iterable[str] = (),
+) -> AccountProtectionOwnership:
+    """Load the sole account-wide TPSL owner index from the canonical ledger."""
+
+    normalized_venue = str(venue or "deepcoin").lower()
+    rows = (
+        session.query(PositionProtectionLedger)
+        .filter(PositionProtectionLedger.venue == normalized_venue)
+        .order_by(
+            PositionProtectionLedger.order_id.asc(),
+            PositionProtectionLedger.id.asc(),
+        )
+        .all()
+    )
+    return build_account_protection_ownership(
+        rows,
+        venue=normalized_venue,
+        live_pos_ids=live_pos_ids,
+    )
+
+
+def build_account_protection_ownership(
+    rows: Iterable[object],
+    *,
+    venue: str = "deepcoin",
+    live_pos_ids: Iterable[str] = (),
+) -> AccountProtectionOwnership:
+    """Build an exact owner index without symbol, side, price, size, or time."""
+
+    normalized_venue = str(venue or "deepcoin").lower()
+    live_ids = {
+        str(pos_id).strip()
+        for pos_id in live_pos_ids
+        if str(pos_id or "").strip()
+    }
+    grouped: dict[str, list[ProtectionOwnership]] = {}
+    for row in rows:
+        row_venue = str(_field(row, "venue") or "deepcoin").lower()
+        status = str(_field(row, "status") or "").lower()
+        order_id = str(_field(row, "order_id") or "").strip()
+        pos_id = str(_field(row, "pos_id") or "").strip()
+        if (
+            row_venue != normalized_venue
+            or status not in _ACTIVE_OWNERSHIP_STATUSES
+            or not order_id
+            or not pos_id
+        ):
+            continue
+        grouped.setdefault(order_id, []).append(
+            ProtectionOwnership(
+                venue=row_venue,
+                order_id=order_id,
+                pos_id=pos_id,
+                status=status,
+                purpose=str(_field(row, "purpose") or ""),
+            )
+        )
+
+    by_order_id: dict[str, ProtectionOwnership] = {}
+    conflicts: list[ProtectionOwnershipConflict] = []
+    for order_id, candidates in sorted(grouped.items()):
+        pos_ids = tuple(sorted({candidate.pos_id for candidate in candidates}))
+        if len(pos_ids) != 1:
+            conflicts.append(
+                ProtectionOwnershipConflict(order_id=order_id, pos_ids=pos_ids)
+            )
+            continue
+        by_order_id[order_id] = candidates[-1]
+
+    by_pos_id_mutable: dict[str, list[ProtectionOwnership]] = {}
+    for owner in by_order_id.values():
+        by_pos_id_mutable.setdefault(owner.pos_id, []).append(owner)
+    by_pos_id = {
+        pos_id: tuple(sorted(owners, key=lambda owner: owner.order_id))
+        for pos_id, owners in sorted(by_pos_id_mutable.items())
+    }
+    stale = tuple(
+        sorted(
+            owner.order_id
+            for owner in by_order_id.values()
+            if live_ids and owner.pos_id not in live_ids
+        )
+    )
+    return AccountProtectionOwnership(
+        by_order_id=MappingProxyType(dict(sorted(by_order_id.items()))),
+        by_pos_id=MappingProxyType(by_pos_id),
+        conflicts=tuple(conflicts),
+        stale_order_ids=stale,
+    )
 
 
 def upsert_protection_ledger_row(
@@ -90,3 +222,9 @@ def list_verified_ledger_rows_for_positions(
 
 def _compact_json(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _field(value: object, name: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)

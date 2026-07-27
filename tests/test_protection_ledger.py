@@ -8,7 +8,9 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.protection_ledger import (
+    build_account_protection_ownership,
     list_verified_ledger_rows_for_positions,
+    load_account_protection_ownership,
     upsert_protection_ledger_row,
 )
 
@@ -149,6 +151,130 @@ def test_upsert_protection_ledger_row_skips_empty_order_id(tmp_path):
         assert list_verified_ledger_rows_for_positions(
             session, ["1001124164749504"]
         ) == []
+
+
+def test_load_account_protection_ownership_indexes_exact_active_rows(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        for order_id, pos_id, purpose in (
+            ("ord-a", "pos-a", "stop_loss"),
+            ("ord-b", "pos-a", "take_profit"),
+            ("ord-c", "pos-b", "stop_loss"),
+        ):
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=1,
+                execution_order_leg_id=2,
+                strategy_instance_id="strategy-1",
+                pos_id=pos_id,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price="60000",
+                size_text="0",
+                status="verified",
+                evidence_source="test",
+                evidence={},
+            )
+        session.commit()
+
+    with session_factory() as session:
+        index = load_account_protection_ownership(
+            session,
+            venue="deepcoin",
+            live_pos_ids={"pos-a", "pos-b"},
+        )
+
+    assert index.owner_for_order("ord-a").pos_id == "pos-a"
+    assert index.orders_for_position("pos-a") == ("ord-a", "ord-b")
+    assert index.orders_for_position("pos-b") == ("ord-c",)
+    assert index.owner_for_order("unknown") is None
+    assert index.conflicts == ()
+    assert index.stale_order_ids == ()
+
+
+def test_account_protection_ownership_excludes_terminal_and_marks_stale(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        active = upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=1,
+            execution_order_leg_id=2,
+            strategy_instance_id="strategy-1",
+            pos_id="closed-pos",
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            order_id="stale-active",
+            purpose="stop_loss",
+            trigger_price="60000",
+            size_text="0",
+            status="verified",
+            evidence_source="test",
+            evidence={},
+        )
+        terminal = upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=1,
+            execution_order_leg_id=2,
+            strategy_instance_id="strategy-1",
+            pos_id="pos-a",
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            order_id="cancelled-1",
+            purpose="stop_loss",
+            trigger_price="60000",
+            size_text="0",
+            status="cancelled",
+            evidence_source="test",
+            evidence={},
+        )
+        session.commit()
+        assert active is not None
+        assert terminal is not None
+
+    with session_factory() as session:
+        index = load_account_protection_ownership(
+            session,
+            venue="deepcoin",
+            live_pos_ids={"pos-a"},
+        )
+
+    assert index.owner_for_order("cancelled-1") is None
+    assert index.owner_for_order("stale-active").pos_id == "closed-pos"
+    assert index.stale_order_ids == ("stale-active",)
+
+
+def test_account_protection_ownership_reports_duplicate_owner_conflict():
+    rows = [
+        {
+            "venue": "deepcoin",
+            "order_id": "same-order",
+            "pos_id": "pos-a",
+            "status": "verified",
+            "purpose": "stop_loss",
+        },
+        {
+            "venue": "deepcoin",
+            "order_id": "same-order",
+            "pos_id": "pos-b",
+            "status": "verified",
+            "purpose": "stop_loss",
+        },
+    ]
+
+    index = build_account_protection_ownership(
+        rows,
+        venue="deepcoin",
+        live_pos_ids={"pos-a", "pos-b"},
+    )
+
+    assert index.owner_for_order("same-order") is None
+    assert index.conflicts[0].order_id == "same-order"
+    assert index.conflicts[0].pos_ids == ("pos-a", "pos-b")
 
 
 def test_bootstrap_creates_backup_stop_and_protection_incident_tables(tmp_path):
