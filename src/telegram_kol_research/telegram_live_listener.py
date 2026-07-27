@@ -14,6 +14,9 @@ from sqlalchemy import tuple_
 
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig, load_ai_recognition_config
 from telegram_kol_research.candidates import persist_text_signal_candidates
+from telegram_kol_research.contextual_message_window import (
+    fetch_missing_reply_target,
+)
 from telegram_kol_research.message_recognition import (
     filter_records_by_inserted_message_keys,
     recognize_message_now,
@@ -180,6 +183,28 @@ async def persist_live_message_event(
         live_ai_config = load_ai_recognition_config(ai_recognition_config_path)
     if inserted_keys and live_ai_config is not None:
         chat_id, message_id = inserted_keys[0]
+        reply_to_message_id = getattr(message, "reply_to_msg_id", None)
+        telegram_client = getattr(event, "client", None)
+        if (
+            authoritative_processor is not None
+            and telegram_client is not None
+            and reply_to_message_id is not None
+        ):
+            try:
+                await fetch_missing_reply_target(
+                    telegram_client,
+                    session_factory=session_factory,
+                    chat_id=chat_id,
+                    message_id=int(reply_to_message_id),
+                    media_root=media_root,
+                    broker=broker,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to recover Telegram reply target chat_id=%s message_id=%s",
+                    chat_id,
+                    reply_to_message_id,
+                )
         with session_factory() as session:
             raw_message = (
                 session.query(RawMessage)

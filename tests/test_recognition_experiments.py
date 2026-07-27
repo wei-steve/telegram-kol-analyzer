@@ -197,8 +197,21 @@ def test_run_mimo_authoritative_includes_recent_context_and_active_strategies(
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
-        session.add(RawMessage(chat_id=100, message_id=7, text="BTC short 63500"))
-        current = RawMessage(chat_id=100, message_id=8, text="现价出局")
+        session.add(
+            RawMessage(
+                chat_id=100,
+                message_id=7,
+                posted_at=datetime(2026, 7, 13, 1, 0, tzinfo=UTC),
+                text="BTC short 63500",
+            )
+        )
+        current = RawMessage(
+            chat_id=100,
+            message_id=8,
+            posted_at=datetime(2026, 7, 13, 2, 0, tzinfo=UTC),
+            text="现价出局",
+            reply_to_message_id=7,
+        )
         session.add(current)
         session.flush()
         session.add(
@@ -250,6 +263,9 @@ def test_run_mimo_authoritative_includes_recent_context_and_active_strategies(
     context_text = captured["context_text"]
     assert "Recent context" in context_text
     assert "BTC short 63500" in context_text
+    assert "Reply context" in context_text
+    assert '"reply_to_message_id": 7' in context_text
+    assert "2026-07-13T01:00:00" in context_text
     assert "Active strategies" in context_text
     assert '"symbol": "BTC"' in context_text
     assert "api_key" not in context_text

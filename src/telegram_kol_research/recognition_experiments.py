@@ -19,8 +19,12 @@ from telegram_kol_research.ai_recognition_config import (
     AiRecognitionConfig,
     load_ai_recognition_config,
 )
+from telegram_kol_research.contextual_message_window import (
+    build_contextual_message_window,
+    render_authoritative_context,
+)
 from telegram_kol_research.media_retention import resolve_media_path
-from telegram_kol_research.models import MediaAsset, RawMessage, RecognitionExperiment, StrategyLifecycle, utc_now
+from telegram_kol_research.models import MediaAsset, RawMessage, RecognitionExperiment, utc_now
 from telegram_kol_research.prompt_composition import compose_trading_prompt
 from telegram_kol_research.prompt_defaults import seed_default_prompt_registry
 from telegram_kol_research.prompt_registry import (
@@ -504,51 +508,11 @@ def _build_mimo_payload(
 
 
 def _build_authoritative_context(session, raw_message: RawMessage) -> str:
-    recent = (
-        session.query(RawMessage)
-        .filter(RawMessage.chat_id == raw_message.chat_id)
-        .filter(RawMessage.id != raw_message.id)
-        .order_by(RawMessage.posted_at.desc(), RawMessage.message_id.desc())
-        .limit(20)
-        .all()
-    )
-    recent_rows = [
-        {
-            "message_id": row.message_id,
-            "text": (row.text or "").strip(),
-        }
-        for row in reversed(recent)
-        if (row.text or "").strip()
-    ]
-    active = (
-        session.query(StrategyLifecycle)
-        .filter(StrategyLifecycle.chat_id == raw_message.chat_id)
-        .filter(StrategyLifecycle.lifecycle_status.in_(["pending_entry", "entered", "expired"]))
-        .order_by(StrategyLifecycle.signal_at.desc())
-        .limit(20)
-        .all()
-    )
-    active_rows = [
-        {
-            "lifecycle_id": row.id,
-            "source_message_id": row.message_id,
-            "symbol": row.symbol,
-            "side": row.side,
-            "status": row.lifecycle_status,
-            "entry_range_low": row.entry_range_low,
-            "entry_range_high": row.entry_range_high,
-            "stop_loss": row.stop_loss,
-            "take_profit": row.take_profit,
-        }
-        for row in active
-    ]
-    return "\n".join(
-        [
-            "Recent context:",
-            json.dumps(recent_rows, ensure_ascii=False, sort_keys=True),
-            "Active strategies:",
-            json.dumps(active_rows, ensure_ascii=False, sort_keys=True),
-        ]
+    return render_authoritative_context(
+        build_contextual_message_window(
+            session,
+            raw_message_id=int(raw_message.id),
+        )
     )
 
 

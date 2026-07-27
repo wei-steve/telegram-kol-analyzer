@@ -329,8 +329,8 @@ message remains absent.
 **Step 5: Replace the legacy 20-message context**
 
 Make `build_authoritative_context_for_message` render the typed bounded context,
-including ISO timestamps. Preserve a feature switch to compare legacy and contextual
-context during rollout.
+including ISO timestamps. Replace the legacy context directly; do not add a shadow
+or background comparison path.
 
 **Step 6: Run tests**
 

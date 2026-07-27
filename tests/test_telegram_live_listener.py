@@ -358,6 +358,75 @@ def test_authoritative_live_path_returns_without_starting_semantic_review(
     asyncio.run(scenario())
 
 
+def test_authoritative_live_path_fetches_missing_reply_before_processing(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "reply-recovery.db")
+    broker = LiveUpdateBroker()
+    events: list[str] = []
+    event = _FakeEvent("取消上面这单")
+    event.message.reply_to_msg_id = 4004
+    event.client = object()
+
+    async def fake_fetch_missing_reply_target(
+        telegram_client,
+        *,
+        session_factory,
+        chat_id,
+        message_id,
+        media_root,
+        broker,
+    ):
+        assert telegram_client is event.client
+        assert chat_id == 123
+        assert message_id == 4004
+        events.append("fetch_reply")
+        return True
+
+    def authoritative_processor(raw_message_id):
+        assert raw_message_id > 0
+        events.append("authoritative")
+        return SimpleNamespace(
+            assessment=SimpleNamespace(
+                agreement_status="pending",
+                differences=[],
+                mimo=SimpleNamespace(
+                    status="非策略",
+                    payload={},
+                    model="mimo-v2.5",
+                    error_message=None,
+                ),
+                deepseek_payload=None,
+            ),
+            recognition=MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="非策略",
+                parse_source="mimo_authoritative",
+            ),
+            automation={"status": "skipped", "reason": "test"},
+        )
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.fetch_missing_reply_target",
+        fake_fetch_missing_reply_target,
+        raising=False,
+    )
+
+    asyncio.run(
+        persist_live_message_event(
+            event=event,
+            session_factory=session_factory,
+            broker=broker,
+            media_root=tmp_path / "media",
+            ai_recognition_config=AiRecognitionConfig(),
+            authoritative_processor=authoritative_processor,
+        )
+    )
+
+    assert events == ["fetch_reply", "authoritative"]
+
+
 def test_authoritative_live_path_delivers_instruction_summary_once_after_completion(
     tmp_path,
     monkeypatch,
