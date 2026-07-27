@@ -991,3 +991,30 @@ do not establish ownership.
 `exchange_write_count` must be `0`. Any nonzero value invalidates the audit
 and requires immediate investigation. This command never submits, adjusts, or
 cancels an order and never creates or updates the database.
+
+### Canonical TPSL ledger backfill
+
+After reviewing the ownership audit, generate a database-only dry run:
+
+```bash
+.venv/bin/telegram-kol-research backfill-canonical-tpsl-ledger \
+  --database-path data/research.db
+```
+
+Review every exact `order_id`, `pos_id`, source row, refusal, and the complete
+fingerprint. Price, size, direction, and time never select a position. Apply
+only when the immediately preceding dry run has precisely the reviewed action
+set and zero refusals:
+
+```bash
+.venv/bin/telegram-kol-research backfill-canonical-tpsl-ledger \
+  --database-path data/research.db \
+  --apply \
+  --expected-fingerprint <reviewed-fingerprint> \
+  --confirmation-token <single-use-token>
+```
+
+The apply writes only `position_protection_ledger` and the single-use
+confirmation record in one database transaction. It never calls a Deepcoin
+write API. Rerun `audit-tpsl-ownership` immediately afterward and require
+`exchange_write_count=0`.

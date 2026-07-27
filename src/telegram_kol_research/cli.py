@@ -153,6 +153,10 @@ from telegram_kol_research.tpsl_ownership_audit import (
     build_tpsl_ownership_audit,
     load_readonly_protection_ledger,
 )
+from telegram_kol_research.tpsl_ledger_backfill import (
+    apply_tpsl_ledger_backfill_plan,
+    build_tpsl_ledger_backfill_plan,
+)
 from telegram_kol_research.web_app import create_web_app
 
 app = typer.Typer(help="Telegram KOL win-rate research CLI.")
@@ -3188,6 +3192,101 @@ def audit_tpsl_ownership(
         return
     for key, value in payload.items():
         typer.echo(f"{key}: {json.dumps(value, ensure_ascii=False, sort_keys=True)}")
+
+
+@app.command("backfill-canonical-tpsl-ledger")
+def backfill_canonical_tpsl_ledger(
+    database_path: Path = typer.Option(
+        Path("data/research.db"),
+        "--database-path",
+    ),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(
+        None,
+        "--expected-fingerprint",
+    ),
+    confirmation_token: str | None = typer.Option(
+        None,
+        "--confirmation-token",
+    ),
+) -> None:
+    """Backfill exact current TPSL owners into the canonical ledger."""
+
+    resolved_database_path = database_path.expanduser().resolve()
+    if not resolved_database_path.is_file():
+        raise typer.BadParameter(
+            "database path must name an existing file; no file was created"
+        )
+    client = build_deepcoin_client_from_env()
+    positions = [
+        row for row in client.list_positions()
+        if isinstance(row, dict)
+    ]
+    pending_orders: list[dict[str, Any]] = []
+    for instrument_id in sorted(
+        {
+            str(row.get("instId") or row.get("InstrumentID") or "").upper()
+            for row in positions
+            if str(row.get("instId") or row.get("InstrumentID") or "").strip()
+        }
+    ):
+        pending_orders.extend(
+            row
+            for row in client.list_trigger_orders_pending(inst_id=instrument_id)
+            if isinstance(row, dict)
+        )
+
+    readonly_engine = create_engine(
+        f"sqlite+pysqlite:///file:{resolved_database_path}?mode=ro&uri=true"
+    )
+    readonly_session_factory = sessionmaker(
+        bind=readonly_engine,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    plan = build_tpsl_ledger_backfill_plan(
+        readonly_session_factory,
+        positions=positions,
+        pending_orders=pending_orders,
+        snapshot_complete=True,
+    )
+    result = None
+    if apply:
+        if not expected_fingerprint or not confirmation_token:
+            raise typer.BadParameter(
+                "--expected-fingerprint and --confirmation-token are required for apply"
+            )
+        writable_session_factory = create_session_factory(resolved_database_path)
+
+        def rebuild():
+            return build_tpsl_ledger_backfill_plan(
+                writable_session_factory,
+                positions=positions,
+                pending_orders=pending_orders,
+                snapshot_complete=True,
+            )
+
+        result = apply_tpsl_ledger_backfill_plan(
+            writable_session_factory,
+            plan,
+            expected_fingerprint=expected_fingerprint,
+            confirmation_token=confirmation_token,
+            fresh_plan_builder=rebuild,
+        )
+    typer.echo(
+        json.dumps(
+            {
+                "mode": "apply" if apply else "dry_run",
+                "fingerprint": plan.fingerprint,
+                "actions": [asdict(row) for row in plan.actions],
+                "refusals": [asdict(row) for row in plan.refusals],
+                "applied": result.applied if result is not None else 0,
+                "exchange_write_count": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
 
 
 @app.command("media-dedupe")
