@@ -51,7 +51,10 @@ from telegram_kol_research.protection_attribution import (
     match_position_protection,
     snapshot_protection_rows,
 )
-from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.protection_ledger import (
+    list_verified_ledger_rows_for_positions,
+    upsert_protection_ledger_row,
+)
 from telegram_kol_research.trade_signals import MANUAL_MANAGEMENT_SOURCE_TYPES
 from telegram_kol_research.trade_signals import MANAGEMENT_TRADE_SIGNAL_ACTIONS
 from telegram_kol_research.trade_signals import TradeSignalRecord
@@ -203,7 +206,21 @@ def adjust_position_tpsl(
     )
     pending = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
     pos_id = _first_string(position, "posId", "pos_id", "id")
-    protection = match_position_protection(live_positions, pending).by_pos_id.get(pos_id or "")
+    with session_factory() as session:
+        ledger_rows = list_verified_ledger_rows_for_positions(
+            session, [pos_id] if pos_id else []
+        )
+    exact_order_position_ids = {
+        str(row.order_id): str(row.pos_id)
+        for row in ledger_rows
+        if str(row.order_id or "").strip()
+    }
+    protection = match_position_protection(
+        live_positions,
+        pending,
+        exact_order_position_ids=exact_order_position_ids,
+        allow_heuristic_attribution=False,
+    ).by_pos_id.get(pos_id or "")
     if protection is not None and protection.status == "present_but_ambiguous":
         raise DeepcoinExecutionActionError("ambiguous_pending_position_tpsl")
     old_order_ids = protection.order_ids if protection is not None else []
@@ -242,7 +259,10 @@ def adjust_position_tpsl(
     if old_row_snapshots:
         pending_recheck = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
         rechecked = match_position_protection(
-            live_positions, pending_recheck
+            live_positions,
+            pending_recheck,
+            exact_order_position_ids=exact_order_position_ids,
+            allow_heuristic_attribution=False,
         ).by_pos_id.get(pos_id or "")
         rechecked_pending_rows = [
             row

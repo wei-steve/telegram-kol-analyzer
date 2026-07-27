@@ -71,6 +71,7 @@ def test_resolve_stop_loss_adjustment_target_prefers_matching_position_id():
                 "slTriggerPrice": "67400",
             },
         ],
+        target_pos_id="pos-1",
     )
 
     assert target.action == "replace_pending_stop_loss"
@@ -79,7 +80,7 @@ def test_resolve_stop_loss_adjustment_target_prefers_matching_position_id():
     assert target.order.trigger_order_id == "stop-1"
 
 
-def test_resolve_stop_loss_adjustment_target_matches_known_client_order_id():
+def test_resolve_stop_loss_adjustment_target_matches_ledger_owned_order_id():
     target = resolve_stop_loss_adjustment_target(
         binding=_binding(pos_id=None, client_order_id="sl-client-1"),
         pending_trigger_orders=[
@@ -87,16 +88,18 @@ def test_resolve_stop_loss_adjustment_target_matches_known_client_order_id():
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "long",
                 "triggerOrderType": "TPSL",
+                "ordId": "sl-owned-1",
                 "clOrdId": "sl-client-1",
                 "slTriggerPx": "67500",
             }
         ],
+        ledger_owned_order_ids={"sl-owned-1"},
     )
 
     assert target.action == "replace_pending_stop_loss"
-    assert target.reason == "matched_pending_stop_loss_by_order_id"
+    assert target.reason == "matched_pending_stop_loss_by_ledger_order_id"
     assert target.order is not None
-    assert target.order.client_order_id == "sl-client-1"
+    assert target.order.trigger_order_id == "sl-owned-1"
 
 
 def test_resolve_stop_loss_adjustment_target_rejects_ambiguous_symbol_side_matches():
@@ -121,26 +124,26 @@ def test_resolve_stop_loss_adjustment_target_rejects_ambiguous_symbol_side_match
             ],
         )
 
-    assert str(exc.value) == "ambiguous_stop_loss_orders_for_symbol_side"
+    assert str(exc.value) == "no_deepcoin_stop_loss_adjustment_target"
 
 
-def test_resolve_stop_loss_adjustment_target_falls_back_to_active_position_sltp():
-    target = resolve_stop_loss_adjustment_target(
-        binding=_binding(pos_id="pos-1"),
-        pending_trigger_orders=[],
-        live_positions=[
-            {
-                "instId": "BTC-USDT-SWAP",
-                "posId": "pos-1",
-                "posSide": "long",
-                "pos": "3",
-            }
-        ],
-    )
-
-    assert target.action == "set_position_sltp"
-    assert target.reason == "no_pending_stop_loss_but_active_position_found"
-    assert target.pos_id == "pos-1"
+def test_resolve_stop_loss_adjustment_target_refuses_active_position_fallback():
+    with pytest.raises(
+        DeepcoinOrderMatchError,
+        match="no_deepcoin_stop_loss_adjustment_target",
+    ):
+        resolve_stop_loss_adjustment_target(
+            binding=_binding(pos_id="pos-1"),
+            pending_trigger_orders=[],
+            live_positions=[
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-1",
+                    "posSide": "long",
+                    "pos": "3",
+                }
+            ],
+        )
 
 
 def test_resolve_stop_loss_adjustment_target_does_not_replace_open_entry_order_sltp():
@@ -361,11 +364,11 @@ def test_native_tpsl_match_refuses_zero_size_order_without_full_open_position_co
         ),
     )
 
-    assert match.status == "ambiguous"
+    assert match.status == "not_found"
     assert match.order is None
 
 
-def test_native_tpsl_match_accepts_zero_size_order_with_one_explicit_open_position():
+def test_native_tpsl_match_refuses_zero_size_order_without_ledger_order_id():
     position = _native_tpsl_position()
 
     match = match_native_tpsl_order(
@@ -389,9 +392,8 @@ def test_native_tpsl_match_accepts_zero_size_order_with_one_explicit_open_positi
         ),
     )
 
-    assert match.status == "verified"
-    assert match.order is not None
-    assert match.order.ord_id == "manual-stop-1"
+    assert match.status == "not_found"
+    assert match.order is None
 
 
 def test_native_tpsl_match_refuses_ambiguous_zero_size_stop():
@@ -418,7 +420,7 @@ def test_native_tpsl_match_refuses_ambiguous_zero_size_stop():
         ),
     )
 
-    assert match.status == "ambiguous"
+    assert match.status == "not_found"
     assert match.order is None
 
 
@@ -455,9 +457,9 @@ def test_native_tpsl_match_does_not_attribute_zero_size_order_to_either_same_sid
         expected=expected,
     )
 
-    assert first_match.status == "ambiguous"
+    assert first_match.status == "not_found"
     assert first_match.order is None
-    assert second_match.status == "ambiguous"
+    assert second_match.status == "not_found"
     assert second_match.order is None
 
 

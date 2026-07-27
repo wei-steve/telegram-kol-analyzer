@@ -128,47 +128,19 @@ def match_native_tpsl_order(
     *,
     open_positions: list[dict[str, Any]] | None = None,
 ) -> NativeTpslMatch:
-    """Find a single verified native TPSL order without guessing ownership.
-
-    A caller-supplied persisted exchange order id is authoritative after the
-    exact order still matches the target position's instrument, side, purpose,
-    trigger price, and size. Without that ID, matching needs one and only one
-    row with the exact instrument, side, creation-time window, and quantity.
-    DeepCoin's ``sz=0`` full-position form additionally requires the caller to
-    provide the complete ``open_positions`` scope so it cannot be attributed to
-    an arbitrary split.
-    """
+    """Validate one ledger-owned native TPSL order without inferring ownership."""
 
     normalized = [order for raw in orders if (order := normalize_native_tpsl(raw))]
-    if expected.ord_id:
-        exact = [order for order in normalized if order.ord_id == expected.ord_id]
-        if len(exact) > 1:
-            return NativeTpslMatch(status="ambiguous", order=None)
-        if not exact:
-            return NativeTpslMatch(status="not_found", order=None)
-        order = exact[0]
-        return NativeTpslMatch(
-            status="verified" if _exact_order_matches(position, order, expected) else "mismatch",
-            order=order,
-        )
-
-    candidates = [
-        order
-        for order in normalized
-        if native_tpsl_belongs_to_position(position, order) and order.size == expected.size
-    ]
-    if len(candidates) > 1:
-        return NativeTpslMatch(status="ambiguous", order=None)
-    if not candidates:
+    if not expected.ord_id:
         return NativeTpslMatch(status="not_found", order=None)
-    order = candidates[0]
-    if _requires_open_position_scope(order) and not _has_unique_open_position_scope(
-        order,
-        open_positions,
-    ):
+    exact = [order for order in normalized if order.ord_id == expected.ord_id]
+    if len(exact) > 1:
         return NativeTpslMatch(status="ambiguous", order=None)
+    if not exact:
+        return NativeTpslMatch(status="not_found", order=None)
+    order = exact[0]
     return NativeTpslMatch(
-        status="verified" if _leg_matches(order, expected) else "mismatch",
+        status="verified" if _exact_order_matches(position, order, expected) else "mismatch",
         order=order,
     )
 
@@ -223,25 +195,6 @@ def _leg_matches(order: NativeTpslOrder, expected: NativeTpslExpectation) -> boo
         else order.take_profit_trigger_price
     )
     return actual_price == expected.trigger_price and order.size == expected.size
-
-
-def _requires_open_position_scope(order: NativeTpslOrder) -> bool:
-    return order.pos_id is None and order.size == Decimal("0")
-
-
-def _has_unique_open_position_scope(
-    order: NativeTpslOrder,
-    open_positions: list[dict[str, Any]] | None,
-) -> bool:
-    if open_positions is None:
-        return False
-    return (
-        sum(
-            native_tpsl_belongs_to_position(open_position, order)
-            for open_position in open_positions
-        )
-        == 1
-    )
 
 
 def _first_string(payload: dict[str, Any], *keys: str) -> str | None:

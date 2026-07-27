@@ -8,11 +8,9 @@ management signals can adjust the intended protection order without guessing.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import Any
 
 from telegram_kol_research.deepcoin_readonly import DeepcoinOrderBinding
-from telegram_kol_research.native_tpsl import native_tpsl_belongs_to_position
 from telegram_kol_research.native_tpsl import normalize_native_tpsl
 
 
@@ -144,22 +142,23 @@ def select_position_tpsl_orders(
     *,
     position: dict[str, Any],
     pending_trigger_orders: list[dict[str, Any]],
+    owned_order_ids: set[str] | frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
-    """Return raw pending TPSL orders that belong to one split position.
+    """Return only pending TPSL rows with exact position or ledger ownership."""
 
-    Deepcoin's pending TPSL rows may not include ``posId``.  In that case the
-    stable observed link is instrument + position side + position creation time,
-    with size either matching the position or reported as zero.
-    """
-
+    target_pos_id = _first_string(position, "posId", "pos_id", "id")
     matches: list[dict[str, Any]] = []
     for order in pending_trigger_orders:
         native_order = normalize_native_tpsl(order)
-        if (
-            native_order
-            and not (native_order.pos_id is None and native_order.size == Decimal("0"))
-            and native_tpsl_belongs_to_position(position, native_order)
-        ):
+        if native_order is None:
+            continue
+        ledger_owned = bool(
+            native_order.ord_id and native_order.ord_id in owned_order_ids
+        )
+        exchange_scoped = bool(
+            target_pos_id and native_order.pos_id == target_pos_id
+        )
+        if ledger_owned or exchange_scoped:
             matches.append(order)
     return matches
 
@@ -195,31 +194,34 @@ def resolve_stop_loss_adjustment_target(
     binding: DeepcoinOrderBinding,
     pending_trigger_orders: list[dict[str, Any]],
     live_positions: list[dict[str, Any]] | None = None,
+    target_pos_id: str | None = None,
+    ledger_owned_order_ids: set[str] | frozenset[str] = frozenset(),
 ) -> StopLossAdjustmentTarget:
-    """Find the exact Deepcoin target for a later stop-loss update signal.
-
-    Matching priority:
-    1. Existing pending SL trigger order tied to this binding by order/client id.
-    2. Existing pending SL trigger order tied to this binding by position id.
-    3. Existing pending SL trigger order uniquely matching instrument + side.
-    4. Active split-position fallback: use set-position-sltp with posId.
-    5. Open entry-order fallback: use replace-order-sltp with orderSysID.
-    """
+    """Find a stop-loss target from exact ``posId`` and ledger-owned ``ordId``."""
 
     protection_orders = [
         order
         for order in extract_pending_protection_orders(pending_trigger_orders)
         if order.purpose == "stop_loss"
     ]
-    direct_id_matches = _match_by_known_order_ids(binding, protection_orders)
+    direct_id_matches = [
+        order
+        for order in protection_orders
+        if order.trigger_order_id in ledger_owned_order_ids
+    ]
     if direct_id_matches:
         return StopLossAdjustmentTarget(
             action="replace_pending_stop_loss",
-            reason="matched_pending_stop_loss_by_order_id",
+            reason="matched_pending_stop_loss_by_ledger_order_id",
             order=_single_or_raise(direct_id_matches, "multiple_stop_loss_orders_for_order_id"),
         )
 
-    position_matches = _match_by_position_ids(binding, protection_orders)
+    exact_pos_id = str(target_pos_id or "").strip()
+    position_matches = [
+        order
+        for order in protection_orders
+        if exact_pos_id and order.pos_id == exact_pos_id
+    ]
     if position_matches:
         return StopLossAdjustmentTarget(
             action="replace_pending_stop_loss",
@@ -227,82 +229,7 @@ def resolve_stop_loss_adjustment_target(
             order=_single_or_raise(position_matches, "multiple_stop_loss_orders_for_pos_id"),
         )
 
-    symbol_side_matches = _match_by_symbol_side(binding, protection_orders)
-    if symbol_side_matches:
-        return StopLossAdjustmentTarget(
-            action="replace_pending_stop_loss",
-            reason="matched_pending_stop_loss_by_unique_symbol_side",
-            order=_single_or_raise(
-                symbol_side_matches,
-                "ambiguous_stop_loss_orders_for_symbol_side",
-            ),
-        )
-
-    live_pos_id = _first_live_position_id(binding, live_positions or [])
-    if live_pos_id:
-        return StopLossAdjustmentTarget(
-            action="set_position_sltp",
-            reason="no_pending_stop_loss_but_active_position_found",
-            pos_id=live_pos_id,
-        )
-
     raise DeepcoinOrderMatchError("no_deepcoin_stop_loss_adjustment_target")
-
-
-def _match_by_known_order_ids(
-    binding: DeepcoinOrderBinding,
-    orders: list[DeepcoinProtectionOrder],
-) -> list[DeepcoinProtectionOrder]:
-    order_ids = set(_split_ids(binding.order_id))
-    client_order_ids = set(_split_ids(binding.client_order_id))
-    return [
-        order
-        for order in orders
-        if (order.trigger_order_id and order.trigger_order_id in order_ids)
-        or (order.client_order_id and order.client_order_id in client_order_ids)
-    ]
-
-
-def _match_by_position_ids(
-    binding: DeepcoinOrderBinding,
-    orders: list[DeepcoinProtectionOrder],
-) -> list[DeepcoinProtectionOrder]:
-    pos_ids = set(_split_ids(binding.pos_id))
-    if not pos_ids:
-        return []
-    return [order for order in orders if order.pos_id and order.pos_id in pos_ids]
-
-
-def _match_by_symbol_side(
-    binding: DeepcoinOrderBinding,
-    orders: list[DeepcoinProtectionOrder],
-) -> list[DeepcoinProtectionOrder]:
-    expected_symbol = binding.symbol.upper()
-    expected_side = binding.side.lower()
-    return [
-        order
-        for order in orders
-        if _symbol_from_inst_id(order.inst_id) == expected_symbol
-        and _normalize_side(order.pos_side) == expected_side
-    ]
-
-
-def _first_live_position_id(
-    binding: DeepcoinOrderBinding,
-    positions: list[dict[str, Any]],
-) -> str | None:
-    pos_ids = set(_split_ids(binding.pos_id))
-    for position in positions:
-        pos_id = _first_string(position, "posId", "pos_id", "id")
-        if pos_ids and pos_id not in pos_ids:
-            continue
-        if _symbol_from_inst_id(position.get("instId")) != binding.symbol.upper():
-            continue
-        if _normalize_side(str(position.get("posSide") or position.get("side") or "")) != binding.side.lower():
-            continue
-        if _has_nonzero_size(position):
-            return pos_id
-    return None
 
 
 def _single_or_raise(
@@ -336,10 +263,6 @@ def _first_price(payload: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
-def _split_ids(value: str | None) -> list[str]:
-    return [item.strip() for item in str(value or "").split(",") if item.strip()]
-
-
 def _normalize_size(value: Any) -> str | None:
     if value in (None, ""):
         return None
@@ -347,24 +270,3 @@ def _normalize_size(value: Any) -> str | None:
         return f"{float(value):g}"
     except (TypeError, ValueError):
         return str(value)
-
-
-def _symbol_from_inst_id(value: Any) -> str:
-    text = str(value or "").upper()
-    return text.split("-")[0] if text else ""
-
-
-def _normalize_side(value: str) -> str:
-    side = value.lower()
-    if side == "buy":
-        return "long"
-    if side == "sell":
-        return "short"
-    return side
-
-
-def _has_nonzero_size(position: dict[str, Any]) -> bool:
-    try:
-        return abs(float(position.get("pos") or position.get("size") or 0)) > 0
-    except (TypeError, ValueError):
-        return False

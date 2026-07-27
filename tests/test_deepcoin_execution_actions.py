@@ -26,6 +26,7 @@ from telegram_kol_research.models import (
     BoundPositionCloseReservation,
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionProtectionLedger,
     RawMessage,
     StrategyLifecycle,
 )
@@ -1873,6 +1874,9 @@ def test_adjust_position_tpsl_refuses_to_append_when_existing_tpsl_is_missing(tm
 def test_adjust_position_tpsl_refuses_unattributed_pending_tpsl_orders(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = _binding(session_factory)
+    with session_factory() as session:
+        session.query(PositionProtectionLedger).delete()
+        session.commit()
     trade_signal = _signal(
         session_factory,
         action="adjust_stop_loss",
@@ -1891,7 +1895,10 @@ def test_adjust_position_tpsl_refuses_unattributed_pending_tpsl_orders(tmp_path)
     for order in client.trigger_pending:
         order.pop("posId")
 
-    with pytest.raises(DeepcoinExecutionActionError, match="ambiguous_pending_position_tpsl"):
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="no_existing_position_tpsl_to_adjust",
+    ):
         adjust_position_tpsl(
             session_factory,
             trade_signal=trade_signal,
@@ -1902,7 +1909,7 @@ def test_adjust_position_tpsl_refuses_unattributed_pending_tpsl_orders(tmp_path)
     assert client.protection_payloads == []
 
 
-def test_adjust_position_tpsl_accepts_uniquely_attributed_unscoped_orders(tmp_path):
+def test_adjust_position_tpsl_accepts_ledger_owned_unscoped_orders(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = _binding(session_factory)
     trade_signal = _signal(
