@@ -275,6 +275,7 @@ class AiRecognitionConfig:
     ai_models: list[AiModelConfig] = field(default_factory=list)
     active_text_model_id: str = ""
     active_image_model_id: str = ""
+    context_resolution_model_id: str = ""
 
 
 def build_authoritative_mimo_prompt(config: AiRecognitionConfig) -> str:
@@ -397,6 +398,7 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
             ai_models=ai_models,
             active_text_model_id=text_model.id,
             active_image_model_id=image_model.id,
+            context_resolution_model_id=text_model.id,
         )
 
     raw_data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -451,6 +453,12 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
         supports="image",
         fallback_provider=raw_image_provider,
     )
+    context_resolution_model = _select_active_model(
+        ai_models,
+        str(raw_data.get("context_resolution_model_id") or ""),
+        supports="text",
+        fallback_provider=(text_model.provider if text_model else raw_text_provider),
+    )
     return AiRecognitionConfig(
         recognition_prompt=recognition_prompt,
         lifecycle_event_prompt=lifecycle_event_prompt,
@@ -461,6 +469,9 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
         ai_models=ai_models,
         active_text_model_id=text_model.id if text_model else "",
         active_image_model_id=image_model.id if image_model else "",
+        context_resolution_model_id=(
+            context_resolution_model.id if context_resolution_model else ""
+        ),
     )
 
 
@@ -489,6 +500,12 @@ def save_ai_recognition_config(
         supports="image",
         fallback_provider=config.image_provider,
     )
+    context_resolution_model = _select_active_model(
+        ai_models,
+        config.context_resolution_model_id,
+        supports="text",
+        fallback_provider=(text_model.provider if text_model else config.text_provider),
+    )
     normalized = AiRecognitionConfig(
         recognition_prompt=_with_price_shorthand_instruction(
             _with_normalized_strategy_output_instructions(
@@ -509,6 +526,9 @@ def save_ai_recognition_config(
         ai_models=ai_models,
         active_text_model_id=text_model.id if text_model else "",
         active_image_model_id=image_model.id if image_model else "",
+        context_resolution_model_id=(
+            context_resolution_model.id if context_resolution_model else ""
+        ),
     )
     payload: dict[str, Any] = {
         "mode": normalized.mode,
@@ -517,6 +537,7 @@ def save_ai_recognition_config(
         "mimo_direct_prompt": normalized.mimo_direct_prompt,
         "active_text_model_id": normalized.active_text_model_id,
         "active_image_model_id": normalized.active_image_model_id,
+        "context_resolution_model_id": normalized.context_resolution_model_id,
         "ai_models": [_model_to_payload(model) for model in normalized.ai_models],
         "text_provider": _provider_to_payload(normalized.text_provider),
         "image_provider": _provider_to_payload(normalized.image_provider),

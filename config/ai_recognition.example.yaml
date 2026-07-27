@@ -1,6 +1,7 @@
 mode: ai_provider
 active_text_model_id: "deepseek-v4-flash"
 active_image_model_id: "glm-ocr"
+context_resolution_model_id: "deepseek-v4-flash"
 ai_models:
   - id: "deepseek-v4-flash"
     label: "DeepSeek V4 Flash"

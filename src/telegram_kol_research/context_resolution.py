@@ -1,0 +1,509 @@
+"""DeepSeek-backed second-pass strategy-thread resolution."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
+
+import httpx
+from sqlalchemy.orm import sessionmaker
+
+from telegram_kol_research.ai_recognition_config import (
+    AiProviderConfig,
+    AiRecognitionConfig,
+)
+from telegram_kol_research.context_resolution_prompt import (
+    CONTEXT_RESOLUTION_PROMPT_VERSION,
+    CONTEXT_RESOLUTION_SYSTEM_PROMPT,
+    build_context_resolution_request,
+    render_context_resolution_user_prompt,
+)
+from telegram_kol_research.models import (
+    ContextResolutionAttempt,
+    MessageEvidenceVersion,
+    RawMessage,
+    utc_now,
+)
+
+
+DECISIONS = frozenset(
+    {
+        "new_thread",
+        "revise_thread",
+        "manage_thread",
+        "cancel_thread",
+        "exit_thread",
+        "hold",
+        "unresolved",
+    }
+)
+MANAGEMENT_ACTIONS = frozenset(
+    {
+        "cancel_pending_entry",
+        "exit_full",
+        "exit_partial",
+        "partial_take_profit",
+        "move_stop_to_protect",
+        "hold_update",
+        "risk_update",
+        "replace_entry",
+    }
+)
+CONFLICT_TYPES = frozenset(
+    {
+        "text_image_conflict",
+        "reply_target_conflict",
+        "multiple_candidates",
+        "target_ambiguous",
+        "entry_or_revision",
+        "exchange_state_conflict",
+    }
+)
+REANALYSIS_TRIGGERS = frozenset(
+    {
+        "message_edited",
+        "reply_target_available",
+        "exchange_state_changed",
+        "strategy_state_changed",
+        "evidence_version_changed",
+    }
+)
+TARGET_REQUIRED_DECISIONS = frozenset(
+    {"revise_thread", "manage_thread", "cancel_thread", "exit_thread"}
+)
+MULTI_TARGET_DECISIONS = frozenset({"cancel_thread", "exit_thread"})
+
+
+class ContextResolutionError(ValueError):
+    """Raised when the second resolver cannot produce a safe decision."""
+
+
+@dataclass(frozen=True, slots=True)
+class ContextResolutionDecision:
+    decision: str
+    target_thread_ids: tuple[int, ...]
+    management_action: str | None
+    confidence: float
+    supporting_message_ids: tuple[int, ...]
+    opposing_message_ids: tuple[int, ...]
+    conflict_types: tuple[str, ...]
+    risk_reducing_fanout_allowed: bool
+    reanalysis_triggers: tuple[str, ...]
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "decision": self.decision,
+            "target_thread_ids": list(self.target_thread_ids),
+            "management_action": self.management_action,
+            "confidence": self.confidence,
+            "supporting_message_ids": list(self.supporting_message_ids),
+            "opposing_message_ids": list(self.opposing_message_ids),
+            "conflict_types": list(self.conflict_types),
+            "risk_reducing_fanout_allowed": self.risk_reducing_fanout_allowed,
+            "reanalysis_triggers": list(self.reanalysis_triggers),
+            "reason": self.reason,
+        }
+
+
+def _int_tuple(value: Any, *, field: str) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        raise ContextResolutionError(f"{field} must be a list")
+    try:
+        result = tuple(int(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise ContextResolutionError(f"{field} must contain integers") from exc
+    if len(result) != len(set(result)):
+        raise ContextResolutionError(f"{field} contains duplicates")
+    return result
+
+
+def _closed_tuple(value: Any, *, field: str, allowed: frozenset[str]) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ContextResolutionError(f"{field} must be a list")
+    result = tuple(str(item) for item in value)
+    if any(item not in allowed for item in result):
+        raise ContextResolutionError(f"{field} contains an unknown value")
+    if len(result) != len(set(result)):
+        raise ContextResolutionError(f"{field} contains duplicates")
+    return result
+
+
+def parse_context_resolution_decision(
+    payload: Mapping[str, Any],
+    *,
+    allowed_thread_ids: set[int],
+    allowed_message_ids: set[int],
+) -> ContextResolutionDecision:
+    """Validate the model response against supplied IDs and closed values."""
+
+    if not isinstance(payload, Mapping):
+        raise ContextResolutionError("decision payload must be an object")
+    decision = str(payload.get("decision") or "")
+    if decision not in DECISIONS:
+        raise ContextResolutionError("unknown decision")
+    target_thread_ids = _int_tuple(
+        payload.get("target_thread_ids"),
+        field="target_thread_ids",
+    )
+    if any(thread_id not in allowed_thread_ids for thread_id in target_thread_ids):
+        raise ContextResolutionError("invented target thread id")
+    if decision in TARGET_REQUIRED_DECISIONS and not target_thread_ids:
+        raise ContextResolutionError("target thread is required")
+    if decision not in TARGET_REQUIRED_DECISIONS and target_thread_ids:
+        raise ContextResolutionError("decision must not select a target thread")
+    fanout = payload.get("risk_reducing_fanout_allowed")
+    if not isinstance(fanout, bool):
+        raise ContextResolutionError("risk_reducing_fanout_allowed must be boolean")
+    if len(target_thread_ids) > 1 and (
+        decision not in MULTI_TARGET_DECISIONS or not fanout
+    ):
+        raise ContextResolutionError("multiple targets are not safe for this decision")
+    if fanout and decision not in MULTI_TARGET_DECISIONS:
+        raise ContextResolutionError("fanout is only valid for cancel or exit")
+    management_action_value = payload.get("management_action")
+    management_action = (
+        None if management_action_value is None else str(management_action_value)
+    )
+    if management_action is not None and management_action not in MANAGEMENT_ACTIONS:
+        raise ContextResolutionError("unknown management action")
+    try:
+        confidence = float(payload.get("confidence"))
+    except (TypeError, ValueError) as exc:
+        raise ContextResolutionError("confidence must be numeric") from exc
+    if not 0.0 <= confidence <= 1.0:
+        raise ContextResolutionError("confidence outside [0, 1]")
+    supporting = _int_tuple(
+        payload.get("supporting_message_ids"),
+        field="supporting_message_ids",
+    )
+    opposing = _int_tuple(
+        payload.get("opposing_message_ids"),
+        field="opposing_message_ids",
+    )
+    if any(item not in allowed_message_ids for item in supporting + opposing):
+        raise ContextResolutionError("message evidence is outside supplied context")
+    conflicts = _closed_tuple(
+        payload.get("conflict_types"),
+        field="conflict_types",
+        allowed=CONFLICT_TYPES,
+    )
+    triggers = _closed_tuple(
+        payload.get("reanalysis_triggers"),
+        field="reanalysis_triggers",
+        allowed=REANALYSIS_TRIGGERS,
+    )
+    return ContextResolutionDecision(
+        decision=decision,
+        target_thread_ids=target_thread_ids,
+        management_action=management_action,
+        confidence=confidence,
+        supporting_message_ids=supporting,
+        opposing_message_ids=opposing,
+        conflict_types=conflicts,
+        risk_reducing_fanout_allowed=fanout,
+        reanalysis_triggers=triggers,
+        reason=str(payload.get("reason") or "").strip(),
+    )
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _collect_ids(value: Any, key_names: set[str]) -> set[int]:
+    found: set[int] = set()
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if str(key) in key_names and item is not None:
+                try:
+                    found.add(int(item))
+                except (TypeError, ValueError):
+                    pass
+            found.update(_collect_ids(item, key_names))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found.update(_collect_ids(item, key_names))
+    return found
+
+
+def _select_provider(config: AiRecognitionConfig) -> AiProviderConfig:
+    requested = str(config.context_resolution_model_id or "")
+    for model in config.ai_models:
+        if model.id == requested and model.supports_text:
+            return model.provider
+    return config.text_provider
+
+
+def _completion_url(base_url: str) -> str:
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/v1"):
+        return f"{normalized}/chat/completions"
+    return f"{normalized}/v1/chat/completions"
+
+
+def _default_model_caller(
+    *,
+    provider: AiProviderConfig,
+    system_prompt: str,
+    request_payload: dict[str, Any],
+) -> str:
+    if not provider.is_configured:
+        raise RuntimeError("context resolution provider is not configured")
+    headers = {"Content-Type": "application/json"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    payload = {
+        "model": provider.model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": render_context_resolution_user_prompt(request_payload),
+            },
+        ],
+    }
+    with httpx.Client(timeout=provider.timeout_seconds) as client:
+        response = client.post(
+            _completion_url(provider.base_url),
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+    return str(data["choices"][0]["message"]["content"])
+
+
+def _decode_model_payload(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    if not isinstance(value, str):
+        raise json.JSONDecodeError("model response is not JSON text", "", 0)
+    text = value.strip()
+    if text.startswith("```"):
+        text = text.removeprefix("```json").removeprefix("```")
+        text = text.removesuffix("```").strip()
+    decoded = json.loads(text)
+    if not isinstance(decoded, Mapping):
+        raise json.JSONDecodeError("model response is not an object", text, 0)
+    return decoded
+
+
+def _current_evidence_version_id(session_factory, raw_message_id: int) -> int | None:
+    with session_factory() as session:
+        row = (
+            session.query(MessageEvidenceVersion.id)
+            .filter(
+                MessageEvidenceVersion.raw_message_id == int(raw_message_id),
+                MessageEvidenceVersion.superseded_at.is_(None),
+            )
+            .order_by(MessageEvidenceVersion.version.desc())
+            .first()
+        )
+    return int(row[0]) if row is not None else None
+
+
+def _upsert_attempt(
+    session_factory,
+    *,
+    raw_message_id: int,
+    evidence_version_id: int | None,
+    context_fingerprint: str,
+    model: str,
+    request_payload: dict[str, Any],
+    decision: ContextResolutionDecision | None,
+    status: str,
+    error_class: str | None,
+    attempts: int,
+) -> None:
+    now = utc_now()
+    with session_factory() as session:
+        row = (
+            session.query(ContextResolutionAttempt)
+            .filter(
+                ContextResolutionAttempt.raw_message_id == int(raw_message_id),
+                ContextResolutionAttempt.context_fingerprint == context_fingerprint,
+            )
+            .one_or_none()
+        )
+        if row is None:
+            row = ContextResolutionAttempt(
+                raw_message_id=int(raw_message_id),
+                message_evidence_version_id=evidence_version_id,
+                context_fingerprint=context_fingerprint,
+                model=model,
+                prompt_versions_json=_canonical_json(
+                    {"context_resolution": CONTEXT_RESOLUTION_PROMPT_VERSION}
+                ),
+                request_summary_json=_canonical_json(request_payload),
+                decision_json=None,
+                status=status,
+                error_class=error_class,
+                reanalysis_triggers_json="[]",
+                attempts=int(attempts),
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+        else:
+            row.message_evidence_version_id = evidence_version_id
+            row.model = model
+            row.request_summary_json = _canonical_json(request_payload)
+            row.status = status
+            row.error_class = error_class
+            row.attempts = int(attempts)
+            row.updated_at = now
+        if decision is not None:
+            row.decision_json = _canonical_json(decision.to_dict())
+            row.reanalysis_triggers_json = _canonical_json(
+                list(decision.reanalysis_triggers)
+            )
+        session.commit()
+
+
+def resolve_contextual_strategy(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    ai_recognition_config: AiRecognitionConfig,
+    evidence: Any,
+    context_window: Any,
+    candidates: Any,
+    first_pass_payload: Any,
+    exchange_state: Any,
+    model_caller: Callable[..., Any] = _default_model_caller,
+) -> ContextResolutionDecision:
+    """Call DeepSeek once, retrying only one malformed JSON response."""
+
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        current_message = {
+            "raw_message_id": int(raw_message.id),
+            "chat_id": int(raw_message.chat_id),
+            "message_id": int(raw_message.message_id),
+            "posted_at": (
+                raw_message.posted_at.isoformat()
+                if raw_message.posted_at is not None
+                else None
+            ),
+            "text": raw_message.text,
+            "reply_to_message_id": raw_message.reply_to_message_id,
+        }
+    request_payload = build_context_resolution_request(
+        current_message=current_message,
+        evidence=evidence,
+        context_window=context_window,
+        candidates=candidates,
+        exchange_state=exchange_state,
+        first_pass_payload=first_pass_payload,
+    )
+    evidence_version_id = _current_evidence_version_id(
+        session_factory,
+        int(raw_message_id),
+    )
+    fingerprint_payload = {
+        "raw_message_id": int(raw_message_id),
+        "evidence_version_id": evidence_version_id,
+        "request": request_payload,
+    }
+    context_fingerprint = "sha256:" + hashlib.sha256(
+        _canonical_json(fingerprint_payload).encode("utf-8")
+    ).hexdigest()
+    allowed_thread_ids = _collect_ids(
+        request_payload.get("candidate_strategy_threads"),
+        {"thread_id", "strategy_thread_id"},
+    )
+    allowed_message_ids = _collect_ids(
+        {
+            "current": request_payload.get("current_message"),
+            "context": request_payload.get("message_context"),
+            "candidates": request_payload.get("candidate_strategy_threads"),
+        },
+        {"message_id", "source_message_id", "root_message_id"},
+    )
+    provider = _select_provider(ai_recognition_config)
+    attempts = 0
+    for attempt_number in (1, 2):
+        attempts = attempt_number
+        try:
+            raw_result = model_caller(
+                provider=provider,
+                system_prompt=CONTEXT_RESOLUTION_SYSTEM_PROMPT,
+                request_payload=request_payload,
+            )
+        except Exception as exc:
+            _upsert_attempt(
+                session_factory,
+                raw_message_id=raw_message_id,
+                evidence_version_id=evidence_version_id,
+                context_fingerprint=context_fingerprint,
+                model=provider.model,
+                request_payload=request_payload,
+                decision=None,
+                status="failed",
+                error_class="network_error",
+                attempts=attempts,
+            )
+            raise ContextResolutionError("context model call failed") from exc
+        try:
+            decoded = _decode_model_payload(raw_result)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            if attempt_number == 1:
+                continue
+            _upsert_attempt(
+                session_factory,
+                raw_message_id=raw_message_id,
+                evidence_version_id=evidence_version_id,
+                context_fingerprint=context_fingerprint,
+                model=provider.model,
+                request_payload=request_payload,
+                decision=None,
+                status="failed",
+                error_class="malformed_json",
+                attempts=attempts,
+            )
+            raise ContextResolutionError("context model returned malformed JSON") from exc
+        try:
+            decision = parse_context_resolution_decision(
+                decoded,
+                allowed_thread_ids=allowed_thread_ids,
+                allowed_message_ids=allowed_message_ids,
+            )
+        except ContextResolutionError:
+            _upsert_attempt(
+                session_factory,
+                raw_message_id=raw_message_id,
+                evidence_version_id=evidence_version_id,
+                context_fingerprint=context_fingerprint,
+                model=provider.model,
+                request_payload=request_payload,
+                decision=None,
+                status="failed",
+                error_class="contract_error",
+                attempts=attempts,
+            )
+            raise
+        _upsert_attempt(
+            session_factory,
+            raw_message_id=raw_message_id,
+            evidence_version_id=evidence_version_id,
+            context_fingerprint=context_fingerprint,
+            model=provider.model,
+            request_payload=request_payload,
+            decision=decision,
+            status="completed",
+            error_class=None,
+            attempts=attempts,
+        )
+        return decision
+    raise AssertionError("unreachable")

@@ -180,6 +180,7 @@ def test_load_ai_recognition_config_uses_defaults_when_file_is_missing(tmp_path)
     assert config.mode == "local_rule_parser"
     assert config.active_text_model_id == "deepseek-v4-flash"
     assert config.active_image_model_id == "mimo-v2.5"
+    assert config.context_resolution_model_id == "deepseek-v4-flash"
     assert config.text_provider.is_configured is False
     assert config.image_provider.is_configured is False
     assert config.recognition_prompt.startswith(DEFAULT_RECOGNITION_PROMPT)
@@ -218,6 +219,24 @@ def test_save_and_load_ai_recognition_config_round_trips_prompt(tmp_path):
     assert "58900-59300" in config.recognition_prompt
     assert "57800" in config.lifecycle_event_prompt
     assert config.mode == "local_rule_parser"
+    assert config.context_resolution_model_id == "deepseek-v4-flash"
+
+
+def test_context_resolution_model_must_be_a_text_model(tmp_path):
+    config_path = tmp_path / "ai_recognition.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "active_text_model_id: deepseek-v4-flash",
+                "context_resolution_model_id: glm-ocr",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_ai_recognition_config(config_path)
+
+    assert config.context_resolution_model_id == "deepseek-v4-flash"
 
 
 def test_load_ai_recognition_config_upgrades_existing_normalized_prompt(tmp_path):
