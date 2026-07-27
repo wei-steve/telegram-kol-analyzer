@@ -42,6 +42,10 @@ from telegram_kol_research.entry_protection_ledger_repair import (
     apply_entry_protection_ledger_repair_plan,
     build_entry_protection_ledger_repair_plan,
 )
+from telegram_kol_research.evidence_backfill import (
+    plan_mimo_evidence_backfill,
+    run_mimo_evidence_backfill,
+)
 from telegram_kol_research.current_protection_backfill import (
     SupervisedProtectionMapping,
     apply_current_protection_backfill_plan,
@@ -2541,6 +2545,112 @@ def _build_recovery_market_provider(market_provider: str):
     if normalized == "binance":
         return BinanceMarketDataProvider()
     raise typer.BadParameter("market-provider must be one of: none, gate, binance")
+
+
+def _parse_evidence_backfill_timestamp(
+    value: str | None,
+    *,
+    option_name: str,
+) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"{option_name} must be an ISO-8601 timestamp"
+        ) from exc
+
+
+@app.command("backfill-mimo-evidence")
+def backfill_mimo_evidence(
+    database_path: Path = Path("data/research.db"),
+    ai_config_path: Path = Path("config/ai_recognition.yaml"),
+    media_root: Path = Path("data/media"),
+    chat_ids: list[int] = typer.Option(
+        [],
+        "--chat-id",
+        help="Telegram chat ID to backfill. Repeat for multiple chats.",
+    ),
+    use_configured_context_chats: bool = typer.Option(
+        False,
+        "--use-configured-context-chats",
+        help="Also use the persisted contextual-resolution chat list.",
+    ),
+    start_at: str | None = typer.Option(None, "--start-at"),
+    end_at: str | None = typer.Option(None, "--end-at"),
+    limit: int = typer.Option(100, "--limit", min=1),
+    delay_seconds: float = typer.Option(2.0, "--delay-seconds", min=0.0),
+    retry_failed: bool = typer.Option(False, "--retry-failed"),
+    apply: bool = typer.Option(False, "--apply"),
+) -> None:
+    """Backfill immutable MiMo evidence without applying strategy actions."""
+
+    session_factory = create_session_factory(database_path)
+    scoped_chat_ids = [int(chat_id) for chat_id in chat_ids]
+    if use_configured_context_chats:
+        settings = load_trading_settings(session_factory)
+        scoped_chat_ids.extend(settings.context_resolution_live_chat_ids)
+    scoped_chat_ids = sorted(set(scoped_chat_ids))
+    if not scoped_chat_ids:
+        raise typer.BadParameter(
+            "at least one chat scope is required via --chat-id or "
+            "--use-configured-context-chats"
+        )
+    parsed_start = _parse_evidence_backfill_timestamp(
+        start_at,
+        option_name="--start-at",
+    )
+    parsed_end = _parse_evidence_backfill_timestamp(
+        end_at,
+        option_name="--end-at",
+    )
+    plan = plan_mimo_evidence_backfill(
+        session_factory,
+        chat_ids=scoped_chat_ids,
+        media_root=media_root,
+        start_at=parsed_start,
+        end_at=parsed_end,
+        limit=limit,
+        retry_failed=retry_failed,
+    )
+    ai_config = load_ai_recognition_config(ai_config_path) if apply else None
+    result = run_mimo_evidence_backfill(
+        session_factory,
+        plan=plan,
+        ai_recognition_config=ai_config,
+        media_root=media_root,
+        apply=apply,
+        delay_seconds=delay_seconds,
+    )
+    rows = (
+        list(result.rows)
+        if apply
+        else [
+            {
+                "raw_message_id": item.raw_message_id,
+                "chat_id": item.chat_id,
+                "message_id": item.message_id,
+                "status": item.status,
+            }
+            for item in plan.items
+        ]
+    )
+    typer.echo(
+        json.dumps(
+            {
+                **asdict(result),
+                "chat_ids": list(plan.chat_ids),
+                "start_at": plan.start_at,
+                "end_at": plan.end_at,
+                "limit": plan.limit,
+                "retry_failed": plan.retry_failed,
+                "rows": rows,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    )
 
 
 @app.command("resolve-context-once")
