@@ -31,6 +31,8 @@ def _canonical_json(value: Any) -> str:
 def build_message_input_fingerprint(
     raw_message: RawMessage,
     media_assets: Iterable[MediaAsset],
+    *,
+    media_root: str | Path | None = None,
 ) -> str:
     """Return a stable fingerprint of editable text and attached media."""
 
@@ -39,6 +41,8 @@ def build_message_input_fingerprint(
         content_hash = None
         if asset.local_path:
             path = Path(asset.local_path)
+            if not path.is_absolute() and media_root is not None:
+                path = Path(media_root) / path
             if path.is_file():
                 digest = hashlib.sha256()
                 with path.open("rb") as handle:
@@ -68,6 +72,114 @@ def build_message_input_fingerprint(
     }
     digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
+
+
+def normalize_mimo_evidence(
+    payload: Mapping[str, Any],
+    *,
+    input_kind: str,
+    error_message: str | None,
+) -> tuple[str, float, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Normalize the source-separated MiMo evidence contract."""
+
+    evidence = payload.get("evidence")
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    text_evidence = evidence.get("text")
+    if not isinstance(text_evidence, Mapping):
+        input_reading = payload.get("input_reading")
+        input_reading = (
+            input_reading if isinstance(input_reading, Mapping) else {}
+        )
+        text_evidence = {
+            "observed_text": str(input_reading.get("observed_text") or ""),
+            "fields": {},
+        }
+    images = evidence.get("images")
+    if not isinstance(images, list):
+        images = []
+    conflicts = evidence.get("conflicts")
+    if not isinstance(conflicts, list):
+        conflicts = []
+    if error_message:
+        extraction_status = (
+            "image_unavailable" if "image" in input_kind else "failed"
+        )
+    else:
+        extraction_status = "completed"
+    try:
+        confidence = float(payload.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = min(1.0, max(0.0, confidence))
+    strategy = payload.get("strategy")
+    lifecycle_event = payload.get("lifecycle_event")
+    normalized_evidence = {
+        "strategy": strategy if isinstance(strategy, Mapping) else {},
+        "lifecycle_event": (
+            lifecycle_event if isinstance(lifecycle_event, Mapping) else {}
+        ),
+        "conflicts": conflicts,
+    }
+    return (
+        extraction_status,
+        confidence,
+        dict(text_evidence),
+        {"images": images},
+        normalized_evidence,
+    )
+
+
+def persist_mimo_message_evidence(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    payload: Mapping[str, Any],
+    input_kind: str,
+    model: str,
+    prompt_versions: Mapping[str, Any],
+    error_message: str | None,
+    media_root: str | Path,
+) -> MessageEvidenceVersion:
+    """Persist the evidence produced by one authoritative MiMo read."""
+
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        media_assets = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.raw_message_id == int(raw_message_id))
+            .order_by(MediaAsset.id.asc())
+            .all()
+        )
+        input_fingerprint = build_message_input_fingerprint(
+            raw_message,
+            media_assets,
+            media_root=media_root,
+        )
+    (
+        extraction_status,
+        confidence,
+        text_evidence,
+        image_evidence,
+        normalized_evidence,
+    ) = normalize_mimo_evidence(
+        payload,
+        input_kind=input_kind,
+        error_message=error_message,
+    )
+    return save_message_evidence_version(
+        session_factory,
+        raw_message_id=raw_message_id,
+        input_fingerprint=input_fingerprint,
+        model=model,
+        prompt_versions=prompt_versions,
+        extraction_status=extraction_status,
+        confidence=confidence,
+        text_evidence=text_evidence,
+        image_evidence=image_evidence,
+        normalized_evidence=normalized_evidence,
+    )
 
 
 def save_message_evidence_version(

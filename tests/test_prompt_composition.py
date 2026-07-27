@@ -9,6 +9,7 @@ from telegram_kol_research.prompt_composition import (
     validate_prompt_content,
 )
 from telegram_kol_research.prompt_defaults import (
+    DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
     DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
     DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
     MIMO_VISION_PROMPT,
@@ -16,6 +17,17 @@ from telegram_kol_research.prompt_defaults import (
     STRATEGY_ALERT_PROMPT,
     SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
 )
+
+
+def test_shared_prompt_requires_source_separated_multimodal_evidence():
+    prompt = DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+
+    assert '"evidence"' in prompt
+    assert '"text"' in prompt
+    assert '"images"' in prompt
+    assert '"image_type"' in prompt
+    assert '"conflicts"' in prompt
+    assert "不得静默合并" in prompt
 from telegram_kol_research.prompt_registry import PromptSeed, seed_prompt_definition
 
 

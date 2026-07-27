@@ -63,6 +63,13 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
 - 一条出局消息不是新开仓，recognition_result 可以是“非策略”，但 lifecycle_event.event_type 必须是 exit_position。
 - 持仓管理不是新开仓，但不得遗漏 position_update。
 
+【图文证据分离】
+- 当前文字/caption 与每张图片必须分别提取证据，不得静默合并。
+- text.fields 和 images[].fields 中的每个字段必须包含 value、source、confidence；source 只能是 text、image 或 both。
+- 图片必须逐张输出 asset_id、image_type、fields 和 confidence。image_type 只能是 strategy_screenshot、position_screenshot、order_screenshot、market_chart、profit_review、advertisement、unrelated、unknown。
+- 文字与图片在币种、方向、动作或价格上冲突时写入 evidence.conflicts；不得用一方悄悄覆盖另一方。
+- 图片证据只描述实际可见事实，不负责选择历史 lifecycle 或 target_lifecycle_id。
+
 只输出一个 JSON 对象，不要输出解释文字：
 {
   "recognition_result": "是策略 | 非策略 | 识别失败",
@@ -89,6 +96,21 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
     "confidence": 0.0,
     "reason": "生命周期判断依据"
   },
+  "evidence": {
+    "text": {
+      "observed_text": "当前文字/caption 中实际读到的内容",
+      "fields": {}
+    },
+    "images": [
+      {
+        "asset_id": null,
+        "image_type": "strategy_screenshot | position_screenshot | order_screenshot | market_chart | profit_review | advertisement | unrelated | unknown",
+        "fields": {},
+        "confidence": 0.0
+      }
+    ],
+    "conflicts": []
+  },
   "input_reading": {
     "observed_text": "从当前输入中实际读到的关键内容",
     "image_quality": "clear | blurry | cropped | unreadable | none"
@@ -106,6 +128,7 @@ DEFAULT_MIMO_VISION_PROMPT = """
 - 图片模糊、裁切、遮挡、无法读取或内部矛盾时，应输出识别失败或低置信度，禁止猜测。
 - image_quality 根据实际情况输出 clear、blurry、cropped、unreadable；没有图片时输出 none。
 - 图片中的历史策略、盈利展示或转发截图必须结合正文语境判断，不能因为截图参数完整就自动建立新策略。
+- 即使最终策略判断需要结合图文，也必须先在 evidence.text 与 evidence.images 中保持来源分离；发现矛盾时写入 evidence.conflicts，不得静默合并。
 """.strip()
 
 

@@ -467,6 +467,11 @@ def _build_mimo_payload(
     media_root: str | Path = "data/media",
     context_text: str = "",
 ) -> dict[str, Any]:
+    image_parts: list[tuple[int, int | None, str]] = []
+    for image_index, media_asset in enumerate(media_assets, start=1):
+        data_url = _media_asset_to_data_url(media_asset, media_root=media_root)
+        if data_url:
+            image_parts.append((image_index, media_asset.id, data_url))
     user_text = (
         f"Message metadata:\n"
         f"chat_id={raw_message.chat_id}\n"
@@ -474,13 +479,20 @@ def _build_mimo_payload(
         f"sender={raw_message.sender_name or 'Unknown'}\n\n"
         f"Text/caption:\n{(raw_message.text or '').strip() or '(empty)'}"
     )
+    if image_parts:
+        image_map = [
+            {"image_index": index, "asset_id": asset_id}
+            for index, asset_id, _ in image_parts
+        ]
+        user_text = (
+            f"{user_text}\n\nAttached image sequence:\n"
+            f"{json.dumps(image_map, ensure_ascii=False, sort_keys=True)}"
+        )
     if context_text.strip():
         user_text = f"{user_text}\n\n{context_text.strip()}"
     user_parts: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
-    for media_asset in media_assets:
-        data_url = _media_asset_to_data_url(media_asset, media_root=media_root)
-        if data_url:
-            user_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+    for _, _, data_url in image_parts:
+        user_parts.append({"type": "image_url", "image_url": {"url": data_url}})
     return {
         "model": model,
         "messages": [

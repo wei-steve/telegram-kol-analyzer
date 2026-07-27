@@ -14,6 +14,7 @@ from telegram_kol_research.message_recognition import (
     MessageRecognitionResult,
     apply_authoritative_mimo_payload,
 )
+from telegram_kol_research.message_evidence import persist_mimo_message_evidence
 from telegram_kol_research.models import MessageInstructionItem
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
@@ -102,6 +103,16 @@ def assess_message_authoritatively(
         ai_recognition_config=ai_recognition_config,
         media_root=media_root,
         context_text=context_text,
+    )
+    persist_mimo_message_evidence(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload=mimo.payload,
+        input_kind=mimo.input_kind,
+        model=mimo.model,
+        prompt_versions=mimo.prompt_versions,
+        error_message=mimo.error_message,
+        media_root=media_root,
     )
     if mimo.error_message or mimo.status == "识别失败":
         agreement_status, differences = "authoritative_failed", []

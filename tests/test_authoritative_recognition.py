@@ -15,6 +15,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
     MessageInstructionItem,
+    MessageEvidenceVersion,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -148,6 +149,84 @@ def test_fengge_exit_applies_mimo_while_execution_gate_is_pending(tmp_path, monk
         assert lifecycle.exited_at is None
         assert lifecycle.exit_signal_message_id == 8401
         assert lifecycle.management_action == "exit_requested"
+
+
+def test_authoritative_assessment_persists_separate_text_and_image_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=12,
+            text="ETH 做空，按图中止损",
+        )
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    payload = {
+        "recognition_result": "是策略",
+        "reason": "图文策略",
+        "strategy": {"symbol": "ETH", "side": "short", "stop_loss": "2100"},
+        "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+        "evidence": {
+            "text": {
+                "observed_text": "ETH 做空，按图中止损",
+                "fields": {
+                    "symbol": {
+                        "value": "ETH",
+                        "source": "text",
+                        "confidence": 0.99,
+                    }
+                },
+            },
+            "images": [
+                {
+                    "asset_id": 91,
+                    "image_type": "strategy_screenshot",
+                    "fields": {
+                        "stop_loss": {
+                            "value": "2100",
+                            "source": "image",
+                            "confidence": 0.92,
+                        }
+                    },
+                    "confidence": 0.92,
+                }
+            ],
+            "conflicts": [],
+        },
+        "confidence": 0.93,
+    }
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: MimoAuthoritativeResult(
+            raw_message_id=raw_id,
+            payload=payload,
+            input_kind="text+image",
+            model="mimo-v2.5",
+            status="是策略",
+            prompt_versions={"trading.analysis.mimo_vision": 12},
+        ),
+    )
+
+    assess_message_authoritatively(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+
+    with session_factory() as session:
+        evidence = session.query(MessageEvidenceVersion).one()
+    assert evidence.extraction_status == "completed"
+    assert json.loads(evidence.text_evidence_json)["fields"]["symbol"]["value"] == "ETH"
+    assert json.loads(evidence.image_evidence_json)["images"][0]["fields"][
+        "stop_loss"
+    ]["value"] == "2100"
+    assert json.loads(evidence.normalized_evidence_json)["conflicts"] == []
 
 
 def test_mimo_cancel_entry_for_entered_strategy_creates_full_exit_candidate(
