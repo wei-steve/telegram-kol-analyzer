@@ -899,7 +899,7 @@ git add src/telegram_kol_research/context_resolution_worker.py \
 git commit -m "feat: automatically reanalyze unresolved context"
 ```
 
-### Task 11: Add shadow rollout settings and observability
+### Task 11: Add direct enablement settings and observability
 
 **Files:**
 - Modify: `src/telegram_kol_research/trading_settings.py:21-60`
@@ -917,11 +917,11 @@ git commit -m "feat: automatically reanalyze unresolved context"
 Add:
 
 ```python
-context_resolution_mode: Literal["disabled", "shadow", "live"] = "disabled"
+context_resolution_enabled: bool = False
 context_resolution_live_chat_ids: list[int] = []
 ```
 
-Assert unknown values fail closed and absent legacy settings default to disabled.
+Assert malformed values fail closed and absent legacy settings default to disabled.
 
 **Step 2: Write failing UI/query tests**
 
@@ -933,7 +933,7 @@ The strategy detail must show:
 - evidence version and image type;
 - second-decision confidence and evidence IDs;
 - unresolved reason and next reanalysis trigger;
-- shadow/live result difference.
+- whether contextual automation was enabled for the message's group.
 
 Do not render raw model payloads, image base64, credentials, or full exchange response
 JSON.
@@ -949,8 +949,9 @@ Expected: FAIL.
 
 **Step 4: Implement settings and projections**
 
-Gate live contextual action by both global mode and chat allowlist. Shadow mode persists
-the decision and proposed target/action but creates no executable instruction.
+Gate contextual action by the new boolean, the existing auto-trade/management gates,
+and the chat allowlist. When disabled, the production listener must not call the
+context resolver or persist background comparison results.
 
 **Step 5: Run tests**
 
@@ -973,7 +974,7 @@ git add src/telegram_kol_research/trading_settings.py \
   src/telegram_kol_research/templates/index.html \
   tests/test_trading_settings.py \
   tests/test_web_strategy_records.py tests/test_web_page_render.py
-git commit -m "feat: expose contextual resolution shadow state"
+git commit -m "feat: gate contextual strategy resolution"
 ```
 
 ### Task 12: Add historical replay and complete local verification
@@ -1007,7 +1008,7 @@ Assert:
 - no old entry may submit or reconcile as active after confirmed cancellation;
 - a late fill takes the exact recovery path;
 - repeated replay is idempotent;
-- shadow mode produces no Deepcoin write call.
+- disabled mode produces no AI or Deepcoin call.
 
 **Step 3: Run focused tests**
 
@@ -1041,7 +1042,7 @@ Document:
 
 - evidence extraction lifecycle;
 - strategy-thread decisions;
-- shadow/live gates;
+- disabled/enabled gates and the group allowlist;
 - unresolved automatic retry;
 - read-only server audit commands;
 - rollback procedure.
@@ -1054,7 +1055,7 @@ git add tests/fixtures/context_resolution/dpl_1460_1465.json \
 git commit -m "test: replay contextual strategy resolution"
 ```
 
-### Task 13: Review, push, deploy shadow mode, and verify production
+### Task 13: Review, push, deploy disabled, and verify production
 
 **Files:**
 - Review all files changed by Tasks 1-12
@@ -1111,18 +1112,19 @@ git rev-parse HEAD
 
 Expected: service `active`, SHA matches the pushed commit, tests PASS.
 
-**Step 6: Enable shadow mode only**
+**Step 6: Keep contextual resolution disabled**
 
 Set:
 
 ```json
 {
-  "context_resolution_mode": "shadow",
+  "context_resolution_enabled": false,
   "context_resolution_live_chat_ids": []
 }
 ```
 
-Do not enable live execution yet.
+The production listener must not call either AI resolver through the new path while
+this switch is false.
 
 **Step 7: Run a read-only production audit**
 
@@ -1132,13 +1134,15 @@ Verify for new and recent “大漂亮社区 11分组” messages:
 - image facts are separated from text;
 - reply chains resolve;
 - `1460/1462/1465` replay resolves to one thread;
-- proposed thread/action is visible;
-- zero contextual live instructions or Deepcoin writes were created in shadow mode;
+- the one-shot command returns the proposed thread/action without writing the source
+  database;
+- zero contextual instruction, AI background call, or Deepcoin write was created by
+  the disabled production path;
 - existing position/order attribution remains unchanged.
 
-**Step 8: Observe one bounded window**
+**Step 8: Run bounded offline fixtures and one-shot read-only audits**
 
-Keep shadow mode through enough real contextual messages to cover at least:
+Run redacted historical fixtures and explicit one-shot read-only audits covering:
 
 - one update;
 - one cancel or exit;
@@ -1146,11 +1150,14 @@ Keep shadow mode through enough real contextual messages to cover at least:
 - one text+image message;
 - one reply message.
 
-Review mismatches and fix them through the normal local commit/push/deploy workflow.
+The audit must operate on a coherent private database snapshot and make no source DB,
+listener, instruction, notification, or exchange write. Review mismatches and fix them
+through the normal local commit/push/deploy workflow.
 
 **Step 9: Enable risk-reducing live actions for one group**
 
-Only after shadow evidence is reviewed, allow live contextual resolution for
+Only after offline and read-only evidence is reviewed, set
+`context_resolution_enabled=true` and allow live contextual resolution for
 `-1002805019371`, initially limited to:
 
 - cancel confirmed pending entries;
