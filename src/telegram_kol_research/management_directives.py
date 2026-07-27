@@ -52,7 +52,14 @@ _FULL_EXIT_TERMS = (
     "止损出局",
     "止盈出局",
 )
-_CANCEL_ENTRY_TERMS = ("策略先取消", "取消策略", "撤销入场", "取消入场")
+_CANCEL_ENTRY_TERMS = (
+    "策略先取消",
+    "取消策略",
+    "撤销入场",
+    "取消入场",
+    "取消挂单",
+    "撤销挂单",
+)
 _RISK_INCREASING_TERMS = ("加仓", "补仓", "再做一次", "重新进场", "反手")
 
 
@@ -67,6 +74,7 @@ class ManagementDirective:
     fanout_allowed: bool
     cancel_deferred_entries: bool
     reason_code: str
+    strategy_thread_id: int | None = None
 
 
 def resolve_management_directive(
@@ -89,6 +97,9 @@ def resolve_management_directive(
     symbol = _normalized_optional(lifecycle_event.get("symbol"), upper=True)
     side = _normalized_optional(lifecycle_event.get("side"), upper=False)
     stop_loss = _normalized_optional(lifecycle_event.get("stop_loss"), upper=False)
+    strategy_thread_id = _positive_int_or_none(
+        lifecycle_event.get("strategy_thread_id")
+    )
 
     if any(term in combined for term in _CANCEL_ENTRY_TERMS) or event_type == "cancel_entry":
         return ManagementDirective(
@@ -101,6 +112,7 @@ def resolve_management_directive(
             fanout_allowed=False,
             cancel_deferred_entries=True,
             reason_code="explicit_cancel_entry",
+            strategy_thread_id=strategy_thread_id,
         )
 
     risk_increasing = raw_action in {
@@ -120,6 +132,7 @@ def resolve_management_directive(
             fanout_allowed=False,
             cancel_deferred_entries=False,
             reason_code="risk_increasing_fanout_forbidden",
+            strategy_thread_id=strategy_thread_id,
         )
 
     if raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}:
@@ -134,6 +147,7 @@ def resolve_management_directive(
                 fanout_allowed=False,
                 cancel_deferred_entries=False,
                 reason_code="stop_adjustment_direction_not_verified",
+                strategy_thread_id=strategy_thread_id,
             )
         return _directive(
             "adjust_stop_loss",
@@ -141,6 +155,7 @@ def resolve_management_directive(
             side=side,
             stop_loss=stop_loss,
             reason_code="explicit_stop_adjustment_requires_position_validation",
+            strategy_thread_id=strategy_thread_id,
         )
 
     if any(term in combined for term in _TAIL_TERMS):
@@ -155,13 +170,18 @@ def resolve_management_directive(
                 or "出局" in combined
                 else "tail_retention"
             ),
+            strategy_thread_id=strategy_thread_id,
         )
 
     if event_type in {
         "exit_position", "exit_full", "full_exit", "close_position",
     } or any(term in combined for term in _FULL_EXIT_TERMS):
         return _directive(
-            "full_exit", symbol=symbol, side=side, reason_code="explicit_full_exit",
+            "full_exit",
+            symbol=symbol,
+            side=side,
+            reason_code="explicit_full_exit",
+            strategy_thread_id=strategy_thread_id,
         )
 
     has_partial = (
@@ -199,6 +219,7 @@ def resolve_management_directive(
                 if has_break_even
                 else "partial_risk_reduction"
             ),
+            strategy_thread_id=strategy_thread_id,
         )
 
     if has_break_even:
@@ -207,6 +228,7 @@ def resolve_management_directive(
             symbol=symbol,
             side=side,
             reason_code="break_even_protection",
+            strategy_thread_id=strategy_thread_id,
         )
 
     if raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"} or (
@@ -223,6 +245,7 @@ def resolve_management_directive(
                 fanout_allowed=False,
                 cancel_deferred_entries=False,
                 reason_code="stop_adjustment_direction_not_verified",
+                strategy_thread_id=strategy_thread_id,
             )
         return _directive(
             "adjust_stop_loss",
@@ -230,6 +253,7 @@ def resolve_management_directive(
             side=side,
             stop_loss=stop_loss,
             reason_code="explicit_stop_adjustment_requires_position_validation",
+            strategy_thread_id=strategy_thread_id,
         )
 
     return ManagementDirective(
@@ -242,6 +266,7 @@ def resolve_management_directive(
         fanout_allowed=False,
         cancel_deferred_entries=False,
         reason_code="no_actionable_risk_reduction",
+        strategy_thread_id=strategy_thread_id,
     )
 
 
@@ -253,6 +278,7 @@ def _directive(
     side: str | None,
     stop_loss: str | None = None,
     reason_code: str,
+    strategy_thread_id: int | None = None,
 ) -> ManagementDirective:
     return ManagementDirective(
         intent=intent,
@@ -269,7 +295,16 @@ def _directive(
             "full_exit",
         },
         reason_code=reason_code,
+        strategy_thread_id=strategy_thread_id,
     )
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized > 0 else None
 
 
 def _management_fraction(

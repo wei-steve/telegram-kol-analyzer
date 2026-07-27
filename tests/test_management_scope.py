@@ -18,6 +18,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     RawMessage,
     StrategyLifecycle,
+    StrategyThread,
 )
 
 
@@ -35,6 +36,7 @@ def _persist_live_strategy(
     binding_status: str = "active",
     attribution_status: str = "verified",
     pos_id: str,
+    strategy_thread_id: int | None = None,
 ) -> StrategyLifecycle:
     strategy_id = f"deepcoin:{chat_id}:{message_id}:{symbol}:{side}"
     binding = ExecutionBinding(
@@ -59,6 +61,7 @@ def _persist_live_strategy(
         signal_at=NOW,
         entered_at=NOW,
         execution_binding_id=binding.id,
+        strategy_thread_id=strategy_thread_id,
     )
     leg = ExecutionOrderLeg(
         execution_binding_id=binding.id,
@@ -172,6 +175,75 @@ def test_fanout_excludes_other_scope_and_unverified_binding(tmp_path) -> None:
         )
 
     assert [row.lifecycle_id for row in targets] == [included.id]
+
+
+def test_fanout_is_limited_to_resolved_strategy_thread(tmp_path) -> None:
+    session_factory = create_session_factory(tmp_path / "thread-scope.db")
+    with session_factory() as session:
+        selected_thread = StrategyThread(
+            chat_id=88,
+            root_message_id=1,
+            symbol="BTC",
+            side="long",
+        )
+        other_thread = StrategyThread(
+            chat_id=88,
+            root_message_id=3,
+            symbol="BTC",
+            side="long",
+        )
+        session.add_all([selected_thread, other_thread])
+        session.flush()
+        first = _persist_live_strategy(
+            session,
+            chat_id=88,
+            message_id=1,
+            pos_id="pos-1",
+            strategy_thread_id=selected_thread.id,
+        )
+        second = _persist_live_strategy(
+            session,
+            chat_id=88,
+            message_id=2,
+            pos_id="pos-2",
+            strategy_thread_id=selected_thread.id,
+        )
+        _persist_live_strategy(
+            session,
+            chat_id=88,
+            message_id=3,
+            pos_id="pos-other-thread",
+            strategy_thread_id=other_thread.id,
+        )
+        message = RawMessage(
+            chat_id=88,
+            message_id=4,
+            text="有入场的止盈一半带保护",
+        )
+        session.add(message)
+        session.flush()
+        directive = resolve_management_directive(
+            text=message.text or "",
+            lifecycle_event={
+                "event_type": "position_update",
+                "symbol": "BTC",
+                "side": "long",
+                "strategy_thread_id": selected_thread.id,
+            },
+        )
+
+        targets = resolve_management_scope_in_session(
+            session,
+            raw_message=message,
+            directive=directive,
+            explicit_target_lifecycle_id=None,
+            reply_target_lifecycle_id=None,
+        )
+
+    assert [target.lifecycle_id for target in targets] == [first.id, second.id]
+    assert {target.strategy_thread_id for target in targets} == {
+        selected_thread.id
+    }
 
 
 def test_explicit_target_must_match_message_scope(tmp_path) -> None:

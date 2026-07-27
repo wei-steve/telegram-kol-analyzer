@@ -170,6 +170,23 @@ def test_full_exit_and_cancel_entry_are_risk_reducing() -> None:
     assert cancel_entry.cancel_deferred_entries is True
 
 
+def test_cancel_pending_orders_wording_is_a_cancel_entry_directive() -> None:
+    directive = resolve_management_directive(
+        text="已经有入场的继续拿着，取消挂单",
+        lifecycle_event={
+            "event_type": "position_update",
+            "symbol": "BTC",
+            "side": "long",
+            "strategy_thread_id": 42,
+        },
+    )
+
+    assert directive.intent == "cancel_entry"
+    assert directive.cancel_deferred_entries is True
+    assert directive.fanout_allowed is False
+    assert directive.strategy_thread_id == 42
+
+
 def test_commentary_and_optional_new_short_do_not_become_actions() -> None:
     directive = resolve_management_directive(
         text="激进的可以在6.5万附近做空，个人会再观察",

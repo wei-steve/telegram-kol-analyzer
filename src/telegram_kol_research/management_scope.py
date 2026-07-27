@@ -28,6 +28,7 @@ class ManagementScopeTarget:
     symbol: str
     side: str
     scope_source: str
+    strategy_thread_id: int | None
 
 
 def resolve_management_scope_in_session(
@@ -94,6 +95,7 @@ def resolve_management_scope_in_session(
                         if reply_target_lifecycle_id is not None
                         else "explicit_unverified"
                     ),
+                    strategy_thread_id=lifecycle.strategy_thread_id,
                 ),
             )
         return (target,)
@@ -112,6 +114,12 @@ def resolve_management_scope_in_session(
         .order_by(StrategyLifecycle.id.asc())
         .all()
     )
+    if directive.strategy_thread_id is not None:
+        lifecycles = [
+            lifecycle
+            for lifecycle in lifecycles
+            if lifecycle.strategy_thread_id == directive.strategy_thread_id
+        ]
     lifecycles = [
         lifecycle
         for lifecycle in lifecycles
@@ -196,6 +204,11 @@ def _require_source_identity(
     ):
         raise ManagementScopeError("target_source_identity_mismatch")
     if (
+        directive.strategy_thread_id is not None
+        and lifecycle.strategy_thread_id != directive.strategy_thread_id
+    ):
+        raise ManagementScopeError("target_strategy_thread_mismatch")
+    if (
         directive.side is not None
         and directive.side != str(lifecycle.side or "").lower()
     ):
@@ -254,4 +267,5 @@ def _verified_live_target(
         symbol=str(lifecycle.symbol).upper(),
         side=str(lifecycle.side).lower(),
         scope_source=scope_source,
+        strategy_thread_id=lifecycle.strategy_thread_id,
     )
