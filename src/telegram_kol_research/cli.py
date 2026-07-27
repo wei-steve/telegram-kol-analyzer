@@ -149,6 +149,10 @@ from telegram_kol_research.telegram_live_listener import (
 )
 from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidates
 from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.tpsl_ownership_audit import (
+    build_tpsl_ownership_audit,
+    load_readonly_protection_ledger,
+)
 from telegram_kol_research.web_app import create_web_app
 
 app = typer.Typer(help="Telegram KOL win-rate research CLI.")
@@ -3131,6 +3135,59 @@ def media_cleanup(
     typer.echo(f"Deleted files: {result.deleted_files}")
     typer.echo(f"Cleared local paths: {result.cleared_local_paths}")
     typer.echo(f"Freed bytes: {result.freed_bytes}")
+
+
+@app.command("audit-tpsl-ownership")
+def audit_tpsl_ownership(
+    database_path: Path = typer.Option(
+        Path("data/research.db"),
+        "--database-path",
+        help="Existing production database opened read-only.",
+    ),
+    output_json: bool = typer.Option(
+        False,
+        "--output-json",
+        help="Emit the stable machine-readable report.",
+    ),
+) -> None:
+    """Read live Deepcoin TPSL ownership coverage without exchange writes."""
+
+    try:
+        ledger_rows = load_readonly_protection_ledger(database_path)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(
+            "database path must name an existing file; no file was created"
+        ) from exc
+    client = build_deepcoin_client_from_env()
+    positions = [
+        row for row in client.list_positions()
+        if isinstance(row, dict)
+    ]
+    pending_orders: list[dict[str, Any]] = []
+    instrument_ids = sorted(
+        {
+            str(row.get("instId") or row.get("InstrumentID") or "").upper()
+            for row in positions
+            if str(row.get("instId") or row.get("InstrumentID") or "").strip()
+        }
+    )
+    for instrument_id in instrument_ids:
+        pending_orders.extend(
+            row
+            for row in client.list_trigger_orders_pending(inst_id=instrument_id)
+            if isinstance(row, dict)
+        )
+    report = build_tpsl_ownership_audit(
+        positions=positions,
+        pending_orders=pending_orders,
+        ledger_rows=ledger_rows,
+    )
+    payload = report.as_dict()
+    if output_json:
+        typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    for key, value in payload.items():
+        typer.echo(f"{key}: {json.dumps(value, ensure_ascii=False, sort_keys=True)}")
 
 
 @app.command("media-dedupe")

@@ -49,6 +49,7 @@ def test_cli_help_renders():
     assert "audit-management-batches" in result.stdout
     assert "archive-unbound-holdings" in result.stdout
     assert "monitor-production-safety" in result.stdout
+    assert "audit-tpsl-ownership" in result.stdout
 
 
 def test_repair_position_management_apply_requires_exact_action_and_fingerprint(

@@ -968,3 +968,26 @@ backfill workers. If the source message changes during inference, the batch
 returns `message_input_changed` and deliberately saves no stale evidence.
 Operator output contains stable error codes only; inspect protected service
 logs for details.
+
+## 15. Audit account-wide TPSL ownership
+
+Keep automatic trading frozen. This server-only command reads current
+positions and pending TPSL rows from Deepcoin and opens the local database in
+SQLite read-only mode:
+
+```bash
+cd /opt/telegram-kol-analyzer
+.venv/bin/telegram-kol-research audit-tpsl-ownership \
+  --database-path data/research.db \
+  --output-json
+```
+
+Review `live_position_count`, `pending_tpsl_count`,
+`owned_pending_count`, `unowned_pending_order_ids`, `conflicts`, and
+`stale_ledger_order_ids`. Every pending TPSL must be classified exactly once
+as owned, unowned, or conflicting. Price, size, direction, and creation time
+do not establish ownership.
+
+`exchange_write_count` must be `0`. Any nonzero value invalidates the audit
+and requires immediate investigation. This command never submits, adjusts, or
+cancels an order and never creates or updates the database.
