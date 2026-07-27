@@ -485,7 +485,7 @@ def run_mimo_evidence_backfill(
 
     return EvidenceBackfillResult(
         mode="apply" if apply else "dry_run",
-        considered=len(plan.items),
+        considered=plan.scanned,
         planned=len(process_items),
         succeeded=succeeded,
         failed=failed,

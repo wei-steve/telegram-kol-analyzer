@@ -296,6 +296,7 @@ def test_dry_run_never_calls_mimo_or_writes_evidence(tmp_path):
 
     assert result.mode == "dry_run"
     assert result.planned == 1
+    assert result.considered == 1
     assert result.succeeded == 0
     assert load_current_message_evidence(session_factory, raw_message_id) is None
 
@@ -333,6 +334,46 @@ def test_apply_rechecks_evidence_claim_before_calling_mimo(tmp_path):
 
     assert result.succeeded == 0
     assert result.failed == 0
+    assert result.skipped_completed == 1
+
+
+def test_result_considered_includes_scanned_skips(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    base = datetime(2026, 7, 20, 8, 0, tzinfo=UTC)
+    completed = _add_message(
+        session_factory,
+        message_id=19,
+        posted_at=base,
+    )
+    _add_message(
+        session_factory,
+        message_id=20,
+        posted_at=base + timedelta(minutes=1),
+    )
+    _save_evidence(
+        session_factory,
+        completed,
+        _fingerprint(session_factory, completed, tmp_path),
+    )
+    plan = plan_mimo_evidence_backfill(
+        session_factory,
+        chat_ids=[-1001],
+        media_root=tmp_path,
+        limit=1,
+    )
+
+    result = run_mimo_evidence_backfill(
+        session_factory,
+        plan=plan,
+        ai_recognition_config=None,
+        media_root=tmp_path,
+        apply=False,
+        delay_seconds=0,
+    )
+
+    assert plan.scanned == 2
+    assert result.considered == 2
+    assert result.planned == 1
     assert result.skipped_completed == 1
 
 
