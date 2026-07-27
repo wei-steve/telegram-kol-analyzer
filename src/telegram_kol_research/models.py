@@ -66,6 +66,181 @@ class MediaAsset(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class MessageEvidenceVersion(Base):
+    __tablename__ = "message_evidence_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_message_id",
+            "input_fingerprint",
+            name="uq_message_evidence_input_fingerprint",
+        ),
+        UniqueConstraint(
+            "raw_message_id",
+            "version",
+            name="uq_message_evidence_message_version",
+        ),
+        Index(
+            "ix_message_evidence_current",
+            "raw_message_id",
+            "superseded_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(80), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_versions_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
+    extraction_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    text_evidence_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
+    image_evidence_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
+    normalized_evidence_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
+    superseded_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
+class StrategyThread(Base):
+    __tablename__ = "strategy_threads"
+    __table_args__ = (
+        UniqueConstraint(
+            "chat_id",
+            "root_message_id",
+            name="uq_strategy_threads_chat_root_message",
+        ),
+        Index(
+            "ix_strategy_threads_source_state",
+            "chat_id",
+            "symbol",
+            "side",
+            "status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    root_message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="active", index=True
+    )
+    current_lifecycle_id: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
+class StrategyMessageLink(Base):
+    __tablename__ = "strategy_message_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "strategy_thread_id",
+            "raw_message_id",
+            "relation_kind",
+            name="uq_strategy_message_links_thread_message_relation",
+        ),
+        Index(
+            "ix_strategy_message_links_message_status",
+            "raw_message_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_thread_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_threads.id"), nullable=False, index=True
+    )
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    message_evidence_version_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("message_evidence_versions.id"), nullable=True, index=True
+    )
+    relation_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    resolver: Mapped[str] = mapped_column(String(64), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    evidence_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    decision_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="active"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
+class ContextResolutionAttempt(Base):
+    __tablename__ = "context_resolution_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_message_id",
+            "context_fingerprint",
+            name="uq_context_resolution_message_fingerprint",
+        ),
+        Index(
+            "ix_context_resolution_status_next",
+            "status",
+            "next_attempt_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    message_evidence_version_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("message_evidence_versions.id"), nullable=True, index=True
+    )
+    context_fingerprint: Mapped[str] = mapped_column(String(80), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_versions_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
+    request_summary_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
+    decision_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    error_class: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    reanalysis_triggers_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
 class SignalCandidate(Base):
     __tablename__ = "signal_candidates"
 
@@ -1435,6 +1610,9 @@ class StrategyLifecycle(Base):
     exit_price_actual: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     # Associations
+    strategy_thread_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("strategy_threads.id"), nullable=True, index=True
+    )
     execution_binding_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("execution_bindings.id"), nullable=True, index=True
     )
