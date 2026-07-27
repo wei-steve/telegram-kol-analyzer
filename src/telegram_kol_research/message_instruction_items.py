@@ -22,7 +22,9 @@ from telegram_kol_research.models import (
 )
 
 
-MANAGEMENT_EVENT_TYPES = frozenset({"close_signal", "position_update"})
+MANAGEMENT_EVENT_TYPES = frozenset(
+    {"close_signal", "position_update", "strategy_revision"}
+)
 FINISH_STATUSES = frozenset({"submitted", "succeeded", "failed", "unknown"})
 ERROR_STATUSES = frozenset({"failed", "unknown"})
 SUMMARY_NOTIFICATION_LEASE = timedelta(minutes=5)

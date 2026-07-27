@@ -228,7 +228,15 @@ def test_revision_is_resolved_before_instruction_projection(tmp_path, monkeypatc
     assert assessment.context_resolution.decision == "revise_thread"
     assert result.status == "非策略"
     with session_factory() as session:
-        assert session.query(MessageInstructionItem).count() == 0
+        item = session.query(MessageInstructionItem).one()
+        candidate = session.get(SignalCandidate, item.signal_candidate_id)
+        assert item.instruction_kind == "management"
+        assert candidate.event_type == "strategy_revision"
+        assert candidate.target_lifecycle_id == lifecycle_id
+        assert candidate.management_action == "replace_entry"
+        assert candidate.entry_text == "65100-65400"
+        assert candidate.stop_loss_text == "64500"
+        assert candidate.take_profit_text == "66000"
         link = (
             session.query(StrategyMessageLink)
             .filter(StrategyMessageLink.raw_message_id == current_id)

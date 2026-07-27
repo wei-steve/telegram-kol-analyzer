@@ -132,6 +132,7 @@ def auto_process_message_trade_signal(
     deepcoin_client: DeepcoinTradingClientProtocol,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     processed_at: datetime | None = None,
+    revision_replacement_writer: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute projected items, or use the legacy single-candidate path."""
 
@@ -146,6 +147,7 @@ def auto_process_message_trade_signal(
             deepcoin_client=deepcoin_client,
             contract_spec_provider=contract_spec_provider,
             processed_at=processed_at,
+            revision_replacement_writer=revision_replacement_writer,
         )
     return _auto_process_single_message_trade_signal(
         session_factory,
@@ -154,6 +156,7 @@ def auto_process_message_trade_signal(
         deepcoin_client=deepcoin_client,
         contract_spec_provider=contract_spec_provider,
         processed_at=processed_at,
+        revision_replacement_writer=revision_replacement_writer,
     )
 
 
@@ -165,6 +168,7 @@ def execute_message_instruction_items(
     deepcoin_client: DeepcoinTradingClientProtocol | None,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     processed_at: datetime | None = None,
+    revision_replacement_writer: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Claim and execute each durable instruction independently in sequence."""
 
@@ -187,6 +191,7 @@ def execute_message_instruction_items(
                 processed_at=now,
                 instruction_kind=item.instruction_kind,
                 candidate_id=item.signal_candidate_id,
+                revision_replacement_writer=revision_replacement_writer,
             )
         except DeepcoinRequestOutcomeUnknown as exc:
             finish_status = "unknown"
@@ -264,6 +269,7 @@ def _auto_process_single_message_trade_signal(
     processed_at: datetime | None = None,
     instruction_kind: str | None = None,
     candidate_id: int | None = None,
+    revision_replacement_writer: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute exactly one selected candidate through the existing venue path."""
 
@@ -335,6 +341,7 @@ def _auto_process_single_message_trade_signal(
             contract_spec_provider=contract_spec_provider,
             settings=settings,
             processed_at=now,
+            revision_replacement_writer=revision_replacement_writer,
         )
     if instruction_kind == "management":
         return {"status": "blocked", "reason": "management_candidate_unavailable"}
@@ -696,6 +703,7 @@ def _auto_process_management_signal(
     contract_spec_provider: DeepcoinContractSpecProvider | None,
     settings,
     processed_at: datetime,
+    revision_replacement_writer: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     raw_message, candidate, source, has_media = loaded
     if candidate.id != candidate_id:
@@ -719,6 +727,32 @@ def _auto_process_management_signal(
         return {"status": "skipped", "reason": "confidence_below_minimum"}
     if has_media and not settings.allow_vision_auto_trade:
         return {"status": "skipped", "reason": "vision_auto_trade_disabled"}
+    if candidate.event_type == "strategy_revision":
+        with session_factory() as session:
+            lifecycle = session.get(
+                StrategyLifecycle,
+                int(candidate.target_lifecycle_id or 0),
+            )
+            strategy_thread_id = (
+                int(lifecycle.strategy_thread_id)
+                if lifecycle is not None
+                and lifecycle.strategy_thread_id is not None
+                else None
+            )
+        return execute_strategy_revision(
+            session_factory,
+            raw_message_id=raw_message.id,
+            strategy_thread_id=strategy_thread_id,
+            replacement={
+                "entry": candidate.entry_text,
+                "stop_loss": candidate.stop_loss_text,
+                "take_profit": candidate.take_profit_text,
+                "leverage": candidate.leverage_text,
+            },
+            deepcoin_client=deepcoin_client,
+            replacement_writer=revision_replacement_writer,
+            processed_at=processed_at,
+        )
 
     result = plan_strategy_management_batch(
         session_factory,
@@ -926,7 +960,11 @@ def _load_best_management_candidate(
             .join(SignalCandidate, SignalCandidate.raw_message_id == RawMessage.id)
             .outerjoin(Source, SignalCandidate.source_id == Source.id)
             .filter(RawMessage.id == raw_message_id)
-            .filter(SignalCandidate.event_type.in_(["close_signal", "position_update"]))
+            .filter(
+                SignalCandidate.event_type.in_(
+                    ["close_signal", "position_update", "strategy_revision"]
+                )
+            )
         )
         if candidate_id is not None:
             query = query.filter(SignalCandidate.id == int(candidate_id))

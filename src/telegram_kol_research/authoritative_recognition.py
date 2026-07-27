@@ -24,11 +24,16 @@ from telegram_kol_research.message_recognition import (
     MessageRecognitionResult,
     apply_authoritative_mimo_payload,
 )
+from telegram_kol_research.message_instruction_items import (
+    create_message_instruction_items_in_session,
+)
 from telegram_kol_research.message_evidence import persist_mimo_message_evidence
 from telegram_kol_research.models import (
     MessageInstructionItem,
     RawMessage,
+    SignalCandidate,
     StrategyLifecycle,
+    StrategyThread,
 )
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
@@ -287,7 +292,9 @@ def _resolved_mimo_result(
     candidates: Sequence[StrategyThreadCandidate],
 ) -> MimoAuthoritativeResult:
     payload = dict(mimo.payload)
-    payload["_context_resolution"] = decision.to_dict()
+    original_strategy = mimo.payload.get("strategy")
+    context_payload = decision.to_dict()
+    payload["_context_resolution"] = context_payload
     if decision.decision == "new_thread":
         return replace(mimo, payload=payload)
     if decision.confidence < 0.7 or decision.decision in {"hold", "unresolved"}:
@@ -310,6 +317,9 @@ def _resolved_mimo_result(
     if len(lifecycle_ids) != len(decision.target_thread_ids):
         raise ContextResolutionError("resolved thread has no current lifecycle")
     if decision.decision == "revise_thread":
+        context_payload["replacement_strategy"] = dict(
+            original_strategy if isinstance(original_strategy, dict) else {}
+        )
         payload.update(
             recognition_result="非策略",
             reason=decision.reason or "strategy revision requires revision planner",
@@ -514,7 +524,80 @@ def apply_authoritative_assessment(
             session_factory,
             raw_message_id=assessment.raw_message_id,
         )
+    elif (
+        assessment.context_resolution is not None
+        and assessment.context_resolution.decision == "revise_thread"
+        and assessment.context_resolution.confidence >= 0.7
+    ):
+        _project_context_revision_instruction(
+            session_factory,
+            assessment=assessment,
+        )
     return result
+
+
+def _project_context_revision_instruction(
+    session_factory: sessionmaker,
+    *,
+    assessment: AuthoritativeAssessment,
+) -> None:
+    decision = assessment.context_resolution
+    if decision is None or len(decision.target_thread_ids) != 1:
+        return
+    context_payload = assessment.mimo.payload.get("_context_resolution")
+    context_payload = context_payload if isinstance(context_payload, dict) else {}
+    replacement = context_payload.get("replacement_strategy")
+    replacement = replacement if isinstance(replacement, dict) else {}
+    with session_factory() as session:
+        thread = session.get(StrategyThread, int(decision.target_thread_ids[0]))
+        if thread is None or thread.current_lifecycle_id is None:
+            return
+        lifecycle = session.get(
+            StrategyLifecycle,
+            int(thread.current_lifecycle_id),
+        )
+        if lifecycle is None:
+            return
+        candidate = (
+            session.query(SignalCandidate)
+            .filter(
+                SignalCandidate.raw_message_id == assessment.raw_message_id,
+                SignalCandidate.event_type == "strategy_revision",
+                SignalCandidate.target_lifecycle_id == lifecycle.id,
+                SignalCandidate.parse_source == "mimo_authoritative",
+            )
+            .one_or_none()
+        )
+        if candidate is None:
+            candidate = SignalCandidate(
+                raw_message_id=assessment.raw_message_id,
+                event_type="strategy_revision",
+                target_lifecycle_id=lifecycle.id,
+                parse_source="mimo_authoritative",
+            )
+            session.add(candidate)
+        candidate.symbol = lifecycle.symbol
+        candidate.side = lifecycle.side
+        candidate.management_action = "replace_entry"
+        candidate.entry_text = _string_or_none(replacement.get("entry"))
+        candidate.stop_loss_text = _string_or_none(replacement.get("stop_loss"))
+        candidate.take_profit_text = _string_or_none(replacement.get("take_profit"))
+        candidate.leverage_text = _string_or_none(replacement.get("leverage"))
+        candidate.confidence = float(decision.confidence)
+        candidate.recognition_generation = assessment.authoritative_generation
+        session.flush()
+        create_message_instruction_items_in_session(
+            session,
+            raw_message_id=assessment.raw_message_id,
+            candidate_ids={int(candidate.id)},
+        )
+        session.commit()
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
 
 
 def _ensure_entry_strategy_thread(
