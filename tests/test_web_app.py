@@ -38,6 +38,7 @@ from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import MessageEvidenceVersion
 from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import PositionBackupStopOrder
+from telegram_kol_research.models import PositionTakeProfitOrder
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TradeSignal
@@ -1692,6 +1693,77 @@ def test_execution_dashboard_does_not_use_ledger_for_closed_entry_leg(tmp_path):
     assert response.status_code == 200
     assert "止损: 67200" not in response.text
     assert "无止损" in response.text
+
+
+def test_execution_dashboard_does_not_use_take_profit_business_table_as_owner(tmp_path):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return [{
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-business-only",
+                "posSide": "long",
+                "pos": "3",
+                "avgPx": "64000",
+            }]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [{
+                "ordId": "tp-business-only",
+                "triggerOrderType": "TPSL",
+                "instId": inst_id,
+                "posSide": "long",
+                "sz": "3",
+                "tpTriggerPrice": "67000",
+            }]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+    with app.state.session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="long",
+            status="active",
+            pos_id="pos-business-only",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            pos_id="pos-business-only",
+            venue="deepcoin",
+            attribution_status="verified",
+            attribution_evidence_json=json.dumps({"policy_version": 2}),
+            status="active",
+        )
+        session.add(leg)
+        session.flush()
+        session.add(
+            PositionTakeProfitOrder(
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-business-only",
+                order_id="tp-business-only",
+                trigger_price="67000",
+                size_text="3",
+                status="active",
+            )
+        )
+        session.commit()
+
+    response = TestClient(app).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "未归属交易所保护单" in response.text
+    assert "止盈止损(0)" in response.text
 
 
 def test_execution_dashboard_renders_ambiguous_stop_truthfully(tmp_path):

@@ -67,7 +67,6 @@ from telegram_kol_research.models import (
     MessageEvidenceVersion,
     PositionBackupStopOrder,
     PositionProtectionLedger,
-    PositionTakeProfitOrder,
     RecognitionDecision,
     StrategyManagementBatch,
     StrategyManagementLeg,
@@ -118,6 +117,9 @@ from telegram_kol_research.position_attribution import PositionAttributionError
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
 from telegram_kol_research.position_attribution import require_manual_position_attribution_allowed
 from telegram_kol_research.protection_attribution import match_position_protection
+from telegram_kol_research.protection_ledger import (
+    build_account_protection_ownership,
+)
 from telegram_kol_research.protection_snapshot import build_position_protection_audit
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import list_recovery_decisions
@@ -917,8 +919,6 @@ def _load_deepcoin_live_position_rows(
                 else []
             )
         }
-        exact_order_position_ids: dict[str, str] = {}
-        conflicting_order_ids: set[str] = set()
         verified_live_leg_ids: set[int] = set()
         for leg in legs:
             binding = bindings_by_id.get(int(leg.execution_binding_id))
@@ -932,8 +932,8 @@ def _load_deepcoin_live_position_rows(
                 and has_authoritative_persisted_position(leg, session=session)
             ):
                 verified_live_leg_ids.add(int(leg.id))
-        if verified_live_leg_ids:
-            for ledger_row in (
+        ledger_rows = (
+            (
                 session.query(PositionProtectionLedger)
                 .filter(PositionProtectionLedger.venue == "deepcoin")
                 .filter(
@@ -943,54 +943,24 @@ def _load_deepcoin_live_position_rows(
                 )
                 .filter(PositionProtectionLedger.status == "verified")
                 .all()
-            ):
-                order_id = str(ledger_row.order_id or "").strip()
-                pos_id = str(ledger_row.pos_id or "").strip()
-                leg = legs_by_pos_id.get(pos_id)
-                if (
-                    order_id
-                    and pos_id in active_pos_ids
-                    and leg is not None
-                    and int(leg.id) == int(ledger_row.execution_order_leg_id)
-                ):
-                    _register_exact_order_position_id(
-                        exact_order_position_ids,
-                        conflicting_order_ids,
-                        order_id,
-                        pos_id,
-                    )
-        if verified_live_leg_ids:
-            for take_profit_order in (
-                session.query(PositionTakeProfitOrder)
-                .filter(PositionTakeProfitOrder.venue == "deepcoin")
-                .filter(
-                    PositionTakeProfitOrder.execution_order_leg_id.in_(
-                        verified_live_leg_ids
-                    )
-                )
-                .filter(PositionTakeProfitOrder.status == "active")
-                .all()
-            ):
-                order_id = str(take_profit_order.order_id or "").strip()
-                pos_id = str(take_profit_order.pos_id or "").strip()
-                leg = legs_by_pos_id.get(pos_id)
-                if (
-                    order_id
-                    and pos_id in active_pos_ids
-                    and leg is not None
-                    and int(leg.id) == int(take_profit_order.execution_order_leg_id)
-                ):
-                    _register_exact_order_position_id(
-                        exact_order_position_ids,
-                        conflicting_order_ids,
-                        order_id,
-                        pos_id,
-                    )
+            )
+            if verified_live_leg_ids
+            else []
+        )
+        account_ownership = build_account_protection_ownership(
+            ledger_rows,
+            venue="deepcoin",
+            live_pos_ids=active_pos_ids,
+        )
+        exact_order_position_ids = {
+            order_id: owner.pos_id
+            for order_id, owner in account_ownership.by_order_id.items()
+        }
         direct_protection_rows, pending_unattributed_rows = (
             _split_exchange_protection_display_rows(
                 positions=active_positions,
                 pending_orders=tpsl_orders,
-                exact_order_position_ids=exact_order_position_ids,
+                account_ownership=account_ownership,
                 contract_spec_provider=contract_spec_provider,
             )
         )
@@ -2354,6 +2324,7 @@ def _split_exchange_protection_display_rows(
     positions: list[dict[str, Any]],
     pending_orders: list[dict[str, Any]],
     exact_order_position_ids: dict[str, str] | None = None,
+    account_ownership=None,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
 ) -> tuple[dict[str, list[dict[str, str]]], list[dict[str, str]]]:
     """Separate exact position TPSL rows from exchange rows without an owner."""
@@ -2363,6 +2334,7 @@ def _split_exchange_protection_display_rows(
         positions=positions,
         pending_orders=pending_orders,
         exact_order_position_ids=exact_order_position_ids or {},
+        account_ownership=account_ownership,
         contract_spec_provider=contract_spec_provider,
     )
     return (
