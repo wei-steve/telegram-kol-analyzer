@@ -17,6 +17,7 @@ from telegram_kol_research.models import (
     ExecutionEvent,
     ExecutionOrderLeg,
     PositionBackupStopOrder,
+    PositionProtectionLedger,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 
@@ -167,6 +168,14 @@ def test_migration_cancels_owned_legacy_generic_only_after_native_readback(tmp_p
             ("legacy-backup-1", "migrated"),
             ("native-backup-1", "active"),
         ]
+        ledger = session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id == "native-backup-1"
+        ).one()
+        assert (ledger.pos_id, ledger.purpose, ledger.status) == (
+            "pos-1",
+            "stop_loss",
+            "verified",
+        )
         assert session.query(ExecutionEvent).order_by(ExecutionEvent.id.desc()).first().reason == "legacy_generic_cancelled"
 
 

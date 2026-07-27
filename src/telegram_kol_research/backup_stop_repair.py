@@ -22,6 +22,7 @@ from telegram_kol_research.position_attribution import has_authoritative_persist
 from telegram_kol_research.position_mutation_gateway import (
     submit_exact_position_sltp,
 )
+from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.repair_confirmation import (
     consume_repair_confirmation_token,
     require_repair_confirmation_token_unused,
@@ -396,6 +397,32 @@ def apply_backup_stop_repair_plan(
         row.response_json = json.dumps(response, ensure_ascii=False, sort_keys=True)
         row.submitted_at = observed_at
         row.updated_at = observed_at
+        leg = session.get(ExecutionOrderLeg, int(row.execution_order_leg_id))
+        upsert_protection_ledger_row(
+            session,
+            venue=row.venue,
+            execution_binding_id=int(row.execution_binding_id),
+            execution_order_leg_id=int(row.execution_order_leg_id),
+            strategy_instance_id=(
+                str(leg.strategy_instance_id)
+                if leg is not None and leg.strategy_instance_id
+                else None
+            ),
+            pos_id=row.pos_id,
+            instrument_id=row.instrument_id,
+            side=row.side,
+            order_id=verified_order_id,
+            purpose="stop_loss",
+            trigger_price=row.trigger_price,
+            size_text="0",
+            status="verified",
+            evidence_source="backup_stop_repair_pending_readback",
+            evidence={
+                "backup_stop_row_id": int(row.id),
+                "action_id": action.action_id,
+            },
+            seen_at=observed_at,
+        )
         session.commit()
     return BackupStopRepairResult("active", action.pos_id, order_id=verified_order_id)
 

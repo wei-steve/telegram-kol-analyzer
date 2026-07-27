@@ -11,7 +11,11 @@ from telegram_kol_research.execution_bindings import (
     upsert_execution_binding,
     upsert_execution_order_leg,
 )
-from telegram_kol_research.models import ExecutionOrderLeg, PositionBackupStopOrder
+from telegram_kol_research.models import (
+    ExecutionOrderLeg,
+    PositionBackupStopOrder,
+    PositionProtectionLedger,
+)
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 
@@ -261,6 +265,14 @@ def test_repair_apply_activates_only_after_native_tpsl_readback_matches(tmp_path
     assert result.order_id == "backup-1"
     with session_factory() as session:
         assert session.query(PositionBackupStopOrder).one().status == "active"
+        ledger = session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id == "backup-1"
+        ).one()
+        assert (ledger.pos_id, ledger.purpose, ledger.status) == (
+            "pos-1",
+            "stop_loss",
+            "verified",
+        )
 
 
 def test_pending_native_readback_freezes_future_backup_repair_without_rebuild(tmp_path):

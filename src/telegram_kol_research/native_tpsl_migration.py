@@ -31,6 +31,7 @@ from telegram_kol_research.position_mutation_gateway import (
     exact_position_write_gate,
     submit_exact_position_sltp,
 )
+from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.repair_confirmation import (
     consume_repair_confirmation_token,
     require_repair_confirmation_token_unused,
@@ -338,6 +339,33 @@ def apply_native_tpsl_migration_plan(
             response_json=json.dumps(response, ensure_ascii=False, sort_keys=True),
             submitted_at=observed_at, created_at=observed_at, updated_at=observed_at,
         ))
+        leg = session.get(ExecutionOrderLeg, action.leg_id)
+        upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=action.binding_id,
+            execution_order_leg_id=action.leg_id,
+            strategy_instance_id=(
+                str(leg.strategy_instance_id)
+                if leg is not None and leg.strategy_instance_id
+                else None
+            ),
+            pos_id=action.pos_id,
+            instrument_id=action.instrument_id,
+            side=action.side,
+            order_id=native_order_id,
+            purpose="stop_loss",
+            trigger_price=action.native_stop,
+            size_text="0",
+            status="verified",
+            evidence_source="native_tpsl_migration_pending_readback",
+            evidence={
+                "legacy_backup_row_id": action.legacy_backup_row_id,
+                "legacy_order_id": action.legacy_order_id,
+                "action_id": action.action_id,
+            },
+            seen_at=observed_at,
+        )
         _record_event(
             session_factory, action, status="verified", reason="native_tpsl_verified",
             response={"response": response, "native_order_id": native_order_id}, now=observed_at,
