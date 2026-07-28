@@ -1,0 +1,584 @@
+"""Deterministic, bounded helpers for the durable runtime-incident ledger."""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Sequence
+from datetime import datetime
+
+from sqlalchemy import and_, case, or_, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import sessionmaker
+
+from telegram_kol_research.models import RuntimeIncident
+
+
+MAX_REDACTED_SUMMARY_LENGTH = 2048
+MAX_DIAGNOSIS_JSON_LENGTH = 8192
+MAX_EVIDENCE_REFS_JSON_LENGTH = 4096
+MAX_CLAIMABLE_LIMIT = 100
+
+_SENSITIVE_KEY_MARKERS = (
+    "secret",
+    "token",
+    "credential",
+    "cookie",
+    "sessionid",
+    "apikey",
+    "apisecret",
+    "accesstoken",
+    "refreshtoken",
+    "password",
+    "passphrase",
+    "authorization",
+    "bearer",
+    "privatekey",
+    "dcaccesskey",
+    "dcaccesssign",
+    "dcaccesspassphrase",
+)
+_CREDENTIAL_PATTERNS = (
+    re.compile(r"\bsk-[a-z0-9_-]{12,}", re.IGNORECASE),
+    re.compile(r"\beyj[a-z0-9_-]{12,}\.[a-z0-9_-]{6,}\.", re.IGNORECASE),
+    re.compile(r"\b\d{6,12}:[a-z0-9_-]{20,}\b", re.IGNORECASE),
+    re.compile(r"\b(?:akia|asia)[a-z0-9]{16}\b", re.IGNORECASE),
+    re.compile(r"\bapi[_-]?key\s*[:=]\s*\S+", re.IGNORECASE),
+    re.compile(r"\bauthorization\s*:\s*bearer\s+\S+", re.IGNORECASE),
+    re.compile(
+        r"\bdc-access-(?:key|sign|passphrase)\s*[:=]\s*\S+",
+        re.IGNORECASE,
+    ),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+)
+_OPAQUE_VALUE_PATTERN = re.compile(r"[A-Za-z0-9_+/=-]{32,}")
+_SUMMARY_FIELDS = frozenset(
+    {
+        "component",
+        "containment",
+        "error_code",
+        "error_type",
+        "impact",
+        "incident_state",
+        "notification_status",
+        "operation",
+        "provider_status",
+        "reason_code",
+        "retry_count",
+        "source_status",
+        "worker_kind",
+    }
+)
+_DIAGNOSIS_FIELDS = frozenset(
+    {
+        "attempted_queries",
+        "auto_handle_eligible",
+        "codex_handoff_required",
+        "confidence",
+        "hypothesis",
+        "missing_evidence",
+        "recommended_playbook",
+        "remaining_risk",
+    }
+)
+_EVIDENCE_REFERENCE_PATTERN = re.compile(
+    r"[a-z][a-z0-9_-]{1,31}:[A-Za-z0-9._-]{1,128}"
+)
+_CLAIMABLE_STATUS = "pending"
+_CLAIMED_STATUS = "claimed"
+_SEVERITY_RANKS = {
+    "info": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
+_ALLOWED_TRANSITIONS = {
+    "pending": frozenset({"claimed", "closed"}),
+    "claimed": frozenset({"diagnosed", "retry_pending", "escalated", "resolved"}),
+    "diagnosed": frozenset({"escalated", "resolved", "closed"}),
+    "retry_pending": frozenset({"claimed", "escalated", "closed"}),
+    "escalated": frozenset({"resolved", "closed"}),
+    "resolved": frozenset({"closed"}),
+    "closed": frozenset(),
+}
+
+
+class RuntimeIncidentBoundsError(ValueError):
+    """Raised before an unbounded or apparently sensitive value reaches storage."""
+
+
+def _sensitive_key(key: str) -> bool:
+    compact = re.sub(r"[^a-z0-9]+", "", key.lower())
+    return any(marker in compact for marker in _SENSITIVE_KEY_MARKERS)
+
+
+def _looks_like_opaque_secret(value: str) -> bool:
+    for candidate in _OPAQUE_VALUE_PATTERN.findall(value):
+        classes = sum(
+            (
+                any(character.islower() for character in candidate),
+                any(character.isupper() for character in candidate),
+                any(character.isdigit() for character in candidate),
+                any(character in "_+/=-" for character in candidate),
+            )
+        )
+        if classes >= 3 and len(set(candidate)) >= 12:
+            return True
+    return False
+
+
+def _contains_sensitive_material(
+    value: str,
+    *,
+    detect_opaque: bool = False,
+) -> bool:
+    return any(pattern.search(value) for pattern in _CREDENTIAL_PATTERNS) or (
+        detect_opaque and _looks_like_opaque_secret(value)
+    )
+
+
+def _walk_json_values(value):
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            yield str(key), nested
+            yield from _walk_json_values(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _walk_json_values(nested)
+    else:
+        yield None, value
+
+
+def _validate_redacted_json_contract(name: str, normalized: str) -> None:
+    try:
+        parsed = json.loads(normalized)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeIncidentBoundsError(
+            f"{name} must be bounded JSON"
+        ) from exc
+
+    if name == "redacted_summary":
+        if not isinstance(parsed, dict) or not parsed:
+            raise RuntimeIncidentBoundsError(
+                "redacted_summary must be a non-empty structured object"
+            )
+        unknown_fields = set(parsed) - _SUMMARY_FIELDS
+        if unknown_fields:
+            if any(_sensitive_key(str(key)) for key in unknown_fields):
+                raise RuntimeIncidentBoundsError(
+                    "redacted_summary contains sensitive material"
+                )
+            raise RuntimeIncidentBoundsError(
+                f"redacted_summary contains unsupported fields: "
+                f"{sorted(unknown_fields)!r}"
+            )
+        if any(isinstance(value, (dict, list)) for value in parsed.values()):
+            raise RuntimeIncidentBoundsError(
+                "redacted_summary fields must be scalar"
+            )
+    elif name == "evidence_refs_json" and not isinstance(parsed, list):
+        raise RuntimeIncidentBoundsError(
+            "evidence_refs_json must be a list of stable references"
+        )
+    elif name == "evidence_refs_json":
+        if not all(
+            isinstance(reference, str)
+            and _EVIDENCE_REFERENCE_PATTERN.fullmatch(reference)
+            for reference in parsed
+        ):
+            raise RuntimeIncidentBoundsError(
+                "evidence_refs_json must be a list of stable references"
+            )
+    elif name == "diagnosis_json":
+        if not isinstance(parsed, dict):
+            raise RuntimeIncidentBoundsError(
+                "diagnosis_json must be a structured object"
+            )
+        unknown_fields = set(parsed) - _DIAGNOSIS_FIELDS
+        if unknown_fields:
+            if any(_sensitive_key(str(key)) for key in unknown_fields):
+                raise RuntimeIncidentBoundsError(
+                    "diagnosis_json contains sensitive material"
+                )
+            raise RuntimeIncidentBoundsError(
+                f"diagnosis_json contains unsupported fields: "
+                f"{sorted(unknown_fields)!r}"
+            )
+
+    for key, value in _walk_json_values(parsed):
+        if key is not None and _sensitive_key(key):
+            raise RuntimeIncidentBoundsError(f"{name} contains sensitive material")
+        if isinstance(value, str):
+            if len(value) > 512:
+                raise RuntimeIncidentBoundsError(
+                    f"{name} contains an unbounded string value"
+                )
+            if _contains_sensitive_material(value, detect_opaque=True):
+                raise RuntimeIncidentBoundsError(
+                    f"{name} contains sensitive material"
+                )
+        elif value is not None and not isinstance(
+            value, (bool, int, float, dict, list)
+        ):
+            raise RuntimeIncidentBoundsError(
+                f"{name} contains an unsupported value"
+            )
+
+
+def _validate_required_text(name: str, value: str, *, maximum: int) -> str:
+    if value is None:
+        raise RuntimeIncidentBoundsError(f"{name} is required")
+    normalized = str(value)
+    if not normalized or len(normalized) > maximum:
+        raise RuntimeIncidentBoundsError(
+            f"{name} must contain between 1 and {maximum} characters"
+        )
+    if _contains_sensitive_material(normalized):
+        raise RuntimeIncidentBoundsError(f"{name} contains sensitive material")
+    return normalized
+
+
+def _validate_bounded_payload(
+    name: str,
+    value: str | None,
+    *,
+    maximum: int,
+    check_sensitive: bool = False,
+) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value)
+    if len(normalized) > maximum:
+        raise RuntimeIncidentBoundsError(
+            f"{name} exceeds {maximum} characters"
+        )
+    if check_sensitive:
+        _validate_redacted_json_contract(name, normalized)
+    return normalized
+
+
+def _detach(session, incident: RuntimeIncident) -> RuntimeIncident:
+    session.refresh(incident)
+    session.expunge(incident)
+    return incident
+
+
+def record_runtime_incident(
+    session_factory: sessionmaker,
+    *,
+    source_kind: str,
+    source_record_id: str,
+    incident_type: str,
+    severity: str,
+    fingerprint: str,
+    redacted_summary: str,
+    occurred_at: datetime,
+    feature_policy_version: str,
+    prompt_version: str,
+    tool_policy_version: str,
+    generation: int = 1,
+    diagnosis_json: str | None = None,
+    evidence_refs_json: str | None = None,
+) -> RuntimeIncident:
+    """Insert or atomically coalesce one occurrence of a fingerprint generation."""
+
+    values = {
+        "source_kind": _validate_required_text(
+            "source_kind", source_kind, maximum=64
+        ),
+        "source_record_id": _validate_required_text(
+            "source_record_id", source_record_id, maximum=255
+        ),
+        "incident_type": _validate_required_text(
+            "incident_type", incident_type, maximum=64
+        ),
+        "severity": _validate_required_text("severity", severity, maximum=16),
+        "fingerprint": _validate_required_text(
+            "fingerprint", fingerprint, maximum=64
+        ),
+        "generation": int(generation),
+        "redacted_summary": _validate_bounded_payload(
+            "redacted_summary",
+            redacted_summary,
+            maximum=MAX_REDACTED_SUMMARY_LENGTH,
+            check_sensitive=True,
+        ),
+        "diagnosis_json": _validate_bounded_payload(
+            "diagnosis_json",
+            diagnosis_json,
+            maximum=MAX_DIAGNOSIS_JSON_LENGTH,
+            check_sensitive=True,
+        ),
+        "evidence_refs_json": _validate_bounded_payload(
+            "evidence_refs_json",
+            evidence_refs_json,
+            maximum=MAX_EVIDENCE_REFS_JSON_LENGTH,
+            check_sensitive=True,
+        ),
+        "feature_policy_version": _validate_required_text(
+            "feature_policy_version", feature_policy_version, maximum=64
+        ),
+        "prompt_version": _validate_required_text(
+            "prompt_version", prompt_version, maximum=64
+        ),
+        "tool_policy_version": _validate_required_text(
+            "tool_policy_version", tool_policy_version, maximum=64
+        ),
+    }
+    if values["generation"] < 1:
+        raise ValueError("generation must be positive")
+
+    insert_values = {
+        **values,
+        "status": _CLAIMABLE_STATUS,
+        "repeat_count": 1,
+        "first_occurred_at": occurred_at,
+        "last_occurred_at": occurred_at,
+        "notification_status": "pending",
+        "recovery_status": "not_requested",
+        "created_at": occurred_at,
+        "updated_at": occurred_at,
+    }
+    with session_factory() as session:
+        existing_severity_rank = case(
+            *(
+                (RuntimeIncident.severity == severity_name, rank)
+                for severity_name, rank in _SEVERITY_RANKS.items()
+            ),
+            else_=0,
+        )
+        incoming_severity_rank = _SEVERITY_RANKS.get(
+            str(values["severity"]).lower(), 0
+        )
+        occurrence_is_newer = RuntimeIncident.last_occurred_at <= occurred_at
+        occurrence_is_older = RuntimeIncident.first_occurred_at >= occurred_at
+        statement = sqlite_insert(RuntimeIncident).values(**insert_values)
+        statement = statement.on_conflict_do_update(
+            index_elements=[
+                RuntimeIncident.fingerprint,
+                RuntimeIncident.generation,
+            ],
+            set_={
+                "repeat_count": RuntimeIncident.repeat_count + 1,
+                "first_occurred_at": case(
+                    (occurrence_is_older, occurred_at),
+                    else_=RuntimeIncident.first_occurred_at,
+                ),
+                "last_occurred_at": case(
+                    (occurrence_is_newer, occurred_at),
+                    else_=RuntimeIncident.last_occurred_at,
+                ),
+                "severity": case(
+                    (
+                        existing_severity_rank <= incoming_severity_rank,
+                        values["severity"],
+                    ),
+                    else_=RuntimeIncident.severity,
+                ),
+                "redacted_summary": case(
+                    (occurrence_is_newer, values["redacted_summary"]),
+                    else_=RuntimeIncident.redacted_summary,
+                ),
+                "updated_at": case(
+                    (RuntimeIncident.updated_at <= occurred_at, occurred_at),
+                    else_=RuntimeIncident.updated_at,
+                ),
+            },
+        ).returning(RuntimeIncident.id)
+        incident_id = session.execute(statement).scalar_one()
+        session.commit()
+        return _detach(session, session.get(RuntimeIncident, incident_id))
+
+
+def _claimable(now: datetime):
+    return or_(
+        RuntimeIncident.status.in_((_CLAIMABLE_STATUS, "retry_pending")),
+        and_(
+            RuntimeIncident.status == _CLAIMED_STATUS,
+            RuntimeIncident.claim_expires_at.is_not(None),
+            RuntimeIncident.claim_expires_at <= now,
+        ),
+    )
+
+
+def list_claimable_runtime_incidents(
+    session_factory: sessionmaker,
+    *,
+    now: datetime,
+    limit: int = 20,
+) -> list[RuntimeIncident]:
+    """Return a bounded oldest-first snapshot of claimable incident rows."""
+
+    bounded_limit = max(1, min(int(limit), MAX_CLAIMABLE_LIMIT))
+    with session_factory() as session:
+        rows = (
+            session.query(RuntimeIncident)
+            .filter(_claimable(now))
+            .order_by(
+                RuntimeIncident.last_occurred_at,
+                RuntimeIncident.id,
+            )
+            .limit(bounded_limit)
+            .all()
+        )
+        for row in rows:
+            session.expunge(row)
+        return rows
+
+
+def claim_runtime_incident(
+    session_factory: sessionmaker,
+    *,
+    incident_id: int,
+    claim_token: str,
+    claimed_at: datetime,
+    claim_expires_at: datetime,
+) -> RuntimeIncident | None:
+    """Claim one row through a compare-and-set update."""
+
+    token = _validate_required_text("claim_token", claim_token, maximum=64)
+    if claim_expires_at <= claimed_at:
+        raise ValueError("claim_expires_at must be after claimed_at")
+    with session_factory() as session:
+        incident_id_result = session.execute(
+            update(RuntimeIncident)
+            .where(
+                RuntimeIncident.id == int(incident_id),
+                _claimable(claimed_at),
+            )
+            .values(
+                status=_CLAIMED_STATUS,
+                claim_token=token,
+                claimed_at=claimed_at,
+                claim_expires_at=claim_expires_at,
+                updated_at=claimed_at,
+            )
+            .returning(RuntimeIncident.id)
+        ).scalar_one_or_none()
+        session.commit()
+        if incident_id_result is None:
+            return None
+        return _detach(
+            session, session.get(RuntimeIncident, int(incident_id_result))
+        )
+
+
+def transition_runtime_incident(
+    session_factory: sessionmaker,
+    *,
+    incident_id: int,
+    from_status: str | Sequence[str],
+    to_status: str,
+    now: datetime,
+    claim_token: str | None = None,
+    diagnosis_json: str | None = None,
+    evidence_refs_json: str | None = None,
+    playbook_name: str | None = None,
+    recovery_status: str | None = None,
+) -> bool:
+    """Apply a token-checked lifecycle transition without loading stale state."""
+
+    sources = (
+        (from_status,)
+        if isinstance(from_status, str)
+        else tuple(str(status) for status in from_status)
+    )
+    if not sources:
+        raise ValueError("from_status must not be empty")
+    target = str(to_status)
+    if any(target not in _ALLOWED_TRANSITIONS.get(source, ()) for source in sources):
+        raise ValueError(f"invalid runtime incident transition: {sources!r} -> {target}")
+
+    values: dict[str, object | None] = {
+        "status": target,
+        "updated_at": now,
+    }
+    if diagnosis_json is not None:
+        values["diagnosis_json"] = _validate_bounded_payload(
+            "diagnosis_json",
+            diagnosis_json,
+            maximum=MAX_DIAGNOSIS_JSON_LENGTH,
+            check_sensitive=True,
+        )
+    if evidence_refs_json is not None:
+        values["evidence_refs_json"] = _validate_bounded_payload(
+            "evidence_refs_json",
+            evidence_refs_json,
+            maximum=MAX_EVIDENCE_REFS_JSON_LENGTH,
+            check_sensitive=True,
+        )
+    if playbook_name is not None:
+        values["playbook_name"] = _validate_required_text(
+            "playbook_name", playbook_name, maximum=128
+        )
+    if recovery_status is not None:
+        values["recovery_status"] = _validate_required_text(
+            "recovery_status", recovery_status, maximum=32
+        )
+    if target != _CLAIMED_STATUS:
+        values.update(
+            claim_token=None,
+            claimed_at=None,
+            claim_expires_at=None,
+        )
+
+    predicates = [
+        RuntimeIncident.id == int(incident_id),
+        RuntimeIncident.status.in_(sources),
+    ]
+    if claim_token is not None:
+        predicates.append(RuntimeIncident.claim_token == str(claim_token))
+    elif _CLAIMED_STATUS in sources:
+        return False
+    if _CLAIMED_STATUS in sources:
+        predicates.extend(
+            (
+                RuntimeIncident.claim_expires_at.is_not(None),
+                RuntimeIncident.claim_expires_at > now,
+            )
+        )
+    with session_factory() as session:
+        result = session.execute(
+            update(RuntimeIncident).where(*predicates).values(**values)
+        )
+        session.commit()
+        return result.rowcount == 1
+
+
+def release_or_expire_runtime_incident_claim(
+    session_factory: sessionmaker,
+    *,
+    incident_id: int,
+    claim_token: str,
+    now: datetime,
+    force_release: bool = False,
+) -> bool:
+    """Return a matching claim to pending after expiry or explicit worker release."""
+
+    predicates = [
+        RuntimeIncident.id == int(incident_id),
+        RuntimeIncident.status == _CLAIMED_STATUS,
+        RuntimeIncident.claim_token == str(claim_token),
+    ]
+    if not force_release:
+        predicates.extend(
+            (
+                RuntimeIncident.claim_expires_at.is_not(None),
+                RuntimeIncident.claim_expires_at <= now,
+            )
+        )
+    with session_factory() as session:
+        result = session.execute(
+            update(RuntimeIncident)
+            .where(*predicates)
+            .values(
+                status=_CLAIMABLE_STATUS,
+                claim_token=None,
+                claimed_at=None,
+                claim_expires_at=None,
+                updated_at=now,
+            )
+        )
+        session.commit()
+        return result.rowcount == 1

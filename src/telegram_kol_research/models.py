@@ -6,7 +6,19 @@ from datetime import UTC, datetime
 from typing import Optional
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -1666,6 +1678,156 @@ class RecoveryDecisionRecord(Base):
     run_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class RuntimeIncident(Base):
+    """Additive, redacted ledger entry for one runtime-failure generation."""
+
+    __tablename__ = "runtime_incidents"
+    __table_args__ = (
+        Index(
+            "ix_runtime_incidents_fingerprint_generation",
+            "fingerprint",
+            "generation",
+            unique=True,
+        ),
+        Index(
+            "ix_runtime_incidents_claimable",
+            "status",
+            "claim_expires_at",
+            "last_occurred_at",
+        ),
+        Index(
+            "ix_runtime_incidents_source",
+            "source_kind",
+            "source_record_id",
+        ),
+        CheckConstraint(
+            "length(redacted_summary) <= 2048",
+            name="ck_runtime_incidents_summary_bounded",
+        ),
+        CheckConstraint(
+            "diagnosis_json IS NULL OR length(diagnosis_json) <= 8192",
+            name="ck_runtime_incidents_diagnosis_bounded",
+        ),
+        CheckConstraint(
+            "evidence_refs_json IS NULL OR length(evidence_refs_json) <= 4096",
+            name="ck_runtime_incidents_evidence_bounded",
+        ),
+        CheckConstraint(
+            "length(source_kind) BETWEEN 1 AND 64",
+            name="ck_runtime_incidents_source_kind_bounded",
+        ),
+        CheckConstraint(
+            "length(source_record_id) BETWEEN 1 AND 255",
+            name="ck_runtime_incidents_source_record_bounded",
+        ),
+        CheckConstraint(
+            "length(incident_type) BETWEEN 1 AND 64",
+            name="ck_runtime_incidents_type_bounded",
+        ),
+        CheckConstraint(
+            "length(severity) BETWEEN 1 AND 16",
+            name="ck_runtime_incidents_severity_bounded",
+        ),
+        CheckConstraint(
+            "length(fingerprint) BETWEEN 1 AND 64",
+            name="ck_runtime_incidents_fingerprint_bounded",
+        ),
+        CheckConstraint(
+            "generation >= 1 AND repeat_count >= 1",
+            name="ck_runtime_incidents_positive_counters",
+        ),
+        CheckConstraint(
+            "length(status) BETWEEN 1 AND 32",
+            name="ck_runtime_incidents_status_bounded",
+        ),
+        CheckConstraint(
+            "claim_token IS NULL OR length(claim_token) <= 64",
+            name="ck_runtime_incidents_claim_token_bounded",
+        ),
+        CheckConstraint(
+            "length(notification_status) BETWEEN 1 AND 32",
+            name="ck_runtime_incidents_notification_status_bounded",
+        ),
+        CheckConstraint(
+            "notification_claim_token IS NULL "
+            "OR length(notification_claim_token) <= 64",
+            name="ck_runtime_incidents_notification_token_bounded",
+        ),
+        CheckConstraint(
+            "playbook_name IS NULL OR length(playbook_name) <= 128",
+            name="ck_runtime_incidents_playbook_bounded",
+        ),
+        CheckConstraint(
+            "length(recovery_status) BETWEEN 1 AND 32",
+            name="ck_runtime_incidents_recovery_status_bounded",
+        ),
+        CheckConstraint(
+            "length(feature_policy_version) BETWEEN 1 AND 64 "
+            "AND length(prompt_version) BETWEEN 1 AND 64 "
+            "AND length(tool_policy_version) BETWEEN 1 AND 64",
+            name="ck_runtime_incidents_policy_versions_bounded",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_record_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    incident_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="pending",
+        server_default=text("'pending'"),
+    )
+    repeat_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    first_occurred_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    last_occurred_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    claim_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    redacted_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    diagnosis_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    evidence_refs_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notification_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="pending",
+        server_default=text("'pending'"),
+    )
+    notification_claim_token: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    notification_claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    playbook_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    recovery_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="not_requested",
+        server_default=text("'not_requested'"),
+    )
+    feature_policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    tool_policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
 
 
 class RecoveryOrderConfirmation(Base):
