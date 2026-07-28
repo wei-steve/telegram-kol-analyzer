@@ -50,7 +50,36 @@ def test_handoff_keeps_evidence_and_hypothesis_separate_and_requires_verificatio
     assert "独立验证" in handoff["codex_prompt"]
     assert "AGENTS.md" in handoff["codex_prompt"]
     assert "禁止" in handoff["codex_prompt"]
-    assert len(handoff["codex_prompt"]) <= 1600
+    assert len(handoff["codex_prompt"]) <= 512
+
+
+def test_handoff_bounds_codex_prompt_for_maximum_contract_text():
+    handoff = build_runtime_incident_handoff(
+        incident={
+            "id": 17,
+            "incident_type": "worker_retry_exhausted",
+            "source_kind": "worker_job",
+            "source_record_id": "42",
+            "redacted_summary": {"error_type": "provider_timeout"},
+        },
+        diagnosis=RuntimeAgentDiagnosis.from_mapping(
+            {
+                "incident_id": 17,
+                "diagnosis_hypothesis": "h" * 512,
+                "confidence": "low",
+                "evidence_references": ["incident:17"],
+                "missing_evidence": ["m" * 512],
+                "recommended_playbook_name": None,
+                "auto_handle_eligible": False,
+                "codex_handoff_required": True,
+                "remaining_risk": "r" * 512,
+            },
+            expected_incident_id=17,
+        ),
+        attempted_queries=("get_incident_summary",),
+    )
+
+    assert len(handoff["codex_prompt"]) <= 512
 
 
 def test_handoff_rejects_sensitive_or_mismatched_incident_material():

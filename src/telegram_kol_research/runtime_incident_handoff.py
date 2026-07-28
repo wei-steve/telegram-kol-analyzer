@@ -77,7 +77,7 @@ def build_runtime_incident_handoff(
         f"证据引用: {', '.join(diagnosis.evidence_references) or '-'}\n"
         f"Agent 假设: {diagnosis.diagnosis_hypothesis}\n"
         f"剩余风险: {diagnosis.remaining_risk}"
-    )[:1600]
+    )[:512]
     handoff = {
         "incident": compact_incident,
         "evidence_references": list(diagnosis.evidence_references),

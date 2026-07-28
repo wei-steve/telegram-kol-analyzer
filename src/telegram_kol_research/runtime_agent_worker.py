@@ -362,6 +362,11 @@ def run_runtime_agent_once(
         )
         if reusable is not None:
             diagnosis = _diagnosis_from_reusable(claimed.id, reusable)
+            handoff = build_runtime_incident_handoff(
+                incident=_handoff_incident(claimed),
+                diagnosis=diagnosis,
+                attempted_queries=diagnosis.attempted_queries,
+            )
             if not _commit_diagnosis(
                 session_factory,
                 incident=claimed,
@@ -376,11 +381,7 @@ def run_runtime_agent_once(
             return RuntimeAgentWorkerResult(
                 status="reused",
                 incident_id=claimed.id,
-                handoff=build_runtime_incident_handoff(
-                    incident=_handoff_incident(claimed),
-                    diagnosis=diagnosis,
-                    attempted_queries=diagnosis.attempted_queries,
-                ),
+                handoff=handoff,
             )
 
         messages = build_runtime_agent_messages(
@@ -442,6 +443,11 @@ def run_runtime_agent_once(
                     raise RuntimeAgentContractError(
                         "diagnosis cites evidence that was not returned"
                     )
+                handoff = build_runtime_incident_handoff(
+                    incident=_handoff_incident(claimed),
+                    diagnosis=diagnosis,
+                    attempted_queries=attempted_queries,
+                )
                 if not _commit_diagnosis(
                     session_factory,
                     incident=claimed,
@@ -455,11 +461,6 @@ def run_runtime_agent_once(
                         tool_steps=len(attempted_queries),
                         refused_tool_calls=refused,
                     )
-                handoff = build_runtime_incident_handoff(
-                    incident=_handoff_incident(claimed),
-                    diagnosis=diagnosis,
-                    attempted_queries=attempted_queries,
-                )
                 return RuntimeAgentWorkerResult(
                     status="diagnosed",
                     incident_id=claimed.id,
