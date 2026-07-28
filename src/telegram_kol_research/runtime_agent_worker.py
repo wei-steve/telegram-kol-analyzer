@@ -392,6 +392,7 @@ def run_runtime_agent_once(
         # configured hard tool budget is four. Once this evidence budget is
         # exhausted, tools are no longer advertised to the provider.
         evidence_tool_limit = max(1, min(config.max_tool_steps, 3))
+        final_instruction_added = False
         max_turns = max(2, min(config.max_tool_steps, 4) + 4)
         for _ in range(max_turns):
             if monotonic() - started > config.max_wall_seconds:
@@ -400,6 +401,25 @@ def run_runtime_agent_once(
                 messages,
                 maximum=config.max_prompt_bytes,
             )
+            if (
+                len(attempted_queries) >= evidence_tool_limit
+                and not final_instruction_added
+            ):
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Evidence collection is complete. Do not request "
+                            "another evidence tool. Submit the final diagnosis "
+                            "now with submit_runtime_diagnosis."
+                        ),
+                    }
+                )
+                final_instruction_added = True
+                _validate_message_budget(
+                    messages,
+                    maximum=config.max_prompt_bytes,
+                )
             raw_turn = model_turn(
                 messages=messages,
                 tool_schemas=(

@@ -197,6 +197,7 @@ def test_worker_reserves_final_turn_after_three_evidence_tools(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     incident = _record(session_factory)
     observed_tool_schemas = []
+    observed_messages = []
     tool_names = (
         "get_incident_summary",
         "get_worker_state",
@@ -230,6 +231,7 @@ def test_worker_reserves_final_turn_after_three_evidence_tools(tmp_path):
 
     def model_turn(**kwargs):
         observed_tool_schemas.append(kwargs["tool_schemas"])
+        observed_messages.append(kwargs["messages"])
         return next(turns)
 
     result = run_runtime_agent_once(
@@ -244,6 +246,7 @@ def test_worker_reserves_final_turn_after_three_evidence_tools(tmp_path):
     assert result.tool_steps == 3
     assert all(observed_tool_schemas[:3])
     assert observed_tool_schemas[3] == []
+    assert "Evidence collection is complete" in observed_messages[3][-1]["content"]
 
 
 def test_worker_refuses_repeated_tool_without_reexecuting_provider(tmp_path):
