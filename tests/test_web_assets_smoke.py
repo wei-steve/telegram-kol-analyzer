@@ -162,6 +162,166 @@ def test_silent_positions_check_discards_snapshot_after_visible_panel_changes(tm
     )
 
 
+def test_positions_refresh_normalizes_and_restores_in_memory_ui_state(tmp_path):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required for the positions UI-state behavior test")
+
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    assert "function exchangePositionUiState(root)" in js
+    assert "function applyExchangePositionUiState(root, state)" in js
+
+    commit_start = js.index("function commitPositionsPanel")
+    commit_end = js.index("\nfunction ", commit_start + 1)
+    commit_block = js[commit_start:commit_end]
+    check_start = js.index("async function checkPositionsPanelForChanges")
+    check_end = js.index("\nasync function loadPositionsPanel", check_start + 1)
+    check_block = js[check_start:check_end]
+
+    assert "const uiState = exchangePositionUiState(current);" in commit_block
+    assert commit_block.index("const uiState = exchangePositionUiState(current);") < (
+        commit_block.index("container.replaceChildren(fragment);")
+    )
+    assert commit_block.index("bindExchangePositionTabs();") < commit_block.index(
+        "applyExchangePositionUiState(fragment, uiState);"
+    )
+    assert "const uiState = exchangePositionUiState(current);" in check_block
+    assert "applyExchangePositionUiState(fragment, uiState);" in check_block
+    assert check_block.index("applyExchangePositionUiState(fragment, uiState);") < (
+        check_block.index("positionsPanelComparableMarkup(current)")
+    )
+
+    functions_start = js.index("function setExchangePositionTab")
+    functions_end = js.index("\nfunction restoreExchangePositionTab", functions_start)
+    view_start = js.index("function setExchangePositionView")
+    view_end = js.index("\nfunction restoreExchangePositionView", view_start)
+    harness = textwrap.dedent(
+        """
+        global.window = {
+          localStorage: {
+            getItem: () => { throw new Error('storage unavailable'); },
+            setItem: () => { throw new Error('storage unavailable'); },
+          },
+        };
+        const EXCHANGE_POSITION_TABS = [
+          'positions', 'open-orders', 'order-history', 'position-history',
+        ];
+
+        class FakeClassList {
+          constructor(active = false) { this.values = new Set(active ? ['is-active'] : []); }
+          toggle(name, enabled) {
+            if (enabled) this.values.add(name);
+            else this.values.delete(name);
+          }
+          contains(name) { return this.values.has(name); }
+        }
+
+        class FakeElement {
+          constructor(dataset, active = false) {
+            this.dataset = dataset;
+            this.classList = new FakeClassList(active);
+            this.attributes = {};
+          }
+          setAttribute(name, value) { this.attributes[name] = value; }
+        }
+
+        class FakeRoot {
+          constructor() {
+            const tabs = ['positions', 'open-orders', 'order-history', 'position-history'];
+            this.tabs = tabs.map((name, index) => new FakeElement(
+              { exchangePositionTab: name }, index === 0,
+            ));
+            this.tabPanels = tabs.map((name, index) => new FakeElement(
+              { exchangePositionPanel: name }, index === 0,
+            ));
+            const views = ['list', 'grouped'];
+            this.viewButtons = views.map((name, index) => new FakeElement(
+              { exchangeViewMode: name }, index === 0,
+            ));
+            this.viewPanels = views.map((name, index) => new FakeElement(
+              { exchangeViewPanel: name }, index === 0,
+            ));
+          }
+          querySelectorAll(selector) {
+            if (selector === '[data-exchange-position-tab]') return this.tabs;
+            if (selector === '[data-exchange-position-panel]') return this.tabPanels;
+            if (selector === '[data-exchange-view-mode]') return this.viewButtons;
+            if (selector === '[data-exchange-view-panel]') return this.viewPanels;
+            return [];
+          }
+          querySelector(selector) {
+            const items = this.querySelectorAll(selector.replace('.is-active', ''));
+            return items.find((item) => item.classList.contains('is-active')) || null;
+          }
+          get outerHTML() {
+            const state = exchangePositionUiState(this);
+            return `${state.tab}:${state.view}`;
+          }
+        }
+
+        const current = new FakeRoot();
+        setExchangePositionTab(current, 'order-history');
+        setExchangePositionView(current, 'grouped');
+        const fragment = new FakeRoot();
+        if (current.outerHTML === fragment.outerHTML) {
+          throw new Error('test setup should begin with different UI state');
+        }
+
+        const state = exchangePositionUiState(current);
+        applyExchangePositionUiState(fragment, state);
+        if (fragment.outerHTML !== 'order-history:grouped') {
+          throw new Error(`UI state was not restored: ${fragment.outerHTML}`);
+        }
+        if (current.outerHTML !== fragment.outerHTML) {
+          throw new Error('equivalent data should compare equally after UI normalization');
+        }
+        """
+    )
+    result = subprocess.run(
+        [
+            "node",
+            "-e",
+            "\n".join(
+                [
+                    harness,
+                    js[functions_start:functions_end],
+                    js[view_start:view_end],
+                ]
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_positions_change_comparison_ignores_browsing_only_dom_state(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    comparable_start = js.index("function positionsPanelComparableMarkup")
+    comparable_end = js.index("\nfunction ", comparable_start + 1)
+    comparable_block = js[comparable_start:comparable_end]
+    check_start = js.index("async function checkPositionsPanelForChanges")
+    check_end = js.index("\nasync function loadPositionsPanel", check_start + 1)
+    check_block = js[check_start:check_end]
+
+    assert "root.cloneNode(true)" in comparable_block
+    assert "setExchangePositionTab(clone, 'positions');" in comparable_block
+    assert "setExchangePositionView(clone, 'list');" in comparable_block
+    assert "clone.querySelectorAll('details[open]')" in comparable_block
+    assert "details.removeAttribute('open')" in comparable_block
+    assert "current.outerHTML === fragment.outerHTML" not in check_block
+    assert check_block.index("positionsPanelComparableMarkup(current)") < (
+        check_block.index("positionsPanelComparableMarkup(fragment)")
+    )
+    assert check_block.index("positionsPanelComparableMarkup(fragment)") < (
+        check_block.index("pendingPositionsFragment = fragment;")
+    )
+
+
 def test_app_js_restores_exchange_position_view_after_partial_reload(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

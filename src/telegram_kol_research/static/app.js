@@ -1708,10 +1708,13 @@ function bindStrategyRecordController() {
 function commitPositionsPanel(fragment) {
   const container = document.querySelector('[data-lazy-workbench="positions"]');
   if (!container || !fragment) return false;
+  const current = container.querySelector('[data-exchange-position-tabs]');
+  const uiState = exchangePositionUiState(current);
   container.replaceChildren(fragment);
   pendingPositionsFragment = null;
   bindDashboardTabs();
   bindExchangePositionTabs();
+  applyExchangePositionUiState(fragment, uiState);
   bindBoundPositionCloseButtons();
   bindDeepcoinPositionSync();
   bindLivePositionAttributionButtons();
@@ -1748,6 +1751,19 @@ function showPendingPositionsRefreshNotice() {
   container.prepend(notice);
 }
 
+function positionsPanelComparableMarkup(root) {
+  const clone = root.cloneNode(true);
+  setExchangePositionTab(clone, 'positions');
+  setExchangePositionView(clone, 'list');
+  clone.querySelectorAll('details[open]').forEach((details) => {
+    details.removeAttribute('open');
+  });
+  clone.querySelectorAll('.strategy-record-position-target').forEach((item) => {
+    item.classList.remove('strategy-record-position-target');
+  });
+  return clone.outerHTML;
+}
+
 async function checkPositionsPanelForChanges() {
   const container = document.querySelector('[data-lazy-workbench="positions"]');
   const current = container?.querySelector('[data-exchange-position-tabs]');
@@ -1755,7 +1771,12 @@ async function checkPositionsPanelForChanges() {
   try {
     const fragment = await fetchWorkbenchPartial('/positions-panel', '[data-exchange-position-tabs]');
     if (current !== container.querySelector('[data-exchange-position-tabs]')) return false;
-    if (current.outerHTML === fragment.outerHTML) {
+    const uiState = exchangePositionUiState(current);
+    applyExchangePositionUiState(fragment, uiState);
+    if (
+      positionsPanelComparableMarkup(current)
+      === positionsPanelComparableMarkup(fragment)
+    ) {
       pendingPositionsFragment = null;
       clearPendingPositionsRefreshNotice();
       return false;
@@ -2287,6 +2308,21 @@ function setExchangePositionTab(root, tab) {
       panel.dataset.exchangePositionPanel === selectedTab,
     );
   });
+}
+
+function exchangePositionUiState(root) {
+  const activeTab = root?.querySelector('[data-exchange-position-tab].is-active');
+  const activeView = root?.querySelector('[data-exchange-view-mode].is-active');
+  return {
+    tab: activeTab?.dataset.exchangePositionTab || exchangePositionTab(),
+    view: activeView?.dataset.exchangeViewMode || exchangePositionViewMode(),
+  };
+}
+
+function applyExchangePositionUiState(root, state) {
+  if (!root || !state) return;
+  setExchangePositionTab(root, state.tab);
+  setExchangePositionView(root, state.view);
 }
 
 function restoreExchangePositionTab(root) {
