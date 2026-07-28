@@ -214,6 +214,9 @@ def request_structured_chat_turn(
         "messages": messages,
         "tools": tool_schemas,
         "tool_choice": "auto",
+        # The runtime worker intentionally executes one bounded read-only
+        # projection per turn. Ask compatible providers not to fan out calls.
+        "parallel_tool_calls": False,
     }
     created_client = client is None
     active_client = client or httpx.Client(

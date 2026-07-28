@@ -67,6 +67,7 @@ def test_request_structured_chat_turn_normalizes_one_tool_call():
     def handler(request: httpx.Request) -> httpx.Response:
         payload = request.read().decode("utf-8")
         assert '"tool_choice":"auto"' in payload
+        assert '"parallel_tool_calls":false' in payload
         assert '"name":"get_incident_summary"' in payload
         return httpx.Response(
             200,
