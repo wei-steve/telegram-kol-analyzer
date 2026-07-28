@@ -6,25 +6,38 @@ used to advance or reinterpret the rollout.
 ```yaml
 project: runtime-incident-agent
 design_version: 1
-current_phase: 2
-phase_name: deterministic-incident-adapters-and-telegram-baseline
-phase_status: in_progress
-last_completed_phase: 1
-last_completed_commit: 9820d3b
-production_commit: 9820d3be6e4ff426e60cdc9ee84c200dd0b63397
+current_phase: 3
+phase_name: read-only-incident-agent-and-codex-handoff
+phase_status: planned
+last_completed_phase: 2
+last_completed_commit: 22ac194
+production_commit: 711b41fd6a3ce6b6d1f710f445649c7b0f83f3fb
 local_tests:
   - "phase-2-focused-regressions: 310 passed"
   - "full-suite: 2558 passed, 1 skipped; pytest cleanup hung after the completed summary and was interrupted"
 server_verification:
-  status: pending
-  deployed_commit: 9820d3be6e4ff426e60cdc9ee84c200dd0b63397
+  status: complete
+  deployed_commit: 711b41fd6a3ce6b6d1f710f445649c7b0f83f3fb
   service: active
-  incident_agent_behavior: phase-1-ledger-only
-  remaining: "Prove a safe deployment window; deploy 22ac194 with capture and Telegram disabled; verify continuity; canary one capture class and its source-to-incident dedupe; then enable and verify Telegram delivery."
-enabled_flags: []
+  bounded_restarts: clean
+  listener: monitoring-31-enabled-groups
+  recognition: latest-message-completed
+  contextual_resolution_inflight: 0
+  position_mutation_inflight: 0
+  management_latest: succeeded
+  production_safety: stable-complete-baseline-audit_abnormal
+  capture_canary: "management_partial_failed source batch 28 -> runtime incident 1"
+  capture_dedupe: "three scans retained generation 1 and repeat_count 1"
+  telegram_canary: delivered
+  incident_agent_behavior: deterministic-capture-and-telegram-only
+  remaining: "Begin Phase 3 from failing closed-contract and read-only-tool tests."
+enabled_flags:
+  - "capture:management_partial_failed"
+  - "telegram:deterministic-runtime-incident-reports"
 known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (31 blocked, 1 partial_failed, 5 recovery_required); the no-notify audit itself was stable and complete."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
+  - "The full local suite completed its test summary but pytest cleanup hung and required interruption."
 phase_7_explicitly_approved: false
 next_session_prompt: "请执行自定义ai agent的下一步实施"
 ```
@@ -79,15 +92,23 @@ When the user says `请执行自定义ai agent的下一步实施`:
 
 ### Phase 2 — Deterministic incident adapters and Telegram baseline
 
-- Status: in progress
+- Status: completed
 - Local implementation commit: `22ac194`
 - Review: no Critical, Important, or Minor findings
 - Local verification: 310 focused/regression tests passed; the full suite
   reported 2558 passed and 1 skipped, then hung during pytest cleanup and was
   interrupted
 - Runtime defaults: all capture classes disabled and Telegram delivery disabled
-- Remaining: safe-window production deployment, disabled-state continuity
-  verification, one-class capture/dedupe canary, and Telegram delivery canary
+- Production deployment: `711b41f`, initially with all Phase 2 flags disabled
+- Capture canary: the sole `management_partial_failed` source batch `28`
+  produced runtime incident `1`; three scans retained generation `1` and
+  `repeat_count=1`
+- Telegram canary: runtime incident `1` reached `delivered`
+- Enabled production scope: only `management_partial_failed` capture and
+  deterministic runtime-incident Telegram delivery
+- Continuity: service active, HTTP 200, listener monitoring 31 groups, no
+  contextual-resolution or position-mutation work in flight, latest
+  recognition complete, and no new service errors
 
 ## Current Phase Exit Checklist
 
@@ -100,6 +121,6 @@ Phase 2 is not complete until:
   non-blocking;
 - [x] focused and critical regression tests pass;
 - [x] changes are reviewed, committed, and pushed;
-- [ ] production deploys with capture and notification flags disabled;
-- [ ] one capture class is canaried only after source-to-incident dedupe evidence;
-- [ ] Telegram delivery is enabled only after capture evidence is correct.
+- [x] production deploys with capture and notification flags disabled;
+- [x] one capture class is canaried only after source-to-incident dedupe evidence;
+- [x] Telegram delivery is enabled only after capture evidence is correct.
