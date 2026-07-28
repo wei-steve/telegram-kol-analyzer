@@ -53,16 +53,25 @@ def test_runtime_incident_flags_are_dormant_by_default_and_parse_allowlist():
                 "context_worker_exhausted,monitor_audit_incomplete"
             ),
             "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED": "true",
+            "TELEGRAM_KOL_RUNTIME_AGENT_ENABLED": "true",
+            "TELEGRAM_KOL_RUNTIME_AGENT_MAX_TOOL_STEPS": "99",
+            "TELEGRAM_KOL_RUNTIME_AGENT_MAX_WALL_SECONDS": "12",
         },
         env_file_paths=[],
     )
 
     assert default.capture_types == frozenset()
     assert default.telegram_notifications_enabled is False
+    assert default.agent_enabled is False
     assert enabled.capture_types == frozenset(
         {"context_worker_exhausted", "monitor_audit_incomplete"}
     )
     assert enabled.telegram_notifications_enabled is True
+    assert enabled.agent_enabled is True
+    assert enabled.agent_max_tool_steps == 4
+    assert enabled.agent_max_wall_seconds == 12.0
+    assert enabled.prompt_version == "runtime-agent-prompt-v1"
+    assert enabled.tool_policy_version == "runtime-agent-tools-v1"
     assert RuntimeIncidentConfig(
         capture_types=frozenset({"*"})
     ).captures("management_recovery_required") is False

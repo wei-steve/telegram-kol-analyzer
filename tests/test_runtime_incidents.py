@@ -76,12 +76,15 @@ def test_runtime_incident_table_has_additive_defaults_and_indexes(tmp_path):
         "tool_policy_version",
         "created_at",
         "updated_at",
+        "agent_attempt_count",
+        "agent_next_attempt_at",
     } <= set(columns)
     assert columns["generation"]["default"] is not None
     assert columns["status"]["default"] is not None
     assert columns["repeat_count"]["default"] is not None
     assert columns["notification_status"]["default"] is not None
     assert columns["recovery_status"]["default"] is not None
+    assert columns["agent_attempt_count"]["default"] is not None
     assert {
         "ix_runtime_incidents_claimable",
         "ix_runtime_incidents_source",
@@ -94,6 +97,8 @@ def test_runtime_incident_table_has_additive_defaults_and_indexes(tmp_path):
     assert incident.repeat_count == 1
     assert incident.notification_status == "pending"
     assert incident.recovery_status == "not_requested"
+    assert incident.agent_attempt_count == 0
+    assert incident.agent_next_attempt_at is None
 
 
 def test_record_same_fingerprint_deduplicates_and_increments_repeat_count(tmp_path):

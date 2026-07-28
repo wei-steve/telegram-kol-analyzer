@@ -9,6 +9,7 @@ import platform
 import re
 import sqlite3
 import shutil
+import subprocess
 import tempfile
 from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
@@ -83,20 +84,40 @@ from telegram_kol_research.llm_adjudication import (
     export_llm_submission_sample,
 )
 from telegram_kol_research.llm_import import import_llm_adjudication_results
+from telegram_kol_research.llm_chat import (
+    load_llm_proxy_config,
+    request_structured_chat_turn,
+)
 from telegram_kol_research.media_retention import cleanup_media_files
 from telegram_kol_research.media_dedupe import dedupe_media_assets
 from telegram_kol_research.models import (
+    ContextResolutionAttempt,
     ExecutionBinding,
+    ExecutionOrderLeg,
+    PositionProtectionIncident,
     PositionProtectionLedger,
     StrategyLifecycle,
     StrategyManagementBatch,
+    StrategyManagementLeg,
     TradeIdea,
     RawMessage,
+    RuntimeIncident,
     SignalCandidate,
 )
 from telegram_kol_research.models import SyncCheckpoint
 from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
 from telegram_kol_research.reporting import load_leaderboard_rows, write_report
+from telegram_kol_research.config import load_runtime_incident_config
+from telegram_kol_research.runtime_agent_tools import RuntimeAgentToolRegistry
+from telegram_kol_research.runtime_agent_worker import (
+    RuntimeAgentWorkerConfig,
+    run_runtime_agent_loop,
+    run_runtime_agent_once,
+)
+from telegram_kol_research.runtime_incident_handoff import (
+    RuntimeIncidentHandoffError,
+    load_runtime_incident_handoff,
+)
 from telegram_kol_research.raw_ingest import (
     NormalizedMessageRecord,
     normalize_message_payload,
@@ -1844,6 +1865,598 @@ def monitor_production_safety(
     )
     if outcome.exit_code:
         raise typer.Exit(code=outcome.exit_code)
+
+
+def _build_runtime_agent_cli_tools(
+    session_factory,
+    *,
+    max_output_bytes: int,
+    monitor_state_path: Path = Path(
+        "/var/lib/telegram-kol-monitor/state.json"
+    ),
+    journal_reader=None,
+) -> RuntimeAgentToolRegistry:
+    def load_incident(session, incident_id: int):
+        row = session.get(RuntimeIncident, incident_id)
+        if row is None:
+            raise ValueError("runtime incident does not exist")
+        return row
+
+    def load_management_batch(session, incident):
+        if incident.source_kind != "strategy_management_batch":
+            return None
+        try:
+            batch_id = int(incident.source_record_id)
+        except (TypeError, ValueError):
+            return None
+        return session.get(StrategyManagementBatch, batch_id)
+
+    def load_protection_incident(session, incident):
+        if incident.source_kind != "position_protection_incident":
+            return None
+        try:
+            protection_id = int(incident.source_record_id)
+        except (TypeError, ValueError):
+            return None
+        return session.get(PositionProtectionIncident, protection_id)
+
+    def isoformat(value):
+        return value.isoformat() if value is not None else None
+
+    def incident_summary(*, incident_id: int):
+        with session_factory() as session:
+            row = load_incident(session, incident_id)
+            try:
+                summary = json.loads(row.redacted_summary)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                summary = {}
+            return {
+                "data": {
+                    "incident_id": row.id,
+                    "incident_type": row.incident_type,
+                    "severity": row.severity,
+                    "status": row.status,
+                    "generation": row.generation,
+                    "repeat_count": row.repeat_count,
+                    "redacted_summary": summary,
+                },
+                "evidence_refs": [f"incident:{row.id}"],
+            }
+
+    def lifecycle_state(*, incident_id: int):
+        with session_factory() as session:
+            incident = load_incident(session, incident_id)
+            batch = load_management_batch(session, incident)
+            protection = load_protection_incident(session, incident)
+            lifecycle_id = batch.target_lifecycle_id if batch is not None else None
+            binding_id = (
+                batch.execution_binding_id
+                if batch is not None
+                else (
+                    protection.execution_binding_id
+                    if protection is not None
+                    else None
+                )
+            )
+            lifecycle = (
+                session.get(StrategyLifecycle, lifecycle_id)
+                if lifecycle_id is not None
+                else (
+                    session.query(StrategyLifecycle)
+                    .filter(StrategyLifecycle.execution_binding_id == binding_id)
+                    .order_by(StrategyLifecycle.id.desc())
+                    .first()
+                    if binding_id is not None
+                    else None
+                )
+            )
+            binding = (
+                session.get(ExecutionBinding, binding_id)
+                if binding_id is not None
+                else None
+            )
+            order_legs = (
+                session.query(ExecutionOrderLeg)
+                .filter(ExecutionOrderLeg.execution_binding_id == binding_id)
+                .order_by(ExecutionOrderLeg.leg_index, ExecutionOrderLeg.id)
+                .limit(20)
+                .all()
+                if binding_id is not None
+                else []
+            )
+            return {
+                "data": {
+                    "incident_id": incident.id,
+                    "applicable": bool(lifecycle or binding or order_legs),
+                    "lifecycle": (
+                        {
+                            "id": lifecycle.id,
+                            "status": lifecycle.lifecycle_status,
+                            "symbol": lifecycle.symbol,
+                            "side": lifecycle.side,
+                            "exit_reason": lifecycle.exit_reason,
+                            "updated_at": isoformat(lifecycle.updated_at),
+                        }
+                        if lifecycle is not None
+                        else None
+                    ),
+                    "binding": (
+                        {
+                            "id": binding.id,
+                            "status": binding.status,
+                            "venue": binding.venue,
+                            "symbol": binding.symbol,
+                            "side": binding.side,
+                            "last_exchange_status": binding.last_exchange_status,
+                        }
+                        if binding is not None
+                        else None
+                    ),
+                    "order_legs": [
+                        {
+                            "id": leg.id,
+                            "purpose": leg.purpose,
+                            "leg_index": leg.leg_index,
+                            "status": leg.status,
+                            "attribution_status": leg.attribution_status,
+                            "terminal_reason": leg.terminal_reason,
+                        }
+                        for leg in order_legs
+                    ],
+                },
+                "evidence_refs": [f"incident:{incident.id}"],
+            }
+
+    def worker_state(*, incident_id: int):
+        with session_factory() as session:
+            incident = load_incident(session, incident_id)
+            data = {
+                "incident_id": incident.id,
+                "worker_kind": incident.source_kind,
+                "applicable": False,
+            }
+            references = [f"incident:{incident.id}"]
+            if incident.source_kind == "context_resolution_attempt":
+                try:
+                    attempt_id = int(incident.source_record_id)
+                except (TypeError, ValueError):
+                    attempt_id = 0
+                attempt = session.get(ContextResolutionAttempt, attempt_id)
+                if attempt is not None:
+                    data.update(
+                        {
+                            "applicable": True,
+                            "status": attempt.status,
+                            "attempts": attempt.attempts,
+                            "error_class": attempt.error_class,
+                            "next_attempt_at": isoformat(attempt.next_attempt_at),
+                            "claimed": bool(attempt.claim_token),
+                            "updated_at": isoformat(attempt.updated_at),
+                        }
+                    )
+                    references.append(f"context-attempt:{attempt.id}")
+            else:
+                batch = load_management_batch(session, incident)
+                if batch is not None:
+                    data.update(
+                        {
+                            "applicable": True,
+                            "status": batch.status,
+                            "reason_code": batch.reason_code,
+                            "execution_mode": batch.execution_mode,
+                            "started_at": isoformat(batch.started_at),
+                            "completed_at": isoformat(batch.completed_at),
+                            "updated_at": isoformat(batch.updated_at),
+                        }
+                    )
+                    references.append(f"management-batch:{batch.id}")
+            return {"data": data, "evidence_refs": references}
+
+    def service_audit_state(*, incident_id: int):
+        with session_factory() as session:
+            incident = load_incident(session, incident_id)
+        data = {
+            "incident_id": incident.id,
+            "available": False,
+            "last_full_audit_date": None,
+            "last_window_at": None,
+            "last_notification_at": None,
+            "anomaly_present": None,
+        }
+        try:
+            raw = json.loads(monitor_state_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            raw = None
+        if isinstance(raw, dict):
+            data.update(
+                {
+                    "available": True,
+                    "last_full_audit_date": str(
+                        raw.get("last_full_audit_date") or ""
+                    )[:64]
+                    or None,
+                    "last_window_at": str(raw.get("last_window_at") or "")[:64]
+                    or None,
+                    "last_notification_at": str(
+                        raw.get("last_notification_at") or ""
+                    )[:64]
+                    or None,
+                    "anomaly_present": bool(raw.get("anomaly_fingerprint")),
+                }
+            )
+        return {
+            "data": data,
+            "evidence_refs": ["audit-state:production-safety"],
+        }
+
+    def default_journal_reader():
+        try:
+            completed = subprocess.run(
+                (
+                    "journalctl",
+                    "-u",
+                    "telegram-kol.service",
+                    "-n",
+                    "80",
+                    "--output=json",
+                    "--no-pager",
+                ),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ()
+        entries = []
+        for line in completed.stdout.splitlines()[:80]:
+            try:
+                payload = json.loads(line)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            entries.append(
+                {
+                    "priority": str(payload.get("PRIORITY") or "")[:2],
+                    "timestamp": str(
+                        payload.get("__REALTIME_TIMESTAMP") or ""
+                    )[:32],
+                }
+            )
+        return tuple(entries)
+
+    def journal_summary(*, incident_id: int):
+        with session_factory() as session:
+            incident = load_incident(session, incident_id)
+        entries = tuple((journal_reader or default_journal_reader)())[:80]
+        priority_counts: dict[str, int] = {}
+        latest_timestamp = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            priority = str(entry.get("priority") or "unknown")[:16]
+            priority_counts[priority] = priority_counts.get(priority, 0) + 1
+            timestamp = str(entry.get("timestamp") or "")[:64]
+            if timestamp and (
+                latest_timestamp is None or timestamp > latest_timestamp
+            ):
+                latest_timestamp = timestamp
+        return {
+            "data": {
+                "incident_id": incident.id,
+                "available": bool(entries),
+                "entry_count": len(entries),
+                "priority_counts": priority_counts,
+                "latest_timestamp": latest_timestamp,
+            },
+            "evidence_refs": ["journal:telegram-kol"],
+        }
+
+    def stored_exchange_state(session, incident):
+        batch = load_management_batch(session, incident)
+        if batch is None:
+            return []
+        legs = (
+            session.query(StrategyManagementLeg)
+            .filter(StrategyManagementLeg.management_batch_id == batch.id)
+            .order_by(StrategyManagementLeg.leg_index, StrategyManagementLeg.id)
+            .limit(20)
+            .all()
+        )
+        rows = []
+        for leg in legs:
+            try:
+                snapshot = json.loads(leg.last_exchange_snapshot_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                snapshot = {}
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            exchange_status = next(
+                (
+                    snapshot.get(key)
+                    for key in (
+                        "status",
+                        "order_status",
+                        "position_status",
+                        "state",
+                    )
+                    if isinstance(snapshot.get(key), (str, int, float, bool))
+                ),
+                None,
+            )
+            exchange_size = next(
+                (
+                    snapshot.get(key)
+                    for key in ("size", "position_size", "remaining_size")
+                    if isinstance(snapshot.get(key), (str, int, float))
+                ),
+                None,
+            )
+            rows.append(
+                {
+                    "management_leg_id": leg.id,
+                    "leg_index": leg.leg_index,
+                    "local_status": leg.status,
+                    "snapshot_present": bool(snapshot),
+                    "exchange_status": (
+                        str(exchange_status)[:64]
+                        if exchange_status is not None
+                        else None
+                    ),
+                    "exchange_size": (
+                        str(exchange_size)[:64]
+                        if exchange_size is not None
+                        else None
+                    ),
+                }
+            )
+        return rows
+
+    def exchange_snapshot(*, incident_id: int):
+        with session_factory() as session:
+            incident = load_incident(session, incident_id)
+            rows = stored_exchange_state(session, incident)
+            return {
+                "data": {
+                    "incident_id": incident.id,
+                    "snapshot_kind": "durable_last_observed",
+                    "applicable": incident.source_kind
+                    == "strategy_management_batch",
+                    "legs": rows,
+                },
+                "evidence_refs": [f"incident:{incident.id}"],
+            }
+
+    def compare_local_exchange(*, incident_id: int):
+        with session_factory() as session:
+            incident = load_incident(session, incident_id)
+            rows = stored_exchange_state(session, incident)
+            comparisons = [
+                {
+                    "management_leg_id": row["management_leg_id"],
+                    "local_status": row["local_status"],
+                    "exchange_status": row["exchange_status"],
+                    "comparable": row["exchange_status"] is not None,
+                    "matches": (
+                        row["exchange_status"] == row["local_status"]
+                        if row["exchange_status"] is not None
+                        else None
+                    ),
+                }
+                for row in rows
+            ]
+            return {
+                "data": {
+                    "incident_id": incident.id,
+                    "comparison_kind": "local_vs_durable_last_observed",
+                    "applicable": incident.source_kind
+                    == "strategy_management_batch",
+                    "comparisons": comparisons,
+                },
+                "evidence_refs": [f"incident:{incident.id}"],
+            }
+
+    def prior_attempts(*, incident_id: int):
+        with session_factory() as session:
+            current = load_incident(session, incident_id)
+            rows = (
+                session.query(RuntimeIncident)
+                .filter(
+                    RuntimeIncident.fingerprint == current.fingerprint,
+                    RuntimeIncident.id != current.id,
+                )
+                .order_by(
+                    RuntimeIncident.generation.desc(),
+                    RuntimeIncident.id.desc(),
+                )
+                .limit(10)
+                .all()
+            )
+            return {
+                "data": {
+                    "incident_id": current.id,
+                    "attempts": [
+                        {
+                            "incident_id": row.id,
+                            "generation": row.generation,
+                            "status": row.status,
+                            "recovery_status": row.recovery_status,
+                        }
+                        for row in rows
+                    ],
+                },
+                "evidence_refs": [
+                    f"incident:{row.id}" for row in rows
+                ] or [f"incident:{current.id}"],
+            }
+
+    return RuntimeAgentToolRegistry(
+        providers={
+            "get_incident_summary": incident_summary,
+            "get_lifecycle_state": lifecycle_state,
+            "get_worker_state": worker_state,
+            "get_service_audit_state": service_audit_state,
+            "get_journal_summary": journal_summary,
+            "get_exchange_snapshot": exchange_snapshot,
+            "compare_local_exchange": compare_local_exchange,
+            "get_prior_attempts": prior_attempts,
+        },
+        max_output_bytes=max_output_bytes,
+    )
+
+
+@app.command("runtime-incident-agent-once")
+def runtime_incident_agent_once(
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+) -> None:
+    """Diagnose at most one runtime incident through the dormant read-only agent."""
+
+    runtime_config = load_runtime_incident_config()
+    session_factory = create_session_factory(database_path)
+    tools = _build_runtime_agent_cli_tools(
+        session_factory,
+        max_output_bytes=runtime_config.agent_max_tool_output_bytes,
+    )
+    worker_config = RuntimeAgentWorkerConfig(
+        enabled=runtime_config.agent_enabled,
+        max_tool_steps=runtime_config.agent_max_tool_steps,
+        max_wall_seconds=runtime_config.agent_max_wall_seconds,
+        max_prompt_bytes=runtime_config.agent_max_prompt_bytes,
+        max_model_output_bytes=runtime_config.agent_max_tool_output_bytes,
+        claim_lease_seconds=runtime_config.agent_claim_lease_seconds,
+    )
+    if runtime_config.agent_enabled:
+        llm_config = load_llm_proxy_config()
+
+        def model_turn(**kwargs):
+            return request_structured_chat_turn(
+                config=llm_config,
+                messages=kwargs["messages"],
+                tool_schemas=kwargs["tool_schemas"],
+                timeout_seconds=kwargs["timeout_seconds"],
+            )
+
+    else:
+        def model_turn(**kwargs):
+            raise RuntimeError("disabled runtime agent cannot call the model")
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=worker_config,
+        tools=tools,
+        model_turn=model_turn,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "incident_id": result.incident_id,
+                "status": result.status,
+                "tool_steps": result.tool_steps,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+@app.command("runtime-incident-agent-worker")
+def runtime_incident_agent_worker(
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+    poll_seconds: float = typer.Option(
+        5.0, "--poll-seconds", min=0.25, max=60.0
+    ),
+) -> None:
+    """Run the independently supervised runtime incident sidecar loop."""
+
+    runtime_config = load_runtime_incident_config()
+    if not runtime_config.agent_enabled:
+        typer.echo(
+            '{"incident_id":null,"status":"disabled","tool_steps":0}'
+        )
+        return
+    session_factory = create_session_factory(database_path)
+    tools = _build_runtime_agent_cli_tools(
+        session_factory,
+        max_output_bytes=runtime_config.agent_max_tool_output_bytes,
+    )
+    worker_config = RuntimeAgentWorkerConfig(
+        enabled=True,
+        max_tool_steps=runtime_config.agent_max_tool_steps,
+        max_wall_seconds=runtime_config.agent_max_wall_seconds,
+        max_prompt_bytes=runtime_config.agent_max_prompt_bytes,
+        max_model_output_bytes=runtime_config.agent_max_tool_output_bytes,
+        claim_lease_seconds=runtime_config.agent_claim_lease_seconds,
+    )
+    llm_config = load_llm_proxy_config()
+
+    def run_once():
+        return run_runtime_agent_once(
+            session_factory,
+            config=worker_config,
+            tools=tools,
+            model_turn=lambda **kwargs: request_structured_chat_turn(
+                config=llm_config,
+                messages=kwargs["messages"],
+                tool_schemas=kwargs["tool_schemas"],
+                timeout_seconds=kwargs["timeout_seconds"],
+            ),
+        )
+
+    def report(result):
+        typer.echo(
+            json.dumps(
+                {
+                    "incident_id": result.incident_id,
+                    "status": result.status,
+                    "tool_steps": result.tool_steps,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+    try:
+        run_runtime_agent_loop(
+            run_once=run_once,
+            on_result=report,
+            poll_seconds=poll_seconds,
+        )
+    except KeyboardInterrupt:
+        return
+
+
+@app.command("runtime-incident-handoff")
+def runtime_incident_handoff(
+    incident_id: int = typer.Argument(..., min=1),
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+) -> None:
+    """Print the bounded Codex handoff rebuilt from durable ledger fields."""
+
+    session_factory = create_session_factory(database_path)
+    try:
+        handoff = load_runtime_incident_handoff(
+            session_factory,
+            incident_id=incident_id,
+        )
+    except RuntimeIncidentHandoffError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(
+        json.dumps(
+            handoff,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
 
 @app.command("audit-management-batches")

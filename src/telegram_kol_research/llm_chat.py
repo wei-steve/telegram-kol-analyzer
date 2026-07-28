@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -193,6 +194,82 @@ def request_grounded_chat_answer(
         return ""
     _raise_for_error_like_answer(content)
     return content
+
+
+def request_structured_chat_turn(
+    *,
+    config: LLMProxyConfig,
+    messages: list[dict[str, Any]],
+    tool_schemas: list[dict[str, Any]],
+    timeout_seconds: float | None = None,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    """Return one normalized tool call or final JSON object from the proxy."""
+
+    headers = {"Content-Type": "application/json"}
+    if config.api_key:
+        headers["Authorization"] = f"Bearer {config.api_key}"
+    payload = {
+        "model": config.model,
+        "messages": messages,
+        "tools": tool_schemas,
+        "tool_choice": "auto",
+    }
+    created_client = client is None
+    active_client = client or httpx.Client(
+        timeout=timeout_seconds or config.timeout_seconds
+    )
+    try:
+        response = active_client.post(
+            f"{config.base_url.rstrip('/')}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=timeout_seconds or config.timeout_seconds,
+        )
+        response.raise_for_status()
+        data = response.json()
+    finally:
+        if created_client:
+            active_client.close()
+
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise ValueError("structured chat response must contain one choice")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise ValueError("structured chat response is missing a message")
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        if not isinstance(tool_calls, list) or len(tool_calls) != 1:
+            raise ValueError("structured chat response must contain one tool call")
+        tool_call = tool_calls[0]
+        function = tool_call.get("function") if isinstance(tool_call, dict) else None
+        if not isinstance(function, dict):
+            raise ValueError("structured tool call is invalid")
+        arguments = function.get("arguments")
+        try:
+            parsed_arguments = (
+                json.loads(arguments) if isinstance(arguments, str) else arguments
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError("structured tool arguments are invalid JSON") from exc
+        return {
+            "tool_call": {
+                "id": tool_call.get("id"),
+                "name": function.get("name"),
+                "arguments": parsed_arguments,
+            }
+        }
+    content = message.get("content")
+    if not isinstance(content, str):
+        raise ValueError("structured chat response has no final JSON")
+    try:
+        final = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError("structured chat final is invalid JSON") from exc
+    if not isinstance(final, dict):
+        raise ValueError("structured chat final must be an object")
+    return {"final": final}
 
 
 def _request_chat_completion(

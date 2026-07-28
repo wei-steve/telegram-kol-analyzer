@@ -124,6 +124,45 @@ the local `delivered` commit may repeat it after lease expiry. The fixed
 `事件ID` is the operator deduplication marker; committed successes are never
 reclaimed.
 
+### Phase 3 read-only Agent sidecar
+
+Phase 3 adds a separately supervised worker and keeps it dormant by default:
+
+- `TELEGRAM_KOL_RUNTIME_AGENT_ENABLED`: only `1`, `true`, `yes`, or `on`
+  enables diagnosis. Empty or any other value leaves the worker disabled.
+- `TELEGRAM_KOL_RUNTIME_AGENT_MAX_TOOL_STEPS`: bounded to 1–4.
+- `TELEGRAM_KOL_RUNTIME_AGENT_MAX_WALL_SECONDS`: bounded to 5–120 seconds.
+- `TELEGRAM_KOL_RUNTIME_AGENT_MAX_PROMPT_BYTES`: bounded to 4096–32768 bytes.
+- `TELEGRAM_KOL_RUNTIME_AGENT_MAX_TOOL_OUTPUT_BYTES`: bounded to 512–32768
+  bytes.
+- `TELEGRAM_KOL_RUNTIME_AGENT_CLAIM_LEASE_SECONDS`: bounded to 5–3600 seconds.
+
+The reviewed unit is
+`deploy/systemd/telegram-kol-runtime-agent.service`. Install it only with:
+
+```bash
+sudo /opt/telegram-kol-analyzer/scripts/install_runtime_agent_sidecar.sh
+```
+
+The installer refuses an active or enabled unit and leaves the installed unit
+disabled and inactive. Deployment of Phase 3 code and unit installation must
+therefore create no Agent process. The worker may be started for a synthetic
+canary only after the normal service passes the post-deployment continuity
+checks and the environment file explicitly enables the Agent.
+
+Each incident generation permits at most three model attempts. Failures use a
+durable 5-second, then 10-second retry schedule; the third failure escalates
+without another automatic model call. Tool transcripts, individual tool
+outputs, model turns, wall time, and repeated calls are independently bounded.
+
+Immediate Phase 3 rollback is:
+
+1. stop and disable `telegram-kol-runtime-agent.service`;
+2. clear `TELEGRAM_KOL_RUNTIME_AGENT_ENABLED`;
+3. leave capture and deterministic Phase 2 notification settings unchanged;
+4. confirm `telegram-kol.service`, listener, recognition, contextual
+   resolution, management, and reconciliation remain active.
+
 ## Rollback
 
 1. Disable the newest phase feature flag.

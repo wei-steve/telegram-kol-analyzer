@@ -393,7 +393,13 @@ def record_runtime_incident(
 
 def _claimable(now: datetime):
     return or_(
-        RuntimeIncident.status.in_((_CLAIMABLE_STATUS, "retry_pending")),
+        and_(
+            RuntimeIncident.status.in_((_CLAIMABLE_STATUS, "retry_pending")),
+            or_(
+                RuntimeIncident.agent_next_attempt_at.is_(None),
+                RuntimeIncident.agent_next_attempt_at <= now,
+            ),
+        ),
         and_(
             RuntimeIncident.status == _CLAIMED_STATUS,
             RuntimeIncident.claim_expires_at.is_not(None),
@@ -427,6 +433,55 @@ def list_claimable_runtime_incidents(
         return rows
 
 
+def find_reusable_runtime_incident_diagnosis(
+    session_factory: sessionmaker,
+    *,
+    fingerprint: str,
+    exclude_incident_id: int,
+) -> RuntimeIncident | None:
+    """Return the newest completed diagnosis for the same redacted fingerprint."""
+
+    normalized_fingerprint = _validate_required_text(
+        "fingerprint", fingerprint, maximum=64
+    )
+    with session_factory() as session:
+        row = (
+            session.query(RuntimeIncident)
+            .filter(
+                RuntimeIncident.fingerprint == normalized_fingerprint,
+                RuntimeIncident.id != int(exclude_incident_id),
+                RuntimeIncident.status == "diagnosed",
+                RuntimeIncident.diagnosis_json.is_not(None),
+                RuntimeIncident.evidence_refs_json.is_not(None),
+            )
+            .order_by(
+                RuntimeIncident.generation.desc(),
+                RuntimeIncident.updated_at.desc(),
+                RuntimeIncident.id.desc(),
+            )
+            .first()
+        )
+        if row is None:
+            return None
+        session.expunge(row)
+        return row
+
+
+def get_runtime_incident(
+    session_factory: sessionmaker,
+    *,
+    incident_id: int,
+) -> RuntimeIncident | None:
+    """Return one detached incident row for bounded read-only presentation."""
+
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, int(incident_id))
+        if row is None:
+            return None
+        session.expunge(row)
+        return row
+
+
 def claim_runtime_incident(
     session_factory: sessionmaker,
     *,
@@ -452,6 +507,8 @@ def claim_runtime_incident(
                 claim_token=token,
                 claimed_at=claimed_at,
                 claim_expires_at=claim_expires_at,
+                agent_attempt_count=RuntimeIncident.agent_attempt_count + 1,
+                agent_next_attempt_at=None,
                 updated_at=claimed_at,
             )
             .returning(RuntimeIncident.id)
@@ -476,6 +533,8 @@ def transition_runtime_incident(
     evidence_refs_json: str | None = None,
     playbook_name: str | None = None,
     recovery_status: str | None = None,
+    queue_notification: bool = False,
+    agent_next_attempt_at: datetime | None = None,
 ) -> bool:
     """Apply a token-checked lifecycle transition without loading stale state."""
 
@@ -516,6 +575,17 @@ def transition_runtime_incident(
         values["recovery_status"] = _validate_required_text(
             "recovery_status", recovery_status, maximum=32
         )
+    if queue_notification:
+        values.update(
+            notification_status="pending",
+            notification_claim_token=None,
+            notification_claimed_at=None,
+            notified_at=None,
+        )
+    if agent_next_attempt_at is not None:
+        values["agent_next_attempt_at"] = agent_next_attempt_at
+    elif target in {"diagnosed", "escalated", "resolved", "closed"}:
+        values["agent_next_attempt_at"] = None
     if target != _CLAIMED_STATUS:
         values.update(
             claim_token=None,

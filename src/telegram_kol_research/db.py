@@ -47,6 +47,16 @@ REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES = frozenset(
 
 
 SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
+    "runtime_incidents": {
+        "agent_attempt_count": (
+            "ALTER TABLE runtime_incidents "
+            "ADD COLUMN agent_attempt_count INTEGER NOT NULL DEFAULT 0"
+        ),
+        "agent_next_attempt_at": (
+            "ALTER TABLE runtime_incidents "
+            "ADD COLUMN agent_next_attempt_at DATETIME"
+        ),
+    },
     "trigger_protection_stop_rescues": {
         "error_json": (
             "ALTER TABLE trigger_protection_stop_rescues ADD COLUMN error_json TEXT"

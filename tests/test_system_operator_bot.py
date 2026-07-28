@@ -80,6 +80,88 @@ def test_runtime_incident_notification_has_fixed_bounded_redacted_labels(tmp_pat
     assert 0 < len(rendered) <= operator_bot_module.RUNTIME_INCIDENT_MESSAGE_MAX_CHARS
 
 
+def test_runtime_incident_diagnosis_notification_labels_hypothesis_and_no_action(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "runtime-diagnosis.db")
+    incident = _record_runtime_incident(session_factory)
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        row.status = "diagnosed"
+        row.diagnosis_json = json.dumps(
+            {
+                "hypothesis": "Provider retry exhaustion.",
+                "confidence": "medium",
+                "missing_evidence": ["current provider health"],
+                "recommended_playbook": None,
+                "auto_handle_eligible": False,
+                "codex_handoff_required": True,
+                "remaining_risk": "Source job unresolved.",
+                "attempted_queries": ["get_incident_summary"],
+            }
+        )
+        row.evidence_refs_json = f'["incident:{incident.id}"]'
+        rendered = operator_bot_module.format_runtime_incident_diagnosis_notification(
+            row
+        )
+
+    assert "AI诊断假设: Provider retry exhaustion." in rendered
+    assert "置信度: medium" in rendered
+    assert "Codex交接: 需要" in rendered
+    assert "自动操作: 未执行" in rendered
+    assert 0 < len(rendered) <= operator_bot_module.RUNTIME_INCIDENT_MESSAGE_MAX_CHARS
+
+
+def test_runtime_incident_delivery_uses_diagnosis_report_for_diagnosed_row(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "runtime-diagnosis-send.db")
+    incident = _record_runtime_incident(session_factory)
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        row.status = "diagnosed"
+        row.diagnosis_json = json.dumps(
+            {
+                "hypothesis": "Provider retry exhaustion.",
+                "confidence": "medium",
+                "missing_evidence": [],
+                "recommended_playbook": None,
+                "auto_handle_eligible": False,
+                "codex_handoff_required": True,
+                "remaining_risk": "Source job unresolved.",
+                "attempted_queries": ["get_incident_summary"],
+            }
+        )
+        row.evidence_refs_json = f'["incident:{incident.id}"]'
+        session.commit()
+    delivered_text = []
+
+    async def capture(**kwargs):
+        delivered_text.append(kwargs["text"])
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "send_system_operator_bot_message",
+        capture,
+    )
+
+    delivered = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=RuntimeIncidentConfig(
+                telegram_notifications_enabled=True
+            ),
+            claimed_at=NOW,
+        )
+    )
+
+    assert delivered == 1
+    assert delivered_text[0].startswith("【运行异常 AI 诊断】")
+    assert "AI诊断假设: Provider retry exhaustion." in delivered_text[0]
+
+
 def test_runtime_incident_delivery_is_disabled_without_claiming(tmp_path):
     session_factory = create_session_factory(tmp_path / "runtime-disabled.db")
     incident = _record_runtime_incident(session_factory)

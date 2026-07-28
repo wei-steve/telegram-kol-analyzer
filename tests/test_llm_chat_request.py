@@ -6,6 +6,7 @@ from telegram_kol_research.llm_chat import (
     build_proxy_chat_payload,
     load_llm_proxy_config,
     request_grounded_chat_answer,
+    request_structured_chat_turn,
 )
 
 
@@ -60,6 +61,95 @@ def test_request_grounded_chat_answer_reads_openai_compatible_response():
     )
 
     assert answer == "Grounded answer [1]"
+
+
+def test_request_structured_chat_turn_normalizes_one_tool_call():
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = request.read().decode("utf-8")
+        assert '"tool_choice":"auto"' in payload
+        assert '"name":"get_incident_summary"' in payload
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_incident_summary",
+                                        "arguments": '{"incident_id":17}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    turn = request_structured_chat_turn(
+        config=LLMProxyConfig(
+            base_url="http://proxy.test",
+            api_key="secret",
+            model="gpt-test",
+            timeout_seconds=5,
+        ),
+        messages=[{"role": "system", "content": "Read-only diagnosis."}],
+        tool_schemas=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_incident_summary",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        timeout_seconds=3,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert turn == {
+        "tool_call": {
+            "id": "call-1",
+            "name": "get_incident_summary",
+            "arguments": {"incident_id": 17},
+        }
+    }
+
+
+def test_request_structured_chat_turn_normalizes_closed_final_json():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"incident_id":17,"confidence":"low"}'
+                        }
+                    }
+                ]
+            },
+        )
+
+    turn = request_structured_chat_turn(
+        config=LLMProxyConfig(
+            base_url="http://proxy.test",
+            api_key="",
+            model="gpt-test",
+            timeout_seconds=5,
+        ),
+        messages=[{"role": "system", "content": "Read-only diagnosis."}],
+        tool_schemas=[],
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert turn == {"final": {"incident_id": 17, "confidence": "low"}}
 
 
 def test_request_grounded_chat_answer_raises_for_image_input_error_text_in_success_payload():

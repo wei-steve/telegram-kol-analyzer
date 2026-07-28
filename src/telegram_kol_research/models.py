@@ -1789,6 +1789,12 @@ class RuntimeIncident(Base):
     repeat_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default=text("1")
     )
+    agent_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    agent_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
     first_occurred_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     last_occurred_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)

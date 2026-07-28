@@ -30,6 +30,22 @@ FORBIDDEN_SYMBOL_FRAGMENTS = (
 ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
     "runtime_incidents.py": frozenset({"models"}),
     "runtime_incident_adapters.py": frozenset({"config", "runtime_incidents"}),
+    "runtime_agent_contracts.py": frozenset(),
+    "runtime_agent_tools.py": frozenset({"runtime_agent_contracts"}),
+    "runtime_agent_prompt.py": frozenset({"runtime_agent_contracts"}),
+    "runtime_agent_worker.py": frozenset(
+        {
+            "llm_chat",
+            "runtime_agent_contracts",
+            "runtime_agent_tools",
+            "runtime_agent_prompt",
+            "runtime_incident_handoff",
+            "runtime_incidents",
+        }
+    ),
+    "runtime_incident_handoff.py": frozenset(
+        {"runtime_agent_contracts", "runtime_incidents"}
+    ),
 }
 
 

@@ -147,6 +147,42 @@ def format_runtime_incident_notification(incident) -> str:
     return rendered[:RUNTIME_INCIDENT_MESSAGE_MAX_CHARS]
 
 
+def format_runtime_incident_diagnosis_notification(incident) -> str:
+    """Render a bounded Phase 3 hypothesis report with no action authority."""
+
+    try:
+        diagnosis = json.loads(incident.diagnosis_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        diagnosis = {}
+    if not isinstance(diagnosis, dict):
+        diagnosis = {}
+    handoff_required = diagnosis.get("codex_handoff_required") is True
+    missing = diagnosis.get("missing_evidence")
+    if isinstance(missing, list):
+        missing_text = "; ".join(str(item) for item in missing[:4]) or "-"
+    else:
+        missing_text = "-"
+    lines = [
+        "【运行异常 AI 诊断】",
+        f"事件ID: {int(incident.id)}",
+        f"类型: {_safe_runtime_incident_value(incident.incident_type, limit=64)}",
+        (
+            "AI诊断假设: "
+            f"{_safe_runtime_incident_value(diagnosis.get('hypothesis'), limit=320)}"
+        ),
+        f"置信度: {_safe_runtime_incident_value(diagnosis.get('confidence'), limit=16)}",
+        f"缺失证据: {_safe_runtime_incident_value(missing_text, limit=240)}",
+        (
+            "剩余风险: "
+            f"{_safe_runtime_incident_value(diagnosis.get('remaining_risk'), limit=240)}"
+        ),
+        f"Codex交接: {'需要' if handoff_required else '不需要'}",
+        "自动操作: 未执行",
+        "边界: 未参与策略识别或上下文策略解析。",
+    ]
+    return "\n".join(lines)[:RUNTIME_INCIDENT_MESSAGE_MAX_CHARS]
+
+
 def _safe_runtime_incident_value(value: Any, *, limit: int) -> str:
     text = str(value or "-").strip()
     lowered = text.lower()
@@ -1047,7 +1083,12 @@ async def deliver_runtime_incident_notifications(
         try:
             await send_system_operator_bot_message(
                 config=config,
-                text=format_runtime_incident_notification(incident),
+                text=(
+                    format_runtime_incident_diagnosis_notification(incident)
+                    if incident.status == "diagnosed"
+                    and incident.diagnosis_json
+                    else format_runtime_incident_notification(incident)
+                ),
             )
         except Exception as exc:
             failed_at = operation_now

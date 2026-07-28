@@ -66,3 +66,16 @@ def test_runtime_incident_table_is_added_to_an_existing_database(tmp_path):
         assert connection.execute(
             "SELECT display_name FROM sources WHERE telegram_sender_id = 7"
         ).fetchone() == ("Legacy Source",)
+
+
+def test_runtime_incident_agent_retry_columns_have_additive_compat_migrations():
+    statements = SQLITE_COMPAT_COLUMNS["runtime_incidents"]
+
+    assert "agent_attempt_count" in statements
+    assert "agent_next_attempt_at" in statements
+    assert "ADD COLUMN agent_attempt_count INTEGER NOT NULL DEFAULT 0" in (
+        statements["agent_attempt_count"]
+    )
+    assert "ADD COLUMN agent_next_attempt_at DATETIME" in (
+        statements["agent_next_attempt_at"]
+    )

@@ -1,0 +1,49 @@
+[Unit]
+Description=Telegram KOL read-only runtime incident agent sidecar
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
+
+[Service]
+Type=simple
+User=telegram-kol-agent
+Group=telegram-kol-agent
+SupplementaryGroups=systemd-journal
+UMask=0077
+WorkingDirectory=/opt/telegram-kol-analyzer
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research runtime-incident-agent-worker --database-path /opt/telegram-kol-analyzer/data/research.db --poll-seconds 5
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateMounts=true
+PrivateTmp=true
+ProcSubset=pid
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged
+ReadOnlyPaths=/opt/telegram-kol-analyzer
+ReadWritePaths=/opt/telegram-kol-analyzer/data
+
+[Install]
+WantedBy=multi-user.target
