@@ -8,15 +8,30 @@ project: runtime-incident-agent
 design_version: 1
 current_phase: 1
 phase_name: durable-runtime-incident-ledger
-phase_status: planned
+phase_status: in_progress
 last_completed_phase: 0
 last_completed_commit: 52a7eff
-production_commit: not-required-for-documentation-only-phase
+production_commit: 1488520b1674a736ba53f0a75fae018a57b6b645
 local_tests:
-  - documentation-files-present
-server_verification: not-required-for-documentation-only-phase
+  - "phase-1-required-regressions: 213 passed"
+  - "full-suite: 2521 passed, 1 skipped"
+server_verification:
+  status: partial
+  deployed_commit: 1488520b1674a736ba53f0a75fae018a57b6b645
+  service: active
+  additive_table: present-and-empty
+  listener: post-restart-message-persisted
+  recognition: post-restart-message-completed
+  checkpoint: covers-post-restart-message
+  reconciliation_backlog: unchanged-at-168
+  incident_agent_behavior: dormant
+  safety_audit: stable-complete-baseline-audit_abnormal
+  remaining: "Repeat a controlled safe-window restart and prove the journal has no graceful-shutdown timeout, stop-sigterm timeout, or SIGKILL before completing Phase 1."
 enabled_flags: []
-known_issues: []
+known_issues:
+  - "The deployment restart completed and message continuity was proven, but Uvicorn logged `timeout graceful shutdown exceeded`; the bounded-restart gate is not complete."
+  - "The pre-existing production safety baseline remains `audit_abnormal` (31 blocked, 1 partial_failed, 5 recovery_required); the no-notify audit itself was stable and complete."
+  - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
 phase_7_explicitly_approved: false
 next_session_prompt: "请执行自定义ai agent的下一步实施"
 ```
@@ -58,14 +73,28 @@ When the user says `请执行自定义ai agent的下一步实施`:
 
 Phase 1 is not complete until:
 
-- [ ] additive incident model and bootstrap path are tested;
-- [ ] same-fingerprint deduplication is tested;
-- [ ] claim transitions are concurrency-safe;
-- [ ] bounded/redacted storage is tested;
-- [ ] architecture-boundary test passes;
-- [ ] context-resolution and management regressions pass;
-- [ ] changes are committed and pushed;
-- [ ] a safe deployment window is proven;
-- [ ] production is updated with all agent flags off;
+- [x] additive incident model and bootstrap path are tested;
+- [x] same-fingerprint deduplication is tested;
+- [x] claim transitions are concurrency-safe;
+- [x] bounded/redacted storage is tested;
+- [x] architecture-boundary test passes;
+- [x] context-resolution and management regressions pass;
+- [x] changes are committed and pushed;
+- [x] a safe deployment window is proven;
+- [x] production is updated with all agent flags off;
 - [ ] service, listener, reconciliation, and safety monitor are verified;
 - [ ] this file advances to Phase 2.
+
+## Phase 1 Progress
+
+- Local implementation commit: `1488520` (`feat: add runtime incident ledger`)
+- GitHub push: completed on `codex/deepcoin-auto-trading-v1`
+- Production deployment: completed with all incident-agent behavior dormant
+- Additive schema: `runtime_incidents` exists and contains zero rows
+- Continuity evidence: a message received after restart was persisted, covered
+  by the checkpoint, and completed authoritative recognition; no post-restart
+  recognition gap was found
+- Exact remaining verification: perform one later controlled restart in a
+  proven safe window and require a clean old-process shutdown journal with no
+  graceful timeout, stop timeout, or `SIGKILL`; then rerun the stable no-notify
+  safety audit and advance only to Phase 2
