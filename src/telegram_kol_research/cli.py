@@ -205,6 +205,25 @@ _MAX_DECIMAL_FIXED_CHARS = 128
 _WEB_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 10
 
 
+def _build_web_server(app_instance, *, host: str, port: int):
+    """Close long-lived SSE streams before Uvicorn waits for requests to drain."""
+
+    import uvicorn
+
+    class WebServer(uvicorn.Server):
+        async def shutdown(self, sockets=None) -> None:
+            app_instance.state.live_update_broker.close()
+            await super().shutdown(sockets=sockets)
+
+    config = uvicorn.Config(
+        app_instance,
+        host=host,
+        port=port,
+        timeout_graceful_shutdown=_WEB_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+    )
+    return WebServer(config=config)
+
+
 class ManagementAuditSnapshotError(RuntimeError):
     """Source files could not produce two identical coherent private snapshots."""
 
@@ -2973,12 +2992,12 @@ def web(
         deepcoin_contract_spec_provider=deepcoin_contract_spec_provider,
     )
     try:
-        uvicorn.run(
+        server = _build_web_server(
             app_instance,
             host=host,
             port=port,
-            timeout_graceful_shutdown=_WEB_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
         )
+        server.run()
     finally:
         if telegram_session_lock_entered and telegram_session_lock is not None:
             telegram_session_lock.__exit__(None, None, None)

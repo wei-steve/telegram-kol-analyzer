@@ -1,8 +1,12 @@
+import asyncio
+from types import SimpleNamespace
+
 from typer.testing import CliRunner
 from pathlib import Path
 
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.cli import app
+from telegram_kol_research import cli as cli_module
 
 
 def test_web_command_is_available_in_help():
@@ -11,6 +15,51 @@ def test_web_command_is_available_in_help():
     assert result.exit_code == 0
     assert "web" in result.stdout
     assert "alerts" in result.stdout
+
+
+def test_web_server_closes_live_update_streams_before_uvicorn_shutdown(monkeypatch):
+    shutdown_order = []
+    broker = cli_module.LiveUpdateBroker()
+    stream = broker.stream()
+
+    class FakeConfig:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeServer:
+        def __init__(self, config):
+            self.config = config
+
+        async def shutdown(self, sockets=None):
+            try:
+                await anext(stream)
+            except StopAsyncIteration:
+                shutdown_order.append("live_updates_closed")
+            else:
+                raise AssertionError("live update stream remained open")
+            shutdown_order.append("uvicorn_shutdown")
+
+    monkeypatch.setattr("uvicorn.Config", FakeConfig)
+    monkeypatch.setattr("uvicorn.Server", FakeServer)
+    app_instance = SimpleNamespace(
+        state=SimpleNamespace(live_update_broker=broker)
+    )
+
+    async def run_shutdown():
+        assert await anext(stream) == ": keep-alive\n\n"
+        server = cli_module._build_web_server(
+            app_instance,
+            host="127.0.0.1",
+            port=8123,
+        )
+        await server.shutdown()
+        return server
+
+    server = asyncio.run(run_shutdown())
+
+    assert shutdown_order == ["live_updates_closed", "uvicorn_shutdown"]
+    assert server.config.kwargs["timeout_graceful_shutdown"] == 10
 
 
 def test_web_command_starts_app_for_semantic_review_without_telegram_credentials(
@@ -41,14 +90,17 @@ groups:
         captured["deepcoin_contract_spec_provider"] = deepcoin_contract_spec_provider
         return object()
 
-    def fake_run(app_instance, host, port, **kwargs):
+    def fake_build_web_server(app_instance, *, host, port):
         captured["app_instance"] = app_instance
         captured["host"] = host
         captured["port"] = port
-        captured["uvicorn_kwargs"] = kwargs
+        return SimpleNamespace(run=lambda: None)
 
     monkeypatch.setattr("telegram_kol_research.cli.create_web_app", fake_create_web_app, raising=False)
-    monkeypatch.setattr("uvicorn.run", fake_run)
+    monkeypatch.setattr(
+        "telegram_kol_research.cli._build_web_server",
+        fake_build_web_server,
+    )
     monkeypatch.setattr(
         "telegram_kol_research.cli.load_telegram_auth_config",
         lambda: (_ for _ in ()).throw(ValueError("TELEGRAM_API_ID is required")),
@@ -77,7 +129,6 @@ groups:
     assert captured["group_config"].groups[0].chat_title == "Demo Group"
     assert captured["deepcoin_contract_spec_provider"].get_contract_spec("BTC-USDT-SWAP") is None
     assert captured["port"] == 8123
-    assert captured["uvicorn_kwargs"]["timeout_graceful_shutdown"] == 10
     assert captured["live_listener_status_reason"] == "缺少 Telegram API 凭据或 Telethon 运行依赖"
 
 
@@ -103,7 +154,10 @@ contracts:
         return object()
 
     monkeypatch.setattr("telegram_kol_research.cli.create_web_app", fake_create_web_app, raising=False)
-    monkeypatch.setattr("uvicorn.run", lambda app_instance, host, port, **kwargs: None)
+    monkeypatch.setattr(
+        "telegram_kol_research.cli._build_web_server",
+        lambda app_instance, host, port: SimpleNamespace(run=lambda: None),
+    )
     monkeypatch.setattr(
         "telegram_kol_research.cli.load_telegram_auth_config",
         lambda: (_ for _ in ()).throw(ValueError("TELEGRAM_API_ID is required")),
@@ -157,7 +211,10 @@ groups:
         return object()
 
     monkeypatch.setattr("telegram_kol_research.cli.create_web_app", fake_create_web_app, raising=False)
-    monkeypatch.setattr("uvicorn.run", lambda app_instance, host, port, **kwargs: None)
+    monkeypatch.setattr(
+        "telegram_kol_research.cli._build_web_server",
+        lambda app_instance, host, port: SimpleNamespace(run=lambda: None),
+    )
     monkeypatch.setattr(
         "telegram_kol_research.cli.load_telegram_auth_config",
         lambda: TelegramAuthConfig(
@@ -216,7 +273,10 @@ groups:
         return object()
 
     monkeypatch.setattr("telegram_kol_research.cli.create_web_app", fake_create_web_app, raising=False)
-    monkeypatch.setattr("uvicorn.run", lambda app_instance, host, port, **kwargs: None)
+    monkeypatch.setattr(
+        "telegram_kol_research.cli._build_web_server",
+        lambda app_instance, host, port: SimpleNamespace(run=lambda: None),
+    )
     monkeypatch.setattr(
         "telegram_kol_research.cli.load_telegram_auth_config",
         lambda: TelegramAuthConfig(
