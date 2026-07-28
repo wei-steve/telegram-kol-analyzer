@@ -31,7 +31,7 @@ class RuntimeIncidentConfig:
     agent_max_tool_output_bytes: int = 8192
     agent_claim_lease_seconds: float = 120.0
     feature_policy_version: str = "runtime-incident-phase-3-v1"
-    prompt_version: str = "runtime-agent-prompt-v1"
+    prompt_version: str = "runtime-agent-prompt-v2"
     tool_policy_version: str = "runtime-agent-tools-v1"
 
     def captures(self, incident_type: str) -> bool:

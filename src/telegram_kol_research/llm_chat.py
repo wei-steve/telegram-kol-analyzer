@@ -223,6 +223,8 @@ def request_structured_chat_turn(
                 "parallel_tool_calls": False,
             }
         )
+    else:
+        payload["response_format"] = {"type": "json_object"}
     created_client = client is None
     active_client = client or httpx.Client(
         timeout=timeout_seconds or config.timeout_seconds

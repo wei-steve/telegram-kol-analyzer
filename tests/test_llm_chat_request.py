@@ -128,6 +128,7 @@ def test_request_structured_chat_turn_normalizes_closed_final_json():
         assert '"tools"' not in payload
         assert '"tool_choice"' not in payload
         assert '"parallel_tool_calls"' not in payload
+        assert '"response_format":{"type":"json_object"}' in payload
         return httpx.Response(
             200,
             request=request,

@@ -489,6 +489,7 @@ def claim_runtime_incident(
     claim_token: str,
     claimed_at: datetime,
     claim_expires_at: datetime,
+    prompt_version: str | None = None,
 ) -> RuntimeIncident | None:
     """Claim one row through a compare-and-set update."""
 
@@ -496,21 +497,26 @@ def claim_runtime_incident(
     if claim_expires_at <= claimed_at:
         raise ValueError("claim_expires_at must be after claimed_at")
     with session_factory() as session:
+        claim_values: dict[str, object | None] = {
+            "status": _CLAIMED_STATUS,
+            "claim_token": token,
+            "claimed_at": claimed_at,
+            "claim_expires_at": claim_expires_at,
+            "agent_attempt_count": RuntimeIncident.agent_attempt_count + 1,
+            "agent_next_attempt_at": None,
+            "updated_at": claimed_at,
+        }
+        if prompt_version is not None:
+            claim_values["prompt_version"] = _validate_required_text(
+                "prompt_version", prompt_version, maximum=64
+            )
         incident_id_result = session.execute(
             update(RuntimeIncident)
             .where(
                 RuntimeIncident.id == int(incident_id),
                 _claimable(claimed_at),
             )
-            .values(
-                status=_CLAIMED_STATUS,
-                claim_token=token,
-                claimed_at=claimed_at,
-                claim_expires_at=claim_expires_at,
-                agent_attempt_count=RuntimeIncident.agent_attempt_count + 1,
-                agent_next_attempt_at=None,
-                updated_at=claimed_at,
-            )
+            .values(**claim_values)
             .returning(RuntimeIncident.id)
         ).scalar_one_or_none()
         session.commit()
@@ -535,6 +541,7 @@ def transition_runtime_incident(
     recovery_status: str | None = None,
     queue_notification: bool = False,
     agent_next_attempt_at: datetime | None = None,
+    prompt_version: str | None = None,
 ) -> bool:
     """Apply a token-checked lifecycle transition without loading stale state."""
 
@@ -584,7 +591,11 @@ def transition_runtime_incident(
         )
     if agent_next_attempt_at is not None:
         values["agent_next_attempt_at"] = agent_next_attempt_at
-    elif target in {"diagnosed", "escalated", "resolved", "closed"}:
+    if prompt_version is not None:
+        values["prompt_version"] = _validate_required_text(
+            "prompt_version", prompt_version, maximum=64
+        )
+    if target in {"diagnosed", "escalated", "resolved", "closed"}:
         values["agent_next_attempt_at"] = None
     if target != _CLAIMED_STATUS:
         values.update(

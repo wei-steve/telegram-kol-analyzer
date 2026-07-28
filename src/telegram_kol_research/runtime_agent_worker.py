@@ -15,7 +15,10 @@ from telegram_kol_research.runtime_agent_contracts import (
     RuntimeAgentDiagnosis,
     RuntimeAgentToolCall,
 )
-from telegram_kol_research.runtime_agent_prompt import build_runtime_agent_messages
+from telegram_kol_research.runtime_agent_prompt import (
+    RUNTIME_AGENT_PROMPT_VERSION,
+    build_runtime_agent_messages,
+)
 from telegram_kol_research.runtime_agent_tools import (
     RuntimeAgentToolError,
     RuntimeAgentToolRegistry,
@@ -236,6 +239,7 @@ def _commit_diagnosis(
     claim_token: str,
     diagnosis: RuntimeAgentDiagnosis,
     now: datetime,
+    prompt_version: str | None = None,
 ) -> bool:
     diagnosis_json = json.dumps(
         diagnosis.to_ledger_mapping(),
@@ -259,6 +263,7 @@ def _commit_diagnosis(
         evidence_refs_json=evidence_json,
         playbook_name=diagnosis.recommended_playbook_name,
         queue_notification=True,
+        prompt_version=prompt_version,
     )
 
 
@@ -326,6 +331,7 @@ def run_runtime_agent_once(
         claimed_at=operation_now,
         claim_expires_at=operation_now
         + timedelta(seconds=max(5.0, min(config.claim_lease_seconds, 3600.0))),
+        prompt_version=RUNTIME_AGENT_PROMPT_VERSION,
     )
     if claimed is None:
         return RuntimeAgentWorkerResult(status="claim_lost", incident_id=candidate.id)
@@ -362,6 +368,7 @@ def run_runtime_agent_once(
                 claim_token=claim_token,
                 diagnosis=diagnosis,
                 now=operation_now,
+                prompt_version=reusable.prompt_version,
             ):
                 return RuntimeAgentWorkerResult(
                     status="claim_lost", incident_id=claimed.id

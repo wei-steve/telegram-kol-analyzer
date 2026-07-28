@@ -184,6 +184,7 @@ def test_worker_runs_bounded_tool_loop_and_commits_structured_diagnosis(tmp_path
     with session_factory() as session:
         row = session.get(RuntimeIncident, incident.id)
         assert row.status == "diagnosed"
+        assert row.prompt_version == "runtime-agent-prompt-v2"
         assert "Provider retries may have been exhausted." in row.diagnosis_json
         assert row.evidence_refs_json == (
             f'["incident:{incident.id}","worker-job:42"]'
@@ -436,5 +437,6 @@ def test_worker_reuses_same_fingerprint_diagnosis_without_model_call(tmp_path):
     with session_factory() as session:
         row = session.get(RuntimeIncident, second.id)
         assert row.status == "diagnosed"
+        assert row.prompt_version == first.prompt_version
         assert "Known provider outage" in row.diagnosis_json
         assert f"incident:{second.id}" in row.evidence_refs_json
