@@ -9,6 +9,7 @@ let promptCenterState = {
 };
 let hasDeferredMessageRefresh = false;
 let recoveryRefreshPromise = null;
+let pendingPositionsFragment = null;
 const STRATEGY_RECORD_FILTER_KEY = 'telegram-workbench:strategy-filter';
 const STRATEGY_RECORD_GROUP_KEY = 'telegram-workbench:strategy-group';
 const STRATEGY_RECORD_SCROLL_KEY = 'telegram-workbench:strategy-scroll';
@@ -1704,17 +1705,72 @@ function bindStrategyRecordController() {
   updateStrategyRecordChangesBadge();
 }
 
-async function loadPositionsPanel() {
+function commitPositionsPanel(fragment) {
   const container = document.querySelector('[data-lazy-workbench="positions"]');
-  if (!container) return;
-  const fragment = await fetchWorkbenchPartial('/positions-panel', '[data-exchange-position-tabs]');
-  container.innerHTML = '';
-  container.appendChild(fragment);
+  if (!container || !fragment) return false;
+  container.replaceChildren(fragment);
+  pendingPositionsFragment = null;
   bindDashboardTabs();
   bindExchangePositionTabs();
   bindBoundPositionCloseButtons();
   bindDeepcoinPositionSync();
   bindLivePositionAttributionButtons();
+  return true;
+}
+
+function clearPendingPositionsRefreshNotice() {
+  document.querySelector('[data-positions-refresh-notice]')?.remove();
+}
+
+function applyPendingPositionsRefresh() {
+  if (!pendingPositionsFragment) return false;
+  const fragment = pendingPositionsFragment;
+  clearPendingPositionsRefreshNotice();
+  return commitPositionsPanel(fragment);
+}
+
+function showPendingPositionsRefreshNotice() {
+  const container = document.querySelector('[data-lazy-workbench="positions"]');
+  if (!container || container.querySelector('[data-positions-refresh-notice]')) return;
+  const notice = document.createElement('aside');
+  notice.className = 'positions-refresh-notice';
+  notice.dataset.positionsRefreshNotice = '';
+  notice.setAttribute('role', 'status');
+  notice.setAttribute('aria-live', 'polite');
+  const message = document.createElement('span');
+  message.textContent = '检测到新的持仓数据';
+  const applyButton = document.createElement('button');
+  applyButton.type = 'button';
+  applyButton.className = 'secondary-button';
+  applyButton.textContent = '点击更新';
+  applyButton.addEventListener('click', applyPendingPositionsRefresh);
+  notice.append(message, applyButton);
+  container.prepend(notice);
+}
+
+async function checkPositionsPanelForChanges() {
+  const container = document.querySelector('[data-lazy-workbench="positions"]');
+  const current = container?.querySelector('[data-exchange-position-tabs]');
+  if (!container || !current) return false;
+  try {
+    const fragment = await fetchWorkbenchPartial('/positions-panel', '[data-exchange-position-tabs]');
+    if (current !== container.querySelector('[data-exchange-position-tabs]')) return false;
+    if (current.outerHTML === fragment.outerHTML) {
+      pendingPositionsFragment = null;
+      clearPendingPositionsRefreshNotice();
+      return false;
+    }
+    pendingPositionsFragment = fragment;
+    showPendingPositionsRefreshNotice();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function loadPositionsPanel() {
+  const fragment = await fetchWorkbenchPartial('/positions-panel', '[data-exchange-position-tabs]');
+  commitPositionsPanel(fragment);
 }
 
 function persistedSelectedChatId() {
@@ -3694,8 +3750,8 @@ function scheduleRecoveryRefresh() {
     await refreshMonitorStatus();
     await refreshFromDatabaseChanges();
     const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView;
-    if (activeView === 'home' || activeView === 'positions') {
-      await ensureWorkbenchViewLoaded(activeView, { force: true });
+    if (activeView === 'positions') {
+      await checkPositionsPanelForChanges();
     }
   })().finally(() => {
     recoveryRefreshPromise = null;

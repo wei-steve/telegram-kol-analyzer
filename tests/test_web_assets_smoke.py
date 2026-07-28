@@ -120,6 +120,48 @@ def test_app_js_polls_for_updates_even_when_sse_stays_quiet(tmp_path):
     assert "startPollingUpdates();" in response.text
 
 
+def test_focus_recovery_checks_positions_without_replacing_visible_panel(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+
+    assert "async function checkPositionsPanelForChanges()" in js
+
+    recovery_start = js.index("function scheduleRecoveryRefresh")
+    recovery_end = js.index("\nfunction ", recovery_start + 1)
+    recovery_block = js[recovery_start:recovery_end]
+    check_start = js.index("async function checkPositionsPanelForChanges")
+    check_end = js.index("\nfunction ", check_start + 1)
+    check_block = js[check_start:check_end]
+
+    assert "await refreshMonitorStatus();" in recovery_block
+    assert "await refreshFromDatabaseChanges();" in recovery_block
+    assert "await checkPositionsPanelForChanges();" in recovery_block
+    assert "ensureWorkbenchViewLoaded(activeView, { force: true })" not in recovery_block
+    assert "pendingPositionsFragment = fragment;" in check_block
+    assert "showPendingPositionsRefreshNotice();" in check_block
+    assert "container.innerHTML" not in check_block
+    assert "setAttribute('aria-busy'" not in check_block
+
+
+def test_silent_positions_check_discards_snapshot_after_visible_panel_changes(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    check_start = js.index("async function checkPositionsPanelForChanges")
+    check_end = js.index("\nfunction ", check_start + 1)
+    check_block = js[check_start:check_end]
+
+    stale_guard = (
+        "if (current !== container.querySelector('[data-exchange-position-tabs]')) "
+        "return false;"
+    )
+    assert stale_guard in check_block
+    assert check_block.index(stale_guard) < check_block.index(
+        "pendingPositionsFragment = fragment;"
+    )
+
+
 def test_app_js_restores_exchange_position_view_after_partial_reload(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
@@ -141,6 +183,9 @@ def test_app_js_restores_exchange_position_tab_after_partial_reload(tmp_path):
     load_start = js.index("async function loadPositionsPanel")
     load_end = js.index("\nfunction ", load_start + 1)
     load_block = js[load_start:load_end]
+    commit_start = js.index("function commitPositionsPanel")
+    commit_end = js.index("\nfunction ", commit_start + 1)
+    commit_block = js[commit_start:commit_end]
 
     assert "const EXCHANGE_POSITION_TAB_KEY" in js
     assert "const EXCHANGE_POSITION_TABS = [" in js
@@ -153,7 +198,8 @@ def test_app_js_restores_exchange_position_tab_after_partial_reload(tmp_path):
     assert "saveExchangePositionTab(target);" in bind_block
     assert "restoreExchangePositionTab(root);" in bind_block
     assert "return 'positions';" in js
-    assert load_block.index("container.appendChild(fragment);") < load_block.index(
+    assert "commitPositionsPanel(fragment);" in load_block
+    assert commit_block.index("container.replaceChildren(fragment);") < commit_block.index(
         "bindExchangePositionTabs();"
     )
 

@@ -1037,6 +1037,35 @@ body {
   overflow: visible;
 }
 
+.positions-refresh-notice {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 40;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  max-width: calc(100vw - 32px);
+  padding: 10px 12px;
+  border: 1px solid rgba(96, 165, 250, 0.4);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.96);
+  color: #e2e8f0;
+  box-shadow: 0 12px 30px rgba(2, 6, 23, 0.34);
+}
+
+.positions-refresh-notice .secondary-button {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+@media (max-width: 640px) {
+  .positions-refresh-notice {
+    right: 16px;
+    bottom: 76px;
+  }
+}
+
 .exchange-tab-strip {
   display: flex;
   gap: 18px;
