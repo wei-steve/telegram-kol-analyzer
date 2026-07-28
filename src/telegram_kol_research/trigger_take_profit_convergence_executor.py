@@ -620,34 +620,6 @@ def _verified_native_take_profit(
     return match.order
 
 
-def _native_pending_take_profit_ids(
-    *,
-    position: dict[str, object],
-    open_positions: list[dict[str, object]],
-    pending: list[dict[str, object]],
-) -> set[str]:
-    ids: set[str] = set()
-    for raw in pending:
-        if not isinstance(raw, dict):
-            continue
-        order = normalize_native_tpsl(raw)
-        if order is None:
-            if (
-                str(raw.get("instId") or "").upper() == str(position.get("instId") or "").upper()
-                and str(raw.get("posId") or raw.get("pos_id") or "")
-                == str(position.get("posId") or position.get("pos_id") or "")
-                and _present(raw, "tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
-            ):
-                ids.add(str(raw.get("ordId") or raw.get("orderId") or "unidentified_pending_take_profit"))
-            continue
-        if order.take_profit_trigger_price is None:
-            continue
-        if _native_tpsl_is_scoped_to_position(order, position=position, open_positions=open_positions):
-            if order.ord_id:
-                ids.add(order.ord_id)
-    return ids
-
-
 def _unowned_pending_take_profit_present(
     *,
     pending: list[dict[str, object]],
@@ -680,50 +652,6 @@ def _unowned_pending_take_profit_present(
         if order.ord_id not in owned_order_ids:
             return True
     return False
-
-
-def _native_tpsl_is_scoped_to_position(
-    order: NativeTpslOrder,
-    *,
-    position: dict[str, object],
-    open_positions: list[dict[str, object]],
-) -> bool:
-    position_id = str(position.get("posId") or position.get("pos_id") or "")
-    if order.pos_id is not None:
-        return bool(position_id) and order.pos_id == position_id
-    # An unscoped native order is never adopted from an incomplete snapshot.
-    if not open_positions:
-        return False
-    position_time = _position_time(position)
-    if position_time is None or order.created_time is None:
-        return False
-    candidates = [
-        item for item in open_positions
-        if isinstance(item, dict)
-        and str(item.get("instId") or "").upper() == order.inst_id
-        and str(item.get("posSide") or item.get("side") or "").lower() == order.pos_side
-        and _time_is_within_position_window(order.created_time, _position_time(item))
-    ]
-    return len(candidates) == 1 and str(candidates[0].get("posId") or candidates[0].get("pos_id") or "") == position_id
-
-
-def _position_time(position: dict[str, object]) -> str | None:
-    for key in ("cTime", "uTime", "createdTime", "created_at"):
-        value = position.get(key)
-        if value not in (None, ""):
-            return str(value)
-    return None
-
-
-def _time_is_within_position_window(order_time: str, position_time: str | None) -> bool:
-    if position_time is None:
-        return False
-    if order_time == position_time:
-        return True
-    try:
-        return 0 <= int(Decimal(order_time)) - int(Decimal(position_time)) <= 86_400_000
-    except (InvalidOperation, ValueError):
-        return False
 
 
 def _exact_live_position(

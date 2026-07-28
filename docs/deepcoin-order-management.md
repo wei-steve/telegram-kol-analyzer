@@ -57,15 +57,18 @@ positions. If a filled order cannot be safely attributed to exactly one local
 strategy binding, it must remain an execution attribution problem rather than
 being counted as a normal KOL holding.
 
-For a later stop-loss update, resolve the target in this order:
+For a later stop-loss update, `position_protection_ledger` is the sole TPSL
+ownership and mutation authority. Load the verified account-wide ledger first,
+resolve each pending exchange `ordId` to its ledger `posId`, validate any
+exchange-supplied `posId` against that owner, and cancel only the exact owned
+order IDs. A missing, stale, conflicting, or unowned order fails closed before
+any Deepcoin write.
 
-1. Pending SL trigger order with matching Deepcoin order id or `clOrdId`.
-2. Pending SL trigger order with matching `posId`.
-3. A single pending SL trigger order matching instrument + side.
-4. Active position fallback: cancel the matched position's existing TPSL trigger orders, then call `set-position-sltp` with `posId`.
-5. Unfilled trigger-entry fallback: cancel the old trigger order and recreate it with the same entry fields and the new TP/SL.
-
-If instrument + side has more than one candidate and there is no `posId` or order id match, fail closed and require manual review. This matters because multiple KOLs can hold BTC long at the same time.
+There is no symbol/side, price, quantity, creation-time, `sz=0`, client-order,
+or active-position fallback. Those fields may validate a ledger-owned row or
+help an operator review a dry-run report, but they never establish ownership.
+Unfilled entry adjustment remains a separate exact entry-order
+cancel-and-recreate workflow.
 
 Live probe findings:
 
@@ -83,6 +86,10 @@ Live probe findings:
 - `src/telegram_kol_research/deepcoin_order_matching.py` normalizes pending TPSL trigger orders and selects the exact stop-loss adjustment target.
 - `src/telegram_kol_research/deepcoin_client.py` exposes pending/history read helpers for regular orders and trigger/TPSL orders.
 - `src/telegram_kol_research/execution_bindings.py` persists the local strategy to Deepcoin id mapping.
+- `src/telegram_kol_research/protection_ledger.py` loads the account-wide
+  canonical `ordId → posId` index. `position_backup_stop_orders` and
+  `position_take_profit_orders` remain workflow-state tables and cannot
+  authorize cancellation, replacement, or display ownership.
 
 Supported queue actions:
 
@@ -94,7 +101,12 @@ Supported queue actions:
 - `cancel_entry`, `cancel_limit_entry`, `cancel_trigger_entry`: cancel a bound unfilled regular or trigger entry order after verifying it is still pending.
 - `adjust_trigger_entry_tpsl`, `recreate_trigger_entry`: unfilled trigger-limit TP/SL adjustment by canceling the old trigger order and recreating it with the same entry fields plus the new TP/SL.
 
-Safety rule: never use `adjust_*` as a blind `set-position-sltp` call. If old TPSL rows cannot be matched, the code fails closed with `no_existing_position_tpsl_to_adjust` so it does not append a second TP/SL pair.
+Safety rule: never use `adjust_*` as a blind `set-position-sltp` call. If the
+account ledger does not own the current `ordId`, the code fails closed with
+`no_existing_position_tpsl_to_adjust`. Management preflight uses stable
+refusals such as `protection_missing_cancellable_order_id`,
+`protection_price_or_size_mismatch`, and
+`protection_ambiguous_global_assignment`, with zero cancel/set payloads.
 
 ## Historical Audit
 

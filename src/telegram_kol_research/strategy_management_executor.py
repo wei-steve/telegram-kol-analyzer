@@ -54,7 +54,7 @@ from telegram_kol_research.protection_attribution import (
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.protection_revisions import record_replacing_protection_revision
-from telegram_kol_research.protection_ledger import list_verified_ledger_rows_for_positions
+from telegram_kol_research.protection_ledger import list_verified_account_ledger_rows
 from telegram_kol_research.strategy_management_batches import (
     ManagementBatchRecord,
     claim_ready_batch,
@@ -453,7 +453,6 @@ def reserve_break_even_market_actions(
                 exact_order_position_ids=_exact_order_position_ids(
                     ledger_rows_by_pos_id
                 ),
-                allow_heuristic_attribution=False,
             )
             protection_rows = {}
             seen_order_ids: set[str] = set()
@@ -2913,7 +2912,6 @@ def _preflight_exact_protection_rows(
         exact_order_position_ids=_exact_order_position_ids(
             ledger_rows_by_pos_id
         ),
-        allow_heuristic_attribution=False,
     )
     seen_ids: set[str] = set()
     current_rows_by_pos_id: dict[str, list[dict[str, Any]]] = {}
@@ -2936,7 +2934,7 @@ def _preflight_exact_protection_rows(
         if (
             (
                 protection is None
-                or protection.status != "verified"
+                or protection.status in {"absent", "evidence_unavailable"}
                 or position_only_without_order_ids
             )
             and expected.get("order_ids")
@@ -3016,9 +3014,11 @@ def _remaining_size_after_partial_close(leg: Any) -> Decimal | None:
     return remaining if remaining > 0 else None
 
 
-def _ledger_rows_by_pos_id(session_factory: sessionmaker, pos_ids: list[str]) -> dict[str, list[Any]]:
+def _ledger_rows_by_pos_id(
+    session_factory: sessionmaker, _pos_ids: list[str]
+) -> dict[str, list[Any]]:
     with session_factory() as session:
-        rows = list_verified_ledger_rows_for_positions(session, pos_ids)
+        rows = list_verified_account_ledger_rows(session)
         result: dict[str, list[Any]] = {}
         for row in rows:
             result.setdefault(str(row.pos_id), []).append(row)

@@ -4,11 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from math import isclose
 from typing import Any
-
-
-DEFAULT_PROTECTION_TIME_TOLERANCE_MS = 5_000
 
 
 @dataclass(slots=True)
@@ -176,19 +172,6 @@ def _nonzero_text(value: Any) -> str | None:
 @dataclass(frozen=True, slots=True)
 class _Position:
     pos_id: str
-    instrument_id: str
-    side: str
-    size: float | None
-    created_at_ms: int | None
-    raw: dict[str, Any]
-
-
-@dataclass(slots=True)
-class _ProtectionGroup:
-    instrument_id: str
-    side: str
-    created_at_ms: int | None
-    rows: list[dict[str, Any]] = field(default_factory=list)
 
 
 def match_position_protection(
@@ -196,17 +179,12 @@ def match_position_protection(
     tpsl_orders: list[dict[str, Any]],
     *,
     evidence_available: bool = True,
-    time_tolerance_ms: int = DEFAULT_PROTECTION_TIME_TOLERANCE_MS,
     exact_order_position_ids: dict[str, str] | None = None,
-    allow_heuristic_attribution: bool = True,
 ) -> ProtectionMatchResult:
-    """Match TPSL rows without borrowing strategy-ownership assumptions.
+    """Match TPSL rows only through the canonical ``ordId → posId`` ledger.
 
-    ``exact_order_position_ids`` is durable ownership evidence recorded when a
-    known position-management operation creates a replacement TPSL order. It
-    is deliberately keyed by the exchange order ID, so it can supplement a
-    later unscoped exchange response without relaxing heuristic matching for
-    any other order.
+    Exchange position IDs are validation evidence, not an ownership source.
+    Price, size, instrument, side and timestamps never establish ownership.
     """
 
     parsed_positions = [_parse_position(row) for row in positions]
@@ -220,11 +198,11 @@ def match_position_protection(
     positions_by_id = {row.pos_id: row for row in parsed_positions}
 
     exact_rows: dict[str, list[dict[str, Any]]] = {
-        row.pos_id: _inline_position_protection_rows(row.raw) for row in parsed_positions
+        row.pos_id: [] for row in parsed_positions
     }
     exact_order_position_ids = exact_order_position_ids or {}
-    ledger_confirmed_pos_ids: set[str] = set()
-    unscoped_groups: list[_ProtectionGroup] = []
+    conflicting_pos_ids: set[str] = set()
+    unowned_order_present = False
     for order in tpsl_orders:
         if str(order.get("triggerOrderType") or "TPSL").upper() != "TPSL":
             continue
@@ -240,20 +218,12 @@ def match_position_protection(
             "id",
         )
         ledger_pos_id = exact_order_position_ids.get(order_id or "")
-        if ledger_pos_id is not None:
-            if ledger_pos_id in positions_by_id:
-                if ledger_pos_id not in ledger_confirmed_pos_ids:
-                    exact_rows[ledger_pos_id] = [
-                        row
-                        for row in exact_rows[ledger_pos_id]
-                        if row.get("_evidence_source") != "position"
-                    ]
-                exact_rows[ledger_pos_id].append(order)
-                ledger_confirmed_pos_ids.add(ledger_pos_id)
-            # A persisted exact owner that is no longer live must not be
-            # re-attributed through the weaker timestamp/size heuristic.
+        if ledger_pos_id is None:
+            unowned_order_present = True
             continue
-        pos_id = _first_text(
+        if ledger_pos_id not in positions_by_id:
+            continue
+        exchange_pos_id = _first_text(
             order,
             "closePosId",
             "close_pos_id",
@@ -262,171 +232,32 @@ def match_position_protection(
             "pos_id",
             "positionId",
         )
-        if pos_id:
-            if pos_id in positions_by_id:
-                exact_rows[pos_id].append(order)
+        if exchange_pos_id is not None and exchange_pos_id != ledger_pos_id:
+            conflicting_pos_ids.add(ledger_pos_id)
             continue
-        instrument_id = _instrument_id(order)
-        side = _side(order)
-        created_at_ms = _timestamp_ms(order)
-        merge_candidates = [
-            candidate
-            for candidate in unscoped_groups
-            if _can_merge_protection_row(
-                    candidate,
-                    order,
-                    instrument_id=instrument_id,
-                    side=side,
-                    created_at_ms=created_at_ms,
-                    time_tolerance_ms=time_tolerance_ms,
-                )
-        ]
-        group = None
-        if merge_candidates:
-            best_distance = min(
-                _time_distance(candidate.created_at_ms, created_at_ms)
-                for candidate in merge_candidates
-            )
-            nearest = [
-                candidate
-                for candidate in merge_candidates
-                if _time_distance(candidate.created_at_ms, created_at_ms)
-                == best_distance
-            ]
-            if len(nearest) == 1:
-                group = nearest[0]
-        if group is None:
-            group = _ProtectionGroup(
-                instrument_id=instrument_id,
-                side=side,
-                created_at_ms=created_at_ms,
-            )
-            unscoped_groups.append(group)
-        group.rows.append(order)
+        exact_rows[ledger_pos_id].append(order)
 
     for pos_id, rows in exact_rows.items():
-        if rows:
-            match = (
-                "ledger_confirmed_current_order"
-                if pos_id in ledger_confirmed_pos_ids
-                else "exact_pos_id"
+        if pos_id in conflicting_pos_ids:
+            by_pos_id[pos_id] = PositionProtection(
+                status="present_but_ambiguous",
+                evidence={"match": "ledger_exchange_position_conflict"},
             )
+            continue
+        if rows:
+            if unowned_order_present:
+                by_pos_id[pos_id] = PositionProtection(
+                    status="present_but_ambiguous",
+                    evidence={"match": "global_unowned_order_present"},
+                )
+                continue
             by_pos_id[pos_id] = _verified_protection(
                 rows,
-                evidence={"match": match, "pos_id": pos_id},
+                evidence={
+                    "match": "ledger_confirmed_current_order",
+                    "pos_id": pos_id,
+                },
             )
-
-    if not allow_heuristic_attribution:
-        return ProtectionMatchResult(by_pos_id=by_pos_id)
-
-    groups = list(unscoped_groups)
-    edges: list[tuple[int, str, tuple[float, int]]] = []
-    plausible_by_group: dict[int, list[_Position]] = {}
-    for group_index, group in enumerate(groups):
-        plausible: list[_Position] = []
-        for position in parsed_positions:
-            if position.instrument_id != group.instrument_id or position.side != group.side:
-                continue
-            time_distance = _time_distance(position.created_at_ms, group.created_at_ms)
-            if time_distance is not None and time_distance > max(0, int(time_tolerance_ms)):
-                continue
-            plausible.append(position)
-            if time_distance is None:
-                continue
-            size_penalty = _size_penalty(position.size, group.rows)
-            if size_penalty != 0:
-                continue
-            edges.append((group_index, position.pos_id, (time_distance, size_penalty)))
-        plausible_by_group[group_index] = plausible
-
-    assignments: dict[int, str] = {}
-    remaining = list(edges)
-    while remaining:
-        group_best = _unique_best_protection_edges(remaining, key_index=0)
-        position_best = _unique_best_protection_edges(remaining, key_index=1)
-        accepted = [
-            edge
-            for edge in remaining
-            if group_best.get(edge[0]) == edge and position_best.get(edge[1]) == edge
-        ]
-        if not accepted:
-            break
-        accepted_groups = {edge[0] for edge in accepted}
-        accepted_positions = {edge[1] for edge in accepted}
-        for group_index, pos_id, _rank in accepted:
-            assignments[group_index] = pos_id
-        remaining = [
-            edge
-            for edge in remaining
-            if edge[0] not in accepted_groups and edge[1] not in accepted_positions
-        ]
-
-    unresolved_groups = set(range(len(groups))) - set(assignments)
-    ambiguous_pos_ids = {
-        position.pos_id
-        for group_index in unresolved_groups
-        for position in plausible_by_group.get(group_index, [])
-    }
-    # An accepted assignment is also unsafe if another protection group plausibly
-    # competes for that same position. Never expose order IDs in this case.
-    for group_index, pos_id in assignments.items():
-        if any(
-            candidate.pos_id == pos_id
-            for unresolved_index in unresolved_groups
-            for candidate in plausible_by_group.get(unresolved_index, [])
-        ):
-            ambiguous_pos_ids.add(pos_id)
-
-    for group_index, pos_id in assignments.items():
-        if pos_id in ambiguous_pos_ids:
-            continue
-        group = groups[group_index]
-        rows = [
-            row
-            for row in exact_rows[pos_id]
-            if row.get("_evidence_source") != "position"
-        ]
-        rows.extend(group.rows)
-        exact_rows[pos_id] = rows
-        rank = next(edge[2] for edge in edges if edge[0] == group_index and edge[1] == pos_id)
-        by_pos_id[pos_id] = _verified_protection(
-            rows,
-            evidence={
-                "match": "mutual_unique_instrument_side_time_size",
-                "time_distance_ms": rank[0],
-                "size_penalty": rank[1],
-            },
-        )
-
-    for pos_id in ambiguous_pos_ids:
-        ambiguous_rows = [
-            row
-            for group_index, group in enumerate(groups)
-            if any(
-                candidate.pos_id == pos_id
-                for candidate in plausible_by_group.get(group_index, [])
-            )
-            for row in group.rows
-        ]
-        inline = _verified_protection(
-            exact_rows[pos_id],
-            evidence={"match": "inline_position"},
-        )
-        by_pos_id[pos_id] = PositionProtection(
-            status="present_but_ambiguous",
-            stop_loss=inline.stop_loss,
-            take_profits=inline.take_profits,
-            evidence={
-                "match": "ambiguous_global_assignment",
-                "has_inline_position_protection": bool(exact_rows[pos_id]),
-                "has_stop_loss": any(
-                    _protection_price(row, "sl") is not None for row in ambiguous_rows
-                ),
-                "has_take_profit": any(
-                    _protection_price(row, "tp") is not None for row in ambiguous_rows
-                ),
-            },
-        )
 
     return ProtectionMatchResult(by_pos_id=by_pos_id)
 
@@ -435,23 +266,7 @@ def _parse_position(row: dict[str, Any]) -> _Position | None:
     pos_id = _first_text(row, "posId", "pos_id", "id")
     if not pos_id:
         return None
-    return _Position(
-        pos_id=pos_id,
-        instrument_id=_instrument_id(row),
-        side=_side(row),
-        size=_float_or_none(row.get("pos") or row.get("size") or row.get("sz")),
-        created_at_ms=_timestamp_ms(row),
-        raw=row,
-    )
-
-
-def _inline_position_protection_rows(position: dict[str, Any]) -> list[dict[str, Any]]:
-    if not _row_has_protection(position):
-        return []
-    row = dict(position)
-    row["posId"] = _first_text(position, "posId", "pos_id", "id")
-    row["_evidence_source"] = "position"
-    return [row]
+    return _Position(pos_id=pos_id)
 
 
 def _verified_protection(
@@ -469,57 +284,6 @@ def _verified_protection(
         rows=[dict(row) for row in rows],
         evidence=evidence,
     )
-
-
-def _size_penalty(position_size: float | None, rows: list[dict[str, Any]]) -> int:
-    if position_size is None or position_size <= 0:
-        return 1
-    row_sizes = [
-        (row, _float_or_none(row.get("sz") or row.get("size"))) for row in rows
-    ]
-    row_sizes = [
-        (row, value) for row, value in row_sizes if value is not None and value >= 0
-    ]
-    tp_sizes = [
-        size
-        for row, size in row_sizes
-        if _protection_price(row, "tp") is not None
-    ]
-    if tp_sizes:
-        if any(value == 0 for value in tp_sizes):
-            return 0
-        return (
-            0
-            if isclose(sum(tp_sizes), position_size, rel_tol=1e-9, abs_tol=1e-9)
-            else 1
-        )
-    sizes = [value for _row, value in row_sizes]
-    if any(value == 0 for value in sizes):
-        return 0
-    if any(isclose(value, position_size, rel_tol=1e-9, abs_tol=1e-9) for value in sizes):
-        return 0
-    return 1
-
-
-def _can_merge_protection_row(
-    group: _ProtectionGroup,
-    row: dict[str, Any],
-    *,
-    instrument_id: str,
-    side: str,
-    created_at_ms: int | None,
-    time_tolerance_ms: int,
-) -> bool:
-    if group.instrument_id != instrument_id or group.side != side:
-        return False
-    distance = _time_distance(group.created_at_ms, created_at_ms)
-    if distance is None or distance > max(0, int(time_tolerance_ms)):
-        return False
-    row_has_stop = _protection_price(row, "sl") is not None
-    group_has_stop = any(_protection_price(item, "sl") is not None for item in group.rows)
-    # One evidence group may contain one full stop and multiple partial targets.
-    # A second stop is a competing group and must remain globally ambiguous.
-    return not (row_has_stop and group_has_stop)
 
 
 def _row_has_protection(row: dict[str, Any]) -> bool:
@@ -554,43 +318,6 @@ def _unique_floats(values: list[float]) -> list[float]:
         if value not in result:
             result.append(value)
     return result
-
-
-def _instrument_id(row: dict[str, Any]) -> str:
-    return str(row.get("instId") or row.get("instrument_id") or "").upper()
-
-
-def _side(row: dict[str, Any]) -> str:
-    value = str(row.get("posSide") or row.get("side") or "").lower()
-    return {"buy": "long", "sell": "short"}.get(value, value)
-
-
-def _timestamp_ms(row: dict[str, Any]) -> int | None:
-    value = row.get("cTime") or row.get("uTime") or row.get("created_at")
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def _unique_best_protection_edges(
-    edges: list[tuple[int, str, tuple[float, int]]], *, key_index: int
-) -> dict[object, tuple[int, str, tuple[float, int]]]:
-    result: dict[object, tuple[int, str, tuple[float, int]]] = {}
-    keys = {edge[key_index] for edge in edges}
-    for value in keys:
-        candidates = [edge for edge in edges if edge[key_index] == value]
-        best_rank = min(edge[2] for edge in candidates)
-        winners = [edge for edge in candidates if edge[2] == best_rank]
-        if len(winners) == 1:
-            result[value] = winners[0]
-    return result
-
-
-def _time_distance(first: int | None, second: int | None) -> float | None:
-    if first is None or second is None:
-        return None
-    return float(abs(first - second))
 
 
 def _float_or_none(value: Any) -> float | None:

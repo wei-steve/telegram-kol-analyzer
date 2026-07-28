@@ -47,6 +47,7 @@ from telegram_kol_research.protection_attribution import (
     snapshot_protection_rows,
 )
 from telegram_kol_research.protection_ledger import (
+    list_verified_account_ledger_rows,
     list_verified_ledger_rows_for_positions,
 )
 from telegram_kol_research.position_authority_lock import position_authority_lock
@@ -514,9 +515,7 @@ def _plan_strategy_management_batch_locked(
             )
         ledger_rows_by_pos_id: dict[str, list[PositionProtectionLedger]] = {}
         with session_factory() as session:
-            for row in list_verified_ledger_rows_for_positions(
-                session, [str(position["pos_id"]) for position in economics]
-            ):
+            for row in list_verified_account_ledger_rows(session):
                 ledger_rows_by_pos_id.setdefault(str(row.pos_id), []).append(row)
         exact_order_position_ids = {
             str(row.order_id): str(row.pos_id)
@@ -529,7 +528,6 @@ def _plan_strategy_management_batch_locked(
             tpsl_orders,
             evidence_available=True,
             exact_order_position_ids=exact_order_position_ids,
-            allow_heuristic_attribution=False,
         )
         global_protection_order_id_counts = Counter(
             order_id
@@ -1895,7 +1893,7 @@ def _unverified_protection_reason(
     if ledger_rows:
         return "protection_price_or_size_mismatch"
     if current_order_ids:
-        return "protection_ambiguous_global_assignment"
+        return "protection_missing_cancellable_order_id"
     return "target_protection_not_verified"
 
 

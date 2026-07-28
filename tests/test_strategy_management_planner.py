@@ -1143,7 +1143,7 @@ def test_local_identity_change_during_planning_blocks_before_freeze(
     assert result.reason_code == "target_identity_changed_during_planning"
 
 
-def test_protection_ambiguity_blocks_every_target(monkeypatch, tmp_path):
+def test_unowned_protection_blocks_every_target(monkeypatch, tmp_path):
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id, _, _ = _persist_exact_management_target(
@@ -1177,7 +1177,7 @@ def test_protection_ambiguity_blocks_every_target(monkeypatch, tmp_path):
     )
 
     assert result.status == "blocked"
-    assert result.reason_code == "protection_ambiguous_global_assignment"
+    assert result.reason_code == "protection_missing_cancellable_order_id"
     assert result.batch.status == "blocked"
     assert result.batch.execution_mode == "shadow"
     assert result.batch.legs == ()
@@ -1631,7 +1631,7 @@ def test_inline_protection_without_exact_order_id_blocks_plan(monkeypatch, tmp_p
     )
 
     assert result.status == "blocked"
-    assert result.reason_code == "protection_missing_cancellable_order_id"
+    assert result.reason_code == "target_protection_not_verified"
 
 
 def test_any_protection_row_without_exact_unique_id_blocks_plan(monkeypatch, tmp_path):
@@ -1713,7 +1713,7 @@ def test_selected_protection_order_id_must_be_unique_across_global_snapshot(
     )
 
     assert result.status == "blocked"
-    assert result.reason_code == "protection_ambiguous_global_assignment"
+    assert result.reason_code == "protection_missing_cancellable_order_id"
 
 
 @pytest.mark.parametrize(
@@ -1818,6 +1818,29 @@ def test_partial_plan_accepts_legacy_comma_separated_binding_pos_ids(
     with session_factory() as session:
         binding = session.get(ExecutionBinding, binding_id)
         binding.pos_id = "pos-b,pos-c"
+        for leg in (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id)
+            .order_by(ExecutionOrderLeg.id)
+        ):
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=leg.strategy_instance_id,
+                pos_id=str(leg.pos_id),
+                instrument_id="BTC-USDT-SWAP",
+                side="short",
+                order_id=f"sl-{leg.pos_id}",
+                purpose="stop_loss",
+                trigger_price="63000",
+                size_text="0",
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence={"match": "exact_written_order"},
+                seen_at=PLANNED_AT,
+            )
         session.commit()
     _disable_reconciliation(monkeypatch, planner)
 
@@ -1886,12 +1909,41 @@ def test_partial_then_break_even_plans_durable_close_and_protection_phases(
 ):
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "research.db")
-    raw_id, _, _ = _persist_exact_management_target(
+    raw_id, _, binding_id = _persist_exact_management_target(
         session_factory,
         intent="partial_then_break_even",
         management_fraction=None,
     )
     _disable_reconciliation(monkeypatch, planner)
+    with session_factory() as session:
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, pos_id="pos-b")
+            .one()
+        )
+        for order_id, purpose, trigger_price, size_text in (
+            ("tp-old", "take_profit", "61000", "10"),
+            ("sl-old", "stop_loss", "63000", "0"),
+        ):
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=leg.strategy_instance_id,
+                pos_id="pos-b",
+                instrument_id="BTC-USDT-SWAP",
+                side="short",
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price=trigger_price,
+                size_text=size_text,
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence={"match": "exact_written_order"},
+                seen_at=PLANNED_AT,
+            )
+        session.commit()
     tpsl = [
         {
             "triggerOrderType": "TPSL",
@@ -1932,7 +1984,7 @@ def test_partial_then_break_even_plans_durable_close_and_protection_phases(
         "intent": "partial_then_break_even",
         "stop_loss_text": None,
     }
-    assert result.batch.legs[0].old_tpsl["order_ids"] == ["tp-old", "sl-old"]
+    assert result.batch.legs[0].old_tpsl["order_ids"] == ["sl-old", "tp-old"]
 
 
 def test_risk_reduction_protection_recovery_snapshots_exact_owned_orders(

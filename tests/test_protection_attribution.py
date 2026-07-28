@@ -29,24 +29,23 @@ def _tpsl(*, created_at="1782788877000", size="0", **overrides):
     return row
 
 
-def test_one_second_timestamp_difference_matches_full_position_stop():
+def test_one_second_timestamp_difference_never_establishes_ownership():
     result = match_position_protection(
         [_position("pos-smart-market")],
         [_tpsl(ordId="sl-1", slTriggerPrice="1820")],
     )
 
     protection = result.by_pos_id["pos-smart-market"]
-    assert protection.status == "verified"
-    assert protection.stop_loss == 1820
-    assert protection.order_ids == ["sl-1"]
-    assert protection.can_mutate is True
+    assert protection.status == "absent"
+    assert protection.stop_loss is None
+    assert protection.order_ids == []
+    assert protection.can_mutate is False
 
 
 def test_runtime_mode_never_authorizes_unscoped_time_size_candidate():
     result = match_position_protection(
         [_position("pos-runtime")],
         [_tpsl(ordId="sl-guess", slTriggerPrice="1820")],
-        allow_heuristic_attribution=False,
     )
 
     protection = result.by_pos_id["pos-runtime"]
@@ -55,14 +54,14 @@ def test_runtime_mode_never_authorizes_unscoped_time_size_candidate():
     assert protection.can_mutate is False
 
 
-def test_zero_size_tpsl_is_full_position_protection():
+def test_zero_size_tpsl_without_ledger_owner_is_not_position_protection():
     result = match_position_protection(
         [_position("pos-zero", size="5.2")],
         [_tpsl(ordId="sl-zero", size="0", slTriggerPx="1555")],
     )
 
-    assert result.by_pos_id["pos-zero"].stop_loss == 1555
-    assert result.by_pos_id["pos-zero"].status == "verified"
+    assert result.by_pos_id["pos-zero"].stop_loss is None
+    assert result.by_pos_id["pos-zero"].status == "absent"
 
 
 def test_exact_managed_tpsl_evidence_uses_only_order_bound_rows():
@@ -100,6 +99,11 @@ def test_partial_take_profit_sizes_can_cover_one_position():
             _tpsl(ordId="tp-1", size="0.9", tpTriggerPrice="1900"),
             _tpsl(ordId="tp-2", size="0.6", tpTriggerPrice="2000"),
         ],
+        exact_order_position_ids={
+            "sl-full": "pos-split",
+            "tp-1": "pos-split",
+            "tp-2": "pos-split",
+        },
     )
 
     protection = result.by_pos_id["pos-split"]
@@ -117,6 +121,11 @@ def test_stop_and_partial_targets_created_at_nearby_times_form_one_evidence_grou
             _tpsl(created_at="11000", ordId="tp-1", size="0.9", tpTriggerPrice="1900"),
             _tpsl(created_at="12000", ordId="tp-2", size="0.6", tpTriggerPrice="2000"),
         ],
+        exact_order_position_ids={
+            "sl": "pos-staggered",
+            "tp-1": "pos-staggered",
+            "tp-2": "pos-staggered",
+        },
     )
 
     protection = result.by_pos_id["pos-staggered"]
@@ -257,7 +266,7 @@ def test_normalize_protection_snapshots_converts_legacy_zero_combined_sides():
         },
     ]
 
-def test_nearby_positions_keep_each_target_with_its_nearest_stop_group():
+def test_ledger_keeps_nearby_positions_orders_separate():
     result = match_position_protection(
         [
             _position("pos-a", size="1", created_at="10000"),
@@ -269,6 +278,12 @@ def test_nearby_positions_keep_each_target_with_its_nearest_stop_group():
             _tpsl(created_at="14000", ordId="tp-b", size="2", tpTriggerPrice="2000"),
             _tpsl(created_at="10000", ordId="tp-a", size="1", tpTriggerPrice="1900"),
         ],
+        exact_order_position_ids={
+            "sl-a": "pos-a",
+            "tp-a": "pos-a",
+            "sl-b": "pos-b",
+            "tp-b": "pos-b",
+        },
     )
 
     assert result.by_pos_id["pos-a"].order_ids == ["sl-a", "tp-a"]
@@ -277,7 +292,7 @@ def test_nearby_positions_keep_each_target_with_its_nearest_stop_group():
     assert result.by_pos_id["pos-b"].stop_loss == 1700
 
 
-def test_many_same_side_positions_match_only_time_and_size_compatible_groups():
+def test_many_same_side_positions_match_only_ledger_owned_orders():
     result = match_position_protection(
         [
             _position("pos-a", size="8", created_at="10000"),
@@ -289,6 +304,7 @@ def test_many_same_side_positions_match_only_time_and_size_compatible_groups():
             _tpsl(created_at="15000", ordId="b", size="19", slTriggerPrice="62070"),
             _tpsl(created_at="21000", ordId="c", size="5", slTriggerPrice="61000"),
         ],
+        exact_order_position_ids={"a": "pos-a", "b": "pos-b", "c": "pos-c"},
     )
 
     assert result.by_pos_id["pos-a"].status == "verified"
@@ -319,6 +335,7 @@ def test_inline_position_prices_are_not_cancellable_order_rows():
                 tpTriggerPrice="64880",
             )
         ],
+        exact_order_position_ids={"position-tpsl": "pos-a"},
     )
 
     protection = result.by_pos_id["pos-a"]
@@ -327,7 +344,7 @@ def test_inline_position_prices_are_not_cancellable_order_rows():
     assert [row.get("ordId") for row in protection.rows] == ["position-tpsl"]
 
 
-def test_full_stop_does_not_hide_partial_target_size_mismatch():
+def test_price_and_size_candidates_without_ledger_owner_remain_absent():
     result = match_position_protection(
         [
             _position("pos-a", size="1", created_at="10000"),
@@ -340,13 +357,13 @@ def test_full_stop_does_not_hide_partial_target_size_mismatch():
         ],
     )
 
-    assert result.by_pos_id["pos-a"].status == "present_but_ambiguous"
+    assert result.by_pos_id["pos-a"].status == "absent"
     assert result.by_pos_id["pos-a"].order_ids == []
-    assert result.by_pos_id["pos-b"].status == "present_but_ambiguous"
+    assert result.by_pos_id["pos-b"].status == "absent"
     assert result.by_pos_id["pos-b"].order_ids == []
 
 
-def test_equidistant_target_does_not_merge_into_first_stop_group():
+def test_equidistant_target_does_not_establish_any_owner():
     result = match_position_protection(
         [
             _position("pos-a", size="1", created_at="10000"),
@@ -359,30 +376,30 @@ def test_equidistant_target_does_not_merge_into_first_stop_group():
         ],
     )
 
-    assert result.by_pos_id["pos-a"].status == "present_but_ambiguous"
-    assert result.by_pos_id["pos-b"].status == "present_but_ambiguous"
+    assert result.by_pos_id["pos-a"].status == "absent"
+    assert result.by_pos_id["pos-b"].status == "absent"
 
 
-def test_exact_position_id_has_priority_over_indistinguishable_positions():
+def test_exchange_position_id_without_ledger_is_not_authority():
     result = match_position_protection(
         [_position("pos-a"), _position("pos-b")],
         [_tpsl(posId="pos-b", ordId="sl-b", slTriggerPrice="1820")],
     )
 
     assert result.by_pos_id["pos-a"].status == "absent"
-    assert result.by_pos_id["pos-b"].status == "verified"
-    assert result.by_pos_id["pos-b"].stop_loss == 1820
+    assert result.by_pos_id["pos-b"].status == "absent"
+    assert result.by_pos_id["pos-b"].stop_loss is None
 
 
-def test_close_pos_id_is_exact_protection_identity():
+def test_exchange_close_pos_id_without_ledger_is_not_authority():
     result = match_position_protection(
         [_position("pos-a"), _position("pos-b")],
         [_tpsl(closePosId="pos-b", ordId="sl-b", slTriggerPrice="1820")],
     )
 
     assert result.by_pos_id["pos-a"].status == "absent"
-    assert result.by_pos_id["pos-b"].status == "verified"
-    assert result.by_pos_id["pos-b"].stop_loss == 1820
+    assert result.by_pos_id["pos-b"].status == "absent"
+    assert result.by_pos_id["pos-b"].stop_loss is None
 
 
 def test_unknown_close_pos_id_is_never_borrowed_by_a_live_position():
@@ -395,7 +412,7 @@ def test_unknown_close_pos_id_is_never_borrowed_by_a_live_position():
     assert result.by_pos_id["pos-live"].order_ids == []
 
 
-def test_indistinguishable_positions_make_unscoped_protection_ambiguous():
+def test_indistinguishable_positions_do_not_adopt_unscoped_protection():
     result = match_position_protection(
         [_position("pos-a"), _position("pos-b")],
         [_tpsl(ordId="sl-unknown", slTriggerPrice="1820")],
@@ -403,19 +420,20 @@ def test_indistinguishable_positions_make_unscoped_protection_ambiguous():
 
     for pos_id in ("pos-a", "pos-b"):
         protection = result.by_pos_id[pos_id]
-        assert protection.status == "present_but_ambiguous"
+        assert protection.status == "absent"
         assert protection.stop_loss is None
         assert protection.order_ids == []
         assert protection.can_mutate is False
 
 
-def test_ambiguous_extra_order_blocks_mutation_even_with_one_exact_order():
+def test_unowned_extra_order_freezes_ledger_owned_position_without_borrowing():
     result = match_position_protection(
         [_position("pos-a"), _position("pos-b")],
         [
             _tpsl(posId="pos-a", ordId="sl-a", slTriggerPrice="1810"),
             _tpsl(ordId="sl-unknown", slTriggerPrice="1820"),
         ],
+        exact_order_position_ids={"sl-a": "pos-a"},
     )
 
     assert result.by_pos_id["pos-a"].status == "present_but_ambiguous"
@@ -423,7 +441,7 @@ def test_ambiguous_extra_order_blocks_mutation_even_with_one_exact_order():
     assert result.by_pos_id["pos-a"].can_mutate is False
 
 
-def test_unrelated_pending_order_does_not_hide_exact_inline_position_prices():
+def test_unowned_pending_order_freezes_other_ledger_owned_protection():
     result = match_position_protection(
         [
             _position(
@@ -449,14 +467,15 @@ def test_unrelated_pending_order_does_not_hide_exact_inline_position_prices():
                 slTriggerPrice="66500",
             ),
         ],
+        exact_order_position_ids={"position-tpsl": "pos-a"},
     )
 
     protection = result.by_pos_id["pos-a"]
-    assert protection.status == "verified"
-    assert protection.stop_loss == 66500
-    assert protection.take_profits == [63300]
-    assert protection.order_ids == ["position-tpsl"]
-    assert protection.can_mutate is True
+    assert protection.status == "present_but_ambiguous"
+    assert protection.stop_loss is None
+    assert protection.take_profits == []
+    assert protection.order_ids == []
+    assert protection.can_mutate is False
 
 
 def test_missing_tpsl_evidence_is_not_reported_as_absent():
@@ -480,12 +499,12 @@ def test_unscoped_tpsl_without_timestamps_never_authorizes_mutation():
     result = match_position_protection([position], [order])
 
     protection = result.by_pos_id["pos-no-time"]
-    assert protection.status == "present_but_ambiguous"
+    assert protection.status == "absent"
     assert protection.order_ids == []
     assert protection.can_mutate is False
 
 
-def test_two_unscoped_groups_competing_for_one_position_are_ambiguous():
+def test_two_unscoped_groups_never_become_position_owned():
     result = match_position_protection(
         [_position("pos-one", created_at="10000")],
         [
@@ -495,7 +514,7 @@ def test_two_unscoped_groups_competing_for_one_position_are_ambiguous():
     )
 
     protection = result.by_pos_id["pos-one"]
-    assert protection.status == "present_but_ambiguous"
+    assert protection.status == "absent"
     assert protection.order_ids == []
     assert protection.can_mutate is False
 
@@ -507,5 +526,5 @@ def test_incompatible_size_does_not_authorize_unscoped_tpsl():
     )
 
     protection = result.by_pos_id["pos-size"]
-    assert protection.status == "present_but_ambiguous"
+    assert protection.status == "absent"
     assert protection.can_mutate is False

@@ -52,7 +52,7 @@ from telegram_kol_research.protection_attribution import (
     snapshot_protection_rows,
 )
 from telegram_kol_research.protection_ledger import (
-    list_verified_ledger_rows_for_positions,
+    list_verified_account_ledger_rows,
     upsert_protection_ledger_row,
 )
 from telegram_kol_research.trade_signals import MANUAL_MANAGEMENT_SOURCE_TYPES
@@ -207,9 +207,7 @@ def adjust_position_tpsl(
     pending = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
     pos_id = _first_string(position, "posId", "pos_id", "id")
     with session_factory() as session:
-        ledger_rows = list_verified_ledger_rows_for_positions(
-            session, [pos_id] if pos_id else []
-        )
+        ledger_rows = list_verified_account_ledger_rows(session)
     exact_order_position_ids = {
         str(row.order_id): str(row.pos_id)
         for row in ledger_rows
@@ -219,7 +217,6 @@ def adjust_position_tpsl(
         live_positions,
         pending,
         exact_order_position_ids=exact_order_position_ids,
-        allow_heuristic_attribution=False,
     ).by_pos_id.get(pos_id or "")
     if protection is not None and protection.status == "present_but_ambiguous":
         raise DeepcoinExecutionActionError("ambiguous_pending_position_tpsl")
@@ -262,7 +259,6 @@ def adjust_position_tpsl(
             live_positions,
             pending_recheck,
             exact_order_position_ids=exact_order_position_ids,
-            allow_heuristic_attribution=False,
         ).by_pos_id.get(pos_id or "")
         rechecked_pending_rows = [
             row

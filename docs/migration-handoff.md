@@ -324,13 +324,13 @@ binding is an explicit operator decision, writes a `manual_bind` verified leg,
 and cannot overwrite conflict or unavailable evidence.
 
 Position protection is attributed independently from strategy ownership.
-Exact TPSL `posId` wins; otherwise the matcher uses a small time window,
-instrument, side, full-position `sz=0`, and aggregated partial TP sizes. A
-unique result may be displayed and mutated. Ambiguous protection displays
-`止损存在，归属待确认`; read failure displays `止损证据暂不可用`; neither state
-exposes cancellable order IDs. Missing timestamps, incompatible sizes, or two
-protection groups competing for one position are ambiguous and fail closed.
-Unscoped TPSL matching is global and mutual-unique across all live positions.
+`position_protection_ledger` is the sole ownership authority: a pending TPSL
+row is owned only when its exact `ordId` has one verified ledger `posId`.
+Exchange `posId` is validation evidence and a disagreement is a conflict; it
+does not create ownership without the ledger. Price, quantity, instrument,
+side, creation time, `sz=0`, and candidate uniqueness never assign an order.
+Unowned or conflicting rows freeze mutation and expose no cancellable order
+IDs. Read failure remains `止损证据暂不可用`.
 Initial TP/SL protection created immediately after a market entry must also be
 persisted into `position_protection_ledger`, not merely recorded as an
 `execution_events` row. When Deepcoin returns one protection order ID but the
@@ -488,11 +488,12 @@ submission response alone must never render as an exchange-confirmed exit.
 Historical management messages must not be replayed after deployment; reconcile
 current exchange state and create actions only from new messages.
 
-Deepcoin TPSL attribution must first use the position identity carried by the
-order itself. In current API responses this is normally `closePosId`; legacy
-aliases (`posId`, `pos_id`, and `positionId`) remain accepted. An exact
-`closePosId` must never fall through to symbol/side/time heuristics or be
-borrowed by a nearby same-symbol position.
+Deepcoin TPSL readback validates a ledger owner against position identity
+carried by the order. In current API responses this is normally `closePosId`;
+legacy aliases (`posId`, `pos_id`, and `positionId`) remain accepted. A
+disagreement with the canonical ledger is a conflict. An exchange position ID
+without the ledger remains unowned and must never fall through to
+symbol/side/time/size inference.
 
 For split-entry strategies, `execution_order_legs` is the position-identity
 authority. Strategy list and detail views derive the current `pos_ids` from

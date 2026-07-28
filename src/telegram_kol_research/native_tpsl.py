@@ -145,32 +145,6 @@ def match_native_tpsl_order(
     )
 
 
-def native_tpsl_belongs_to_position(
-    position: dict[str, Any],
-    order: NativeTpslOrder,
-) -> bool:
-    """Return whether a TPSL row can be attributed to one split position."""
-
-    position_inst_id = str(position.get("instId") or "").upper()
-    position_side = _normalize_side(str(position.get("posSide") or ""))
-    position_pos_id = _first_string(position, "posId", "pos_id", "id")
-    position_size = _decimal(
-        position.get("pos") if position.get("pos") not in (None, "") else position.get("size")
-    )
-    position_time = _latest_time(position, "cTime", "uTime", "createdTime", "created_at")
-    if not position_inst_id or not position_side:
-        return False
-    if order.inst_id != position_inst_id or order.pos_side != position_side:
-        return False
-    if position_pos_id and order.pos_id:
-        return position_pos_id == order.pos_id
-    if order.pos_id and position_pos_id != order.pos_id:
-        return False
-    if position_size is None or order.size not in {position_size, Decimal("0")}:
-        return False
-    return _time_matches_position(order.created_time, position_time)
-
-
 def _exact_order_matches(
     position: dict[str, Any],
     order: NativeTpslOrder,
@@ -233,30 +207,3 @@ def _normalize_side(value: str) -> str:
     if side == "sell":
         return "short"
     return side
-
-
-def _latest_time(payload: dict[str, Any], *keys: str) -> str | None:
-    values = [_first_string({key: payload.get(key)}, key) for key in keys]
-    present = [value for value in values if value is not None]
-    return max(present, key=lambda value: _to_int(value) or 0) if present else None
-
-
-def _time_matches_position(order_time: str | None, position_time: str | None) -> bool:
-    if not order_time or not position_time:
-        return False
-    if order_time == position_time:
-        return True
-    order_ms = _to_int(order_time)
-    position_ms = _to_int(position_time)
-    return (
-        order_ms is not None
-        and position_ms is not None
-        and 0 <= order_ms - position_ms <= 86_400_000
-    )
-
-
-def _to_int(value: Any) -> int | None:
-    try:
-        return int(Decimal(str(value)))
-    except (InvalidOperation, ValueError):
-        return None

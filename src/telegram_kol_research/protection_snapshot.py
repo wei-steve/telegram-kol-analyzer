@@ -10,7 +10,6 @@ from telegram_kol_research.models import PendingTpslSnapshotObservation
 from telegram_kol_research.native_tpsl import (
     NativeTpslExpectation,
     match_native_tpsl_order,
-    native_tpsl_belongs_to_position,
     normalize_native_tpsl,
 )
 from telegram_kol_research.protection_ledger import AccountProtectionOwnership
@@ -262,16 +261,7 @@ def _empty_stop(*, source):
 
 def _unowned_native_order_can_affect_position(order, position):
     pos_id = _text(position.get("posId") or position.get("pos_id") or position.get("id"))
-    if order.pos_id and order.pos_id == pos_id:
-        return True
-    if order.size == Decimal("0"):
-        position_inst_id = _text(position.get("instId") or position.get("inst_id")) or ""
-        position_side = _text(position.get("posSide") or position.get("side")) or ""
-        return (
-            order.inst_id == position_inst_id.upper()
-            and order.pos_side == position_side.lower()
-        )
-    return native_tpsl_belongs_to_position(position, order)
+    return bool(order.pos_id and order.pos_id == pos_id)
 
 
 def _latest_row(rows):

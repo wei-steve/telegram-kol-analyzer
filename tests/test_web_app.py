@@ -1766,7 +1766,7 @@ def test_execution_dashboard_does_not_use_take_profit_business_table_as_owner(tm
     assert "止盈止损(0)" in response.text
 
 
-def test_execution_dashboard_renders_ambiguous_stop_truthfully(tmp_path):
+def test_execution_dashboard_keeps_unowned_stop_out_of_positions(tmp_path):
     class FakeDeepcoinClient:
         def list_positions(self):
             return [
@@ -1802,8 +1802,8 @@ def test_execution_dashboard_renders_ambiguous_stop_truthfully(tmp_path):
     response = TestClient(app).get("/execution")
 
     assert response.status_code == 200
-    assert response.text.count("止损存在，归属待确认") == 2
-    assert "无止损" not in response.text
+    assert "止损存在，归属待确认" not in response.text
+    assert response.text.count("无止损") == 2
 
 
 def test_execution_dashboard_keeps_ambiguous_pending_tpsl_orders_unattributed(tmp_path):
@@ -2590,12 +2590,16 @@ def test_bound_position_close_api_submits_exact_live_position_and_keeps_lifecycl
                     "posSide": "short",
                     "pos": "11",
                     "avgPx": "64350",
+                    "mgnMode": "cross",
+                    "posMode": "split",
                 },
                 {
                     "instId": "BTC-USDT-SWAP",
                     "posId": "pos-other",
                     "posSide": "short",
                     "pos": "7",
+                    "mgnMode": "cross",
+                    "posMode": "split",
                 },
             ]
 
@@ -2659,7 +2663,8 @@ def test_bound_position_close_api_submits_exact_live_position_and_keeps_lifecycl
     assert response.status_code == 200
     assert response.json()["submitted"] is True
     assert response.json()["pos_id"] == "pos-target"
-    assert fake_client.position_calls == ["BTC-USDT-SWAP"]
+    assert fake_client.position_calls
+    assert set(fake_client.position_calls) == {"BTC-USDT-SWAP"}
     assert fake_client.order_payloads == [
         {
             "instId": "BTC-USDT-SWAP",

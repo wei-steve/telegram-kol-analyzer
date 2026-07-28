@@ -220,6 +220,23 @@ def list_verified_ledger_rows_for_positions(
     )
 
 
+def list_verified_account_ledger_rows(
+    session, *, venue: str = "deepcoin"
+) -> list[PositionProtectionLedger]:
+    """Return every verified TPSL owner row for one venue/account."""
+
+    return (
+        session.query(PositionProtectionLedger)
+        .filter(PositionProtectionLedger.venue == str(venue or "deepcoin").lower())
+        .filter(PositionProtectionLedger.status == "verified")
+        .order_by(
+            PositionProtectionLedger.pos_id.asc(),
+            PositionProtectionLedger.order_id.asc(),
+        )
+        .all()
+    )
+
+
 def _compact_json(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 

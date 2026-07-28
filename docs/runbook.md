@@ -988,6 +988,24 @@ Review `live_position_count`, `pending_tpsl_count`,
 as owned, unowned, or conflicting. Price, size, direction, and creation time
 do not establish ownership.
 
+The runtime read and mutation sequence is fixed:
+
+1. Read the complete account position and pending-TPSL snapshots.
+2. Load all verified `position_protection_ledger` rows for the account.
+3. Join pending rows by exact `ordId → posId`; validate, but never derive,
+   ownership from an exchange `posId`.
+4. Display, audit, plan, cancel, or replace only canonical owned rows.
+5. Refuse stale, missing, unowned, conflicting, or incomplete evidence before
+   producing any exchange write.
+
+`position_backup_stop_orders` and `position_take_profit_orders` describe
+workflow state only. They are not ownership authorities. Stable refusal codes
+include `no_existing_position_tpsl_to_adjust`,
+`protection_missing_cancellable_order_id`,
+`protection_price_or_size_mismatch`,
+`protection_ambiguous_global_assignment`, and
+`target_protection_evidence_unavailable`.
+
 `exchange_write_count` must be `0`. Any nonzero value invalidates the audit
 and requires immediate investigation. This command never submits, adjusts, or
 cancels an order and never creates or updates the database.
@@ -1018,3 +1036,9 @@ The apply writes only `position_protection_ledger` and the single-use
 confirmation record in one database transaction. It never calls a Deepcoin
 write API. Rerun `audit-tpsl-ownership` immediately afterward and require
 `exchange_write_count=0`.
+
+Historical repair is supervised and dry-run first. Symbol, side, price,
+quantity, creation time, or `sz=0` may be shown to an operator as supporting
+context, but an apply is allowed only for the separately reviewed exact
+`ordId → posId` actions in the fingerprinted plan. Runtime code must never
+reuse those review fields as automatic attribution rules.
