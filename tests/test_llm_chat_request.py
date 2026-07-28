@@ -125,10 +125,9 @@ def test_request_structured_chat_turn_normalizes_one_tool_call():
 def test_request_structured_chat_turn_normalizes_closed_final_json():
     def handler(request: httpx.Request) -> httpx.Response:
         payload = request.read().decode("utf-8")
-        assert '"tools"' not in payload
-        assert '"tool_choice"' not in payload
-        assert '"parallel_tool_calls"' not in payload
-        assert '"response_format":{"type":"json_object"}' in payload
+        assert '"name":"submit_runtime_diagnosis"' in payload
+        assert '"tool_choice":{"type":"function"' in payload
+        assert '"parallel_tool_calls":false' in payload
         return httpx.Response(
             200,
             request=request,
@@ -136,7 +135,19 @@ def test_request_structured_chat_turn_normalizes_closed_final_json():
                 "choices": [
                     {
                         "message": {
-                            "content": '{"incident_id":17,"confidence":"low"}'
+                            "tool_calls": [
+                                {
+                                    "id": "final-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_runtime_diagnosis",
+                                        "arguments": (
+                                            '{"incident_id":17,'
+                                            '"confidence":"low"}'
+                                        ),
+                                    },
+                                }
+                            ]
                         }
                     }
                 ]
@@ -156,6 +167,62 @@ def test_request_structured_chat_turn_normalizes_closed_final_json():
     )
 
     assert turn == {"final": {"incident_id": 17, "confidence": "low"}}
+
+
+def test_request_structured_chat_turn_serializes_provider_parallel_calls():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_incident_summary",
+                                        "arguments": '{"incident_id":17}',
+                                    },
+                                },
+                                {
+                                    "id": "call-2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_worker_state",
+                                        "arguments": '{"incident_id":17}',
+                                    },
+                                },
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    turn = request_structured_chat_turn(
+        config=LLMProxyConfig(
+            base_url="http://proxy.test",
+            api_key="",
+            model="gpt-test",
+            timeout_seconds=5,
+        ),
+        messages=[{"role": "system", "content": "Read-only diagnosis."}],
+        tool_schemas=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_incident_summary",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert turn["tool_call"]["name"] == "get_incident_summary"
 
 
 def test_request_grounded_chat_answer_raises_for_image_input_error_text_in_success_payload():

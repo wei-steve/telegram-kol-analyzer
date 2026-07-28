@@ -19,6 +19,53 @@ class LLMProxyConfig:
     timeout_seconds: float
 
 
+_FINAL_DIAGNOSIS_TOOL_NAME = "submit_runtime_diagnosis"
+_FINAL_DIAGNOSIS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": _FINAL_DIAGNOSIS_TOOL_NAME,
+        "description": "Submit the final closed read-only incident diagnosis.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "incident_id": {"type": "integer"},
+                "diagnosis_hypothesis": {"type": "string"},
+                "confidence": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                },
+                "evidence_references": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "missing_evidence": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "recommended_playbook_name": {
+                    "type": ["string", "null"],
+                },
+                "auto_handle_eligible": {"type": "boolean"},
+                "codex_handoff_required": {"type": "boolean"},
+                "remaining_risk": {"type": "string"},
+            },
+            "required": [
+                "incident_id",
+                "diagnosis_hypothesis",
+                "confidence",
+                "evidence_references",
+                "missing_evidence",
+                "recommended_playbook_name",
+                "auto_handle_eligible",
+                "codex_handoff_required",
+                "remaining_risk",
+            ],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 def load_llm_proxy_config(
     environ: dict[str, str] | None = None,
     env_file_paths: list[str | os.PathLike[str]] | None = None,
@@ -224,7 +271,16 @@ def request_structured_chat_turn(
             }
         )
     else:
-        payload["response_format"] = {"type": "json_object"}
+        payload.update(
+            {
+                "tools": [_FINAL_DIAGNOSIS_TOOL],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": _FINAL_DIAGNOSIS_TOOL_NAME},
+                },
+                "parallel_tool_calls": False,
+            }
+        )
     created_client = client is None
     active_client = client or httpx.Client(
         timeout=timeout_seconds or config.timeout_seconds
@@ -250,8 +306,11 @@ def request_structured_chat_turn(
         raise ValueError("structured chat response is missing a message")
     tool_calls = message.get("tool_calls")
     if tool_calls:
-        if not isinstance(tool_calls, list) or len(tool_calls) != 1:
-            raise ValueError("structured chat response must contain one tool call")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            raise ValueError("structured chat response tool calls are invalid")
+        # Some compatible providers ignore parallel_tool_calls=false. Serialize
+        # their response by accepting only the first request; no additional
+        # requested tool is executed or added to the transcript.
         tool_call = tool_calls[0]
         function = tool_call.get("function") if isinstance(tool_call, dict) else None
         if not isinstance(function, dict):
@@ -263,13 +322,16 @@ def request_structured_chat_turn(
             )
         except json.JSONDecodeError as exc:
             raise ValueError("structured tool arguments are invalid JSON") from exc
-        return {
+        normalized = {
             "tool_call": {
                 "id": tool_call.get("id"),
                 "name": function.get("name"),
                 "arguments": parsed_arguments,
             }
         }
+        if function.get("name") == _FINAL_DIAGNOSIS_TOOL_NAME:
+            return {"final": parsed_arguments}
+        return normalized
     content = message.get("content")
     if not isinstance(content, str):
         raise ValueError("structured chat response has no final JSON")
