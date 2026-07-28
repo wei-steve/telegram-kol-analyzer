@@ -6,39 +6,41 @@ used to advance or reinterpret the rollout.
 ```yaml
 project: runtime-incident-agent
 design_version: 1
-current_phase: 3
-phase_name: read-only-incident-agent-and-codex-handoff
-phase_status: in_progress
-last_completed_phase: 2
-last_completed_commit: 22ac194
-production_commit: 711b41fd6a3ce6b6d1f710f445649c7b0f83f3fb
+current_phase: 4
+phase_name: expand-read-only-evidence-and-build-evaluation-corpus
+phase_status: planned
+last_completed_phase: 3
+last_completed_commit: d5c5b70
+production_commit: d5c5b700117303aed6ed22d86ceb08026138df12
 local_tests:
-  - "phase-3-focused-ledger-agent-notification: 147 passed"
+  - "phase-3-post-canary-focused: 127 passed"
   - "context-resolution-and-management-regressions: 176 passed"
   - "full-suite attempt: 2237 passed, 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the failing test passed in isolation"
 server_verification:
-  status: pending
-  deployed_commit: 711b41fd6a3ce6b6d1f710f445649c7b0f83f3fb
-  service: active
-  bounded_restarts: clean
-  listener: monitoring-31-enabled-groups
-  recognition: latest-message-completed
+  status: complete
+  deployed_commit: d5c5b700117303aed6ed22d86ceb08026138df12
+  service: active-http-200
+  bounded_restarts: "clean; one pre-restart evidence claim expired and was recovered to completed after a bounded follow-up restart"
+  listener: monitoring-31-enabled-groups-and-continuing
+  recognition: "raw message 8143 recovered; latest raw message 8151 completed"
   contextual_resolution_inflight: 0
   position_mutation_inflight: 0
-  management_latest: succeeded
+  management_latest: "succeeded; totals unchanged except new normal successes"
   production_safety: stable-complete-baseline-audit_abnormal
-  capture_canary: "management_partial_failed source batch 28 -> runtime incident 1"
-  capture_dedupe: "three scans retained generation 1 and repeat_count 1"
-  telegram_canary: delivered
-  incident_agent_behavior: deterministic-capture-and-telegram-only
-  remaining: "Commit and push Phase 3, prove a safe deployment window, deploy with the Agent disabled, install the sidecar unit disabled/inactive, verify continuity, then run only a synthetic read-only canary."
+  sidecar: installed-disabled-inactive
+  agent_flag: absent
+  production_incident_row: "incident 1 remained pending with zero Agent attempts"
+  synthetic_canary: "isolated temporary database; one live-model attempt, three read-only tools, diagnosed, bounded Codex handoff available"
+  synthetic_business_rows: "raw/recognition/lifecycle/management/mutation tables all remained empty"
+  incident_agent_behavior: "read-only diagnosis and handoff only; no playbook executed"
+  remaining: "Begin Phase 4 only on the next approved turn."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
 known_issues:
-  - "The pre-existing production safety baseline remains `audit_abnormal` (31 blocked, 1 partial_failed, 5 recovery_required); the no-notify audit itself was stable and complete."
+  - "The pre-existing production safety baseline remains `audit_abnormal` (35 blocked, 1 partial_failed, 5 recovery_required); Phase 3 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
-  - "The full local suite completed its test summary but pytest cleanup hung and required interruption."
+  - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
 next_session_prompt: "请执行自定义ai agent的下一步实施"
 ```
@@ -113,19 +115,35 @@ When the user says `请执行自定义ai agent的下一步实施`:
 
 ### Phase 3 — Read-only incident agent and Codex handoff
 
-- Status: in progress
+- Status: completed
 - Local implementation: closed diagnosis/tool contracts, eight bounded
   read-only projections, OpenAI-compatible tool loop, durable retry budget,
   reproducible Codex handoff, diagnosis Telegram report, and a separately
   supervised sidecar that remains disabled by default
-- Review: all Critical and Important findings resolved after three review
-  passes
-- Local verification: 147 focused ledger/Agent/notification tests and 176
+- Provider compatibility hardening: serialized ignored parallel calls, reserved
+  a forced closed final-diagnosis turn, versioned the exact prompt used, and
+  validated the handoff before committing diagnosis
+- Review: all Critical and Important findings resolved, including server-canary
+  findings
+- Local verification: 127 post-canary focused tests and 176
   context-resolution/management regressions passed
 - Full-suite note: one pre-existing timing-sensitive Web lifespan test exceeded
   its 0.2-second deadline under aggregate load after 2237 passes and 1 skip;
   the exact test passed in isolation
-- Deployment: pending safe-window proof; no Phase 3 Agent process is enabled
+- Deployment: `d5c5b70`; main service active with HTTP 200, sidecar installed
+  disabled/inactive, and Agent flag absent
+- Synthetic canary: an isolated temporary database was diagnosed with three
+  bounded read-only tool calls and produced a reproducible Codex handoff; all
+  source business tables remained empty
+- Continuity: the listener continued after deployment; one expired
+  pre-restart evidence claim was recovered to a completed recognition, the
+  latest recognition completed, and no contextual-resolution or
+  position-mutation work remained in flight
+
+### Phase 4 — Expand read-only evidence and build evaluation corpus
+
+- Status: planned
+- Implementation started: no
 
 ## Current Phase Exit Checklist
 
@@ -140,9 +158,9 @@ Phase 3 is not complete until:
 - [x] diagnosis Telegram reports state uncertainty and that no action executed;
 - [x] architecture and contextual-resolution/management regressions pass;
 - [x] changes receive review with no remaining Critical or Important findings;
-- [ ] changes are committed and pushed;
-- [ ] production deploys with the Agent flag off;
-- [ ] the sidecar unit is installed disabled and inactive;
-- [ ] service/listener/checkpoint/reconciliation continuity is verified;
-- [ ] a synthetic read-only incident is diagnosed without a business-row change;
-- [ ] the Agent is disabled again after the canary unless separately approved.
+- [x] changes are committed and pushed;
+- [x] production deploys with the Agent flag off;
+- [x] the sidecar unit is installed disabled and inactive;
+- [x] service/listener/checkpoint/reconciliation continuity is verified;
+- [x] a synthetic read-only incident is diagnosed without a business-row change;
+- [x] the Agent is disabled again after the canary unless separately approved.
