@@ -8,26 +8,19 @@ project: runtime-incident-agent
 design_version: 1
 current_phase: 2
 phase_name: deterministic-incident-adapters-and-telegram-baseline
-phase_status: planned
+phase_status: in_progress
 last_completed_phase: 1
 last_completed_commit: 9820d3b
 production_commit: 9820d3be6e4ff426e60cdc9ee84c200dd0b63397
 local_tests:
-  - "phase-1-plus-shutdown-regressions: 325 passed"
-  - "full-suite: 2522 passed, 1 skipped"
+  - "phase-2-focused-regressions: 310 passed"
+  - "full-suite: 2558 passed, 1 skipped; pytest cleanup hung after the completed summary and was interrupted"
 server_verification:
-  status: complete
+  status: pending
   deployed_commit: 9820d3be6e4ff426e60cdc9ee84c200dd0b63397
   service: active
-  additive_table: present-and-empty
-  bounded_restart: clean-old-process-exit-without-graceful-timeout-stop-timeout-or-sigkill
-  listener: new-service-owns-telegram-session
-  recognition: post-restart-message-completed
-  checkpoint: covers-post-restart-message
-  reconciliation_backlog: unchanged-at-168
-  incident_agent_behavior: dormant
-  safety_audit: stable-complete-baseline-audit_abnormal
-  remaining: "Begin Phase 2 from failing adapter tests; keep capture and Telegram delivery disabled by default."
+  incident_agent_behavior: phase-1-ledger-only
+  remaining: "Prove a safe deployment window; deploy 22ac194 with capture and Telegram disabled; verify continuity; canary one capture class and its source-to-incident dedupe; then enable and verify Telegram delivery."
 enabled_flags: []
 known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (31 blocked, 1 partial_failed, 5 recovery_required); the no-notify audit itself was stable and complete."
@@ -84,17 +77,29 @@ When the user says `请执行自定义ai agent的下一步实施`:
 - Safety audit: stable and complete with the unchanged pre-existing
   `audit_abnormal` baseline
 
+### Phase 2 — Deterministic incident adapters and Telegram baseline
+
+- Status: in progress
+- Local implementation commit: `22ac194`
+- Review: no Critical, Important, or Minor findings
+- Local verification: 310 focused/regression tests passed; the full suite
+  reported 2558 passed and 1 skipped, then hung during pytest cleanup and was
+  interrupted
+- Runtime defaults: all capture classes disabled and Telegram delivery disabled
+- Remaining: safe-window production deployment, disabled-state continuity
+  verification, one-class capture/dedupe canary, and Telegram delivery canary
+
 ## Current Phase Exit Checklist
 
 Phase 2 is not complete until:
 
-- [ ] technical/runtime-only adapter tests fail for the intended missing behavior;
-- [ ] `unresolved`, `hold`, and ordinary contextual reanalysis are excluded;
-- [ ] best-effort adapters cannot alter the original source transition;
-- [ ] deterministic Telegram reports are bounded, redacted, deduplicated, and
+- [x] technical/runtime-only adapter tests fail for the intended missing behavior;
+- [x] `unresolved`, `hold`, and ordinary contextual reanalysis are excluded;
+- [x] best-effort adapters cannot alter the original source transition;
+- [x] deterministic Telegram reports are bounded, redacted, deduplicated, and
   non-blocking;
-- [ ] focused and critical regression tests pass;
-- [ ] changes are reviewed, committed, and pushed;
+- [x] focused and critical regression tests pass;
+- [x] changes are reviewed, committed, and pushed;
 - [ ] production deploys with capture and notification flags disabled;
 - [ ] one capture class is canaried only after source-to-incident dedupe evidence;
 - [ ] Telegram delivery is enabled only after capture evidence is correct.
