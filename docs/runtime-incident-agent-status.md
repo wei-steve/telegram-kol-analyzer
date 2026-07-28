@@ -6,30 +6,30 @@ used to advance or reinterpret the rollout.
 ```yaml
 project: runtime-incident-agent
 design_version: 1
-current_phase: 1
-phase_name: durable-runtime-incident-ledger
-phase_status: in_progress
-last_completed_phase: 0
-last_completed_commit: 52a7eff
-production_commit: 1488520b1674a736ba53f0a75fae018a57b6b645
+current_phase: 2
+phase_name: deterministic-incident-adapters-and-telegram-baseline
+phase_status: planned
+last_completed_phase: 1
+last_completed_commit: 9820d3b
+production_commit: 9820d3be6e4ff426e60cdc9ee84c200dd0b63397
 local_tests:
-  - "phase-1-required-regressions: 213 passed"
-  - "full-suite: 2521 passed, 1 skipped"
+  - "phase-1-plus-shutdown-regressions: 325 passed"
+  - "full-suite: 2522 passed, 1 skipped"
 server_verification:
-  status: partial
-  deployed_commit: 1488520b1674a736ba53f0a75fae018a57b6b645
+  status: complete
+  deployed_commit: 9820d3be6e4ff426e60cdc9ee84c200dd0b63397
   service: active
   additive_table: present-and-empty
-  listener: post-restart-message-persisted
+  bounded_restart: clean-old-process-exit-without-graceful-timeout-stop-timeout-or-sigkill
+  listener: new-service-owns-telegram-session
   recognition: post-restart-message-completed
   checkpoint: covers-post-restart-message
   reconciliation_backlog: unchanged-at-168
   incident_agent_behavior: dormant
   safety_audit: stable-complete-baseline-audit_abnormal
-  remaining: "Repeat a controlled safe-window restart and prove the journal has no graceful-shutdown timeout, stop-sigterm timeout, or SIGKILL before completing Phase 1."
+  remaining: "Begin Phase 2 from failing adapter tests; keep capture and Telegram delivery disabled by default."
 enabled_flags: []
 known_issues:
-  - "The deployment restart completed and message continuity was proven, but Uvicorn logged `timeout graceful shutdown exceeded`; the bounded-restart gate is not complete."
   - "The pre-existing production safety baseline remains `audit_abnormal` (31 blocked, 1 partial_failed, 5 recovery_required); the no-notify audit itself was stable and complete."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
 phase_7_explicitly_approved: false
@@ -69,32 +69,32 @@ When the user says `请执行自定义ai agent的下一步实施`:
 - Local verification: canonical documentation files present
 - Commit: `52a7eff` (`docs: plan runtime incident agent rollout`)
 
+### Phase 1 — Durable runtime incident ledger
+
+- Status: completed
+- Runtime behavior enabled: no
+- Ledger commit: `1488520` (`feat: add runtime incident ledger`)
+- Shutdown continuity fix: `9820d3b` (`fix: drain live streams before web shutdown`)
+- Local verification: 325 phase/regression tests and 2522 full-suite tests passed
+- Production verification: additive table present and empty, Telegram session
+  owned by the restarted service, recognition/checkpoint continuity preserved,
+  reconciliation backlog unchanged at 168, and incident behavior dormant
+- Bounded restart: old PID exited cleanly without a Uvicorn graceful timeout,
+  systemd stop timeout, or `SIGKILL`
+- Safety audit: stable and complete with the unchanged pre-existing
+  `audit_abnormal` baseline
+
 ## Current Phase Exit Checklist
 
-Phase 1 is not complete until:
+Phase 2 is not complete until:
 
-- [x] additive incident model and bootstrap path are tested;
-- [x] same-fingerprint deduplication is tested;
-- [x] claim transitions are concurrency-safe;
-- [x] bounded/redacted storage is tested;
-- [x] architecture-boundary test passes;
-- [x] context-resolution and management regressions pass;
-- [x] changes are committed and pushed;
-- [x] a safe deployment window is proven;
-- [x] production is updated with all agent flags off;
-- [ ] service, listener, reconciliation, and safety monitor are verified;
-- [ ] this file advances to Phase 2.
-
-## Phase 1 Progress
-
-- Local implementation commit: `1488520` (`feat: add runtime incident ledger`)
-- GitHub push: completed on `codex/deepcoin-auto-trading-v1`
-- Production deployment: completed with all incident-agent behavior dormant
-- Additive schema: `runtime_incidents` exists and contains zero rows
-- Continuity evidence: a message received after restart was persisted, covered
-  by the checkpoint, and completed authoritative recognition; no post-restart
-  recognition gap was found
-- Exact remaining verification: perform one later controlled restart in a
-  proven safe window and require a clean old-process shutdown journal with no
-  graceful timeout, stop timeout, or `SIGKILL`; then rerun the stable no-notify
-  safety audit and advance only to Phase 2
+- [ ] technical/runtime-only adapter tests fail for the intended missing behavior;
+- [ ] `unresolved`, `hold`, and ordinary contextual reanalysis are excluded;
+- [ ] best-effort adapters cannot alter the original source transition;
+- [ ] deterministic Telegram reports are bounded, redacted, deduplicated, and
+  non-blocking;
+- [ ] focused and critical regression tests pass;
+- [ ] changes are reviewed, committed, and pushed;
+- [ ] production deploys with capture and notification flags disabled;
+- [ ] one capture class is canaried only after source-to-incident dedupe evidence;
+- [ ] Telegram delivery is enabled only after capture evidence is correct.
