@@ -30,6 +30,21 @@ from telegram_kol_research.production_safety_monitor import run_production_safet
 from telegram_kol_research.production_safety_monitor import save_monitor_state
 from telegram_kol_research.production_safety_monitor import send_monitor_test_notification
 from telegram_kol_research.production_safety_monitor import should_run_daily_audit
+from telegram_kol_research.config import RuntimeIncidentConfig
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    PositionProtectionIncident,
+    RawMessage,
+    RuntimeIncident,
+    StrategyManagementBatch,
+    StrategyManagementLeg,
+)
+from telegram_kol_research.strategy_management_batches import (
+    ManagementLegCreate,
+    create_management_batch,
+)
 
 
 REVIEWED_HEAD = "3ec22ca77a1362167ce9d2cf702cfc50b1491967"
@@ -731,6 +746,271 @@ def test_monitor_orchestration_reads_all_bounded_lightweight_sources(tmp_path):
         ("journal", datetime(2026, 7, 16, 0, 0, tzinfo=UTC)),
         ("events", datetime(2026, 7, 16, 0, 0, tzinfo=UTC), 50),
     ]
+
+
+def test_monitor_records_adapter_failure_after_read_only_evaluation(tmp_path):
+    adapters = _RecordingAdapters()
+    adapters.read_service_state = lambda: (_ for _ in ()).throw(
+        RuntimeError("service adapter unavailable")
+    )
+    session_factory = create_session_factory(tmp_path / "monitor-incident.db")
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=adapters,
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        notify=False,
+        runtime_incident_session_factory=session_factory,
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"monitor_adapter_failure"})
+        ),
+    )
+
+    assert "adapter_failure" in outcome.result.reason_codes
+    with session_factory() as session:
+        row = session.query(RuntimeIncident).one()
+        assert row.incident_type == "monitor_adapter_failure"
+
+
+def test_monitor_adapts_each_durable_severe_protection_incident_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "protection-incident.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:1:2:BTC:long",
+            kol_id="kol",
+            chat_id=1,
+            message_id=2,
+            symbol="BTC",
+            side="long",
+            status="open",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="market",
+            pos_id="pos-1",
+            status="active",
+        )
+        session.add(leg)
+        session.flush()
+        source = PositionProtectionIncident(
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            pos_id="pos-1",
+            incident_type="stop_trigger_failed",
+            fingerprint="f" * 64,
+            evidence_json='{"reason_code":"stop_trigger_failed"}',
+            delivery_status="pending",
+            created_at=datetime(2026, 7, 16, 0, 20),
+            updated_at=datetime(2026, 7, 16, 0, 20),
+        )
+        session.add(source)
+        session.commit()
+        source_id = source.id
+
+    kwargs = {
+        "expectations": EXPECTATIONS,
+        "state_path": tmp_path / "state.json",
+        "adapters": _RecordingAdapters(),
+        "notify": False,
+        "runtime_incident_session_factory": session_factory,
+        "runtime_incident_config": RuntimeIncidentConfig(
+            capture_types=frozenset({"severe_protection_incident"})
+        ),
+    }
+    run_production_safety_monitor(
+        **kwargs,
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+    )
+    run_production_safety_monitor(
+        **kwargs,
+        now=datetime(2026, 7, 16, 0, 31, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        row = session.query(RuntimeIncident).one()
+        assert row.incident_type == "severe_protection_incident"
+        assert row.source_record_id == str(source_id)
+        assert row.repeat_count == 1
+
+
+def test_monitor_notification_failure_is_adapted_without_changing_outcome(tmp_path):
+    session_factory = create_session_factory(tmp_path / "monitor-notify-failure.db")
+    adapters = _RecordingAdapters(service_state="failed")
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=adapters,
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: SimpleNamespace(bot_token="token", chat_id="chat"),
+        send_bot_message=lambda **kwargs: (_ for _ in ()).throw(
+            RuntimeError("Telegram unavailable")
+        ),
+        runtime_incident_session_factory=session_factory,
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"notification_delivery_failure"})
+        ),
+    )
+
+    assert outcome.notification_status == "delivery_failed"
+    assert outcome.monitor_error == "notification_delivery_failed"
+    with session_factory() as session:
+        row = session.query(RuntimeIncident).one()
+        assert row.incident_type == "notification_delivery_failure"
+
+
+def test_monitor_adapts_durable_management_submit_unknown_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "management-source.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=2, text="close")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    batch = create_management_batch(
+        session_factory,
+        idempotency_fingerprint="9" * 64,
+        raw_message_id=raw_id,
+        recognition_decision_id=91,
+        recognition_generation="g1",
+        target_lifecycle_id=92,
+        strategy_instance_id="deepcoin:1:2:BTC:long",
+        execution_binding_id=93,
+        intent="full_take_profit",
+        effective_action="full_exit",
+        requested_fraction=None,
+        effective_fraction=1.0,
+        partial_round_before=0,
+        target_fingerprint="8" * 64,
+        target_snapshot={"positions": []},
+        legs=[
+            ManagementLegCreate(
+                execution_order_leg_id=94,
+                pos_id="pos-1",
+                leg_index=0,
+                status="submit_unknown",
+                planned_close_size="0.02",
+                last_error={"reason": "submission_outcome_unknown"},
+            )
+        ],
+        status="reconciling",
+        reason_code="one_or_more_close_submissions_unknown",
+    )
+    kwargs = {
+        "expectations": EXPECTATIONS,
+        "state_path": tmp_path / "state.json",
+        "adapters": _RecordingAdapters(),
+        "notify": False,
+        "runtime_incident_session_factory": session_factory,
+        "runtime_incident_config": RuntimeIncidentConfig(
+            capture_types=frozenset({"management_submit_unknown"})
+        ),
+    }
+
+    run_production_safety_monitor(
+        **kwargs,
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+    )
+    run_production_safety_monitor(
+        **kwargs,
+        now=datetime(2026, 7, 16, 0, 31, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        row = session.query(RuntimeIncident).one()
+        assert row.incident_type == "management_submit_unknown"
+        assert row.source_record_id == str(batch.id)
+        assert row.repeat_count == 1
+
+
+def test_durable_source_scan_failure_does_not_change_monitor_outcome(tmp_path):
+    class FailingSessionFactory:
+        def __call__(self):
+            raise RuntimeError("runtime ledger unavailable")
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        notify=False,
+        runtime_incident_session_factory=FailingSessionFactory(),
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"severe_protection_incident"})
+        ),
+    )
+
+    assert outcome.result.healthy is True
+    assert outcome.monitor_error is None
+
+
+def test_management_source_scan_does_not_starve_enabled_type_beyond_limit(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "management-backlog.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=2, text="close")
+        session.add(raw)
+        session.flush()
+        for index in range(101):
+            enabled = index == 100
+            batch = StrategyManagementBatch(
+                idempotency_fingerprint=f"{index:064x}",
+                raw_message_id=raw.id,
+                recognition_decision_id=1000 + index,
+                recognition_generation="g1",
+                target_lifecycle_id=2000 + index,
+                strategy_instance_id=f"strategy-{index}",
+                execution_binding_id=3000 + index,
+                intent="full_take_profit",
+                effective_action="full_exit",
+                execution_mode="live",
+                partial_round_before=0,
+                status="reconciling" if enabled else "partial_failed",
+                reason_code=(
+                    "submission_outcome_unknown"
+                    if enabled
+                    else "one_or_more_close_submissions_failed"
+                ),
+                target_fingerprint=f"{index + 1000:064x}",
+                target_snapshot_json="{}",
+                planned_at=datetime(2026, 7, 16, 0, 0),
+            )
+            session.add(batch)
+            session.flush()
+            session.add(
+                StrategyManagementLeg(
+                    management_batch_id=batch.id,
+                    execution_order_leg_id=4000 + index,
+                    pos_id=f"pos-{index}",
+                    leg_index=0,
+                    status="submit_unknown" if enabled else "failed",
+                )
+            )
+        session.commit()
+
+    run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        notify=False,
+        runtime_incident_session_factory=session_factory,
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"management_submit_unknown"})
+        ),
+    )
+
+    with session_factory() as session:
+        row = session.query(RuntimeIncident).one()
+        assert row.incident_type == "management_submit_unknown"
+        assert row.source_record_id == "101"
 
 
 def test_first_run_journal_failure_persists_original_window_for_recovery(tmp_path):

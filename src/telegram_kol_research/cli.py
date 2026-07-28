@@ -1825,6 +1825,7 @@ def monitor_production_safety(
         notify=notify,
         force_full_audit=force_full_audit,
         lookback=timedelta(minutes=lookback_minutes),
+        runtime_incident_session_factory=create_session_factory(database_path),
     )
     summary = {
         "audit_ran": outcome.audit_ran,

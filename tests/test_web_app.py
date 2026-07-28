@@ -12,6 +12,7 @@ import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
+from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
@@ -392,6 +393,66 @@ def test_semantic_review_worker_lifespan_starts_once_without_telegram_and_stops_
 
     assert app.state.semantic_review_task is None
     assert shutdown_order == ["semantic_review_stopped", "resources_closed"]
+
+
+def test_runtime_incident_notifications_use_system_operator_bot_lifespan(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.web_app as web_module
+
+    started = threading.Event()
+    stopped = threading.Event()
+    calls = []
+
+    async def fake_runtime_incident_loop(**kwargs):
+        calls.append(kwargs)
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(
+        web_module,
+        "run_runtime_incident_notification_loop",
+        fake_runtime_incident_loop,
+    )
+    app = create_web_app(database_path=tmp_path / "research.db")
+    system_config = SystemOperatorBotConfig(
+        bot_token="system-token",
+        chat_id="system-chat",
+    )
+    app.state.system_operator_bot_config = system_config
+    app.state.notification_bot_config = None
+    app.state.runtime_incident_config = RuntimeIncidentConfig(
+        telegram_notifications_enabled=True,
+    )
+
+    with TestClient(app):
+        assert started.wait(timeout=1)
+        assert len(calls) == 1
+        assert calls[0]["config"] is system_config
+        assert calls[0]["session_factory"] is app.state.session_factory
+        assert app.state.runtime_incident_notification_task is not None
+
+    assert stopped.wait(timeout=1)
+    assert app.state.runtime_incident_notification_task is None
+
+
+def test_runtime_incident_notification_worker_stays_dormant_when_disabled(
+    tmp_path,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="system-token",
+        chat_id="system-chat",
+    )
+    app.state.runtime_incident_config = RuntimeIncidentConfig()
+
+    with TestClient(app):
+        assert app.state.runtime_incident_notification_task is None
+        assert app.state.system_operator_bot_command_task is not None
 
 
 def test_management_worker_lifespan_starts_once_and_is_cancelled(tmp_path):

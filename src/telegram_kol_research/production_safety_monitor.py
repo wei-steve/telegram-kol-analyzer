@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 import selectors
@@ -24,6 +25,17 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from telegram_kol_research.config import (
+    RuntimeIncidentConfig,
+    load_runtime_incident_config,
+)
+from telegram_kol_research.runtime_incident_adapters import (
+    capture_management_state,
+    capture_monitor_state,
+    capture_notification_failure,
+    capture_protection_state,
+    capture_runtime_incident_best_effort,
+)
 from telegram_kol_research.system_operator_bot import (
     load_notification_bot_config,
     send_system_operator_bot_message,
@@ -33,6 +45,7 @@ from telegram_kol_research.system_operator_bot import (
 
 MAX_ALERT_LENGTH = 1200
 MAX_SAFE_COUNT = 1_000_000_000
+logger = logging.getLogger(__name__)
 
 _SAFE_EVENT_VALUE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 _GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
@@ -480,6 +493,8 @@ def run_production_safety_monitor(
     lookback: timedelta = _DEFAULT_LOOKBACK,
     load_bot_config=_load_monitor_bot_config,
     send_bot_message=send_system_operator_bot_message,
+    runtime_incident_session_factory=None,
+    runtime_incident_config: RuntimeIncidentConfig | None = None,
 ) -> MonitorRunOutcome:
     """Collect, evaluate, deduplicate, optionally notify, and persist state."""
 
@@ -627,12 +642,189 @@ def run_production_safety_monitor(
     except (OSError, TypeError, ValueError):
         monitor_error = "state_write_failed"
 
+    if runtime_incident_session_factory is not None:
+        incident_config_loader = (
+            (lambda: runtime_incident_config)
+            if runtime_incident_config is not None
+            else load_runtime_incident_config
+        )
+        capture_runtime_incident_best_effort(
+            capture_monitor_state,
+            runtime_incident_session_factory,
+            config_loader=incident_config_loader,
+            checked_at=checked_at,
+            reason_codes=result.reason_codes,
+            adapter_failures=tuple(failures),
+        )
+        if notification_status in {"config_missing", "delivery_failed"}:
+            capture_runtime_incident_best_effort(
+                capture_notification_failure,
+                runtime_incident_session_factory,
+                config_loader=incident_config_loader,
+                source_kind="production_safety_monitor_notification",
+                source_record_id=fingerprint_monitor_result(result),
+                error_type=monitor_error,
+                occurred_at=checked_at,
+            )
+        capture_uncaptured_runtime_incident_sources(
+            runtime_incident_session_factory,
+            config_loader=incident_config_loader,
+        )
+
     return MonitorRunOutcome(
         result=result,
         notification_status=notification_status,
         audit_ran=audit_ran,
         monitor_error=monitor_error,
     )
+
+
+def capture_uncaptured_runtime_incident_sources(
+    session_factory,
+    *,
+    config_loader=load_runtime_incident_config,
+    limit: int = 100,
+) -> int:
+    """Best-effort scan durable sources outside listener and trading paths."""
+
+    from telegram_kol_research.models import (
+        PositionProtectionIncident,
+        RuntimeIncident,
+        StrategyManagementBatch,
+        StrategyManagementLeg,
+    )
+    from sqlalchemy import String, and_, cast, exists, or_
+
+    try:
+        config = config_loader()
+        capture_management = any(
+            config.captures(incident_type)
+            for incident_type in (
+                "management_submit_unknown",
+                "management_partial_failed",
+                "management_recovery_required",
+            )
+        )
+        capture_protection = config.captures("severe_protection_incident")
+        if not capture_management and not capture_protection:
+            return 0
+        bounded_limit = max(1, min(int(limit), 100))
+        captured = 0
+        if capture_management:
+            incident_types = {
+                "submit_unknown": "management_submit_unknown",
+                "partial_failed": "management_partial_failed",
+                "recovery_required": "management_recovery_required",
+            }
+            enabled_incident_types = tuple(
+                (status, incident_type)
+                for status, incident_type in incident_types.items()
+                if config.captures(incident_type)
+            )
+            projected_batches = []
+            with session_factory() as session:
+                for status, incident_type in enabled_incident_types:
+                    remaining = bounded_limit - len(projected_batches)
+                    if remaining <= 0:
+                        break
+                    status_on_leg = exists().where(
+                        and_(
+                            StrategyManagementLeg.management_batch_id
+                            == StrategyManagementBatch.id,
+                            StrategyManagementLeg.status == status,
+                        )
+                    )
+                    already_captured = exists().where(
+                        and_(
+                            RuntimeIncident.source_kind
+                            == "strategy_management_batch",
+                            RuntimeIncident.source_record_id
+                            == cast(StrategyManagementBatch.id, String),
+                            RuntimeIncident.incident_type == incident_type,
+                        )
+                    )
+                    batches = (
+                        session.query(StrategyManagementBatch)
+                        .filter(
+                            or_(
+                                StrategyManagementBatch.status == status,
+                                status_on_leg,
+                            ),
+                            ~already_captured,
+                        )
+                        .order_by(StrategyManagementBatch.id.asc())
+                        .limit(remaining)
+                        .all()
+                    )
+                    projected_batches.extend(
+                        (
+                            int(batch.id),
+                            status,
+                            str(batch.reason_code or "") or None,
+                            batch.updated_at,
+                        )
+                        for batch in batches
+                    )
+            for batch_id, status, reason_code, updated_at in projected_batches:
+                occurred_at = updated_at
+                if occurred_at.tzinfo is None:
+                    occurred_at = occurred_at.replace(tzinfo=UTC)
+                row = capture_management_state(
+                    session_factory,
+                    config=config,
+                    batch_id=batch_id,
+                    status=status,
+                    reason_code=reason_code,
+                    occurred_at=occurred_at,
+                )
+                captured += int(row is not None)
+
+        if capture_protection:
+            with session_factory() as session:
+                sources = (
+                    session.query(PositionProtectionIncident)
+                    .outerjoin(
+                        RuntimeIncident,
+                        and_(
+                            RuntimeIncident.source_kind
+                            == "position_protection_incident",
+                            RuntimeIncident.source_record_id
+                            == cast(PositionProtectionIncident.id, String),
+                        ),
+                    )
+                    .filter(RuntimeIncident.id.is_(None))
+                    .order_by(PositionProtectionIncident.id.asc())
+                    .limit(bounded_limit)
+                    .all()
+                )
+                projected_sources = [
+                    (
+                        int(source.id),
+                        str(source.incident_type),
+                        source.created_at,
+                    )
+                    for source in sources
+                ]
+            for source_id, incident_type, created_at in projected_sources:
+                occurred_at = created_at
+                if occurred_at.tzinfo is None:
+                    occurred_at = occurred_at.replace(tzinfo=UTC)
+                row = capture_protection_state(
+                    session_factory,
+                    config=config,
+                    source_record_id=str(source_id),
+                    severity="high",
+                    reason_code=incident_type,
+                    occurred_at=occurred_at,
+                )
+                captured += int(row is not None)
+        return captured
+    except Exception as exc:
+        logger.warning(
+            "Runtime incident durable source scan failed open: error=%s",
+            type(exc).__name__,
+        )
+        return 0
 
 
 def send_monitor_test_notification(

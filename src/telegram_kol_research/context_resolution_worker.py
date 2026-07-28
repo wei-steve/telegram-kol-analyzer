@@ -24,6 +24,10 @@ from telegram_kol_research.models import (
     StrategyMessageLink,
     StrategyThread,
 )
+from telegram_kol_research.runtime_incident_adapters import (
+    capture_context_worker_state,
+    capture_runtime_incident_best_effort,
+)
 
 
 EVENT_TRIGGER_MAP = {
@@ -603,6 +607,16 @@ def run_context_resolution_once(
             ),
             increment_attempts=not exhausted,
         )
+        if exhausted:
+            capture_runtime_incident_best_effort(
+                capture_context_worker_state,
+                session_factory,
+                attempt_id=claim.attempt_id,
+                raw_message_id=claim.raw_message_id,
+                status="exhausted",
+                occurred_at=current,
+                error_type=type(exc).__name__,
+            )
         if exhausted and notify_final_failure is not None:
             should_notify = False
             with session_factory() as session:

@@ -47,6 +47,11 @@ from telegram_kol_research.recognition_decisions import (
     complete_semantic_review,
     fail_semantic_review,
 )
+from telegram_kol_research.runtime_incident_adapters import (
+    capture_notification_failure,
+    capture_provider_failure,
+    capture_runtime_incident_best_effort,
+)
 from telegram_kol_research.recognition_experiments import (
     _extract_chat_content,
 )
@@ -579,6 +584,15 @@ async def run_semantic_review_once(
                         claim.raw_message_id,
                         sanitize_notifier_exception(status_exc),
                     )
+                await asyncio.to_thread(
+                    capture_runtime_incident_best_effort,
+                    capture_notification_failure,
+                    session_factory,
+                    source_kind="semantic_review_notification",
+                    source_record_id=str(claim.raw_message_id),
+                    error_type=type(exc).__name__,
+                    occurred_at=now,
+                )
                 logger.error(
                     "Critical semantic-review notifier failed for raw_message_id=%s: %s",
                     claim.raw_message_id,
@@ -612,6 +626,17 @@ async def run_semantic_review_once(
             error=str(exc),
             next_attempt_at=next_attempt_at,
         )
+        if next_attempt_at is None:
+            await asyncio.to_thread(
+                capture_runtime_incident_best_effort,
+                capture_provider_failure,
+                session_factory,
+                source_kind="semantic_review",
+                source_record_id=str(claim.raw_message_id),
+                provider_status="retry_exhausted",
+                error_type=type(exc).__name__,
+                occurred_at=failure_at,
+            )
         logger.exception(
             "Semantic disagreement review failed for raw_message_id=%s",
             claim.raw_message_id,

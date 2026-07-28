@@ -19,6 +19,10 @@ from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
+from telegram_kol_research.config import (
+    RuntimeIncidentConfig,
+    load_runtime_incident_config,
+)
 from telegram_kol_research.llm_chat import _load_env_file_values
 from telegram_kol_research.message_instruction_items import (
     FINISH_STATUSES,
@@ -30,6 +34,7 @@ from telegram_kol_research.time_utils import utc_naive_to_local
 
 
 logger = logging.getLogger(__name__)
+RUNTIME_INCIDENT_MESSAGE_MAX_CHARS = 1200
 
 
 @dataclass(slots=True)
@@ -92,6 +97,63 @@ def load_notification_bot_config(
 
 def system_operator_bot_enabled(config: SystemOperatorBotConfig | None) -> bool:
     return bool(config and config.bot_token and config.chat_id)
+
+
+def format_runtime_incident_notification(incident) -> str:
+    """Render one bounded deterministic report without AI interpretation."""
+
+    try:
+        summary = json.loads(incident.redacted_summary or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        summary = {}
+    if not isinstance(summary, dict):
+        summary = {}
+    labels = {
+        "component": "组件",
+        "source_status": "源状态",
+        "reason_code": "原因代码",
+        "error_code": "错误代码",
+        "error_type": "错误类型",
+        "provider_status": "提供方状态",
+        "notification_status": "通知状态",
+        "containment": "当前遏制",
+        "impact": "影响",
+    }
+    lines = [
+        "【运行异常】",
+        f"事件ID: {int(incident.id)}",
+        f"类型: {_safe_runtime_incident_value(incident.incident_type, limit=64)}",
+        f"严重程度: {_safe_runtime_incident_value(incident.severity, limit=16)}",
+        (
+            "来源: "
+            f"{_safe_runtime_incident_value(incident.source_kind, limit=64)}:"
+            f"{_safe_runtime_incident_value(incident.source_record_id, limit=255)}"
+        ),
+        f"重复次数: {max(1, int(incident.repeat_count or 1))}",
+    ]
+    for key, label in labels.items():
+        if key in summary:
+            lines.append(
+                f"{label}: {_safe_runtime_incident_value(summary[key], limit=180)}"
+            )
+    lines.extend(
+        (
+            "AI诊断: 未启用",
+            "自动操作: 未执行",
+            "处理: 已记录，正常交易流程未等待本通知。",
+        )
+    )
+    rendered = "\n".join(lines)
+    return rendered[:RUNTIME_INCIDENT_MESSAGE_MAX_CHARS]
+
+
+def _safe_runtime_incident_value(value: Any, *, limit: int) -> str:
+    text = str(value or "-").strip()
+    lowered = text.lower()
+    if any(marker in lowered for marker in _SENSITIVE_MARKERS):
+        return "[redacted]"
+    text = "".join(character if character.isprintable() else "?" for character in text)
+    return _truncate_text(text, limit=max(1, int(limit)))
 
 
 def format_pending_entry_expiry_review_message(payload: dict[str, Any]) -> str:
@@ -888,6 +950,156 @@ def claim_next_strategy_management_notification(
         }
 
 
+def claim_next_runtime_incident_notification(
+    session_factory,
+    *,
+    claimed_at: datetime | None = None,
+    lease_seconds: float = 120.0,
+):
+    """CAS one pending, failed, or stale runtime-incident delivery."""
+
+    from telegram_kol_research.models import RuntimeIncident
+
+    now = claimed_at or datetime.now(UTC)
+    stale_before = now - timedelta(seconds=max(5.0, float(lease_seconds)))
+    claimable = or_(
+        RuntimeIncident.notification_status == "pending",
+        and_(
+            RuntimeIncident.notification_status == "failed",
+            or_(
+                RuntimeIncident.notification_claimed_at.is_(None),
+                RuntimeIncident.notification_claimed_at <= stale_before,
+            ),
+        ),
+        (
+            (RuntimeIncident.notification_status == "delivering")
+            & or_(
+                RuntimeIncident.notification_claimed_at.is_(None),
+                RuntimeIncident.notification_claimed_at <= stale_before,
+            )
+        ),
+    )
+    with session_factory() as session:
+        row_id = (
+            session.query(RuntimeIncident.id)
+            .filter(claimable)
+            .order_by(RuntimeIncident.id.asc())
+            .limit(1)
+            .scalar()
+        )
+    if row_id is None:
+        return None
+    token = uuid.uuid4().hex
+    with session_factory() as session:
+        result = session.execute(
+            update(RuntimeIncident)
+            .where(RuntimeIncident.id == row_id, claimable)
+            .values(
+                notification_status="delivering",
+                notification_claim_token=token,
+                notification_claimed_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+        if result.rowcount != 1:
+            return None
+        row = session.get(RuntimeIncident, row_id)
+        session.expunge(row)
+        return {"incident": row, "claim_token": token}
+
+
+async def deliver_runtime_incident_notifications(
+    session_factory,
+    *,
+    config: SystemOperatorBotConfig,
+    runtime_config: RuntimeIncidentConfig | None = None,
+    limit: int = 20,
+    claimed_at: datetime | None = None,
+) -> int:
+    """Deliver with at-least-once crash semantics and stable incident IDs.
+
+    A process death after Telegram accepts a report but before ``delivered``
+    commits can cause one repeat after lease expiry. The visible incident ID is
+    the operator deduplication marker; committed successes are not reclaimed.
+    """
+
+    from telegram_kol_research.models import RuntimeIncident
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_notification_failure,
+    )
+
+    feature_config = runtime_config or load_runtime_incident_config()
+    if not feature_config.telegram_notifications_enabled:
+        return 0
+    operation_now = claimed_at or datetime.now(UTC)
+    delivered = 0
+    for _ in range(max(1, min(int(limit), 100))):
+        claim = claim_next_runtime_incident_notification(
+            session_factory,
+            claimed_at=claimed_at,
+            lease_seconds=feature_config.notification_lease_seconds,
+        )
+        if claim is None:
+            break
+        incident = claim["incident"]
+        token = claim["claim_token"]
+        try:
+            await send_system_operator_bot_message(
+                config=config,
+                text=format_runtime_incident_notification(incident),
+            )
+        except Exception as exc:
+            failed_at = operation_now
+            with session_factory() as session:
+                session.execute(
+                    update(RuntimeIncident)
+                    .where(
+                        RuntimeIncident.id == incident.id,
+                        RuntimeIncident.notification_status == "delivering",
+                        RuntimeIncident.notification_claim_token == token,
+                    )
+                    .values(
+                        notification_status="failed",
+                        notification_claim_token=None,
+                        notification_claimed_at=failed_at,
+                        updated_at=failed_at,
+                    )
+                )
+                session.commit()
+            if incident.incident_type != "notification_delivery_failure":
+                capture_notification_failure(
+                    session_factory,
+                    config=feature_config,
+                    source_kind="runtime_incident_notification",
+                    source_record_id=str(incident.id),
+                    error_type=type(exc).__name__,
+                    occurred_at=failed_at,
+                )
+            # Do not retry the same failed row in a hot loop.
+            break
+        delivered_at = operation_now
+        with session_factory() as session:
+            result = session.execute(
+                update(RuntimeIncident)
+                .where(
+                    RuntimeIncident.id == incident.id,
+                    RuntimeIncident.notification_status == "delivering",
+                    RuntimeIncident.notification_claim_token == token,
+                )
+                .values(
+                    notification_status="delivered",
+                    notification_claim_token=None,
+                    notification_claimed_at=None,
+                    notified_at=delivered_at,
+                    updated_at=delivered_at,
+                )
+            )
+            session.commit()
+            delivered += int(result.rowcount == 1)
+    return delivered
+
+
 async def deliver_strategy_management_notifications(
     session_factory, *, config: SystemOperatorBotConfig, group_labels=None, limit: int = 20,
     claimed_at: datetime | None = None, lease_seconds: float = 120.0,
@@ -919,6 +1131,7 @@ async def deliver_strategy_management_notifications(
             for message in split_strategy_management_notification(payload):
                 await send_system_operator_bot_message(config=config, text=message)
         except Exception as exc:
+            failed_at = datetime.now(UTC)
             with session_factory() as session:
                 session.execute(
                     update(StrategyManagementNotification)
@@ -931,10 +1144,23 @@ async def deliver_strategy_management_notifications(
                         status="failed", claim_token=None,
                         lease_expires_at=None,
                         delivery_error=type(exc).__name__,
-                        updated_at=datetime.now(UTC),
+                        updated_at=failed_at,
                     )
                 )
                 session.commit()
+            from telegram_kol_research.runtime_incident_adapters import (
+                capture_notification_failure,
+                capture_runtime_incident_best_effort,
+            )
+
+            capture_runtime_incident_best_effort(
+                capture_notification_failure,
+                session_factory,
+                source_kind="strategy_management_notification",
+                source_record_id=str(claim["id"]),
+                error_type=type(exc).__name__,
+                occurred_at=failed_at,
+            )
             # Retry on a later worker tick. Reclaiming the just-failed row in the
             # same tick would create an unbounded hot loop during an outage.
             break
@@ -971,6 +1197,38 @@ async def run_strategy_management_notification_loop(
         except Exception:
             pass
         await asyncio.sleep(max(0.1, float(interval_seconds)))
+
+
+async def run_runtime_incident_notification_loop(
+    *,
+    session_factory,
+    config: SystemOperatorBotConfig,
+    interval_seconds: float = 5.0,
+    runtime_config: RuntimeIncidentConfig | None = None,
+) -> None:
+    """Poll the Phase 2 outbox through the dedicated system operator bot."""
+
+    if runtime_config is None:
+        try:
+            feature_config = load_runtime_incident_config()
+        except Exception:
+            feature_config = RuntimeIncidentConfig()
+    else:
+        feature_config = runtime_config
+    while True:
+        try:
+            await deliver_runtime_incident_notifications(
+                session_factory,
+                config=config,
+                runtime_config=feature_config,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        await asyncio.sleep(max(0.1, float(interval_seconds)))
+
+
 def build_pending_entry_expiry_review_reply_markup(payload: dict[str, Any]) -> dict[str, Any]:
     lifecycle_id = payload.get("lifecycle_id")
     return {

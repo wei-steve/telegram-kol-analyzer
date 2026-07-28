@@ -29,6 +29,7 @@ FORBIDDEN_SYMBOL_FRAGMENTS = (
 )
 ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
     "runtime_incidents.py": frozenset({"models"}),
+    "runtime_incident_adapters.py": frozenset({"config", "runtime_incidents"}),
 }
 
 

@@ -6,11 +6,13 @@ import pytest
 
 import telegram_kol_research.telegram_bot_commands as bot_commands_module
 import telegram_kol_research.system_operator_bot as operator_bot_module
+from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
 )
-from telegram_kol_research.models import RawMessage, SignalCandidate
+from telegram_kol_research.models import RawMessage, RuntimeIncident, SignalCandidate
+from telegram_kol_research.runtime_incidents import record_runtime_incident
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
     build_pending_entry_expiry_review_reply_markup,
@@ -26,6 +28,237 @@ from telegram_kol_research.system_operator_bot import (
 )
 
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+
+
+def _record_runtime_incident(session_factory, **overrides):
+    values = {
+        "source_kind": "context_resolution_attempt",
+        "source_record_id": "41",
+        "incident_type": "context_worker_exhausted",
+        "severity": "high",
+        "fingerprint": "a" * 64,
+        "redacted_summary": json.dumps(
+            {
+                "component": "context_resolution",
+                "source_status": "exhausted",
+                "reason_code": "context_reanalysis_exhausted",
+            },
+            sort_keys=True,
+        ),
+        "occurred_at": NOW,
+        "feature_policy_version": "runtime-incident-phase-2-v1",
+        "prompt_version": "none",
+        "tool_policy_version": "none",
+    }
+    values.update(overrides)
+    return record_runtime_incident(session_factory, **values)
+
+
+def test_runtime_incident_notification_has_fixed_bounded_redacted_labels(tmp_path):
+    session_factory = create_session_factory(tmp_path / "runtime-format.db")
+    incident = _record_runtime_incident(session_factory)
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        row.redacted_summary = json.dumps(
+            {
+                "component": "Authorization: bearer never-show-this",
+                "source_status": "x" * 1800,
+            }
+        )
+        session.commit()
+        session.refresh(row)
+        rendered = operator_bot_module.format_runtime_incident_notification(row)
+
+    assert rendered.startswith("【运行异常】")
+    assert f"事件ID: {incident.id}" in rendered
+    assert "类型: context_worker_exhausted" in rendered
+    assert "严重程度: high" in rendered
+    assert "AI诊断: 未启用" in rendered
+    assert "自动操作: 未执行" in rendered
+    assert "never-show-this" not in rendered
+    assert "[redacted]" in rendered
+    assert 0 < len(rendered) <= operator_bot_module.RUNTIME_INCIDENT_MESSAGE_MAX_CHARS
+
+
+def test_runtime_incident_delivery_is_disabled_without_claiming(tmp_path):
+    session_factory = create_session_factory(tmp_path / "runtime-disabled.db")
+    incident = _record_runtime_incident(session_factory)
+
+    delivered = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=RuntimeIncidentConfig(),
+        )
+    )
+
+    assert delivered == 0
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        assert row.notification_status == "pending"
+        assert row.notification_claim_token is None
+
+
+def test_runtime_incident_notification_retries_failure_and_deduplicates_success(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "runtime-retry.db")
+    incident = _record_runtime_incident(session_factory)
+    attempts = []
+
+    async def fail_once(**kwargs):
+        attempts.append(kwargs["text"])
+        if len(attempts) == 1:
+            raise httpx.ConnectError("temporary Telegram failure")
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "send_system_operator_bot_message",
+        fail_once,
+    )
+    runtime_config = RuntimeIncidentConfig(
+        telegram_notifications_enabled=True,
+        notification_lease_seconds=30,
+    )
+
+    first = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=runtime_config,
+            claimed_at=NOW,
+        )
+    )
+    second = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=runtime_config,
+            claimed_at=NOW + timedelta(seconds=31),
+        )
+    )
+    third = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=runtime_config,
+            claimed_at=NOW + timedelta(seconds=31),
+        )
+    )
+
+    assert (first, second, third) == (0, 1, 0)
+    assert len(attempts) == 2
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        assert row.notification_status == "delivered"
+        assert row.notification_claim_token is None
+        assert row.notified_at is not None
+
+
+def test_failed_runtime_notification_backs_off_without_starving_newer_incident(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "runtime-fairness.db")
+    first = _record_runtime_incident(session_factory)
+    second = _record_runtime_incident(
+        session_factory,
+        source_record_id="42",
+        fingerprint="b" * 64,
+    )
+    attempts = []
+
+    async def fail_first(**kwargs):
+        attempts.append(kwargs["text"])
+        if len(attempts) == 1:
+            raise httpx.ConnectError("Telegram unavailable")
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "send_system_operator_bot_message",
+        fail_first,
+    )
+    runtime_config = RuntimeIncidentConfig(
+        telegram_notifications_enabled=True,
+        notification_lease_seconds=30,
+    )
+
+    assert asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=runtime_config,
+            claimed_at=NOW,
+        )
+    ) == 0
+    assert asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=runtime_config,
+            claimed_at=NOW,
+        )
+    ) == 1
+    assert asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=runtime_config,
+            claimed_at=NOW + timedelta(seconds=31),
+        )
+    ) == 1
+
+    assert f"事件ID: {first.id}" in attempts[0]
+    assert f"事件ID: {second.id}" in attempts[1]
+    assert f"事件ID: {first.id}" in attempts[2]
+
+
+def test_runtime_incident_notification_claim_has_one_concurrent_winner(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    session_factory = create_session_factory(tmp_path / "runtime-claim.db")
+    _record_runtime_incident(session_factory)
+    barrier = __import__("threading").Barrier(2)
+
+    def claim():
+        barrier.wait()
+        return operator_bot_module.claim_next_runtime_incident_notification(
+            session_factory,
+            claimed_at=NOW,
+            lease_seconds=30,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(pool.map(lambda _: claim(), range(2)))
+
+    assert sum(item is not None for item in claims) == 1
+
+
+def test_runtime_incident_notification_stale_claim_is_recoverable(tmp_path):
+    session_factory = create_session_factory(tmp_path / "runtime-stale-claim.db")
+    _record_runtime_incident(session_factory)
+
+    first = operator_bot_module.claim_next_runtime_incident_notification(
+        session_factory,
+        claimed_at=NOW,
+        lease_seconds=30,
+    )
+    before_expiry = operator_bot_module.claim_next_runtime_incident_notification(
+        session_factory,
+        claimed_at=NOW + timedelta(seconds=29),
+        lease_seconds=30,
+    )
+    after_expiry = operator_bot_module.claim_next_runtime_incident_notification(
+        session_factory,
+        claimed_at=NOW + timedelta(seconds=31),
+        lease_seconds=30,
+    )
+
+    assert first is not None
+    assert before_expiry is None
+    assert after_expiry is not None
+    assert after_expiry["claim_token"] != first["claim_token"]
 
 
 def test_message_instruction_summary_reports_management_failure_and_entry_attempt():

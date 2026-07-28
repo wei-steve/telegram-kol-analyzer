@@ -102,6 +102,28 @@ Only then enable the phase's canary flag.
   notification storm triggers immediate disablement.
 - Disabling the incident agent must not disable normal production components.
 
+### Phase 2 capture and notification flags
+
+Phase 2 uses two independent, dormant-by-default settings:
+
+- `TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES`: comma-separated exact
+  incident types. Empty disables capture. Wildcards are not supported.
+- `TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED`: only `1`, `true`, `yes`,
+  or `on` enables deterministic incident delivery. Empty or any other value
+  disables delivery.
+
+The first canary must set exactly one capture type and leave Telegram delivery
+off. Compare source rows with `runtime_incidents` fingerprints and repeat
+counts before adding another type. Telegram delivery may be enabled only after
+the capture comparison is correct. Immediate Phase 2 rollback is to clear both
+settings and restart only in a newly proven safe window.
+
+Telegram delivery has at-least-once crash semantics because Telegram does not
+accept an idempotency key. A crash after Telegram accepts a report but before
+the local `delivered` commit may repeat it after lease expiry. The fixed
+`事件ID` is the operator deduplication marker; committed successes are never
+reclaimed.
+
 ## Rollback
 
 1. Disable the newest phase feature flag.

@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+import telegram_kol_research.context_resolution_worker as context_worker_module
 from telegram_kol_research.context_resolution_worker import (
     build_redacted_exchange_state,
     build_context_state_fingerprint,
@@ -473,3 +474,56 @@ def test_final_failure_notifies_once_after_bounded_attempts(tmp_path):
 
     assert result["status"] == "exhausted"
     assert len(notices) == 1
+
+
+def test_exhausted_worker_records_incident_only_after_source_state_commits(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "failure-incident.db")
+    raw_id, attempt_id = _persist_unresolved(session_factory)
+    with session_factory() as session:
+        attempt = session.get(ContextResolutionAttempt, attempt_id)
+        attempt.attempts = 3
+        session.commit()
+    schedule_context_reanalysis(
+        session_factory,
+        event_type="message_edited",
+        raw_message_id=raw_id,
+        occurred_at=NOW,
+    )
+    captured = []
+
+    def capture_best_effort(adapter, *args, **kwargs):
+        with session_factory() as session:
+            assert session.get(ContextResolutionAttempt, attempt_id).status == "exhausted"
+        captured.append((adapter, args, kwargs))
+
+    monkeypatch.setattr(
+        context_worker_module,
+        "capture_runtime_incident_best_effort",
+        capture_best_effort,
+    )
+
+    result = run_context_resolution_once(
+        session_factory,
+        context_fingerprint_factory=lambda _: "sha256:new",
+        reanalyze=lambda *_: (_ for _ in ()).throw(RuntimeError("temporary")),
+        max_attempts=3,
+        now=NOW,
+    )
+
+    assert result["status"] == "exhausted"
+    assert captured == [
+        (
+            context_worker_module.capture_context_worker_state,
+            (session_factory,),
+            {
+                "attempt_id": attempt_id,
+                "raw_message_id": raw_id,
+                "status": "exhausted",
+                "occurred_at": NOW,
+                "error_type": "RuntimeError",
+            },
+        )
+    ]

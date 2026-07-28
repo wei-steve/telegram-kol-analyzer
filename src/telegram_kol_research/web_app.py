@@ -147,6 +147,10 @@ from telegram_kol_research.strategy_alerts import (
     load_strategy_alert_config,
     strategy_alerts_enabled,
 )
+from telegram_kol_research.config import (
+    RuntimeIncidentConfig,
+    load_runtime_incident_config,
+)
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
     canonical_management_error_summary,
@@ -158,6 +162,7 @@ from telegram_kol_research.system_operator_bot import (
     send_pending_entry_expiry_review,
     send_semantic_disagreement_notification,
     send_system_operator_bot_message,
+    run_runtime_incident_notification_loop,
     run_strategy_management_notification_loop,
     system_operator_bot_enabled,
 )
@@ -3113,7 +3118,28 @@ def create_web_app(
                 app.state.strategy_management_notification_task.add_done_callback(
                     _log_background_task_result("strategy_management_notification_task")
                 )
-            if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
+            if isinstance(
+                app.state.system_operator_bot_config,
+                SystemOperatorBotConfig,
+            ):
+                if (
+                    app.state.runtime_incident_config
+                    .telegram_notifications_enabled
+                ):
+                    app.state.runtime_incident_notification_task = (
+                        asyncio.create_task(
+                            run_runtime_incident_notification_loop(
+                                session_factory=app.state.session_factory,
+                                config=app.state.system_operator_bot_config,
+                                runtime_config=app.state.runtime_incident_config,
+                            )
+                        )
+                    )
+                    app.state.runtime_incident_notification_task.add_done_callback(
+                        _log_background_task_result(
+                            "runtime_incident_notification_task"
+                        )
+                    )
                 app.state.system_operator_bot_command_task = asyncio.create_task(
                     run_system_operator_bot_command_loop(
                         config=app.state.system_operator_bot_config,
@@ -3228,6 +3254,18 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.strategy_management_notification_task = None
+            runtime_incident_notification_task = (
+                app.state.runtime_incident_notification_task
+            )
+            if runtime_incident_notification_task is not None:
+                runtime_incident_notification_task.cancel()
+                try:
+                    await runtime_incident_notification_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.runtime_incident_notification_task = None
             reconcile_task = app.state.reconcile_task
             if reconcile_task is not None:
                 reconcile_task.cancel()
@@ -3265,6 +3303,10 @@ def create_web_app(
         if system_operator_bot_enabled(loaded_notification_bot_config)
         else None
     )
+    try:
+        app.state.runtime_incident_config = load_runtime_incident_config()
+    except Exception:
+        app.state.runtime_incident_config = RuntimeIncidentConfig()
     app.state.chat_requester = request_grounded_chat_answer
     app.state.prompt_test_runner = run_prompt_draft_test
     app.state.live_target_titles = live_target_titles or set()
@@ -3352,6 +3394,7 @@ def create_web_app(
     app.state.telegram_bot_command_task = None
     app.state.system_operator_bot_command_task = None
     app.state.strategy_management_notification_task = None
+    app.state.runtime_incident_notification_task = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client
     app.state.reconcile_once_runner = run_reconcile_once

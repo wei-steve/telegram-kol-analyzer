@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from telegram_kol_research.ai_recognition_config import AiProviderConfig, AiRecognitionConfig
+from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import RawMessage, RecognitionDecision
 from telegram_kol_research.recognition_decisions import claim_next_semantic_review
@@ -163,6 +164,53 @@ def test_worker_marks_invalid_json_failed_after_three_attempts(tmp_path):
         assert row.comparison_status == "failed"
         assert row.comparison_attempts == 3
         assert row.comparison_next_attempt_at is None
+
+
+def test_worker_retry_exhaustion_is_adapted_after_failed_state_commits(
+    tmp_path,
+    monkeypatch,
+):
+    factory, raw_id, _ = _setup(tmp_path)
+    calls = []
+
+    def capture(adapter, *args, **kwargs):
+        with factory() as session:
+            assert session.query(RecognitionDecision).one().comparison_status == "failed"
+        calls.append((adapter, args, kwargs))
+
+    monkeypatch.setattr(
+        review_module,
+        "capture_runtime_incident_best_effort",
+        capture,
+    )
+
+    asyncio.run(
+        run_semantic_review_once(
+            factory,
+            config=AiRecognitionConfig(),
+            notifier=None,
+            reviewer=lambda *args, **kwargs: (_ for _ in ()).throw(
+                TimeoutError("provider timeout")
+            ),
+            now=NOW,
+            now_provider=lambda: NOW,
+            max_attempts=1,
+        )
+    )
+
+    assert calls == [
+        (
+            review_module.capture_provider_failure,
+            (factory,),
+            {
+                "source_kind": "semantic_review",
+                "source_record_id": str(raw_id),
+                "provider_status": "retry_exhausted",
+                "error_type": "TimeoutError",
+                "occurred_at": NOW,
+            },
+        )
+    ]
 
 
 def test_worker_recovers_stale_running_claim(tmp_path):
@@ -369,6 +417,51 @@ def test_worker_failed_notification_is_final_and_does_not_change_automation(tmp_
         now=NOW + timedelta(minutes=1),
     ))
     assert notified == []
+
+
+def test_worker_notification_failure_is_adapted_after_delivery_state_commits(
+    tmp_path,
+    monkeypatch,
+):
+    factory, raw_id, mimo = _setup(tmp_path, text="全部出局")
+    payload = _review_payload(action_type="exit_full", critical=True)
+    calls = []
+
+    def capture(adapter, *args, **kwargs):
+        with factory() as session:
+            assert session.query(RecognitionDecision).one().notification_status == "failed"
+        calls.append((adapter, args, kwargs))
+
+    monkeypatch.setattr(
+        review_module,
+        "capture_runtime_incident_best_effort",
+        capture,
+    )
+
+    asyncio.run(
+        run_semantic_review_once(
+            factory,
+            config=AiRecognitionConfig(),
+            notifier=lambda **kwargs: (_ for _ in ()).throw(
+                TimeoutError("telegram timeout")
+            ),
+            reviewer=lambda *args, **kwargs: _run(raw_id, mimo, payload),
+            now=NOW,
+        )
+    )
+
+    assert calls == [
+        (
+            review_module.capture_notification_failure,
+            (factory,),
+            {
+                "source_kind": "semantic_review_notification",
+                "source_record_id": str(raw_id),
+                "error_type": "TimeoutError",
+                "occurred_at": NOW,
+            },
+        )
+    ]
 
 
 def test_notification_delivery_status_update_never_overwrites_newer_automation(tmp_path):
