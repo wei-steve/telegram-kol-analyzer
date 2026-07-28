@@ -1568,6 +1568,7 @@ def test_auto_process_message_trade_signal_submits_market_order_then_position_sl
             "posId": "pos-1",
             "posSide": "long",
             "pos": "33",
+            "avgPx": "68000",
             "mrgPosition": "split",
             "mgnMode": "cross",
             "uTime": "1",
@@ -1633,6 +1634,7 @@ def test_auto_process_message_trade_signal_records_entry_protection_ledger(tmp_p
             "posId": "pos-1",
             "posSide": "long",
             "pos": "2.6",
+            "avgPx": "1844",
             "mrgPosition": "split",
             "mgnMode": "cross",
         }
@@ -1690,6 +1692,7 @@ def test_auto_process_message_trade_signal_records_response_anchored_primary_sto
             "posId": "pos-1",
             "posSide": "long",
             "pos": "2.6",
+            "avgPx": "1844",
             "mrgPosition": "split",
             "mgnMode": "cross",
         }
@@ -1727,7 +1730,7 @@ def test_auto_process_message_trade_signal_records_response_anchored_primary_sto
         ("sltp-1", "pos-1", "stop_loss", "1788.0"),
     ]
     assert {json.loads(row.evidence_json)["match"] for row in rows} == {
-        "exchange_returned_order_id",
+        "exchange_returned_order_id_exact_readback",
     }
 
 
@@ -1757,6 +1760,7 @@ def test_auto_process_message_trade_signal_does_not_ledger_price_only_tpsl(tmp_p
             "posId": "pos-1",
             "posSide": "long",
             "pos": "2.6",
+            "avgPx": "1844",
             "mrgPosition": "split",
             "mgnMode": "cross",
         }
@@ -1816,6 +1820,7 @@ def test_auto_process_message_trade_signal_records_combined_entry_protection(tmp
             "posId": "pos-1",
             "posSide": "long",
             "pos": "2.6",
+            "avgPx": "1844",
             "mrgPosition": "split",
             "mgnMode": "cross",
         }
@@ -1891,9 +1896,10 @@ def test_auto_process_nearby_single_entry_uses_market_when_price_is_close(tmp_pa
     fake_client.positions = [
         {
             "instId": "BTC-USDT-SWAP",
-            "posId": "pos-nearby",
+            "posId": "pos-1",
             "posSide": "long",
             "pos": "13",
+            "avgPx": "59680",
             "mrgPosition": "split",
             "mgnMode": "cross",
             "uTime": "1",

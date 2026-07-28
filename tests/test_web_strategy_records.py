@@ -9,6 +9,8 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    PositionBackupStopOrder,
+    PositionProtectionLedger,
     PositionProtectionRevision,
     RawMessage,
     RecognitionDecision,
@@ -579,8 +581,8 @@ def test_strategy_record_detail_confirms_and_renders_every_verified_entry_leg(tm
 
 def test_strategy_record_detail_surfaces_management_execution_drift(tmp_path):
     class DriftPositionClient:
-        def list_positions(self):
-            return [
+        def list_positions(self, *, inst_id=None):
+            rows = [
                 {
                     "instId": "BTC-USDT-SWAP",
                     "posId": "pos-web-record",
@@ -589,9 +591,13 @@ def test_strategy_record_detail_surfaces_management_execution_drift(tmp_path):
                     "avgPx": "67000",
                 }
             ]
+            if inst_id is None:
+                return rows
+            return [row for row in rows if row["instId"] == inst_id]
 
         def list_trigger_orders_pending(self, *, inst_id):
-            assert inst_id == "BTC-USDT-SWAP"
+            if inst_id != "BTC-USDT-SWAP":
+                return []
             return [
                 {
                     "instId": inst_id,
@@ -599,22 +605,85 @@ def test_strategy_record_detail_surfaces_management_execution_drift(tmp_path):
                     "posSide": "long",
                     "triggerOrderType": "TPSL",
                     "ordId": "legacy-stop",
-                    "slTriggerPrice": "60500",
+                    "slTriggerPx": "60500",
                     "sz": "0",
-                }
+                },
+                {
+                    "instId": inst_id,
+                    "closePosId": "pos-web-record",
+                    "posSide": "long",
+                    "triggerOrderType": "TPSL",
+                    "ordId": "backup-stop",
+                    "slTriggerPx": "60000",
+                    "sz": "0",
+                },
             ]
 
-        def list_open_orders(self):
+        def list_open_orders(self, *, inst_id=None):
             return []
 
-        def list_order_history(self):
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+        def list_position_history(self, *, inst_id=None):
             return []
 
     client, lifecycle_id = _client(tmp_path, client_factory=DriftPositionClient)
     with client.app.state.session_factory() as session:
         lifecycle = session.query(StrategyLifecycle).one()
+        binding = session.query(ExecutionBinding).one()
+        leg = session.query(ExecutionOrderLeg).one()
+        binding.status = "active"
+        leg.status = "active"
+        leg.attribution_evidence_json = (
+            '{"evidence_type":"direct_fill","policy_version":2}'
+        )
         lifecycle.stop_loss = 63_575.875
         lifecycle.management_signal_message_id = 1451
+        session.add(PositionProtectionLedger(
+            venue="deepcoin",
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            pos_id="pos-web-record",
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            order_id="legacy-stop",
+            purpose="stop_loss",
+            trigger_price="60500",
+            status="verified",
+            evidence_source="test_exact_order_readback",
+        ))
+        session.add(PositionProtectionLedger(
+            venue="deepcoin",
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            pos_id="pos-web-record",
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            order_id="backup-stop",
+            purpose="backup_stop",
+            trigger_price="60000",
+            status="verified",
+            evidence_source="test_exact_order_readback",
+        ))
+        session.add(PositionBackupStopOrder(
+            venue="deepcoin",
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            pos_id="pos-web-record",
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            trigger_price="60000",
+            order_id="backup-stop",
+            client_order_id="backup-stop-client",
+            status="active",
+            request_json='{"slTriggerPx":"60000"}',
+        ))
         session.commit()
 
     response = client.get(f"/strategy-records/{lifecycle_id}")

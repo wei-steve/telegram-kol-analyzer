@@ -31,7 +31,8 @@ class _Client:
     def list_positions(self, *, inst_id=None):
         return [{
             "instId": "BTC-USDT-SWAP", "posId": "pos-1", "posSide": "short",
-            "pos": "2", "mgnMode": "cross", "posMode": "split",
+            "pos": "2", "avgPx": "64000",
+            "mgnMode": "cross", "posMode": "split",
         }]
 
     def list_trigger_orders_pending(self, *, inst_id):
@@ -39,6 +40,15 @@ class _Client:
 
     def set_position_sltp(self, payload):
         self.calls.append(dict(payload))
+        self.pending.append({
+            "ordId": "rescue-sl-1",
+            "instId": payload["instId"],
+            "posId": payload["posId"],
+            "posSide": payload["posSide"],
+            "triggerOrderType": "TPSL",
+            "slTriggerPx": payload["slTriggerPx"],
+            "slOrdPx": payload["slOrdPx"],
+        })
         return {"code": "0", "data": {"ordId": "rescue-sl-1"}}
 
 
@@ -246,7 +256,7 @@ def test_rescue_persists_bounded_failure_diagnostics(tmp_path):
     with session_factory() as session:
         rescue = session.get(TriggerProtectionStopRescue, planned.rescue_id)
         diagnostics = json.loads(rescue.error_json)
-    assert diagnostics["type"] == "RuntimeError"
+    assert diagnostics["type"] == "DeepcoinRequestOutcomeUnknown"
     assert len(diagnostics["message"]) == 512
 
 

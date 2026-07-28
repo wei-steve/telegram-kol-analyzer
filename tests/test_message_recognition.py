@@ -552,7 +552,7 @@ def test_authoritative_multi_target_partial_take_profit_persists_one_candidate_p
     assert [item.instruction_kind for item in items] == ["management", "management"]
 
 
-def test_authoritative_unscoped_break_even_fans_out_to_verified_same_group_positions(
+def test_authoritative_unscoped_break_even_does_not_guess_same_group_positions(
     tmp_path,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
@@ -564,7 +564,6 @@ def test_authoritative_unscoped_break_even_fans_out_to_verified_same_group_posit
             text="BTC多单浮盈700点左右，修改止损好成本保护，继续持有。",
         )
         session.add(raw_message)
-        target_ids = []
         for message_id, pos_id in ((9654, "pos-1"), (9701, "pos-2")):
             strategy_id = f"deepcoin:88:{message_id}:BTC:long"
             binding = ExecutionBinding(
@@ -605,7 +604,6 @@ def test_authoritative_unscoped_break_even_fans_out_to_verified_same_group_posit
                 )
             )
             session.flush()
-            target_ids.append(lifecycle.id)
         session.commit()
         raw_message_id = raw_message.id
 
@@ -644,13 +642,8 @@ def test_authoritative_unscoped_break_even_fans_out_to_verified_same_group_posit
             .all()
         )
 
-    assert [candidate.target_lifecycle_id for candidate in candidates] == sorted(
-        target_ids
-    )
-    assert {candidate.management_action for candidate in candidates} == {
-        "move_stop_to_break_even"
-    }
-    assert [item.instruction_kind for item in items] == ["management", "management"]
+    assert candidates == []
+    assert items == []
 
 
 def test_authoritative_reply_target_wins_over_conflicting_model_target(tmp_path):

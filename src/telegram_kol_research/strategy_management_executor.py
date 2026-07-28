@@ -182,17 +182,18 @@ def execute_trigger_protection_stop_rescue(
         rescue.request_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         rescue.reserved_at = now
         rescue.updated_at = now
+        reserved_pos_id = str(rescue.pos_id)
         session.commit()
 
     try:
         response = submit_exact_position_sltp(
             session_factory=session_factory,
             deepcoin_client=deepcoin_client,
-            pos_id=rescue.pos_id,
+            pos_id=reserved_pos_id,
             payload=payload,
             idempotency_key=f"rescue:{rescue_id}:set:stop_loss",
             live_execution_gate=lambda: exact_position_write_gate(
-                session_factory, pos_id=rescue.pos_id
+                session_factory, pos_id=reserved_pos_id
             ),
             now_provider=lambda: now,
             require_readback=True,

@@ -134,6 +134,7 @@ def _seed_trigger_protection_adoption(session_factory):
             execution_binding_id=binding_id,
             leg_index=1,
             order_kind="trigger_limit",
+            strategy_instance_id="deepcoin:100:55:ETH:short",
             order_id="entry-1",
             client_order_id="entry-client-1",
             status="submitted",
@@ -196,6 +197,8 @@ class _ProtectionAdoptionReconciliationClient:
                 "posSide": "short",
                 "pos": "4.4",
                 "avgPx": "1883",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
                 "cTime": "1784512860000",
             }
         ]
@@ -234,7 +237,15 @@ class _ProtectionAdoptionReconciliationClient:
 
 class _BackupStopSubmissionClient:
     def __init__(self, positions, *, responses=None):
-        self.positions = list(positions)
+        self.positions = [
+            {
+                "avgPx": "1883",
+                "mgnMode": "cross",
+                "posMode": "split",
+                **row,
+            }
+            for row in positions
+        ]
         self.responses = list(responses or [])
         self.sltp_payloads = []
         self.pending_rows = [{
@@ -311,6 +322,7 @@ def _seed_exact_backup_candidate(
             .filter(ExecutionOrderLeg.execution_binding_id == binding_id)
             .one()
         )
+        leg.strategy_instance_id = binding.strategy_instance_id
         leg.order_kind = order_kind
         leg.attribution_evidence_json = json.dumps({"policy_version": 2})
         if with_primary:
@@ -410,11 +422,15 @@ def test_reconcile_submits_one_exact_backup_stop_when_explicitly_enabled(tmp_pat
             super().__init__([_pending_combined_tpsl("tpsl-1")])
             self.sltp_payloads = []
 
-        def list_positions(self):
-            return [{
+        def list_positions(self, *, inst_id=None):
+            rows = [{
                 "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
-                "pos": "4.4", "avgPx": "1883", "liqPx": "2000", "mrgPosition": "split",
+                "pos": "4.4", "avgPx": "1883", "liqPx": "2000",
+                "mgnMode": "cross", "mrgPosition": "split",
             }]
+            if inst_id is None:
+                return rows
+            return [row for row in rows if row["instId"] == inst_id]
 
         def set_position_sltp(self, payload):
             self.sltp_payloads.append(payload)

@@ -278,9 +278,6 @@ def adjust_position_tpsl(
 
     cancel_responses: list[dict[str, Any]] = []
     for order_id in old_order_ids:
-        cancel_payload = {
-            "instType": "SWAP", "instId": inst_id, "ordId": str(order_id)
-        }
         response = cancel_exact_position_sltp(
             session_factory=session_factory,
             deepcoin_client=deepcoin_client,
