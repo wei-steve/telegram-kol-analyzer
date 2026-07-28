@@ -10,7 +10,7 @@ current_phase: 1
 phase_name: durable-runtime-incident-ledger
 phase_status: planned
 last_completed_phase: 0
-last_completed_commit: pending-phase-0-commit
+last_completed_commit: 52a7eff
 production_commit: not-required-for-documentation-only-phase
 local_tests:
   - documentation-files-present
@@ -52,7 +52,7 @@ When the user says `请执行自定义ai agent的下一步实施`:
 - Runtime behavior changed: no
 - Production restart required: no
 - Local verification: canonical documentation files present
-- Commit: recorded after commit in the next checkpoint update
+- Commit: `52a7eff` (`docs: plan runtime incident agent rollout`)
 
 ## Current Phase Exit Checklist
 
