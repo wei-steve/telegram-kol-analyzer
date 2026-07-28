@@ -10,6 +10,27 @@
 powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1
 ```
 
+# Runtime Incident AI Agent
+
+- When the user says `请执行自定义ai agent的下一步实施`, first read:
+  1. `docs/plans/2026-07-28-runtime-incident-agent-design.md`
+  2. `docs/plans/2026-07-28-runtime-incident-agent.md`
+  3. `docs/runtime-incident-agent-status.md`
+  4. `docs/runtime-incident-agent-runbook.md`
+- Continue the phase named by `current_phase` in the status file. If it is
+  `in_progress`, resume it; if it is `planned`, start it. Never implement more
+  than one phase in one user turn.
+- The existing first-pass recognition and contextual multi-information strategy
+  resolution remain authoritative. The runtime incident agent must not replace,
+  bypass, or duplicate strategy targeting or contextual resolution.
+- Every runtime phase must be introduced dormant or shadow-only, preserve the
+  current production path, and have a tested disable/rollback path before it can
+  be enabled. Do not restart or deploy during an active time-sensitive strategy
+  operation. If a safe deployment window cannot be proven, finish local work,
+  leave the phase `in_progress`, and record the exact server verification still
+  required.
+- Documentation-only phases do not require a production service restart.
+
 # Deepcoin API Docs
 
 - If the browser/web reader gets `403 Forbidden` for Deepcoin docs, retry from the local shell with PowerShell/.NET HTTP requests. The docs page `https://www.deepcoin.com/docs/zh/authentication` was confirmed readable from the local environment with HTTP `200 OK` on 2026-07-05.
