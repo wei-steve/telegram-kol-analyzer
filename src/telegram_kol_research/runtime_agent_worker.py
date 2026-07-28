@@ -381,6 +381,10 @@ def run_runtime_agent_once(
             max_prompt_bytes=config.max_prompt_bytes,
         )
         seen_calls: set[str] = set()
+        # Reserve a model turn for the final closed diagnosis even when the
+        # configured hard tool budget is four. Once this evidence budget is
+        # exhausted, tools are no longer advertised to the provider.
+        evidence_tool_limit = max(1, min(config.max_tool_steps, 3))
         max_turns = max(2, min(config.max_tool_steps, 4) + 4)
         for _ in range(max_turns):
             if monotonic() - started > config.max_wall_seconds:
@@ -391,7 +395,11 @@ def run_runtime_agent_once(
             )
             raw_turn = model_turn(
                 messages=messages,
-                tool_schemas=tools.tool_schemas(),
+                tool_schemas=(
+                    tools.tool_schemas()
+                    if len(attempted_queries) < evidence_tool_limit
+                    else []
+                ),
                 timeout_seconds=min(
                     config.model_timeout_seconds,
                     max(1.0, config.max_wall_seconds - (monotonic() - started)),
@@ -454,7 +462,7 @@ def run_runtime_agent_once(
                     },
                 )
                 continue
-            if len(attempted_queries) >= max(1, min(config.max_tool_steps, 4)):
+            if len(attempted_queries) >= evidence_tool_limit:
                 transition_runtime_incident(
                     session_factory,
                     incident_id=claimed.id,

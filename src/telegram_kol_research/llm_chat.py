@@ -212,12 +212,17 @@ def request_structured_chat_turn(
     payload = {
         "model": config.model,
         "messages": messages,
-        "tools": tool_schemas,
-        "tool_choice": "auto",
-        # The runtime worker intentionally executes one bounded read-only
-        # projection per turn. Ask compatible providers not to fan out calls.
-        "parallel_tool_calls": False,
     }
+    if tool_schemas:
+        payload.update(
+            {
+                "tools": tool_schemas,
+                "tool_choice": "auto",
+                # The runtime worker intentionally executes one bounded
+                # read-only projection per turn.
+                "parallel_tool_calls": False,
+            }
+        )
     created_client = client is None
     active_client = client or httpx.Client(
         timeout=timeout_seconds or config.timeout_seconds

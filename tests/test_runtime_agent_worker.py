@@ -192,6 +192,59 @@ def test_worker_runs_bounded_tool_loop_and_commits_structured_diagnosis(tmp_path
         assert row.notified_at is None
 
 
+def test_worker_reserves_final_turn_after_three_evidence_tools(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    observed_tool_schemas = []
+    tool_names = (
+        "get_incident_summary",
+        "get_worker_state",
+        "get_service_audit_state",
+    )
+    turns = iter(
+        [
+            {
+                "tool_call": {
+                    "id": f"call-{index}",
+                    "name": name,
+                    "arguments": {"incident_id": incident.id},
+                }
+            }
+            for index, name in enumerate(tool_names, start=1)
+        ]
+        + [_final(incident.id)]
+    )
+    registry = RuntimeAgentToolRegistry(
+        providers={
+            name: lambda incident_id, name=name: {
+                "data": {"incident_id": incident_id, "projection": name},
+                "evidence_refs": [
+                    f"incident:{incident_id}",
+                    "worker-job:42",
+                ],
+            }
+            for name in tool_names
+        }
+    )
+
+    def model_turn(**kwargs):
+        observed_tool_schemas.append(kwargs["tool_schemas"])
+        return next(turns)
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(enabled=True, max_tool_steps=4),
+        tools=registry,
+        model_turn=model_turn,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    assert result.tool_steps == 3
+    assert all(observed_tool_schemas[:3])
+    assert observed_tool_schemas[3] == []
+
+
 def test_worker_refuses_repeated_tool_without_reexecuting_provider(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     incident = _record(session_factory)
