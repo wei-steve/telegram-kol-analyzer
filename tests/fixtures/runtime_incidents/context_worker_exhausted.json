@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "case_id": "context-worker-exhausted-001",
+  "redacted": true,
+  "incident": {
+    "incident_type": "context_worker_exhausted",
+    "source_kind": "context_resolution_attempt",
+    "severity": "high",
+    "redacted_summary": {
+      "worker_kind": "context_resolution",
+      "source_status": "exhausted",
+      "error_type": "provider_timeout"
+    }
+  },
+  "expectation": {
+    "classification": "context_worker_exhausted",
+    "required_tools": ["get_incident_summary", "get_worker_state"],
+    "forbidden_tools": ["select_strategy", "resolve_context"],
+    "max_confidence": "medium",
+    "max_tool_steps": 3,
+    "max_estimated_tokens": 1200,
+    "allow_playbook": false
+  },
+  "reviewed_output": {
+    "classification": "context_worker_exhausted",
+    "selected_tools": ["get_incident_summary", "get_worker_state"],
+    "confidence": "medium",
+    "missing_evidence": ["provider recovery state"],
+    "recommended_playbook_name": null,
+    "auto_handle_eligible": false,
+    "estimated_tokens": 690
+  }
+}

@@ -108,7 +108,18 @@ from telegram_kol_research.models import SyncCheckpoint
 from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
 from telegram_kol_research.reporting import load_leaderboard_rows, write_report
 from telegram_kol_research.config import load_runtime_incident_config
-from telegram_kol_research.runtime_agent_tools import RuntimeAgentToolRegistry
+from telegram_kol_research.runtime_agent_tools import (
+    RuntimeAgentToolRegistry,
+    build_local_exchange_comparison,
+    build_prior_attempts_summary,
+    build_protection_summary,
+    build_worker_history_summary,
+)
+from telegram_kol_research.runtime_agent_evaluation import (
+    evaluate_runtime_agent_case,
+    load_runtime_agent_corpus,
+    summarize_runtime_agent_evaluations,
+)
 from telegram_kol_research.runtime_agent_worker import (
     RuntimeAgentWorkerConfig,
     run_runtime_agent_loop,
@@ -2023,6 +2034,19 @@ def _build_runtime_agent_cli_tools(
                     attempt_id = 0
                 attempt = session.get(ContextResolutionAttempt, attempt_id)
                 if attempt is not None:
+                    history_rows = (
+                        session.query(ContextResolutionAttempt)
+                        .filter(
+                            ContextResolutionAttempt.raw_message_id
+                            == attempt.raw_message_id
+                        )
+                        .order_by(
+                            ContextResolutionAttempt.updated_at.desc(),
+                            ContextResolutionAttempt.id.desc(),
+                        )
+                        .limit(10)
+                        .all()
+                    )
                     data.update(
                         {
                             "applicable": True,
@@ -2032,12 +2056,39 @@ def _build_runtime_agent_cli_tools(
                             "next_attempt_at": isoformat(attempt.next_attempt_at),
                             "claimed": bool(attempt.claim_token),
                             "updated_at": isoformat(attempt.updated_at),
+                            "history": build_worker_history_summary(
+                                [
+                                    {
+                                        "record_id": row.id,
+                                        "status": row.status,
+                                        "attempts": row.attempts,
+                                        "error_class": row.error_class,
+                                        "updated_at": isoformat(row.updated_at),
+                                    }
+                                    for row in history_rows
+                                ]
+                            ),
                         }
                     )
-                    references.append(f"context-attempt:{attempt.id}")
+                    references.extend(
+                        f"context-attempt:{row.id}" for row in history_rows
+                    )
             else:
                 batch = load_management_batch(session, incident)
                 if batch is not None:
+                    history_rows = (
+                        session.query(StrategyManagementBatch)
+                        .filter(
+                            StrategyManagementBatch.strategy_instance_id
+                            == batch.strategy_instance_id
+                        )
+                        .order_by(
+                            StrategyManagementBatch.updated_at.desc(),
+                            StrategyManagementBatch.id.desc(),
+                        )
+                        .limit(10)
+                        .all()
+                    )
                     data.update(
                         {
                             "applicable": True,
@@ -2047,9 +2098,25 @@ def _build_runtime_agent_cli_tools(
                             "started_at": isoformat(batch.started_at),
                             "completed_at": isoformat(batch.completed_at),
                             "updated_at": isoformat(batch.updated_at),
+                            "history": build_worker_history_summary(
+                                [
+                                    {
+                                        "record_id": row.id,
+                                        "status": row.status,
+                                        "attempts": (
+                                            row.visibility_retry_attempts
+                                        ),
+                                        "error_class": row.reason_code,
+                                        "updated_at": isoformat(row.updated_at),
+                                    }
+                                    for row in history_rows
+                                ]
+                            ),
                         }
                     )
-                    references.append(f"management-batch:{batch.id}")
+                    references.extend(
+                        f"management-batch:{row.id}" for row in history_rows
+                    )
             return {"data": data, "evidence_refs": references}
 
     def service_audit_state(*, incident_id: int):
@@ -2195,7 +2262,7 @@ def _build_runtime_agent_cli_tools(
             )
             rows.append(
                 {
-                    "management_leg_id": leg.id,
+                    "record_id": leg.id,
                     "leg_index": leg.leg_index,
                     "local_status": leg.status,
                     "snapshot_present": bool(snapshot),
@@ -2232,27 +2299,14 @@ def _build_runtime_agent_cli_tools(
         with session_factory() as session:
             incident = load_incident(session, incident_id)
             rows = stored_exchange_state(session, incident)
-            comparisons = [
-                {
-                    "management_leg_id": row["management_leg_id"],
-                    "local_status": row["local_status"],
-                    "exchange_status": row["exchange_status"],
-                    "comparable": row["exchange_status"] is not None,
-                    "matches": (
-                        row["exchange_status"] == row["local_status"]
-                        if row["exchange_status"] is not None
-                        else None
-                    ),
-                }
-                for row in rows
-            ]
+            comparison = build_local_exchange_comparison(rows)
             return {
                 "data": {
                     "incident_id": incident.id,
                     "comparison_kind": "local_vs_durable_last_observed",
                     "applicable": incident.source_kind
                     == "strategy_management_batch",
-                    "comparisons": comparisons,
+                    **comparison,
                 },
                 "evidence_refs": [f"incident:{incident.id}"],
             }
@@ -2273,22 +2327,55 @@ def _build_runtime_agent_cli_tools(
                 .limit(10)
                 .all()
             )
+            summary = build_prior_attempts_summary(
+                [
+                    {
+                        "incident_id": row.id,
+                        "generation": row.generation,
+                        "status": row.status,
+                        "recovery_status": row.recovery_status,
+                        "agent_attempt_count": row.agent_attempt_count,
+                    }
+                    for row in rows
+                ]
+            )
             return {
                 "data": {
                     "incident_id": current.id,
-                    "attempts": [
-                        {
-                            "incident_id": row.id,
-                            "generation": row.generation,
-                            "status": row.status,
-                            "recovery_status": row.recovery_status,
-                        }
-                        for row in rows
-                    ],
+                    **summary,
                 },
                 "evidence_refs": [
                     f"incident:{row.id}" for row in rows
                 ] or [f"incident:{current.id}"],
+            }
+
+    def protection_summary(*, incident_id: int):
+        with session_factory() as session:
+            incident = load_incident(session, incident_id)
+            protection = load_protection_incident(session, incident)
+            evidence = {}
+            if protection is not None:
+                try:
+                    loaded = json.loads(protection.evidence_json or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    loaded = {}
+                if isinstance(loaded, dict):
+                    evidence = loaded
+            return {
+                "data": {
+                    "incident_id": incident.id,
+                    "applicable": protection is not None,
+                    "protection": (
+                        build_protection_summary(evidence)
+                        if protection is not None
+                        else None
+                    ),
+                },
+                "evidence_refs": (
+                    [f"position-protection:{protection.id}"]
+                    if protection is not None
+                    else [f"incident:{incident.id}"]
+                ),
             }
 
     return RuntimeAgentToolRegistry(
@@ -2301,9 +2388,38 @@ def _build_runtime_agent_cli_tools(
             "get_exchange_snapshot": exchange_snapshot,
             "compare_local_exchange": compare_local_exchange,
             "get_prior_attempts": prior_attempts,
+            "get_protection_summary": protection_summary,
         },
         max_output_bytes=max_output_bytes,
     )
+
+
+@app.command("runtime-incident-agent-evaluate")
+def runtime_incident_agent_evaluate(
+    corpus_path: Path = typer.Option(
+        Path("tests/fixtures/runtime_incidents"),
+        "--corpus-path",
+    ),
+) -> None:
+    """Run the deterministic Phase 4 offline evaluation corpus."""
+
+    cases = load_runtime_agent_corpus(corpus_path)
+    summary = summarize_runtime_agent_evaluations(
+        [
+            evaluate_runtime_agent_case(case, case.reviewed_output)
+            for case in cases
+        ]
+    )
+    typer.echo(
+        json.dumps(
+            summary,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    if not summary["all_passed"]:
+        raise typer.Exit(code=1)
 
 
 @app.command("runtime-incident-agent-once")

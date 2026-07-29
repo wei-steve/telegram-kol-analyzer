@@ -13,6 +13,7 @@ RUNTIME_AGENT_MODULES = (
     "runtime_agent_tools.py",
     "runtime_agent_prompt.py",
     "runtime_agent_worker.py",
+    "runtime_agent_evaluation.py",
     "runtime_incident_handoff.py",
     "runtime_agent_playbooks.py",
     "runtime_agent_policy.py",

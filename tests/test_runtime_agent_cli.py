@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 from typer.testing import CliRunner
 
@@ -10,7 +11,12 @@ from telegram_kol_research.runtime_agent_tools import (
     READ_ONLY_RUNTIME_AGENT_TOOL_NAMES,
 )
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import RuntimeIncident
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    PositionProtectionIncident,
+    RuntimeIncident,
+)
 from telegram_kol_research.runtime_incidents import record_runtime_incident
 
 
@@ -120,3 +126,87 @@ def test_runtime_agent_cli_configures_every_phase3_read_only_projection(tmp_path
         )
         assert result.evidence_refs
         assert isinstance(result.data, dict)
+
+
+def test_phase4_protection_projection_is_bounded_and_omits_order_ids(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="fixture",
+            chat_id=1,
+            message_id=2,
+            symbol="BTCUSDT",
+            side="long",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            leg_index=0,
+            purpose="entry",
+            pos_id="fixture-position",
+        )
+        session.add(leg)
+        session.flush()
+        protection = PositionProtectionIncident(
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            pos_id="fixture-position",
+            incident_type="missing_stop_loss",
+            fingerprint="p" * 64,
+            evidence_json=(
+                '{"reason_code":"missing_stop_loss",'
+                '"missing_stop_loss":true,'
+                '"take_profit_order_ids":["tp-secret-reference"],'
+                '"stop_loss_order_ids":[],"position_size":"1.0"}'
+            ),
+        )
+        session.add(protection)
+        session.commit()
+        protection_id = protection.id
+
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="position_protection_incident",
+        source_record_id=str(protection_id),
+        incident_type="severe_protection_incident",
+        severity="critical",
+        fingerprint="b" * 64,
+        redacted_summary='{"reason_code":"missing_stop_loss"}',
+        occurred_at=datetime(2026, 7, 28, 9, 0, tzinfo=UTC),
+        feature_policy_version="runtime-incident-phase-4-v1",
+        prompt_version="runtime-agent-prompt-v1",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    registry = _build_runtime_agent_cli_tools(
+        session_factory,
+        max_output_bytes=8192,
+        monitor_state_path=tmp_path / "missing-monitor-state.json",
+        journal_reader=lambda: (),
+    )
+
+    result = registry.execute(
+        "get_protection_summary",
+        {"incident_id": incident.id},
+        expected_incident_id=incident.id,
+    )
+
+    assert result.data["applicable"] is True
+    assert result.data["protection"]["missing_stop_loss"] is True
+    assert result.data["protection"]["take_profit_count"] == 1
+    assert "tp-secret-reference" not in str(result.as_model_payload())
+
+
+def test_phase4_offline_evaluation_cli_reports_reviewed_corpus_metrics():
+    corpus = Path(__file__).parent / "fixtures" / "runtime_incidents"
+
+    result = CliRunner().invoke(
+        app,
+        ["runtime-incident-agent-evaluate", "--corpus-path", str(corpus)],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["case_count"] == 7
+    assert payload["all_passed"] is True
+    assert payload["unsafe_recommendation_refusal_rate"] == 1.0

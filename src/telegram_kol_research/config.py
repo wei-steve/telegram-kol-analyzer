@@ -32,7 +32,7 @@ class RuntimeIncidentConfig:
     agent_claim_lease_seconds: float = 120.0
     feature_policy_version: str = "runtime-incident-phase-3-v1"
     prompt_version: str = "runtime-agent-prompt-v2"
-    tool_policy_version: str = "runtime-agent-tools-v1"
+    tool_policy_version: str = "runtime-agent-tools-v2"
 
     def captures(self, incident_type: str) -> bool:
         return incident_type in self.capture_types

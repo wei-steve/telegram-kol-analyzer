@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "case_id": "notification-delivery-failure-001",
+  "redacted": true,
+  "incident": {
+    "incident_type": "notification_delivery_failure",
+    "source_kind": "system_operator_bot",
+    "severity": "medium",
+    "redacted_summary": {
+      "component": "telegram_notification",
+      "notification_status": "failed",
+      "error_type": "network_timeout"
+    }
+  },
+  "expectation": {
+    "classification": "notification_delivery_failure",
+    "required_tools": ["get_incident_summary", "get_service_audit_state"],
+    "forbidden_tools": ["select_strategy", "execute_management"],
+    "max_confidence": "medium",
+    "max_tool_steps": 3,
+    "max_estimated_tokens": 1100,
+    "allow_playbook": false
+  },
+  "reviewed_output": {
+    "classification": "notification_delivery_failure",
+    "selected_tools": ["get_incident_summary", "get_service_audit_state"],
+    "confidence": "medium",
+    "missing_evidence": ["notification endpoint recovery state"],
+    "recommended_playbook_name": null,
+    "auto_handle_eligible": false,
+    "estimated_tokens": 590
+  }
+}

@@ -8,16 +8,18 @@ project: runtime-incident-agent
 design_version: 1
 current_phase: 4
 phase_name: expand-read-only-evidence-and-build-evaluation-corpus
-phase_status: planned
+phase_status: in_progress
 last_completed_phase: 3
 last_completed_commit: d5c5b70
 production_commit: d5c5b700117303aed6ed22d86ceb08026138df12
 local_tests:
+  - "phase-4-runtime-agent-and-critical-regressions: passed"
+  - "phase-4-offline-evaluation: 7 cases, all six metrics at 1.0"
   - "phase-3-post-canary-focused: 127 passed"
   - "context-resolution-and-management-regressions: 176 passed"
   - "full-suite attempt: 2237 passed, 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the failing test passed in isolation"
 server_verification:
-  status: complete
+  status: pending-phase-4-safe-window-deployment
   deployed_commit: d5c5b700117303aed6ed22d86ceb08026138df12
   service: active-http-200
   bounded_restarts: "clean; one pre-restart evidence claim expired and was recovered to completed after a bounded follow-up restart"
@@ -33,7 +35,7 @@ server_verification:
   synthetic_canary: "isolated temporary database; one live-model attempt, three read-only tools, diagnosed, bounded Codex handoff available"
   synthetic_business_rows: "raw/recognition/lifecycle/management/mutation tables all remained empty"
   incident_agent_behavior: "read-only diagnosis and handoff only; no playbook executed"
-  remaining: "Begin Phase 4 only on the next approved turn."
+  remaining: "Commit, push, prove a safe deployment window, deploy Phase 4 with the Agent disabled, and run read-only server validation."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
@@ -142,25 +144,34 @@ When the user says `请执行自定义ai agent的下一步实施`:
 
 ### Phase 4 — Expand read-only evidence and build evaluation corpus
 
-- Status: planned
-- Implementation started: no
+- Status: in progress
+- Local implementation: seven reviewed redacted incident fixtures, deterministic
+  offline classification/tool/safety/certainty/budget/context-boundary metrics,
+  coherent local/exchange comparisons, bounded related-worker history, bounded
+  same-fingerprint attempt history, and an order-ID-free protection summary
+- Authority change: none; all evidence remains read-only and the Agent sidecar
+  remains dormant by default
+- Local verification: runtime-agent and critical context-resolution/management
+  regressions passed; all seven evaluation cases passed all six gates
+- Remaining: reviewed commit/push, safe-window production deployment, and
+  read-only server validation
 
 ## Current Phase Exit Checklist
 
-Phase 3 is not complete until:
+Phase 4 is not complete until:
 
-- [x] the closed structured contract rejects extra actions and unknown tools;
-- [x] all tool and transcript outputs are bounded and redacted;
-- [x] the worker is dormant by default and executes no recovery action;
-- [x] claims, crash recovery, retry backoff, and attempt ceilings are durable;
-- [x] identical fingerprints reuse diagnosis without another model call;
-- [x] evidence and Agent hypotheses remain separate and rebuild a Codex handoff;
-- [x] diagnosis Telegram reports state uncertainty and that no action executed;
-- [x] architecture and contextual-resolution/management regressions pass;
+- [x] the redacted corpus covers all seven required technical incident classes;
+- [x] normal contextual ambiguity remains excluded;
+- [x] offline classification, evidence-tool, safety, certainty, budget, and
+      contextual-targeting gates pass;
+- [x] local/exchange, worker-history, prior-attempt, and protection projections
+      are bounded and redacted;
+- [x] architecture and critical context-resolution/management regressions pass;
 - [x] changes receive review with no remaining Critical or Important findings;
-- [x] changes are committed and pushed;
-- [x] production deploys with the Agent flag off;
-- [x] the sidecar unit is installed disabled and inactive;
-- [x] service/listener/checkpoint/reconciliation continuity is verified;
-- [x] a synthetic read-only incident is diagnosed without a business-row change;
-- [x] the Agent is disabled again after the canary unless separately approved.
+- [ ] changes are committed and pushed;
+- [ ] a safe production deployment window is proven;
+- [ ] production deploys with the Agent sidecar disabled and inactive;
+- [ ] service/listener/checkpoint/reconciliation continuity is verified;
+- [ ] the offline corpus gate passes from the deployed checkout;
+- [ ] reviewed production incidents are inspected through read-only tools only;
+- [ ] no business row or action authority changes.

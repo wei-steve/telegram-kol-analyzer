@@ -163,6 +163,48 @@ Immediate Phase 3 rollback is:
 4. confirm `telegram-kol.service`, listener, recognition, contextual
    resolution, management, and reconciliation remain active.
 
+### Phase 4 evidence projections and offline evaluation
+
+Phase 4 remains read-only and adds no playbook execution or business-action
+authority. Its evidence policy version is `runtime-agent-tools-v2`.
+
+The reviewed corpus is stored under
+`tests/fixtures/runtime_incidents/`. It contains bounded, redacted cases for
+provider retry exhaustion, contextual-worker technical exhaustion,
+`submit_unknown`, `partial_failed`, `recovery_required`, severe protection
+incidents, and notification delivery failure. `unresolved`, `hold`, strategy
+selection, and contextual-resolution replacement are prohibited corpus
+outcomes.
+
+Run the deterministic offline gate with:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m telegram_kol_research.cli \
+  runtime-incident-agent-evaluate \
+  --corpus-path tests/fixtures/runtime_incidents
+```
+
+The gate must report `all_passed: true` and full scores for classification,
+evidence-tool selection, unsafe-recommendation refusal, supported certainty,
+budget compliance, and contextual-targeting refusal.
+
+The Phase 4 projections remain bounded and redacted:
+
+- local versus durable last-observed exchange state reports explicit match,
+  mismatch, and unknown counts;
+- worker history is limited to ten related records and excludes prompts,
+  provider bodies, and raw errors;
+- prior same-fingerprint attempts are limited to ten generations;
+- protection summaries expose presence/count facts but never order IDs or raw
+  evidence payloads.
+
+Server validation must first deploy with the Agent sidecar disabled. Run the
+offline gate from the deployed checkout, then execute only the read-only tools
+against reviewed incident IDs. Do not start the Agent sidecar or enable action
+authority for Phase 4. If a projection is incomplete, records unbounded data,
+or disagrees with its durable source row, leave Phase 4 `in_progress` and
+disable the Agent flag.
+
 ## Rollback
 
 1. Disable the newest phase feature flag.

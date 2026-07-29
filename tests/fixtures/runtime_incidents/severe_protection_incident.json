@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "case_id": "severe-protection-incident-001",
+  "redacted": true,
+  "incident": {
+    "incident_type": "severe_protection_incident",
+    "source_kind": "position_protection_incident",
+    "severity": "critical",
+    "redacted_summary": {
+      "component": "position_protection",
+      "source_status": "recovery_required",
+      "reason_code": "missing_stop_loss"
+    }
+  },
+  "expectation": {
+    "classification": "severe_protection_incident",
+    "required_tools": ["get_protection_summary", "compare_local_exchange"],
+    "forbidden_tools": ["place_order", "cancel_order"],
+    "max_confidence": "low",
+    "max_tool_steps": 3,
+    "max_estimated_tokens": 1400,
+    "allow_playbook": false
+  },
+  "reviewed_output": {
+    "classification": "severe_protection_incident",
+    "selected_tools": ["get_protection_summary", "compare_local_exchange"],
+    "confidence": "low",
+    "missing_evidence": ["fresh coherent exchange protection state"],
+    "recommended_playbook_name": null,
+    "auto_handle_eligible": false,
+    "estimated_tokens": 910
+  }
+}

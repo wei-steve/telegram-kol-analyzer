@@ -24,6 +24,7 @@ READ_ONLY_RUNTIME_AGENT_TOOL_NAMES = frozenset(
         "get_exchange_snapshot",
         "compare_local_exchange",
         "get_prior_attempts",
+        "get_protection_summary",
     }
 )
 _SENSITIVE_KEY_PATTERN = re.compile(
@@ -40,6 +41,162 @@ _CREDENTIAL_PATTERN = re.compile(
 
 class RuntimeAgentToolError(ValueError):
     """Raised when a tool request or result fails the read-only policy."""
+
+
+def _safe_scalar(value: Any, *, maximum: int = 64):
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:maximum]
+
+
+def build_local_exchange_comparison(
+    rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize bounded local and durable exchange observations coherently."""
+
+    projected = []
+    for raw in tuple(rows)[:20]:
+        local_status = _safe_scalar(raw.get("local_status"))
+        exchange_status = _safe_scalar(raw.get("exchange_status"))
+        if exchange_status is None:
+            comparison = "unknown"
+        elif str(exchange_status).lower() == str(local_status).lower():
+            comparison = "match"
+        else:
+            comparison = "mismatch"
+        projected.append(
+            {
+                "record_id": _safe_scalar(raw.get("record_id")),
+                "local_status": local_status,
+                "exchange_status": exchange_status,
+                "exchange_size": _safe_scalar(raw.get("exchange_size")),
+                "comparison": comparison,
+            }
+        )
+    counts = {
+        label: sum(row["comparison"] == label for row in projected)
+        for label in ("match", "mismatch", "unknown")
+    }
+    return {
+        "total": len(projected),
+        "comparable": counts["match"] + counts["mismatch"],
+        "matches": counts["match"],
+        "mismatches": counts["mismatch"],
+        "unknown": counts["unknown"],
+        "rows": projected,
+    }
+
+
+def build_worker_history_summary(
+    rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Return counts plus a bounded history without prompts or provider bodies."""
+
+    projected = []
+    status_counts: dict[str, int] = {}
+    attempts_total = 0
+    for raw in tuple(rows)[:10]:
+        status = str(raw.get("status") or "unknown")[:32]
+        attempts = raw.get("attempts", 0)
+        attempts = (
+            max(0, int(attempts))
+            if isinstance(attempts, (int, float)) and not isinstance(attempts, bool)
+            else 0
+        )
+        status_counts[status] = status_counts.get(status, 0) + 1
+        attempts_total += attempts
+        projected.append(
+            {
+                "record_id": _safe_scalar(raw.get("record_id")),
+                "status": status,
+                "attempts": attempts,
+                "error_class": _safe_scalar(raw.get("error_class")),
+                "updated_at": _safe_scalar(raw.get("updated_at")),
+            }
+        )
+    return {
+        "total": len(projected),
+        "status_counts": dict(sorted(status_counts.items())),
+        "attempts_total": attempts_total,
+        "history": projected,
+    }
+
+
+def build_prior_attempts_summary(
+    rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Aggregate prior same-fingerprint incident generations."""
+
+    projected = []
+    agent_attempts_total = 0
+    for raw in tuple(rows)[:10]:
+        attempts = raw.get("agent_attempt_count", 0)
+        attempts = (
+            max(0, int(attempts))
+            if isinstance(attempts, (int, float)) and not isinstance(attempts, bool)
+            else 0
+        )
+        agent_attempts_total += attempts
+        projected.append(
+            {
+                "incident_id": _safe_scalar(raw.get("incident_id")),
+                "generation": _safe_scalar(raw.get("generation")),
+                "status": _safe_scalar(raw.get("status")),
+                "recovery_status": _safe_scalar(raw.get("recovery_status")),
+                "agent_attempt_count": attempts,
+            }
+        )
+    return {
+        "total": len(projected),
+        "diagnosed": sum(row["status"] == "diagnosed" for row in projected),
+        "escalated": sum(row["status"] == "escalated" for row in projected),
+        "agent_attempts_total": agent_attempts_total,
+        "attempts": projected,
+    }
+
+
+def build_protection_summary(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """Project protection evidence without returning order identifiers."""
+
+    def count(name: str) -> int:
+        value = evidence.get(name)
+        return min(len(value), 20) if isinstance(value, list) else 0
+
+    take_profit_count = count("take_profit_order_ids")
+    stop_loss_count = count("stop_loss_order_ids")
+    missing_stop = evidence.get("missing_stop_loss")
+    missing_take_profit = evidence.get("missing_take_profit")
+    stop_evidence_available = (
+        "missing_stop_loss" in evidence or "stop_loss_order_ids" in evidence
+    )
+    take_profit_evidence_available = (
+        "missing_take_profit" in evidence
+        or "take_profit_order_ids" in evidence
+    )
+    return {
+        "reason_code": _safe_scalar(evidence.get("reason_code")),
+        "missing_stop_loss": (
+            (
+                bool(missing_stop)
+                if missing_stop is not None
+                else stop_loss_count == 0
+            )
+            if stop_evidence_available
+            else None
+        ),
+        "missing_take_profit": (
+            (
+                bool(missing_take_profit)
+                if missing_take_profit is not None
+                else take_profit_count == 0
+            )
+            if take_profit_evidence_available
+            else None
+        ),
+        "take_profit_count": take_profit_count,
+        "stop_loss_count": stop_loss_count,
+        "position_size_present": evidence.get("position_size") not in (None, ""),
+    }
 
 
 @dataclass(frozen=True, slots=True)

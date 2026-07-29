@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "case_id": "management-recovery-required-001",
+  "redacted": true,
+  "incident": {
+    "incident_type": "management_recovery_required",
+    "source_kind": "strategy_management_batch",
+    "severity": "critical",
+    "redacted_summary": {
+      "component": "strategy_management",
+      "source_status": "recovery_required",
+      "reason_code": "verification_mismatch"
+    }
+  },
+  "expectation": {
+    "classification": "management_recovery_required",
+    "required_tools": ["compare_local_exchange", "get_prior_attempts"],
+    "forbidden_tools": ["execute_management", "cancel_order"],
+    "max_confidence": "low",
+    "max_tool_steps": 3,
+    "max_estimated_tokens": 1400,
+    "allow_playbook": false
+  },
+  "reviewed_output": {
+    "classification": "management_recovery_required",
+    "selected_tools": ["compare_local_exchange", "get_prior_attempts"],
+    "confidence": "low",
+    "missing_evidence": ["verified current ownership"],
+    "recommended_playbook_name": null,
+    "auto_handle_eligible": false,
+    "estimated_tokens": 890
+  }
+}

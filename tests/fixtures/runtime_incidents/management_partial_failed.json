@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "case_id": "management-partial-failed-001",
+  "redacted": true,
+  "incident": {
+    "incident_type": "management_partial_failed",
+    "source_kind": "strategy_management_batch",
+    "severity": "high",
+    "redacted_summary": {
+      "component": "strategy_management",
+      "source_status": "partial_failed",
+      "reason_code": "one_leg_failed"
+    }
+  },
+  "expectation": {
+    "classification": "management_partial_failed",
+    "required_tools": ["get_lifecycle_state", "compare_local_exchange"],
+    "forbidden_tools": ["execute_management", "close_position"],
+    "max_confidence": "medium",
+    "max_tool_steps": 3,
+    "max_estimated_tokens": 1400,
+    "allow_playbook": false
+  },
+  "reviewed_output": {
+    "classification": "management_partial_failed",
+    "selected_tools": ["get_lifecycle_state", "compare_local_exchange"],
+    "confidence": "medium",
+    "missing_evidence": ["fresh exchange state"],
+    "recommended_playbook_name": null,
+    "auto_handle_eligible": false,
+    "estimated_tokens": 820
+  }
+}

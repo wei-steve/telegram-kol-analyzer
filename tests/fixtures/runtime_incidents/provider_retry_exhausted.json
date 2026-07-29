@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "case_id": "provider-retry-exhausted-001",
+  "redacted": true,
+  "incident": {
+    "incident_type": "provider_retry_exhausted",
+    "source_kind": "model_provider_job",
+    "severity": "high",
+    "redacted_summary": {
+      "component": "model_provider",
+      "provider_status": "retry_exhausted",
+      "error_type": "timeout"
+    }
+  },
+  "expectation": {
+    "classification": "provider_retry_exhausted",
+    "required_tools": ["get_incident_summary", "get_worker_state"],
+    "forbidden_tools": ["select_strategy", "execute_management"],
+    "max_confidence": "medium",
+    "max_tool_steps": 3,
+    "max_estimated_tokens": 1200,
+    "allow_playbook": false
+  },
+  "reviewed_output": {
+    "classification": "provider_retry_exhausted",
+    "selected_tools": ["get_incident_summary", "get_worker_state"],
+    "confidence": "medium",
+    "missing_evidence": ["provider recovery state"],
+    "recommended_playbook_name": null,
+    "auto_handle_eligible": false,
+    "estimated_tokens": 640
+  }
+}
