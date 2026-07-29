@@ -28,6 +28,11 @@ The sidecar calls this endpoint without receiving database-file ownership,
 small coordinator captures the bounded response and exposes it to the existing
 `get_service_audit_state` verification tool exactly once.
 
+The main process admits at most one audit at a time through a non-blocking
+process lock. Busy requests fail immediately. Each child receives a dedicated
+parent-owned scratch directory; the parent removes it in all success, timeout,
+oversize, parse-error, and subprocess-error paths.
+
 ### Rejected: start `telegram-kol-monitor-diagnostic.service`
 
 The sidecar is deliberately denied access to systemd's control socket and has
@@ -45,22 +50,26 @@ run the full scan synchronously without a killable deadline.
 ## Components and Data Flow
 
 1. The main-service endpoint validates loopback origin before doing work.
-2. It starts `audit-management-batches` in a killable subprocess with fixed
-   arguments, a 20-second deadline, and bounded combined output.
-3. It validates and reduces the audit to fixed completion facts.
-4. `RuntimeAgentProductionAuditRefresh` receives a loopback HTTP reader.
-5. The action handler calls `rerun` with the exact incident and executor
+2. It takes the process-wide audit lock without waiting; a busy request exits.
+3. The parent creates a dedicated scratch directory.
+4. It starts `audit-management-batches` in a killable subprocess with fixed
+   arguments, the exact scratch root, a 20-second deadline, and bounded
+   combined output.
+5. The parent removes the entire scratch root in a unified cleanup path.
+6. It validates and reduces the audit to fixed completion facts.
+7. `RuntimeAgentProductionAuditRefresh` receives a loopback HTTP reader.
+8. The action handler calls `rerun` with the exact incident and executor
    identity fields.
-6. The coordinator validates and reduces the result to fixed completion facts:
+9. The coordinator validates and reduces the result to fixed completion facts:
    snapshot status, validation status, completeness, malformed-row count, and
    bounded alert-state counts.
-7. The proof is held only in bounded process memory and keyed by incident ID.
-8. The existing `get_service_audit_state` tool atomically consumes that proof
+10. The proof is held only in bounded process memory and keyed by incident ID.
+11. The existing `get_service_audit_state` tool atomically consumes that proof
    and returns `audit_run_completed`, `complete`, and `monitor_error`.
-9. The executor independently applies its existing playbook-specific
+12. The executor independently applies its existing playbook-specific
    verification rule and durably records the bounded proof in the recovery
    attempt.
-10. A later audit-state query falls back to the existing passive monitor-state
+13. A later audit-state query falls back to the existing passive monitor-state
    projection.
 
 ## Failure and Safety Behavior
@@ -70,6 +79,10 @@ run the full scan synchronously without a killable deadline.
   the existing executor behavior.
 - A blocked or oversized subprocess is killed within the hard deadline and
   reduced to a generic unavailable result.
+- Parent-owned scratch cleanup prevents killed children from accumulating
+  private database or WAL copies.
+- Concurrent loopback requests do not queue or start another child; they
+  receive a generic busy response.
 - Non-loopback or proxy-forwarded requests are rejected before subprocess
   creation.
 - An incomplete or malformed audit is still captured as a completed run, but
@@ -86,7 +99,8 @@ run the full scan synchronously without a killable deadline.
 
 Tests cover valid complete results, historical abnormal counts, incomplete and
 malformed results, runner exceptions, a blocking subprocess deadline,
-loopback/proxy rejection, endpoint redaction, one-shot consumption, bounded
+scratch cleanup after a killed child, loopback/proxy rejection, endpoint
+redaction, endpoint single-flight behavior, one-shot consumption, bounded
 capture storage, production CLI wiring, passive fallback, and executor
 verification.
 Critical Runtime Agent, listener, contextual-resolution, management, mutation,

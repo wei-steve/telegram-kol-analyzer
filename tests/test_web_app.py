@@ -5033,3 +5033,81 @@ def test_runtime_agent_production_audit_endpoint_refuses_non_loopback_clients(
     assert response.status_code == 404
     assert proxied.status_code == 404
     assert calls == []
+
+
+def test_runtime_agent_production_audit_endpoint_is_single_flight(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+    calls = 0
+
+    def audit():
+        nonlocal active, max_active, calls
+        with state_lock:
+            active += 1
+            calls += 1
+            max_active = max(max_active, active)
+        started.set()
+        release.wait(timeout=2)
+        with state_lock:
+            active -= 1
+        return {
+            "snapshot_status": "stable",
+            "snapshot_validation": "ok",
+            "schema_status": "available",
+            "output_complete": True,
+            "batches_truncated": False,
+            "malformed_row_count": 0,
+            "malformed_field_count": 0,
+            "legacy_pending_management": {
+                "complete": True,
+                "truncated": False,
+                "scan_truncated": False,
+            },
+            "counts": {
+                "batches_total": 0,
+                "blocked": 0,
+                "submit_unknown": 0,
+                "partial_failed": 0,
+                "recovery_required": 0,
+            },
+        }
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_agent_production_audit_runner=audit,
+    )
+    first = {}
+
+    def run_first():
+        first["response"] = TestClient(
+            app,
+            client=("127.0.0.1", 50000),
+        ).post("/api/runtime-agent/read-only-production-audit")
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert started.wait(timeout=1)
+    started_at = time.monotonic()
+    busy = TestClient(
+        app,
+        client=("127.0.0.1", 50001),
+    ).post("/api/runtime-agent/read-only-production-audit")
+    busy_elapsed = time.monotonic() - started_at
+    release.set()
+    thread.join(timeout=2)
+
+    again = TestClient(
+        app,
+        client=("127.0.0.1", 50002),
+    ).post("/api/runtime-agent/read-only-production-audit")
+
+    assert busy.status_code == 409
+    assert busy.json() == {"detail": "production audit busy"}
+    assert busy_elapsed < 0.5
+    assert first["response"].status_code == 200
+    assert again.status_code == 200
+    assert max_active == 1
+    assert calls == 2

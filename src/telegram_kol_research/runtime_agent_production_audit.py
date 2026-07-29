@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import json
 import sys
+import tempfile
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -43,7 +44,9 @@ class _AuditProof:
     batches_truncated: bool
     malformed_row_count: int
     malformed_field_count: int
-    legacy_complete: bool
+    legacy_source_complete: bool
+    legacy_truncated: bool
+    legacy_scan_truncated: bool
     counts: dict[str, int]
 
     @property
@@ -56,7 +59,9 @@ class _AuditProof:
             and self.batches_truncated is False
             and self.malformed_row_count == 0
             and self.malformed_field_count == 0
-            and self.legacy_complete is True
+            and self.legacy_source_complete is True
+            and self.legacy_truncated is False
+            and self.legacy_scan_truncated is False
         )
 
 
@@ -132,11 +137,9 @@ def _project_audit(value: Any) -> _AuditProof:
         malformed_field_count=_bounded_count(
             value.get("malformed_field_count")
         ),
-        legacy_complete=(
-            legacy_flags[0] is True
-            and legacy_flags[1] is False
-            and legacy_flags[2] is False
-        ),
+        legacy_source_complete=legacy_flags[0],
+        legacy_truncated=legacy_flags[1],
+        legacy_scan_truncated=legacy_flags[2],
         counts={
             name: _bounded_count(counts.get(name))
             for name in _COUNT_FIELDS
@@ -154,9 +157,9 @@ def _proof_payload(proof: _AuditProof) -> dict[str, Any]:
         "malformed_row_count": proof.malformed_row_count,
         "malformed_field_count": proof.malformed_field_count,
         "legacy_pending_management": {
-            "complete": proof.legacy_complete,
-            "truncated": False if proof.legacy_complete else True,
-            "scan_truncated": False,
+            "complete": proof.legacy_source_complete,
+            "truncated": proof.legacy_truncated,
+            "scan_truncated": proof.legacy_scan_truncated,
         },
         "counts": dict(proof.counts),
     }
@@ -173,12 +176,13 @@ def run_bounded_production_audit_command(
     *,
     timeout_seconds: float = 20.0,
     audit_command: tuple[str, ...] | None = None,
+    scratch_parent: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run the exact read-only audit in a killable, output-bounded process."""
 
     if not 0.05 <= float(timeout_seconds) <= 20.0:
         raise ValueError("production audit timeout is invalid")
-    command = audit_command or (
+    command_template = audit_command or (
         sys.executable,
         "-m",
         "telegram_kol_research.cli",
@@ -189,17 +193,27 @@ def run_bounded_production_audit_command(
         "100",
         "--output-format",
         "json",
+        "--scratch-root",
+        "{scratch_root}",
     )
     try:
-        completed = _run_bounded_command(
-            command,
-            timeout_seconds=float(timeout_seconds),
-            max_output_bytes=_MAX_COMMAND_OUTPUT_BYTES,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError("audit command failed")
-        value = json.loads(completed.output)
-        return project_bounded_production_audit(value)
+        with tempfile.TemporaryDirectory(
+            dir=scratch_parent,
+            prefix=".runtime-agent-audit-",
+        ) as scratch_root:
+            command = tuple(
+                scratch_root if item == "{scratch_root}" else item
+                for item in command_template
+            )
+            completed = _run_bounded_command(
+                command,
+                timeout_seconds=float(timeout_seconds),
+                max_output_bytes=_MAX_COMMAND_OUTPUT_BYTES,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError("audit command failed")
+            value = json.loads(completed.output)
+            return project_bounded_production_audit(value)
     except Exception as exc:
         raise RuntimeAgentProductionAuditError(
             "production audit unavailable"
@@ -273,6 +287,10 @@ class RuntimeAgentProductionAuditRefresh:
             "batches_truncated": proof.batches_truncated,
             "malformed_row_count": proof.malformed_row_count,
             "malformed_field_count": proof.malformed_field_count,
-            "legacy_complete": proof.legacy_complete,
+            "legacy_complete": (
+                proof.legacy_source_complete is True
+                and proof.legacy_truncated is False
+                and proof.legacy_scan_truncated is False
+            ),
             "counts": dict(proof.counts),
         }

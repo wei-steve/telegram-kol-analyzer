@@ -1239,14 +1239,30 @@ def _audit_management_snapshot(
         return result
 
 
-def _audit_management_batches_read_only(database_path: Path, *, limit: int) -> dict:
+def _audit_management_batches_read_only(
+    database_path: Path,
+    *,
+    limit: int,
+    scratch_root: Path | None = None,
+) -> dict:
     try:
-        with tempfile.TemporaryDirectory(prefix="management-audit-") as temporary:
-            snapshot_path, snapshot_info = _build_stable_private_snapshots(
-                database_path, Path(temporary)
+        if scratch_root is not None:
+            private_root = Path(scratch_root)
+            if private_root.is_symlink() or not private_root.is_dir():
+                raise ManagementAuditSnapshotError(
+                    "private_snapshot_root_invalid",
+                    status="snapshot_unavailable",
+                )
+            return _build_stable_private_snapshots_and_audit(
+                database_path,
+                private_root,
+                limit=limit,
             )
-            return _audit_management_snapshot(
-                snapshot_path, limit=limit, snapshot_info=snapshot_info
+        with tempfile.TemporaryDirectory(prefix="management-audit-") as temporary:
+            return _build_stable_private_snapshots_and_audit(
+                database_path,
+                Path(temporary),
+                limit=limit,
             )
     except ManagementAuditSnapshotError:
         raise
@@ -1254,6 +1270,23 @@ def _audit_management_batches_read_only(database_path: Path, *, limit: int) -> d
         raise ManagementAuditSnapshotError(
             "private_snapshot_unavailable", status="snapshot_unavailable"
         ) from exc
+
+
+def _build_stable_private_snapshots_and_audit(
+    database_path: Path,
+    scratch_root: Path,
+    *,
+    limit: int,
+) -> dict:
+    snapshot_path, snapshot_info = _build_stable_private_snapshots(
+        database_path,
+        scratch_root,
+    )
+    return _audit_management_snapshot(
+        snapshot_path,
+        limit=limit,
+        snapshot_info=snapshot_info,
+    )
 
 
 def _record_within_window(record: NormalizedMessageRecord, *, start_at, end_at) -> bool:
@@ -2774,6 +2807,11 @@ def audit_management_batches(
     database_path: Path = Path("data/research.db"),
     limit: int = typer.Option(20, min=1, max=100),
     output_format: str = typer.Option("text", "--output-format"),
+    scratch_root: Path | None = typer.Option(
+        None,
+        "--scratch-root",
+        hidden=True,
+    ),
 ) -> None:
     """Read a bounded, redacted management batch and legacy queue summary."""
 
@@ -2781,7 +2819,11 @@ def audit_management_batches(
     if normalized_format not in {"json", "text"}:
         raise typer.BadParameter("output-format must be one of: text, json")
     try:
-        audit = _audit_management_batches_read_only(database_path, limit=limit)
+        audit = _audit_management_batches_read_only(
+            database_path,
+            limit=limit,
+            scratch_root=scratch_root,
+        )
     except (
         ManagementAuditSnapshotError,
         sqlite3.Error,

@@ -45,7 +45,9 @@ Add:
 - atomic one-shot consumption;
 - a maximum of 32 ephemeral captures;
 - a loopback-only, proxy-refusing endpoint;
-- a 20-second killable subprocess and 1 MiB output ceiling.
+- a 20-second killable subprocess and 1 MiB output ceiling;
+- parent-owned per-run scratch cleanup;
+- non-blocking single-flight endpoint admission.
 
 **Step 4: Verify GREEN**
 

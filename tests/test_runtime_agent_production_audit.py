@@ -240,6 +240,12 @@ def test_server_projection_omits_raw_audit_rows_and_unknown_fields():
 
 def test_blocking_audit_subprocess_is_killed_within_hard_deadline(tmp_path):
     started = time.monotonic()
+    script = (
+        "from pathlib import Path; import sys,time; "
+        "p=Path(sys.argv[1]); "
+        "(p/'partial-snapshot').write_bytes(b'x'*1048576); "
+        "time.sleep(60)"
+    )
 
     with pytest.raises(
         RuntimeAgentProductionAuditError,
@@ -251,8 +257,29 @@ def test_blocking_audit_subprocess_is_killed_within_hard_deadline(tmp_path):
             audit_command=(
                 sys.executable,
                 "-c",
-                "import time; time.sleep(60)",
+                script,
+                "{scratch_root}",
             ),
+            scratch_parent=tmp_path,
         )
 
     assert time.monotonic() - started < 2
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_server_projection_preserves_exact_legacy_completion_flags():
+    payload = project_bounded_production_audit(
+        _audit(
+            legacy_pending_management={
+                "complete": False,
+                "truncated": False,
+                "scan_truncated": True,
+            }
+        )
+    )
+
+    assert payload["legacy_pending_management"] == {
+        "complete": False,
+        "truncated": False,
+        "scan_truncated": True,
+    }

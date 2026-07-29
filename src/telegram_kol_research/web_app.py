@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 from urllib.parse import urlencode
 
@@ -3297,6 +3298,7 @@ def create_web_app(
             )
         )
     )
+    app.state.runtime_agent_production_audit_lock = threading.Lock()
     app.state.log_directory = log_directory
     app.state.session_factory = create_session_factory(database_path)
     app.state.media_root = resolved_media_root.resolve()
@@ -3590,18 +3592,29 @@ def create_web_app(
             or "x-forwarded-for" in request.headers
         ):
             raise HTTPException(status_code=404, detail="not found")
-        try:
-            return project_bounded_production_audit(
-                app.state.runtime_agent_production_audit_runner()
-            )
-        except Exception:
-            logger.warning(
-                "Runtime Agent read-only production audit is unavailable"
-            )
+        acquired = app.state.runtime_agent_production_audit_lock.acquire(
+            blocking=False
+        )
+        if not acquired:
             raise HTTPException(
-                status_code=503,
-                detail="production audit unavailable",
+                status_code=409,
+                detail="production audit busy",
             )
+        try:
+            try:
+                return project_bounded_production_audit(
+                    app.state.runtime_agent_production_audit_runner()
+                )
+            except Exception:
+                logger.warning(
+                    "Runtime Agent read-only production audit is unavailable"
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="production audit unavailable",
+                )
+        finally:
+            app.state.runtime_agent_production_audit_lock.release()
 
     @app.get("/api/management-batches")
     def api_management_batches(chat_id: int, limit: int = 50):
