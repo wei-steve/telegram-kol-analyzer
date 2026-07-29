@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 from sqlalchemy.orm import sessionmaker
@@ -15,6 +16,43 @@ from telegram_kol_research.models import TradingSetting
 
 
 TRADING_SETTINGS_KEY = "global"
+
+ENTRY_THRESHOLD_KEYS = (
+    "market_leg_threshold",
+    "first_limit_offset",
+    "second_limit_offset",
+)
+
+LEGACY_SYMBOL_ENTRY_THRESHOLD_DEFAULTS = {
+    "BTC": {
+        "market_leg_threshold": "200",
+        "first_limit_offset": "90",
+        "second_limit_offset": "90",
+    },
+    "ETH": {
+        "market_leg_threshold": "4",
+        "first_limit_offset": "2",
+        "second_limit_offset": "2",
+    },
+}
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolEntryThresholds:
+    market_leg_threshold: Decimal
+    first_limit_offset: Decimal
+    second_limit_offset: Decimal
+
+    @classmethod
+    def zero(cls) -> "SymbolEntryThresholds":
+        return cls(Decimal("0"), Decimal("0"), Decimal("0"))
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "market_leg_threshold": _canonical_decimal(self.market_leg_threshold),
+            "first_limit_offset": _canonical_decimal(self.first_limit_offset),
+            "second_limit_offset": _canonical_decimal(self.second_limit_offset),
+        }
 
 
 @dataclass(slots=True)
@@ -29,6 +67,12 @@ class TradingSettings:
     min_ai_confidence: float = 0.75
     allowed_symbols: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
     symbol_max_loss_usdt: dict[str, float] = field(default_factory=dict)
+    symbol_entry_thresholds: dict[str, dict[str, str]] = field(
+        default_factory=lambda: {
+            symbol: values.copy()
+            for symbol, values in LEGACY_SYMBOL_ENTRY_THRESHOLD_DEFAULTS.items()
+        }
+    )
     entry_range_order_style: str = "eager"
     take_profit_allocations: list[float] = field(default_factory=lambda: [40.0, 30.0, 30.0])
     trigger_backup_stop_buffer_bps: float = 20.0
@@ -45,6 +89,21 @@ class TradingSettings:
             default_max_loss_usdt=self.default_max_loss_usdt,
             symbol_max_loss_usdt=self.symbol_max_loss_usdt,
             symbol=symbol,
+        )
+
+    def entry_thresholds_for_symbol(
+        self,
+        symbol: str | None,
+    ) -> SymbolEntryThresholds:
+        normalized_symbol = str(symbol or "").strip().upper()
+        values = self.symbol_entry_thresholds.get(normalized_symbol)
+        if not values:
+            return SymbolEntryThresholds.zero()
+        return SymbolEntryThresholds(
+            **{
+                key: Decimal(values.get(key, "0"))
+                for key in ENTRY_THRESHOLD_KEYS
+            }
         )
 
     @property
@@ -146,6 +205,11 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
     defaults = TradingSettings()
     allowed_symbols = _parse_symbol_list(raw.get("allowed_symbols"), defaults.allowed_symbols)
     symbol_max_loss_usdt = _parse_symbol_max_loss_usdt(raw.get("symbol_max_loss_usdt"))
+    symbol_entry_thresholds = _parse_symbol_entry_thresholds(
+        raw.get("symbol_entry_thresholds")
+        if "symbol_entry_thresholds" in raw
+        else LEGACY_SYMBOL_ENTRY_THRESHOLD_DEFAULTS
+    )
     take_profit_allocations = _parse_allocations(
         raw.get("take_profit_allocations"),
         defaults.take_profit_allocations,
@@ -189,6 +253,7 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         ),
         allowed_symbols=allowed_symbols,
         symbol_max_loss_usdt=symbol_max_loss_usdt,
+        symbol_entry_thresholds=symbol_entry_thresholds,
         entry_range_order_style=style,
         take_profit_allocations=take_profit_allocations,
         trigger_backup_stop_buffer_bps=_positive_float(
@@ -337,6 +402,57 @@ def _parse_symbol_max_loss_usdt(value: Any) -> dict[str, float]:
             continue
         if loss > 0:
             parsed[symbol] = loss
+    return parsed
+
+
+def _canonical_decimal(value: Decimal) -> str:
+    canonical = format(value, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    return canonical or "0"
+
+
+def _parse_entry_threshold_value(value: Any, field_name: str) -> Decimal:
+    if isinstance(value, bool) or isinstance(value, (dict, list, tuple, set)):
+        raise ValueError(f"{field_name} must be a non-negative finite decimal")
+    if isinstance(value, str) and not value.strip():
+        raise ValueError(f"{field_name} must be a non-negative finite decimal")
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
+        raise ValueError(
+            f"{field_name} must be a non-negative finite decimal"
+        ) from None
+    if not parsed.is_finite() or parsed < 0:
+        raise ValueError(f"{field_name} must be a non-negative finite decimal")
+    return parsed
+
+
+def _parse_symbol_entry_thresholds(
+    value: Any,
+) -> dict[str, dict[str, str]]:
+    if not isinstance(value, dict):
+        raise ValueError("symbol_entry_thresholds must be an object")
+
+    parsed: dict[str, dict[str, str]] = {}
+    for raw_symbol, raw_thresholds in value.items():
+        symbol = str(raw_symbol or "").strip().upper()
+        if not symbol:
+            raise ValueError("symbol_entry_thresholds symbol must not be empty")
+        if not isinstance(raw_thresholds, dict):
+            raise ValueError(
+                f"symbol_entry_thresholds.{symbol} must be an object"
+            )
+        thresholds = SymbolEntryThresholds(
+            **{
+                key: _parse_entry_threshold_value(
+                    raw_thresholds.get(key, "0"),
+                    f"symbol_entry_thresholds.{symbol}.{key}",
+                )
+                for key in ENTRY_THRESHOLD_KEYS
+            }
+        )
+        parsed[symbol] = thresholds.to_dict()
     return parsed
 
 

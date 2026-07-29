@@ -1,8 +1,11 @@
+from decimal import Decimal
+
 import pytest
 
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.group_config import TrackedSenderConfig
+from telegram_kol_research.trading_settings import SymbolEntryThresholds
 from telegram_kol_research.trading_settings import apply_trading_settings_to_group_config
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.trading_settings import load_trading_settings
@@ -20,6 +23,16 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.default_max_loss_usdt == 20.0
     assert settings.max_concurrent_positions == 4
     assert settings.allowed_symbols == ["BTC", "ETH"]
+    assert settings.entry_thresholds_for_symbol("BTC") == SymbolEntryThresholds(
+        market_leg_threshold=Decimal("200"),
+        first_limit_offset=Decimal("90"),
+        second_limit_offset=Decimal("90"),
+    )
+    assert settings.entry_thresholds_for_symbol("ETH") == SymbolEntryThresholds(
+        market_leg_threshold=Decimal("4"),
+        first_limit_offset=Decimal("2"),
+        second_limit_offset=Decimal("2"),
+    )
     assert settings.entry_range_order_style == "eager"
     assert settings.nearby_entry_market_deviation_pct == 0.15
     assert settings.take_profit_allocations == [40.0, 30.0, 30.0]
@@ -162,6 +175,18 @@ def test_save_trading_settings_normalizes_user_input(tmp_path):
                 "bad": "0",
                 "empty": "",
             },
+            "symbol_entry_thresholds": {
+                "btc": {
+                    "market_leg_threshold": "200",
+                    "first_limit_offset": "90",
+                    "second_limit_offset": "90",
+                },
+                "doge": {
+                    "market_leg_threshold": "0.01",
+                    "first_limit_offset": "0.002",
+                    "second_limit_offset": "0.003",
+                },
+            },
             "nearby_entry_market_deviation_pct": "1.2",
             "take_profit_allocations": "50,25,25",
             "entry_range_order_style": "eager",
@@ -173,12 +198,80 @@ def test_save_trading_settings_normalizes_user_input(tmp_path):
     assert reloaded.default_max_loss_usdt == 120.0
     assert reloaded.allowed_symbols == ["BTC", "ETH", "SOL"]
     assert reloaded.symbol_max_loss_usdt == {"BTC": 20.0, "ETH": 15.5}
+    assert reloaded.to_dict()["symbol_entry_thresholds"]["DOGE"] == {
+        "market_leg_threshold": "0.01",
+        "first_limit_offset": "0.002",
+        "second_limit_offset": "0.003",
+    }
     assert reloaded.max_loss_for_symbol("btc") == 20.0
     assert reloaded.max_loss_for_symbol("SOL") == 120.0
     assert reloaded.nearby_entry_market_deviation_pct == 1.2
     assert reloaded.take_profit_allocations == [50.0, 25.0, 25.0]
     assert reloaded.entry_range_order_style == "eager"
     assert reloaded.allow_vision_auto_trade is True
+
+
+def test_legacy_settings_seed_initial_fixed_entry_thresholds(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    settings = save_trading_settings(
+        session_factory,
+        {
+            "allowed_symbols": ["BTC", "ETH", "SOL"],
+            "symbol_max_loss_usdt": {"BTC": 20, "ETH": 15, "SOL": 10},
+        },
+    )
+
+    assert settings.entry_thresholds_for_symbol("BTC") == SymbolEntryThresholds(
+        market_leg_threshold=Decimal("200"),
+        first_limit_offset=Decimal("90"),
+        second_limit_offset=Decimal("90"),
+    )
+    assert settings.entry_thresholds_for_symbol("ETH") == SymbolEntryThresholds(
+        market_leg_threshold=Decimal("4"),
+        first_limit_offset=Decimal("2"),
+        second_limit_offset=Decimal("2"),
+    )
+    assert settings.entry_thresholds_for_symbol("SOL") == SymbolEntryThresholds.zero()
+
+
+def test_symbol_entry_thresholds_preserve_small_decimals(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    settings = save_trading_settings(
+        session_factory,
+        {
+            "symbol_entry_thresholds": {
+                "PEPE": {
+                    "market_leg_threshold": "0.000003",
+                    "first_limit_offset": "0.000001",
+                    "second_limit_offset": "0.000002",
+                }
+            }
+        },
+    )
+
+    assert settings.to_dict()["symbol_entry_thresholds"]["PEPE"] == {
+        "market_leg_threshold": "0.000003",
+        "first_limit_offset": "0.000001",
+        "second_limit_offset": "0.000002",
+    }
+
+
+@pytest.mark.parametrize("invalid", ["-1", -0.1, "nan", "inf", {}, []])
+def test_symbol_entry_thresholds_reject_invalid_values(invalid):
+    with pytest.raises(ValueError):
+        trading_settings_from_payload(
+            {
+                "symbol_entry_thresholds": {
+                    "BTC": {
+                        "market_leg_threshold": invalid,
+                        "first_limit_offset": "0",
+                        "second_limit_offset": "0",
+                    }
+                }
+            }
+        )
 
 
 @pytest.mark.parametrize("value, expected", [
