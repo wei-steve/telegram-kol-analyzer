@@ -62,8 +62,6 @@ def build_deepcoin_order_draft(
         payload_preview.get("entry_range"),
         symbol=symbol,
     )
-    entry_low = _normalize_price(entry_low, contract_spec)
-    entry_high = _normalize_price(entry_high, contract_spec)
     single_entry_price = math.isclose(entry_low, entry_high)
 
     source = payload_preview.get("source") or {}
@@ -131,7 +129,11 @@ def build_deepcoin_order_draft(
         else None
     )
     if order_type == "market" or single_entry_price:
-        reference_price = _normalize_price((entry_low + entry_high) / 2, contract_spec)
+        reference_price = _normalize_final_entry_price(
+            (entry_low + entry_high) / 2,
+            contract_spec,
+            error_message="entry price produces non-positive price after tick normalization",
+        )
         order_legs = [
             _single_entry_leg(
                 open_side=open_side,
@@ -405,15 +407,22 @@ def _range_entry_leg_prices(
         raise DeepcoinOrderDraftError(
             "fixed entry offset produces price outside finite float range"
         )
-    normalized_prices = (
-        _normalize_price(float(first), contract_spec),
-        _normalize_price(float(second), contract_spec),
+    return (
+        _normalize_final_entry_price(
+            float(first),
+            contract_spec,
+            error_message=(
+                "fixed entry offset produces non-positive price after tick normalization"
+            ),
+        ),
+        _normalize_final_entry_price(
+            float(second),
+            contract_spec,
+            error_message=(
+                "fixed entry offset produces non-positive price after tick normalization"
+            ),
+        ),
     )
-    if any(price <= 0 or not math.isfinite(price) for price in normalized_prices):
-        raise DeepcoinOrderDraftError(
-            "fixed entry offset produces non-positive price after tick normalization"
-        )
-    return normalized_prices
 
 
 def _hybrid_market_entry_price(
@@ -431,7 +440,13 @@ def _hybrid_market_entry_price(
     distance = abs(Decimal(str(current_price)) - Decimal(str(anchor)))
     if distance > market_leg_threshold:
         return None
-    return _normalize_price(current_price, contract_spec)
+    return _normalize_final_entry_price(
+        current_price,
+        contract_spec,
+        error_message=(
+            "hybrid market entry produces non-positive price after tick normalization"
+        ),
+    )
 
 
 def _estimate_leg_quantity(
@@ -695,6 +710,20 @@ def _normalize_price(price: float, contract_spec: DeepcoinContractSpec | None) -
     if contract_spec is None:
         return price
     return _round_down_to_step(price, contract_spec.price_tick)
+
+
+def _normalize_final_entry_price(
+    price: float,
+    contract_spec: DeepcoinContractSpec | None,
+    *,
+    error_message: str,
+) -> float:
+    if price <= 0 or not math.isfinite(price):
+        raise DeepcoinOrderDraftError(error_message)
+    normalized = _normalize_price(price, contract_spec)
+    if normalized <= 0 or not math.isfinite(normalized):
+        raise DeepcoinOrderDraftError(error_message)
+    return normalized
 
 
 def _normalize_margin_mode(value: Any) -> str:

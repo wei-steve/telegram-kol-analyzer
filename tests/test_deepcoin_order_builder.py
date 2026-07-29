@@ -349,6 +349,109 @@ def test_small_fixed_offsets_survive_until_tick_normalization():
     ]
 
 
+def test_fixed_offsets_apply_before_tick_normalization_for_unaligned_range():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            contract="SOL-USDT",
+            entry_range="100.01-100.09",
+            stop_loss="90",
+            take_profit=None,
+            first_limit_offset="0.05",
+            second_limit_offset="0.05",
+        ),
+        contract_spec=DeepcoinContractSpec(
+            instrument_id="SOL-USDT-SWAP",
+            contract_value=1,
+            quantity_step=1,
+            min_quantity=1,
+            price_tick=0.1,
+        ),
+    )
+
+    assert [leg["price"] for leg in draft["order_legs"]] == [100.1, 100.0]
+
+
+def test_range_endpoints_normalized_to_zero_are_rejected():
+    with pytest.raises(
+        DeepcoinOrderDraftError,
+        match="non-positive price after tick normalization",
+    ):
+        build_deepcoin_order_draft(
+            _payload_preview(
+                contract="PEPE-USDT",
+                entry_range="0.000001-0.000002",
+                stop_loss="0.0000005",
+                take_profit=None,
+                first_limit_offset="0",
+                second_limit_offset="0",
+            ),
+            contract_spec=DeepcoinContractSpec(
+                instrument_id="PEPE-USDT-SWAP",
+                contract_value=1,
+                quantity_step=1,
+                min_quantity=1,
+                price_tick=0.00001,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("order_type", "entry_range"),
+    [
+        ("market", "0.000001-0.000002"),
+        ("limit", "0.000001-0.000001"),
+    ],
+)
+def test_single_and_explicit_market_prices_normalized_to_zero_are_rejected(
+    order_type,
+    entry_range,
+):
+    with pytest.raises(
+        DeepcoinOrderDraftError,
+        match="entry price produces non-positive price after tick normalization",
+    ):
+        build_deepcoin_order_draft(
+            _payload_preview(
+                contract="PEPE-USDT",
+                order_type=order_type,
+                entry_range=entry_range,
+                stop_loss="0.0000005",
+                take_profit=None,
+            ),
+            contract_spec=DeepcoinContractSpec(
+                instrument_id="PEPE-USDT-SWAP",
+                contract_value=1,
+                quantity_step=1,
+                min_quantity=1,
+                price_tick=0.00001,
+            ),
+        )
+
+
+def test_hybrid_market_price_normalized_to_zero_is_rejected():
+    with pytest.raises(
+        DeepcoinOrderDraftError,
+        match="hybrid market entry produces non-positive price",
+    ):
+        build_deepcoin_order_draft(
+            _payload_preview(
+                contract="PEPE-USDT",
+                entry_range="0.000001-0.000002",
+                current_price="0.0000015",
+                stop_loss="0.0000005",
+                take_profit=None,
+                market_leg_threshold="0.000001",
+            ),
+            contract_spec=DeepcoinContractSpec(
+                instrument_id="PEPE-USDT-SWAP",
+                contract_value=1,
+                quantity_step=1,
+                min_quantity=1,
+                price_tick=0.00001,
+            ),
+        )
+
+
 def test_equivalent_normalized_fixed_limit_legs_coalesce():
     draft = build_deepcoin_order_draft(
         _payload_preview(

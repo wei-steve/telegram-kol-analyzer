@@ -33,9 +33,9 @@ def test_trading_symbol_assets_preserve_decimal_threshold_state(tmp_path):
     assert "market_leg_threshold" in selector_block
     assert "first_limit_offset" in selector_block
     assert "second_limit_offset" in selector_block
-    assert "第一腿市价阈值" in selector_block
-    assert "第一腿限价偏移" in selector_block
-    assert "第二腿限价偏移" in selector_block
+    assert "第一腿市价固定阈值" in selector_block
+    assert "第一腿限价固定价差" in selector_block
+    assert "第二腿限价固定价差" in selector_block
     assert "input.min = '0';" in selector_block
     assert "input.step = 'any';" in selector_block
     assert "delete state.thresholdsBySymbol" not in selector_block

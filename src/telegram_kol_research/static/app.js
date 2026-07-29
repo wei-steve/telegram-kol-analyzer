@@ -2463,9 +2463,9 @@ function initTradingSymbolSelector(form) {
 
       const thresholds = ensureSymbolEntryThresholds(symbol);
       [
-        ['market_leg_threshold', '第一腿市价阈值'],
-        ['first_limit_offset', '第一腿限价偏移'],
-        ['second_limit_offset', '第二腿限价偏移'],
+        ['market_leg_threshold', '第一腿市价固定阈值'],
+        ['first_limit_offset', '第一腿限价固定价差'],
+        ['second_limit_offset', '第二腿限价固定价差'],
       ].forEach(([field, text]) => {
         const label = document.createElement('label');
         const labelText = document.createElement('span');
