@@ -1120,7 +1120,53 @@ def cancel_pending_entry_legs(
         client_order_ids=pending_leg_keys["client_order_ids"],
     )
     if not trigger_orders and not regular_orders:
-        raise DeepcoinExecutionActionError("no_bound_pending_entry_order")
+        _mark_pending_entry_keys_cancelled(
+            session_factory,
+            binding_id=binding.id,
+            order_ids=pending_leg_keys["order_ids"],
+            client_order_ids=pending_leg_keys["client_order_ids"],
+            terminal_reason="pending_entry_order_absent_confirmed",
+            updated_at=now,
+        )
+        _remove_cancelled_order_ids_from_active_binding(
+            session_factory,
+            binding=binding,
+            cancelled_order_ids=pending_leg_keys["order_ids"],
+            cancelled_client_order_ids=pending_leg_keys["client_order_ids"],
+            updated_at=now,
+        )
+        event_id = record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                execution_binding_id=binding.id,
+                trade_signal_id=trade_signal.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                kol_id=binding.kol_id,
+                chat_id=binding.chat_id,
+                message_id=binding.message_id,
+                source_message_id=trade_signal.message_id,
+                symbol=binding.symbol,
+                side=binding.side,
+                action="cancel_entry_absent_confirmed",
+                reason=trade_signal.action,
+                created_at=now,
+            ),
+        )
+        return {
+            "submitted": False,
+            "status": "already_absent",
+            "venue": "deepcoin",
+            "signal_id": trade_signal.id,
+            "action": trade_signal.action,
+            "binding_id": binding.id,
+            "order_id": ",".join(sorted(pending_leg_keys["order_ids"])),
+            "client_order_id": ",".join(
+                sorted(pending_leg_keys["client_order_ids"])
+            ),
+            "cancelled_orders": [],
+            "event_ids": [event_id],
+            "executed_at": now.isoformat(),
+        }
 
     cancelled_orders: list[dict[str, Any]] = []
     for cancel_type, orders in (("trigger", trigger_orders), ("regular", regular_orders)):
@@ -1175,6 +1221,19 @@ def cancel_pending_entry_legs(
                 ),
             )
 
+    remaining_trigger_orders = _select_orders_by_known_ids(
+        deepcoin_client.list_trigger_orders_pending(inst_id=inst_id),
+        order_ids=pending_leg_keys["order_ids"],
+        client_order_ids=pending_leg_keys["client_order_ids"],
+    )
+    remaining_regular_orders = _select_orders_by_known_ids(
+        deepcoin_client.list_open_orders(inst_id=inst_id),
+        order_ids=pending_leg_keys["order_ids"],
+        client_order_ids=pending_leg_keys["client_order_ids"],
+    )
+    if remaining_trigger_orders or remaining_regular_orders:
+        raise DeepcoinExecutionActionError("pending_entry_cancel_not_confirmed")
+
     for cancelled_order in cancelled_orders:
         _update_entry_leg_status(
             session_factory,
@@ -1211,6 +1270,36 @@ def cancel_pending_entry_legs(
         "cancelled_orders": cancelled_orders,
         "executed_at": now.isoformat(),
     }
+
+
+def _mark_pending_entry_keys_cancelled(
+    session_factory: sessionmaker,
+    *,
+    binding_id: int,
+    order_ids: set[str],
+    client_order_ids: set[str],
+    terminal_reason: str,
+    updated_at: datetime,
+) -> None:
+    with session_factory() as session:
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == int(binding_id))
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .all()
+        )
+        for leg in legs:
+            if (
+                (leg.order_id and str(leg.order_id) in order_ids)
+                or (
+                    leg.client_order_id
+                    and str(leg.client_order_id) in client_order_ids
+                )
+            ):
+                leg.status = "cancelled"
+                leg.terminal_reason = terminal_reason
+                leg.updated_at = updated_at
+        session.commit()
 
 
 @serialized_position_authority_mutation

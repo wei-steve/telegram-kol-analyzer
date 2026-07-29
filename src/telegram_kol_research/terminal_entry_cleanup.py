@@ -1,0 +1,261 @@
+"""Resolve exact unfilled entry legs before a strategy terminates."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Literal
+
+from sqlalchemy.orm import sessionmaker
+
+from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
+from telegram_kol_research.deepcoin_execution_actions import (
+    DeepcoinExecutionActionError,
+    cancel_pending_entry_legs,
+)
+from telegram_kol_research.deepcoin_normalization import (
+    normalize_deepcoin_swap_instrument,
+)
+from telegram_kol_research.execution_events import list_execution_events
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    StrategyLifecycle,
+)
+from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
+from telegram_kol_research.position_authority_lock import (
+    serialized_position_authority_mutation,
+)
+from telegram_kol_research.trade_signals import (
+    enqueue_trade_signal,
+    mark_trade_signal_failed,
+    mark_trade_signal_submitted,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalEntryCleanupResult:
+    status: Literal["resolved", "already_absent", "blocked", "unknown"]
+    binding_id: int
+    lifecycle_id: int
+    leg_ids: tuple[int, ...]
+    order_ids: tuple[str, ...]
+    event_ids: tuple[int, ...]
+
+
+@serialized_position_authority_mutation
+def cleanup_terminal_entry_legs(
+    session_factory: sessionmaker,
+    *,
+    lifecycle_id: int,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    reason: str,
+    cleaned_at: datetime | None = None,
+) -> TerminalEntryCleanupResult:
+    now = cleaned_at or datetime.now(UTC)
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, int(lifecycle_id))
+        if lifecycle is None or lifecycle.execution_binding_id is None:
+            raise LookupError("terminal_entry_cleanup_lifecycle_not_bound")
+        binding = session.get(ExecutionBinding, int(lifecycle.execution_binding_id))
+        if binding is None:
+            raise LookupError("terminal_entry_cleanup_binding_not_found")
+        pending_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == binding.id)
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .all()
+        )
+        pending_legs = [
+            leg
+            for leg in pending_legs
+            if str(leg.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
+            and not leg.pos_id
+        ]
+        if not pending_legs:
+            return TerminalEntryCleanupResult(
+                status="already_absent",
+                binding_id=int(binding.id),
+                lifecycle_id=int(lifecycle.id),
+                leg_ids=(),
+                order_ids=(),
+                event_ids=(),
+            )
+        if any(not (leg.order_id or leg.client_order_id) for leg in pending_legs):
+            return TerminalEntryCleanupResult(
+                status="blocked",
+                binding_id=int(binding.id),
+                lifecycle_id=int(lifecycle.id),
+                leg_ids=tuple(sorted(int(leg.id) for leg in pending_legs)),
+                order_ids=tuple(
+                    sorted(str(leg.order_id) for leg in pending_legs if leg.order_id)
+                ),
+                event_ids=(),
+            )
+        binding_id = int(binding.id)
+        lifecycle_id_value = int(lifecycle.id)
+        leg_ids = tuple(sorted(int(leg.id) for leg in pending_legs))
+        order_ids = tuple(
+            sorted(str(leg.order_id) for leg in pending_legs if leg.order_id)
+        )
+        signal_values = {
+            "kol_id": binding.kol_id,
+            "chat_id": int(binding.chat_id),
+            "message_id": int(binding.message_id),
+            "symbol": binding.symbol,
+            "side": binding.side,
+            "strategy_instance_id": binding.strategy_instance_id,
+        }
+        instrument_id = normalize_deepcoin_swap_instrument(binding.symbol)
+        client_order_ids = tuple(
+            sorted(
+                str(leg.client_order_id)
+                for leg in pending_legs
+                if leg.client_order_id
+            )
+        )
+
+    trade_signal = enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="terminal_entry_cleanup",
+        action="cancel_entry",
+        payload={
+            "binding_id": binding_id,
+            "lifecycle_id": lifecycle_id_value,
+            "reason": str(reason or "strategy_terminal"),
+        },
+        enqueued_at=now,
+        **signal_values,
+    )
+    try:
+        result = cancel_pending_entry_legs(
+            session_factory,
+            trade_signal=trade_signal,
+            deepcoin_client=deepcoin_client,
+            executed_at=now,
+        )
+    except DeepcoinExecutionActionError as exc:
+        mark_trade_signal_failed(
+            session_factory,
+            signal_id=trade_signal.id,
+            error=str(exc),
+            failed_at=now,
+        )
+        return TerminalEntryCleanupResult(
+            status=(
+                "blocked"
+                if str(exc) == "pending_entry_cancel_not_confirmed"
+                else "unknown"
+            ),
+            binding_id=binding_id,
+            lifecycle_id=lifecycle_id_value,
+            leg_ids=leg_ids,
+            order_ids=order_ids,
+            event_ids=_event_ids_for_signal(session_factory, trade_signal.id),
+        )
+    except Exception:
+        still_visible = _entry_order_is_still_visible(
+            deepcoin_client,
+            instrument_id=instrument_id,
+            order_ids=set(order_ids),
+            client_order_ids=set(client_order_ids),
+        )
+        if still_visible is False:
+            result = cancel_pending_entry_legs(
+                session_factory,
+                trade_signal=trade_signal,
+                deepcoin_client=deepcoin_client,
+                executed_at=now,
+            )
+        else:
+            mark_trade_signal_failed(
+                session_factory,
+                signal_id=trade_signal.id,
+                error="terminal_entry_cleanup_exchange_outcome_unknown",
+                failed_at=now,
+            )
+            return TerminalEntryCleanupResult(
+                status="unknown",
+                binding_id=binding_id,
+                lifecycle_id=lifecycle_id_value,
+                leg_ids=leg_ids,
+                order_ids=order_ids,
+                event_ids=_event_ids_for_signal(session_factory, trade_signal.id),
+            )
+
+    status = (
+        "already_absent"
+        if result.get("status") == "already_absent"
+        else "resolved"
+    )
+    terminal_reason = (
+        "terminal_entry_cleanup_absent"
+        if status == "already_absent"
+        else "terminal_entry_cleanup_confirmed"
+    )
+    with session_factory() as session:
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.id.in_(leg_ids))
+            .all()
+        )
+        for leg in legs:
+            leg.status = "cancelled"
+            leg.terminal_reason = terminal_reason
+            leg.updated_at = now
+        session.commit()
+    mark_trade_signal_submitted(
+        session_factory,
+        signal_id=trade_signal.id,
+        result=result,
+        processed_at=now,
+    )
+    return TerminalEntryCleanupResult(
+        status=status,
+        binding_id=binding_id,
+        lifecycle_id=lifecycle_id_value,
+        leg_ids=leg_ids,
+        order_ids=order_ids,
+        event_ids=_event_ids_for_signal(session_factory, trade_signal.id),
+    )
+
+
+def _event_ids_for_signal(session_factory: sessionmaker, signal_id: int) -> tuple[int, ...]:
+    return tuple(
+        int(event.id)
+        for event in list_execution_events(session_factory)
+        if event.trade_signal_id == int(signal_id)
+    )
+
+
+def _entry_order_is_still_visible(
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    *,
+    instrument_id: str,
+    order_ids: set[str],
+    client_order_ids: set[str],
+) -> bool | None:
+    try:
+        orders = [
+            *(deepcoin_client.list_trigger_orders_pending(inst_id=instrument_id) or []),
+            *(deepcoin_client.list_open_orders(inst_id=instrument_id) or []),
+        ]
+    except Exception:
+        return None
+    for order in orders:
+        order_id = str(
+            order.get("ordId")
+            or order.get("orderId")
+            or order.get("order_id")
+            or ""
+        )
+        client_order_id = str(
+            order.get("clOrdId")
+            or order.get("clientOrderId")
+            or order.get("client_order_id")
+            or ""
+        )
+        if order_id in order_ids or client_order_id in client_order_ids:
+            return True
+    return False
