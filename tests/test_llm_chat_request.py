@@ -49,7 +49,7 @@ def test_runtime_agent_llm_config_is_isolated():
     )
 
     assert config == LLMProxyConfig(
-        base_url="https://api.xiaomimimo.com/v1",
+        base_url="https://api.xiaomimimo.com",
         api_key="agent-key",
         model="mimo-v2.5",
         timeout_seconds=120.0,
@@ -73,6 +73,21 @@ def test_runtime_agent_llm_config_never_falls_back_to_shared_key():
         "dedicated Runtime Agent provider configuration is invalid"
     )
     assert shared_key not in str(exc_info.value)
+
+
+def test_runtime_agent_llm_config_rejects_non_finite_timeout():
+    with pytest.raises(RuntimeAgentLLMConfigError):
+        load_runtime_agent_llm_config(
+            environ={
+                "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL": (
+                    "https://api.xiaomimimo.com/v1"
+                ),
+                "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY": "agent-key",
+                "TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL": "mimo-v2.5",
+                "TELEGRAM_KOL_RUNTIME_AGENT_LLM_TIMEOUT_SECONDS": "inf",
+            },
+            env_file_paths=[],
+        )
 
 
 def test_request_grounded_chat_answer_reads_openai_compatible_response():

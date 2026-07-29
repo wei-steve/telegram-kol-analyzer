@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -126,13 +127,16 @@ def load_runtime_agent_llm_config(
     if (
         parsed_url.scheme != "https"
         or not parsed_url.netloc
+        or parsed_url.path.rstrip("/") not in {"", "/v1"}
+        or parsed_url.query
+        or parsed_url.fragment
         or not api_key
         or not model
-        or timeout_seconds != timeout_seconds
+        or not math.isfinite(timeout_seconds)
     ):
         raise RuntimeAgentLLMConfigError(_RUNTIME_AGENT_LLM_CONFIG_ERROR)
     return LLMProxyConfig(
-        base_url=base_url.rstrip("/"),
+        base_url=f"{parsed_url.scheme}://{parsed_url.netloc}",
         api_key=api_key,
         model=model,
         timeout_seconds=max(5.0, min(timeout_seconds, 120.0)),
