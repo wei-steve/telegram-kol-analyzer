@@ -11,8 +11,12 @@ phase_name: low-risk-automatic-recovery
 phase_status: in_progress
 last_completed_phase: 5
 last_completed_commit: 8ec6542
-production_commit: 25e833665aac8e660c249c3399d14e884c7bf92d
+production_commit: e3e784a07a005bdc23f6f18c6f4294b0fdb19b95
 local_tests:
+  - "phase-6-telegram-evidence-runtime-web-focused: 355 passed, 2 sqlite deprecation warnings"
+  - "phase-6-telegram-evidence-context-management-regressions: 417 passed"
+  - "phase-6-telegram-evidence-listener-monitor-mutation-regressions: 136 passed, 2 known deprecation warnings"
+  - "phase-6-telegram-evidence-offline-evaluation: 7 cases, all nine metrics at 1.0"
   - "phase-6-stale-claim-rejected-runtime-baseline: 219 passed"
   - "phase-6-stale-claim-rejected-context-policy-baseline: 25 passed"
   - "phase-6-production-audit-runtime-web-focused: 333 passed"
@@ -56,8 +60,8 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-6-production-audit-verified
-  deployed_commit: 25e833665aac8e660c249c3399d14e884c7bf92d
+  status: phase-6-telegram-evidence-verified
+  deployed_commit: e3e784a07a005bdc23f6f18c6f4294b0fdb19b95
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
   listener: monitoring-31-enabled-groups-and-continuing
@@ -122,14 +126,19 @@ server_verification:
   phase_6_production_audit_postdeploy: "333 deployed focused tests passed; the seven-case offline gate kept all nine metrics at 1.0; latest raw message 8354 completed as non-strategy; evidence/context/management/position-mutation/recovery work in flight was zero. The no-notify monitor returned monitor_error null with only the known audit_abnormal baseline. Before deployment it returned two transient adapter_failure results, then recovered to the same known baseline on the third bounded attempt"
   phase_6_stale_claim_review: "the proposed context-resolution handler was rejected before deployment. The authoritative adapter records context_worker_exhausted only after the source attempt becomes exhausted and its claim is cleared, while the proposed handler and policy required an unreachable stale-running row plus summary fields the adapter never emits. Adding a parallel stale-claim path would duplicate the authoritative context worker's existing compare-and-set reclaim. The synthetic implementation was removed and no production restart occurred"
   phase_6_stale_claim_no_deploy_continuity: "production remained at 25e8336 with the main service active HTTP 200 and sidecar inactive. Runtime incident count stayed 3; context, management, position-mutation, and recovery work in flight were zero; management batch 80 remained succeeded. Latest raw message 8357 had a recognition-failed result on the unchanged pre-existing production code after 8356 completed as non-strategy, so no deployment window was claimed and no restart was attempted"
-  remaining: "Keep all Agent/action flags empty/off. Three reviewed handlers retain positive isolated canaries: build_read_only_reconciliation_plan, refresh_read_only_exchange_snapshot, and rerun_production_audit. recover_stale_side_effect_free_claim remains executor_not_configured and must not be implemented against contextual claims without a new genuine durable source state. fetch_missing_telegram_evidence is the next read-only candidate; it still requires its own design, handler, bounded proof, safe window, and canary."
+  phase_6_telegram_evidence_deployment: "commit e3e784a deployed after raw messages 8358, 8359, and 8360 completed recognition following the unchanged-code failure at 8357, with zero evidence/context/management/position-mutation/recovery work in flight. The service restarted cleanly, returned HTTP 200, the sidecar stayed inactive, and every Agent/shadow/action flag and allowlist remained empty/off"
+  phase_6_telegram_evidence_boundary: "the main service alone owns bot credentials and runs concurrent read-only getMe/getChat calls behind a true five-second wall-clock deadline, loopback/proxy refusal, and process-wide single-flight. The unprivileged sidecar received only four fixed booleans. X-Forwarded-For returned HTTP 404; simultaneous system-operator probes returned HTTP 200/409 and a later request returned HTTP 200. The notification-bot channel failed closed with HTTP 503 because its production config is absent"
+  phase_6_telegram_evidence_canary: "one isolated temporary-database runtime_incident_notification failure enabled exactly fetch_missing_telegram_evidence in-process. The deployed system-operator probe reached verified/action_verified with only incident:2 and telegram-evidence:2 references; the synthetic failed source remained failed. Production stayed at 3 incidents, 1 historical recovery attempt, 70 strategy notifications with unchanged latest updated_at, and management batch 80 remained succeeded"
+  phase_6_telegram_evidence_postdeploy: "221 deployed focused tests passed; the seven-case offline gate kept all nine metrics at 1.0; the listener reported monitoring 31 groups with raw message 8360 completed as non-strategy. Evidence/context/management/position-mutation/recovery work in flight was zero. The no-notify monitor returned monitor_error null with only the known audit_abnormal baseline"
+  remaining: "Keep all Agent/action flags empty/off. Four reviewed handlers retain positive isolated canaries: build_read_only_reconciliation_plan, refresh_read_only_exchange_snapshot, rerun_production_audit, and fetch_missing_telegram_evidence. recover_stale_side_effect_free_claim remains executor_not_configured and must not be implemented against contextual claims without a new genuine durable source state. reschedule_non_writing_ai_job is the next catalog candidate, but its genuine production source state and non-writing ownership proof must be reviewed before any handler design."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
 known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
-  - "Phase 6 production wiring currently implements the read-only reconciliation-plan, exchange-snapshot-refresh, and production-audit handlers. Claim recovery, AI-job reschedule, and Telegram-evidence playbooks fail closed as executor_not_configured until separately reviewed handlers exist. The first context-claim recovery design was rejected because its source state was unreachable and would duplicate the authoritative context worker."
+  - "The production notification-bot configuration is absent, so the new read-only Telegram evidence endpoint returns HTTP 503 for strategy-management notification sources. Runtime-incident system-operator evidence is verified; the unsupported production channel fails closed and no credential was added in Phase 6."
+  - "Phase 6 production wiring currently implements the read-only reconciliation-plan, exchange-snapshot-refresh, production-audit, and Telegram-evidence handlers. Claim recovery and AI-job reschedule fail closed as executor_not_configured until separately reviewed handlers exist. The first context-claim recovery design was rejected because its source state was unreachable and would duplicate the authoritative context worker."
   - "Historical MiMo v4/v6 attempts failed closed on text-form tool output and fabricated evidence. Prompt v7 now passed an isolated live closed-final validation with only actually gathered evidence, while production incident 2 remains preserved as escalated for audit history."
   - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
@@ -315,11 +324,13 @@ Phase 5 is not complete until:
   circuit breaker; playbook-specific fail-closed verification; bounded
   Telegram/Codex action evidence; and dormant action flags
 - Production handler scope: `build_read_only_reconciliation_plan`,
-  `refresh_read_only_exchange_snapshot`, and `rerun_production_audit` are
+  `refresh_read_only_exchange_snapshot`, `rerun_production_audit`, and
+  `fetch_missing_telegram_evidence` are
   wired. They respectively record a bounded non-writing plan, refresh and
   compare coherent read-only account state, and run a bounded read-only
-  production audit. All other catalog actions refuse execution without an
-  explicitly injected reviewed handler
+  production audit, or fetch fixed read-only bot/chat availability evidence.
+  All other catalog actions refuse execution without an explicitly injected
+  reviewed handler
 - Provider isolation implementation: dedicated
   `TELEGRAM_KOL_RUNTIME_AGENT_LLM_*` configuration with no fallback to shared
   credentials; direct MiMo `mimo-v2.5`; token accounting remains console-only
@@ -381,6 +392,15 @@ Phase 5 is not complete until:
   one-shot canary reached `action_verified` with `incident` and `audit-run`
   evidence only. Production incident, recovery-attempt, and management rows
   were unchanged.
+- The fourth Phase 6 handler, `fetch_missing_telegram_evidence`, is deployed at
+  `e3e784a` and reviewed with no Critical, Important, or Minor findings. The
+  root main service keeps both bot credentials behind a loopback-only,
+  proxy-refusing, single-flight endpoint and returns four booleans after a
+  hard five-second read-only `getMe`/`getChat` probe. The unprivileged sidecar
+  validates a real failed source and consumes one in-memory proof. An isolated
+  runtime-notification canary reached `action_verified`; its source remained
+  failed and production rows were unchanged. The absent notification-bot
+  configuration causes that exact channel to fail closed with HTTP 503.
 
 ## Current Phase 6 Exit Checklist
 
@@ -404,7 +424,7 @@ Phase 5 is not complete until:
 - [x] service/listener/checkpoint/reconciliation continuity is verified;
 - [x] the reviewed production model provider is available;
 - [x] the live provider completes a closed final using only gathered evidence;
-- [x] all three implemented production handlers pass isolated reversible
+- [x] all four implemented production handlers pass isolated reversible
       canaries;
 - [ ] each remaining playbook receives its own handler, verification proof,
       safe window, and canary before enablement.
