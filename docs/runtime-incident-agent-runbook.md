@@ -260,6 +260,31 @@ both of these exact flags are enabled:
 - `TELEGRAM_KOL_RUNTIME_AGENT_ACTION_CIRCUIT_THRESHOLD`: bounded to 1–5 and
   defaults to 3.
 
+The Runtime Agent provider is isolated from every shared or business-model
+credential:
+
+- `TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL` must be an HTTPS
+  OpenAI-compatible endpoint;
+- `TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY` is required and never falls back to
+  `TELEGRAM_KOL_LLM_API_KEY`;
+- `TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL` is required;
+- `TELEGRAM_KOL_RUNTIME_AGENT_LLM_TIMEOUT_SECONDS` is bounded to 5–120
+  seconds.
+
+Production uses the direct MiMo endpoint and `mimo-v2.5`. The dedicated key
+exists only in `config/runtime_incident_agent.env`, which must be root-owned
+mode `0600`; never print, commit, persist, or include it in a handoff. Token
+accounting is intentionally performed only in the MiMo console through this
+dedicated key. The application does not store usage metadata.
+
+Missing or invalid dedicated provider configuration must fail before an
+incident claim or model-attempt increment. It must never fall back to the Web
+workbench provider, authoritative recognition credentials, or another model.
+The first provider verification must keep the sidecar and all action flags
+disabled and use a non-business prompt with no incident, Telegram, strategy,
+position, or exchange data. Report only configuration completeness, endpoint
+host, model, HTTP status, and response-shape validity.
+
 Enabling a name is not sufficient to execute it. Each playbook also requires a
 reviewed, explicitly injected deterministic action handler. A missing handler
 is a refusal, never a simulated success. The handler must perform the named

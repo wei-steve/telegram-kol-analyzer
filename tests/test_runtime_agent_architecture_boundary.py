@@ -102,3 +102,33 @@ def test_runtime_agent_modules_do_not_import_business_resolution_or_write_paths(
                 imported_module.split(".", 1)[0] in allowed
                 for imported_module in package_imports
             ), f"{filename} imports non-allowlisted application module: {package_imports}"
+
+
+@pytest.mark.architecture
+def test_runtime_agent_cli_uses_only_the_dedicated_provider_loader():
+    cli_source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "telegram_kol_research"
+        / "cli.py"
+    ).read_text(encoding="utf-8")
+
+    assert cli_source.count("load_runtime_agent_llm_config()") == 2
+    assert "load_llm_proxy_config" not in cli_source
+
+
+@pytest.mark.architecture
+def test_runtime_agent_environment_example_has_placeholders_not_secrets():
+    example = (
+        Path(__file__).parents[1]
+        / "config"
+        / "runtime_incident_agent.env.example"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL="
+        "https://api.xiaomimimo.com/v1"
+    ) in example
+    assert "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY=" in example
+    assert "TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL=mimo-v2.5" in example
+    assert "sk-" not in example

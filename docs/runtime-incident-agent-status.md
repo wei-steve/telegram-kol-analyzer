@@ -274,6 +274,10 @@ Phase 5 is not complete until:
   `build_read_only_reconciliation_plan` is wired, and it records a bounded
   read-only plan from durable last-observed state; all other catalog actions
   refuse execution without an explicitly injected reviewed handler
+- Provider isolation implementation: dedicated
+  `TELEGRAM_KOL_RUNTIME_AGENT_LLM_*` configuration with no fallback to shared
+  credentials; direct MiMo `mimo-v2.5`; token accounting remains console-only
+  and no usage ledger is added
 - Authority change in production: none; all Phase 6 action flags remain off
 - Review: all Critical and Important findings were fixed; final review found
   no remaining Critical or Important defects
