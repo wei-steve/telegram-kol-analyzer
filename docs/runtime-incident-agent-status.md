@@ -11,8 +11,11 @@ phase_name: low-risk-automatic-recovery
 phase_status: in_progress
 last_completed_phase: 5
 last_completed_commit: 8ec6542
-production_commit: 1fe682980f97e17ac7dc54307036c5dff40a92a1
+production_commit: 10165fca74a3db955a9fad1387056a4911f07a3c
 local_tests:
+  - "phase-6-dedicated-mimo-provider-final-after-review-fixes: 184 passed"
+  - "phase-6-dedicated-mimo-provider-final-regression: 183 passed"
+  - "phase-6-dedicated-mimo-provider-post-deploy-focused: 31 passed"
   - "phase-6-dedicated-mimo-provider-final: 181 passed"
   - "phase-6-dedicated-mimo-provider-review-focused: 30 passed"
   - "phase-6-dedicated-mimo-provider-offline-evaluation: 7 cases, all nine metrics at 1.0"
@@ -35,8 +38,8 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-6-dormant-boundary-deployed
-  deployed_commit: 1fe682980f97e17ac7dc54307036c5dff40a92a1
+  status: phase-6-dedicated-mimo-provider-verified-dormant
+  deployed_commit: 10165fca74a3db955a9fad1387056a4911f07a3c
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
   listener: monitoring-31-enabled-groups-and-continuing
@@ -81,14 +84,17 @@ server_verification:
   phase_6_continuity: "raw message 8309 arrived immediately before the restart and retained its pre-restart evidence lease; deterministic lease recovery completed recognition after expiry, while later messages 8310 and 8311 also completed; no management or position mutation was in flight"
   phase_6_deployed_tests: "91 focused tests passed; 7-case offline evaluation passed all nine metrics at 1.0"
   phase_6_monitor: "bounded no-notify diagnostic completed with monitor_error null and only the unchanged audit_abnormal baseline"
-  remaining: "Keep all action flags empty/off. A real canary remains blocked until a reviewed production model provider is available; only build_read_only_reconciliation_plan currently has a production handler, and every other playbook must remain refused until its own handler and positive verification proof are reviewed."
+  phase_6_dedicated_provider: "root-owned mode 0600 configuration installed; sidecar identity loaded only the dedicated MiMo host/model/key presence through systemd-style environment injection; agent and action authority false with empty allowlists"
+  phase_6_provider_probe: "one non-business request with no incident, Telegram, strategy, position, or exchange data returned HTTP 200 from mimo-v2.5 with the required tool-call shape; response content, headers, key, and usage were not printed or persisted"
+  phase_6_provider_tests: "32 deployed focused tests passed; 7-case offline evaluation passed all nine metrics at 1.0; service HTTP 200, sidecar disabled/inactive, recovery-attempt ledger empty, latest three recognitions complete, and no evidence claim, management batch, or position mutation in flight"
+  phase_6_provider_restart_continuity: "raw message 8314 arrived immediately before the final runtime restart, retained its pre-restart evidence lease, and completed through normal lease-expiry recovery; no message gap or business mutation was observed"
+  remaining: "Keep all action flags empty/off until a new safe window is proven for exactly one reversible build_read_only_reconciliation_plan canary. Every other playbook must remain refused until its own handler and positive verification proof are reviewed."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
 known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
-  - "The production runtime-agent host has no provider listening on the default local proxy endpoint. A real one-shot attempt safely returned retry_pending without tool calls; the successful Phase 5 shadow-policy canary used a controlled closed-contract model turn. A reviewed provider path is required before Phase 6 production enablement."
   - "Phase 6 production wiring currently implements only the read-only reconciliation-plan handler. Refresh, audit, claim recovery, AI-job reschedule, and Telegram-evidence playbooks fail closed as executor_not_configured until separately reviewed handlers exist."
   - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
@@ -296,7 +302,12 @@ Phase 5 is not complete until:
   continuity preserved through an expired pre-restart evidence claim; no
   management or position mutation was in flight; monitor retained only the
   known `audit_abnormal` baseline
-- Canary: blocked by the missing reviewed production model provider
+- Provider verification: dedicated MiMo `mimo-v2.5` configuration is installed
+  root-owned mode `0600`; a non-business forced-tool probe returned HTTP 200
+  with the required response shape; no provider response or usage was
+  persisted
+- Canary: pending a separately proven safe window with exactly one reversible
+  `build_read_only_reconciliation_plan` allowlist
 
 ## Current Phase 6 Exit Checklist
 
@@ -318,7 +329,7 @@ Phase 5 is not complete until:
 - [x] a safe production deployment window is proven;
 - [x] production deploys with sidecar and every action flag disabled;
 - [x] service/listener/checkpoint/reconciliation continuity is verified;
-- [ ] the reviewed production model provider is available;
+- [x] the reviewed production model provider is available;
 - [ ] exactly one production handler passes a reversible canary;
 - [ ] each remaining playbook receives its own handler, verification proof,
       safe window, and canary before enablement.
