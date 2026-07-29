@@ -11,8 +11,9 @@ phase_name: low-risk-automatic-recovery
 phase_status: in_progress
 last_completed_phase: 5
 last_completed_commit: 8ec6542
-production_commit: 731318b236cca9609c964e4b4503a700459fc3fe
+production_commit: 0b2aecc16a2c3cb0e238acc5379877922ac7481c
 local_tests:
+  - "phase-6-read-only-exchange-refresh-timeout-fix-runtime-web-focused: 262 passed"
   - "phase-6-read-only-exchange-refresh-runtime-web-focused: 261 passed"
   - "phase-6-read-only-exchange-refresh-context-management-regressions: 396 passed"
   - "phase-6-read-only-exchange-refresh-listener-monitor-mutation-regressions: 178 passed, 1 skipped"
@@ -49,8 +50,8 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-6-mimo-closed-final-verified
-  deployed_commit: 731318b236cca9609c964e4b4503a700459fc3fe
+  status: phase-6-read-only-exchange-refresh-verified
+  deployed_commit: 0b2aecc16a2c3cb0e238acc5379877922ac7481c
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
   listener: monitoring-31-enabled-groups-and-continuing
@@ -106,14 +107,17 @@ server_verification:
   phase_6_final_correction_deployment: "commit 731318b deployed after a fresh safe-window check with zero evidence/context/management/position-mutation/recovery work in flight; the main service returned HTTP 200 and the sidecar remained disabled/inactive with Agent, shadow, action, and action-allowlist settings empty/off"
   phase_6_live_mimo_closed_final: "one isolated temporary-database notification-delivery incident used the deployed dedicated MiMo provider and prompt v7; it completed diagnosed on its first durable attempt after three bounded read-only queries, stored only the actual incident:1 evidence reference, and nominated fetch_missing_telegram_evidence while empty shadow/action allowlists refused all authority"
   phase_6_final_correction_postdeploy: "70 deployed focused tests passed; the seven-case offline gate kept all nine metrics at 1.0; production runtime incident count remained 3; service active HTTP 200; latest raw message 8341 completed recognition; no evidence/context/management/position-mutation/recovery work remained in flight; no-notify monitor had monitor_error null with only the known audit_abnormal baseline"
-  remaining: "Keep all Agent/action flags empty/off. The live MiMo closed-final gate is now proven. Every remaining playbook still requires its own reviewed handler, positive verification proof, safe window, and canary before any enablement; refresh_read_only_exchange_snapshot is the next candidate."
+  phase_6_exchange_refresh_deployment: "commits 06a188a and 0b2aecc deployed through two separately proven safe windows; service active HTTP 200, sidecar disabled/inactive, all Agent/shadow/action flags empty/off, and the loopback endpoint returned one complete bounded snapshot while refusing a proxy-forwarded request with HTTP 404"
+  phase_6_exchange_refresh_canary: "the first isolated temporary-database attempt failed closed because the five-second internal HTTP timeout was shorter than one observed provider response; no production ledger or business row changed. Commit 0b2aecc raised the bounded timeout to 20 seconds, after which one fresh isolated canary executed exactly two coherent read-only account snapshots and reached verified/action_verified with incident and exchange-snapshot evidence only"
+  phase_6_exchange_refresh_postdeploy: "262 deployed focused tests passed; the seven-case offline gate kept all nine metrics at 1.0; production runtime incident count remained 3; latest raw message 8353 completed recognition; latest management batch 80 remained succeeded; no evidence/context/management/position-mutation/recovery work was in flight. The no-notify monitor had one transient adapter_failure and returned to monitor_error null with only the known audit_abnormal baseline on the bounded retry"
+  remaining: "Keep all Agent/action flags empty/off. refresh_read_only_exchange_snapshot now has a deployed reviewed handler and positive isolated canary. Every remaining playbook still requires its own reviewed handler, verification proof, safe window, and canary; rerun_production_audit is the next read-only candidate."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
 known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
-  - "Phase 6 production wiring currently implements only the read-only reconciliation-plan handler. Refresh, audit, claim recovery, AI-job reschedule, and Telegram-evidence playbooks fail closed as executor_not_configured until separately reviewed handlers exist."
+  - "Phase 6 production wiring currently implements the read-only reconciliation-plan and exchange-snapshot-refresh handlers. Audit, claim recovery, AI-job reschedule, and Telegram-evidence playbooks fail closed as executor_not_configured until separately reviewed handlers exist."
   - "Historical MiMo v4/v6 attempts failed closed on text-form tool output and fabricated evidence. Prompt v7 now passed an isolated live closed-final validation with only actually gathered evidence, while production incident 2 remains preserved as escalated for audit history."
   - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
@@ -346,13 +350,15 @@ Phase 5 is not complete until:
   before recovery policy or action. Local review found no Critical, Important,
   or Minor defects. Commit `731318b` is deployed and the live MiMo closed-final
   validation passed without changing the three production incident rows.
-- The next Phase 6 handler,
-  `refresh_read_only_exchange_snapshot`, is locally complete and reviewed with
-  no Critical, Important, or Minor findings. The sidecar receives no Deepcoin
-  credential: a loopback-only, proxy-refusing main-service endpoint returns a
-  bounded redacted state fingerprint, and the one-shot handler plus independent
-  verification consume exactly two complete coherent reads. Deployment and
-  canary remain pending.
+- The second Phase 6 handler, `refresh_read_only_exchange_snapshot`, is
+  deployed at `0b2aecc` and reviewed with no Critical, Important, or Minor
+  findings. The sidecar receives no Deepcoin credential: a loopback-only,
+  proxy-refusing main-service endpoint returns a bounded redacted state
+  fingerprint, and the one-shot handler plus independent verification consume
+  exactly two complete coherent reads. The first isolated canary failed closed
+  on the original five-second internal HTTP timeout; after a bounded
+  twenty-second timeout fix, a fresh isolated canary reached
+  `action_verified`. Production incident and business rows remained unchanged.
 
 ## Current Phase 6 Exit Checklist
 
@@ -376,6 +382,6 @@ Phase 5 is not complete until:
 - [x] service/listener/checkpoint/reconciliation continuity is verified;
 - [x] the reviewed production model provider is available;
 - [x] the live provider completes a closed final using only gathered evidence;
-- [x] exactly one production handler passes a reversible canary;
+- [x] both implemented production handlers pass isolated reversible canaries;
 - [ ] each remaining playbook receives its own handler, verification proof,
       safe window, and canary before enablement.
