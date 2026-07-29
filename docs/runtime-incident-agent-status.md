@@ -6,13 +6,16 @@ used to advance or reinterpret the rollout.
 ```yaml
 project: runtime-incident-agent
 design_version: 1
-current_phase: 5
-phase_name: versioned-recovery-playbooks-shadow-mode
-phase_status: in_progress
-last_completed_phase: 4
-last_completed_commit: 356e844
-production_commit: 356e84488316a063b0f982fc2585a57b4fd8c8d4
+current_phase: 6
+phase_name: low-risk-automatic-recovery
+phase_status: planned
+last_completed_phase: 5
+last_completed_commit: 8ec6542
+production_commit: 8ec6542de4ebe29eed8ab419109d654a9e12cad2
 local_tests:
+  - "phase-5-final-runtime-agent-monitor-and-safety-tests: 317 passed, 1 skipped"
+  - "phase-5-final-context-resolution-and-management-regressions: 176 passed"
+  - "phase-5-final-offline-evaluation: 7 cases, all nine metrics at 1.0"
   - "phase-5-runtime-agent-and-safety-tests: 235 passed"
   - "phase-5-offline-evaluation: 7 cases, all nine metrics at 1.0"
   - "context-resolution-regressions: 38 passed"
@@ -20,24 +23,24 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-5-deployment-deferred
-  deployed_commit: 356e84488316a063b0f982fc2585a57b4fd8c8d4
+  status: phase-5-completed
+  deployed_commit: 8ec6542de4ebe29eed8ab419109d654a9e12cad2
   service: active-http-200
   bounded_restarts: "clean; no post-restart service errors"
   listener: monitoring-31-enabled-groups-and-continuing
-  recognition: "latest raw message 8239 had a completed recognition before and after deployment"
+  recognition: "latest raw message 8293 had a completed recognition before and after deployment"
   contextual_resolution_inflight: 0
   position_mutation_inflight: 0
   management_latest: "succeeded; six old partial_failed/recovery_required rows were historical, with no active claim or mutation"
-  production_safety: "monitor state readable; no anomaly fingerprint; historical abnormal source rows unchanged"
+  production_safety: "current diagnostic completed with monitor_error null and only the unchanged audit_abnormal baseline"
   sidecar: installed-disabled-inactive
   agent_flag: disabled
-  production_incident_row: "incident 1 remained pending/delivered; total runtime incidents remained 1"
+  production_incident_row: "incident 1 is diagnosed/delivered with one accepted shadow nomination, action_executed false, and the total runtime incident count remains 1"
   phase_4_offline_gate: "7 reviewed cases; all six metrics at 1.0"
   phase_4_readonly_tools: "all nine bounded tools executed against incident 1; only projection keys and evidence counts were inspected"
-  incident_agent_behavior: "read-only projections only; sidecar never started; no playbook or business mutation executed"
+  incident_agent_behavior: "one bounded read-only projection plus deterministic shadow policy only; sidecar remained disabled and no playbook or business mutation executed"
   phase_5_predeployment:
-    reviewed_commit: 549f26f
+    reviewed_commit: 8ec6542
     pushed: true
     production_checkout_before_deploy: 3de5bc7debe26e7b402622e4d0d62418d87d5d7d
     service: active-http-200
@@ -52,16 +55,22 @@ server_verification:
     sidecar: disabled-inactive
     agent_flag: disabled
     shadow_allowlist: empty
-    deployment: "deferred before pull/restart"
-    blocker: "The production safety monitor could not produce a current result. Its state file was incorrectly root-owned; ownership was safely restored to telegram-kol-monitor mode 0600. The next diagnostic then failed because read-only monitor startup attempted the pre-existing strategy_lifecycles expiry-review compatibility UPDATE against the sandboxed read-only database."
-  remaining: "Repair the pre-existing production monitor read-only bootstrap path, rerun the complete pre-deployment gate, then deploy reviewed commit 549f26f with the sidecar and shadow allowlist disabled. After continuity verification, canary exactly one read-only shadow playbook with no execution."
+    production_checkout_after_deploy: 8ec6542de4ebe29eed8ab419109d654a9e12cad2
+    deployment: "completed after a fresh safe-window check; bounded restart shut down cleanly"
+    monitor_fix: "the monitor now opens the existing incident ledger without running bootstrap migrations; the diagnostic completed with monitor_error null and only the unchanged audit_abnormal baseline"
+    post_deploy: "service active HTTP 200; listener monitoring 31 groups; latest raw message 8293 retained a completed recognition; contextual claims and position mutations zero"
+    deployed_offline_gate: "7 reviewed cases; all nine Phase 5 metrics at 1.0"
+    deployed_focused_tests: "95 passed"
+    canary: "incident 1 used one bounded incident-summary tool call and nominated only refresh_read_only_exchange_snapshot; runtime-shadow-policy-v1 accepted it with would_execute=false and action_executed=false"
+    source_integrity: "source management batch 28 remained historical partial_failed with updated_at 2026-07-21 15:20:33.518543; no business row or position mutation changed"
+  remaining: "Begin Phase 6 locally with action authority dormant. Resolve the missing production runtime-agent model provider before any real Agent/action canary, then follow the Phase 6 per-playbook safe-window gates."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
 known_issues:
-  - "The pre-existing production safety baseline remains `audit_abnormal` (35 blocked, 1 partial_failed, 5 recovery_required); Phase 3 did not alter those historical rows."
+  - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
-  - "Phase 5 deployment is deferred because the production monitor cannot currently complete: after restoring its state file to the intended telegram-kol-monitor owner and mode 0600, its read-only sandbox rejected a pre-existing strategy_lifecycles expiry-review compatibility UPDATE during application bootstrap."
+  - "The production runtime-agent host has no provider listening on the default local proxy endpoint. A real one-shot attempt safely returned retry_pending without tool calls; the successful Phase 5 shadow-policy canary used a controlled closed-contract model turn. A reviewed provider path is required before Phase 6 production enablement."
   - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
 next_session_prompt: "请执行自定义ai agent的下一步实施"
@@ -183,22 +192,33 @@ When the user says `请执行自定义ai agent的下一步实施`:
 
 ### Phase 5 — Versioned recovery playbooks in shadow mode
 
-- Status: in_progress
+- Status: completed
 - Implementation started: yes
 - Local implementation: six versioned catalog playbooks, deterministic
   shadow-only policy, exact dormant allowlist, durable nomination/refusal
   audit, bounded Telegram/Codex reporting, and corpus selection gates
 - Action authority change: none; Phase 5 contains no executor
 - Review: no remaining Critical or Important findings
-- Commit: `549f26f` (`feat: add shadow incident recovery playbooks`), pushed
-- Local verification: 235 runtime-agent/safety tests, 38 context-resolution
-  regressions, and 358 management regressions passed; all nine offline metrics
-  scored 1.0 across seven reviewed cases
-- Production deployment: safely deferred before pull or restart because the
-  production safety monitor could not complete its read-only gate; normal
-  service remained active and Phase 5 flags remained disabled
+- Commits: `549f26f` (`feat: add shadow incident recovery playbooks`) and
+  `8ec6542` (`fix: skip monitor database bootstrap`), pushed
+- Local verification: final runtime-agent/monitor/safety selection reported
+  317 passed and 1 skipped; context-resolution and management regressions
+  reported 176 passed; all nine offline metrics scored 1.0 across seven cases
+- Review: no remaining Critical or Important findings after verifying that
+  incident-ledger writes remain best-effort and the monitor no longer runs
+  compatibility migrations in its read-only startup path
+- Production deployment: `8ec6542`; bounded restart completed cleanly with the
+  Agent sidecar disabled and shadow allowlist empty
+- Production verification: service HTTP 200, listener monitoring 31 groups,
+  latest recognition complete, zero contextual claims and position mutations,
+  current monitor result available with only the historical `audit_abnormal`
+  baseline, deployed offline gate all green, and 95 focused tests passed
+- Shadow canary: incident `1` nominated only
+  `refresh_read_only_exchange_snapshot`; deterministic policy accepted it
+  while recording `would_execute: false` and `action_executed: false`; source
+  management batch `28` was unchanged
 
-## Current Phase Exit Checklist
+## Completed Phase 5 Exit Checklist
 
 Phase 5 is not complete until:
 
@@ -218,10 +238,10 @@ Phase 5 is not complete until:
       management regressions pass locally;
 - [x] changes receive review with no remaining Critical or Important findings;
 - [x] changes are committed and pushed;
-- [ ] a safe production deployment window is proven;
-- [ ] production deploys with the Agent sidecar and shadow allowlist disabled;
-- [ ] service/listener/checkpoint/reconciliation continuity is verified;
-- [ ] the deployed checkout passes the offline corpus and focused Phase 5 gates;
-- [ ] exactly one read-only shadow playbook is canaried;
-- [ ] the canary records only nominations and policy results, with no business
+- [x] a safe production deployment window is proven;
+- [x] production deploys with the Agent sidecar and shadow allowlist disabled;
+- [x] service/listener/checkpoint/reconciliation continuity is verified;
+- [x] the deployed checkout passes the offline corpus and focused Phase 5 gates;
+- [x] exactly one read-only shadow playbook is canaried;
+- [x] the canary records only nominations and policy results, with no business
       row mutation and no `action_executed: true`.
