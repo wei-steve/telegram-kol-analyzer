@@ -4559,6 +4559,103 @@ def test_reconcile_then_sync_closes_a_previously_verified_missing_position(tmp_p
     assert leg.terminal_reason == "manual_position_missing"
 
 
+def test_sync_missing_position_cleans_pending_entry_before_lifecycle_exit(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            pos_id="pos-manually-closed",
+            status="active",
+            order_id="entry-1,entry-2",
+            client_order_id="client-1,client-2",
+        ),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=1,
+        order_id="entry-1",
+        client_order_id="client-1",
+        pos_id="pos-manually-closed",
+        status="active",
+        attribution_status="verified",
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=2,
+        order_id="entry-2",
+        client_order_id="client-2",
+        pos_id=None,
+        status="pending",
+        attribution_status="unassigned",
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 30, 1, 0),
+                entered_at=datetime(2026, 7, 30, 1, 1),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def __init__(self):
+            self.trigger_orders = [
+                {
+                    "ordId": "entry-2",
+                    "clOrdId": "client-2",
+                    "instId": "BTC-USDT-SWAP",
+                }
+            ]
+            self.cancelled = []
+
+        def list_positions(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return list(self.trigger_orders)
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def cancel_trigger_order(self, payload):
+            self.cancelled.append(payload["ordId"])
+            self.trigger_orders = []
+            return {"code": "0"}
+
+    client = FakeClient()
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=client,
+        synced_at=datetime(2026, 7, 30, 2, 0),
+    )
+
+    assert client.cancelled == ["entry-2"]
+    assert result.manually_closed == 1
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = session.query(StrategyLifecycle).one()
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id)
+            .order_by(ExecutionOrderLeg.leg_index)
+            .all()
+        )
+        assert binding.status == "closed"
+        assert lifecycle.lifecycle_status == "exited"
+        assert [(leg.status, leg.terminal_reason) for leg in legs] == [
+            ("manually_closed", "manual_position_missing"),
+            ("cancelled", "terminal_entry_cleanup_confirmed"),
+        ]
+
+
 def test_sync_manual_closed_positions_terminalizes_only_missing_verified_leg(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
@@ -4958,8 +5055,9 @@ def test_sync_manual_closed_positions_keeps_binding_open_for_unfilled_entry_leg(
         lifecycle = session.query(StrategyLifecycle).one()
 
     assert binding.status == "open"
-    assert binding.last_exchange_status == "entry_legs_pending_after_position_closed"
+    assert binding.last_exchange_status == "terminal_entry_cleanup_unknown"
     assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.management_action == "terminal_cleanup_required"
 
 
 def test_manual_bind_rolls_back_binding_and_lifecycle_when_leg_owner_conflicts(tmp_path):
