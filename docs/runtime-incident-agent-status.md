@@ -62,22 +62,22 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-6-complete
+  status: phase-6-diagnosis-agent-active
   deployed_commit: e3e784a07a005bdc23f6f18c6f4294b0fdb19b95
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
   listener: monitoring-31-enabled-groups-and-continuing
-  recognition: "latest raw message 8293 had a completed recognition before and after deployment"
+  recognition: "latest raw message 8360 completed as non-strategy; diagnosis-sidecar activation did not restart or alter the main recognition service"
   contextual_resolution_inflight: 0
   position_mutation_inflight: 0
   management_latest: "succeeded; six old partial_failed/recovery_required rows were historical, with no active claim or mutation"
   production_safety: "current diagnostic completed with monitor_error null and only the unchanged audit_abnormal baseline"
-  sidecar: installed-disabled-inactive
-  agent_flag: disabled
-  production_incident_row: "incident 1 is diagnosed/delivered with one accepted shadow nomination, action_executed false, and the total runtime incident count remains 1"
+  sidecar: installed-enabled-active
+  agent_flag: enabled
+  production_incident_row: "the production ledger has 3 incidents: 2 diagnosed and 1 escalated; none is claimable or actively claimed"
   phase_4_offline_gate: "7 reviewed cases; all six metrics at 1.0"
   phase_4_readonly_tools: "all nine bounded tools executed against incident 1; only projection keys and evidence counts were inspected"
-  incident_agent_behavior: "one bounded read-only projection plus deterministic shadow policy only; sidecar remained disabled and no playbook or business mutation executed"
+  incident_agent_behavior: "the enabled sidecar is idle because no incident is claimable. On a future incident it may run bounded diagnosis tools and write only the incident diagnosis/notification ledger; empty shadow/action allowlists and disabled action authority prevent playbook or business mutation"
   phase_5_predeployment:
     reviewed_commit: 8ec6542
     pushed: true
@@ -133,11 +133,13 @@ server_verification:
   phase_6_telegram_evidence_canary: "one isolated temporary-database runtime_incident_notification failure enabled exactly fetch_missing_telegram_evidence in-process. The deployed system-operator probe reached verified/action_verified with only incident:2 and telegram-evidence:2 references; the synthetic failed source remained failed. Production stayed at 3 incidents, 1 historical recovery attempt, 70 strategy notifications with unchanged latest updated_at, and management batch 80 remained succeeded"
   phase_6_telegram_evidence_postdeploy: "221 deployed focused tests passed; the seven-case offline gate kept all nine metrics at 1.0; the listener reported monitoring 31 groups with raw message 8360 completed as non-strategy. Evidence/context/management/position-mutation/recovery work in flight was zero. The no-notify monitor returned monitor_error null with only the known audit_abnormal baseline"
   phase_6_non_writing_ai_job_review: "reschedule_non_writing_ai_job was rejected before implementation. context_worker_exhausted would re-enter the authoritative contextual path with the live auto-trade executor, while semantic_review provider exhaustion can be rescheduled only by mutating RecognitionDecision. Neither production adapter emits business_write_owned false, and get_worker_state has no semantic-review resolver. Production read-only inspection found zero related runtime incidents, zero exhausted context attempts, and two historical terminal semantic-review failures with three attempts, no claim, and no schedule. No runtime change, deployment, or restart occurred"
-  phase_6_completion: "Phase 6 is complete with four reviewed deployed handlers and two documented fail-closed rejections. All Agent/shadow/action flags and allowlists remain empty/off. Optional Phase 7 is blocked because its separately required explicit user approval has not been given"
-  remaining: "Do not begin Phase 7 from the standard implementation trigger. Keep all Agent/action flags empty/off. Phase 7 bounded business recovery requires a fresh explicit user approval that names Phase 7 and accepts its business-mutation scope; phase_7_explicitly_approved remains false."
+  phase_6_completion: "Phase 6 is complete with four reviewed deployed handlers and two documented fail-closed rejections. At completion every Agent/shadow/action flag and allowlist was empty/off. Optional Phase 7 is blocked because its separately required explicit user approval has not been given"
+  phase_6_diagnosis_activation: "after explicit user instruction, the already deployed read-only diagnosis sidecar was enabled persistently without restarting the main service. Preflight proved a complete stable audit, only the known audit_abnormal baseline, no evidence/context/management/position-mutation/recovery work in flight, no claimable runtime incidents, a complete dedicated provider configuration, and empty shadow/action allowlists. The sidecar runs as telegram-kol-agent, is enabled/active, and repeatedly reports idle; the main service remains active HTTP 200. TELEGRAM_KOL_RUNTIME_AGENT_ENABLED is true while shadow/action allowlists remain empty and action authority remains false"
+  remaining: "Do not begin Phase 7 from the standard implementation trigger. Keep shadow and action allowlists empty and action authority off. The Phase 6 diagnosis sidecar may remain active. Phase 7 bounded business recovery requires a fresh explicit user approval that names Phase 7 and accepts its business-mutation scope; phase_7_explicitly_approved remains false."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
+  - "runtime-agent:read-only-diagnosis"
 known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
@@ -372,7 +374,7 @@ Phase 5 is not complete until:
   `incident:1` reference. Empty shadow/action allowlists refused authority;
   at that checkpoint Phase 6 remained `in_progress` for unreviewed playbook
   handlers. The later handler reviews and rejections completed the phase;
-  persistent Agent/action flags remain off
+  at that checkpoint the persistent Agent/action flags remained off
 - Final-correction hardening is locally complete in prompt v7: one malformed
   or contract-invalid final may receive one bounded correction turn with no
   tools and only actually gathered evidence references. A second invalid
@@ -415,6 +417,12 @@ Phase 5 is not complete until:
 - Phase 6 is complete with four deployed positive canaries and two documented
   fail-closed candidate rejections. Production remains at `e3e784a`; the
   completion review is documentation-only and required no service restart.
+- After Phase 6 completion, the user explicitly requested activation of the
+  existing diagnosis worker. The sidecar is now enabled and active under the
+  dedicated unprivileged identity. It had no claimable incident and remained
+  idle during verification. Shadow/action allowlists are empty and action
+  authority is still disabled, so activation adds diagnosis availability but
+  no recovery or business-mutation authority.
 
 ## Current Phase 6 Exit Checklist
 
@@ -452,5 +460,6 @@ Phase 5 is not complete until:
   Phase 7. The ordinary implementation trigger does not grant business-mutation
   authority.
 - Required next action: the user must explicitly approve or decline Phase 7
-  after reviewing its bounded business-recovery scope. Until then, keep every
-  Agent/action flag and allowlist empty/off.
+  after reviewing its bounded business-recovery scope. Until then, the
+  diagnosis sidecar may remain active, but keep shadow/action allowlists empty
+  and action authority off.
