@@ -70,6 +70,7 @@ def test_runtime_agent_cli_rejects_missing_dedicated_provider_before_claim(
     monkeypatch.delenv(
         "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY", raising=False
     )
+    monkeypatch.chdir(tmp_path)
 
     result = CliRunner().invoke(
         app,
@@ -118,6 +119,7 @@ def test_runtime_agent_worker_rejects_missing_dedicated_provider_before_claim(
     monkeypatch.delenv(
         "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY", raising=False
     )
+    monkeypatch.chdir(tmp_path)
 
     result = CliRunner().invoke(
         app,
