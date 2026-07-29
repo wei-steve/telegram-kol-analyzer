@@ -270,9 +270,9 @@ def test_request_structured_chat_turn_normalizes_one_tool_call():
 def test_request_structured_chat_turn_normalizes_closed_final_json():
     def handler(request: httpx.Request) -> httpx.Response:
         payload = request.read().decode("utf-8")
-        assert '"name":"submit_runtime_diagnosis"' in payload
-        assert '"tool_choice":{"type":"function"' in payload
-        assert '"parallel_tool_calls":false' in payload
+        assert '"response_format":{"type":"json_object"}' in payload
+        assert '"tools"' not in payload
+        assert '"tool_choice"' not in payload
         return httpx.Response(
             200,
             request=request,
@@ -280,19 +280,10 @@ def test_request_structured_chat_turn_normalizes_closed_final_json():
                 "choices": [
                     {
                         "message": {
-                            "tool_calls": [
-                                {
-                                    "id": "final-1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "submit_runtime_diagnosis",
-                                        "arguments": (
-                                            '{"incident_id":17,'
-                                            '"confidence":"low"}'
-                                        ),
-                                    },
-                                }
-                            ]
+                            "content": (
+                                '{"incident_id":17,'
+                                '"confidence":"low"}'
+                            )
                         }
                     }
                 ]

@@ -196,7 +196,7 @@ def test_worker_runs_bounded_tool_loop_and_commits_structured_diagnosis(tmp_path
     with session_factory() as session:
         row = session.get(RuntimeIncident, incident.id)
         assert row.status == "diagnosed"
-        assert row.prompt_version == "runtime-agent-prompt-v4"
+        assert row.prompt_version == "runtime-agent-prompt-v5"
         assert "Provider retries may have been exhausted." in row.diagnosis_json
         assert row.evidence_refs_json == (
             f'["incident:{incident.id}","worker-job:42"]'
@@ -587,6 +587,9 @@ def test_worker_reserves_final_turn_after_three_evidence_tools(tmp_path):
     assert all(observed_tool_schemas[:3])
     assert observed_tool_schemas[3] == []
     assert "Evidence collection is complete" in observed_messages[3][-1]["content"]
+    assert "Return only the final JSON object" in (
+        observed_messages[3][-1]["content"]
+    )
 
 
 def test_worker_refuses_repeated_tool_without_reexecuting_provider(tmp_path):

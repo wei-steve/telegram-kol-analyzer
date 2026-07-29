@@ -535,8 +535,8 @@ def run_runtime_agent_once(
                         "role": "user",
                         "content": (
                             "Evidence collection is complete. Do not request "
-                            "another evidence tool. Submit the final diagnosis "
-                            "now with submit_runtime_diagnosis."
+                            "another evidence tool. Return only the final JSON "
+                            "object matching the closed diagnosis contract."
                         ),
                     }
                 )

@@ -7,8 +7,8 @@ from telegram_kol_research.runtime_agent_playbooks import (
 )
 
 
-def test_runtime_agent_v4_prompt_exposes_closed_low_risk_recovery_contract():
-    assert RUNTIME_AGENT_PROMPT_VERSION == "runtime-agent-prompt-v4"
+def test_runtime_agent_v5_prompt_exposes_closed_low_risk_recovery_contract():
+    assert RUNTIME_AGENT_PROMPT_VERSION == "runtime-agent-prompt-v5"
     assert "final JSON object" in RUNTIME_AGENT_SYSTEM_PROMPT
     for field in (
         "incident_id",

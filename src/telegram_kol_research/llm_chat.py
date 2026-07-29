@@ -360,12 +360,7 @@ def request_structured_chat_turn(
     else:
         payload.update(
             {
-                "tools": [_FINAL_DIAGNOSIS_TOOL],
-                "tool_choice": {
-                    "type": "function",
-                    "function": {"name": _FINAL_DIAGNOSIS_TOOL_NAME},
-                },
-                "parallel_tool_calls": False,
+                "response_format": {"type": "json_object"},
             }
         )
     created_client = client is None
