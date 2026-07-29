@@ -20,7 +20,7 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-5-pending
+  status: phase-5-deployment-deferred
   deployed_commit: 356e84488316a063b0f982fc2585a57b4fd8c8d4
   service: active-http-200
   bounded_restarts: "clean; no post-restart service errors"
@@ -36,13 +36,32 @@ server_verification:
   phase_4_offline_gate: "7 reviewed cases; all six metrics at 1.0"
   phase_4_readonly_tools: "all nine bounded tools executed against incident 1; only projection keys and evidence counts were inspected"
   incident_agent_behavior: "read-only projections only; sidecar never started; no playbook or business mutation executed"
-  remaining: "Commit and push the reviewed Phase 5 implementation, prove a safe production window, deploy with the sidecar and shadow allowlist disabled, verify continuity, then canary exactly one read-only shadow playbook with no execution."
+  phase_5_predeployment:
+    reviewed_commit: 549f26f
+    pushed: true
+    production_checkout_before_deploy: 3de5bc7debe26e7b402622e4d0d62418d87d5d7d
+    service: active-http-200
+    listener: monitoring-31-enabled-groups
+    latest_recognition: "raw message 8286 completed"
+    contextual_resolution_claims: 0
+    management_ready_or_running: 0
+    management_recent_nonterminal_10m: 0
+    position_mutation_inflight: 0
+    position_mutation_recent_10m: 0
+    management_audit: "stable/ok/complete on bounded retry; 80 rows, no malformed rows, submit_unknown=0, historical partial_failed=1 and recovery_required=5"
+    sidecar: disabled-inactive
+    agent_flag: disabled
+    shadow_allowlist: empty
+    deployment: "deferred before pull/restart"
+    blocker: "The production safety monitor could not produce a current result. Its state file was incorrectly root-owned; ownership was safely restored to telegram-kol-monitor mode 0600. The next diagnostic then failed because read-only monitor startup attempted the pre-existing strategy_lifecycles expiry-review compatibility UPDATE against the sandboxed read-only database."
+  remaining: "Repair the pre-existing production monitor read-only bootstrap path, rerun the complete pre-deployment gate, then deploy reviewed commit 549f26f with the sidecar and shadow allowlist disabled. After continuity verification, canary exactly one read-only shadow playbook with no execution."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
 known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (35 blocked, 1 partial_failed, 5 recovery_required); Phase 3 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
+  - "Phase 5 deployment is deferred because the production monitor cannot currently complete: after restoring its state file to the intended telegram-kol-monitor owner and mode 0600, its read-only sandbox rejected a pre-existing strategy_lifecycles expiry-review compatibility UPDATE during application bootstrap."
   - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
 next_session_prompt: "请执行自定义ai agent的下一步实施"
@@ -171,9 +190,13 @@ When the user says `请执行自定义ai agent的下一步实施`:
   audit, bounded Telegram/Codex reporting, and corpus selection gates
 - Action authority change: none; Phase 5 contains no executor
 - Review: no remaining Critical or Important findings
+- Commit: `549f26f` (`feat: add shadow incident recovery playbooks`), pushed
 - Local verification: 235 runtime-agent/safety tests, 38 context-resolution
   regressions, and 358 management regressions passed; all nine offline metrics
   scored 1.0 across seven reviewed cases
+- Production deployment: safely deferred before pull or restart because the
+  production safety monitor could not complete its read-only gate; normal
+  service remained active and Phase 5 flags remained disabled
 
 ## Current Phase Exit Checklist
 
@@ -194,7 +217,7 @@ Phase 5 is not complete until:
 - [x] runtime-agent, architecture, notification, context-resolution, and
       management regressions pass locally;
 - [x] changes receive review with no remaining Critical or Important findings;
-- [ ] changes are committed and pushed;
+- [x] changes are committed and pushed;
 - [ ] a safe production deployment window is proven;
 - [ ] production deploys with the Agent sidecar and shadow allowlist disabled;
 - [ ] service/listener/checkpoint/reconciliation continuity is verified;
