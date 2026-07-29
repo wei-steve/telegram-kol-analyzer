@@ -835,6 +835,75 @@ stop and investigate read-only; do not edit the production database directly.
 
 ## 12. Record External Manual Position Closure
 
+### Terminal lifecycle / entry-order invariant
+
+A lifecycle must not become terminal while its exact execution binding still
+has an unfilled entry leg. Before a full close, and when reconciliation proves
+the primary position is gone, the service cancels each exact bound pending
+regular or trigger entry and confirms its absence on a fresh Deepcoin
+read-back. `resolved` means cancellation and absence were confirmed;
+`already_absent` means the local leg existed but the exact exchange order was
+already absent. `blocked` or `unknown` preserves the lifecycle as nonterminal
+with `management_action=terminal_cleanup_required`; it never guesses that the
+order disappeared.
+
+The same reconciliation cycle repairs bounded historical
+`terminal lifecycle + nonterminal entry leg` anomalies. It uses the exact
+binding and order/client IDs only. It must never select an order by symbol,
+side, price, time, or proximity. Cleanup results are stored as
+`execution_events.action=terminal_entry_cleanup_outcome` and delivered through
+the KOL event-processing bot. Notification retry reads only this durable
+outbox; it never repeats the exchange cancellation.
+
+This invariant is always active. It has no shadow path and no runtime feature
+switch. A failure must be fixed at the identity/read-back boundary rather than
+hidden by disabling the invariant.
+
+On the production server, this query is read-only and should return zero rows:
+
+```bash
+sqlite3 -readonly data/research.db <<'SQL'
+SELECT
+  l.id AS lifecycle_id,
+  l.lifecycle_status,
+  b.id AS binding_id,
+  e.id AS entry_leg_id,
+  e.order_id,
+  e.client_order_id,
+  e.status AS entry_status
+FROM strategy_lifecycles AS l
+JOIN execution_bindings AS b
+  ON b.id = l.execution_binding_id
+JOIN execution_order_legs AS e
+  ON e.execution_binding_id = b.id
+WHERE l.lifecycle_status IN ('exited','expired','cancelled','invalidated')
+  AND e.purpose = 'entry'
+  AND e.pos_id IS NULL
+  AND lower(COALESCE(e.status, '')) NOT IN (
+    'cancelled','manually_cancelled','exchange_cancelled',
+    'manually_closed','closed','expired','invalidated'
+  )
+ORDER BY l.id, e.id;
+SQL
+```
+
+For notification health, inspect only bounded status metadata:
+
+```bash
+sqlite3 -readonly data/research.db <<'SQL'
+SELECT id, status, notification_status, notification_attempts,
+       notification_next_attempt_at, notified_at
+FROM execution_events
+WHERE action = 'terminal_entry_cleanup_outcome'
+ORDER BY id DESC
+LIMIT 20;
+SQL
+```
+
+`delivered` is final. `failed` is eligible for a bounded delayed retry;
+`exhausted` means five delivery attempts failed and needs operator
+investigation. Neither state authorizes another Deepcoin write.
+
 Closing a position directly in Deepcoin does not, by itself, authorize the
 service to guess which strategy ended. Exchange position absence is not
 position-attribution evidence.
@@ -860,9 +929,17 @@ pending strategy. A `pending_entry` row without `entered_at` or without a
 resolvable binding must be rejected without changing lifecycle, binding, or
 entry-leg state.
 
-Do not use a missing-position snapshot to perform this transition
-automatically. If strategy identity is uncertain, keep the investigation
-read-only and route the case through the reviewed repair/fingerprint workflow.
+A missing-position snapshot alone does not authorize this transition. Automatic
+reconciliation may proceed only through the lifecycle's exact execution binding
+and only after deferred-entry cleanup is confirmed. If strategy identity is
+uncertain, keep the investigation read-only and route the case through the
+reviewed repair/fingerprint workflow.
+
+To roll back the code, create and review a Git revert of the terminal-entry
+cleanup commits, push it, and deploy through the normal server update helper.
+Do not drop the new nullable event columns or delete outbox history. Most
+importantly, never recreate an entry order that the repaired version already
+confirmed cancelled or absent; exchange cancellation is a terminal fact.
 
 ## 13. Contextual strategy resolution
 

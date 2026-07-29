@@ -323,6 +323,26 @@ close, and TPSL changes pass the same verified-ownership gate. Manual Web
 binding is an explicit operator decision, writes a `manual_bind` verified leg,
 and cannot overwrite conflict or unavailable evidence.
 
+The terminal-entry cleanup invariant extends that rule: an `exited`, `expired`,
+`cancelled`, or `invalidated` lifecycle may not retain an unfilled exact entry
+leg. Manual full close cancels and reads back deferred entry legs before
+submitting the position close. Exchange reconciliation does the same before it
+terminalizes a missing primary position, and its bounded historical backstop
+repairs old terminal rows. Exact binding plus order/client ID is mandatory;
+ambiguous identity performs zero exchange writes.
+
+Cleanup outcomes are durable `execution_events` outbox rows. The KOL
+event-processing bot leases and delivers them with a stable fingerprint,
+bounded error type, delayed retry, and a maximum of five attempts. Delivery
+after process restart does not rerun cleanup and cannot call Deepcoin. This
+invariant is always on, with no shadow behavior and no feature flag.
+
+Production verification uses the read-only SQL in `docs/runbook.md` and must
+show zero terminal lifecycle/nonterminal entry-leg anomalies. Rollback is a
+reviewed Git revert followed by the normal server deployment. Keep schema and
+outbox history, and never recreate an order already confirmed cancelled or
+absent.
+
 Position protection is attributed independently from strategy ownership.
 `position_protection_ledger` is the sole ownership authority: a pending TPSL
 row is owned only when its exact `ordId` has one verified ledger `posId`.

@@ -440,6 +440,35 @@ update helper again. Recheck `git rev-parse HEAD`, service health, settings, and
 the read-only audit. Schema tables may safely remain; do not drop tables or
 delete batch/outbox history during rollback.
 
+### Deploy the terminal-entry cleanup invariant
+
+This repair is an always-on correctness invariant, not a new trading mode. Do
+not add a feature switch or shadow branch. Before restart, prove there is no
+active time-sensitive strategy operation, no in-flight management batch, and
+no unresolved exchange submission outcome. Then deploy with the standard
+Git-based helper and run the read-only invariant and notification queries in
+`docs/runbook.md`.
+
+Deployment succeeds only when:
+
+- the service SHA matches the reviewed branch and
+  `telegram-kol.service` is active;
+- `terminal lifecycle + nonterminal entry leg` returns zero rows after a
+  reconciliation cycle;
+- every cleanup outcome has a bounded durable notification state;
+- exact current positions and protection ownership remain unchanged; and
+- no exchange order is selected or attributed by symbol/side proximity.
+
+`resolved` and `already_absent` are confirmed cleanup results. `blocked` and
+`unknown` are fail-closed results and must leave the lifecycle nonterminal
+until a later exact read-back resolves them. The notification worker never
+calls Deepcoin.
+
+If verification fails, revert the reviewed repair commits, push the revert,
+and redeploy with the same helper. Leave the nullable notification columns and
+event history in place. Never recreate an order whose cancellation or absence
+was already confirmed before rollback.
+
 ## Data And Secrets
 
 Do not commit runtime data or secrets to GitHub. Keep these on the server:
