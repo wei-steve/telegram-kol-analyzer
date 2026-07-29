@@ -264,6 +264,50 @@ concurrent entry messages for the same group can both observe spare capacity
 and briefly exceed the cap. This small race is accepted; it does not relax the
 exact verified-ownership requirements used for reconciliation or management.
 
+## Per-symbol fixed range-entry thresholds
+
+Range-entry pricing is authoritative through
+`symbol_entry_thresholds`, not the legacy shared range percentage. Each symbol
+has three non-negative decimal price distances:
+
+- `market_leg_threshold`: maximum absolute distance from the side-aware anchor
+  at which the first 50% leg may become a market order;
+- `first_limit_offset`: fixed offset for the first limit leg;
+- `second_limit_offset`: fixed offset for the second limit leg.
+
+For a normalized range `low <= high`, a long uses `high` as the market anchor
+and a short uses `low`. The hybrid test is
+`market_leg_threshold > 0` and
+`abs(current_price - anchor) <= market_leg_threshold`. If it matches, the
+first leg is market and the second limit is `low + second_limit_offset` for a
+long or `high - second_limit_offset` for a short. Otherwise, long limits are
+`high + first_limit_offset` and `low + second_limit_offset`; short limits are
+`low - first_limit_offset` and `high - second_limit_offset`.
+
+`market_leg_threshold=0` disables hybrid market conversion even when the
+current price equals the anchor. A zero limit offset uses the original range
+endpoint. BTC migration and fresh-install defaults are `200 / 90 / 90`; ETH
+defaults are `4 / 2 / 2`; missing and newly added symbols default to
+`0 / 0 / 0`. Decimal values remain strings until calculation, then prices are
+normalized to the verified Deepcoin tick. Invalid, negative, non-finite,
+out-of-float-range, non-positive, or tick-normalized-to-zero prices fail
+closed.
+
+Explicit market signals remain one 100% market leg. The separate
+single-point “附近” conversion continues to use
+`nearby_entry_market_deviation_pct`; it is not governed by these range
+distances. Strategy-revision replacement drafts resolve thresholds from the
+authoritative execution binding symbol, not a possibly stale symbol on the
+revision message, and use the same values for preflight and submission.
+
+The old range percentage and range-style fields remain persisted and are
+submitted as hidden settings-form values solely so an older release can read
+them after rollback. New range drafts do not use them. This change affects
+only newly built entry orders and never rewrites existing orders or
+positions. Production verification is settings/API/UI read-back plus passive
+evidence only: never create a real test order, position, Telegram signal, or
+management action to verify these formulas.
+
 ## Deepcoin position-attribution authority
 
 `execution_order_legs` is the only persisted authority that may connect a live

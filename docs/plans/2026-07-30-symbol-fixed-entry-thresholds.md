@@ -165,6 +165,8 @@ Implement `_parse_symbol_entry_thresholds()` with these rules:
 - persist canonical non-exponent decimal strings;
 - when the entire new mapping is absent, seed BTC and ETH with the approved
   initial values;
+- apply the same BTC/ETH seed to fresh `TradingSettings()` defaults, not only
+  legacy rows loaded through the parser;
 - when the mapping exists, do not silently add non-submitted symbol overrides;
 - a missing symbol or missing individual field resolves to zero.
 
@@ -265,6 +267,9 @@ Add separate tests proving:
 - `0.000001` offsets survive until contract tick normalization;
 - equivalent normalized limit legs still coalesce;
 - an explicit `order_type="market"` remains one 100% leg.
+- excessive finite Decimal magnitudes are rejected before float conversion;
+- offsets that are non-positive before normalization or normalize to zero at
+  the contract tick fail closed.
 
 **Step 2: Run the builder tests and verify failure**
 
@@ -412,6 +417,12 @@ Pass the three canonical threshold strings to
 `build_deepcoin_order_draft()`. Rename the execution-plan note only if needed
 to remove the obsolete percentage implication; keep the durable meaning
 `range_hybrid_market_half_limit_half`.
+
+For `strategy_revision`, resolve the threshold object once from the
+authoritative `binding.symbol`, not `candidate.symbol`. Pass that same object
+to both `_build_revision_deepcoin_draft()` calls: the preflight and the
+replacement writer. Add a regression test whose candidate symbol differs from
+the binding symbol and assert both drafts use the binding-symbol fixed prices.
 
 When the fixed market threshold does not match, let the existing recovery live
 submission path build the two fixed limit legs. Do not add an alternate direct
@@ -591,6 +602,9 @@ Assert the rendered settings form:
 - retains `单点附近市价容忍 %`;
 - labels it `单点“附近”市价容忍 %`;
 - does not present `区间入场方式` as an active control;
+- retains hidden values for `max_market_entry_deviation_pct` and
+  `entry_range_order_style` so saving through the new page preserves rollback
+  configuration instead of resetting it;
 - contains data hooks for the four-column per-symbol editor.
 
 Add static asset assertions for:
@@ -707,6 +721,10 @@ Document:
 - new symbols default to zeros;
 - explicit market and single-point nearby signals are unchanged;
 - the old range percentage remains persisted only for rollback;
+- the hidden form values preserve both legacy range controls across saves;
+- strategy revisions use binding-symbol thresholds for both preflight and
+  replacement drafts;
+- finite-magnitude, positive-price, and post-tick safety checks fail closed;
 - only new entries are affected;
 - BTC and ETH migration defaults;
 - server verification must not create real positions.

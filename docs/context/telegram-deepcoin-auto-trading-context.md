@@ -140,12 +140,34 @@ Allowed symbols:
 
 Entry logic:
 
-- If KOL gives an entry range, e.g. `62650-62900 做多`:
-  - If current price is inside the range: enter market.
-  - If current price is outside the range: place 50% of size at one range edge and 50% at the range average. The exact edge selection still needs final confirmation.
+- Range-entry execution uses three fixed decimal price distances per symbol:
+  `market_leg_threshold`, `first_limit_offset`, and `second_limit_offset`.
+- For normalized `low <= high`, a long compares current price with `high`.
+  When the positive market threshold matches, the first 50% leg is market and
+  the second is `low + second_limit_offset`; otherwise the two limits are
+  `high + first_limit_offset` and `low + second_limit_offset`.
+- A short compares current price with `low`. When the positive market
+  threshold matches, the first 50% leg is market and the second is
+  `high - second_limit_offset`; otherwise the two limits are
+  `low - first_limit_offset` and `high - second_limit_offset`.
+- A zero market threshold disables hybrid conversion. Zero limit offsets use
+  the original endpoints. BTC defaults to `200 / 90 / 90`, ETH to
+  `4 / 2 / 2`, and every other missing or newly added symbol to `0 / 0 / 0`.
+- Thresholds use decimal-safe strings and final prices use the verified
+  Deepcoin tick. Non-finite, excessive, non-positive, or tick-normalized-to-zero
+  prices fail closed.
 - If KOL says `现价开多/开空`:
-  - Find a reference price.
-  - Enter market only if current price is within a configured percentage deviation from reference price. Suggested default is 0.15%, but not yet confirmed.
+  - Generate one 100% market leg from the current reference price.
+- A single-price `附近/左右` signal retains its separate percentage tolerance;
+  it does not use the range-entry fixed values.
+- Strategy revisions resolve the three values from the authoritative
+  `ExecutionBinding.symbol` for both preflight and replacement submission.
+- The old range percentage and range-style settings remain persisted through
+  hidden form fields for rollback compatibility, but new range drafts do not
+  read them.
+- The rule change applies only to newly built entries. Verification must use
+  deterministic tests, settings/UI read-back, and passive server evidence;
+  never place a real test order or position.
 
 Stop loss:
 
