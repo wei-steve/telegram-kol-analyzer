@@ -113,6 +113,84 @@ def test_lifecycle_monitor_skips_simulated_exit_for_live_execution_binding(tmp_p
     assert lifecycle.exited_at is None
 
 
+def test_lifecycle_monitor_skips_simulated_exit_for_unknown_binding_with_pending_leg(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:88",
+            chat_id=88,
+            message_id=4106,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            status="unknown",
+            strategy_instance_id="deepcoin:88:4106:BTC:short",
+        )
+        session.add(binding)
+        session.flush()
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="entry-1",
+                    pos_id="pos-1",
+                    status="filled",
+                    attribution_status="attribution_conflict",
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=2,
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id="entry-2",
+                    status="pending",
+                    attribution_status="unassigned",
+                ),
+            ]
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=4106,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 27, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 27, 0, 1, tzinfo=UTC),
+            take_profit="64500",
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    monitor = LifecycleMonitor(session_factory, LiveUpdateBroker())
+    monitor._apply_transitions(
+        [
+            StateTransition(
+                signal_id=lifecycle_id,
+                from_status="entered",
+                to_status="exited",
+                exit_reason="take_profit",
+                trigger_price=64500,
+                occurred_at=datetime(2026, 7, 27, 14, 37, tzinfo=UTC),
+            )
+        ]
+    )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert lifecycle.lifecycle_status == "entered"
+        assert lifecycle.exited_at is None
+        assert lifecycle.exit_reason is None
+
+
 def test_kol_exit_keeps_live_bound_lifecycle_entered_until_reconcile(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

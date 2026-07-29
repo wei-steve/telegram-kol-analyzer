@@ -1342,9 +1342,9 @@ class LifecycleMonitor:
                 # idempotency guard
                 if row.lifecycle_status != t.from_status:
                     continue
-                if t.to_status in ("exited", "expired", "invalidated") and _has_live_execution_binding(
-                    session,
-                    row.execution_binding_id,
+                if (
+                    t.to_status in ("exited", "expired", "invalidated")
+                    and has_live_execution_binding(session, row)
                 ):
                     logger.info(
                         "Skipping simulated lifecycle exit for live execution binding: lifecycle_id=%s binding_id=%s to_status=%s reason=%s",
