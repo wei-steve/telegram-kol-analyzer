@@ -1,4 +1,4 @@
-"""Deterministic, no-execution policy for Phase 5 playbook nominations."""
+"""Deterministic policies for shadow and closed low-risk playbooks."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from telegram_kol_research.runtime_agent_playbooks import (
 
 
 RUNTIME_AGENT_SHADOW_POLICY_VERSION = "runtime-shadow-policy-v1"
+RUNTIME_AGENT_EXECUTION_POLICY_VERSION = "runtime-execution-policy-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,26 @@ class ShadowPlaybookDecision:
             "would_execute": self.would_execute,
             "action_executed": self.executed,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPlaybookDecision:
+    nominated_playbook: str | None
+    playbook_version: int | None
+    accepted: bool
+    refusal_reasons: tuple[str, ...]
+    idempotency_key: str | None
+    verification_query: str | None
+    mode: str = "execute"
+    policy_version: str = RUNTIME_AGENT_EXECUTION_POLICY_VERSION
+    would_execute: bool = False
+    executed: bool = False
+
+    @property
+    def recovery_status(self) -> str:
+        if self.nominated_playbook is None:
+            return "not_requested"
+        return "action_ready" if self.accepted else "action_refused"
 
 
 def _summary(incident: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -126,4 +147,65 @@ def evaluate_shadow_playbook_nomination(
             incident_id=int(incident["id"])
         ),
         verification_query=playbook.verification_query,
+    )
+
+
+def evaluate_execution_playbook_nomination(
+    *,
+    incident: Mapping[str, Any],
+    nominated_playbook: str | None,
+    actions_enabled: bool,
+    enabled_playbooks: frozenset[str],
+    evidence_references: Sequence[str],
+) -> ExecutionPlaybookDecision:
+    """Evaluate Phase 6 authority without executing or importing an executor."""
+
+    if nominated_playbook is None:
+        return ExecutionPlaybookDecision(
+            nominated_playbook=None,
+            playbook_version=None,
+            accepted=False,
+            refusal_reasons=("no_nomination",),
+            idempotency_key=None,
+            verification_query=None,
+        )
+    playbook = get_runtime_agent_playbook(nominated_playbook)
+    if playbook is None:
+        return ExecutionPlaybookDecision(
+            nominated_playbook=nominated_playbook,
+            playbook_version=None,
+            accepted=False,
+            refusal_reasons=("unknown_playbook",),
+            idempotency_key=None,
+            verification_query=None,
+        )
+
+    reasons: list[str] = []
+    if not actions_enabled:
+        reasons.append("action_authority_disabled")
+    if nominated_playbook not in enabled_playbooks:
+        reasons.append("playbook_disabled")
+    if not playbook.executable_in_phase_6:
+        reasons.append("phase_6_execution_not_permitted")
+    if str(incident.get("incident_type") or "") not in (
+        playbook.permitted_incident_types
+    ):
+        reasons.append("incident_type_not_permitted")
+    reasons.extend(
+        _prerequisite_refusals(
+            playbook_name=playbook.name,
+            incident=incident,
+            evidence_references=evidence_references,
+        )
+    )
+    return ExecutionPlaybookDecision(
+        nominated_playbook=nominated_playbook,
+        playbook_version=playbook.version,
+        accepted=not reasons,
+        refusal_reasons=tuple(reasons),
+        idempotency_key=playbook.idempotency_key(
+            incident_id=int(incident["id"])
+        ),
+        verification_query=playbook.verification_query,
+        would_execute=not reasons,
     )

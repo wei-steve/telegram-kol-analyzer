@@ -40,6 +40,7 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
         {
             "llm_chat",
             "runtime_agent_contracts",
+            "runtime_agent_executor",
             "runtime_agent_playbooks",
             "runtime_agent_policy",
             "runtime_agent_tools",
@@ -50,6 +51,9 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
     ),
     "runtime_agent_playbooks.py": frozenset(),
     "runtime_agent_policy.py": frozenset({"runtime_agent_playbooks"}),
+    "runtime_agent_executor.py": frozenset(
+        {"models", "runtime_agent_policy", "runtime_agent_tools"}
+    ),
     "runtime_agent_evaluation.py": frozenset(
         {"runtime_agent_policy"}
     ),

@@ -183,6 +183,49 @@ def format_runtime_incident_diagnosis_notification(incident) -> str:
         )
     else:
         shadow_result = "未提名"
+    recovery_policy = diagnosis.get("recovery_playbook_policy")
+    if not isinstance(recovery_policy, dict):
+        recovery_policy = {}
+    recovery_valid = (
+        recovery_policy.get("mode") == "execute"
+        and recovery_policy.get("policy_version")
+        == "runtime-execution-policy-v1"
+        and isinstance(recovery_policy.get("accepted"), bool)
+        and isinstance(recovery_policy.get("would_execute"), bool)
+        and isinstance(recovery_policy.get("action_executed"), bool)
+    )
+    executed_playbook = (
+        recovery_policy.get("nominated_playbook")
+        if recovery_valid
+        else None
+    )
+    verification_status = (
+        recovery_policy.get("verification_status")
+        if recovery_valid
+        else None
+    )
+    action_evidence = recovery_policy.get("evidence_references")
+    if isinstance(action_evidence, list):
+        action_evidence_text = "; ".join(
+            str(reference) for reference in action_evidence[:4]
+        ) or "-"
+    else:
+        action_evidence_text = "-"
+    if shadow_policy_present and not shadow_policy_valid:
+        action_result = "记录异常，需人工核验"
+    elif not recovery_policy:
+        action_result = "未执行"
+    elif not recovery_valid:
+        action_result = "记录异常，需人工核验"
+    elif (
+        recovery_policy.get("action_executed") is True
+        and verification_status in {"verified", "already_verified"}
+    ):
+        action_result = "已执行并验证"
+    elif recovery_policy.get("action_executed") is True:
+        action_result = "已执行但验证失败，已冻结"
+    else:
+        action_result = f"未执行（{verification_status or '已拒绝'}）"
     missing = diagnosis.get("missing_evidence")
     if isinstance(missing, list):
         missing_text = "; ".join(str(item) for item in missing[:4]) or "-"
@@ -209,10 +252,18 @@ def format_runtime_incident_diagnosis_notification(incident) -> str:
         ),
         f"策略评估: {shadow_result}",
         (
-            "自动操作: 未执行"
-            if not shadow_policy_present or shadow_policy_valid
-            else "自动操作: 记录异常，需人工核验"
+            "执行预案: "
+            f"{_safe_runtime_incident_value(executed_playbook, limit=128)}"
         ),
+        (
+            "验证状态: "
+            f"{_safe_runtime_incident_value(verification_status, limit=32)}"
+        ),
+        (
+            "操作证据: "
+            f"{_safe_runtime_incident_value(action_evidence_text, limit=240)}"
+        ),
+        f"自动操作: {action_result}",
         "边界: 未参与策略识别或上下文策略解析。",
     ]
     return "\n".join(lines)[:RUNTIME_INCIDENT_MESSAGE_MAX_CHARS]

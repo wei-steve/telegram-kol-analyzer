@@ -6,7 +6,11 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from telegram_kol_research.cli import app, _build_runtime_agent_cli_tools
+from telegram_kol_research.cli import (
+    _build_runtime_agent_action_handlers,
+    _build_runtime_agent_cli_tools,
+    app,
+)
 from telegram_kol_research.runtime_agent_tools import (
     READ_ONLY_RUNTIME_AGENT_TOOL_NAMES,
 )
@@ -16,6 +20,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     PositionProtectionIncident,
     RuntimeIncident,
+    StrategyManagementBatch,
 )
 from telegram_kol_research.runtime_incidents import record_runtime_incident
 
@@ -126,6 +131,55 @@ def test_runtime_agent_cli_configures_every_phase3_read_only_projection(tmp_path
         )
         assert result.evidence_refs
         assert isinstance(result.data, dict)
+
+
+def test_phase6_production_handlers_wire_only_a_real_read_only_plan(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        batch = StrategyManagementBatch(
+            idempotency_fingerprint="phase6-plan-handler",
+            raw_message_id=1,
+            recognition_decision_id=1,
+            recognition_generation="fixture",
+            target_lifecycle_id=1,
+            strategy_instance_id="fixture",
+            execution_binding_id=1,
+            intent="close",
+            effective_action="close",
+            target_fingerprint="target",
+            target_snapshot_json="{}",
+            status="partial_failed",
+        )
+        session.add(batch)
+        session.commit()
+        batch_id = batch.id
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="strategy_management_batch",
+        source_record_id=str(batch_id),
+        incident_type="management_partial_failed",
+        severity="high",
+        fingerprint="c" * 64,
+        redacted_summary='{"source_status":"partial_failed"}',
+        occurred_at=datetime(2026, 7, 29, 9, 0, tzinfo=UTC),
+        feature_policy_version="runtime-incident-phase-6-v1",
+        prompt_version="runtime-agent-prompt-v4",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    tools = _build_runtime_agent_cli_tools(
+        session_factory,
+        max_output_bytes=8192,
+        monitor_state_path=tmp_path / "missing-monitor-state.json",
+        journal_reader=lambda: (),
+    )
+    handlers = _build_runtime_agent_action_handlers(tools)
+
+    assert set(handlers) == {"build_read_only_reconciliation_plan"}
+    assert handlers["build_read_only_reconciliation_plan"](
+        incident_id=incident.id,
+        idempotency_key="runtime-incident:1:plan:v1",
+        expected_fingerprint=incident.fingerprint,
+    ) is True
 
 
 def test_phase4_protection_projection_is_bounded_and_omits_order_ids(tmp_path):

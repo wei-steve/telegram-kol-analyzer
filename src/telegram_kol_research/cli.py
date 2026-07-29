@@ -2288,13 +2288,13 @@ def _build_runtime_agent_cli_tools(
     def exchange_snapshot(*, incident_id: int):
         with session_factory() as session:
             incident = load_incident(session, incident_id)
+            batch = load_management_batch(session, incident)
             rows = stored_exchange_state(session, incident)
             return {
                 "data": {
                     "incident_id": incident.id,
                     "snapshot_kind": "durable_last_observed",
-                    "applicable": incident.source_kind
-                    == "strategy_management_batch",
+                    "applicable": batch is not None,
                     "legs": rows,
                 },
                 "evidence_refs": [f"incident:{incident.id}"],
@@ -2303,14 +2303,14 @@ def _build_runtime_agent_cli_tools(
     def compare_local_exchange(*, incident_id: int):
         with session_factory() as session:
             incident = load_incident(session, incident_id)
+            batch = load_management_batch(session, incident)
             rows = stored_exchange_state(session, incident)
             comparison = build_local_exchange_comparison(rows)
             return {
                 "data": {
                     "incident_id": incident.id,
                     "comparison_kind": "local_vs_durable_last_observed",
-                    "applicable": incident.source_kind
-                    == "strategy_management_batch",
+                    "applicable": batch is not None,
                     **comparison,
                 },
                 "evidence_refs": [f"incident:{incident.id}"],
@@ -2399,6 +2399,36 @@ def _build_runtime_agent_cli_tools(
     )
 
 
+def _build_runtime_agent_action_handlers(
+    tools: RuntimeAgentToolRegistry,
+):
+    """Wire only concrete, reviewed Phase 6 actions into production entrypoints."""
+
+    def build_read_only_reconciliation_plan(
+        *,
+        incident_id: int,
+        idempotency_key: str,
+        expected_fingerprint: str,
+    ) -> bool:
+        del idempotency_key, expected_fingerprint
+        comparison = tools.execute(
+            "compare_local_exchange",
+            {"incident_id": int(incident_id)},
+            expected_incident_id=int(incident_id),
+        )
+        return (
+            comparison.data.get("comparison_kind")
+            == "local_vs_durable_last_observed"
+            and comparison.data.get("applicable") is True
+        )
+
+    return {
+        "build_read_only_reconciliation_plan": (
+            build_read_only_reconciliation_plan
+        )
+    }
+
+
 @app.command("runtime-incident-agent-evaluate")
 def runtime_incident_agent_evaluate(
     corpus_path: Path = typer.Option(
@@ -2441,6 +2471,7 @@ def runtime_incident_agent_once(
         session_factory,
         max_output_bytes=runtime_config.agent_max_tool_output_bytes,
     )
+    action_handlers = _build_runtime_agent_action_handlers(tools)
     worker_config = RuntimeAgentWorkerConfig(
         enabled=runtime_config.agent_enabled,
         max_tool_steps=runtime_config.agent_max_tool_steps,
@@ -2449,6 +2480,11 @@ def runtime_incident_agent_once(
         max_model_output_bytes=runtime_config.agent_max_tool_output_bytes,
         claim_lease_seconds=runtime_config.agent_claim_lease_seconds,
         shadow_playbooks=runtime_config.agent_shadow_playbooks,
+        actions_enabled=runtime_config.agent_actions_enabled,
+        action_playbooks=runtime_config.agent_action_playbooks,
+        action_circuit_threshold=(
+            runtime_config.agent_action_circuit_threshold
+        ),
     )
     if runtime_config.agent_enabled:
         llm_config = load_llm_proxy_config()
@@ -2469,6 +2505,7 @@ def runtime_incident_agent_once(
         session_factory,
         config=worker_config,
         tools=tools,
+        action_handlers=action_handlers,
         model_turn=model_turn,
     )
     typer.echo(
@@ -2507,6 +2544,7 @@ def runtime_incident_agent_worker(
         session_factory,
         max_output_bytes=runtime_config.agent_max_tool_output_bytes,
     )
+    action_handlers = _build_runtime_agent_action_handlers(tools)
     worker_config = RuntimeAgentWorkerConfig(
         enabled=True,
         max_tool_steps=runtime_config.agent_max_tool_steps,
@@ -2515,6 +2553,11 @@ def runtime_incident_agent_worker(
         max_model_output_bytes=runtime_config.agent_max_tool_output_bytes,
         claim_lease_seconds=runtime_config.agent_claim_lease_seconds,
         shadow_playbooks=runtime_config.agent_shadow_playbooks,
+        actions_enabled=runtime_config.agent_actions_enabled,
+        action_playbooks=runtime_config.agent_action_playbooks,
+        action_circuit_threshold=(
+            runtime_config.agent_action_circuit_threshold
+        ),
     )
     llm_config = load_llm_proxy_config()
 
@@ -2523,6 +2566,7 @@ def runtime_incident_agent_worker(
             session_factory,
             config=worker_config,
             tools=tools,
+            action_handlers=action_handlers,
             model_turn=lambda **kwargs: request_structured_chat_turn(
                 config=llm_config,
                 messages=kwargs["messages"],

@@ -55,6 +55,7 @@ def build_runtime_incident_handoff(
     diagnosis: RuntimeAgentDiagnosis,
     attempted_queries: Sequence[str],
     shadow_policy: Mapping[str, Any] | None = None,
+    recovery_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if set(incident) != _ALLOWED_INCIDENT_FIELDS:
         raise RuntimeIncidentHandoffError("incident handoff fields are invalid")
@@ -102,6 +103,55 @@ def build_runtime_incident_handoff(
                     "action_executed": (
                         shadow_policy.get("action_executed") is True
                     ),
+                }
+            )
+    if isinstance(recovery_policy, Mapping):
+        if (
+            recovery_policy.get("mode") != "execute"
+            or recovery_policy.get("policy_version")
+            != "runtime-execution-policy-v1"
+            or not isinstance(recovery_policy.get("action_executed"), bool)
+            or not isinstance(recovery_policy.get("accepted"), bool)
+        ):
+            raise RuntimeIncidentHandoffError(
+                "recovery playbook audit violates Phase 6 boundary"
+            )
+        nominated = recovery_policy.get("nominated_playbook")
+        refusal_reasons = recovery_policy.get("refusal_reasons")
+        if isinstance(nominated, str) and nominated:
+            attempted_playbooks.append(
+                {
+                    "name": nominated[:128],
+                    "mode": "execute",
+                    "policy_version": str(
+                        recovery_policy.get("policy_version") or "unknown"
+                    )[:64],
+                    "accepted": recovery_policy.get("accepted") is True,
+                    "refusal_reasons": [
+                        str(reason)[:128]
+                        for reason in (
+                            refusal_reasons
+                            if isinstance(refusal_reasons, list)
+                            else []
+                        )[:8]
+                    ],
+                    "action_executed": (
+                        recovery_policy.get("action_executed") is True
+                    ),
+                    "verification_status": str(
+                        recovery_policy.get("verification_status") or "unknown"
+                    )[:32],
+                    "evidence_references": [
+                        str(reference)[:160]
+                        for reference in (
+                            recovery_policy.get("evidence_references")
+                            if isinstance(
+                                recovery_policy.get("evidence_references"),
+                                list,
+                            )
+                            else []
+                        )[:16]
+                    ],
                 }
             )
     prompt = (
@@ -212,6 +262,11 @@ def load_runtime_incident_handoff(
         shadow_policy=(
             stored.get("shadow_playbook_policy")
             if isinstance(stored.get("shadow_playbook_policy"), dict)
+            else None
+        ),
+        recovery_policy=(
+            stored.get("recovery_playbook_policy")
+            if isinstance(stored.get("recovery_playbook_policy"), dict)
             else None
         ),
     )

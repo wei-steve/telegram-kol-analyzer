@@ -7,8 +7,8 @@ from telegram_kol_research.runtime_agent_playbooks import (
 )
 
 
-def test_runtime_agent_v3_prompt_exposes_the_closed_shadow_contract():
-    assert RUNTIME_AGENT_PROMPT_VERSION == "runtime-agent-prompt-v3"
+def test_runtime_agent_v4_prompt_exposes_closed_low_risk_recovery_contract():
+    assert RUNTIME_AGENT_PROMPT_VERSION == "runtime-agent-prompt-v4"
     assert "final JSON object" in RUNTIME_AGENT_SYSTEM_PROMPT
     for field in (
         "incident_id",
@@ -24,6 +24,10 @@ def test_runtime_agent_v3_prompt_exposes_the_closed_shadow_contract():
         assert field in RUNTIME_AGENT_SYSTEM_PROMPT
     assert "nominate" in RUNTIME_AGENT_SYSTEM_PROMPT
     assert "deterministic policy" in RUNTIME_AGENT_SYSTEM_PROMPT
-    assert "no playbook executes" in RUNTIME_AGENT_SYSTEM_PROMPT
+    assert "model never executes a playbook" in RUNTIME_AGENT_SYSTEM_PROMPT
+    assert "feature-flagged deterministic Phase 6 policy" in (
+        RUNTIME_AGENT_SYSTEM_PROMPT
+    )
+    assert "unknown-write mutation is permitted" in RUNTIME_AGENT_SYSTEM_PROMPT
     for playbook_name in RUNTIME_AGENT_PLAYBOOKS:
         assert playbook_name in RUNTIME_AGENT_SYSTEM_PROMPT

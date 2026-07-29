@@ -247,6 +247,58 @@ Immediate Phase 5 rollback is:
 4. leave Phase 2 capture and deterministic notification settings unchanged;
 5. confirm the normal service and all business workers remain active.
 
+### Phase 6 low-risk automatic recovery
+
+Phase 6 adds a closed executor, but all action authority remains dormant until
+both of these exact flags are enabled:
+
+- `TELEGRAM_KOL_RUNTIME_AGENT_ACTIONS_ENABLED`: only `1`, `true`, `yes`, or
+  `on` enables action policy evaluation.
+- `TELEGRAM_KOL_RUNTIME_AGENT_ACTION_PLAYBOOKS`: comma-separated exact
+  playbook allowlist. Empty disables every action. Wildcards and unknown names
+  are refused.
+- `TELEGRAM_KOL_RUNTIME_AGENT_ACTION_CIRCUIT_THRESHOLD`: bounded to 1–5 and
+  defaults to 3.
+
+Enabling a name is not sufficient to execute it. Each playbook also requires a
+reviewed, explicitly injected deterministic action handler. A missing handler
+is a refusal, never a simulated success. The handler must perform the named
+operation and return only a boolean completion signal; bounded read-only
+verification independently proves the postcondition. Passive durable
+projections cannot verify a live snapshot refresh, audit rerun, evidence
+fetch, or recorded reconciliation plan.
+
+Every execution requires the current incident fingerprint, the live worker
+claim token and unexpired lease, one durable idempotency reservation, the
+playbook attempt budget, and exact post-action evidence. Only one action may be
+reserved globally at a time. An active duplicate reports `action_in_progress`;
+an expired reservation is treated as an unknown outcome and freezes the
+incident without replay. Verification mismatch, unexpected handler exception,
+or repeated failures freeze further action and open the bounded circuit.
+
+The first Phase 6 deployment must keep the Agent sidecar, action authority, and
+action allowlist disabled. A canary is prohibited until:
+
+1. a reviewed production model provider is available;
+2. the exact playbook handler is wired and tested;
+3. its verification projection returns playbook-specific positive proof;
+4. a new safe window is proven;
+5. the action flag and allowlist contain exactly one reversible playbook.
+
+The canary report must show the incident ID, exact playbook, whether the action
+executed, exact verification status, bounded evidence references, and remaining
+risk. Never canary an order, position, protection, strategy, recognition,
+contextual-resolution, or unknown-write mutation.
+
+Immediate Phase 6 rollback is:
+
+1. clear `TELEGRAM_KOL_RUNTIME_AGENT_ACTION_PLAYBOOKS`;
+2. clear `TELEGRAM_KOL_RUNTIME_AGENT_ACTIONS_ENABLED`;
+3. stop and disable `telegram-kol-runtime-agent.service`;
+4. clear `TELEGRAM_KOL_RUNTIME_AGENT_ENABLED`;
+5. leave Phase 2 capture and deterministic notification settings unchanged;
+6. confirm the normal service and all business workers remain active.
+
 ## Rollback
 
 1. Disable the newest phase feature flag.

@@ -15,6 +15,7 @@ def test_context_resolution_schema_is_created(tmp_path):
     assert inspector.has_table("strategy_message_links")
     assert inspector.has_table("context_resolution_attempts")
     assert inspector.has_table("runtime_incidents")
+    assert inspector.has_table("runtime_agent_recovery_attempts")
     assert "strategy_thread_id" in {
         column["name"]
         for column in inspector.get_columns("strategy_lifecycles")

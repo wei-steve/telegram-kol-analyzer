@@ -85,6 +85,7 @@ _DIAGNOSIS_FIELDS = frozenset(
         "missing_evidence",
         "recommended_playbook",
         "remaining_risk",
+        "recovery_playbook_policy",
         "shadow_playbook_policy",
     }
 )
@@ -99,6 +100,22 @@ _SHADOW_POLICY_FIELDS = frozenset(
         "verification_query",
         "would_execute",
         "action_executed",
+    }
+)
+_RECOVERY_POLICY_FIELDS = frozenset(
+    {
+        "mode",
+        "policy_version",
+        "nominated_playbook",
+        "playbook_version",
+        "accepted",
+        "refusal_reasons",
+        "verification_query",
+        "would_execute",
+        "action_executed",
+        "verification_status",
+        "attempt_id",
+        "evidence_references",
     }
 )
 _EVIDENCE_REFERENCE_PATTERN = re.compile(
@@ -306,6 +323,131 @@ def _validate_redacted_json_contract(name: str, normalized: str) -> None:
             ):
                 raise RuntimeIncidentBoundsError(
                     "diagnosis_json shadow policy is invalid"
+                )
+        recovery_policy = parsed.get("recovery_playbook_policy")
+        if recovery_policy is not None and (
+            not isinstance(recovery_policy, dict)
+            or set(recovery_policy) != _RECOVERY_POLICY_FIELDS
+        ):
+            raise RuntimeIncidentBoundsError(
+                "diagnosis_json recovery policy fields are invalid"
+            )
+        if recovery_policy is not None:
+            nominated = recovery_policy["nominated_playbook"]
+            playbook_version = recovery_policy["playbook_version"]
+            accepted = recovery_policy["accepted"]
+            reasons = recovery_policy["refusal_reasons"]
+            verification_query = recovery_policy["verification_query"]
+            verification_status = recovery_policy["verification_status"]
+            attempt_id = recovery_policy["attempt_id"]
+            references = recovery_policy["evidence_references"]
+            catalog_playbook = get_runtime_agent_playbook(nominated)
+            if (
+                recovery_policy["mode"] != "execute"
+                or recovery_policy["policy_version"]
+                != "runtime-execution-policy-v1"
+                or not isinstance(accepted, bool)
+                or recovery_policy["would_execute"] is not accepted
+                or not isinstance(recovery_policy["action_executed"], bool)
+                or (
+                    nominated is not None
+                    and (
+                        not isinstance(nominated, str)
+                        or not _PLAYBOOK_NAME_PATTERN.fullmatch(nominated)
+                    )
+                )
+                or not isinstance(reasons, list)
+                or len(reasons) > 8
+                or not all(
+                    isinstance(reason, str) and 0 < len(reason) <= 128
+                    for reason in reasons
+                )
+                or (
+                    nominated is None
+                    and (
+                        accepted
+                        or playbook_version is not None
+                        or verification_query is not None
+                        or reasons != ["no_nomination"]
+                    )
+                )
+                or (
+                    nominated is not None
+                    and catalog_playbook is None
+                    and (
+                        accepted
+                        or playbook_version is not None
+                        or verification_query is not None
+                        or reasons != ["unknown_playbook"]
+                    )
+                )
+                or (
+                    catalog_playbook is not None
+                    and (
+                        catalog_playbook.version != playbook_version
+                        or not catalog_playbook.executable_in_phase_6
+                        or catalog_playbook.verification_query
+                        != verification_query
+                    )
+                )
+                or (
+                    not accepted
+                    and nominated is not None
+                    and catalog_playbook is not None
+                    and not reasons
+                )
+                or verification_status
+                not in {
+                    "refused",
+                    "verified",
+                    "already_verified",
+                    "verification_failed",
+                    "failed",
+                    "fingerprint_mismatch",
+                    "incident_missing",
+                    "claim_lost",
+                    "action_in_progress",
+                    "circuit_busy",
+                    "incident_action_frozen",
+                    "action_outcome_unknown",
+                    "circuit_open",
+                }
+                or (
+                    attempt_id is not None
+                    and (
+                        isinstance(attempt_id, bool)
+                        or not isinstance(attempt_id, int)
+                        or attempt_id < 1
+                    )
+                )
+                or not isinstance(references, list)
+                or len(references) > 16
+                or not all(
+                    isinstance(reference, str)
+                    and _EVIDENCE_REFERENCE_PATTERN.fullmatch(reference)
+                    for reference in references
+                )
+                or (
+                    recovery_policy["action_executed"]
+                    and (
+                        not accepted
+                        or attempt_id is None
+                        or verification_status
+                        not in {
+                            "verified",
+                            "already_verified",
+                            "verification_failed",
+                            "failed",
+                        }
+                    )
+                )
+                or (
+                    verification_status in {"verified", "already_verified"}
+                    and not recovery_policy["action_executed"]
+                )
+            ):
+                raise RuntimeIncidentBoundsError(
+                    "diagnosis_json recovery policy is invalid"
                 )
 
     for key, value in _walk_json_values(parsed):
@@ -724,6 +866,48 @@ def transition_runtime_incident(
     with session_factory() as session:
         result = session.execute(
             update(RuntimeIncident).where(*predicates).values(**values)
+        )
+        session.commit()
+        return result.rowcount == 1
+
+
+def defer_runtime_incident_action_claim(
+    session_factory: sessionmaker,
+    *,
+    incident_id: int,
+    claim_token: str,
+    now: datetime,
+    retry_at: datetime,
+) -> bool:
+    """Release action contention without consuming the model-attempt budget."""
+
+    if retry_at <= now:
+        raise ValueError("retry_at must be after now")
+    with session_factory() as session:
+        result = session.execute(
+            update(RuntimeIncident)
+            .where(
+                RuntimeIncident.id == int(incident_id),
+                RuntimeIncident.status == _CLAIMED_STATUS,
+                RuntimeIncident.claim_token == str(claim_token),
+                RuntimeIncident.claim_expires_at.is_not(None),
+                RuntimeIncident.claim_expires_at > now,
+            )
+            .values(
+                status="retry_pending",
+                agent_attempt_count=case(
+                    (
+                        RuntimeIncident.agent_attempt_count > 0,
+                        RuntimeIncident.agent_attempt_count - 1,
+                    ),
+                    else_=0,
+                ),
+                agent_next_attempt_at=retry_at,
+                claim_token=None,
+                claimed_at=None,
+                claim_expires_at=None,
+                updated_at=now,
+            )
         )
         session.commit()
         return result.rowcount == 1

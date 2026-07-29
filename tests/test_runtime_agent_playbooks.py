@@ -15,14 +15,16 @@ EXPECTED_PLAYBOOKS = {
 }
 
 
-def test_phase5_catalog_has_six_versioned_shadow_only_playbooks():
+def test_phase6_catalog_has_six_versioned_low_risk_playbooks():
     assert RUNTIME_AGENT_PLAYBOOK_CATALOG_VERSION == "runtime-playbooks-v1"
     assert set(RUNTIME_AGENT_PLAYBOOKS) == EXPECTED_PLAYBOOKS
 
     for name, playbook in RUNTIME_AGENT_PLAYBOOKS.items():
         assert playbook.name == name
         assert playbook.version == 1
-        assert playbook.shadow_only is True
+        assert playbook.shadow_only is False
+        assert playbook.shadow_supported is True
+        assert playbook.executable_in_phase_6 is True
         assert playbook.permitted_incident_types
         assert playbook.prerequisites
         assert playbook.side_effect_class in {

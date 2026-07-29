@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import RuntimeIncident
+from telegram_kol_research.models import (
+    RuntimeAgentRecoveryAttempt,
+    RuntimeIncident,
+)
 from telegram_kol_research.runtime_agent_tools import RuntimeAgentToolRegistry
 from telegram_kol_research.runtime_agent_worker import (
     RuntimeAgentWorkerConfig,
@@ -193,7 +196,7 @@ def test_worker_runs_bounded_tool_loop_and_commits_structured_diagnosis(tmp_path
     with session_factory() as session:
         row = session.get(RuntimeIncident, incident.id)
         assert row.status == "diagnosed"
-        assert row.prompt_version == "runtime-agent-prompt-v3"
+        assert row.prompt_version == "runtime-agent-prompt-v4"
         assert "Provider retries may have been exhausted." in row.diagnosis_json
         assert row.evidence_refs_json == (
             f'["incident:{incident.id}","worker-job:42"]'
@@ -257,6 +260,102 @@ def test_worker_records_shadow_policy_result_but_never_executes_playbook(tmp_pat
         assert stored["shadow_playbook_policy"]["action_executed"] is False
 
 
+def test_worker_executes_one_allowlisted_low_risk_playbook_and_records_verification(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        row.incident_type = "management_partial_failed"
+        session.commit()
+    calls = []
+
+    def provider(name):
+        def call(*, incident_id):
+            calls.append(name)
+            if name == "compare_local_exchange":
+                data = {
+                    "incident_id": incident_id,
+                    "comparison_kind": "local_vs_coherent_read_only_snapshot",
+                    "applicable": True,
+                    "coherent": True,
+                    "complete": True,
+                    "mismatches": 0,
+                    "unknown": 0,
+                }
+            else:
+                data = {
+                    "incident_id": incident_id,
+                    "coherent": True,
+                    "complete": True,
+                }
+            return {
+                "data": data,
+                "evidence_refs": [
+                    f"incident:{incident_id}",
+                    f"projection:{name}",
+                    "worker-job:42",
+                ],
+            }
+
+        return call
+
+    tools = RuntimeAgentToolRegistry(
+        providers={
+            "get_incident_summary": provider("get_incident_summary"),
+            "get_exchange_snapshot": provider("get_exchange_snapshot"),
+            "compare_local_exchange": provider("compare_local_exchange"),
+        }
+    )
+    turns = iter(
+        (
+            {
+                "tool_call": {
+                    "id": "call-1",
+                    "name": "get_incident_summary",
+                    "arguments": {"incident_id": incident.id},
+                }
+            },
+            _shadow_final(incident.id),
+        )
+    )
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            shadow_playbooks=frozenset(
+                {"refresh_read_only_exchange_snapshot"}
+            ),
+            actions_enabled=True,
+            action_playbooks=frozenset(
+                {"refresh_read_only_exchange_snapshot"}
+            ),
+        ),
+        tools=tools,
+        action_handlers={
+            "refresh_read_only_exchange_snapshot": lambda **kwargs: True
+        },
+        model_turn=lambda **kwargs: next(turns),
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    assert calls == [
+        "get_incident_summary",
+        "compare_local_exchange",
+    ]
+    assert result.recovery_policy["action_executed"] is True
+    assert result.recovery_policy["verification_status"] == "verified"
+    assert result.handoff["attempted_playbooks"][-1]["mode"] == "execute"
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        stored = __import__("json").loads(row.diagnosis_json)
+        assert row.recovery_status == "action_verified"
+        assert stored["recovery_playbook_policy"]["action_executed"] is True
+
+
 def test_worker_records_policy_refusal_for_unsafe_nomination(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     incident = _record(session_factory)
@@ -282,6 +381,110 @@ def test_worker_records_policy_refusal_for_unsafe_nomination(tmp_path):
     with session_factory() as session:
         row = session.get(RuntimeIncident, incident.id)
         assert row.recovery_status == "shadow_refused"
+
+
+def test_worker_records_execution_refusal_for_unknown_nomination(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    final = _final(incident.id)
+    final["final"]["recommended_playbook_name"] = "retry_business_instruction"
+    final["final"]["auto_handle_eligible"] = True
+    final["final"]["evidence_references"] = [f"incident:{incident.id}"]
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            actions_enabled=True,
+            action_playbooks=frozenset({"retry_business_instruction"}),
+        ),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: final,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    assert result.recovery_policy["accepted"] is False
+    assert result.recovery_policy["refusal_reasons"] == ["unknown_playbook"]
+    assert result.recovery_policy["action_executed"] is False
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        assert row.recovery_status == "action_refused"
+
+
+def test_worker_retries_instead_of_consuming_incident_on_global_action_contention(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    blocker = record_runtime_incident(
+        session_factory,
+        source_kind="strategy_management_batch",
+        source_record_id="blocker",
+        incident_type="management_partial_failed",
+        severity="high",
+        fingerprint="b" * 64,
+        generation=1,
+        redacted_summary='{"source_status":"partial_failed"}',
+        occurred_at=NOW,
+        feature_policy_version="runtime-incident-phase-6-v1",
+        prompt_version="runtime-agent-prompt-v4",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    with session_factory() as session:
+        session.get(RuntimeIncident, blocker.id).status = "diagnosed"
+        session.add(
+            RuntimeAgentRecoveryAttempt(
+                incident_id=blocker.id,
+                incident_fingerprint=blocker.fingerprint,
+                playbook_name="refresh_read_only_exchange_snapshot",
+                playbook_version=1,
+                idempotency_key="runtime-incident:blocker:refresh:v1",
+                status="reserved",
+                attempt_number=1,
+                policy_version="runtime-execution-policy-v1",
+                started_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    incident = _record(session_factory, generation=2)
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        row.incident_type = "management_partial_failed"
+        session.commit()
+    final = _shadow_final(incident.id)
+    final["final"]["evidence_references"] = [f"incident:{incident.id}"]
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            actions_enabled=True,
+            action_playbooks=frozenset(
+                {"refresh_read_only_exchange_snapshot"}
+            ),
+        ),
+        tools=_registry([]),
+        action_handlers={
+            "refresh_read_only_exchange_snapshot": lambda **kwargs: True
+        },
+        model_turn=lambda **kwargs: final,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert result.status == "action_deferred"
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        assert row.status == "retry_pending"
+        assert row.diagnosis_json is None
+        assert row.agent_attempt_count == 0
+        assert row.agent_next_attempt_at.replace(tzinfo=UTC) == (
+            NOW + timedelta(minutes=3)
+        )
+        assert (
+            session.get(RuntimeAgentRecoveryAttempt, 1).status == "reserved"
+        )
 
 
 def test_worker_accepts_operational_shadow_only_with_durable_non_writing_proof(

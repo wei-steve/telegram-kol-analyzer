@@ -31,8 +31,11 @@ class RuntimeIncidentConfig:
     agent_max_tool_output_bytes: int = 8192
     agent_claim_lease_seconds: float = 120.0
     agent_shadow_playbooks: frozenset[str] = frozenset()
-    feature_policy_version: str = "runtime-incident-phase-5-v1"
-    prompt_version: str = "runtime-agent-prompt-v3"
+    agent_actions_enabled: bool = False
+    agent_action_playbooks: frozenset[str] = frozenset()
+    agent_action_circuit_threshold: int = 3
+    feature_policy_version: str = "runtime-incident-phase-6-v1"
+    prompt_version: str = "runtime-agent-prompt-v4"
     tool_policy_version: str = "runtime-agent-tools-v2"
 
     def captures(self, incident_type: str) -> bool:
@@ -67,6 +70,13 @@ def load_runtime_incident_config(
         item.strip().lower()
         for item in env.get(
             "TELEGRAM_KOL_RUNTIME_AGENT_SHADOW_PLAYBOOKS", ""
+        ).split(",")
+        if item.strip()
+    )
+    agent_action_playbooks = frozenset(
+        item.strip().lower()
+        for item in env.get(
+            "TELEGRAM_KOL_RUNTIME_AGENT_ACTION_PLAYBOOKS", ""
         ).split(",")
         if item.strip()
     )
@@ -109,6 +119,14 @@ def load_runtime_incident_config(
         )
     except (TypeError, ValueError):
         agent_claim_lease_seconds = 120.0
+    try:
+        agent_action_circuit_threshold = int(
+            env.get(
+                "TELEGRAM_KOL_RUNTIME_AGENT_ACTION_CIRCUIT_THRESHOLD", "3"
+            )
+        )
+    except (TypeError, ValueError):
+        agent_action_circuit_threshold = 3
     return RuntimeIncidentConfig(
         capture_types=capture_types,
         telegram_notifications_enabled=_enabled_flag(
@@ -128,4 +146,11 @@ def load_runtime_incident_config(
             5.0, min(agent_claim_lease_seconds, 3600.0)
         ),
         agent_shadow_playbooks=agent_shadow_playbooks,
+        agent_actions_enabled=_enabled_flag(
+            env.get("TELEGRAM_KOL_RUNTIME_AGENT_ACTIONS_ENABLED")
+        ),
+        agent_action_playbooks=agent_action_playbooks,
+        agent_action_circuit_threshold=max(
+            1, min(agent_action_circuit_threshold, 5)
+        ),
     )

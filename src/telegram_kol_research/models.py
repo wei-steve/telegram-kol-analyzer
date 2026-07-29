@@ -1836,6 +1836,101 @@ class RuntimeIncident(Base):
     )
 
 
+class RuntimeAgentRecoveryAttempt(Base):
+    """Durable idempotency and verification record for one low-risk action."""
+
+    __tablename__ = "runtime_agent_recovery_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_runtime_agent_recovery_attempt_idempotency",
+        ),
+        Index(
+            "ix_runtime_agent_recovery_attempts_status",
+            "status",
+            "updated_at",
+        ),
+        Index(
+            "ix_runtime_agent_recovery_attempts_incident",
+            "incident_id",
+            "created_at",
+        ),
+        Index(
+            "uq_runtime_agent_recovery_attempt_active_slot",
+            "execution_slot",
+            unique=True,
+            sqlite_where=text("status = 'reserved'"),
+        ),
+        CheckConstraint(
+            "length(incident_fingerprint) BETWEEN 1 AND 64",
+            name="ck_runtime_agent_recovery_fingerprint_bounded",
+        ),
+        CheckConstraint(
+            "length(playbook_name) BETWEEN 1 AND 128",
+            name="ck_runtime_agent_recovery_playbook_bounded",
+        ),
+        CheckConstraint(
+            "length(idempotency_key) BETWEEN 1 AND 255",
+            name="ck_runtime_agent_recovery_idempotency_bounded",
+        ),
+        CheckConstraint(
+            "length(status) BETWEEN 1 AND 32",
+            name="ck_runtime_agent_recovery_status_bounded",
+        ),
+        CheckConstraint(
+            "action_result_json IS NULL OR length(action_result_json) <= 4096",
+            name="ck_runtime_agent_recovery_action_result_bounded",
+        ),
+        CheckConstraint(
+            "verification_result_json IS NULL "
+            "OR length(verification_result_json) <= 4096",
+            name="ck_runtime_agent_recovery_verification_result_bounded",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR length(error_code) <= 128",
+            name="ck_runtime_agent_recovery_error_bounded",
+        ),
+        CheckConstraint(
+            "playbook_version >= 1 AND attempt_number >= 1",
+            name="ck_runtime_agent_recovery_positive_counters",
+        ),
+        CheckConstraint(
+            "length(policy_version) BETWEEN 1 AND 64",
+            name="ck_runtime_agent_recovery_policy_bounded",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    incident_id: Mapped[int] = mapped_column(
+        ForeignKey("runtime_incidents.id"), nullable=False
+    )
+    incident_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    playbook_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    playbook_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    execution_slot: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    action_result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    verification_result_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    error_code: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
 class RecoveryOrderConfirmation(Base):
     __tablename__ = "recovery_order_confirmations"
     __table_args__ = (

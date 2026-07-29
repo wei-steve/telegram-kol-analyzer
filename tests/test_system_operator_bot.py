@@ -193,6 +193,50 @@ def test_runtime_incident_notification_does_not_contradict_executed_shadow_recor
     assert "自动操作: 未执行" not in rendered
 
 
+def test_runtime_incident_notification_reports_verified_low_risk_action(tmp_path):
+    session_factory = create_session_factory(tmp_path / "runtime-action.db")
+    incident = _record_runtime_incident(session_factory)
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        row.status = "diagnosed"
+        row.recovery_status = "action_verified"
+        row.diagnosis_json = json.dumps(
+            {
+                "hypothesis": "Snapshot was stale.",
+                "confidence": "high",
+                "missing_evidence": [],
+                "recommended_playbook": "refresh_read_only_exchange_snapshot",
+                "auto_handle_eligible": True,
+                "codex_handoff_required": False,
+                "remaining_risk": "Snapshot can become stale again.",
+                "attempted_queries": ["get_incident_summary"],
+                "recovery_playbook_policy": {
+                    "mode": "execute",
+                    "policy_version": "runtime-execution-policy-v1",
+                    "nominated_playbook": "refresh_read_only_exchange_snapshot",
+                    "playbook_version": 1,
+                    "accepted": True,
+                    "refusal_reasons": [],
+                    "verification_query": "compare_local_exchange",
+                    "would_execute": True,
+                    "action_executed": True,
+                    "verification_status": "verified",
+                    "attempt_id": 1,
+                    "evidence_references": [f"incident:{incident.id}"],
+                },
+            }
+        )
+        rendered = operator_bot_module.format_runtime_incident_diagnosis_notification(
+            row
+        )
+
+    assert "执行预案: refresh_read_only_exchange_snapshot" in rendered
+    assert "验证状态: verified" in rendered
+    assert f"操作证据: incident:{incident.id}" in rendered
+    assert "自动操作: 已执行并验证" in rendered
+    assert "自动操作: 未执行" not in rendered
+
+
 def test_runtime_incident_delivery_uses_diagnosis_report_for_diagnosed_row(
     tmp_path,
     monkeypatch,

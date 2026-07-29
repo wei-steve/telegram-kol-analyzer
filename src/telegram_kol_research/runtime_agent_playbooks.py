@@ -10,7 +10,7 @@ RUNTIME_AGENT_PLAYBOOK_CATALOG_VERSION = "runtime-playbooks-v1"
 
 @dataclass(frozen=True, slots=True)
 class RuntimeAgentPlaybook:
-    """Deterministic metadata only; Phase 5 contains no executor."""
+    """Deterministic metadata for shadow review and closed execution."""
 
     name: str
     version: int
@@ -23,7 +23,9 @@ class RuntimeAgentPlaybook:
     terminal_success_condition: str
     escalation_condition: str
     refusal_reasons: tuple[str, ...]
-    shadow_only: bool = True
+    shadow_only: bool = False
+    shadow_supported: bool = True
+    executable_in_phase_6: bool = False
 
     def idempotency_key(self, *, incident_id: int) -> str:
         return self.idempotency_key_template.format(
@@ -41,6 +43,7 @@ def _playbook(
     terminal_success_condition: str,
     escalation_condition: str,
     refusal_reasons: tuple[str, ...],
+    executable_in_phase_6: bool = False,
 ) -> RuntimeAgentPlaybook:
     return RuntimeAgentPlaybook(
         name=name,
@@ -58,6 +61,7 @@ def _playbook(
         terminal_success_condition=terminal_success_condition,
         escalation_condition=escalation_condition,
         refusal_reasons=refusal_reasons,
+        executable_in_phase_6=executable_in_phase_6,
     )
 
 
@@ -79,6 +83,7 @@ _PLAYBOOK_LIST = (
             "incident_evidence_missing",
             "incident_type_not_permitted",
         ),
+        executable_in_phase_6=True,
     ),
     _playbook(
         name="rerun_production_audit",
@@ -96,6 +101,7 @@ _PLAYBOOK_LIST = (
             "incident_evidence_missing",
             "incident_type_not_permitted",
         ),
+        executable_in_phase_6=True,
     ),
     _playbook(
         name="recover_stale_side_effect_free_claim",
@@ -119,6 +125,7 @@ _PLAYBOOK_LIST = (
             "side_effect_free_claim_not_proven",
             "incident_type_not_permitted",
         ),
+        executable_in_phase_6=True,
     ),
     _playbook(
         name="reschedule_non_writing_ai_job",
@@ -139,6 +146,7 @@ _PLAYBOOK_LIST = (
             "business_write_absence_not_proven",
             "incident_type_not_permitted",
         ),
+        executable_in_phase_6=True,
     ),
     _playbook(
         name="fetch_missing_telegram_evidence",
@@ -156,6 +164,7 @@ _PLAYBOOK_LIST = (
             "incident_evidence_missing",
             "incident_type_not_permitted",
         ),
+        executable_in_phase_6=True,
     ),
     _playbook(
         name="build_read_only_reconciliation_plan",
@@ -174,6 +183,7 @@ _PLAYBOOK_LIST = (
             "incident_evidence_missing",
             "incident_type_not_permitted",
         ),
+        executable_in_phase_6=True,
     ),
 )
 

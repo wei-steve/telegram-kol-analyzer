@@ -1,4 +1,4 @@
-"""Versioned prompt construction for the read-only runtime incident agent."""
+"""Versioned prompt construction for the bounded runtime incident agent."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from telegram_kol_research.runtime_agent_playbooks import (
 )
 
 
-RUNTIME_AGENT_PROMPT_VERSION = "runtime-agent-prompt-v3"
+RUNTIME_AGENT_PROMPT_VERSION = "runtime-agent-prompt-v4"
 _PLAYBOOK_NAMES = ", ".join(sorted(RUNTIME_AGENT_PLAYBOOKS))
 RUNTIME_AGENT_SYSTEM_PROMPT = f"""
 You diagnose a durable technical runtime incident using only the supplied
@@ -29,8 +29,11 @@ missing_evidence (string array), recommended_playbook_name (string or null),
 auto_handle_eligible (boolean), codex_handoff_required (boolean), and
 remaining_risk (string). A diagnosis is a hypothesis. You may nominate one
 closed playbook by name, but deterministic policy independently accepts or
-refuses the nomination. Phase 5 is shadow-only: no playbook executes and no
-business mutation occurs.
+refuses the nomination. The model never executes a playbook. A separately
+feature-flagged deterministic Phase 6 policy may execute only an exact
+allowlisted low-risk playbook with durable idempotency and verification.
+No order, position, protection, strategy, recognition, contextual-resolution,
+or unknown-write mutation is permitted.
 The only names eligible for nomination are: {_PLAYBOOK_NAMES}.
 """.strip()
 

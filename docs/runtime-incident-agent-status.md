@@ -8,11 +8,20 @@ project: runtime-incident-agent
 design_version: 1
 current_phase: 6
 phase_name: low-risk-automatic-recovery
-phase_status: planned
+phase_status: in_progress
 last_completed_phase: 5
 last_completed_commit: 8ec6542
 production_commit: 8ec6542de4ebe29eed8ab419109d654a9e12cad2
 local_tests:
+  - "phase-6-final-focused: 180 passed"
+  - "phase-6-final-executor-race-suite: 15 passed"
+  - "phase-6-final-review-focused: 52 passed"
+  - "phase-6-executor-worker-ledger-notification-focused: 109 passed"
+  - "phase-6-runtime-agent-database-focused: 174 passed"
+  - "phase-6-context-resolution-regressions: 38 passed"
+  - "phase-6-management-regressions: 421 passed"
+  - "phase-6-listener-monitor-safety-regressions: 112 passed"
+  - "phase-6-offline-evaluation: 7 cases, all nine metrics at 1.0"
   - "phase-5-final-runtime-agent-monitor-and-safety-tests: 317 passed, 1 skipped"
   - "phase-5-final-context-resolution-and-management-regressions: 176 passed"
   - "phase-5-final-offline-evaluation: 7 cases, all nine metrics at 1.0"
@@ -63,7 +72,7 @@ server_verification:
     deployed_focused_tests: "95 passed"
     canary: "incident 1 used one bounded incident-summary tool call and nominated only refresh_read_only_exchange_snapshot; runtime-shadow-policy-v1 accepted it with would_execute=false and action_executed=false"
     source_integrity: "source management batch 28 remained historical partial_failed with updated_at 2026-07-21 15:20:33.518543; no business row or position mutation changed"
-  remaining: "Begin Phase 6 locally with action authority dormant. Resolve the missing production runtime-agent model provider before any real Agent/action canary, then follow the Phase 6 per-playbook safe-window gates."
+  remaining: "Commit, push, and deploy the reviewed Phase 6 dormant execution boundary in a proven safe window. Keep all action flags empty/off. A real canary remains blocked until a reviewed production model provider is available; only build_read_only_reconciliation_plan currently has a production handler, and every other playbook must remain refused until its own handler and positive verification proof are reviewed."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
@@ -71,6 +80,7 @@ known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
   - "The production runtime-agent host has no provider listening on the default local proxy endpoint. A real one-shot attempt safely returned retry_pending without tool calls; the successful Phase 5 shadow-policy canary used a controlled closed-contract model turn. A reviewed provider path is required before Phase 6 production enablement."
+  - "Phase 6 production wiring currently implements only the read-only reconciliation-plan handler. Refresh, audit, claim recovery, AI-job reschedule, and Telegram-evidence playbooks fail closed as executor_not_configured until separately reviewed handlers exist."
   - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
 next_session_prompt: "请执行自定义ai agent的下一步实施"
@@ -245,3 +255,46 @@ Phase 5 is not complete until:
 - [x] exactly one read-only shadow playbook is canaried;
 - [x] the canary records only nominations and policy results, with no business
       row mutation and no `action_executed: true`.
+
+### Phase 6 — Low-risk automatic recovery
+
+- Status: in_progress
+- Local implementation: additive durable recovery-attempt ledger; exact
+  execution policy; current fingerprint, claim token, lease, idempotency,
+  attempt-budget, and one-active-action gates; per-incident freeze; global
+  circuit breaker; playbook-specific fail-closed verification; bounded
+  Telegram/Codex action evidence; and dormant action flags
+- Production handler scope: only
+  `build_read_only_reconciliation_plan` is wired, and it records a bounded
+  read-only plan from durable last-observed state; all other catalog actions
+  refuse execution without an explicitly injected reviewed handler
+- Authority change in production: none; all Phase 6 action flags remain off
+- Review: all Critical and Important findings were fixed; final review found
+  no remaining Critical or Important defects
+- Deployment: pending a fresh safe-window gate
+- Canary: blocked by the missing reviewed production model provider
+
+## Current Phase 6 Exit Checklist
+
+- [x] action authority and exact allowlist default off;
+- [x] durable idempotency and one-active-action reservation exist;
+- [x] current fingerprint, live claim token, and lease are checked before and
+      after the action;
+- [x] active duplicates defer, stale unknown outcomes freeze, and contention
+      remains retryable;
+- [x] unexpected exceptions, verification mismatch, and repeated failures
+      freeze or open the circuit;
+- [x] no order, position, protection, strategy, recognition, contextual
+      resolution, or unknown-write mutation is reachable;
+- [x] reports include action, exact verification status, and bounded evidence;
+- [x] local focused, offline, context, management, listener, and monitor gates
+      pass;
+- [x] final review has no remaining Critical or Important findings;
+- [ ] changes are committed and pushed;
+- [ ] a safe production deployment window is proven;
+- [ ] production deploys with sidecar and every action flag disabled;
+- [ ] service/listener/checkpoint/reconciliation continuity is verified;
+- [ ] the reviewed production model provider is available;
+- [ ] exactly one production handler passes a reversible canary;
+- [ ] each remaining playbook receives its own handler, verification proof,
+      safe window, and canary before enablement.

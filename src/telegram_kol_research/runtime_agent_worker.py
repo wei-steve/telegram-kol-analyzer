@@ -15,12 +15,20 @@ from telegram_kol_research.runtime_agent_contracts import (
     RuntimeAgentDiagnosis,
     RuntimeAgentToolCall,
 )
+from telegram_kol_research.runtime_agent_executor import (
+    RuntimeAgentExecutionResult,
+    RuntimeAgentExecutorConfig,
+    RuntimeAgentRecoveryDeferred,
+    execute_low_risk_recovery,
+)
 from telegram_kol_research.runtime_agent_prompt import (
     RUNTIME_AGENT_PROMPT_VERSION,
     build_runtime_agent_messages,
 )
 from telegram_kol_research.runtime_agent_policy import (
+    ExecutionPlaybookDecision,
     ShadowPlaybookDecision,
+    evaluate_execution_playbook_nomination,
     evaluate_shadow_playbook_nomination,
 )
 from telegram_kol_research.runtime_agent_tools import (
@@ -32,6 +40,7 @@ from telegram_kol_research.runtime_incident_handoff import (
 )
 from telegram_kol_research.runtime_incidents import (
     claim_runtime_incident,
+    defer_runtime_incident_action_claim,
     find_reusable_runtime_incident_diagnosis,
     list_claimable_runtime_incidents,
     transition_runtime_incident,
@@ -51,6 +60,10 @@ class RuntimeAgentWorkerConfig:
     retry_base_seconds: float = 5.0
     retry_max_seconds: float = 300.0
     shadow_playbooks: frozenset[str] = frozenset()
+    actions_enabled: bool = False
+    action_playbooks: frozenset[str] = frozenset()
+    action_circuit_threshold: int = 3
+    action_reservation_lease_seconds: float = 120.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +74,7 @@ class RuntimeAgentWorkerResult:
     refused_tool_calls: int = 0
     handoff: dict[str, Any] | None = None
     shadow_policy: dict[str, Any] | None = None
+    recovery_policy: dict[str, Any] | None = None
 
 
 def run_runtime_agent_loop(
@@ -87,6 +101,7 @@ def run_runtime_agent_loop(
             "retry_pending",
             "escalated",
             "claim_lost",
+            "action_deferred",
         }:
             sleep(interval)
     return iterations
@@ -246,12 +261,16 @@ def _commit_diagnosis(
     diagnosis: RuntimeAgentDiagnosis,
     now: datetime,
     shadow_decision: ShadowPlaybookDecision,
+    recovery_policy: Mapping[str, Any] | None = None,
+    recovery_status: str | None = None,
     prompt_version: str | None = None,
 ) -> bool:
     ledger_diagnosis = diagnosis.to_ledger_mapping()
     ledger_diagnosis["shadow_playbook_policy"] = (
         shadow_decision.to_ledger_mapping()
     )
+    if recovery_policy is not None:
+        ledger_diagnosis["recovery_playbook_policy"] = dict(recovery_policy)
     diagnosis_json = json.dumps(
         ledger_diagnosis,
         ensure_ascii=True,
@@ -273,10 +292,71 @@ def _commit_diagnosis(
         diagnosis_json=diagnosis_json,
         evidence_refs_json=evidence_json,
         playbook_name=diagnosis.recommended_playbook_name,
-        recovery_status=shadow_decision.recovery_status,
+        recovery_status=recovery_status or shadow_decision.recovery_status,
         queue_notification=True,
         prompt_version=prompt_version,
     )
+
+
+def _evaluate_recovery(
+    session_factory,
+    *,
+    incident,
+    claim_token: str,
+    diagnosis: RuntimeAgentDiagnosis,
+    config: RuntimeAgentWorkerConfig,
+    tools: RuntimeAgentToolRegistry,
+    action_handlers: Mapping[str, Callable[..., bool]] | None,
+    now: datetime,
+    clock: Callable[[], datetime] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not config.actions_enabled:
+        return None, None
+    decision: ExecutionPlaybookDecision = (
+        evaluate_execution_playbook_nomination(
+            incident=_incident_mapping(incident),
+            nominated_playbook=diagnosis.recommended_playbook_name,
+            actions_enabled=(
+                config.actions_enabled and diagnosis.auto_handle_eligible
+            ),
+            enabled_playbooks=config.action_playbooks,
+            evidence_references=diagnosis.evidence_references,
+        )
+    )
+    result: RuntimeAgentExecutionResult = execute_low_risk_recovery(
+        session_factory,
+        incident_id=incident.id,
+        expected_fingerprint=incident.fingerprint,
+        expected_claim_token=claim_token,
+        decision=decision,
+        config=RuntimeAgentExecutorConfig(
+            enabled=config.actions_enabled,
+            circuit_breaker_threshold=config.action_circuit_threshold,
+            reservation_lease_seconds=(
+                config.action_reservation_lease_seconds
+            ),
+        ),
+        tools=tools,
+        action_handlers=action_handlers,
+        now=now,
+        clock=clock,
+    )
+    if result.status in {"action_in_progress", "circuit_busy"}:
+        raise RuntimeAgentRecoveryDeferred(result.status)
+    mapping = result.to_ledger_mapping(decision=decision)
+    if result.status in {"verified", "already_verified"}:
+        recovery_status = "action_verified"
+    elif result.status in {
+        "verification_failed",
+        "failed",
+        "action_outcome_unknown",
+        "circuit_open",
+        "incident_action_frozen",
+    }:
+        recovery_status = "action_frozen"
+    else:
+        recovery_status = "action_refused"
+    return mapping, recovery_status
 
 
 def _transition_retry(
@@ -321,10 +401,11 @@ def run_runtime_agent_once(
     config: RuntimeAgentWorkerConfig,
     tools: RuntimeAgentToolRegistry,
     model_turn: Callable[..., Mapping[str, Any]],
+    action_handlers: Mapping[str, Callable[..., bool]] | None = None,
     now: datetime | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> RuntimeAgentWorkerResult:
-    """Claim and diagnose at most one incident without executing any action."""
+    """Claim and diagnose one incident, with dormant closed recovery authority."""
 
     if not config.enabled:
         return RuntimeAgentWorkerResult(status="disabled")
@@ -380,19 +461,40 @@ def run_runtime_agent_once(
                 enabled_playbooks=config.shadow_playbooks,
                 evidence_references=diagnosis.evidence_references,
             )
+            completion_now = (
+                operation_now if now is not None else datetime.now(UTC)
+            )
+            recovery_policy, recovery_status = _evaluate_recovery(
+                session_factory,
+                incident=claimed,
+                claim_token=claim_token,
+                diagnosis=diagnosis,
+                config=config,
+                tools=tools,
+                action_handlers=action_handlers,
+                now=completion_now,
+                clock=(
+                    (lambda: operation_now)
+                    if now is not None
+                    else (lambda: datetime.now(UTC))
+                ),
+            )
             handoff = build_runtime_incident_handoff(
                 incident=_handoff_incident(claimed),
                 diagnosis=diagnosis,
                 attempted_queries=diagnosis.attempted_queries,
                 shadow_policy=shadow_decision.to_ledger_mapping(),
+                recovery_policy=recovery_policy,
             )
             if not _commit_diagnosis(
                 session_factory,
                 incident=claimed,
                 claim_token=claim_token,
                 diagnosis=diagnosis,
-                now=operation_now,
+                now=completion_now,
                 shadow_decision=shadow_decision,
+                recovery_policy=recovery_policy,
+                recovery_status=recovery_status,
                 prompt_version=reusable.prompt_version,
             ):
                 return RuntimeAgentWorkerResult(
@@ -403,6 +505,7 @@ def run_runtime_agent_once(
                 incident_id=claimed.id,
                 handoff=handoff,
                 shadow_policy=shadow_decision.to_ledger_mapping(),
+                recovery_policy=recovery_policy,
             )
 
         messages = build_runtime_agent_messages(
@@ -470,19 +573,40 @@ def run_runtime_agent_once(
                     enabled_playbooks=config.shadow_playbooks,
                     evidence_references=diagnosis.evidence_references,
                 )
+                completion_now = (
+                    operation_now if now is not None else datetime.now(UTC)
+                )
+                recovery_policy, recovery_status = _evaluate_recovery(
+                    session_factory,
+                    incident=claimed,
+                    claim_token=claim_token,
+                    diagnosis=diagnosis,
+                    config=config,
+                    tools=tools,
+                    action_handlers=action_handlers,
+                    now=completion_now,
+                    clock=(
+                        (lambda: operation_now)
+                        if now is not None
+                        else (lambda: datetime.now(UTC))
+                    ),
+                )
                 handoff = build_runtime_incident_handoff(
                     incident=_handoff_incident(claimed),
                     diagnosis=diagnosis,
                     attempted_queries=attempted_queries,
                     shadow_policy=shadow_decision.to_ledger_mapping(),
+                    recovery_policy=recovery_policy,
                 )
                 if not _commit_diagnosis(
                     session_factory,
                     incident=claimed,
                     claim_token=claim_token,
                     diagnosis=diagnosis,
-                    now=operation_now,
+                    now=completion_now,
                     shadow_decision=shadow_decision,
+                    recovery_policy=recovery_policy,
+                    recovery_status=recovery_status,
                 ):
                     return RuntimeAgentWorkerResult(
                         status="claim_lost",
@@ -497,6 +621,7 @@ def run_runtime_agent_once(
                     refused_tool_calls=refused,
                     handoff=handoff,
                     shadow_policy=shadow_decision.to_ledger_mapping(),
+                    recovery_policy=recovery_policy,
                 )
 
             call = RuntimeAgentToolCall.from_mapping(
@@ -570,6 +695,24 @@ def run_runtime_agent_once(
         )
         return RuntimeAgentWorkerResult(
             status="escalated",
+            incident_id=claimed.id,
+            tool_steps=len(attempted_queries),
+            refused_tool_calls=refused,
+        )
+    except RuntimeAgentRecoveryDeferred:
+        retry_delay = max(
+            5.0,
+            min(float(config.action_reservation_lease_seconds), 3600.0),
+        )
+        deferred = defer_runtime_incident_action_claim(
+            session_factory,
+            incident_id=claimed.id,
+            claim_token=claim_token,
+            now=operation_now,
+            retry_at=operation_now + timedelta(seconds=retry_delay),
+        )
+        return RuntimeAgentWorkerResult(
+            status="action_deferred" if deferred else "claim_lost",
             incident_id=claimed.id,
             tool_steps=len(attempted_queries),
             refused_tool_calls=refused,
