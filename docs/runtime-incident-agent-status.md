@@ -11,7 +11,7 @@ phase_name: low-risk-automatic-recovery
 phase_status: in_progress
 last_completed_phase: 5
 last_completed_commit: 8ec6542
-production_commit: 5e96b555b0bf7a853f5eba53f95a9122d5395317
+production_commit: 731318b236cca9609c964e4b4503a700459fc3fe
 local_tests:
   - "phase-6-mimo-closed-final-correction-runtime-and-provider-focused: 136 passed"
   - "phase-6-mimo-closed-final-correction-context-management-regressions: 396 passed"
@@ -45,8 +45,8 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-6-read-only-reconciliation-plan-canary-verified
-  deployed_commit: 5e96b555b0bf7a853f5eba53f95a9122d5395317
+  status: phase-6-mimo-closed-final-verified
+  deployed_commit: 731318b236cca9609c964e4b4503a700459fc3fe
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
   listener: monitoring-31-enabled-groups-and-continuing
@@ -99,7 +99,10 @@ server_verification:
   phase_6_action_canary: "Incident 3 used a controlled deterministic final diagnosis after the live provider continued to fail closed on invalid evidence references. Exactly build_read_only_reconciliation_plan was allowlisted for the one-shot process; recovery attempt 1 reached verified, recorded plan_recorded true and business_action_executed false, and the diagnosis Telegram report was delivered."
   phase_6_action_canary_integrity: "Source management batch 22 remained historical recovery_required with unchanged updated_at 2026-07-20 15:17:48.203599; no context claim, management work, or position mutation was in flight; sidecar stayed disabled/inactive and no action flags were persisted."
   phase_6_post_canary: "service active HTTP 200 at 5e96b55; latest raw message 8318 completed recognition; focused deployed suite reported 59 passed; seven-case offline gate kept all nine metrics at 1.0; no-notify production monitor completed with monitor_error null and only the known audit_abnormal baseline"
-  remaining: "Keep all Agent/action flags empty/off. The live MiMo loop must demonstrate a closed valid final diagnosis without fabricated evidence before model-driven action authority can be considered proven. Every other playbook remains refused until its own reviewed handler, positive verification proof, safe window, and canary exist."
+  phase_6_final_correction_deployment: "commit 731318b deployed after a fresh safe-window check with zero evidence/context/management/position-mutation/recovery work in flight; the main service returned HTTP 200 and the sidecar remained disabled/inactive with Agent, shadow, action, and action-allowlist settings empty/off"
+  phase_6_live_mimo_closed_final: "one isolated temporary-database notification-delivery incident used the deployed dedicated MiMo provider and prompt v7; it completed diagnosed on its first durable attempt after three bounded read-only queries, stored only the actual incident:1 evidence reference, and nominated fetch_missing_telegram_evidence while empty shadow/action allowlists refused all authority"
+  phase_6_final_correction_postdeploy: "70 deployed focused tests passed; the seven-case offline gate kept all nine metrics at 1.0; production runtime incident count remained 3; service active HTTP 200; latest raw message 8341 completed recognition; no evidence/context/management/position-mutation/recovery work remained in flight; no-notify monitor had monitor_error null with only the known audit_abnormal baseline"
+  remaining: "Keep all Agent/action flags empty/off. The live MiMo closed-final gate is now proven. Every remaining playbook still requires its own reviewed handler, positive verification proof, safe window, and canary before any enablement; refresh_read_only_exchange_snapshot is the next candidate."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
@@ -107,7 +110,7 @@ known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
   - "Phase 6 production wiring currently implements only the read-only reconciliation-plan handler. Refresh, audit, claim recovery, AI-job reschedule, and Telegram-evidence playbooks fail closed as executor_not_configured until separately reviewed handlers exist."
-  - "Live MiMo final-diagnosis attempts now use JSON-object mode and explicit prompt bounds, but the latest v6 attempt still failed closed because the model cited invalid/fabricated evidence references. Incident 2 preserves the earlier text-form-tool failure as escalated; incident 3 was completed only by the controlled deterministic handler canary."
+  - "Historical MiMo v4/v6 attempts failed closed on text-form tool output and fabricated evidence. Prompt v7 now passed an isolated live closed-final validation with only actually gathered evidence, while production incident 2 remains preserved as escalated for audit history."
   - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
 next_session_prompt: "请执行自定义ai agent的下一步实施"
@@ -327,15 +330,18 @@ Phase 5 is not complete until:
   `1` was verified, its recorded plan had `business_action_executed: false`,
   source management batch `22` was unchanged, and the Telegram diagnosis
   report was delivered
-- End-to-end model status: still fail-closed; the latest live MiMo v6 final
-  cited invalid/fabricated evidence references, so Phase 6 remains
-  `in_progress` and persistent Agent/action flags remain off
+- End-to-end model status: prompt v7 completed one isolated live MiMo diagnosis
+  with three bounded read-only queries and only the actually gathered
+  `incident:1` reference. Empty shadow/action allowlists refused authority;
+  Phase 6 remains `in_progress` for the unimplemented playbook handlers and
+  persistent Agent/action flags remain off
 - Final-correction hardening is locally complete in prompt v7: one malformed
   or contract-invalid final may receive one bounded correction turn with no
   tools and only actually gathered evidence references. A second invalid
   response, a corrected tool request, or an exhausted wall budget fails closed
   before recovery policy or action. Local review found no Critical, Important,
-  or Minor defects; deployment and one live MiMo validation remain pending.
+  or Minor defects. Commit `731318b` is deployed and the live MiMo closed-final
+  validation passed without changing the three production incident rows.
 
 ## Current Phase 6 Exit Checklist
 
@@ -358,6 +364,7 @@ Phase 5 is not complete until:
 - [x] production deploys with sidecar and every action flag disabled;
 - [x] service/listener/checkpoint/reconciliation continuity is verified;
 - [x] the reviewed production model provider is available;
+- [x] the live provider completes a closed final using only gathered evidence;
 - [x] exactly one production handler passes a reversible canary;
 - [ ] each remaining playbook receives its own handler, verification proof,
       safe window, and canary before enablement.
