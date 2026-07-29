@@ -4947,6 +4947,110 @@ def test_sync_manual_closed_positions_keeps_unknown_legacy_binding_without_entry
     assert binding.pos_id == "legacy-pos"
 
 
+def test_sync_repairs_terminal_lifecycle_with_pending_entry_leg_exactly_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            pos_id=None,
+            status="unknown",
+            order_id="entry-1,entry-2",
+            client_order_id="client-1,client-2",
+        ),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=1,
+        order_id="entry-1",
+        client_order_id="client-1",
+        pos_id="closed-pos",
+        status="filled",
+        attribution_status="attribution_conflict",
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=2,
+        order_id="entry-2",
+        client_order_id="client-2",
+        pos_id=None,
+        status="pending",
+        attribution_status="unassigned",
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="exited",
+                exit_reason="take_profit",
+                signal_at=datetime(2026, 7, 27, 0, 17),
+                entered_at=datetime(2026, 7, 27, 0, 18),
+                exited_at=datetime(2026, 7, 27, 14, 37),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def __init__(self):
+            self.trigger_orders = [
+                {
+                    "ordId": "entry-2",
+                    "clOrdId": "client-2",
+                    "instId": "BTC-USDT-SWAP",
+                }
+            ]
+            self.cancel_calls = 0
+
+        def list_positions(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return list(self.trigger_orders)
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def cancel_trigger_order(self, payload):
+            self.cancel_calls += 1
+            self.trigger_orders = []
+            return {"code": "0"}
+
+        def list_position_history(self, *, inst_id, pos_id):
+            return []
+
+    client = FakeClient()
+    first = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=client,
+        synced_at=datetime(2026, 7, 30, 2, 0),
+    )
+    second = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=client,
+        synced_at=datetime(2026, 7, 30, 2, 1),
+    )
+
+    assert client.cancel_calls == 1
+    assert first.checked == 1
+    assert second.checked == 1
+    with session_factory() as session:
+        lifecycle = session.query(StrategyLifecycle).one()
+        pending_leg = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.order_id == "entry-2")
+            .one()
+        )
+        assert lifecycle.lifecycle_status == "exited"
+        assert lifecycle.exit_reason == "take_profit"
+        assert pending_leg.status == "cancelled"
+        assert pending_leg.terminal_reason == "terminal_entry_cleanup_confirmed"
+
+
 def test_sync_closed_position_finalizes_pending_kol_exit_exactly_once(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(

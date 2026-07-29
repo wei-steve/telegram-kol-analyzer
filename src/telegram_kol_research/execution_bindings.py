@@ -2479,12 +2479,17 @@ def sync_manual_closed_deepcoin_positions(
         for position in positions
         if _first_string(position, "posId", "pos_id", "id") and _has_nonzero_size(position)
     }
-    cleanup_status_by_binding = _cleanup_missing_position_deferred_entries(
+    cleanup_status_by_binding = _cleanup_terminal_lifecycle_entry_exposure(
+        session_factory,
+        client=client,
+        cleaned_at=now,
+    )
+    cleanup_status_by_binding.update(_cleanup_missing_position_deferred_entries(
         session_factory,
         client=client,
         active_pos_ids={str(pos_id) for pos_id in active_pos_ids if pos_id},
         cleaned_at=now,
-    )
+    ))
     result = ManualCloseSyncResult()
     with session_factory() as session:
         management_reserved_pos_ids = _active_management_reserved_pos_ids(
@@ -2643,6 +2648,59 @@ def _cleanup_missing_position_deferred_entries(
             lifecycle_id=lifecycle_id,
             deepcoin_client=client,
             reason="exchange_position_missing",
+            cleaned_at=cleaned_at,
+        )
+        results[binding_id] = cleanup.status
+    return results
+
+
+def _cleanup_terminal_lifecycle_entry_exposure(
+    session_factory: sessionmaker,
+    *,
+    client: DeepcoinReadOnlyClient,
+    cleaned_at: datetime,
+    limit: int = 100,
+) -> dict[int, str]:
+    from telegram_kol_research.models import StrategyLifecycle
+
+    candidates: list[tuple[int, int]] = []
+    with session_factory() as session:
+        lifecycles = (
+            session.query(StrategyLifecycle)
+            .filter(
+                StrategyLifecycle.lifecycle_status.in_(
+                    ["exited", "expired", "cancelled", "invalidated"]
+                )
+            )
+            .filter(StrategyLifecycle.execution_binding_id.is_not(None))
+            .order_by(StrategyLifecycle.id.asc())
+            .limit(max(1, min(int(limit), 500)))
+            .all()
+        )
+        for lifecycle in lifecycles:
+            binding = session.get(
+                ExecutionBinding,
+                int(lifecycle.execution_binding_id),
+            )
+            if binding is None or not _binding_has_unresolved_entry_leg(
+                session, binding
+            ):
+                continue
+            candidates.append((int(binding.id), int(lifecycle.id)))
+
+    if not candidates:
+        return {}
+    from telegram_kol_research.terminal_entry_cleanup import (
+        cleanup_terminal_entry_legs,
+    )
+
+    results: dict[int, str] = {}
+    for binding_id, lifecycle_id in candidates:
+        cleanup = cleanup_terminal_entry_legs(
+            session_factory,
+            lifecycle_id=lifecycle_id,
+            deepcoin_client=client,
+            reason="terminal_lifecycle_entry_exposure",
             cleaned_at=cleaned_at,
         )
         results[binding_id] = cleanup.status
