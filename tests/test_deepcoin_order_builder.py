@@ -1,3 +1,5 @@
+import pytest
+
 import telegram_kol_research.deepcoin_order_builder as deepcoin_order_builder
 
 from telegram_kol_research.deepcoin_order_builder import DeepcoinOrderDraftError
@@ -213,40 +215,245 @@ def test_build_deepcoin_order_draft_preserves_five_short_take_profit_targets():
     ]
 
 
-def test_build_deepcoin_order_draft_eager_long_uses_adjusted_range_endpoints():
+def test_long_range_outside_fixed_threshold_uses_independent_offsets():
     draft = build_deepcoin_order_draft(
         _payload_preview(
-            entry_range="59800-57800",
-            stop_loss="57000",
-            take_profit="61000-62300-63800",
-            entry_range_order_style="eager",
-            max_market_entry_deviation_pct=0.15,
+            entry_range="60000-61000",
+            current_price="60700",
+            market_leg_threshold="200",
+            first_limit_offset="90",
+            second_limit_offset="80",
         ),
         contract_spec=_btc_contract_spec(),
     )
 
-    assert [leg["price"] for leg in draft["order_legs"]] == [59889.7, 57886.7]
-    assert [leg["order_type"] for leg in draft["order_legs"]] == ["limit", "limit"]
-    assert [leg["position_side"] for leg in draft["order_legs"]] == ["long", "long"]
+    assert [(leg["order_type"], leg["price"]) for leg in draft["order_legs"]] == [
+        ("limit", 61090.0),
+        ("limit", 60080.0),
+    ]
 
 
-def test_build_deepcoin_order_draft_eager_short_uses_adjusted_range_endpoints():
+def test_short_range_uses_subtracted_fixed_offsets():
     draft = build_deepcoin_order_draft(
         _payload_preview(
             open_side="sell",
             position_side="short",
-            entry_range="59800-57800",
-            stop_loss="60600",
-            take_profit="57000-56000",
-            entry_range_order_style="eager",
-            max_market_entry_deviation_pct=0.15,
+            entry_range="60000-61000",
+            stop_loss="62000",
+            current_price="60300",
+            market_leg_threshold="200",
+            first_limit_offset="90",
+            second_limit_offset="80",
         ),
         contract_spec=_btc_contract_spec(),
     )
 
-    assert [leg["price"] for leg in draft["order_legs"]] == [57713.3, 59710.3]
-    assert [leg["order_type"] for leg in draft["order_legs"]] == ["limit", "limit"]
-    assert [leg["position_side"] for leg in draft["order_legs"]] == ["short", "short"]
+    assert [(leg["order_type"], leg["price"]) for leg in draft["order_legs"]] == [
+        ("limit", 59910.0),
+        ("limit", 60920.0),
+    ]
+
+
+def test_long_range_inside_fixed_threshold_uses_market_and_second_offset():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            entry_range="60000-61000",
+            current_price="60850",
+            market_leg_threshold="200",
+            first_limit_offset="90",
+            second_limit_offset="80",
+        ),
+        contract_spec=_btc_contract_spec(),
+    )
+
+    assert [(leg["order_type"], leg["price"]) for leg in draft["order_legs"]] == [
+        ("market", 60850.0),
+        ("limit", 60080.0),
+    ]
+
+
+def test_hybrid_market_leg_does_not_apply_first_limit_offset():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            contract="PEPE-USDT",
+            open_side="sell",
+            position_side="short",
+            entry_range="1-2",
+            stop_loss="3",
+            current_price="1",
+            market_leg_threshold="0.1",
+            first_limit_offset="1",
+            second_limit_offset="0.2",
+        )
+    )
+
+    assert [(leg["order_type"], leg["price"]) for leg in draft["order_legs"]] == [
+        ("market", 1.0),
+        ("limit", 1.8),
+    ]
+
+
+def test_zero_market_threshold_disables_hybrid_at_exact_anchor():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            entry_range="60000-61000",
+            current_price="61000",
+            market_leg_threshold="0",
+            first_limit_offset="90",
+            second_limit_offset="80",
+        ),
+        contract_spec=_btc_contract_spec(),
+    )
+
+    assert [(leg["order_type"], leg["price"]) for leg in draft["order_legs"]] == [
+        ("limit", 61090.0),
+        ("limit", 60080.0),
+    ]
+
+
+def test_zero_offsets_use_original_range_endpoints():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            entry_range="60000-61000",
+            first_limit_offset="0",
+            second_limit_offset="0",
+        ),
+        contract_spec=_btc_contract_spec(),
+    )
+
+    assert [leg["price"] for leg in draft["order_legs"]] == [61000.0, 60000.0]
+
+
+def test_small_fixed_offsets_survive_until_tick_normalization():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            contract="PEPE-USDT",
+            entry_range="0.000010-0.000015",
+            stop_loss="0.000005",
+            take_profit=None,
+            first_limit_offset="0.0000014",
+            second_limit_offset="0.0000024",
+        ),
+        contract_spec=DeepcoinContractSpec(
+            instrument_id="PEPE-USDT-SWAP",
+            contract_value=1,
+            quantity_step=1,
+            min_quantity=1,
+            price_tick=0.000001,
+        ),
+    )
+
+    assert [leg["price"] for leg in draft["order_legs"]] == [
+        0.000016,
+        0.000012,
+    ]
+
+
+def test_equivalent_normalized_fixed_limit_legs_coalesce():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            contract="PEPE-USDT",
+            entry_range="0.000010-0.000011",
+            stop_loss="0.000005",
+            take_profit=None,
+            first_limit_offset="0",
+            second_limit_offset="0.000001",
+        ),
+        contract_spec=DeepcoinContractSpec(
+            instrument_id="PEPE-USDT-SWAP",
+            contract_value=1,
+            quantity_step=1,
+            min_quantity=1,
+            price_tick=0.000001,
+        ),
+    )
+
+    assert len(draft["order_legs"]) == 1
+    assert draft["order_legs"][0]["price"] == 0.000011
+    assert draft["order_legs"][0]["allocation_pct"] == 100.0
+    assert draft["order_legs"][0]["merged_from_leg_indices"] == [1, 2]
+
+
+def test_fixed_offset_rejects_nonpositive_short_limit_price():
+    try:
+        build_deepcoin_order_draft(
+            _payload_preview(
+                contract="PEPE-USDT",
+                open_side="sell",
+                position_side="short",
+                entry_range="1-2",
+                stop_loss="3",
+                first_limit_offset="1",
+            )
+        )
+    except DeepcoinOrderDraftError as exc:
+        assert "fixed entry offset produces non-positive price" in str(exc)
+    else:
+        raise AssertionError("expected non-positive fixed entry price to fail")
+
+
+def test_fixed_offset_rejects_price_normalized_to_zero():
+    with pytest.raises(
+        DeepcoinOrderDraftError,
+        match="fixed entry offset produces non-positive price",
+    ):
+        build_deepcoin_order_draft(
+            _payload_preview(
+                contract="PEPE-USDT",
+                open_side="sell",
+                position_side="short",
+                entry_range="0.000001-0.000002",
+                stop_loss="0.000003",
+                take_profit=None,
+                second_limit_offset="0.0000016",
+            ),
+            contract_spec=DeepcoinContractSpec(
+                instrument_id="PEPE-USDT-SWAP",
+                contract_value=1,
+                quantity_step=1,
+                min_quantity=1,
+                price_tick=0.000001,
+            ),
+        )
+
+
+def test_fixed_offset_rejects_value_outside_finite_float_range():
+    try:
+        build_deepcoin_order_draft(
+            _payload_preview(
+                entry_range="1-2",
+                stop_loss="0.5",
+                first_limit_offset="1e1000",
+            )
+        )
+    except DeepcoinOrderDraftError as exc:
+        assert "first_limit_offset" in str(exc)
+    else:
+        raise AssertionError("expected oversized fixed offset to fail")
+
+
+@pytest.mark.parametrize("invalid", ["-1", -0.1, "nan", "inf", True, {}, [], ""])
+def test_fixed_entry_thresholds_reject_invalid_decimals(invalid):
+    with pytest.raises(DeepcoinOrderDraftError, match="market_leg_threshold"):
+        build_deepcoin_order_draft(
+            _payload_preview(market_leg_threshold=invalid)
+        )
+
+
+def test_explicit_market_order_ignores_fixed_range_thresholds():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            order_type="market",
+            market_leg_threshold="200",
+            first_limit_offset="90",
+            second_limit_offset="80",
+        ),
+        contract_spec=_btc_contract_spec(),
+    )
+
+    assert len(draft["order_legs"]) == 1
+    assert draft["order_legs"][0]["order_type"] == "market"
+    assert draft["order_legs"][0]["allocation_pct"] == 100.0
 
 
 def test_build_deepcoin_order_draft_builds_single_market_order_leg():
@@ -399,7 +606,9 @@ def test_build_deepcoin_order_draft_hybrid_range_entry_near_upper_edge():
             take_profit="1605/1625/1645",
             risk_budget_usdt=20.0,
             current_price=1585.0,
-            max_market_entry_deviation_pct=0.15,
+            market_leg_threshold="4",
+            first_limit_offset="2",
+            second_limit_offset="2",
         ),
         contract_spec=DeepcoinContractSpec(
             instrument_id="ETH-USDT-SWAP",
@@ -417,10 +626,10 @@ def test_build_deepcoin_order_draft_hybrid_range_entry_near_upper_edge():
     assert draft["order_legs"][0]["quantity"] == 2.5
     assert draft["order_legs"][0]["estimated_stop_loss_usdt"] == 10.0
     assert draft["order_legs"][1]["order_type"] == "limit"
-    assert draft["order_legs"][1]["price"] == 1567.34
+    assert draft["order_legs"][1]["price"] == 1567.0
     assert draft["order_legs"][1]["risk_budget_usdt"] == 10.0
-    assert draft["order_legs"][1]["quantity"] == 4.4
-    assert draft["order_legs"][1]["estimated_stop_loss_usdt"] == 9.8296
+    assert draft["order_legs"][1]["quantity"] == 4.5
+    assert draft["order_legs"][1]["estimated_stop_loss_usdt"] == 9.9
     assert "range_entry_hybrid_market_half_limit_half" in draft["notes"]
 
 

@@ -7,6 +7,8 @@ It converts reviewed recovery previews into a conservative, auditable draft.
 from __future__ import annotations
 
 import math
+import sys
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
@@ -20,6 +22,9 @@ from telegram_kol_research.take_profit_plan import build_take_profit_plan
 
 class DeepcoinOrderDraftError(ValueError):
     """Raised when a recovery payload cannot be converted into a draft."""
+
+
+MAX_FLOAT_DECIMAL = Decimal(str(sys.float_info.max))
 
 
 def build_deepcoin_order_draft(
@@ -83,12 +88,18 @@ def build_deepcoin_order_draft(
             side=position_side,
         )
     )
-    entry_range_order_style = str(
-        payload_preview.get("entry_range_order_style") or "conservative"
-    ).lower()
     current_price = _parse_optional_price(payload_preview.get("current_price"), symbol=symbol)
-    market_entry_deviation_pct = _parse_optional_float(
-        payload_preview.get("max_market_entry_deviation_pct")
+    market_leg_threshold = _parse_nonnegative_decimal(
+        payload_preview.get("market_leg_threshold", "0"),
+        field_name="market_leg_threshold",
+    )
+    first_limit_offset = _parse_nonnegative_decimal(
+        payload_preview.get("first_limit_offset", "0"),
+        field_name="first_limit_offset",
+    )
+    second_limit_offset = _parse_nonnegative_decimal(
+        payload_preview.get("second_limit_offset", "0"),
+        field_name="second_limit_offset",
     )
     parsed_take_profit_prices = _parse_take_profit_prices(
         payload_preview.get("take_profit"), symbol=symbol,
@@ -113,7 +124,7 @@ def build_deepcoin_order_draft(
             low=entry_low,
             high=entry_high,
             current_price=current_price,
-            max_deviation_pct=market_entry_deviation_pct,
+            market_leg_threshold=market_leg_threshold,
             contract_spec=contract_spec,
         )
         if order_type == "limit" and not single_entry_price
@@ -140,7 +151,8 @@ def build_deepcoin_order_draft(
             position_side=position_side,
             low=entry_low,
             high=entry_high,
-            deviation_pct=market_entry_deviation_pct,
+            first_limit_offset=Decimal("0"),
+            second_limit_offset=second_limit_offset,
             contract_spec=contract_spec,
         )
         order_legs = [
@@ -200,7 +212,8 @@ def build_deepcoin_order_draft(
             position_side=position_side,
             low=entry_low,
             high=entry_high,
-            deviation_pct=market_entry_deviation_pct,
+            first_limit_offset=first_limit_offset,
+            second_limit_offset=second_limit_offset,
             contract_spec=contract_spec,
         )
         order_legs = [
@@ -338,14 +351,27 @@ def _parse_optional_price(value: Any, *, symbol: str | None = None) -> float | N
     raise DeepcoinOrderDraftError("stop_loss must contain a numeric price")
 
 
-def _parse_optional_float(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
+def _parse_nonnegative_decimal(value: Any, *, field_name: str) -> Decimal:
+    if isinstance(value, bool) or isinstance(value, (dict, list, tuple, set)):
+        raise DeepcoinOrderDraftError(
+            f"{field_name} must be a non-negative finite decimal"
+        )
+    if isinstance(value, str) and not value.strip():
+        raise DeepcoinOrderDraftError(
+            f"{field_name} must be a non-negative finite decimal"
+        )
     try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
+        raise DeepcoinOrderDraftError(
+            f"{field_name} must be a non-negative finite decimal"
+        ) from None
+    if not parsed.is_finite() or parsed < 0 or parsed > MAX_FLOAT_DECIMAL:
+        raise DeepcoinOrderDraftError(
+            f"{field_name} must be a non-negative finite decimal "
+            "within the supported price range"
+        )
+    return parsed
 
 
 def _parse_take_profit_prices(value: Any, *, symbol: str | None = None) -> list[float]:
@@ -359,20 +385,35 @@ def _range_entry_leg_prices(
     position_side: str,
     low: float,
     high: float,
-    deviation_pct: float | None,
+    first_limit_offset: Decimal,
+    second_limit_offset: Decimal,
     contract_spec: DeepcoinContractSpec | None,
 ) -> tuple[float, float]:
-    deviation = max(0.0, float(deviation_pct or 0.0)) / 100
+    low_decimal = Decimal(str(low))
+    high_decimal = Decimal(str(high))
     if position_side == "long":
-        first = _normalize_price(high * (1 + deviation), contract_spec)
-        second = _normalize_price(low * (1 + deviation), contract_spec)
+        first = high_decimal + first_limit_offset
+        second = low_decimal + second_limit_offset
     else:
-        first = _normalize_price(low * (1 - deviation), contract_spec)
-        second = _normalize_price(high * (1 - deviation), contract_spec)
-    if math.isclose(first, second):
-        alternate_endpoint = high if math.isclose(first, low) else low
-        second = _normalize_price(alternate_endpoint, contract_spec)
-    return first, second
+        first = low_decimal - first_limit_offset
+        second = high_decimal - second_limit_offset
+    if first <= 0 or second <= 0:
+        raise DeepcoinOrderDraftError(
+            "fixed entry offset produces non-positive price"
+        )
+    if first > MAX_FLOAT_DECIMAL or second > MAX_FLOAT_DECIMAL:
+        raise DeepcoinOrderDraftError(
+            "fixed entry offset produces price outside finite float range"
+        )
+    normalized_prices = (
+        _normalize_price(float(first), contract_spec),
+        _normalize_price(float(second), contract_spec),
+    )
+    if any(price <= 0 or not math.isfinite(price) for price in normalized_prices):
+        raise DeepcoinOrderDraftError(
+            "fixed entry offset produces non-positive price after tick normalization"
+        )
+    return normalized_prices
 
 
 def _hybrid_market_entry_price(
@@ -381,16 +422,14 @@ def _hybrid_market_entry_price(
     low: float,
     high: float,
     current_price: float | None,
-    max_deviation_pct: float | None,
+    market_leg_threshold: Decimal,
     contract_spec: DeepcoinContractSpec | None,
 ) -> float | None:
-    if current_price is None or max_deviation_pct is None:
+    if current_price is None or market_leg_threshold <= 0:
         return None
     anchor = high if position_side == "long" else low
-    if anchor <= 0:
-        return None
-    deviation_pct = abs(current_price - anchor) / anchor * 100
-    if deviation_pct > max_deviation_pct:
+    distance = abs(Decimal(str(current_price)) - Decimal(str(anchor)))
+    if distance > market_leg_threshold:
         return None
     return _normalize_price(current_price, contract_spec)
 
