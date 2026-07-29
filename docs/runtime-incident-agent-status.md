@@ -13,6 +13,9 @@ last_completed_phase: 5
 last_completed_commit: 8ec6542
 production_commit: 1fe682980f97e17ac7dc54307036c5dff40a92a1
 local_tests:
+  - "phase-6-dedicated-mimo-provider-final: 181 passed"
+  - "phase-6-dedicated-mimo-provider-review-focused: 30 passed"
+  - "phase-6-dedicated-mimo-provider-offline-evaluation: 7 cases, all nine metrics at 1.0"
   - "phase-6-final-focused: 180 passed"
   - "phase-6-final-executor-race-suite: 15 passed"
   - "phase-6-final-review-focused: 52 passed"
@@ -281,6 +284,10 @@ Phase 5 is not complete until:
 - Authority change in production: none; all Phase 6 action flags remain off
 - Review: all Critical and Important findings were fixed; final review found
   no remaining Critical or Important defects
+- Dedicated provider review: no remaining Critical or Important defects;
+  root-owned `0600` secrets load through systemd environment injection,
+  shared credentials never act as fallback, and both Agent commands refuse
+  invalid configuration before claiming an incident
 - Commit: `1fe6829` (`feat: add dormant incident recovery boundary`), pushed
 - Deployment: `1fe6829`, deployed after a fresh safe-window gate with all
   agent/action flags and allowlists disabled
