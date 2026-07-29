@@ -4,7 +4,7 @@
 
 **Goal:** Add a dormant, bounded `rerun_production_audit` handler with one-shot positive verification.
 
-**Architecture:** A coordinator runs the existing stable private-snapshot management audit, projects a bounded proof into memory, and lets `get_service_audit_state` consume it once. The existing Phase 6 executor supplies identity, idempotency, circuit breaking, durable evidence, and fail-closed verification.
+**Architecture:** A loopback-only main-service endpoint runs the existing stable private-snapshot management audit in a killable, output-bounded subprocess. A sidecar coordinator captures only the bounded proof and lets `get_service_audit_state` consume it once; the existing Phase 6 executor supplies identity, idempotency, circuit breaking, durable evidence, and fail-closed verification.
 
 **Tech Stack:** Python 3.13, SQLAlchemy/SQLite, Typer, pytest, existing Runtime Agent executor and management-audit helpers.
 
@@ -15,6 +15,8 @@
 **Files:**
 - Create: `src/telegram_kol_research/runtime_agent_production_audit.py`
 - Create: `tests/test_runtime_agent_production_audit.py`
+- Modify: `src/telegram_kol_research/web_app.py`
+- Modify: `tests/test_web_app.py`
 
 **Step 1: Write failing tests**
 
@@ -34,14 +36,16 @@ Expected: FAIL because the module does not exist.
 
 **Step 3: Implement the coordinator**
 
-Add `RuntimeAgentProductionAuditRefresh` with:
+Add:
 
 - injected `runner`;
 - executor identity validation;
 - fixed-field bounded audit projection;
 - `rerun`, `has_capture`, and `consume_verification`;
 - atomic one-shot consumption;
-- a maximum of 32 ephemeral captures.
+- a maximum of 32 ephemeral captures;
+- a loopback-only, proxy-refusing endpoint;
+- a 20-second killable subprocess and 1 MiB output ceiling.
 
 **Step 4: Verify GREEN**
 
@@ -71,10 +75,10 @@ wired.
 
 **Step 3: Implement minimal wiring**
 
-Construct the coordinator with a bounded call to
-`_audit_management_batches_read_only(database_path, limit=100)`, inject it
-into the tool registry and action-handler builder, and prefer one live proof in
-`get_service_audit_state` before the existing passive projection.
+Construct the coordinator with a 25-second loopback HTTP reader, inject it into
+the tool registry and action-handler builder, and prefer one live proof in
+`get_service_audit_state` before the existing passive projection. Do not grant
+the sidecar database ownership, `CAP_FOWNER`, or systemd access.
 
 **Step 4: Verify GREEN**
 
@@ -151,4 +155,3 @@ production ledger or business-row change, and no notification.
 Update the canonical status with tests, deployment, canary, exact remaining
 work, and the next Phase 6 candidate. Commit and push the documentation-only
 checkpoint without another production restart.
-

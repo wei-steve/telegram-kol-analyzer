@@ -11,6 +11,7 @@ from telegram_kol_research.cli import (
     _build_runtime_agent_cli_tools,
     _build_runtime_agent_production_audit_refresh,
     _read_runtime_agent_exchange_snapshot,
+    _read_runtime_agent_production_audit,
     app,
 )
 from telegram_kol_research.runtime_agent_tools import (
@@ -501,50 +502,72 @@ def test_phase6_wires_audit_handler_to_one_shot_live_verification(tmp_path):
     assert len(calls) == 2
 
 
-def test_phase6_production_audit_runner_uses_requested_database_path(
-    tmp_path,
+def test_phase6_production_audit_reader_uses_bounded_loopback_endpoint(
     monkeypatch,
 ):
-    database_path = tmp_path / "production.db"
-    calls = []
+    observed = {}
 
-    def audit(path, *, limit):
-        calls.append((path, limit))
-        return {
-            "snapshot_status": "stable",
-            "snapshot_validation": "ok",
-            "schema_status": "available",
-            "output_complete": True,
-            "batches_truncated": False,
-            "malformed_row_count": 0,
-            "malformed_field_count": 0,
-            "legacy_pending_management": {
-                "complete": True,
-                "truncated": False,
-                "scan_truncated": False,
-            },
-            "counts": {
-                "batches_total": 0,
-                "blocked": 0,
-                "submit_unknown": 0,
-                "partial_failed": 0,
-                "recovery_required": 0,
-            },
-        }
+    class Response:
+        def raise_for_status(self):
+            return None
 
-    monkeypatch.setattr(
-        "telegram_kol_research.cli._audit_management_batches_read_only",
-        audit,
-    )
+        def json(self):
+            return {
+                "snapshot_status": "stable",
+                "snapshot_validation": "ok",
+                "schema_status": "available",
+                "output_complete": True,
+                "batches_truncated": False,
+                "malformed_row_count": 0,
+                "malformed_field_count": 0,
+                "legacy_pending_management": {
+                    "complete": True,
+                    "truncated": False,
+                    "scan_truncated": False,
+                },
+                "counts": {
+                    "batches_total": 0,
+                    "blocked": 0,
+                    "submit_unknown": 0,
+                    "partial_failed": 0,
+                    "recovery_required": 0,
+                },
+            }
 
-    refresh = _build_runtime_agent_production_audit_refresh(database_path)
+    class Client:
+        def __init__(self, *, timeout, trust_env):
+            observed["timeout"] = timeout
+            observed["trust_env"] = trust_env
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, url):
+            observed["url"] = url
+            return Response()
+
+    monkeypatch.setattr("telegram_kol_research.cli.httpx.Client", Client)
+
+    result = _read_runtime_agent_production_audit()
+    refresh = _build_runtime_agent_production_audit_refresh()
     assert refresh.rerun(
         incident_id=1,
         idempotency_key="runtime-incident:1:audit:v1",
         expected_fingerprint="a" * 64,
     )
 
-    assert calls == [(database_path, 100)]
+    assert result["output_complete"] is True
+    assert observed == {
+        "timeout": 25.0,
+        "trust_env": False,
+        "url": (
+            "http://127.0.0.1:8000/api/runtime-agent/"
+            "read-only-production-audit"
+        ),
+    }
 
 
 def test_runtime_agent_exchange_snapshot_reader_allows_bounded_provider_latency(

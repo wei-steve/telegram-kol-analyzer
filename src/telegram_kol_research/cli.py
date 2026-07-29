@@ -2531,14 +2531,20 @@ def _read_runtime_agent_exchange_snapshot() -> dict[str, Any]:
         return response.json()
 
 
+def _read_runtime_agent_production_audit() -> dict[str, Any]:
+    with httpx.Client(timeout=25.0, trust_env=False) as client:
+        response = client.post(
+            "http://127.0.0.1:8000/api/runtime-agent/"
+            "read-only-production-audit"
+        )
+        response.raise_for_status()
+        return response.json()
+
+
 def _build_runtime_agent_production_audit_refresh(
-    database_path: Path,
 ) -> RuntimeAgentProductionAuditRefresh:
     return RuntimeAgentProductionAuditRefresh(
-        runner=lambda: _audit_management_batches_read_only(
-            database_path,
-            limit=100,
-        )
+        runner=_read_runtime_agent_production_audit
     )
 
 
@@ -2584,7 +2590,7 @@ def runtime_incident_agent_once(
         reader=_read_runtime_agent_exchange_snapshot
     )
     production_audit_refresh = (
-        _build_runtime_agent_production_audit_refresh(database_path)
+        _build_runtime_agent_production_audit_refresh()
     )
     tools = _build_runtime_agent_cli_tools(
         session_factory,
@@ -2669,7 +2675,7 @@ def runtime_incident_agent_worker(
         reader=_read_runtime_agent_exchange_snapshot
     )
     production_audit_refresh = (
-        _build_runtime_agent_production_audit_refresh(database_path)
+        _build_runtime_agent_production_audit_refresh()
     )
     tools = _build_runtime_agent_cli_tools(
         session_factory,

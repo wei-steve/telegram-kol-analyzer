@@ -54,6 +54,10 @@ from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
 from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
+from telegram_kol_research.runtime_agent_production_audit import (
+    project_bounded_production_audit,
+    run_bounded_production_audit_command,
+)
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
@@ -3033,6 +3037,7 @@ def create_web_app(
     strategy_management_worker_interval_seconds: float = 5.0,
     strategy_management_worker_startup_delay_seconds: float = 5.0,
     strategy_management_worker_max_batches: int = 10,
+    runtime_agent_production_audit_runner=None,
 ) -> FastAPI:
     """Create the minimal FastAPI app used by the web command."""
 
@@ -3284,6 +3289,14 @@ def create_web_app(
 
     app = FastAPI(title="Telegram KOL Research Web", lifespan=lifespan)
     app.state.database_path = Path(database_path)
+    app.state.runtime_agent_production_audit_runner = (
+        runtime_agent_production_audit_runner
+        or (
+            lambda: run_bounded_production_audit_command(
+                resolved_database_path
+            )
+        )
+    )
     app.state.log_directory = log_directory
     app.state.session_factory = create_session_factory(database_path)
     app.state.media_root = resolved_media_root.resolve()
@@ -3568,6 +3581,27 @@ def create_web_app(
                     logger.warning(
                         "Runtime Agent read-only exchange client cleanup failed"
                     )
+
+    @app.post("/api/runtime-agent/read-only-production-audit")
+    def api_runtime_agent_read_only_production_audit(request: Request):
+        client_host = request.client.host if request.client is not None else ""
+        if (
+            client_host not in {"127.0.0.1", "::1"}
+            or "x-forwarded-for" in request.headers
+        ):
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            return project_bounded_production_audit(
+                app.state.runtime_agent_production_audit_runner()
+            )
+        except Exception:
+            logger.warning(
+                "Runtime Agent read-only production audit is unavailable"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="production audit unavailable",
+            )
 
     @app.get("/api/management-batches")
     def api_management_batches(chat_id: int, limit: int = 50):

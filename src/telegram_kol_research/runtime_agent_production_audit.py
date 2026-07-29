@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import re
+import json
+import sys
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 from typing import Any
+
+from telegram_kol_research.production_safety_monitor import (
+    _run_bounded_command,
+)
 
 
 _MAX_EPHEMERAL_CAPTURES = 32
 _MAX_COUNT = 1_000_000
+_MAX_COMMAND_OUTPUT_BYTES = 1_048_576
 _FINGERPRINT_PATTERN = re.compile(r"[a-f0-9]{64}")
 _COUNT_FIELDS = (
     "batches_total",
@@ -134,6 +142,68 @@ def _project_audit(value: Any) -> _AuditProof:
             for name in _COUNT_FIELDS
         },
     )
+
+
+def _proof_payload(proof: _AuditProof) -> dict[str, Any]:
+    return {
+        "snapshot_status": proof.snapshot_status,
+        "snapshot_validation": proof.snapshot_validation,
+        "schema_status": proof.schema_status,
+        "output_complete": proof.output_complete,
+        "batches_truncated": proof.batches_truncated,
+        "malformed_row_count": proof.malformed_row_count,
+        "malformed_field_count": proof.malformed_field_count,
+        "legacy_pending_management": {
+            "complete": proof.legacy_complete,
+            "truncated": False if proof.legacy_complete else True,
+            "scan_truncated": False,
+        },
+        "counts": dict(proof.counts),
+    }
+
+
+def project_bounded_production_audit(value: Any) -> dict[str, Any]:
+    """Reduce an audit result to the fixed proof accepted by the sidecar."""
+
+    return _proof_payload(_project_audit(value))
+
+
+def run_bounded_production_audit_command(
+    database_path: str | Path,
+    *,
+    timeout_seconds: float = 20.0,
+    audit_command: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Run the exact read-only audit in a killable, output-bounded process."""
+
+    if not 0.05 <= float(timeout_seconds) <= 20.0:
+        raise ValueError("production audit timeout is invalid")
+    command = audit_command or (
+        sys.executable,
+        "-m",
+        "telegram_kol_research.cli",
+        "audit-management-batches",
+        "--database-path",
+        str(Path(database_path)),
+        "--limit",
+        "100",
+        "--output-format",
+        "json",
+    )
+    try:
+        completed = _run_bounded_command(
+            command,
+            timeout_seconds=float(timeout_seconds),
+            max_output_bytes=_MAX_COMMAND_OUTPUT_BYTES,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("audit command failed")
+        value = json.loads(completed.output)
+        return project_bounded_production_audit(value)
+    except Exception as exc:
+        raise RuntimeAgentProductionAuditError(
+            "production audit unavailable"
+        ) from exc
 
 
 class RuntimeAgentProductionAuditRefresh:

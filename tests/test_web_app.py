@@ -4935,3 +4935,101 @@ def test_runtime_agent_exchange_snapshot_endpoint_hides_close_failures(
     assert response.status_code == 200
     assert response.json()["complete"] is True
     assert "close-secret-error" not in response.text
+
+
+def test_runtime_agent_production_audit_endpoint_is_bounded_and_redacted(
+    tmp_path,
+):
+    def audit():
+        return {
+            "snapshot_status": "stable",
+            "snapshot_validation": "ok",
+            "schema_status": "available",
+            "output_complete": True,
+            "batches_truncated": False,
+            "malformed_row_count": 0,
+            "malformed_field_count": 0,
+            "legacy_pending_management": {
+                "complete": True,
+                "truncated": False,
+                "scan_truncated": False,
+            },
+            "counts": {
+                "batches_total": 80,
+                "blocked": 32,
+                "submit_unknown": 0,
+                "partial_failed": 1,
+                "recovery_required": 5,
+            },
+            "batches": [{"secret": "omitted"}],
+        }
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_agent_production_audit_runner=audit,
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-agent/read-only-production-audit"
+    )
+
+    assert response.status_code == 200
+    assert set(response.json()) == {
+        "snapshot_status",
+        "snapshot_validation",
+        "schema_status",
+        "output_complete",
+        "batches_truncated",
+        "malformed_row_count",
+        "malformed_field_count",
+        "legacy_pending_management",
+        "counts",
+    }
+    assert response.json()["output_complete"] is True
+    assert "omitted" not in response.text
+
+
+def test_runtime_agent_production_audit_endpoint_hides_runner_failures(
+    tmp_path,
+):
+    def unavailable():
+        raise RuntimeError("audit-secret-error")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_agent_production_audit_runner=unavailable,
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-agent/read-only-production-audit"
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "production audit unavailable"}
+    assert "audit-secret-error" not in response.text
+
+
+def test_runtime_agent_production_audit_endpoint_refuses_non_loopback_clients(
+    tmp_path,
+):
+    calls = []
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_agent_production_audit_runner=lambda: calls.append("run"),
+    )
+
+    response = TestClient(
+        app,
+        client=("198.51.100.8", 50000),
+    ).post("/api/runtime-agent/read-only-production-audit")
+    proxied = TestClient(
+        app,
+        client=("127.0.0.1", 50000),
+    ).post(
+        "/api/runtime-agent/read-only-production-audit",
+        headers={"x-forwarded-for": "198.51.100.8"},
+    )
+
+    assert response.status_code == 404
+    assert proxied.status_code == 404
+    assert calls == []

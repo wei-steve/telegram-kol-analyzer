@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import sys
+import time
+
 import pytest
 
 from telegram_kol_research.runtime_agent_production_audit import (
     RuntimeAgentProductionAuditError,
     RuntimeAgentProductionAuditRefresh,
+    project_bounded_production_audit,
+    run_bounded_production_audit_command,
 )
 
 
@@ -218,3 +223,36 @@ def test_ephemeral_audit_captures_are_bounded_to_32():
     assert refresh.has_capture(1) is False
     assert refresh.has_capture(2) is True
     assert refresh.has_capture(33) is True
+
+
+def test_server_projection_omits_raw_audit_rows_and_unknown_fields():
+    payload = project_bounded_production_audit(
+        _audit(
+            batches=[{"sensitive": "omitted"}],
+            unexpected_secret="omitted",
+        )
+    )
+
+    assert payload == _audit()
+    assert "batches" not in payload
+    assert "unexpected_secret" not in payload
+
+
+def test_blocking_audit_subprocess_is_killed_within_hard_deadline(tmp_path):
+    started = time.monotonic()
+
+    with pytest.raises(
+        RuntimeAgentProductionAuditError,
+        match="production audit unavailable",
+    ):
+        run_bounded_production_audit_command(
+            tmp_path / "research.db",
+            timeout_seconds=0.1,
+            audit_command=(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+            ),
+        )
+
+    assert time.monotonic() - started < 2
