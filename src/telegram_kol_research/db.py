@@ -653,3 +653,15 @@ def create_session_factory(database_path: str | Path) -> sessionmaker:
     )
     init_db(engine)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+
+def create_existing_session_factory(database_path: str | Path) -> sessionmaker:
+    """Open an existing SQLite database without running bootstrap migrations."""
+
+    db_path = Path(database_path).resolve(strict=True)
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"timeout": 30},
+        future=True,
+    )
+    return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)

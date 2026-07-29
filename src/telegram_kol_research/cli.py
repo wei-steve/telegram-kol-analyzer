@@ -33,7 +33,10 @@ from telegram_kol_research.context_resolution_worker import (
 )
 from telegram_kol_research.binance_market_data import BinanceMarketDataProvider
 from telegram_kol_research.dataset_export import export_dataset_jsonl
-from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.db import (
+    create_existing_session_factory,
+    create_session_factory,
+)
 from telegram_kol_research.deepcoin_contract_specs import load_deepcoin_contract_specs
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.execution_bindings import (
@@ -1857,7 +1860,9 @@ def monitor_production_safety(
         notify=notify,
         force_full_audit=force_full_audit,
         lookback=timedelta(minutes=lookback_minutes),
-        runtime_incident_session_factory=create_session_factory(database_path),
+        runtime_incident_session_factory=create_existing_session_factory(
+            database_path
+        ),
     )
     summary = {
         "audit_ran": outcome.audit_ran,

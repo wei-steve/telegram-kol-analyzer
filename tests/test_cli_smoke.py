@@ -2,6 +2,7 @@ from typer.testing import CliRunner
 from datetime import UTC, datetime
 import json
 import os
+from pathlib import Path
 import sqlite3
 import tracemalloc
 from types import SimpleNamespace
@@ -320,10 +321,18 @@ def test_monitor_production_test_notification_uses_fixed_text_only(monkeypatch):
 def test_monitor_production_prints_compact_fixed_summary_and_exits_nonzero(monkeypatch):
     import telegram_kol_research.cli as cli_module
 
+    existing_factory = object()
+    requested_paths = []
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda path: requested_paths.append(path) or existing_factory,
+    )
+    observed_kwargs = {}
     monkeypatch.setattr(
         cli_module,
         "run_production_safety_monitor",
-        lambda **kwargs: SimpleNamespace(
+        lambda **kwargs: observed_kwargs.update(kwargs) or SimpleNamespace(
             audit_ran=False,
             exit_code=1,
             monitor_error="notification_delivery_failed",
@@ -346,10 +355,14 @@ def test_monitor_production_prints_compact_fixed_summary_and_exits_nonzero(monke
             "live",
             "--expected-max-concurrent-positions",
             "4",
+            "--database-path",
+            "/tmp/monitor-read-only.db",
         ],
     )
 
     assert result.exit_code == 1
+    assert requested_paths == [Path("/tmp/monitor-read-only.db")]
+    assert observed_kwargs["runtime_incident_session_factory"] is existing_factory
     assert json.loads(result.stdout) == {
         "audit_ran": False,
         "healthy": False,

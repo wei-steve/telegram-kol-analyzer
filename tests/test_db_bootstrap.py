@@ -2,6 +2,7 @@ import sqlite3
 
 from sqlalchemy import text
 
+from telegram_kol_research import db as db_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import Base
 
@@ -16,6 +17,51 @@ def test_database_bootstrap_creates_tables(tmp_path):
     assert "recognition_experiments" in tables
     assert "runtime_incidents" in tables
     assert engine is not None
+
+
+def test_existing_session_factory_skips_bootstrap_and_preserves_writes(tmp_path):
+    database_path = tmp_path / "research.db"
+    writable_session_factory = create_session_factory(database_path)
+    with writable_session_factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO strategy_lifecycles ("
+                "chat_id, message_id, symbol, side, lifecycle_status, "
+                "signal_at, created_at, updated_at, management_action, "
+                "filled_tp_index"
+                ") VALUES (1, 2, 'BTC', 'long', 'pending', "
+                "'2026-07-29 00:00:00', '2026-07-29 00:00:00', "
+                "'2026-07-29 00:00:00', 'expiry_review_requested', -1)"
+            )
+        )
+        session.commit()
+
+    existing_session_factory = db_module.create_existing_session_factory(
+        database_path
+    )
+    with existing_session_factory() as session:
+        notified_at = session.execute(
+            text(
+                "SELECT expiry_review_notified_at "
+                "FROM strategy_lifecycles WHERE chat_id = 1 AND message_id = 2"
+            )
+        ).scalar_one()
+        assert notified_at is None
+        session.execute(
+            text(
+                "UPDATE strategy_lifecycles "
+                "SET expiry_review_notified_at = '2026-07-29 01:00:00'"
+            )
+        )
+        session.commit()
+
+    with existing_session_factory() as session:
+        assert session.execute(
+            text(
+                "SELECT expiry_review_notified_at "
+                "FROM strategy_lifecycles WHERE chat_id = 1 AND message_id = 2"
+            )
+        ).scalar_one() == "2026-07-29 01:00:00"
 
 
 def test_message_instruction_items_have_visibility_retry_columns(tmp_path):
