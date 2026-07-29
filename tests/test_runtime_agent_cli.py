@@ -279,6 +279,123 @@ def test_phase6_production_handlers_wire_only_a_real_read_only_plan(tmp_path):
     ) is True
 
 
+def test_phase6_wires_refresh_handler_to_independent_live_verification(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        batch = StrategyManagementBatch(
+            idempotency_fingerprint="phase6-refresh-handler",
+            raw_message_id=1,
+            recognition_decision_id=1,
+            recognition_generation="fixture",
+            target_lifecycle_id=1,
+            strategy_instance_id="fixture",
+            execution_binding_id=1,
+            intent="close",
+            effective_action="close",
+            target_fingerprint="target",
+            target_snapshot_json="{}",
+            status="partial_failed",
+        )
+        session.add(batch)
+        session.commit()
+        batch_id = batch.id
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="strategy_management_batch",
+        source_record_id=str(batch_id),
+        incident_type="management_partial_failed",
+        severity="high",
+        fingerprint="r" * 64,
+        redacted_summary='{"source_status":"partial_failed"}',
+        occurred_at=datetime(2026, 7, 29, 9, 0, tzinfo=UTC),
+        feature_policy_version="runtime-incident-phase-6-v1",
+        prompt_version="runtime-agent-prompt-v7",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    calls = []
+
+    class Refresh:
+        def refresh(self, **kwargs):
+            calls.append(("refresh", kwargs))
+            return True
+
+        def consume_comparison(self, *, incident_id):
+            if not any(call[0] == "refresh" for call in calls):
+                return None
+            if any(call[0] == "compare" for call in calls):
+                return None
+            calls.append(("compare", incident_id))
+            return {
+                "comparison_kind": (
+                    "local_vs_coherent_read_only_snapshot"
+                ),
+                "applicable": True,
+                "coherent": True,
+                "complete": True,
+                "matches": 1,
+                "mismatches": 0,
+                "unknown": 0,
+                "position_count": 1,
+                "open_order_count": 0,
+            }
+
+    refresh = Refresh()
+    tools = _build_runtime_agent_cli_tools(
+        session_factory,
+        max_output_bytes=8192,
+        monitor_state_path=tmp_path / "missing-monitor-state.json",
+        journal_reader=lambda: (),
+        exchange_snapshot_refresh=refresh,
+    )
+    handlers = _build_runtime_agent_action_handlers(
+        tools,
+        exchange_snapshot_refresh=refresh,
+    )
+
+    passive = tools.execute(
+        "compare_local_exchange",
+        {"incident_id": incident.id},
+        expected_incident_id=incident.id,
+    )
+    assert passive.data["comparison_kind"] == (
+        "local_vs_durable_last_observed"
+    )
+    assert set(handlers) == {
+        "build_read_only_reconciliation_plan",
+        "refresh_read_only_exchange_snapshot",
+    }
+
+    assert handlers["refresh_read_only_exchange_snapshot"](
+        incident_id=incident.id,
+        idempotency_key="runtime-incident:1:refresh:v1",
+        expected_fingerprint=incident.fingerprint,
+    ) is True
+    verified = tools.execute(
+        "compare_local_exchange",
+        {"incident_id": incident.id},
+        expected_incident_id=incident.id,
+    )
+
+    assert calls[0][0] == "refresh"
+    assert calls[1] == ("compare", incident.id)
+    assert verified.data["coherent"] is True
+    assert verified.evidence_refs == (
+        f"incident:{incident.id}",
+        f"exchange-snapshot:{incident.id}",
+    )
+    passive_again = tools.execute(
+        "compare_local_exchange",
+        {"incident_id": incident.id},
+        expected_incident_id=incident.id,
+    )
+    assert passive_again.data["comparison_kind"] == (
+        "local_vs_durable_last_observed"
+    )
+    assert len(calls) == 2
+
+
 def test_phase4_protection_projection_is_bounded_and_omits_order_ids(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

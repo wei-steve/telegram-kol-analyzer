@@ -4798,3 +4798,140 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
     assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
     assert fake_client.trigger_payloads[0]["slTriggerPx"] == "67500.0"
     assert "tpTriggerPx" not in fake_client.trigger_payloads[0]
+
+
+def test_runtime_agent_exchange_snapshot_endpoint_is_bounded_and_redacted(
+    tmp_path,
+):
+    class ReadOnlyClient:
+        def list_positions(self):
+            return [
+                {
+                    "posId": "position-secret",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "1",
+                    "markPx": "100",
+                }
+            ]
+
+        def list_open_orders(self):
+            return [
+                {
+                    "ordId": "order-secret",
+                    "instId": "BTC-USDT-SWAP",
+                    "state": "live",
+                    "side": "sell",
+                    "sz": "1",
+                }
+            ]
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=ReadOnlyClient,
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-agent/read-only-exchange-snapshot"
+    )
+
+    assert response.status_code == 200
+    assert set(response.json()) == {
+        "snapshot_kind",
+        "complete",
+        "position_count",
+        "open_order_count",
+        "fingerprint",
+    }
+    assert response.json()["complete"] is True
+    assert response.json()["position_count"] == 1
+    assert response.json()["open_order_count"] == 1
+    assert len(response.json()["fingerprint"]) == 64
+    assert "position-secret" not in response.text
+    assert "order-secret" not in response.text
+
+
+def test_runtime_agent_exchange_snapshot_endpoint_hides_provider_failures(
+    tmp_path,
+):
+    class BrokenReadOnlyClient:
+        def list_positions(self):
+            raise RuntimeError("provider-secret-error")
+
+        def list_open_orders(self):
+            raise AssertionError("must stop after incomplete positions")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=BrokenReadOnlyClient,
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-agent/read-only-exchange-snapshot"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "snapshot_kind": "bounded_read_only_exchange",
+        "complete": False,
+        "position_count": 0,
+        "open_order_count": 0,
+        "fingerprint": None,
+    }
+    assert "provider-secret-error" not in response.text
+
+
+def test_runtime_agent_exchange_snapshot_endpoint_refuses_non_loopback_clients(
+    tmp_path,
+):
+    factory_calls = []
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: (
+            factory_calls.append("called") or object()
+        ),
+    )
+
+    response = TestClient(
+        app,
+        client=("198.51.100.8", 50000),
+    ).get("/api/runtime-agent/read-only-exchange-snapshot")
+    proxied = TestClient(
+        app,
+        client=("127.0.0.1", 50000),
+    ).get(
+        "/api/runtime-agent/read-only-exchange-snapshot",
+        headers={"x-forwarded-for": "198.51.100.8"},
+    )
+
+    assert response.status_code == 404
+    assert proxied.status_code == 404
+    assert factory_calls == []
+
+
+def test_runtime_agent_exchange_snapshot_endpoint_hides_close_failures(
+    tmp_path,
+):
+    class CloseFailureClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+        def close(self):
+            raise RuntimeError("close-secret-error")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=CloseFailureClient,
+    )
+
+    response = TestClient(
+        app,
+        client=("127.0.0.1", 50000),
+    ).get("/api/runtime-agent/read-only-exchange-snapshot")
+
+    assert response.status_code == 200
+    assert response.json()["complete"] is True
+    assert "close-secret-error" not in response.text

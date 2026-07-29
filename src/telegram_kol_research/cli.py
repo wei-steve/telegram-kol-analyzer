@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import typer
 from sqlalchemy import create_engine, tuple_
 from sqlalchemy.orm import sessionmaker
@@ -117,6 +118,9 @@ from telegram_kol_research.runtime_agent_tools import (
     build_prior_attempts_summary,
     build_protection_summary,
     build_worker_history_summary,
+)
+from telegram_kol_research.runtime_agent_exchange_snapshot import (
+    RuntimeAgentExchangeSnapshotRefresh,
 )
 from telegram_kol_research.runtime_agent_evaluation import (
     evaluate_runtime_agent_case,
@@ -1891,6 +1895,9 @@ def _build_runtime_agent_cli_tools(
         "/var/lib/telegram-kol-monitor/state.json"
     ),
     journal_reader=None,
+    exchange_snapshot_refresh: (
+        RuntimeAgentExchangeSnapshotRefresh | None
+    ) = None,
 ) -> RuntimeAgentToolRegistry:
     def load_incident(session, incident_id: int):
         row = session.get(RuntimeIncident, incident_id)
@@ -2301,6 +2308,24 @@ def _build_runtime_agent_cli_tools(
             }
 
     def compare_local_exchange(*, incident_id: int):
+        live_comparison = (
+            exchange_snapshot_refresh.consume_comparison(
+                incident_id=int(incident_id)
+            )
+            if exchange_snapshot_refresh is not None
+            else None
+        )
+        if live_comparison is not None:
+            return {
+                "data": {
+                    "incident_id": int(incident_id),
+                    **live_comparison,
+                },
+                "evidence_refs": [
+                    f"incident:{int(incident_id)}",
+                    f"exchange-snapshot:{int(incident_id)}",
+                ],
+            }
         with session_factory() as session:
             incident = load_incident(session, incident_id)
             batch = load_management_batch(session, incident)
@@ -2401,6 +2426,10 @@ def _build_runtime_agent_cli_tools(
 
 def _build_runtime_agent_action_handlers(
     tools: RuntimeAgentToolRegistry,
+    *,
+    exchange_snapshot_refresh: (
+        RuntimeAgentExchangeSnapshotRefresh | None
+    ) = None,
 ):
     """Wire only concrete, reviewed Phase 6 actions into production entrypoints."""
 
@@ -2422,11 +2451,39 @@ def _build_runtime_agent_action_handlers(
             and comparison.data.get("applicable") is True
         )
 
-    return {
+    handlers = {
         "build_read_only_reconciliation_plan": (
             build_read_only_reconciliation_plan
         )
     }
+    if exchange_snapshot_refresh is not None:
+
+        def refresh_read_only_exchange_snapshot(
+            *,
+            incident_id: int,
+            idempotency_key: str,
+            expected_fingerprint: str,
+        ) -> bool:
+            return exchange_snapshot_refresh.refresh(
+                incident_id=int(incident_id),
+                idempotency_key=str(idempotency_key),
+                expected_fingerprint=str(expected_fingerprint),
+            )
+
+        handlers["refresh_read_only_exchange_snapshot"] = (
+            refresh_read_only_exchange_snapshot
+        )
+    return handlers
+
+
+def _read_runtime_agent_exchange_snapshot() -> dict[str, Any]:
+    with httpx.Client(timeout=5.0) as client:
+        response = client.get(
+            "http://127.0.0.1:8000/api/runtime-agent/"
+            "read-only-exchange-snapshot"
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 @app.command("runtime-incident-agent-evaluate")
@@ -2467,11 +2524,18 @@ def runtime_incident_agent_once(
 
     runtime_config = load_runtime_incident_config(environment_only=True)
     session_factory = create_session_factory(database_path)
+    exchange_snapshot_refresh = RuntimeAgentExchangeSnapshotRefresh(
+        reader=_read_runtime_agent_exchange_snapshot
+    )
     tools = _build_runtime_agent_cli_tools(
         session_factory,
         max_output_bytes=runtime_config.agent_max_tool_output_bytes,
+        exchange_snapshot_refresh=exchange_snapshot_refresh,
     )
-    action_handlers = _build_runtime_agent_action_handlers(tools)
+    action_handlers = _build_runtime_agent_action_handlers(
+        tools,
+        exchange_snapshot_refresh=exchange_snapshot_refresh,
+    )
     worker_config = RuntimeAgentWorkerConfig(
         enabled=runtime_config.agent_enabled,
         max_tool_steps=runtime_config.agent_max_tool_steps,
@@ -2540,11 +2604,18 @@ def runtime_incident_agent_worker(
         )
         return
     session_factory = create_session_factory(database_path)
+    exchange_snapshot_refresh = RuntimeAgentExchangeSnapshotRefresh(
+        reader=_read_runtime_agent_exchange_snapshot
+    )
     tools = _build_runtime_agent_cli_tools(
         session_factory,
         max_output_bytes=runtime_config.agent_max_tool_output_bytes,
+        exchange_snapshot_refresh=exchange_snapshot_refresh,
     )
-    action_handlers = _build_runtime_agent_action_handlers(tools)
+    action_handlers = _build_runtime_agent_action_handlers(
+        tools,
+        exchange_snapshot_refresh=exchange_snapshot_refresh,
+    )
     worker_config = RuntimeAgentWorkerConfig(
         enabled=True,
         max_tool_steps=runtime_config.agent_max_tool_steps,

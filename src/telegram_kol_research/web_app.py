@@ -130,6 +130,10 @@ from telegram_kol_research.recovery_live_submit import submit_recovery_order_liv
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_runner import run_recovery_dry_run
+from telegram_kol_research.runtime_agent_exchange_snapshot import (
+    build_read_only_exchange_snapshot,
+    incomplete_read_only_exchange_snapshot,
+)
 from telegram_kol_research.semantic_disagreement_review import run_semantic_review_loop
 from telegram_kol_research.strategy_management_worker import (
     run_strategy_management_worker_loop,
@@ -3537,6 +3541,33 @@ def create_web_app(
             limit=limit,
             level=normalized_level,
         )
+
+    @app.get("/api/runtime-agent/read-only-exchange-snapshot")
+    def api_runtime_agent_read_only_exchange_snapshot(request: Request):
+        client_host = request.client.host if request.client is not None else ""
+        if (
+            client_host not in {"127.0.0.1", "::1"}
+            or "x-forwarded-for" in request.headers
+        ):
+            raise HTTPException(status_code=404, detail="not found")
+        client = None
+        try:
+            client = app.state.deepcoin_client_factory()
+            return build_read_only_exchange_snapshot(client)
+        except Exception:
+            logger.warning(
+                "Runtime Agent read-only exchange snapshot is unavailable"
+            )
+            return incomplete_read_only_exchange_snapshot()
+        finally:
+            close_client = getattr(client, "close", None)
+            if callable(close_client):
+                try:
+                    close_client()
+                except Exception:
+                    logger.warning(
+                        "Runtime Agent read-only exchange client cleanup failed"
+                    )
 
     @app.get("/api/management-batches")
     def api_management_batches(chat_id: int, limit: int = 50):

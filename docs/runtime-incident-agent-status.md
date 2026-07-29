@@ -13,6 +13,10 @@ last_completed_phase: 5
 last_completed_commit: 8ec6542
 production_commit: 731318b236cca9609c964e4b4503a700459fc3fe
 local_tests:
+  - "phase-6-read-only-exchange-refresh-runtime-web-focused: 261 passed"
+  - "phase-6-read-only-exchange-refresh-context-management-regressions: 396 passed"
+  - "phase-6-read-only-exchange-refresh-listener-monitor-mutation-regressions: 178 passed, 1 skipped"
+  - "phase-6-read-only-exchange-refresh-offline-evaluation: 7 cases, all nine metrics at 1.0"
   - "phase-6-mimo-closed-final-correction-runtime-and-provider-focused: 136 passed"
   - "phase-6-mimo-closed-final-correction-context-management-regressions: 396 passed"
   - "phase-6-mimo-closed-final-correction-listener-monitor-mutation-regressions: 178 passed, 1 skipped"
@@ -342,6 +346,13 @@ Phase 5 is not complete until:
   before recovery policy or action. Local review found no Critical, Important,
   or Minor defects. Commit `731318b` is deployed and the live MiMo closed-final
   validation passed without changing the three production incident rows.
+- The next Phase 6 handler,
+  `refresh_read_only_exchange_snapshot`, is locally complete and reviewed with
+  no Critical, Important, or Minor findings. The sidecar receives no Deepcoin
+  credential: a loopback-only, proxy-refusing main-service endpoint returns a
+  bounded redacted state fingerprint, and the one-shot handler plus independent
+  verification consume exactly two complete coherent reads. Deployment and
+  canary remain pending.
 
 ## Current Phase 6 Exit Checklist
 
