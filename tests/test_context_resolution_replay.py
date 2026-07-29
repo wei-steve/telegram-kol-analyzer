@@ -244,6 +244,7 @@ def test_replay_executes_revision_cancel_and_late_fill_recovery_path(tmp_path):
     class CancelClient:
         def __init__(self):
             self.open_orders = [{"ordId": "replacement-1"}]
+            self.order_history = []
 
         def list_trigger_orders_pending(self, *, inst_id):
             return []
@@ -253,7 +254,19 @@ def test_replay_executes_revision_cancel_and_late_fill_recovery_path(tmp_path):
 
         def cancel_order(self, payload):
             self.open_orders = []
+            self.order_history = [
+                {"ordId": "replacement-1", "state": "canceled"}
+            ]
             return {"code": "0"}
+
+        def list_order_history(self, *, inst_id=None):
+            return list(self.order_history)
+
+        def list_trigger_order_history(self, *, inst_id):
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
 
     signal = TradeSignalRecord(
         id=1465,

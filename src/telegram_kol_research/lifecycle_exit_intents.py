@@ -6,6 +6,7 @@ from datetime import datetime
 
 from telegram_kol_research.execution_bindings import (
     binding_has_unresolved_entry_leg,
+    binding_has_verified_live_position_leg,
 )
 from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle, utc_now
 
@@ -15,6 +16,7 @@ def has_live_execution_binding(session, lifecycle: StrategyLifecycle) -> bool:
         binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
         if binding is not None and (
             binding.status in {"open", "active"}
+            or binding_has_verified_live_position_leg(session, binding)
             or binding_has_unresolved_entry_leg(session, binding)
         ):
             return True
@@ -29,6 +31,7 @@ def has_live_execution_binding(session, lifecycle: StrategyLifecycle) -> bool:
     )
     return any(
         binding.status in {"open", "active"}
+        or binding_has_verified_live_position_leg(session, binding)
         or binding_has_unresolved_entry_leg(session, binding)
         for binding in bindings
     )

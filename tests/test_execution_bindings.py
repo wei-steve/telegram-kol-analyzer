@@ -4615,6 +4615,7 @@ def test_sync_missing_position_cleans_pending_entry_before_lifecycle_exit(tmp_pa
                 }
             ]
             self.cancelled = []
+            self.trigger_history = []
 
         def list_positions(self):
             return []
@@ -4628,7 +4629,19 @@ def test_sync_missing_position_cleans_pending_entry_before_lifecycle_exit(tmp_pa
         def cancel_trigger_order(self, payload):
             self.cancelled.append(payload["ordId"])
             self.trigger_orders = []
+            self.trigger_history.append(
+                {"ordId": payload["ordId"], "state": "canceled"}
+            )
             return {"code": "0"}
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
+            return list(self.trigger_history)
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
 
     client = FakeClient()
     result = sync_manual_closed_deepcoin_positions(
@@ -4654,6 +4667,112 @@ def test_sync_missing_position_cleans_pending_entry_before_lifecycle_exit(tmp_pa
             ("manually_closed", "manual_position_missing"),
             ("cancelled", "terminal_entry_cleanup_confirmed"),
         ]
+
+
+def test_missing_position_history_uncertainty_does_not_skip_pending_order_cancel(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            pos_id="pos-history-unknown",
+            status="active",
+            order_id="entry-filled,entry-pending",
+            client_order_id="client-filled,client-pending",
+        ),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=1,
+        order_id="entry-filled",
+        client_order_id="client-filled",
+        pos_id="pos-history-unknown",
+        status="active",
+        attribution_status="attribution_conflict",
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=2,
+        order_id="entry-pending",
+        client_order_id="client-pending",
+        pos_id=None,
+        status="pending",
+        attribution_status="unassigned",
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 30, 1, 0),
+                entered_at=datetime(2026, 7, 30, 1, 1),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class Client:
+        def __init__(self):
+            self.pending = [
+                {
+                    "ordId": "entry-pending",
+                    "clOrdId": "client-pending",
+                }
+            ]
+            self.history = []
+            self.cancel_calls = 0
+
+        def list_positions(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return list(self.pending)
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def cancel_trigger_order(self, payload):
+            self.cancel_calls += 1
+            self.pending = []
+            self.history = [{"ordId": "entry-pending", "state": "canceled"}]
+            return {"code": "0"}
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
+            return list(self.history)
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_position_history(self, *, inst_id, pos_id):
+            return []
+
+    client = Client()
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=client,
+        synced_at=datetime(2026, 7, 30, 2, 0),
+    )
+
+    assert client.cancel_calls == 1
+    assert result.manually_closed == 0
+    with session_factory() as session:
+        lifecycle = session.query(StrategyLifecycle).one()
+        pending_leg = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.order_id == "entry-pending")
+            .one()
+        )
+        assert pending_leg.status == "cancelled"
+        assert lifecycle.lifecycle_status == "entered"
 
 
 def test_sync_manual_closed_positions_terminalizes_only_missing_verified_leg(tmp_path):
@@ -5005,6 +5124,7 @@ def test_sync_repairs_terminal_lifecycle_with_pending_entry_leg_exactly_once(tmp
                 }
             ]
             self.cancel_calls = 0
+            self.trigger_history = []
 
         def list_positions(self):
             return []
@@ -5018,7 +5138,19 @@ def test_sync_repairs_terminal_lifecycle_with_pending_entry_leg_exactly_once(tmp
         def cancel_trigger_order(self, payload):
             self.cancel_calls += 1
             self.trigger_orders = []
+            self.trigger_history.append(
+                {"ordId": payload["ordId"], "state": "canceled"}
+            )
             return {"code": "0"}
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
+            return list(self.trigger_history)
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
 
         def list_position_history(self, *, inst_id, pos_id):
             return []
@@ -5049,6 +5181,136 @@ def test_sync_repairs_terminal_lifecycle_with_pending_entry_leg_exactly_once(tmp
         assert lifecycle.exit_reason == "take_profit"
         assert pending_leg.status == "cancelled"
         assert pending_leg.terminal_reason == "terminal_entry_cleanup_confirmed"
+
+
+def test_terminal_cleanup_query_does_not_starve_anomaly_after_clean_history(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        for index in range(101):
+            binding = ExecutionBinding(
+                kol_id=f"group:{index}",
+                chat_id=10_000 + index,
+                message_id=index + 1,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                status="closed",
+                strategy_instance_id=f"deepcoin:{index}:BTC:long",
+            )
+            session.add(binding)
+            session.flush()
+            session.add(
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="limit",
+                    order_id=f"clean-{index}",
+                    status="cancelled",
+                    terminal_reason="test_terminal",
+                )
+            )
+            session.add(
+                StrategyLifecycle(
+                    chat_id=binding.chat_id,
+                    message_id=binding.message_id,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="exited",
+                    signal_at=datetime(2026, 7, 1),
+                    execution_binding_id=binding.id,
+                )
+            )
+        anomaly_binding = ExecutionBinding(
+            kol_id="group:anomaly",
+            chat_id=99_999,
+            message_id=999,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="unknown",
+            strategy_instance_id="deepcoin:anomaly:BTC:long",
+        )
+        session.add(anomaly_binding)
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=anomaly_binding.id,
+                strategy_instance_id=anomaly_binding.strategy_instance_id,
+                leg_index=1,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id="anomaly-entry",
+                client_order_id="anomaly-client",
+                status="pending",
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                chat_id=anomaly_binding.chat_id,
+                message_id=anomaly_binding.message_id,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="exited",
+                signal_at=datetime(2026, 7, 1),
+                execution_binding_id=anomaly_binding.id,
+            )
+        )
+        session.commit()
+
+    class Client:
+        def __init__(self):
+            self.pending = [
+                {
+                    "ordId": "anomaly-entry",
+                    "clOrdId": "anomaly-client",
+                }
+            ]
+            self.history = []
+            self.cancel_calls = 0
+
+        def list_positions(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return list(self.pending)
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def cancel_trigger_order(self, payload):
+            self.cancel_calls += 1
+            self.pending = []
+            self.history = [{"ordId": "anomaly-entry", "state": "canceled"}]
+            return {"code": "0"}
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
+            return list(self.history)
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+    client = Client()
+    sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=client,
+        synced_at=datetime(2026, 7, 30, 2, 0),
+    )
+
+    assert client.cancel_calls == 1
+    with session_factory() as session:
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.order_id == "anomaly-entry")
+            .one()
+        )
+        assert leg.status == "cancelled"
 
 
 def test_sync_closed_position_finalizes_pending_kol_exit_exactly_once(tmp_path):

@@ -1931,6 +1931,7 @@ def test_process_entered_expiry_expire_cancel_cancels_only_pending_entry_leg(tmp
     class FakeDeepcoinClient:
         def __init__(self):
             self.cancel_payloads = []
+            self.trigger_history = []
 
         def list_trigger_orders_pending(self, inst_id):
             if self.cancel_payloads:
@@ -1950,7 +1951,22 @@ def test_process_entered_expiry_expire_cancel_cancels_only_pending_entry_leg(tmp
 
         def cancel_trigger_order(self, cancel_payload):
             self.cancel_payloads.append(dict(cancel_payload))
+            self.trigger_history.append(
+                {
+                    "ordId": cancel_payload.get("ordId"),
+                    "state": "canceled",
+                }
+            )
             return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
+            return list(self.trigger_history)
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
 
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

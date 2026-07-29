@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -2623,7 +2623,6 @@ def _cleanup_missing_position_deferred_entries(
                 not pos_ids
                 or any(pos_id in active_pos_ids for pos_id in pos_ids)
                 or any(pos_id in management_reserved_pos_ids for pos_id in pos_ids)
-                or _binding_close_requires_exact_position_history(session, legs=legs)
                 or not _binding_has_unresolved_entry_leg(session, row)
             ):
                 continue
@@ -2667,12 +2666,25 @@ def _cleanup_terminal_lifecycle_entry_exposure(
     with session_factory() as session:
         lifecycles = (
             session.query(StrategyLifecycle)
+            .join(
+                ExecutionOrderLeg,
+                ExecutionOrderLeg.execution_binding_id
+                == StrategyLifecycle.execution_binding_id,
+            )
             .filter(
                 StrategyLifecycle.lifecycle_status.in_(
                     ["exited", "expired", "cancelled", "invalidated"]
                 )
             )
             .filter(StrategyLifecycle.execution_binding_id.is_not(None))
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .filter(ExecutionOrderLeg.pos_id.is_(None))
+            .filter(
+                ~func.lower(func.coalesce(ExecutionOrderLeg.status, "")).in_(
+                    TERMINAL_ENTRY_LEG_STATES
+                )
+            )
+            .distinct()
             .order_by(StrategyLifecycle.id.asc())
             .limit(max(1, min(int(limit), 500)))
             .all()
@@ -3558,6 +3570,25 @@ def binding_has_unresolved_entry_leg(session, row: ExecutionBinding) -> bool:
         leg_pos_ids = {str(leg.pos_id) for leg in eligible_legs if leg.pos_id}
         return not leg_pos_ids or len(leg_pos_ids) < len(eligible_legs)
     return len(_split_ids(row.order_id)) > len(_split_ids(row.pos_id))
+
+
+def binding_has_verified_live_position_leg(
+    session,
+    row: ExecutionBinding,
+) -> bool:
+    """Return whether an exact binding owns a verified nonterminal position leg."""
+
+    return (
+        session.query(ExecutionOrderLeg.id)
+        .filter(ExecutionOrderLeg.execution_binding_id == row.id)
+        .filter(ExecutionOrderLeg.purpose == "entry")
+        .filter(ExecutionOrderLeg.pos_id.is_not(None))
+        .filter(ExecutionOrderLeg.pos_id != "")
+        .filter(ExecutionOrderLeg.attribution_status == "verified")
+        .filter(~ExecutionOrderLeg.status.in_(TERMINAL_ENTRY_LEG_STATES))
+        .first()
+        is not None
+    )
 
 
 def _binding_has_unresolved_entry_leg(session, row: ExecutionBinding) -> bool:

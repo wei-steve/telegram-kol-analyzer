@@ -1122,11 +1122,22 @@ def claim_next_strategy_management_notification(
 
 def format_terminal_entry_cleanup_notification(event) -> str:
     payload = _decode_mapping(event.response_json)
+    terminal_anomaly = (
+        payload.get("reason") == "terminal_lifecycle_entry_exposure"
+    )
     status_labels = {
         "resolved": "已确认取消",
         "already_absent": "已确认挂单不存在",
-        "blocked": "取消未确认，生命周期保持非终态",
-        "unknown": "交易所结果未知，生命周期保持非终态",
+        "blocked": (
+            "取消未确认，已终态生命周期存在不变量异常"
+            if terminal_anomaly
+            else "取消未确认，生命周期保持非终态"
+        ),
+        "unknown": (
+            "交易所结果未知，已终态生命周期存在不变量异常"
+            if terminal_anomaly
+            else "交易所结果未知，生命周期保持非终态"
+        ),
     }
     order_ids = [
         str(value)[:64]

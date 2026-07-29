@@ -150,12 +150,20 @@ def cleanup_terminal_entry_legs(
             error=str(exc),
             failed_at=now,
         )
+        blocked_reasons = {
+            "ambiguous_pending_entry_identity",
+            "pending_entry_cancel_not_confirmed",
+            "pending_entry_cancel_not_terminally_confirmed",
+            "pending_entry_filled_during_cleanup",
+            "pending_entry_leg_partially_filled",
+            "pending_entry_terminal_evidence_unavailable",
+        }
         return _with_notification(
             session_factory,
             TerminalEntryCleanupResult(
                 status=(
                     "blocked"
-                    if str(exc) == "pending_entry_cancel_not_confirmed"
+                    if str(exc) in blocked_reasons
                     else "unknown"
                 ),
                 binding_id=binding_id,
@@ -175,12 +183,35 @@ def cleanup_terminal_entry_legs(
             client_order_ids=set(client_order_ids),
         )
         if still_visible is False:
-            result = cancel_pending_entry_legs(
-                session_factory,
-                trade_signal=trade_signal,
-                deepcoin_client=deepcoin_client,
-                executed_at=now,
-            )
+            try:
+                result = cancel_pending_entry_legs(
+                    session_factory,
+                    trade_signal=trade_signal,
+                    deepcoin_client=deepcoin_client,
+                    executed_at=now,
+                )
+            except Exception:
+                mark_trade_signal_failed(
+                    session_factory,
+                    signal_id=trade_signal.id,
+                    error="terminal_entry_cleanup_exchange_outcome_unknown",
+                    failed_at=now,
+                )
+                return _with_notification(
+                    session_factory,
+                    TerminalEntryCleanupResult(
+                        status="unknown",
+                        binding_id=binding_id,
+                        lifecycle_id=lifecycle_id_value,
+                        leg_ids=leg_ids,
+                        order_ids=order_ids,
+                        event_ids=_event_ids_for_signal(
+                            session_factory, trade_signal.id
+                        ),
+                    ),
+                    reason=reason,
+                    created_at=now,
+                )
         else:
             mark_trade_signal_failed(
                 session_factory,
