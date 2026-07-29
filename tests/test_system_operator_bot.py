@@ -1570,6 +1570,151 @@ def test_cleanup_notification_failure_is_bounded_and_retries_after_restart(
         assert row.notification_message_id == "8899"
 
 
+def test_cleanup_notification_suppresses_legacy_non_cancellable_backstop_noise(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import execution_events as execution_events_module
+    from telegram_kol_research.models import (
+        ExecutionBinding,
+        ExecutionEvent,
+        ExecutionOrderLeg,
+    )
+
+    session_factory = create_session_factory(tmp_path / "cleanup-suppress.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:legacy",
+            chat_id=1,
+            message_id=2,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="unknown",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="unknown",
+            order_id="legacy-order",
+            status="unknown",
+        )
+        session.add(leg)
+        session.commit()
+        binding_id = binding.id
+        leg_id = leg.id
+    event_id = execution_events_module.enqueue_terminal_entry_cleanup_notification(
+        session_factory,
+        lifecycle_id=1,
+        binding_id=binding_id,
+        status="unknown",
+        leg_ids=(leg_id,),
+        order_ids=("legacy-order",),
+        reason="terminal_lifecycle_entry_exposure",
+        created_at=NOW,
+    )
+    with session_factory() as session:
+        event = session.get(ExecutionEvent, event_id)
+        payload = json.loads(event.response_json)
+        payload.pop("notification_policy_version")
+        event.response_json = json.dumps(payload, sort_keys=True)
+        session.commit()
+    sent = []
+
+    async def fake_send(**kwargs):
+        sent.append(kwargs)
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", fake_send
+    )
+    assert asyncio.run(
+        operator_bot_module.deliver_terminal_entry_cleanup_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig(bot_token="token", chat_id="chat"),
+            delivered_at=NOW,
+        )
+    ) == 0
+    assert sent == []
+    with session_factory() as session:
+        event = session.get(ExecutionEvent, event_id)
+        assert event.notification_status == "not_needed"
+        assert event.notification_error == "non_cancellable_entry_state"
+
+
+def test_fresh_cleanup_unknown_is_delivered_if_leg_later_becomes_filled(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import execution_events as execution_events_module
+    from telegram_kol_research.models import (
+        ExecutionBinding,
+        ExecutionEvent,
+        ExecutionOrderLeg,
+    )
+
+    session_factory = create_session_factory(tmp_path / "cleanup-fresh-filled.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:fresh",
+            chat_id=3,
+            message_id=4,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="unknown",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="limit",
+            order_id="fresh-order",
+            status="pending",
+        )
+        session.add(leg)
+        session.commit()
+        binding_id = binding.id
+        leg_id = leg.id
+    event_id = execution_events_module.enqueue_terminal_entry_cleanup_notification(
+        session_factory,
+        lifecycle_id=2,
+        binding_id=binding_id,
+        status="unknown",
+        leg_ids=(leg_id,),
+        order_ids=("fresh-order",),
+        reason="terminal_lifecycle_entry_exposure",
+        created_at=NOW,
+    )
+    with session_factory() as session:
+        session.get(ExecutionOrderLeg, leg_id).status = "filled"
+        session.commit()
+    sent = []
+
+    async def fake_send(**kwargs):
+        sent.append(kwargs["text"])
+        return 999
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", fake_send
+    )
+    assert asyncio.run(
+        operator_bot_module.deliver_terminal_entry_cleanup_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig(bot_token="token", chat_id="chat"),
+            delivered_at=NOW,
+        )
+    ) == 1
+    assert len(sent) == 1
+    with session_factory() as session:
+        assert (
+            session.get(ExecutionEvent, event_id).notification_status
+            == "delivered"
+        )
+
+
 def test_format_ai_recognition_conflict_review_message_includes_both_model_results():
     message = format_ai_recognition_conflict_review_message(
         {

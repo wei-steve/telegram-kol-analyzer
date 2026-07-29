@@ -1166,6 +1166,10 @@ def claim_next_terminal_entry_cleanup_notification(
     from telegram_kol_research.models import ExecutionEvent
 
     now = claimed_at or datetime.now(UTC)
+    _suppress_non_cancellable_terminal_cleanup_notifications(
+        session_factory,
+        suppressed_at=now,
+    )
     stale_before = now - timedelta(seconds=max(5.0, float(lease_seconds)))
     claimable = and_(
         ExecutionEvent.action == "terminal_entry_cleanup_outcome",
@@ -1219,6 +1223,69 @@ def claim_next_terminal_entry_cleanup_notification(
         row = session.get(ExecutionEvent, row_id)
         session.expunge(row)
         return {"event": row, "claim_token": token}
+
+
+def _suppress_non_cancellable_terminal_cleanup_notifications(
+    session_factory,
+    *,
+    suppressed_at: datetime,
+) -> int:
+    """Suppress legacy backstop noise that never represented a pending order."""
+
+    from telegram_kol_research.models import ExecutionEvent, ExecutionOrderLeg
+
+    cancellable_states = {
+        "pending",
+        "open",
+        "submitted",
+        "partially_filled",
+        "partial",
+    }
+    suppressed = 0
+    with session_factory() as session:
+        rows = (
+            session.query(ExecutionEvent)
+            .filter(
+                ExecutionEvent.action == "terminal_entry_cleanup_outcome",
+                ExecutionEvent.status == "unknown",
+                ExecutionEvent.notification_status.in_(("pending", "failed")),
+            )
+            .order_by(ExecutionEvent.id.asc())
+            .limit(100)
+            .all()
+        )
+        for row in rows:
+            payload = _decode_mapping(row.response_json)
+            if payload.get("reason") != "terminal_lifecycle_entry_exposure":
+                continue
+            if payload.get("notification_policy_version"):
+                continue
+            leg_ids = [
+                int(value)
+                for value in payload.get("leg_ids", [])
+                if str(value).isdigit()
+            ]
+            if not leg_ids:
+                continue
+            leg_states = {
+                str(status or "").lower()
+                for (status,) in (
+                    session.query(ExecutionOrderLeg.status)
+                    .filter(ExecutionOrderLeg.id.in_(leg_ids))
+                    .all()
+                )
+            }
+            if leg_states & cancellable_states:
+                continue
+            row.notification_status = "not_needed"
+            row.notification_error = "non_cancellable_entry_state"
+            row.notification_next_attempt_at = None
+            row.notification_claim_token = None
+            row.notification_claimed_at = None
+            row.notified_at = suppressed_at
+            suppressed += 1
+        session.commit()
+    return suppressed
 
 
 async def deliver_terminal_entry_cleanup_notifications(

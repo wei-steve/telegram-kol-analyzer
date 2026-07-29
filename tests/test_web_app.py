@@ -2824,7 +2824,7 @@ def test_execution_sync_api_delivers_cleanup_notification_outbox(
         deepcoin_client_factory=lambda: FakeDeepcoinClient(),
         now_provider=lambda: datetime(2026, 7, 30, 10, 0),
     )
-    app.state.notification_bot_config = SystemOperatorBotConfig(
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
         bot_token="token",
         chat_id="kol-event-processing",
     )

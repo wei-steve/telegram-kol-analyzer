@@ -173,6 +173,7 @@ def enqueue_terminal_entry_cleanup_notification(
         ),
         "reason": str(reason or "strategy_terminal")[:64],
         "status": normalized_status,
+        "notification_policy_version": "terminal-entry-cleanup-v2",
     }
     fingerprint = hashlib.sha256(
         json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")

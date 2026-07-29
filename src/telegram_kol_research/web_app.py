@@ -3097,6 +3097,9 @@ def create_web_app(
                     interval_seconds=app.state.deepcoin_reconcile_interval_seconds,
                     now_provider=app.state.now_provider,
                     system_operator_bot_config=app.state.notification_bot_config,
+                    terminal_entry_cleanup_bot_config=(
+                        app.state.system_operator_bot_config
+                    ),
                     contract_spec_provider=app.state.deepcoin_contract_spec_provider,
                 )
             )
@@ -4804,11 +4807,6 @@ def create_web_app(
                 synced_at=app.state.now_provider(),
             )
             if isinstance(app.state.notification_bot_config, SystemOperatorBotConfig):
-                await deliver_terminal_entry_cleanup_notifications(
-                    app.state.session_factory,
-                    config=app.state.notification_bot_config,
-                    delivered_at=app.state.now_provider(),
-                )
                 await deliver_pending_position_attribution_incidents(
                     app.state.session_factory,
                     config=app.state.notification_bot_config,
@@ -4817,6 +4815,15 @@ def create_web_app(
                 await deliver_pending_position_protection_incidents(
                     app.state.session_factory,
                     config=app.state.notification_bot_config,
+                    delivered_at=app.state.now_provider(),
+                )
+            if isinstance(
+                app.state.system_operator_bot_config,
+                SystemOperatorBotConfig,
+            ):
+                await deliver_terminal_entry_cleanup_notifications(
+                    app.state.session_factory,
+                    config=app.state.system_operator_bot_config,
                     delivered_at=app.state.now_provider(),
                 )
         except DeepcoinClientError as exc:
@@ -4848,10 +4855,13 @@ def create_web_app(
                 deepcoin_client=app.state.deepcoin_client_factory(),
                 executed_at=app.state.now_provider(),
             )
-            if isinstance(app.state.notification_bot_config, SystemOperatorBotConfig):
+            if isinstance(
+                app.state.system_operator_bot_config,
+                SystemOperatorBotConfig,
+            ):
                 await deliver_terminal_entry_cleanup_notifications(
                     app.state.session_factory,
-                    config=app.state.notification_bot_config,
+                    config=app.state.system_operator_bot_config,
                     delivered_at=app.state.now_provider(),
                 )
         except DeepcoinExecutionActionError as exc:
@@ -5975,6 +5985,7 @@ async def run_deepcoin_execution_reconcile_loop(
     interval_seconds: int = 30,
     now_provider=None,
     system_operator_bot_config: SystemOperatorBotConfig | None = None,
+    terminal_entry_cleanup_bot_config: SystemOperatorBotConfig | None = None,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
 ) -> None:
     while True:
@@ -6003,10 +6014,10 @@ async def run_deepcoin_execution_reconcile_loop(
                 client=client,
                 synced_at=synced_at,
             )
-            if system_operator_bot_enabled(system_operator_bot_config):
+            if system_operator_bot_enabled(terminal_entry_cleanup_bot_config):
                 await deliver_terminal_entry_cleanup_notifications(
                     session_factory,
-                    config=system_operator_bot_config,
+                    config=terminal_entry_cleanup_bot_config,
                     delivered_at=synced_at,
                 )
         except DeepcoinClientError as exc:

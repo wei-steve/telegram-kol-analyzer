@@ -879,9 +879,8 @@ JOIN execution_order_legs AS e
 WHERE l.lifecycle_status IN ('exited','expired','cancelled','invalidated')
   AND e.purpose = 'entry'
   AND e.pos_id IS NULL
-  AND lower(COALESCE(e.status, '')) NOT IN (
-    'cancelled','manually_cancelled','exchange_cancelled',
-    'manually_closed','closed','expired','invalidated'
+  AND lower(COALESCE(e.status, '')) IN (
+    'pending','open','submitted','partially_filled','partial'
   )
 ORDER BY l.id, e.id;
 SQL

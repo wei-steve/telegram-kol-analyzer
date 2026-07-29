@@ -35,6 +35,10 @@ from telegram_kol_research.trade_signals import (
     mark_trade_signal_submitted,
 )
 
+_CANCELLABLE_ENTRY_STATES = frozenset(
+    {"pending", "open", "submitted", "partially_filled", "partial"}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class TerminalEntryCleanupResult:
@@ -72,7 +76,7 @@ def cleanup_terminal_entry_legs(
         pending_legs = [
             leg
             for leg in pending_legs
-            if str(leg.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
+            if str(leg.status or "").lower() in _CANCELLABLE_ENTRY_STATES
             and not leg.pos_id
         ]
         if not pending_legs:

@@ -2680,8 +2680,14 @@ def _cleanup_terminal_lifecycle_entry_exposure(
             .filter(ExecutionOrderLeg.purpose == "entry")
             .filter(ExecutionOrderLeg.pos_id.is_(None))
             .filter(
-                ~func.lower(func.coalesce(ExecutionOrderLeg.status, "")).in_(
-                    TERMINAL_ENTRY_LEG_STATES
+                func.lower(func.coalesce(ExecutionOrderLeg.status, "")).in_(
+                    [
+                        "pending",
+                        "open",
+                        "submitted",
+                        "partially_filled",
+                        "partial",
+                    ]
                 )
             )
             .distinct()
