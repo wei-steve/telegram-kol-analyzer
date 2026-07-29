@@ -1559,6 +1559,11 @@ def test_cleanup_notification_fingerprint_is_stable_across_payload_versions(
 
     assert event_id == old_id
     with session_factory() as session:
+        reused = session.get(ExecutionEvent, old_id)
+        assert (
+            json.loads(reused.response_json)["notification_policy_version"]
+            == "terminal-entry-cleanup-v2"
+        )
         assert (
             session.query(ExecutionEvent)
             .filter(

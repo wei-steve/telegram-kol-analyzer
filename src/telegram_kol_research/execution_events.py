@@ -187,13 +187,15 @@ def enqueue_terminal_entry_cleanup_notification(
     }
     now = created_at or datetime.now(UTC)
     with session_factory() as session:
-        existing_id = (
-            session.query(ExecutionEvent.id)
+        existing = (
+            session.query(ExecutionEvent)
             .filter(ExecutionEvent.notification_fingerprint == fingerprint)
-            .scalar()
+            .one_or_none()
         )
-        if existing_id is not None:
-            return int(existing_id)
+        if existing is not None:
+            _upgrade_cleanup_notification_payload_version(existing, payload)
+            session.commit()
+            return int(existing.id)
         row = ExecutionEvent(
             execution_binding_id=int(binding_id),
             venue="deepcoin",
@@ -212,14 +214,32 @@ def enqueue_terminal_entry_cleanup_notification(
         except IntegrityError:
             session.rollback()
             existing_id = (
-                session.query(ExecutionEvent.id)
+                session.query(ExecutionEvent)
                 .filter(ExecutionEvent.notification_fingerprint == fingerprint)
-                .scalar()
+                .one_or_none()
             )
             if existing_id is None:
                 raise
-            return int(existing_id)
+            _upgrade_cleanup_notification_payload_version(existing_id, payload)
+            session.commit()
+            return int(existing_id.id)
         return int(row.id)
+
+
+def _upgrade_cleanup_notification_payload_version(
+    event: ExecutionEvent,
+    versioned_payload: dict[str, Any],
+) -> None:
+    if event.notification_status not in {"pending", "failed"}:
+        return
+    existing_payload = _json_load(event.response_json)
+    if existing_payload and existing_payload.get("notification_policy_version"):
+        return
+    event.response_json = json.dumps(
+        versioned_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 def _row_to_view(row: ExecutionEvent) -> ExecutionEventView:
