@@ -132,6 +132,9 @@ def test_runtime_config_partial_environment_keeps_file_backed_capture_settings(
     )
 
     monkeypatch.setenv("TELEGRAM_KOL_RUNTIME_AGENT_ENABLED", "false")
+    monkeypatch.delenv(
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES", raising=False
+    )
 
     config = load_runtime_incident_config(env_file_paths=[config_file])
 
