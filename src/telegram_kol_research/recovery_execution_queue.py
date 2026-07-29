@@ -11,6 +11,7 @@ from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import RecoveryDecisionRecord
 from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.kol_codes import resolve_kol_code
+from telegram_kol_research.trading_settings import SymbolEntryThresholds
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -44,9 +45,10 @@ def list_recovery_execution_previews(
                     row,
                     contract_spec_provider=contract_spec_provider,
                     candidate_text=candidate_text_by_key.get(key, {}),
-                    entry_range_order_style=trading_settings.entry_range_order_style,
+                    entry_thresholds=trading_settings.entry_thresholds_for_symbol(
+                        row.symbol
+                    ),
                     take_profit_allocations=trading_settings.take_profit_allocations,
-                    max_market_entry_deviation_pct=trading_settings.max_market_entry_deviation_pct,
                 )
             )
         return previews
@@ -75,9 +77,8 @@ def _preview_row(
     *,
     contract_spec_provider: DeepcoinContractSpecProvider | None,
     candidate_text: dict[str, str],
-    entry_range_order_style: str,
+    entry_thresholds: SymbolEntryThresholds,
     take_profit_allocations: list[float],
-    max_market_entry_deviation_pct: float,
 ) -> dict[str, object]:
     side = row.side.lower()
     contract = _to_deepcoin_contract(row.symbol)
@@ -107,8 +108,7 @@ def _preview_row(
         "stop_loss": row.stop_loss_text,
         "take_profit": candidate_text.get("take_profit_text"),
         "take_profit_allocations": take_profit_allocations,
-        "entry_range_order_style": entry_range_order_style,
-        "max_market_entry_deviation_pct": max_market_entry_deviation_pct,
+        **entry_thresholds.to_dict(),
         "risk_budget_usdt": row.max_loss_usdt,
         "source": source_payload,
     }

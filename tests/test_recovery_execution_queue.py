@@ -12,9 +12,19 @@ from telegram_kol_research.recovery_execution_queue import (
 from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
-def _persist_reviewed_recovery_decision(session_factory, *, action, review_status):
+def _persist_reviewed_recovery_decision(
+    session_factory,
+    *,
+    action,
+    review_status,
+    symbol="BTC",
+    side="long",
+    entry_range=(68000.0, 68200.0),
+    stop_loss_text="67500",
+):
     persist_recovery_evaluations(
         session_factory,
         [
@@ -24,10 +34,10 @@ def _persist_reviewed_recovery_decision(session_factory, *, action, review_statu
                     chat_id=100,
                     message_id=55,
                     posted_at=datetime(2026, 6, 12, 8, 0),
-                    symbol="BTC",
-                    side="long",
-                    entry_range=(68000.0, 68200.0),
-                    stop_loss_text="67500",
+                    symbol=symbol,
+                    side=side,
+                    entry_range=entry_range,
+                    stop_loss_text=stop_loss_text,
                     take_profit_text="69000 / 70000",
                     trading_mode="auto_trade",
                     max_loss_usdt=100.0,
@@ -35,7 +45,7 @@ def _persist_reviewed_recovery_decision(session_factory, *, action, review_statu
                 decision=RecoveryDecision(
                     action=action,
                     reason_codes=["recovery_checks_passed"],
-                    entry_range=(68000.0, 68200.0),
+                    entry_range=entry_range,
                     max_loss_usdt=100.0,
                 ),
             )
@@ -46,8 +56,8 @@ def _persist_reviewed_recovery_decision(session_factory, *, action, review_statu
         session_factory,
         chat_id=100,
         message_id=55,
-        symbol="BTC",
-        side="long",
+        symbol=symbol,
+        side=side,
         review_status=review_status,
         reviewed_at=datetime(2026, 6, 12, 19, 0, tzinfo=UTC),
     )
@@ -67,15 +77,70 @@ def test_recovery_execution_preview_lists_approved_limit_orders_only(tmp_path):
     row = rows[0]
     assert row["review_status"] == "approved_for_order"
     assert row["execution_status"] == "pending_execution"
-    assert row["payload_preview"]["max_market_entry_deviation_pct"] == 0.15
+    assert row["payload_preview"]["market_leg_threshold"] == "200"
+    assert row["payload_preview"]["first_limit_offset"] == "90"
+    assert row["payload_preview"]["second_limit_offset"] == "90"
+    assert "max_market_entry_deviation_pct" not in row["payload_preview"]
+    assert "entry_range_order_style" not in row["payload_preview"]
     assert row["deepcoin_order_draft"]["blocking_reason_codes"] == ["contract_size_unverified"]
     assert [leg["price"] for leg in row["deepcoin_order_draft"]["order_legs"]] == [
-        68302.3,
-        68102.0,
+        68290.0,
+        68090.0,
     ]
     assert [leg["quantity"] for leg in row["deepcoin_order_draft"]["order_legs"]] == [
-        0.062321,
-        0.083056,
+        0.063291,
+        0.084746,
+    ]
+
+
+def test_recovery_execution_preview_uses_eth_fixed_entry_offsets(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_reviewed_recovery_decision(
+        session_factory,
+        action="eligible_for_recovery_limit_order",
+        review_status="approved_for_order",
+        symbol="ETH",
+        entry_range=(1500.0, 1600.0),
+        stop_loss_text="1400",
+    )
+
+    row = list_recovery_execution_previews(session_factory)[0]
+
+    assert row["payload_preview"]["market_leg_threshold"] == "4"
+    assert row["payload_preview"]["first_limit_offset"] == "2"
+    assert row["payload_preview"]["second_limit_offset"] == "2"
+    assert [leg["price"] for leg in row["deepcoin_order_draft"]["order_legs"]] == [
+        1602.0,
+        1502.0,
+    ]
+
+
+def test_recovery_execution_preview_uses_zero_offsets_for_unconfigured_symbol(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "allowed_symbols": ["SOL"],
+            "symbol_entry_thresholds": {},
+        },
+    )
+    _persist_reviewed_recovery_decision(
+        session_factory,
+        action="eligible_for_recovery_limit_order",
+        review_status="approved_for_order",
+        symbol="SOL",
+        entry_range=(100.0, 110.0),
+        stop_loss_text="90",
+    )
+
+    row = list_recovery_execution_previews(session_factory)[0]
+
+    assert row["payload_preview"]["market_leg_threshold"] == "0"
+    assert row["payload_preview"]["first_limit_offset"] == "0"
+    assert row["payload_preview"]["second_limit_offset"] == "0"
+    assert [leg["price"] for leg in row["deepcoin_order_draft"]["order_legs"]] == [
+        110.0,
+        100.0,
     ]
 
 
@@ -151,6 +216,6 @@ def test_recovery_execution_preview_applies_contract_specs_when_available(tmp_pa
     }
     assert draft["blocking_reason_codes"] == []
     assert draft["contract_spec"]["instrument_id"] == "BTC-USDT-SWAP"
-    assert draft["order_legs"][0]["quantity"] == 62.0
+    assert draft["order_legs"][0]["quantity"] == 63.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
-    assert draft["order_legs"][1]["quantity"] == 83.0
+    assert draft["order_legs"][1]["quantity"] == 84.0
