@@ -2591,6 +2591,9 @@ def _build_runtime_agent_action_handlers(
                 expected_fingerprint=str(expected_fingerprint),
             )
 
+        fetch_missing_telegram_evidence.is_applicable = (  # type: ignore[attr-defined]
+            telegram_evidence_refresh.is_applicable
+        )
         handlers["fetch_missing_telegram_evidence"] = (
             fetch_missing_telegram_evidence
         )

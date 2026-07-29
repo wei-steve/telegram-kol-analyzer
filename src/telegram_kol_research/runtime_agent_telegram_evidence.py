@@ -142,6 +142,23 @@ class RuntimeAgentTelegramEvidenceRefresh:
             proof = self._captures.pop(int(incident_id), None)
         return proof.as_mapping() if proof is not None else None
 
+    def is_applicable(
+        self,
+        *,
+        incident_id: int,
+        expected_fingerprint: str,
+    ) -> bool:
+        """Refuse unsupported durable incident families before reservation."""
+
+        try:
+            self._validate_source(
+                incident_id=int(incident_id),
+                expected_fingerprint=str(expected_fingerprint),
+            )
+        except (RuntimeAgentTelegramEvidenceError, TypeError, ValueError):
+            return False
+        return True
+
     def refresh(
         self,
         *,

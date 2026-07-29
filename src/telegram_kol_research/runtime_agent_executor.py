@@ -513,6 +513,21 @@ def execute_low_risk_recovery(
             incident_id=int(incident_id),
             refusal_reasons=("executor_not_configured",),
         )
+    applicability_check = getattr(action_handler, "is_applicable", None)
+    if callable(applicability_check):
+        try:
+            applicable = applicability_check(
+                incident_id=int(incident_id),
+                expected_fingerprint=str(expected_fingerprint),
+            )
+        except Exception:
+            applicable = False
+        if applicable is not True:
+            return RuntimeAgentExecutionResult(
+                status="refused",
+                incident_id=int(incident_id),
+                refusal_reasons=("executor_not_configured",),
+            )
 
     reservation_status, attempt = _reserve_attempt(
         session_factory,

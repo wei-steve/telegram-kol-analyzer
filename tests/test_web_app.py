@@ -5221,6 +5221,59 @@ def test_runtime_agent_telegram_evidence_endpoint_hides_failures(
     assert "secret" not in response.text
 
 
+def test_runtime_agent_telegram_evidence_default_runner_maps_configs(
+    tmp_path,
+    monkeypatch,
+):
+    system_config = SystemOperatorBotConfig(
+        bot_token="system-secret",
+        chat_id="system-chat",
+    )
+    notification_config = SystemOperatorBotConfig(
+        bot_token="notification-secret",
+        chat_id="notification-chat",
+    )
+    observed = []
+
+    async def probe(*, config):
+        observed.append(config)
+        return {
+            "probe_complete": True,
+            "endpoint_reachable": True,
+            "bot_identity_available": True,
+            "target_chat_available": True,
+        }
+
+    monkeypatch.setattr(
+        "telegram_kol_research.web_app."
+        "probe_system_operator_bot_evidence",
+        probe,
+    )
+    app = create_web_app(database_path=tmp_path / "research.db")
+    app.state.system_operator_bot_config = system_config
+    app.state.notification_bot_config = notification_config
+    client = TestClient(app, client=("127.0.0.1", 50000))
+
+    system_response = client.post(
+        "/api/runtime-agent/read-only-telegram-evidence",
+        json={"channel": "system_operator"},
+    )
+    notification_response = client.post(
+        "/api/runtime-agent/read-only-telegram-evidence",
+        json={"channel": "notification"},
+    )
+    app.state.notification_bot_config = None
+    missing_response = client.post(
+        "/api/runtime-agent/read-only-telegram-evidence",
+        json={"channel": "notification"},
+    )
+
+    assert system_response.status_code == 200
+    assert notification_response.status_code == 200
+    assert missing_response.status_code == 503
+    assert observed == [system_config, notification_config]
+
+
 def test_runtime_agent_telegram_evidence_endpoint_is_single_flight(
     tmp_path,
 ):

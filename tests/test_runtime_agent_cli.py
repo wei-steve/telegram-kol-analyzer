@@ -592,6 +592,10 @@ def test_phase6_telegram_evidence_handler_uses_one_fresh_bounded_proof(
     calls = []
 
     class TelegramEvidenceRefresh:
+        def is_applicable(self, **kwargs):
+            calls.append(("applicable", kwargs))
+            return True
+
         def refresh(self, **kwargs):
             calls.append(("refresh", kwargs))
             return True

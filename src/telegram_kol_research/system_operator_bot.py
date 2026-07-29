@@ -99,6 +99,9 @@ def system_operator_bot_enabled(config: SystemOperatorBotConfig | None) -> bool:
     return bool(config and config.bot_token and config.chat_id)
 
 
+_TELEGRAM_EVIDENCE_TIMEOUT_SECONDS = 5.0
+
+
 async def probe_system_operator_bot_evidence(
     *,
     config: SystemOperatorBotConfig,
@@ -109,15 +112,18 @@ async def probe_system_operator_bot_evidence(
         raise RuntimeError("Telegram bot evidence configuration unavailable")
     base_url = f"https://api.telegram.org/bot{config.bot_token}"
     async with httpx.AsyncClient(
-        timeout=5.0,
+        timeout=_TELEGRAM_EVIDENCE_TIMEOUT_SECONDS,
         trust_env=False,
     ) as client:
-        identity_response, chat_response = await asyncio.gather(
-            client.get(f"{base_url}/getMe"),
-            client.post(
-                f"{base_url}/getChat",
-                json={"chat_id": config.chat_id},
+        identity_response, chat_response = await asyncio.wait_for(
+            asyncio.gather(
+                client.get(f"{base_url}/getMe"),
+                client.post(
+                    f"{base_url}/getChat",
+                    json={"chat_id": config.chat_id},
+                ),
             ),
+            timeout=_TELEGRAM_EVIDENCE_TIMEOUT_SECONDS,
         )
 
     def response_ok(response: httpx.Response) -> bool:

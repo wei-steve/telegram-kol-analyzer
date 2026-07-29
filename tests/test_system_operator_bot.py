@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
@@ -2238,3 +2239,54 @@ def test_telegram_evidence_probe_is_concurrent_bounded_and_proxy_free(
     assert observed["payload"] == {"chat_id": "secret-chat"}
     assert "secret-token" not in str(result)
     assert "secret-chat" not in str(result)
+
+
+def test_telegram_evidence_probe_enforces_wall_clock_deadline(
+    monkeypatch,
+):
+    cancelled = []
+
+    class Client:
+        def __init__(self, *, timeout, trust_env):
+            assert timeout == 0.02
+            assert trust_env is False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(("get", url))
+
+        async def post(self, url, *, json):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(("post", url, json))
+
+    monkeypatch.setattr(operator_bot_module.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(
+        operator_bot_module,
+        "_TELEGRAM_EVIDENCE_TIMEOUT_SECONDS",
+        0.02,
+    )
+    started_at = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            operator_bot_module.probe_system_operator_bot_evidence(
+                config=SystemOperatorBotConfig(
+                    bot_token="secret-token",
+                    chat_id="secret-chat",
+                    timeout_seconds=99,
+                )
+            )
+        )
+
+    assert time.monotonic() - started_at < 0.2
+    assert {call[0] for call in cancelled} == {"get", "post"}

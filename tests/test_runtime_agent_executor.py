@@ -174,6 +174,83 @@ def test_telegram_evidence_verification_requires_complete_exact_proof():
         )
 
 
+def test_scoped_handler_refuses_inapplicable_incident_before_reservation(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    handler_calls = []
+
+    class ScopedHandler:
+        def is_applicable(self, **kwargs):
+            handler_calls.append(("applicable", kwargs))
+            return False
+
+        def __call__(self, **kwargs):
+            handler_calls.append(("execute", kwargs))
+            return True
+
+    for index, incident_type in enumerate(
+        ("context_worker_exhausted", "provider_retry_exhausted"),
+        start=1,
+    ):
+        incident = record_runtime_incident(
+            session_factory,
+            source_kind="worker",
+            source_record_id=str(index),
+            incident_type=incident_type,
+            severity="medium",
+            fingerprint=f"{index:064x}",
+            generation=1,
+            redacted_summary='{"business_write_owned":false}',
+            occurred_at=NOW,
+            feature_policy_version="runtime-incident-phase-6-v1",
+            prompt_version="runtime-agent-prompt-v7",
+            tool_policy_version="runtime-agent-tools-v2",
+        )
+        decision = evaluate_execution_playbook_nomination(
+            incident={
+                "id": incident.id,
+                "incident_type": incident.incident_type,
+                "redacted_summary": {"business_write_owned": False},
+            },
+            nominated_playbook="fetch_missing_telegram_evidence",
+            actions_enabled=True,
+            enabled_playbooks=frozenset(
+                {"fetch_missing_telegram_evidence"}
+            ),
+            evidence_references=(f"incident:{incident.id}",),
+        )
+        claim_token = _claim(session_factory, incident)
+
+        result = execute_low_risk_recovery(
+            session_factory,
+            incident_id=incident.id,
+            expected_fingerprint=incident.fingerprint,
+            expected_claim_token=claim_token,
+            decision=decision,
+            config=RuntimeAgentExecutorConfig(enabled=True),
+            tools=RuntimeAgentToolRegistry(providers={}),
+            action_handlers={
+                "fetch_missing_telegram_evidence": ScopedHandler()
+            },
+            now=NOW,
+        )
+
+        assert result.status == "refused"
+        assert result.refusal_reasons == ("executor_not_configured",)
+        with session_factory() as session:
+            row = session.get(RuntimeIncident, incident.id)
+            assert row.recovery_status != "action_frozen"
+            assert (
+                session.query(RuntimeAgentRecoveryAttempt)
+                .filter_by(incident_id=incident.id)
+                .count()
+                == 0
+            )
+
+    assert all(call[0] == "applicable" for call in handler_calls)
+
+
 def test_executor_requires_current_fingerprint_before_reserving_action(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     incident = _record(session_factory)
