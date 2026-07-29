@@ -11,7 +11,7 @@ from telegram_kol_research.runtime_agent_playbooks import (
 )
 
 
-RUNTIME_AGENT_PROMPT_VERSION = "runtime-agent-prompt-v6"
+RUNTIME_AGENT_PROMPT_VERSION = "runtime-agent-prompt-v7"
 _PLAYBOOK_NAMES = ", ".join(sorted(RUNTIME_AGENT_PLAYBOOKS))
 RUNTIME_AGENT_SYSTEM_PROMPT = f"""
 Diagnose a durable technical incident only with supplied bounded read-only

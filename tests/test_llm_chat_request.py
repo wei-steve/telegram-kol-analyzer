@@ -10,6 +10,9 @@ from telegram_kol_research.llm_chat import (
     request_grounded_chat_answer,
     request_structured_chat_turn,
 )
+from telegram_kol_research.runtime_agent_contracts import (
+    RuntimeAgentFinalResponseError,
+)
 
 
 def test_build_proxy_chat_payload_matches_openai_compatible_shape():
@@ -303,6 +306,70 @@ def test_request_structured_chat_turn_normalizes_closed_final_json():
     )
 
     assert turn == {"final": {"incident_id": 17, "confidence": "low"}}
+
+
+@pytest.mark.parametrize("content", ["not-json", "[]", None])
+def test_request_structured_chat_turn_marks_malformed_final_as_correctable(
+    content,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={"choices": [{"message": {"content": content}}]},
+        )
+
+    with pytest.raises(RuntimeAgentFinalResponseError):
+        request_structured_chat_turn(
+            config=LLMProxyConfig(
+                base_url="http://proxy.test",
+                api_key="",
+                model="gpt-test",
+                timeout_seconds=5,
+            ),
+            messages=[{"role": "system", "content": "Read-only diagnosis."}],
+            tool_schemas=[],
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+
+def test_request_structured_chat_turn_marks_malformed_final_tool_as_correctable():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "final-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_runtime_diagnosis",
+                                        "arguments": "not-json",
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    with pytest.raises(RuntimeAgentFinalResponseError):
+        request_structured_chat_turn(
+            config=LLMProxyConfig(
+                base_url="http://proxy.test",
+                api_key="",
+                model="gpt-test",
+                timeout_seconds=5,
+            ),
+            messages=[{"role": "system", "content": "Read-only diagnosis."}],
+            tool_schemas=[{"type": "function", "function": {"name": "read"}}],
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
 
 
 def test_request_structured_chat_turn_serializes_provider_parallel_calls():

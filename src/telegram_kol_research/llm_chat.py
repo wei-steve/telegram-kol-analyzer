@@ -12,6 +12,10 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from telegram_kol_research.runtime_agent_contracts import (
+    RuntimeAgentFinalResponseError,
+)
+
 
 @dataclass(slots=True)
 class LLMProxyConfig:
@@ -403,6 +407,10 @@ def request_structured_chat_turn(
                 json.loads(arguments) if isinstance(arguments, str) else arguments
             )
         except json.JSONDecodeError as exc:
+            if function.get("name") == _FINAL_DIAGNOSIS_TOOL_NAME:
+                raise RuntimeAgentFinalResponseError(
+                    "structured chat final response is invalid"
+                ) from exc
             raise ValueError("structured tool arguments are invalid JSON") from exc
         normalized = {
             "tool_call": {
@@ -416,13 +424,19 @@ def request_structured_chat_turn(
         return normalized
     content = message.get("content")
     if not isinstance(content, str):
-        raise ValueError("structured chat response has no final JSON")
+        raise RuntimeAgentFinalResponseError(
+            "structured chat final response is invalid"
+        )
     try:
         final = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise ValueError("structured chat final is invalid JSON") from exc
+        raise RuntimeAgentFinalResponseError(
+            "structured chat final response is invalid"
+        ) from exc
     if not isinstance(final, dict):
-        raise ValueError("structured chat final must be an object")
+        raise RuntimeAgentFinalResponseError(
+            "structured chat final response is invalid"
+        )
     return {"final": final}
 
 

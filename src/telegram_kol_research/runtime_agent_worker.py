@@ -13,6 +13,7 @@ from typing import Any
 from telegram_kol_research.runtime_agent_contracts import (
     RuntimeAgentContractError,
     RuntimeAgentDiagnosis,
+    RuntimeAgentFinalResponseError,
     RuntimeAgentToolCall,
 )
 from telegram_kol_research.runtime_agent_executor import (
@@ -145,7 +146,11 @@ def _parse_model_turn(raw: Any) -> tuple[str, Mapping[str, Any]]:
         raise RuntimeAgentContractError("model turn must be an object")
     if set(raw) == {"tool_call"} and isinstance(raw["tool_call"], Mapping):
         return "tool_call", raw["tool_call"]
-    if set(raw) == {"final"} and isinstance(raw["final"], Mapping):
+    if set(raw) == {"final"}:
+        if not isinstance(raw["final"], Mapping):
+            raise RuntimeAgentFinalResponseError(
+                "model final response is invalid"
+            )
         return "final", raw["final"]
     raise RuntimeAgentContractError("model turn has an unknown shape")
 
@@ -177,6 +182,50 @@ def _validate_message_budget(messages: list[dict[str, Any]], *, maximum: int) ->
         raise RuntimeAgentContractError(
             "runtime agent transcript exceeds prompt byte budget"
         )
+
+
+def _remaining_wall_budget(
+    *,
+    started: float,
+    maximum: float,
+    monotonic: Callable[[], float],
+) -> float:
+    remaining = float(maximum) - (monotonic() - started)
+    if remaining <= 0:
+        raise TimeoutError("runtime agent wall-clock budget exhausted")
+    return remaining
+
+
+def _final_correction_message(
+    *,
+    incident_id: int,
+    gathered_references: set[str],
+) -> tuple[str, frozenset[str]]:
+    incident_reference = f"incident:{int(incident_id)}"
+    ordered = [incident_reference]
+    ordered.extend(
+        reference
+        for reference in sorted(gathered_references)
+        if reference != incident_reference
+    )
+    allowed = frozenset(ordered[:8])
+    return (
+        (
+            "The previous final JSON failed the closed local contract. This "
+            "is the one correction allowed for this agent attempt. Return "
+            "only a corrected final JSON object; do not call a tool. Use "
+            "evidence_references only from this exact allowlist: "
+            + json.dumps(
+                sorted(allowed),
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            + ". Keep diagnosis_hypothesis and remaining_risk at most 512 "
+            "characters each, missing_evidence at most 16 items, and "
+            "evidence_references at most 32 items."
+        ),
+        allowed,
+    )
 
 
 def _append_tool_exchange(
@@ -464,6 +513,11 @@ def run_runtime_agent_once(
             completion_now = (
                 operation_now if now is not None else datetime.now(UTC)
             )
+            _remaining_wall_budget(
+                started=started,
+                maximum=config.max_wall_seconds,
+                monotonic=monotonic,
+            )
             recovery_policy, recovery_status = _evaluate_recovery(
                 session_factory,
                 incident=claimed,
@@ -518,10 +572,40 @@ def run_runtime_agent_once(
         # exhausted, tools are no longer advertised to the provider.
         evidence_tool_limit = max(1, min(config.max_tool_steps, 3))
         final_instruction_added = False
+        final_correction_used = False
+        correction_allowed_references: frozenset[str] | None = None
         max_turns = max(2, min(config.max_tool_steps, 4) + 4)
-        for _ in range(max_turns):
-            if monotonic() - started > config.max_wall_seconds:
-                raise TimeoutError("runtime agent wall-clock budget exhausted")
+
+        def request_final_correction() -> None:
+            nonlocal final_correction_used
+            nonlocal correction_allowed_references
+            nonlocal final_instruction_added
+            if final_correction_used:
+                raise RuntimeAgentContractError(
+                    "corrected model final is invalid"
+                )
+            correction, correction_allowed_references = (
+                _final_correction_message(
+                    incident_id=claimed.id,
+                    gathered_references=gathered_references,
+                )
+            )
+            messages.append({"role": "user", "content": correction})
+            final_correction_used = True
+            final_instruction_added = True
+            _validate_message_budget(
+                messages,
+                maximum=config.max_prompt_bytes,
+            )
+
+        for turn_index in range(max_turns + 1):
+            if turn_index == max_turns and not final_correction_used:
+                break
+            _remaining_wall_budget(
+                started=started,
+                maximum=config.max_wall_seconds,
+                monotonic=monotonic,
+            )
             _validate_message_budget(
                 messages,
                 maximum=config.max_prompt_bytes,
@@ -545,28 +629,60 @@ def run_runtime_agent_once(
                     messages,
                     maximum=config.max_prompt_bytes,
                 )
-            raw_turn = model_turn(
-                messages=messages,
-                tool_schemas=(
-                    tools.tool_schemas()
-                    if len(attempted_queries) < evidence_tool_limit
-                    else []
-                ),
-                timeout_seconds=min(
-                    config.model_timeout_seconds,
-                    max(1.0, config.max_wall_seconds - (monotonic() - started)),
-                ),
+            remaining_wall = _remaining_wall_budget(
+                started=started,
+                maximum=config.max_wall_seconds,
+                monotonic=monotonic,
+            )
+            try:
+                raw_turn = model_turn(
+                    messages=messages,
+                    tool_schemas=(
+                        tools.tool_schemas()
+                        if (
+                            len(attempted_queries) < evidence_tool_limit
+                            and not final_correction_used
+                        )
+                        else []
+                    ),
+                    timeout_seconds=min(
+                        config.model_timeout_seconds,
+                        remaining_wall,
+                    ),
+                )
+            except RuntimeAgentFinalResponseError:
+                request_final_correction()
+                continue
+            _remaining_wall_budget(
+                started=started,
+                maximum=config.max_wall_seconds,
+                monotonic=monotonic,
             )
             _bounded_model_turn(raw_turn, maximum=config.max_model_output_bytes)
-            turn_kind, payload = _parse_model_turn(raw_turn)
+            try:
+                turn_kind, payload = _parse_model_turn(raw_turn)
+            except RuntimeAgentFinalResponseError:
+                request_final_correction()
+                continue
             if turn_kind == "final":
-                diagnosis = RuntimeAgentDiagnosis.from_mapping(
-                    payload, expected_incident_id=claimed.id
-                ).with_attempted_queries(tuple(attempted_queries))
-                if not set(diagnosis.evidence_references) <= gathered_references:
-                    raise RuntimeAgentContractError(
-                        "diagnosis cites evidence that was not returned"
+                try:
+                    diagnosis = RuntimeAgentDiagnosis.from_mapping(
+                        payload, expected_incident_id=claimed.id
+                    ).with_attempted_queries(tuple(attempted_queries))
+                    allowed_references = (
+                        correction_allowed_references
+                        if correction_allowed_references is not None
+                        else gathered_references
                     )
+                    if not set(diagnosis.evidence_references) <= set(
+                        allowed_references
+                    ):
+                        raise RuntimeAgentContractError(
+                            "diagnosis cites evidence that was not returned"
+                        )
+                except RuntimeAgentContractError:
+                    request_final_correction()
+                    continue
                 shadow_decision = evaluate_shadow_playbook_nomination(
                     incident=_incident_mapping(claimed),
                     nominated_playbook=diagnosis.recommended_playbook_name,
@@ -575,6 +691,11 @@ def run_runtime_agent_once(
                 )
                 completion_now = (
                     operation_now if now is not None else datetime.now(UTC)
+                )
+                _remaining_wall_budget(
+                    started=started,
+                    maximum=config.max_wall_seconds,
+                    monotonic=monotonic,
                 )
                 recovery_policy, recovery_status = _evaluate_recovery(
                     session_factory,
@@ -624,6 +745,10 @@ def run_runtime_agent_once(
                     recovery_policy=recovery_policy,
                 )
 
+            if final_correction_used:
+                raise RuntimeAgentContractError(
+                    "corrected model turn must be final"
+                )
             call = RuntimeAgentToolCall.from_mapping(
                 payload,
                 allowed_tools=tools.allowed_tools,

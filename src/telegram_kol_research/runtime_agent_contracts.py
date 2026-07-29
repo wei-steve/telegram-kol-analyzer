@@ -33,6 +33,10 @@ class RuntimeAgentContractError(ValueError):
     """Raised when model data falls outside the closed agent contract."""
 
 
+class RuntimeAgentFinalResponseError(RuntimeAgentContractError):
+    """Raised when a provider final cannot be parsed as a closed object."""
+
+
 def _bounded_text(name: str, value: Any, *, maximum: int, allow_empty=False) -> str:
     if not isinstance(value, str):
         raise RuntimeAgentContractError(f"{name} must be text")

@@ -8,6 +8,9 @@ from telegram_kol_research.models import (
     RuntimeIncident,
 )
 from telegram_kol_research.runtime_agent_tools import RuntimeAgentToolRegistry
+from telegram_kol_research.runtime_agent_contracts import (
+    RuntimeAgentFinalResponseError,
+)
 from telegram_kol_research.runtime_agent_worker import (
     RuntimeAgentWorkerConfig,
     RuntimeAgentWorkerResult,
@@ -196,7 +199,7 @@ def test_worker_runs_bounded_tool_loop_and_commits_structured_diagnosis(tmp_path
     with session_factory() as session:
         row = session.get(RuntimeIncident, incident.id)
         assert row.status == "diagnosed"
-        assert row.prompt_version == "runtime-agent-prompt-v6"
+        assert row.prompt_version == "runtime-agent-prompt-v7"
         assert "Provider retries may have been exhausted." in row.diagnosis_json
         assert row.evidence_refs_json == (
             f'["incident:{incident.id}","worker-job:42"]'
@@ -590,6 +593,274 @@ def test_worker_reserves_final_turn_after_three_evidence_tools(tmp_path):
     assert "Return only the final JSON object" in (
         observed_messages[3][-1]["content"]
     )
+
+
+def test_worker_requests_one_closed_final_correction_without_echoing_bad_output(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    invalid = _final(incident.id)
+    invalid["final"]["diagnosis_hypothesis"] = "do-not-echo-provider-output"
+    invalid["final"]["evidence_references"] = ["fabricated:999"]
+    corrected = _final(incident.id)
+    turns = iter(
+        (
+            {
+                "tool_call": {
+                    "id": "call-1",
+                    "name": "get_incident_summary",
+                    "arguments": {"incident_id": incident.id},
+                }
+            },
+            invalid,
+            corrected,
+        )
+    )
+    observed = []
+
+    def model_turn(**kwargs):
+        observed.append(
+            {
+                "messages": [
+                    dict(message) for message in kwargs["messages"]
+                ],
+                "tool_schemas": list(kwargs["tool_schemas"]),
+            }
+        )
+        return next(turns)
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(enabled=True),
+        tools=_registry([]),
+        model_turn=model_turn,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    assert result.tool_steps == 1
+    assert len(observed) == 3
+    assert observed[0]["tool_schemas"]
+    assert observed[1]["tool_schemas"]
+    assert observed[2]["tool_schemas"] == []
+    correction = observed[2]["messages"][-1]["content"]
+    assert "one correction" in correction
+    assert f"incident:{incident.id}" in correction
+    assert "worker-job:42" in correction
+    assert "fabricated:999" not in correction
+    assert "do-not-echo-provider-output" not in correction
+
+
+def test_worker_allows_only_one_closed_final_correction_per_agent_attempt(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    invalid = _final(incident.id)
+    invalid["final"]["evidence_references"] = ["fabricated:999"]
+    turns = iter((invalid, invalid, _final(incident.id)))
+    observed = []
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(enabled=True),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: (
+            observed.append(kwargs) or next(turns)
+        ),
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "retry_pending"
+    assert len(observed) == 2
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        assert row.diagnosis_json is None
+        assert row.recovery_status == "not_requested"
+
+
+def test_worker_corrects_provider_level_malformed_final_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    calls = []
+
+    def model_turn(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeAgentFinalResponseError(
+                "structured chat final is invalid"
+            )
+        corrected = _final(incident.id)
+        corrected["final"]["evidence_references"] = [
+            f"incident:{incident.id}"
+        ]
+        return corrected
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(enabled=True),
+        tools=_registry([]),
+        model_turn=model_turn,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    assert len(calls) == 2
+    assert calls[1]["tool_schemas"] == []
+    assert "structured chat final is invalid" not in (
+        calls[1]["messages"][-1]["content"]
+    )
+
+
+def test_worker_corrects_top_level_malformed_final_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    corrected = _final(incident.id)
+    corrected["final"]["evidence_references"] = [
+        f"incident:{incident.id}"
+    ]
+    turns = iter(({"final": "not-an-object"}, corrected))
+    calls = []
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(enabled=True),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: (
+            calls.append(kwargs) or next(turns)
+        ),
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    assert len(calls) == 2
+    assert calls[1]["tool_schemas"] == []
+
+
+def test_worker_reserves_an_extra_model_turn_only_for_final_correction(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    tool_call = {
+        "tool_call": {
+            "id": "call-1",
+            "name": "get_incident_summary",
+            "arguments": {"incident_id": incident.id},
+        }
+    }
+    invalid = _final(incident.id)
+    invalid["final"]["evidence_references"] = ["fabricated:999"]
+    corrected = _final(incident.id)
+    turns = iter(
+        (
+            tool_call,
+            tool_call,
+            tool_call,
+            tool_call,
+            tool_call,
+            tool_call,
+            tool_call,
+            invalid,
+            corrected,
+        )
+    )
+    observed = []
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(enabled=True, max_tool_steps=4),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: (
+            observed.append(kwargs) or next(turns)
+        ),
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    assert len(observed) == 9
+    assert result.refused_tool_calls == 6
+    assert observed[-1]["tool_schemas"] == []
+
+
+def test_worker_does_not_evaluate_recovery_after_correction_exceeds_wall_budget(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    invalid = _final(incident.id)
+    invalid["final"]["evidence_references"] = ["fabricated:999"]
+    corrected = _shadow_final(incident.id)
+    corrected["final"]["evidence_references"] = [f"incident:{incident.id}"]
+    turns = iter((invalid, corrected))
+    elapsed = [0.0]
+    recovery_calls = []
+
+    def model_turn(**kwargs):
+        turn = next(turns)
+        if turn is corrected:
+            elapsed[0] = 6.0
+        return turn
+
+    def evaluate_recovery(*args, **kwargs):
+        recovery_calls.append((args, kwargs))
+        raise AssertionError("recovery must not run outside wall budget")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.runtime_agent_worker._evaluate_recovery",
+        evaluate_recovery,
+    )
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            max_wall_seconds=5.0,
+        ),
+        tools=_registry([]),
+        model_turn=model_turn,
+        now=NOW + timedelta(minutes=2),
+        monotonic=lambda: elapsed[0],
+    )
+
+    assert result.status == "retry_pending"
+    assert recovery_calls == []
+
+
+def test_worker_clamps_model_timeout_to_subsecond_remaining_wall_budget(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    final = _final(incident.id)
+    final["final"]["evidence_references"] = [f"incident:{incident.id}"]
+    clock_calls = [0]
+    observed_timeouts = []
+
+    def monotonic():
+        clock_calls[0] += 1
+        return 0.0 if clock_calls[0] < 3 else 0.75
+
+    def model_turn(**kwargs):
+        observed_timeouts.append(kwargs["timeout_seconds"])
+        return final
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            max_wall_seconds=1.0,
+            model_timeout_seconds=30.0,
+        ),
+        tools=_registry([]),
+        model_turn=model_turn,
+        now=NOW + timedelta(minutes=2),
+        monotonic=monotonic,
+    )
+
+    assert result.status == "diagnosed"
+    assert observed_timeouts == [0.25]
 
 
 def test_worker_refuses_repeated_tool_without_reexecuting_provider(tmp_path):

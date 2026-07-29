@@ -13,6 +13,10 @@ last_completed_phase: 5
 last_completed_commit: 8ec6542
 production_commit: 5e96b555b0bf7a853f5eba53f95a9122d5395317
 local_tests:
+  - "phase-6-mimo-closed-final-correction-runtime-and-provider-focused: 136 passed"
+  - "phase-6-mimo-closed-final-correction-context-management-regressions: 396 passed"
+  - "phase-6-mimo-closed-final-correction-listener-monitor-mutation-regressions: 178 passed, 1 skipped"
+  - "phase-6-mimo-closed-final-correction-offline-evaluation: 7 cases, all nine metrics at 1.0"
   - "phase-6-mimo-json-final-and-bounds-focused: 215 passed"
   - "phase-6-mimo-json-final-and-bounds-context-management-regressions: 176 passed"
   - "phase-6-mimo-json-final-and-bounds-offline-evaluation: 7 cases, all nine metrics at 1.0"
@@ -326,6 +330,12 @@ Phase 5 is not complete until:
 - End-to-end model status: still fail-closed; the latest live MiMo v6 final
   cited invalid/fabricated evidence references, so Phase 6 remains
   `in_progress` and persistent Agent/action flags remain off
+- Final-correction hardening is locally complete in prompt v7: one malformed
+  or contract-invalid final may receive one bounded correction turn with no
+  tools and only actually gathered evidence references. A second invalid
+  response, a corrected tool request, or an exhausted wall budget fails closed
+  before recovery policy or action. Local review found no Critical, Important,
+  or Minor defects; deployment and one live MiMo validation remain pending.
 
 ## Current Phase 6 Exit Checklist
 
