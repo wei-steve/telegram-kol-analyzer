@@ -114,6 +114,25 @@ def test_runtime_config_prefers_complete_systemd_environment_over_unreadable_def
 
     config = load_runtime_incident_config(
         env_file_paths=[config_file],
+        environment_only=True,
     )
 
     assert config.agent_enabled is False
+
+
+def test_runtime_config_partial_environment_keeps_file_backed_capture_settings(
+    tmp_path,
+    monkeypatch,
+):
+    config_file = tmp_path / "telegram.env"
+    config_file.write_text(
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES="
+        "worker_retry_exhausted\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("TELEGRAM_KOL_RUNTIME_AGENT_ENABLED", "false")
+
+    config = load_runtime_incident_config(env_file_paths=[config_file])
+
+    assert config.captures("worker_retry_exhausted") is True

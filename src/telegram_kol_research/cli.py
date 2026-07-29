@@ -2465,7 +2465,7 @@ def runtime_incident_agent_once(
 ) -> None:
     """Diagnose at most one runtime incident through the dormant read-only agent."""
 
-    runtime_config = load_runtime_incident_config()
+    runtime_config = load_runtime_incident_config(environment_only=True)
     session_factory = create_session_factory(database_path)
     tools = _build_runtime_agent_cli_tools(
         session_factory,
@@ -2533,7 +2533,7 @@ def runtime_incident_agent_worker(
 ) -> None:
     """Run the independently supervised runtime incident sidecar loop."""
 
-    runtime_config = load_runtime_incident_config()
+    runtime_config = load_runtime_incident_config(environment_only=True)
     if not runtime_config.agent_enabled:
         typer.echo(
             '{"incident_id":null,"status":"disabled","tool_steps":0}'

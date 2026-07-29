@@ -49,6 +49,8 @@ def _enabled_flag(value: str | None) -> bool:
 def load_runtime_incident_config(
     environ: dict[str, str] | None = None,
     env_file_paths: list[str | os.PathLike[str]] | None = None,
+    *,
+    environment_only: bool = False,
 ) -> RuntimeIncidentConfig:
     """Load dormant-by-default runtime incident flags from bounded settings."""
 
@@ -58,10 +60,7 @@ def load_runtime_incident_config(
         else env_file_paths
     )
     active_environment = os.environ if environ is None else environ
-    if environ is None and any(
-        name.startswith("TELEGRAM_KOL_RUNTIME_")
-        for name in active_environment
-    ):
+    if environment_only:
         env: dict[str, str] = {}
     else:
         env = dict(
