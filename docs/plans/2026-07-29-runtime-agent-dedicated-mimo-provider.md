@@ -141,7 +141,7 @@ git commit -m "fix: require dedicated runtime agent provider"
 ### Task 3: Operational contract and secret-safe examples
 
 **Files:**
-- Modify: `config/runtime_incident_agent.env.example`
+- Create: `config/runtime_incident_agent.env.example`
 - Modify: `docs/runtime-incident-agent-runbook.md`
 - Modify: `docs/runtime-incident-agent-status.md`
 - Test: `tests/test_runtime_agent_architecture_boundary.py`
