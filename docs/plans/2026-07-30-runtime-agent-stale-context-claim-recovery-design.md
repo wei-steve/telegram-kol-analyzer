@@ -21,9 +21,15 @@ commit from this design may be deployed. The catalog entry remains fail-closed
 as `executor_not_configured` until a genuine durable source state exists that
 does not replace, bypass, or duplicate the contextual worker.
 
-## Scope
+## Historical Rejected Proposal — Do Not Implement
 
-Implement the next Phase 6 playbook,
+The remainder of this document preserves the abandoned proposal for audit
+history only. Its selection language and test plan are not current
+instructions.
+
+### Scope
+
+The proposal attempted to implement the Phase 6 playbook,
 `recover_stale_side_effect_free_claim`, for one exact worker family:
 `context_resolution_attempt`. The handler may return an expired contextual
 reanalysis claim to its existing safe queue. It must not rerun contextual
@@ -60,9 +66,8 @@ a bounded in-memory proof of the committed transition. `get_worker_state`
 consumes that proof exactly once for executor verification, then returns to its
 ordinary passive projection.
 
-This is the selected approach because it preserves the authoritative worker,
-avoids a verification race, and proves only the transition actually committed
-by this action.
+This was the initially selected approach before review proved that its source
+state was unreachable. It is not approved for implementation.
 
 ## Safety Contract
 
