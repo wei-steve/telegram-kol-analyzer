@@ -45,6 +45,55 @@ def test_runtime_agent_cli_is_dormant_without_feature_flag(tmp_path, monkeypatch
     }
 
 
+def test_runtime_agent_cli_rejects_missing_dedicated_provider_before_claim(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="worker_job",
+        source_record_id="dedicated-provider",
+        incident_type="worker_retry_exhausted",
+        severity="high",
+        fingerprint="d" * 64,
+        redacted_summary='{"error_type":"provider_timeout"}',
+        occurred_at=datetime(2026, 7, 29, 9, 0, tzinfo=UTC),
+        feature_policy_version="runtime-incident-phase-6-v1",
+        prompt_version="runtime-agent-prompt-v4",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    shared_key = "shared-key-must-not-leak"
+    monkeypatch.setenv("TELEGRAM_KOL_RUNTIME_AGENT_ENABLED", "true")
+    monkeypatch.setenv("TELEGRAM_KOL_LLM_API_KEY", shared_key)
+    monkeypatch.delenv(
+        "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY", raising=False
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "runtime-incident-agent-once",
+            "--database-path",
+            str(database_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert (
+        "dedicated Runtime Agent provider configuration is invalid"
+        in str(result.exception)
+    )
+    assert shared_key not in result.output
+    assert shared_key not in str(result.exception)
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        assert row.status == "pending"
+        assert row.claim_token is None
+        assert row.agent_attempt_count == 0
+
+
 def test_runtime_agent_cli_prints_reproducible_handoff(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

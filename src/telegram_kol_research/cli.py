@@ -88,7 +88,7 @@ from telegram_kol_research.llm_adjudication import (
 )
 from telegram_kol_research.llm_import import import_llm_adjudication_results
 from telegram_kol_research.llm_chat import (
-    load_llm_proxy_config,
+    load_runtime_agent_llm_config,
     request_structured_chat_turn,
 )
 from telegram_kol_research.media_retention import cleanup_media_files
@@ -2487,7 +2487,7 @@ def runtime_incident_agent_once(
         ),
     )
     if runtime_config.agent_enabled:
-        llm_config = load_llm_proxy_config()
+        llm_config = load_runtime_agent_llm_config()
 
         def model_turn(**kwargs):
             return request_structured_chat_turn(
@@ -2559,7 +2559,7 @@ def runtime_incident_agent_worker(
             runtime_config.agent_action_circuit_threshold
         ),
     )
-    llm_config = load_llm_proxy_config()
+    llm_config = load_runtime_agent_llm_config()
 
     def run_once():
         return run_runtime_agent_once(
