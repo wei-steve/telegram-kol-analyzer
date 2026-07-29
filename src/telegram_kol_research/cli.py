@@ -125,9 +125,6 @@ from telegram_kol_research.runtime_agent_exchange_snapshot import (
 from telegram_kol_research.runtime_agent_production_audit import (
     RuntimeAgentProductionAuditRefresh,
 )
-from telegram_kol_research.runtime_agent_context_claim_recovery import (
-    RuntimeAgentContextClaimRecovery,
-)
 from telegram_kol_research.runtime_agent_evaluation import (
     evaluate_runtime_agent_case,
     load_runtime_agent_corpus,
@@ -1940,9 +1937,6 @@ def _build_runtime_agent_cli_tools(
     production_audit_refresh: (
         RuntimeAgentProductionAuditRefresh | None
     ) = None,
-    context_claim_recovery: (
-        RuntimeAgentContextClaimRecovery | None
-    ) = None,
 ) -> RuntimeAgentToolRegistry:
     def load_incident(session, incident_id: int):
         row = session.get(RuntimeIncident, incident_id)
@@ -2078,36 +2072,6 @@ def _build_runtime_agent_cli_tools(
     def worker_state(*, incident_id: int):
         with session_factory() as session:
             incident = load_incident(session, incident_id)
-            live_verification = (
-                context_claim_recovery.consume_verification(
-                    incident_id=int(incident_id)
-                )
-                if context_claim_recovery is not None
-                else None
-            )
-            if live_verification is not None:
-                context_attempt_id = live_verification.get(
-                    "context_attempt_id"
-                )
-                if (
-                    isinstance(context_attempt_id, bool)
-                    or not isinstance(context_attempt_id, int)
-                    or context_attempt_id < 1
-                ):
-                    raise ValueError(
-                        "context claim recovery proof is invalid"
-                    )
-                return {
-                    "data": {
-                        "incident_id": incident.id,
-                        "worker_kind": incident.source_kind,
-                        **live_verification,
-                    },
-                    "evidence_refs": [
-                        f"incident:{incident.id}",
-                        f"context-attempt:{context_attempt_id}",
-                    ],
-                }
             data = {
                 "incident_id": incident.id,
                 "worker_kind": incident.source_kind,
@@ -2529,9 +2493,6 @@ def _build_runtime_agent_action_handlers(
     production_audit_refresh: (
         RuntimeAgentProductionAuditRefresh | None
     ) = None,
-    context_claim_recovery: (
-        RuntimeAgentContextClaimRecovery | None
-    ) = None,
 ):
     """Wire only concrete, reviewed Phase 6 actions into production entrypoints."""
 
@@ -2590,23 +2551,6 @@ def _build_runtime_agent_action_handlers(
             )
 
         handlers["rerun_production_audit"] = rerun_production_audit
-    if context_claim_recovery is not None:
-
-        def recover_stale_side_effect_free_claim(
-            *,
-            incident_id: int,
-            idempotency_key: str,
-            expected_fingerprint: str,
-        ) -> bool:
-            return context_claim_recovery.recover(
-                incident_id=int(incident_id),
-                idempotency_key=str(idempotency_key),
-                expected_fingerprint=str(expected_fingerprint),
-            )
-
-        handlers["recover_stale_side_effect_free_claim"] = (
-            recover_stale_side_effect_free_claim
-        )
     return handlers
 
 
@@ -2681,21 +2625,16 @@ def runtime_incident_agent_once(
     production_audit_refresh = (
         _build_runtime_agent_production_audit_refresh()
     )
-    context_claim_recovery = RuntimeAgentContextClaimRecovery(
-        session_factory
-    )
     tools = _build_runtime_agent_cli_tools(
         session_factory,
         max_output_bytes=runtime_config.agent_max_tool_output_bytes,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
         production_audit_refresh=production_audit_refresh,
-        context_claim_recovery=context_claim_recovery,
     )
     action_handlers = _build_runtime_agent_action_handlers(
         tools,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
         production_audit_refresh=production_audit_refresh,
-        context_claim_recovery=context_claim_recovery,
     )
     worker_config = RuntimeAgentWorkerConfig(
         enabled=runtime_config.agent_enabled,
@@ -2771,21 +2710,16 @@ def runtime_incident_agent_worker(
     production_audit_refresh = (
         _build_runtime_agent_production_audit_refresh()
     )
-    context_claim_recovery = RuntimeAgentContextClaimRecovery(
-        session_factory
-    )
     tools = _build_runtime_agent_cli_tools(
         session_factory,
         max_output_bytes=runtime_config.agent_max_tool_output_bytes,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
         production_audit_refresh=production_audit_refresh,
-        context_claim_recovery=context_claim_recovery,
     )
     action_handlers = _build_runtime_agent_action_handlers(
         tools,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
         production_audit_refresh=production_audit_refresh,
-        context_claim_recovery=context_claim_recovery,
     )
     worker_config = RuntimeAgentWorkerConfig(
         enabled=True,

@@ -1,5 +1,26 @@
 # Runtime Agent Stale Context Claim Recovery Design
 
+## Review Outcome
+
+**Rejected before deployment.** Review proved that the proposed source state is
+not reachable through the authoritative runtime path. The context worker emits
+a `context_worker_exhausted` incident only after it has changed the source
+attempt to `exhausted` and cleared its claim. The emitted incident summary also
+does not contain `claim_status` or `claim_side_effect_class`. The proposed
+handler instead required that same source row to remain `running` with a stale
+claim and required both summary fields.
+
+Adding a second stale-claim capture/recovery path would duplicate the existing
+authoritative context worker, which already reclaims stale `running` attempts
+with a compare-and-set operation. Making the normal worker wait for the
+Runtime Agent would also violate the dormant-by-default and production
+continuity boundaries.
+
+The implementation and synthetic tests were therefore removed. No runtime
+commit from this design may be deployed. The catalog entry remains fail-closed
+as `executor_not_configured` until a genuine durable source state exists that
+does not replace, bypass, or duplicate the contextual worker.
+
 ## Scope
 
 Implement the next Phase 6 playbook,

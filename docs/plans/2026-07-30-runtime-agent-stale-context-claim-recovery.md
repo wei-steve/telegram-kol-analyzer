@@ -2,6 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
+**Status:** Rejected during mandatory code review and not deployed. The plan's
+synthetic stale-running source state cannot be emitted by the authoritative
+context incident adapter. See the paired design's Review Outcome. Do not resume
+this plan without a new design based on a genuine durable source state.
+
 **Goal:** Add a dormant, compare-and-set Phase 6 handler that returns one proven stale, side-effect-free contextual reanalysis claim to its existing queue and verifies the exact committed transition.
 
 **Architecture:** A dedicated in-process coordinator validates the runtime incident and source attempt, refuses any live or business-writing target, performs one narrow SQL compare-and-set update, and retains a bounded one-shot verification proof. The existing CLI tool registry consumes that proof through `get_worker_state`; the executor remains the sole authority gate and the authoritative context worker remains the sole consumer of the restored queue item.

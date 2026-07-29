@@ -13,6 +13,8 @@ last_completed_phase: 5
 last_completed_commit: 8ec6542
 production_commit: 25e833665aac8e660c249c3399d14e884c7bf92d
 local_tests:
+  - "phase-6-stale-claim-rejected-runtime-baseline: 219 passed"
+  - "phase-6-stale-claim-rejected-context-policy-baseline: 25 passed"
   - "phase-6-production-audit-runtime-web-focused: 333 passed"
   - "phase-6-production-audit-context-management-regressions: 396 passed"
   - "phase-6-production-audit-listener-monitor-mutation-regressions: 140 passed, 2 known deprecation warnings"
@@ -118,14 +120,15 @@ server_verification:
   phase_6_production_audit_boundary: "the root main service alone runs the fixed read-only audit command with a 20-second timeout, 1 MiB combined-output ceiling, dedicated automatically removed scratch root, and process-wide single-flight lock. The loopback endpoint refused X-Forwarded-For with HTTP 404; simultaneous requests returned one HTTP 200 and one immediate HTTP 409; a later request returned HTTP 200; scratch residue stayed zero. The unprivileged telegram-kol-agent identity consumed the bounded endpoint without database ownership or credential expansion"
   phase_6_production_audit_canary: "one isolated temporary-database management_partial_failed incident enabled exactly rerun_production_audit in-process; the deployed handler completed one production read-only audit and reached verified/action_verified with only incident:1 and audit-run:1 evidence. The production ledger remained at 3 incidents and 1 earlier recovery attempt; latest management batch 80 remained succeeded with unchanged updated_at 2026-07-29 06:39:13.358810"
   phase_6_production_audit_postdeploy: "333 deployed focused tests passed; the seven-case offline gate kept all nine metrics at 1.0; latest raw message 8354 completed as non-strategy; evidence/context/management/position-mutation/recovery work in flight was zero. The no-notify monitor returned monitor_error null with only the known audit_abnormal baseline. Before deployment it returned two transient adapter_failure results, then recovered to the same known baseline on the third bounded attempt"
-  remaining: "Keep all Agent/action flags empty/off. Three reviewed handlers now have positive isolated canaries: build_read_only_reconciliation_plan, refresh_read_only_exchange_snapshot, and rerun_production_audit. Every remaining playbook still requires its own reviewed handler, exact non-writing proof, safe window, and canary; recover_stale_side_effect_free_claim is the next operational-reversible candidate."
+  phase_6_stale_claim_review: "the proposed context-resolution handler was rejected before deployment. The authoritative adapter records context_worker_exhausted only after the source attempt becomes exhausted and its claim is cleared, while the proposed handler and policy required an unreachable stale-running row plus summary fields the adapter never emits. Adding a parallel stale-claim path would duplicate the authoritative context worker's existing compare-and-set reclaim. The synthetic implementation was removed and no production restart occurred"
+  remaining: "Keep all Agent/action flags empty/off. Three reviewed handlers retain positive isolated canaries: build_read_only_reconciliation_plan, refresh_read_only_exchange_snapshot, and rerun_production_audit. recover_stale_side_effect_free_claim remains executor_not_configured and must not be implemented against contextual claims without a new genuine durable source state. fetch_missing_telegram_evidence is the next read-only candidate; it still requires its own design, handler, bounded proof, safe window, and canary."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
 known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
-  - "Phase 6 production wiring currently implements the read-only reconciliation-plan, exchange-snapshot-refresh, and production-audit handlers. Claim recovery, AI-job reschedule, and Telegram-evidence playbooks fail closed as executor_not_configured until separately reviewed handlers exist."
+  - "Phase 6 production wiring currently implements the read-only reconciliation-plan, exchange-snapshot-refresh, and production-audit handlers. Claim recovery, AI-job reschedule, and Telegram-evidence playbooks fail closed as executor_not_configured until separately reviewed handlers exist. The first context-claim recovery design was rejected because its source state was unreachable and would duplicate the authoritative context worker."
   - "Historical MiMo v4/v6 attempts failed closed on text-form tool output and fabricated evidence. Prompt v7 now passed an isolated live closed-final validation with only actually gathered evidence, while production incident 2 remains preserved as escalated for audit history."
   - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
