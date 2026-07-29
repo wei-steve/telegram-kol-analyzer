@@ -3404,7 +3404,9 @@ def _clear_resolved_expiry_review(lifecycle) -> None:
     lifecycle.management_note = None
 
 
-def _binding_has_unresolved_entry_leg(session, row: ExecutionBinding) -> bool:
+def binding_has_unresolved_entry_leg(session, row: ExecutionBinding) -> bool:
+    """Return whether an exact binding still has an unfilled entry exposure."""
+
     legs = (
         session.query(ExecutionOrderLeg)
         .filter(ExecutionOrderLeg.execution_binding_id == row.id)
@@ -3422,6 +3424,10 @@ def _binding_has_unresolved_entry_leg(session, row: ExecutionBinding) -> bool:
         leg_pos_ids = {str(leg.pos_id) for leg in eligible_legs if leg.pos_id}
         return not leg_pos_ids or len(leg_pos_ids) < len(eligible_legs)
     return len(_split_ids(row.order_id)) > len(_split_ids(row.pos_id))
+
+
+def _binding_has_unresolved_entry_leg(session, row: ExecutionBinding) -> bool:
+    return binding_has_unresolved_entry_leg(session, row)
 
 
 def _apply_recorded_terminal_entry_events(
