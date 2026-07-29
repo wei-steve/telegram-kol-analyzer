@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 from telegram_kol_research.cli import (
     _build_runtime_agent_action_handlers,
     _build_runtime_agent_cli_tools,
+    _build_runtime_agent_production_audit_refresh,
     _read_runtime_agent_exchange_snapshot,
     app,
 )
@@ -395,6 +396,146 @@ def test_phase6_wires_refresh_handler_to_independent_live_verification(
         "local_vs_durable_last_observed"
     )
     assert len(calls) == 2
+
+
+def test_phase6_wires_audit_handler_to_one_shot_live_verification(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="strategy_management_batch",
+        source_record_id="80",
+        incident_type="management_partial_failed",
+        severity="high",
+        fingerprint="a" * 64,
+        redacted_summary='{"source_status":"partial_failed"}',
+        occurred_at=datetime(2026, 7, 30, 9, 0, tzinfo=UTC),
+        feature_policy_version="runtime-incident-phase-6-v1",
+        prompt_version="runtime-agent-prompt-v7",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    monitor_state_path = tmp_path / "monitor-state.json"
+    monitor_state_path.write_text(
+        '{"last_full_audit_date":"2026-07-29",'
+        '"last_window_at":"2026-07-29T09:00:00",'
+        '"last_notification_at":null,"anomaly_fingerprint":null}',
+        encoding="utf-8",
+    )
+    calls = []
+
+    class AuditRefresh:
+        def rerun(self, **kwargs):
+            calls.append(("rerun", kwargs))
+            return True
+
+        def consume_verification(self, *, incident_id):
+            if not any(call[0] == "rerun" for call in calls):
+                return None
+            if any(call[0] == "verify" for call in calls):
+                return None
+            calls.append(("verify", incident_id))
+            return {
+                "available": True,
+                "audit_run_completed": True,
+                "complete": True,
+                "monitor_error": None,
+                "snapshot_status": "stable",
+                "snapshot_validation": "ok",
+                "output_complete": True,
+                "malformed_row_count": 0,
+                "counts": {
+                    "batches_total": 80,
+                    "submit_unknown": 0,
+                    "partial_failed": 1,
+                    "recovery_required": 5,
+                },
+            }
+
+    audit_refresh = AuditRefresh()
+    tools = _build_runtime_agent_cli_tools(
+        session_factory,
+        max_output_bytes=8192,
+        monitor_state_path=monitor_state_path,
+        journal_reader=lambda: (),
+        production_audit_refresh=audit_refresh,
+    )
+    handlers = _build_runtime_agent_action_handlers(
+        tools,
+        production_audit_refresh=audit_refresh,
+    )
+
+    passive = tools.execute(
+        "get_service_audit_state",
+        {"incident_id": incident.id},
+        expected_incident_id=incident.id,
+    )
+    assert passive.data["audit_run_completed"] is False
+    assert set(handlers) == {
+        "build_read_only_reconciliation_plan",
+        "rerun_production_audit",
+    }
+
+    assert handlers["rerun_production_audit"](
+        incident_id=incident.id,
+        idempotency_key="runtime-incident:1:audit:v1",
+        expected_fingerprint=incident.fingerprint,
+    ) is True
+    verified = tools.execute(
+        "get_service_audit_state",
+        {"incident_id": incident.id},
+        expected_incident_id=incident.id,
+    )
+
+    assert calls[0][0] == "rerun"
+    assert calls[1] == ("verify", incident.id)
+    assert verified.data["complete"] is True
+    assert verified.evidence_refs == (
+        f"incident:{incident.id}",
+        f"audit-run:{incident.id}",
+    )
+    passive_again = tools.execute(
+        "get_service_audit_state",
+        {"incident_id": incident.id},
+        expected_incident_id=incident.id,
+    )
+    assert passive_again.data["audit_run_completed"] is False
+    assert len(calls) == 2
+
+
+def test_phase6_production_audit_runner_uses_requested_database_path(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "production.db"
+    calls = []
+
+    def audit(path, *, limit):
+        calls.append((path, limit))
+        return {
+            "snapshot_status": "stable",
+            "snapshot_validation": "ok",
+            "output_complete": True,
+            "malformed_row_count": 0,
+            "counts": {
+                "batches_total": 0,
+                "submit_unknown": 0,
+                "partial_failed": 0,
+                "recovery_required": 0,
+            },
+        }
+
+    monkeypatch.setattr(
+        "telegram_kol_research.cli._audit_management_batches_read_only",
+        audit,
+    )
+
+    refresh = _build_runtime_agent_production_audit_refresh(database_path)
+    assert refresh.rerun(
+        incident_id=1,
+        idempotency_key="runtime-incident:1:audit:v1",
+        expected_fingerprint="a" * 64,
+    )
+
+    assert calls == [(database_path, 100)]
 
 
 def test_runtime_agent_exchange_snapshot_reader_allows_bounded_provider_latency(

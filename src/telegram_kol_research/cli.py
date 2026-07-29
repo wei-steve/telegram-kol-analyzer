@@ -122,6 +122,9 @@ from telegram_kol_research.runtime_agent_tools import (
 from telegram_kol_research.runtime_agent_exchange_snapshot import (
     RuntimeAgentExchangeSnapshotRefresh,
 )
+from telegram_kol_research.runtime_agent_production_audit import (
+    RuntimeAgentProductionAuditRefresh,
+)
 from telegram_kol_research.runtime_agent_evaluation import (
     evaluate_runtime_agent_case,
     load_runtime_agent_corpus,
@@ -1898,6 +1901,9 @@ def _build_runtime_agent_cli_tools(
     exchange_snapshot_refresh: (
         RuntimeAgentExchangeSnapshotRefresh | None
     ) = None,
+    production_audit_refresh: (
+        RuntimeAgentProductionAuditRefresh | None
+    ) = None,
 ) -> RuntimeAgentToolRegistry:
     def load_incident(session, incident_id: int):
         row = session.get(RuntimeIncident, incident_id)
@@ -2134,9 +2140,30 @@ def _build_runtime_agent_cli_tools(
     def service_audit_state(*, incident_id: int):
         with session_factory() as session:
             incident = load_incident(session, incident_id)
+        live_verification = (
+            production_audit_refresh.consume_verification(
+                incident_id=int(incident_id)
+            )
+            if production_audit_refresh is not None
+            else None
+        )
+        if live_verification is not None:
+            return {
+                "data": {
+                    "incident_id": incident.id,
+                    **live_verification,
+                },
+                "evidence_refs": [
+                    f"incident:{incident.id}",
+                    f"audit-run:{incident.id}",
+                ],
+            }
         data = {
             "incident_id": incident.id,
             "available": False,
+            "audit_run_completed": False,
+            "complete": False,
+            "monitor_error": None,
             "last_full_audit_date": None,
             "last_window_at": None,
             "last_notification_at": None,
@@ -2430,6 +2457,9 @@ def _build_runtime_agent_action_handlers(
     exchange_snapshot_refresh: (
         RuntimeAgentExchangeSnapshotRefresh | None
     ) = None,
+    production_audit_refresh: (
+        RuntimeAgentProductionAuditRefresh | None
+    ) = None,
 ):
     """Wire only concrete, reviewed Phase 6 actions into production entrypoints."""
 
@@ -2473,6 +2503,21 @@ def _build_runtime_agent_action_handlers(
         handlers["refresh_read_only_exchange_snapshot"] = (
             refresh_read_only_exchange_snapshot
         )
+    if production_audit_refresh is not None:
+
+        def rerun_production_audit(
+            *,
+            incident_id: int,
+            idempotency_key: str,
+            expected_fingerprint: str,
+        ) -> bool:
+            return production_audit_refresh.rerun(
+                incident_id=int(incident_id),
+                idempotency_key=str(idempotency_key),
+                expected_fingerprint=str(expected_fingerprint),
+            )
+
+        handlers["rerun_production_audit"] = rerun_production_audit
     return handlers
 
 
@@ -2484,6 +2529,17 @@ def _read_runtime_agent_exchange_snapshot() -> dict[str, Any]:
         )
         response.raise_for_status()
         return response.json()
+
+
+def _build_runtime_agent_production_audit_refresh(
+    database_path: Path,
+) -> RuntimeAgentProductionAuditRefresh:
+    return RuntimeAgentProductionAuditRefresh(
+        runner=lambda: _audit_management_batches_read_only(
+            database_path,
+            limit=100,
+        )
+    )
 
 
 @app.command("runtime-incident-agent-evaluate")
@@ -2527,14 +2583,19 @@ def runtime_incident_agent_once(
     exchange_snapshot_refresh = RuntimeAgentExchangeSnapshotRefresh(
         reader=_read_runtime_agent_exchange_snapshot
     )
+    production_audit_refresh = (
+        _build_runtime_agent_production_audit_refresh(database_path)
+    )
     tools = _build_runtime_agent_cli_tools(
         session_factory,
         max_output_bytes=runtime_config.agent_max_tool_output_bytes,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
+        production_audit_refresh=production_audit_refresh,
     )
     action_handlers = _build_runtime_agent_action_handlers(
         tools,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
+        production_audit_refresh=production_audit_refresh,
     )
     worker_config = RuntimeAgentWorkerConfig(
         enabled=runtime_config.agent_enabled,
@@ -2607,14 +2668,19 @@ def runtime_incident_agent_worker(
     exchange_snapshot_refresh = RuntimeAgentExchangeSnapshotRefresh(
         reader=_read_runtime_agent_exchange_snapshot
     )
+    production_audit_refresh = (
+        _build_runtime_agent_production_audit_refresh(database_path)
+    )
     tools = _build_runtime_agent_cli_tools(
         session_factory,
         max_output_bytes=runtime_config.agent_max_tool_output_bytes,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
+        production_audit_refresh=production_audit_refresh,
     )
     action_handlers = _build_runtime_agent_action_handlers(
         tools,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
+        production_audit_refresh=production_audit_refresh,
     )
     worker_config = RuntimeAgentWorkerConfig(
         enabled=True,
