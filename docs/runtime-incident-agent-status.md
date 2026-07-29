@@ -6,13 +6,15 @@ used to advance or reinterpret the rollout.
 ```yaml
 project: runtime-incident-agent
 design_version: 1
-current_phase: 6
-phase_name: low-risk-automatic-recovery
-phase_status: in_progress
-last_completed_phase: 5
-last_completed_commit: 8ec6542
+current_phase: 7
+phase_name: optional-bounded-business-recovery
+phase_status: blocked
+last_completed_phase: 6
+last_completed_commit: 46852f0
 production_commit: e3e784a07a005bdc23f6f18c6f4294b0fdb19b95
 local_tests:
+  - "phase-6-non-writing-ai-job-source-review-baseline: 115 passed"
+  - "phase-6-non-writing-ai-job-offline-evaluation: 7 cases, all nine metrics at 1.0"
   - "phase-6-telegram-evidence-runtime-web-focused: 355 passed, 2 sqlite deprecation warnings"
   - "phase-6-telegram-evidence-context-management-regressions: 417 passed"
   - "phase-6-telegram-evidence-listener-monitor-mutation-regressions: 136 passed, 2 known deprecation warnings"
@@ -60,7 +62,7 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-6-telegram-evidence-verified
+  status: phase-6-complete
   deployed_commit: e3e784a07a005bdc23f6f18c6f4294b0fdb19b95
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
@@ -130,7 +132,9 @@ server_verification:
   phase_6_telegram_evidence_boundary: "the main service alone owns bot credentials and runs concurrent read-only getMe/getChat calls behind a true five-second wall-clock deadline, loopback/proxy refusal, and process-wide single-flight. The unprivileged sidecar received only four fixed booleans. X-Forwarded-For returned HTTP 404; simultaneous system-operator probes returned HTTP 200/409 and a later request returned HTTP 200. The notification-bot channel failed closed with HTTP 503 because its production config is absent"
   phase_6_telegram_evidence_canary: "one isolated temporary-database runtime_incident_notification failure enabled exactly fetch_missing_telegram_evidence in-process. The deployed system-operator probe reached verified/action_verified with only incident:2 and telegram-evidence:2 references; the synthetic failed source remained failed. Production stayed at 3 incidents, 1 historical recovery attempt, 70 strategy notifications with unchanged latest updated_at, and management batch 80 remained succeeded"
   phase_6_telegram_evidence_postdeploy: "221 deployed focused tests passed; the seven-case offline gate kept all nine metrics at 1.0; the listener reported monitoring 31 groups with raw message 8360 completed as non-strategy. Evidence/context/management/position-mutation/recovery work in flight was zero. The no-notify monitor returned monitor_error null with only the known audit_abnormal baseline"
-  remaining: "Keep all Agent/action flags empty/off. Four reviewed handlers retain positive isolated canaries: build_read_only_reconciliation_plan, refresh_read_only_exchange_snapshot, rerun_production_audit, and fetch_missing_telegram_evidence. recover_stale_side_effect_free_claim remains executor_not_configured and must not be implemented against contextual claims without a new genuine durable source state. reschedule_non_writing_ai_job is the next catalog candidate, but its genuine production source state and non-writing ownership proof must be reviewed before any handler design."
+  phase_6_non_writing_ai_job_review: "reschedule_non_writing_ai_job was rejected before implementation. context_worker_exhausted would re-enter the authoritative contextual path with the live auto-trade executor, while semantic_review provider exhaustion can be rescheduled only by mutating RecognitionDecision. Neither production adapter emits business_write_owned false, and get_worker_state has no semantic-review resolver. Production read-only inspection found zero related runtime incidents, zero exhausted context attempts, and two historical terminal semantic-review failures with three attempts, no claim, and no schedule. No runtime change, deployment, or restart occurred"
+  phase_6_completion: "Phase 6 is complete with four reviewed deployed handlers and two documented fail-closed rejections. All Agent/shadow/action flags and allowlists remain empty/off. Optional Phase 7 is blocked because its separately required explicit user approval has not been given"
+  remaining: "Do not begin Phase 7 from the standard implementation trigger. Keep all Agent/action flags empty/off. Phase 7 bounded business recovery requires a fresh explicit user approval that names Phase 7 and accepts its business-mutation scope; phase_7_explicitly_approved remains false."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
@@ -138,7 +142,7 @@ known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
   - "The production notification-bot configuration is absent, so the new read-only Telegram evidence endpoint returns HTTP 503 for strategy-management notification sources. Runtime-incident system-operator evidence is verified; the unsupported production channel fails closed and no credential was added in Phase 6."
-  - "Phase 6 production wiring currently implements the read-only reconciliation-plan, exchange-snapshot-refresh, production-audit, and Telegram-evidence handlers. Claim recovery and AI-job reschedule fail closed as executor_not_configured until separately reviewed handlers exist. The first context-claim recovery design was rejected because its source state was unreachable and would duplicate the authoritative context worker."
+  - "Phase 6 production wiring implements the read-only reconciliation-plan, exchange-snapshot-refresh, production-audit, and Telegram-evidence handlers. Claim recovery and AI-job reschedule remain executor_not_configured by reviewed design: the former duplicated the authoritative stale-claim path, while the latter had no source satisfying both non-writing proof and the recognition/contextual-resolution boundary."
   - "Historical MiMo v4/v6 attempts failed closed on text-form tool output and fabricated evidence. Prompt v7 now passed an isolated live closed-final validation with only actually gathered evidence, while production incident 2 remains preserved as escalated for audit history."
   - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
@@ -317,7 +321,7 @@ Phase 5 is not complete until:
 
 ### Phase 6 — Low-risk automatic recovery
 
-- Status: in_progress
+- Status: completed
 - Local implementation: additive durable recovery-attempt ledger; exact
   execution policy; current fingerprint, claim token, lease, idempotency,
   attempt-budget, and one-active-action gates; per-incident freeze; global
@@ -366,7 +370,8 @@ Phase 5 is not complete until:
 - End-to-end model status: prompt v7 completed one isolated live MiMo diagnosis
   with three bounded read-only queries and only the actually gathered
   `incident:1` reference. Empty shadow/action allowlists refused authority;
-  Phase 6 remains `in_progress` for the unimplemented playbook handlers and
+  at that checkpoint Phase 6 remained `in_progress` for unreviewed playbook
+  handlers. The later handler reviews and rejections completed the phase;
   persistent Agent/action flags remain off
 - Final-correction hardening is locally complete in prompt v7: one malformed
   or contract-invalid final may receive one bounded correction turn with no
@@ -401,6 +406,15 @@ Phase 5 is not complete until:
   runtime-notification canary reached `action_verified`; its source remained
   failed and production rows were unchanged. The absent notification-bot
   configuration causes that exact channel to fail closed with HTTP 503.
+- `reschedule_non_writing_ai_job` was rejected before implementation. The
+  contextual source can re-enter the live auto-trade path, while the only
+  provider source is a failed semantic review that would require a prohibited
+  `RecognitionDecision` mutation. Neither adapter proves
+  `business_write_owned: false`. Review found no Critical, Important, or Minor
+  source-analysis defect after the canonical status correction.
+- Phase 6 is complete with four deployed positive canaries and two documented
+  fail-closed candidate rejections. Production remains at `e3e784a`; the
+  completion review is documentation-only and required no service restart.
 
 ## Current Phase 6 Exit Checklist
 
@@ -426,5 +440,17 @@ Phase 5 is not complete until:
 - [x] the live provider completes a closed final using only gathered evidence;
 - [x] all four implemented production handlers pass isolated reversible
       canaries;
-- [ ] each remaining playbook receives its own handler, verification proof,
-      safe window, and canary before enablement.
+- [x] each catalog playbook has either a reviewed handler with verification and
+      an isolated canary, or a documented fail-closed source rejection.
+
+### Phase 7 — Optional Bounded Business Recovery
+
+- Status: blocked
+- Explicit approval recorded: no
+- Runtime or production change: none
+- Blocker: the canonical plan requires a fresh explicit user approval for
+  Phase 7. The ordinary implementation trigger does not grant business-mutation
+  authority.
+- Required next action: the user must explicitly approve or decline Phase 7
+  after reviewing its bounded business-recovery scope. Until then, keep every
+  Agent/action flag and allowlist empty/off.
