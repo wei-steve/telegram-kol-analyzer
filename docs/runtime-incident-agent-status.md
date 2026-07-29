@@ -11,7 +11,7 @@ phase_name: low-risk-automatic-recovery
 phase_status: in_progress
 last_completed_phase: 5
 last_completed_commit: 8ec6542
-production_commit: 8ec6542de4ebe29eed8ab419109d654a9e12cad2
+production_commit: 1fe682980f97e17ac7dc54307036c5dff40a92a1
 local_tests:
   - "phase-6-final-focused: 180 passed"
   - "phase-6-final-executor-race-suite: 15 passed"
@@ -32,10 +32,10 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-5-completed
-  deployed_commit: 8ec6542de4ebe29eed8ab419109d654a9e12cad2
+  status: phase-6-dormant-boundary-deployed
+  deployed_commit: 1fe682980f97e17ac7dc54307036c5dff40a92a1
   service: active-http-200
-  bounded_restarts: "clean; no post-restart service errors"
+  bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
   listener: monitoring-31-enabled-groups-and-continuing
   recognition: "latest raw message 8293 had a completed recognition before and after deployment"
   contextual_resolution_inflight: 0
@@ -72,7 +72,13 @@ server_verification:
     deployed_focused_tests: "95 passed"
     canary: "incident 1 used one bounded incident-summary tool call and nominated only refresh_read_only_exchange_snapshot; runtime-shadow-policy-v1 accepted it with would_execute=false and action_executed=false"
     source_integrity: "source management batch 28 remained historical partial_failed with updated_at 2026-07-21 15:20:33.518543; no business row or position mutation changed"
-  remaining: "Commit, push, and deploy the reviewed Phase 6 dormant execution boundary in a proven safe window. Keep all action flags empty/off. A real canary remains blocked until a reviewed production model provider is available; only build_read_only_reconciliation_plan currently has a production handler, and every other playbook must remain refused until its own handler and positive verification proof are reviewed."
+  phase_6_predeployment: "service active HTTP 200; latest raw message 8308 had a completed recognition; evidence, runtime-agent, management, and position-mutation work in flight were all zero"
+  phase_6_deployment: "commit 1fe682980f97e17ac7dc54307036c5dff40a92a1 deployed with a bounded restart; service returned HTTP 200; sidecar remained disabled/inactive; agent and action authority were false with zero shadow/action allowlists"
+  phase_6_ledger: "runtime_agent_recovery_attempts table present with zero rows"
+  phase_6_continuity: "raw message 8309 arrived immediately before the restart and retained its pre-restart evidence lease; deterministic lease recovery completed recognition after expiry, while later messages 8310 and 8311 also completed; no management or position mutation was in flight"
+  phase_6_deployed_tests: "91 focused tests passed; 7-case offline evaluation passed all nine metrics at 1.0"
+  phase_6_monitor: "bounded no-notify diagnostic completed with monitor_error null and only the unchanged audit_abnormal baseline"
+  remaining: "Keep all action flags empty/off. A real canary remains blocked until a reviewed production model provider is available; only build_read_only_reconciliation_plan currently has a production handler, and every other playbook must remain refused until its own handler and positive verification proof are reviewed."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
@@ -271,7 +277,14 @@ Phase 5 is not complete until:
 - Authority change in production: none; all Phase 6 action flags remain off
 - Review: all Critical and Important findings were fixed; final review found
   no remaining Critical or Important defects
-- Deployment: pending a fresh safe-window gate
+- Commit: `1fe6829` (`feat: add dormant incident recovery boundary`), pushed
+- Deployment: `1fe6829`, deployed after a fresh safe-window gate with all
+  agent/action flags and allowlists disabled
+- Production verification: 91 focused tests and the seven-case offline gate
+  passed; service HTTP 200; recovery-attempt ledger empty; listener recognition
+  continuity preserved through an expired pre-restart evidence claim; no
+  management or position mutation was in flight; monitor retained only the
+  known `audit_abnormal` baseline
 - Canary: blocked by the missing reviewed production model provider
 
 ## Current Phase 6 Exit Checklist
@@ -290,10 +303,10 @@ Phase 5 is not complete until:
 - [x] local focused, offline, context, management, listener, and monitor gates
       pass;
 - [x] final review has no remaining Critical or Important findings;
-- [ ] changes are committed and pushed;
-- [ ] a safe production deployment window is proven;
-- [ ] production deploys with sidecar and every action flag disabled;
-- [ ] service/listener/checkpoint/reconciliation continuity is verified;
+- [x] changes are committed and pushed;
+- [x] a safe production deployment window is proven;
+- [x] production deploys with sidecar and every action flag disabled;
+- [x] service/listener/checkpoint/reconciliation continuity is verified;
 - [ ] the reviewed production model provider is available;
 - [ ] exactly one production handler passes a reversible canary;
 - [ ] each remaining playbook receives its own handler, verification proof,
