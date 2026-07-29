@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 import pytest
 
+import telegram_kol_research.web_app as web_app_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.config import RuntimeIncidentConfig
@@ -2798,6 +2799,41 @@ def test_execution_sync_api_marks_missing_deepcoin_position_closed(tmp_path):
 
         assert lifecycle.lifecycle_status == "exited"
         assert lifecycle.exit_reason == "manual"
+
+
+def test_execution_sync_api_delivers_cleanup_notification_outbox(
+    tmp_path, monkeypatch
+):
+    class FakeDeepcoinClient:
+        def list_positions(self):
+            return []
+
+    delivered = []
+
+    async def fake_deliver(session_factory, *, config, delivered_at, **_kwargs):
+        delivered.append((session_factory, config.chat_id, delivered_at))
+        return 1
+
+    monkeypatch.setattr(
+        web_app_module,
+        "deliver_terminal_entry_cleanup_notifications",
+        fake_deliver,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        now_provider=lambda: datetime(2026, 7, 30, 10, 0),
+    )
+    app.state.notification_bot_config = SystemOperatorBotConfig(
+        bot_token="token",
+        chat_id="kol-event-processing",
+    )
+
+    response = TestClient(app).post("/api/execution/sync-deepcoin")
+
+    assert response.status_code == 200
+    assert len(delivered) == 1
+    assert delivered[0][1] == "kol-event-processing"
 
 
 def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):

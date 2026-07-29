@@ -20,6 +20,50 @@ def test_database_bootstrap_creates_tables(tmp_path):
     assert engine is not None
 
 
+def test_cleanup_notification_columns_are_added_to_existing_execution_events(tmp_path):
+    database_path = tmp_path / "research.db"
+    conn = sqlite3.connect(database_path)
+    conn.execute(
+        """
+        CREATE TABLE execution_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_instance_id VARCHAR(255),
+            execution_binding_id INTEGER,
+            venue VARCHAR(64) NOT NULL,
+            action VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            order_id VARCHAR(255),
+            pos_id VARCHAR(255),
+            created_at DATETIME NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(execution_events)").fetchall()
+    }
+    conn.close()
+
+    assert {
+        "notification_status",
+        "notification_fingerprint",
+        "notification_message_id",
+        "notification_error",
+        "notification_attempts",
+        "notification_next_attempt_at",
+        "notification_claim_token",
+        "notification_claimed_at",
+        "notified_at",
+    } <= columns
+
+
 def test_existing_session_factory_skips_bootstrap_and_preserves_writes(tmp_path):
     database_path = tmp_path / "research.db"
     writable_session_factory = create_session_factory(database_path)

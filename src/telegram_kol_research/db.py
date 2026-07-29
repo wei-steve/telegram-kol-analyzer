@@ -186,6 +186,40 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
             "ALTER TABLE execution_order_legs ADD COLUMN last_verified_at DATETIME"
         ),
     },
+    "execution_events": {
+        "notification_status": (
+            "ALTER TABLE execution_events ADD COLUMN notification_status VARCHAR(32)"
+        ),
+        "notification_fingerprint": (
+            "ALTER TABLE execution_events "
+            "ADD COLUMN notification_fingerprint VARCHAR(64)"
+        ),
+        "notification_message_id": (
+            "ALTER TABLE execution_events "
+            "ADD COLUMN notification_message_id VARCHAR(255)"
+        ),
+        "notification_error": (
+            "ALTER TABLE execution_events ADD COLUMN notification_error VARCHAR(128)"
+        ),
+        "notification_attempts": (
+            "ALTER TABLE execution_events "
+            "ADD COLUMN notification_attempts INTEGER NOT NULL DEFAULT 0"
+        ),
+        "notification_next_attempt_at": (
+            "ALTER TABLE execution_events "
+            "ADD COLUMN notification_next_attempt_at DATETIME"
+        ),
+        "notification_claim_token": (
+            "ALTER TABLE execution_events "
+            "ADD COLUMN notification_claim_token VARCHAR(64)"
+        ),
+        "notification_claimed_at": (
+            "ALTER TABLE execution_events ADD COLUMN notification_claimed_at DATETIME"
+        ),
+        "notified_at": (
+            "ALTER TABLE execution_events ADD COLUMN notified_at DATETIME"
+        ),
+    },
     "position_attribution_audits": {
         "notification_status": (
             "ALTER TABLE position_attribution_audits "
@@ -352,6 +386,12 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
+    "uq_execution_events_cleanup_notification_fingerprint": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_execution_events_cleanup_notification_fingerprint "
+        "ON execution_events (notification_fingerprint) "
+        "WHERE notification_fingerprint IS NOT NULL"
+    ),
     "uq_message_instruction_items_message_candidate": (
         "CREATE UNIQUE INDEX IF NOT EXISTS "
         "uq_message_instruction_items_message_candidate "

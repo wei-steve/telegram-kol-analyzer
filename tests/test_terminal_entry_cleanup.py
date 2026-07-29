@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionEvent,
     ExecutionOrderLeg,
     StrategyLifecycle,
 )
@@ -143,9 +144,16 @@ def test_terminal_entry_cleanup_cancels_exact_trigger_and_confirms_readback(tmp_
             .one()
         )
         binding = session.get(ExecutionBinding, binding_id)
+        notification = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "terminal_entry_cleanup_outcome")
+            .one()
+        )
         assert leg.status == "cancelled"
         assert leg.terminal_reason == "terminal_entry_cleanup_confirmed"
         assert binding.order_id == "position-order"
+        assert notification.status == "resolved"
+        assert notification.notification_status == "pending"
 
 
 def test_terminal_entry_cleanup_marks_exact_already_absent_order_terminal(tmp_path):

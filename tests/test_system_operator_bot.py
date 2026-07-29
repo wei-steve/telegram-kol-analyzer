@@ -1437,6 +1437,139 @@ def test_position_attribution_incident_delivery_is_deduplicated_and_durable(
     assert len(sent) == 2
 
 
+def test_cleanup_notification_delivery_is_durable_and_deduplicated(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import execution_events as execution_events_module
+    from telegram_kol_research.models import ExecutionEvent
+
+    session_factory = create_session_factory(tmp_path / "cleanup-notification.db")
+    event_id = execution_events_module.enqueue_terminal_entry_cleanup_notification(
+        session_factory,
+        lifecycle_id=625,
+        binding_id=208,
+        status="resolved",
+        leg_ids=(901,),
+        order_ids=("1001124388622177",),
+        reason="primary_position_closed",
+        created_at=NOW,
+    )
+    duplicate_id = (
+        execution_events_module.enqueue_terminal_entry_cleanup_notification(
+            session_factory,
+            lifecycle_id=625,
+            binding_id=208,
+            status="resolved",
+            leg_ids=(901,),
+            order_ids=("1001124388622177",),
+            reason="primary_position_closed",
+            created_at=NOW + timedelta(seconds=1),
+        )
+    )
+    assert duplicate_id == event_id
+
+    sent = []
+
+    async def fake_send(**kwargs):
+        sent.append(kwargs["text"])
+        return 7788
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", fake_send
+    )
+    config = SystemOperatorBotConfig(bot_token="token", chat_id="chat")
+    delivered = asyncio.run(
+        operator_bot_module.deliver_terminal_entry_cleanup_notifications(
+            session_factory,
+            config=config,
+            delivered_at=NOW + timedelta(minutes=1),
+        )
+    )
+    assert delivered == 1
+    assert len(sent) == 1
+    assert "挂单清理" in sent[0]
+    assert "1001124388622177" in sent[0]
+
+    with session_factory() as session:
+        row = session.get(ExecutionEvent, event_id)
+        assert row.notification_status == "delivered"
+        assert row.notification_message_id == "7788"
+        assert row.notification_attempts == 1
+        assert row.notified_at == (NOW + timedelta(minutes=1)).replace(tzinfo=None)
+
+    assert asyncio.run(
+        operator_bot_module.deliver_terminal_entry_cleanup_notifications(
+            session_factory,
+            config=config,
+            delivered_at=NOW + timedelta(minutes=2),
+        )
+    ) == 0
+
+
+def test_cleanup_notification_failure_is_bounded_and_retries_after_restart(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import execution_events as execution_events_module
+    from telegram_kol_research.models import ExecutionEvent
+
+    database_path = tmp_path / "cleanup-notification-retry.db"
+    session_factory = create_session_factory(database_path)
+    event_id = execution_events_module.enqueue_terminal_entry_cleanup_notification(
+        session_factory,
+        lifecycle_id=626,
+        binding_id=209,
+        status="blocked",
+        leg_ids=(902,),
+        order_ids=("order-2",),
+        reason="primary_position_closed",
+        created_at=NOW,
+    )
+
+    async def fail_send(**_kwargs):
+        raise RuntimeError("secret=" + "x" * 1000)
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", fail_send
+    )
+    config = SystemOperatorBotConfig(bot_token="token", chat_id="chat")
+    assert asyncio.run(
+        operator_bot_module.deliver_terminal_entry_cleanup_notifications(
+            session_factory,
+            config=config,
+            delivered_at=NOW,
+        )
+    ) == 0
+
+    with session_factory() as session:
+        row = session.get(ExecutionEvent, event_id)
+        assert row.notification_status == "failed"
+        assert row.notification_error == "RuntimeError"
+        assert row.notification_attempts == 1
+        assert row.notification_next_attempt_at is not None
+
+    restarted_factory = create_session_factory(database_path)
+
+    async def succeed_send(**_kwargs):
+        return 8899
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", succeed_send
+    )
+    assert asyncio.run(
+        operator_bot_module.deliver_terminal_entry_cleanup_notifications(
+            restarted_factory,
+            config=config,
+            delivered_at=NOW + timedelta(minutes=10),
+        )
+    ) == 1
+
+    with restarted_factory() as session:
+        row = session.get(ExecutionEvent, event_id)
+        assert row.notification_status == "delivered"
+        assert row.notification_attempts == 2
+        assert row.notification_message_id == "8899"
+
+
 def test_format_ai_recognition_conflict_review_message_includes_both_model_results():
     message = format_ai_recognition_conflict_review_message(
         {
@@ -1800,6 +1933,8 @@ def test_process_entered_expiry_expire_cancel_cancels_only_pending_entry_leg(tmp
             self.cancel_payloads = []
 
         def list_trigger_orders_pending(self, inst_id):
+            if self.cancel_payloads:
+                return []
             return [
                 {
                     "instId": inst_id,

@@ -1558,6 +1558,11 @@ class ExecutionEvent(Base):
         Index("ix_execution_events_action_created", "action", "created_at"),
         Index("ix_execution_events_order", "order_id"),
         Index("ix_execution_events_pos", "pos_id"),
+        Index(
+            "uq_execution_events_cleanup_notification_fingerprint",
+            "notification_fingerprint",
+            unique=True,
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1587,6 +1592,31 @@ class ExecutionEvent(Base):
     request_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     exchange_event_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    notification_status: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    notification_fingerprint: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    notification_message_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    notification_error: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
+    notification_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    notification_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    notification_claim_token: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    notification_claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 

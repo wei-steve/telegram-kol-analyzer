@@ -163,6 +163,7 @@ from telegram_kol_research.config import (
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
     canonical_management_error_summary,
+    deliver_terminal_entry_cleanup_notifications,
     deliver_pending_position_attribution_incidents,
     deliver_pending_position_protection_incidents,
     load_notification_bot_config,
@@ -4803,6 +4804,11 @@ def create_web_app(
                 synced_at=app.state.now_provider(),
             )
             if isinstance(app.state.notification_bot_config, SystemOperatorBotConfig):
+                await deliver_terminal_entry_cleanup_notifications(
+                    app.state.session_factory,
+                    config=app.state.notification_bot_config,
+                    delivered_at=app.state.now_provider(),
+                )
                 await deliver_pending_position_attribution_incidents(
                     app.state.session_factory,
                     config=app.state.notification_bot_config,
@@ -4842,6 +4848,12 @@ def create_web_app(
                 deepcoin_client=app.state.deepcoin_client_factory(),
                 executed_at=app.state.now_provider(),
             )
+            if isinstance(app.state.notification_bot_config, SystemOperatorBotConfig):
+                await deliver_terminal_entry_cleanup_notifications(
+                    app.state.session_factory,
+                    config=app.state.notification_bot_config,
+                    delivered_at=app.state.now_provider(),
+                )
         except DeepcoinExecutionActionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except DeepcoinClientError as exc:
@@ -5991,6 +6003,12 @@ async def run_deepcoin_execution_reconcile_loop(
                 client=client,
                 synced_at=synced_at,
             )
+            if system_operator_bot_enabled(system_operator_bot_config):
+                await deliver_terminal_entry_cleanup_notifications(
+                    session_factory,
+                    config=system_operator_bot_config,
+                    delivered_at=synced_at,
+                )
         except DeepcoinClientError as exc:
             logger.warning("Deepcoin execution reconcile skipped: %s", exc)
         except Exception:

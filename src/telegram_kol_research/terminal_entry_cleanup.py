@@ -16,7 +16,10 @@ from telegram_kol_research.deepcoin_execution_actions import (
 from telegram_kol_research.deepcoin_normalization import (
     normalize_deepcoin_swap_instrument,
 )
-from telegram_kol_research.execution_events import list_execution_events
+from telegram_kol_research.execution_events import (
+    enqueue_terminal_entry_cleanup_notification,
+    list_execution_events,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -82,15 +85,20 @@ def cleanup_terminal_entry_legs(
                 event_ids=(),
             )
         if any(not (leg.order_id or leg.client_order_id) for leg in pending_legs):
-            return TerminalEntryCleanupResult(
-                status="blocked",
-                binding_id=int(binding.id),
-                lifecycle_id=int(lifecycle.id),
-                leg_ids=tuple(sorted(int(leg.id) for leg in pending_legs)),
-                order_ids=tuple(
-                    sorted(str(leg.order_id) for leg in pending_legs if leg.order_id)
+            return _with_notification(
+                session_factory,
+                TerminalEntryCleanupResult(
+                    status="blocked",
+                    binding_id=int(binding.id),
+                    lifecycle_id=int(lifecycle.id),
+                    leg_ids=tuple(sorted(int(leg.id) for leg in pending_legs)),
+                    order_ids=tuple(
+                        sorted(str(leg.order_id) for leg in pending_legs if leg.order_id)
+                    ),
+                    event_ids=(),
                 ),
-                event_ids=(),
+                reason=reason,
+                created_at=now,
             )
         binding_id = int(binding.id)
         lifecycle_id_value = int(lifecycle.id)
@@ -142,17 +150,22 @@ def cleanup_terminal_entry_legs(
             error=str(exc),
             failed_at=now,
         )
-        return TerminalEntryCleanupResult(
-            status=(
-                "blocked"
-                if str(exc) == "pending_entry_cancel_not_confirmed"
-                else "unknown"
+        return _with_notification(
+            session_factory,
+            TerminalEntryCleanupResult(
+                status=(
+                    "blocked"
+                    if str(exc) == "pending_entry_cancel_not_confirmed"
+                    else "unknown"
+                ),
+                binding_id=binding_id,
+                lifecycle_id=lifecycle_id_value,
+                leg_ids=leg_ids,
+                order_ids=order_ids,
+                event_ids=_event_ids_for_signal(session_factory, trade_signal.id),
             ),
-            binding_id=binding_id,
-            lifecycle_id=lifecycle_id_value,
-            leg_ids=leg_ids,
-            order_ids=order_ids,
-            event_ids=_event_ids_for_signal(session_factory, trade_signal.id),
+            reason=reason,
+            created_at=now,
         )
     except Exception:
         still_visible = _entry_order_is_still_visible(
@@ -175,13 +188,20 @@ def cleanup_terminal_entry_legs(
                 error="terminal_entry_cleanup_exchange_outcome_unknown",
                 failed_at=now,
             )
-            return TerminalEntryCleanupResult(
-                status="unknown",
-                binding_id=binding_id,
-                lifecycle_id=lifecycle_id_value,
-                leg_ids=leg_ids,
-                order_ids=order_ids,
-                event_ids=_event_ids_for_signal(session_factory, trade_signal.id),
+            return _with_notification(
+                session_factory,
+                TerminalEntryCleanupResult(
+                    status="unknown",
+                    binding_id=binding_id,
+                    lifecycle_id=lifecycle_id_value,
+                    leg_ids=leg_ids,
+                    order_ids=order_ids,
+                    event_ids=_event_ids_for_signal(
+                        session_factory, trade_signal.id
+                    ),
+                ),
+                reason=reason,
+                created_at=now,
             )
 
     status = (
@@ -211,13 +231,45 @@ def cleanup_terminal_entry_legs(
         result=result,
         processed_at=now,
     )
+    return _with_notification(
+        session_factory,
+        TerminalEntryCleanupResult(
+            status=status,
+            binding_id=binding_id,
+            lifecycle_id=lifecycle_id_value,
+            leg_ids=leg_ids,
+            order_ids=order_ids,
+            event_ids=_event_ids_for_signal(session_factory, trade_signal.id),
+        ),
+        reason=reason,
+        created_at=now,
+    )
+
+
+def _with_notification(
+    session_factory: sessionmaker,
+    result: TerminalEntryCleanupResult,
+    *,
+    reason: str,
+    created_at: datetime,
+) -> TerminalEntryCleanupResult:
+    notification_event_id = enqueue_terminal_entry_cleanup_notification(
+        session_factory,
+        lifecycle_id=result.lifecycle_id,
+        binding_id=result.binding_id,
+        status=result.status,
+        leg_ids=result.leg_ids,
+        order_ids=result.order_ids,
+        reason=reason,
+        created_at=created_at,
+    )
     return TerminalEntryCleanupResult(
-        status=status,
-        binding_id=binding_id,
-        lifecycle_id=lifecycle_id_value,
-        leg_ids=leg_ids,
-        order_ids=order_ids,
-        event_ids=_event_ids_for_signal(session_factory, trade_signal.id),
+        status=result.status,
+        binding_id=result.binding_id,
+        lifecycle_id=result.lifecycle_id,
+        leg_ids=result.leg_ids,
+        order_ids=result.order_ids,
+        event_ids=tuple(sorted({*result.event_ids, notification_event_id})),
     )
 
 

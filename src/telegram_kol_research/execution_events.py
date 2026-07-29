@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.models import ExecutionEvent
 
@@ -144,6 +146,72 @@ def list_execution_events(
             .all()
         )
         return [_row_to_view(row) for row in rows]
+
+
+def enqueue_terminal_entry_cleanup_notification(
+    session_factory: sessionmaker,
+    *,
+    lifecycle_id: int,
+    binding_id: int,
+    status: str,
+    leg_ids: tuple[int, ...],
+    order_ids: tuple[str, ...],
+    reason: str,
+    created_at: datetime | None = None,
+) -> int:
+    """Persist one durable notification event for a stable cleanup outcome."""
+
+    normalized_status = str(status or "unknown").lower()
+    if normalized_status not in {"resolved", "already_absent", "blocked", "unknown"}:
+        normalized_status = "unknown"
+    payload = {
+        "binding_id": int(binding_id),
+        "lifecycle_id": int(lifecycle_id),
+        "leg_ids": sorted({int(value) for value in leg_ids}),
+        "order_ids": sorted(
+            {str(value)[:255] for value in order_ids if str(value)}
+        ),
+        "reason": str(reason or "strategy_terminal")[:64],
+        "status": normalized_status,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    now = created_at or datetime.now(UTC)
+    with session_factory() as session:
+        existing_id = (
+            session.query(ExecutionEvent.id)
+            .filter(ExecutionEvent.notification_fingerprint == fingerprint)
+            .scalar()
+        )
+        if existing_id is not None:
+            return int(existing_id)
+        row = ExecutionEvent(
+            execution_binding_id=int(binding_id),
+            venue="deepcoin",
+            action="terminal_entry_cleanup_outcome",
+            status=normalized_status,
+            reason=payload["reason"],
+            response_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            notification_status="pending",
+            notification_fingerprint=fingerprint,
+            notification_attempts=0,
+            created_at=now,
+        )
+        session.add(row)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            existing_id = (
+                session.query(ExecutionEvent.id)
+                .filter(ExecutionEvent.notification_fingerprint == fingerprint)
+                .scalar()
+            )
+            if existing_id is None:
+                raise
+            return int(existing_id)
+        return int(row.id)
 
 
 def _row_to_view(row: ExecutionEvent) -> ExecutionEventView:

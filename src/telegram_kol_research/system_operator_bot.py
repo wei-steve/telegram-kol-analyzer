@@ -35,6 +35,8 @@ from telegram_kol_research.time_utils import utc_naive_to_local
 
 logger = logging.getLogger(__name__)
 RUNTIME_INCIDENT_MESSAGE_MAX_CHARS = 1200
+TERMINAL_ENTRY_CLEANUP_NOTIFICATION_MAX_ATTEMPTS = 5
+TERMINAL_ENTRY_CLEANUP_NOTIFICATION_LEASE_SECONDS = 120
 
 
 @dataclass(slots=True)
@@ -1118,6 +1120,176 @@ def claim_next_strategy_management_notification(
         }
 
 
+def format_terminal_entry_cleanup_notification(event) -> str:
+    payload = _decode_mapping(event.response_json)
+    status_labels = {
+        "resolved": "已确认取消",
+        "already_absent": "已确认挂单不存在",
+        "blocked": "取消未确认，生命周期保持非终态",
+        "unknown": "交易所结果未知，生命周期保持非终态",
+    }
+    order_ids = [
+        str(value)[:64]
+        for value in payload.get("order_ids", [])
+        if str(value)
+    ][:10]
+    return (
+        "【终态挂单清理】\n"
+        f"清理事件ID: {event.id}\n"
+        f"生命周期: {payload.get('lifecycle_id')}\n"
+        f"执行绑定: {payload.get('binding_id')}\n"
+        f"结果: {status_labels.get(str(event.status), '结果未知')}\n"
+        f"挂单: {', '.join(order_ids) if order_ids else '无可用订单号'}\n"
+        "自动操作: 仅发送持久化结果通知，不会重复提交撤单"
+    )[:1200]
+
+
+def claim_next_terminal_entry_cleanup_notification(
+    session_factory,
+    *,
+    claimed_at: datetime | None = None,
+    lease_seconds: float = TERMINAL_ENTRY_CLEANUP_NOTIFICATION_LEASE_SECONDS,
+):
+    """Atomically lease one cleanup notification without touching the exchange."""
+
+    from telegram_kol_research.models import ExecutionEvent
+
+    now = claimed_at or datetime.now(UTC)
+    stale_before = now - timedelta(seconds=max(5.0, float(lease_seconds)))
+    claimable = and_(
+        ExecutionEvent.action == "terminal_entry_cleanup_outcome",
+        ExecutionEvent.notification_attempts
+        < TERMINAL_ENTRY_CLEANUP_NOTIFICATION_MAX_ATTEMPTS,
+        or_(
+            ExecutionEvent.notification_status == "pending",
+            and_(
+                ExecutionEvent.notification_status == "failed",
+                or_(
+                    ExecutionEvent.notification_next_attempt_at.is_(None),
+                    ExecutionEvent.notification_next_attempt_at <= now,
+                ),
+            ),
+            and_(
+                ExecutionEvent.notification_status == "delivering",
+                or_(
+                    ExecutionEvent.notification_claimed_at.is_(None),
+                    ExecutionEvent.notification_claimed_at <= stale_before,
+                ),
+            ),
+        ),
+    )
+    with session_factory() as session:
+        row_id = (
+            session.query(ExecutionEvent.id)
+            .filter(claimable)
+            .order_by(ExecutionEvent.id.asc())
+            .limit(1)
+            .scalar()
+        )
+    if row_id is None:
+        return None
+    token = uuid.uuid4().hex
+    with session_factory() as session:
+        result = session.execute(
+            update(ExecutionEvent)
+            .where(ExecutionEvent.id == row_id, claimable)
+            .values(
+                notification_status="delivering",
+                notification_claim_token=token,
+                notification_claimed_at=now,
+                notification_next_attempt_at=None,
+                notification_error=None,
+                notification_attempts=ExecutionEvent.notification_attempts + 1,
+            )
+        )
+        session.commit()
+        if result.rowcount != 1:
+            return None
+        row = session.get(ExecutionEvent, row_id)
+        session.expunge(row)
+        return {"event": row, "claim_token": token}
+
+
+async def deliver_terminal_entry_cleanup_notifications(
+    session_factory,
+    *,
+    config: SystemOperatorBotConfig,
+    delivered_at: datetime | None = None,
+    limit: int = 20,
+) -> int:
+    """Deliver a bounded durable outbox; this worker performs no exchange writes."""
+
+    from telegram_kol_research.models import ExecutionEvent
+
+    operation_now = delivered_at or datetime.now(UTC)
+    delivered = 0
+    for _ in range(max(1, min(int(limit), 100))):
+        claim = claim_next_terminal_entry_cleanup_notification(
+            session_factory,
+            claimed_at=operation_now,
+        )
+        if claim is None:
+            break
+        event = claim["event"]
+        token = claim["claim_token"]
+        try:
+            message_id = await send_system_operator_bot_message(
+                config=config,
+                text=format_terminal_entry_cleanup_notification(event),
+            )
+        except Exception as exc:
+            attempts = int(event.notification_attempts or 0)
+            exhausted = (
+                attempts >= TERMINAL_ENTRY_CLEANUP_NOTIFICATION_MAX_ATTEMPTS
+            )
+            retry_at = None
+            if not exhausted:
+                retry_at = operation_now + timedelta(
+                    seconds=min(900, 60 * (2 ** max(0, attempts - 1)))
+                )
+            with session_factory() as session:
+                session.execute(
+                    update(ExecutionEvent)
+                    .where(
+                        ExecutionEvent.id == event.id,
+                        ExecutionEvent.notification_status == "delivering",
+                        ExecutionEvent.notification_claim_token == token,
+                    )
+                    .values(
+                        notification_status="exhausted" if exhausted else "failed",
+                        notification_claim_token=None,
+                        notification_claimed_at=None,
+                        notification_error=type(exc).__name__[:128],
+                        notification_next_attempt_at=retry_at,
+                    )
+                )
+                session.commit()
+            break
+        with session_factory() as session:
+            result = session.execute(
+                update(ExecutionEvent)
+                .where(
+                    ExecutionEvent.id == event.id,
+                    ExecutionEvent.notification_status == "delivering",
+                    ExecutionEvent.notification_claim_token == token,
+                )
+                .values(
+                    notification_status="delivered",
+                    notification_claim_token=None,
+                    notification_claimed_at=None,
+                    notification_error=None,
+                    notification_next_attempt_at=None,
+                    notification_message_id=(
+                        str(message_id)[:255] if message_id is not None else None
+                    ),
+                    notified_at=operation_now,
+                )
+            )
+            session.commit()
+            delivered += int(result.rowcount == 1)
+    return delivered
+
+
 def claim_next_runtime_incident_notification(
     session_factory,
     *,
@@ -1431,7 +1603,7 @@ async def send_system_operator_bot_message(
     config: SystemOperatorBotConfig,
     text: str,
     reply_markup: dict[str, Any] | None = None,
-) -> None:
+) -> int | str | None:
     payload: dict[str, Any] = {
         "chat_id": config.chat_id,
         "text": text,
@@ -1445,6 +1617,16 @@ async def send_system_operator_bot_message(
             json=payload,
         )
         response.raise_for_status()
+        try:
+            body = response.json()
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(body, dict):
+            return None
+        result = body.get("result")
+        if not isinstance(result, dict):
+            return None
+        return result.get("message_id")
 
 
 async def send_message_instruction_summary_notification(
