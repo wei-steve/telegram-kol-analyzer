@@ -57,17 +57,24 @@ def load_runtime_incident_config(
         if env_file_paths is None
         else env_file_paths
     )
-    env = dict(
-        _load_env_file_values(
-            paths,
-            ignore_unreadable_names=frozenset(
-                {"runtime_incident_agent.env"}
-            ),
+    active_environment = os.environ if environ is None else environ
+    if environ is None and any(
+        name.startswith("TELEGRAM_KOL_RUNTIME_")
+        for name in active_environment
+    ):
+        env: dict[str, str] = {}
+    else:
+        env = dict(
+            _load_env_file_values(
+                paths,
+                ignore_unreadable_names=frozenset(
+                    {"runtime_incident_agent.env"}
+                ),
+            )
+            if paths
+            else {}
         )
-        if paths
-        else {}
-    )
-    env.update(os.environ if environ is None else environ)
+    env.update(active_environment)
     capture_types = frozenset(
         item.strip().lower()
         for item in env.get(

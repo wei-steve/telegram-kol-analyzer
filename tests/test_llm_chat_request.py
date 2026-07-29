@@ -141,6 +141,40 @@ def test_runtime_agent_llm_config_uses_systemd_environment_when_secret_file_is_u
     assert config.model == "mimo-v2.5"
 
 
+def test_runtime_agent_llm_config_does_not_open_defaults_when_systemd_environment_is_complete(
+    tmp_path,
+    monkeypatch,
+):
+    config_file = tmp_path / "llm.env"
+    config_file.write_text("unreadable=true\n", encoding="utf-8")
+    original_open = open
+
+    def guarded_open(path, *args, **kwargs):
+        if str(path) == str(config_file):
+            raise PermissionError("root-owned unrelated config")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", guarded_open)
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL",
+        "https://api.xiaomimimo.com/v1",
+    )
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY",
+        "agent-key",
+    )
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL",
+        "mimo-v2.5",
+    )
+
+    config = load_runtime_agent_llm_config(
+        env_file_paths=[config_file],
+    )
+
+    assert config.model == "mimo-v2.5"
+
+
 def test_request_grounded_chat_answer_reads_openai_compatible_response():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == httpx.URL("http://proxy.test/v1/chat/completions")

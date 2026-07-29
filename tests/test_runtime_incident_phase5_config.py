@@ -94,3 +94,26 @@ def test_runtime_config_does_not_hide_unreadable_non_secret_config(
             environ={},
             env_file_paths=[config_file],
         )
+
+
+def test_runtime_config_prefers_complete_systemd_environment_over_unreadable_defaults(
+    tmp_path,
+    monkeypatch,
+):
+    config_file = tmp_path / "telegram.env"
+    config_file.write_text("unreadable=true\n", encoding="utf-8")
+    original_open = open
+
+    def guarded_open(path, *args, **kwargs):
+        if str(path) == str(config_file):
+            raise PermissionError("root-owned unrelated config")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", guarded_open)
+    monkeypatch.setenv("TELEGRAM_KOL_RUNTIME_AGENT_ENABLED", "false")
+
+    config = load_runtime_incident_config(
+        env_file_paths=[config_file],
+    )
+
+    assert config.agent_enabled is False

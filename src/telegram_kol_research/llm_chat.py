@@ -104,15 +104,24 @@ def load_runtime_agent_llm_config(
         if env_file_paths is None
         else env_file_paths
     )
-    env = dict(
-        _load_env_file_values(
-            paths,
-            ignore_unreadable_names=frozenset(
-                {"runtime_incident_agent.env"}
-            ),
-        )
+    active_environment = os.environ if environ is None else environ
+    dedicated_names = (
+        "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL",
+        "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY",
+        "TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL",
     )
-    env.update(os.environ if environ is None else environ)
+    if all(str(active_environment.get(name, "")).strip() for name in dedicated_names):
+        env: dict[str, str] = {}
+    else:
+        env = dict(
+            _load_env_file_values(
+                paths,
+                ignore_unreadable_names=frozenset(
+                    {"runtime_incident_agent.env"}
+                ),
+            )
+        )
+    env.update(active_environment)
     base_url = env.get(
         "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL", ""
     ).strip()
