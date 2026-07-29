@@ -7,9 +7,12 @@ from telegram_kol_research.runtime_agent_playbooks import (
 )
 
 
-def test_runtime_agent_v5_prompt_exposes_closed_low_risk_recovery_contract():
-    assert RUNTIME_AGENT_PROMPT_VERSION == "runtime-agent-prompt-v5"
+def test_runtime_agent_v6_prompt_exposes_closed_low_risk_recovery_contract():
+    assert RUNTIME_AGENT_PROMPT_VERSION == "runtime-agent-prompt-v6"
     assert "final JSON object" in RUNTIME_AGENT_SYSTEM_PROMPT
+    assert "at most 512 characters" in RUNTIME_AGENT_SYSTEM_PROMPT
+    assert "at most 16 items" in RUNTIME_AGENT_SYSTEM_PROMPT
+    assert "at most 32 items" in RUNTIME_AGENT_SYSTEM_PROMPT
     for field in (
         "incident_id",
         "diagnosis_hypothesis",

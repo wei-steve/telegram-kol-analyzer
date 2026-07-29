@@ -196,7 +196,7 @@ def test_worker_runs_bounded_tool_loop_and_commits_structured_diagnosis(tmp_path
     with session_factory() as session:
         row = session.get(RuntimeIncident, incident.id)
         assert row.status == "diagnosed"
-        assert row.prompt_version == "runtime-agent-prompt-v5"
+        assert row.prompt_version == "runtime-agent-prompt-v6"
         assert "Provider retries may have been exhausted." in row.diagnosis_json
         assert row.evidence_refs_json == (
             f'["incident:{incident.id}","worker-job:42"]'

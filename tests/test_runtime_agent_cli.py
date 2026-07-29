@@ -61,7 +61,7 @@ def test_runtime_agent_cli_rejects_missing_dedicated_provider_before_claim(
         redacted_summary='{"error_type":"provider_timeout"}',
         occurred_at=datetime(2026, 7, 29, 9, 0, tzinfo=UTC),
         feature_policy_version="runtime-incident-phase-6-v1",
-        prompt_version="runtime-agent-prompt-v5",
+        prompt_version="runtime-agent-prompt-v6",
         tool_policy_version="runtime-agent-tools-v2",
     )
     shared_key = "shared-key-must-not-leak"
@@ -111,7 +111,7 @@ def test_runtime_agent_worker_rejects_missing_dedicated_provider_before_claim(
         redacted_summary='{"error_type":"provider_timeout"}',
         occurred_at=datetime(2026, 7, 29, 9, 0, tzinfo=UTC),
         feature_policy_version="runtime-incident-phase-6-v1",
-        prompt_version="runtime-agent-prompt-v5",
+        prompt_version="runtime-agent-prompt-v6",
         tool_policy_version="runtime-agent-tools-v2",
     )
     monkeypatch.setenv("TELEGRAM_KOL_RUNTIME_AGENT_ENABLED", "true")
@@ -260,7 +260,7 @@ def test_phase6_production_handlers_wire_only_a_real_read_only_plan(tmp_path):
         redacted_summary='{"source_status":"partial_failed"}',
         occurred_at=datetime(2026, 7, 29, 9, 0, tzinfo=UTC),
         feature_policy_version="runtime-incident-phase-6-v1",
-        prompt_version="runtime-agent-prompt-v5",
+        prompt_version="runtime-agent-prompt-v6",
         tool_policy_version="runtime-agent-tools-v2",
     )
     tools = _build_runtime_agent_cli_tools(

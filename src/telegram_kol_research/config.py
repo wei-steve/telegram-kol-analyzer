@@ -35,7 +35,7 @@ class RuntimeIncidentConfig:
     agent_action_playbooks: frozenset[str] = frozenset()
     agent_action_circuit_threshold: int = 3
     feature_policy_version: str = "runtime-incident-phase-6-v1"
-    prompt_version: str = "runtime-agent-prompt-v5"
+    prompt_version: str = "runtime-agent-prompt-v6"
     tool_policy_version: str = "runtime-agent-tools-v2"
 
     def captures(self, incident_type: str) -> bool:
