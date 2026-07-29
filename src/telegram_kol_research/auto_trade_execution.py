@@ -727,7 +727,11 @@ def _auto_process_management_signal(
     if runtime_config["trading_mode"] != "auto_trade":
         return {"status": "skipped", "reason": "kol_or_group_auto_trade_disabled"}
     symbol = str(candidate.symbol or "").upper()
-    if not symbol or symbol not in {item.upper() for item in settings.allowed_symbols}:
+    allowed_symbols = {item.upper() for item in settings.allowed_symbols}
+    if (
+        candidate.event_type != "strategy_revision"
+        and (not symbol or symbol not in allowed_symbols)
+    ):
         return {"status": "skipped", "reason": "symbol_not_allowed", "symbol": symbol}
     if candidate.confidence < settings.min_ai_confidence:
         return {"status": "skipped", "reason": "confidence_below_minimum"}
@@ -756,23 +760,30 @@ def _auto_process_management_signal(
             )
             if binding is not None:
                 session.expunge(binding)
+        if binding is None:
+            return {
+                "status": "blocked",
+                "reason": "revision_binding_missing",
+            }
+        binding_symbol = str(binding.symbol or "").upper()
+        if not binding_symbol or binding_symbol not in allowed_symbols:
+            return {
+                "status": "skipped",
+                "reason": "symbol_not_allowed",
+                "symbol": binding_symbol,
+            }
         replacement_writer = revision_replacement_writer
         if replacement_writer is None:
-            if binding is None:
-                return {
-                    "status": "blocked",
-                    "reason": "revision_binding_missing",
-                }
             revision_entry_thresholds = settings.entry_thresholds_for_symbol(
-                str(binding.symbol)
+                binding_symbol
             )
             reference_price = _safe_ticker_price(
                 deepcoin_client,
-                inst_id=_to_deepcoin_swap_instrument(str(binding.symbol)),
+                inst_id=_to_deepcoin_swap_instrument(binding_symbol),
             )
             entry_range = _parse_entry_range(
                 candidate.entry_text,
-                symbol=str(binding.symbol),
+                symbol=binding_symbol,
                 reference_price=reference_price,
             )
             if entry_range is None:
@@ -782,7 +793,7 @@ def _auto_process_management_signal(
                 }
             max_loss_usdt = _resolve_signal_max_loss_usdt(
                 runtime_config,
-                symbol=str(binding.symbol),
+                symbol=binding_symbol,
             )
 
             def replacement_writer(**kwargs):

@@ -1708,6 +1708,98 @@ def test_strategy_revision_uses_binding_symbol_fixed_offsets_for_both_drafts(
     ] == [[1592.0, 1583.0], [1592.0, 1583.0]]
 
 
+def test_strategy_revision_rejects_disallowed_authoritative_binding_symbol(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:54:ETH:long",
+            kol_id="group:100",
+            chat_id=100,
+            message_id=54,
+            symbol="ETH",
+            side="long",
+            venue="deepcoin",
+            status="open",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=54,
+            symbol="ETH",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 1, 7, 55, tzinfo=UTC),
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.flush()
+        raw = RawMessage(
+            chat_id=100,
+            message_id=55,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 7, 1, 8, 0, tzinfo=UTC),
+            text="revise ETH entry to 1580-1590",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="long",
+                event_type="strategy_revision",
+                target_lifecycle_id=lifecycle.id,
+                entry_text="1580-1590",
+                stop_loss_text="1550",
+                take_profit_text="1650",
+                recognition_generation="revision-generation",
+                parse_source="mimo_authoritative",
+                confidence=0.99,
+            )
+        )
+        session.commit()
+        raw_message_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "allowed_symbols": ["BTC"],
+        },
+    )
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    monkeypatch.setattr(
+        auto_module,
+        "execute_strategy_revision",
+        lambda *_args, **_kwargs: {"status": "unexpected_execution"},
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+        contract_spec_provider=_StaticContractSpecProvider(),
+        revision_replacement_writer=lambda **_kwargs: {
+            "status": "unexpected_replacement"
+        },
+        processed_at=datetime(2026, 7, 1, 8, 1, tzinfo=UTC),
+    )
+
+    assert result == {
+        "status": "skipped",
+        "reason": "symbol_not_allowed",
+        "symbol": "ETH",
+    }
+
+
 def test_auto_process_message_trade_signal_uses_symbol_specific_risk_budget(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_message_id = _persist_candidate(

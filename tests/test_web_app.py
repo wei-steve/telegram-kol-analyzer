@@ -959,6 +959,26 @@ def test_trading_settings_api_rejects_negative_fixed_entry_threshold(tmp_path):
     assert "market_leg_threshold" in response.json()["detail"]
 
 
+def test_trading_settings_api_rejects_fixed_threshold_above_float_max(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "1e1000",
+                    "first_limit_offset": "90",
+                    "second_limit_offset": "90",
+                }
+            }
+        },
+    )
+
+    assert response.status_code == 422
+    assert "market_leg_threshold" in response.json()["detail"]
+
+
 def test_management_execution_mode_api_persists_shadow_with_auto_trade_disabled(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

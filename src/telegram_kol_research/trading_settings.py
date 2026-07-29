@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -16,6 +17,7 @@ from telegram_kol_research.models import TradingSetting
 
 
 TRADING_SETTINGS_KEY = "global"
+MAX_FLOAT_DECIMAL = Decimal(str(sys.float_info.max))
 
 ENTRY_THRESHOLD_KEYS = (
     "market_leg_threshold",
@@ -155,14 +157,27 @@ def save_trading_settings(
 ) -> TradingSettings:
     """Validate and persist global trading settings."""
 
-    settings = trading_settings_from_payload(payload)
-    value_json = json.dumps(settings.to_dict(), ensure_ascii=False, sort_keys=True)
     with session_factory() as session:
         row = (
             session.query(TradingSetting)
             .filter(TradingSetting.key == TRADING_SETTINGS_KEY)
             .one_or_none()
         )
+        merged_payload = dict(payload)
+        if row is not None and "symbol_entry_thresholds" not in merged_payload:
+            try:
+                persisted_payload = json.loads(row.value_json)
+            except json.JSONDecodeError:
+                persisted_payload = {}
+            if (
+                isinstance(persisted_payload, dict)
+                and "symbol_entry_thresholds" in persisted_payload
+            ):
+                merged_payload["symbol_entry_thresholds"] = persisted_payload[
+                    "symbol_entry_thresholds"
+                ]
+        settings = trading_settings_from_payload(merged_payload)
+        value_json = json.dumps(settings.to_dict(), ensure_ascii=False, sort_keys=True)
         if row is None:
             row = TradingSetting(key=TRADING_SETTINGS_KEY, value_json=value_json)
             session.add(row)
@@ -423,7 +438,7 @@ def _parse_entry_threshold_value(value: Any, field_name: str) -> Decimal:
         raise ValueError(
             f"{field_name} must be a non-negative finite decimal"
         ) from None
-    if not parsed.is_finite() or parsed < 0:
+    if not parsed.is_finite() or parsed < 0 or parsed > MAX_FLOAT_DECIMAL:
         raise ValueError(f"{field_name} must be a non-negative finite decimal")
     return parsed
 

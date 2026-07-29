@@ -235,6 +235,54 @@ def test_legacy_settings_seed_initial_fixed_entry_thresholds(tmp_path):
     assert settings.entry_thresholds_for_symbol("SOL") == SymbolEntryThresholds.zero()
 
 
+def test_legacy_save_preserves_persisted_fixed_entry_thresholds(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "250",
+                    "first_limit_offset": "100",
+                    "second_limit_offset": "95",
+                },
+                "DOGE": {
+                    "market_leg_threshold": "0.01",
+                    "first_limit_offset": "0.002",
+                    "second_limit_offset": "0.003",
+                },
+            },
+        },
+    )
+
+    saved = save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": False,
+            "max_market_entry_deviation_pct": "0.2",
+            "entry_range_order_style": "conservative",
+        },
+    )
+
+    assert saved.auto_trade_enabled is False
+    assert saved.symbol_entry_thresholds == {
+        "BTC": {
+            "market_leg_threshold": "250",
+            "first_limit_offset": "100",
+            "second_limit_offset": "95",
+        },
+        "DOGE": {
+            "market_leg_threshold": "0.01",
+            "first_limit_offset": "0.002",
+            "second_limit_offset": "0.003",
+        },
+    }
+    assert load_trading_settings(session_factory).symbol_entry_thresholds == (
+        saved.symbol_entry_thresholds
+    )
+
+
 def test_symbol_entry_thresholds_preserve_small_decimals(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
 
@@ -266,6 +314,21 @@ def test_symbol_entry_thresholds_reject_invalid_values(invalid):
                 "symbol_entry_thresholds": {
                     "BTC": {
                         "market_leg_threshold": invalid,
+                        "first_limit_offset": "0",
+                        "second_limit_offset": "0",
+                    }
+                }
+            }
+        )
+
+
+def test_symbol_entry_thresholds_reject_magnitude_above_finite_float_max():
+    with pytest.raises(ValueError, match="market_leg_threshold"):
+        trading_settings_from_payload(
+            {
+                "symbol_entry_thresholds": {
+                    "BTC": {
+                        "market_leg_threshold": "1e1000",
                         "first_limit_offset": "0",
                         "second_limit_offset": "0",
                     }
