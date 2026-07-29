@@ -90,6 +90,57 @@ def test_runtime_agent_llm_config_rejects_non_finite_timeout():
         )
 
 
+@pytest.mark.parametrize(
+    ("base_url", "model"),
+    [
+        ("https://other-provider.invalid/v1", "mimo-v2.5"),
+        ("https://api.xiaomimimo.com/v1", "other-model"),
+    ],
+)
+def test_runtime_agent_llm_config_requires_reviewed_mimo_provider(
+    base_url,
+    model,
+):
+    with pytest.raises(RuntimeAgentLLMConfigError):
+        load_runtime_agent_llm_config(
+            environ={
+                "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL": base_url,
+                "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY": "agent-key",
+                "TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL": model,
+            },
+            env_file_paths=[],
+        )
+
+
+def test_runtime_agent_llm_config_uses_systemd_environment_when_secret_file_is_unreadable(
+    tmp_path,
+    monkeypatch,
+):
+    secret_file = tmp_path / "runtime_incident_agent.env"
+    secret_file.write_text("unreadable=true\n", encoding="utf-8")
+    original_open = open
+
+    def guarded_open(path, *args, **kwargs):
+        if str(path) == str(secret_file):
+            raise PermissionError("root-owned secret")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", guarded_open)
+
+    config = load_runtime_agent_llm_config(
+        environ={
+            "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL": (
+                "https://api.xiaomimimo.com/v1"
+            ),
+            "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY": "agent-key",
+            "TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL": "mimo-v2.5",
+        },
+        env_file_paths=[secret_file],
+    )
+
+    assert config.model == "mimo-v2.5"
+
+
 def test_request_grounded_chat_answer_reads_openai_compatible_response():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == httpx.URL("http://proxy.test/v1/chat/completions")

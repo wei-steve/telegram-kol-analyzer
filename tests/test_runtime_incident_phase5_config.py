@@ -1,3 +1,5 @@
+import pytest
+
 from telegram_kol_research.config import load_runtime_incident_config
 
 
@@ -47,3 +49,48 @@ def test_phase6_action_authority_is_dormant_bounded_and_exact_allowlisted():
         }
     )
     assert enabled.agent_action_circuit_threshold == 5
+
+
+def test_runtime_config_uses_systemd_environment_when_secret_file_is_unreadable(
+    tmp_path,
+    monkeypatch,
+):
+    secret_file = tmp_path / "runtime_incident_agent.env"
+    secret_file.write_text("unreadable=true\n", encoding="utf-8")
+    original_open = open
+
+    def guarded_open(path, *args, **kwargs):
+        if str(path) == str(secret_file):
+            raise PermissionError("root-owned secret")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", guarded_open)
+
+    config = load_runtime_incident_config(
+        environ={"TELEGRAM_KOL_RUNTIME_AGENT_ENABLED": "true"},
+        env_file_paths=[secret_file],
+    )
+
+    assert config.agent_enabled is True
+
+
+def test_runtime_config_does_not_hide_unreadable_non_secret_config(
+    tmp_path,
+    monkeypatch,
+):
+    config_file = tmp_path / "telegram.env"
+    config_file.write_text("unreadable=true\n", encoding="utf-8")
+    original_open = open
+
+    def guarded_open(path, *args, **kwargs):
+        if str(path) == str(config_file):
+            raise PermissionError("unexpected permissions")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", guarded_open)
+
+    with pytest.raises(PermissionError):
+        load_runtime_incident_config(
+            environ={},
+            env_file_paths=[config_file],
+        )

@@ -104,7 +104,14 @@ def load_runtime_agent_llm_config(
         if env_file_paths is None
         else env_file_paths
     )
-    env = dict(_load_env_file_values(paths))
+    env = dict(
+        _load_env_file_values(
+            paths,
+            ignore_unreadable_names=frozenset(
+                {"runtime_incident_agent.env"}
+            ),
+        )
+    )
     env.update(os.environ if environ is None else environ)
     base_url = env.get(
         "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL", ""
@@ -126,12 +133,12 @@ def load_runtime_agent_llm_config(
     parsed_url = urlsplit(base_url)
     if (
         parsed_url.scheme != "https"
-        or not parsed_url.netloc
+        or parsed_url.netloc.lower() != "api.xiaomimimo.com"
         or parsed_url.path.rstrip("/") not in {"", "/v1"}
         or parsed_url.query
         or parsed_url.fragment
         or not api_key
-        or not model
+        or model != "mimo-v2.5"
         or not math.isfinite(timeout_seconds)
     ):
         raise RuntimeAgentLLMConfigError(_RUNTIME_AGENT_LLM_CONFIG_ERROR)
@@ -145,6 +152,8 @@ def load_runtime_agent_llm_config(
 
 def _load_env_file_values(
     env_file_paths: list[str | os.PathLike[str]] | None = None,
+    *,
+    ignore_unreadable_names: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
     values: dict[str, str] = {}
     candidate_paths = env_file_paths or [
@@ -155,13 +164,21 @@ def _load_env_file_values(
         path = os.fspath(raw_path)
         if not os.path.isfile(path):
             continue
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#") or "=" not in stripped:
-                    continue
-                key, value = stripped.split("=", 1)
-                values[key.strip()] = value.strip().strip('"').strip("'")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if (
+                        not stripped
+                        or stripped.startswith("#")
+                        or "=" not in stripped
+                    ):
+                        continue
+                    key, value = stripped.split("=", 1)
+                    values[key.strip()] = value.strip().strip('"').strip("'")
+        except PermissionError:
+            if os.path.basename(path) not in ignore_unreadable_names:
+                raise
     return values
 
 

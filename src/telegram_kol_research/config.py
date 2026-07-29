@@ -57,7 +57,16 @@ def load_runtime_incident_config(
         if env_file_paths is None
         else env_file_paths
     )
-    env = dict(_load_env_file_values(paths) if paths else {})
+    env = dict(
+        _load_env_file_values(
+            paths,
+            ignore_unreadable_names=frozenset(
+                {"runtime_incident_agent.env"}
+            ),
+        )
+        if paths
+        else {}
+    )
     env.update(os.environ if environ is None else environ)
     capture_types = frozenset(
         item.strip().lower()
