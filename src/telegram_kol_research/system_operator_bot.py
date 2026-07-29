@@ -99,6 +99,46 @@ def system_operator_bot_enabled(config: SystemOperatorBotConfig | None) -> bool:
     return bool(config and config.bot_token and config.chat_id)
 
 
+async def probe_system_operator_bot_evidence(
+    *,
+    config: SystemOperatorBotConfig,
+) -> dict[str, bool]:
+    """Fetch fixed read-only Bot API and target-chat availability evidence."""
+
+    if not system_operator_bot_enabled(config):
+        raise RuntimeError("Telegram bot evidence configuration unavailable")
+    base_url = f"https://api.telegram.org/bot{config.bot_token}"
+    async with httpx.AsyncClient(
+        timeout=5.0,
+        trust_env=False,
+    ) as client:
+        identity_response, chat_response = await asyncio.gather(
+            client.get(f"{base_url}/getMe"),
+            client.post(
+                f"{base_url}/getChat",
+                json={"chat_id": config.chat_id},
+            ),
+        )
+
+    def response_ok(response: httpx.Response) -> bool:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            return False
+        return (
+            response.status_code == 200
+            and isinstance(payload, dict)
+            and payload.get("ok") is True
+        )
+
+    return {
+        "probe_complete": True,
+        "endpoint_reachable": True,
+        "bot_identity_available": response_ok(identity_response),
+        "target_chat_available": response_ok(chat_response),
+    }
+
+
 def format_runtime_incident_notification(incident) -> str:
     """Render one bounded deterministic report without AI interpretation."""
 

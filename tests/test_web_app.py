@@ -5111,3 +5111,185 @@ def test_runtime_agent_production_audit_endpoint_is_single_flight(tmp_path):
     assert again.status_code == 200
     assert max_active == 1
     assert calls == 2
+
+
+def test_runtime_agent_telegram_evidence_endpoint_is_bounded_and_exact(
+    tmp_path,
+):
+    calls = []
+
+    async def probe(channel):
+        calls.append(channel)
+        return {
+            "probe_complete": True,
+            "endpoint_reachable": True,
+            "bot_identity_available": True,
+            "target_chat_available": True,
+            "secret": "must-not-leak",
+        }
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_agent_telegram_evidence_runner=probe,
+    )
+
+    response = TestClient(
+        app,
+        client=("127.0.0.1", 50000),
+    ).post(
+        "/api/runtime-agent/read-only-telegram-evidence",
+        json={"channel": "system_operator"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "probe_complete": True,
+        "endpoint_reachable": True,
+        "bot_identity_available": True,
+        "target_chat_available": True,
+    }
+    assert calls == ["system_operator"]
+    assert "must-not-leak" not in response.text
+
+
+def test_runtime_agent_telegram_evidence_endpoint_refuses_invalid_access(
+    tmp_path,
+):
+    calls = []
+
+    async def probe(channel):
+        calls.append(channel)
+        return {}
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_agent_telegram_evidence_runner=probe,
+    )
+
+    remote = TestClient(
+        app,
+        client=("198.51.100.8", 50000),
+    ).post(
+        "/api/runtime-agent/read-only-telegram-evidence",
+        json={"channel": "system_operator"},
+    )
+    proxied = TestClient(
+        app,
+        client=("127.0.0.1", 50001),
+    ).post(
+        "/api/runtime-agent/read-only-telegram-evidence",
+        headers={"x-forwarded-for": "198.51.100.8"},
+        json={"channel": "system_operator"},
+    )
+    invalid = TestClient(
+        app,
+        client=("127.0.0.1", 50002),
+    ).post(
+        "/api/runtime-agent/read-only-telegram-evidence",
+        json={"channel": "arbitrary"},
+    )
+
+    assert remote.status_code == 404
+    assert proxied.status_code == 404
+    assert invalid.status_code == 422
+    assert calls == []
+
+
+def test_runtime_agent_telegram_evidence_endpoint_hides_failures(
+    tmp_path,
+):
+    async def unavailable(channel):
+        raise RuntimeError(f"secret-{channel}")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_agent_telegram_evidence_runner=unavailable,
+    )
+
+    response = TestClient(
+        app,
+        client=("127.0.0.1", 50000),
+    ).post(
+        "/api/runtime-agent/read-only-telegram-evidence",
+        json={"channel": "notification"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Telegram evidence unavailable"
+    }
+    assert "secret" not in response.text
+
+
+def test_runtime_agent_telegram_evidence_endpoint_is_single_flight(
+    tmp_path,
+):
+    started = threading.Event()
+    release = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+    calls = 0
+
+    async def probe(channel):
+        nonlocal active, max_active, calls
+        with state_lock:
+            active += 1
+            calls += 1
+            max_active = max(max_active, active)
+        started.set()
+        await asyncio.to_thread(release.wait, 2)
+        with state_lock:
+            active -= 1
+        return {
+            "probe_complete": True,
+            "endpoint_reachable": True,
+            "bot_identity_available": True,
+            "target_chat_available": True,
+        }
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_agent_telegram_evidence_runner=probe,
+    )
+    first = {}
+
+    def run_first():
+        first["response"] = TestClient(
+            app,
+            client=("127.0.0.1", 50000),
+        ).post(
+            "/api/runtime-agent/read-only-telegram-evidence",
+            json={"channel": "system_operator"},
+        )
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert started.wait(timeout=1)
+    started_at = time.monotonic()
+    busy = TestClient(
+        app,
+        client=("127.0.0.1", 50001),
+    ).post(
+        "/api/runtime-agent/read-only-telegram-evidence",
+        json={"channel": "notification"},
+    )
+    busy_elapsed = time.monotonic() - started_at
+    release.set()
+    thread.join(timeout=2)
+
+    again = TestClient(
+        app,
+        client=("127.0.0.1", 50002),
+    ).post(
+        "/api/runtime-agent/read-only-telegram-evidence",
+        json={"channel": "notification"},
+    )
+
+    assert busy.status_code == 409
+    assert busy.json() == {"detail": "Telegram evidence busy"}
+    assert busy_elapsed < 0.5
+    assert first["response"].status_code == 200
+    assert again.status_code == 200
+    assert max_active == 1
+    assert calls == 2

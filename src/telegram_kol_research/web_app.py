@@ -167,6 +167,7 @@ from telegram_kol_research.system_operator_bot import (
     deliver_pending_position_protection_incidents,
     load_notification_bot_config,
     load_system_operator_bot_config,
+    probe_system_operator_bot_evidence,
     send_ai_recognition_conflict_review,
     send_pending_entry_expiry_review,
     send_semantic_disagreement_notification,
@@ -174,6 +175,9 @@ from telegram_kol_research.system_operator_bot import (
     run_runtime_incident_notification_loop,
     run_strategy_management_notification_loop,
     system_operator_bot_enabled,
+)
+from telegram_kol_research.runtime_agent_telegram_evidence import (
+    project_bounded_telegram_evidence,
 )
 from telegram_kol_research.time_utils import DEFAULT_LOCAL_TIMEZONE
 from telegram_kol_research.trading_settings import (
@@ -3039,6 +3043,7 @@ def create_web_app(
     strategy_management_worker_startup_delay_seconds: float = 5.0,
     strategy_management_worker_max_batches: int = 10,
     runtime_agent_production_audit_runner=None,
+    runtime_agent_telegram_evidence_runner=None,
 ) -> FastAPI:
     """Create the minimal FastAPI app used by the web command."""
 
@@ -3322,6 +3327,24 @@ def create_web_app(
         if system_operator_bot_enabled(loaded_notification_bot_config)
         else None
     )
+
+    async def default_runtime_agent_telegram_evidence_runner(
+        channel: str,
+    ):
+        config = (
+            app.state.system_operator_bot_config
+            if channel == "system_operator"
+            else app.state.notification_bot_config
+        )
+        if not isinstance(config, SystemOperatorBotConfig):
+            raise RuntimeError("Telegram evidence configuration unavailable")
+        return await probe_system_operator_bot_evidence(config=config)
+
+    app.state.runtime_agent_telegram_evidence_runner = (
+        runtime_agent_telegram_evidence_runner
+        or default_runtime_agent_telegram_evidence_runner
+    )
+    app.state.runtime_agent_telegram_evidence_lock = threading.Lock()
     try:
         app.state.runtime_incident_config = load_runtime_incident_config()
     except Exception:
@@ -3615,6 +3638,57 @@ def create_web_app(
                 )
         finally:
             app.state.runtime_agent_production_audit_lock.release()
+
+    @app.post("/api/runtime-agent/read-only-telegram-evidence")
+    async def api_runtime_agent_read_only_telegram_evidence(
+        request: Request,
+    ):
+        client_host = (
+            request.client.host if request.client is not None else ""
+        )
+        if (
+            client_host not in {"127.0.0.1", "::1"}
+            or "x-forwarded-for" in request.headers
+        ):
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            payload = await request.json()
+        except (TypeError, ValueError):
+            payload = None
+        channel = (
+            payload.get("channel")
+            if isinstance(payload, dict)
+            else None
+        )
+        if channel not in {"system_operator", "notification"}:
+            raise HTTPException(
+                status_code=422,
+                detail="invalid Telegram evidence channel",
+            )
+        acquired = app.state.runtime_agent_telegram_evidence_lock.acquire(
+            blocking=False
+        )
+        if not acquired:
+            raise HTTPException(
+                status_code=409,
+                detail="Telegram evidence busy",
+            )
+        try:
+            try:
+                result = await app.state.runtime_agent_telegram_evidence_runner(
+                    channel
+                )
+                return project_bounded_telegram_evidence(result)
+            except Exception:
+                logger.warning(
+                    "Runtime Agent Telegram evidence is unavailable"
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Telegram evidence unavailable",
+                )
+        finally:
+            app.state.runtime_agent_telegram_evidence_lock.release()
 
     @app.get("/api/management-batches")
     def api_management_batches(chat_id: int, limit: int = 50):

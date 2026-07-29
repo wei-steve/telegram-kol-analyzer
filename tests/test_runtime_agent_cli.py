@@ -10,8 +10,10 @@ from telegram_kol_research.cli import (
     _build_runtime_agent_action_handlers,
     _build_runtime_agent_cli_tools,
     _build_runtime_agent_production_audit_refresh,
+    _build_runtime_agent_telegram_evidence_refresh,
     _read_runtime_agent_exchange_snapshot,
     _read_runtime_agent_production_audit,
+    _read_runtime_agent_telegram_evidence,
     app,
 )
 from telegram_kol_research.runtime_agent_tools import (
@@ -567,6 +569,149 @@ def test_phase6_production_audit_reader_uses_bounded_loopback_endpoint(
             "http://127.0.0.1:8000/api/runtime-agent/"
             "read-only-production-audit"
         ),
+    }
+
+
+def test_phase6_telegram_evidence_handler_uses_one_fresh_bounded_proof(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="runtime_incident_notification",
+        source_record_id="1",
+        incident_type="notification_delivery_failure",
+        severity="medium",
+        fingerprint="7" * 64,
+        redacted_summary='{"notification_status":"failed"}',
+        occurred_at=datetime(2026, 7, 30, 9, 0, tzinfo=UTC),
+        feature_policy_version="runtime-incident-phase-6-v1",
+        prompt_version="runtime-agent-prompt-v7",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    calls = []
+
+    class TelegramEvidenceRefresh:
+        def refresh(self, **kwargs):
+            calls.append(("refresh", kwargs))
+            return True
+
+        def consume_verification(self, *, incident_id):
+            if not any(call[0] == "refresh" for call in calls):
+                return None
+            if any(call[0] == "verify" for call in calls):
+                return None
+            calls.append(("verify", incident_id))
+            return {
+                "evidence_fetched": True,
+                "evidence_available": True,
+                "probe_complete": True,
+                "endpoint_reachable": True,
+                "bot_identity_available": True,
+                "target_chat_available": True,
+            }
+
+    refresh = TelegramEvidenceRefresh()
+    tools = _build_runtime_agent_cli_tools(
+        session_factory,
+        max_output_bytes=8192,
+        journal_reader=lambda: (),
+        telegram_evidence_refresh=refresh,
+    )
+    handlers = _build_runtime_agent_action_handlers(
+        tools,
+        telegram_evidence_refresh=refresh,
+    )
+
+    passive = tools.execute(
+        "get_incident_summary",
+        {"incident_id": incident.id},
+        expected_incident_id=incident.id,
+    )
+    assert "evidence_fetched" not in passive.data
+    assert set(handlers) == {
+        "build_read_only_reconciliation_plan",
+        "fetch_missing_telegram_evidence",
+    }
+
+    assert handlers["fetch_missing_telegram_evidence"](
+        incident_id=incident.id,
+        idempotency_key="runtime-incident:1:telegram-evidence:v1",
+        expected_fingerprint=incident.fingerprint,
+    )
+    verified = tools.execute(
+        "get_incident_summary",
+        {"incident_id": incident.id},
+        expected_incident_id=incident.id,
+    )
+
+    assert verified.data["evidence_fetched"] is True
+    assert verified.data["evidence_available"] is True
+    assert verified.evidence_refs == (
+        f"incident:{incident.id}",
+        f"telegram-evidence:{incident.id}",
+    )
+    passive_again = tools.execute(
+        "get_incident_summary",
+        {"incident_id": incident.id},
+        expected_incident_id=incident.id,
+    )
+    assert "evidence_fetched" not in passive_again.data
+    assert len(calls) == 2
+
+
+def test_phase6_telegram_evidence_reader_uses_exact_loopback_channel(
+    tmp_path,
+    monkeypatch,
+):
+    observed = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "probe_complete": True,
+                "endpoint_reachable": True,
+                "bot_identity_available": True,
+                "target_chat_available": True,
+            }
+
+    class Client:
+        def __init__(self, *, timeout, trust_env):
+            observed["timeout"] = timeout
+            observed["trust_env"] = trust_env
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, url, *, json):
+            observed["url"] = url
+            observed["json"] = json
+            return Response()
+
+    monkeypatch.setattr("telegram_kol_research.cli.httpx.Client", Client)
+
+    result = _read_runtime_agent_telegram_evidence("notification")
+    session_factory = create_session_factory(tmp_path / "research.db")
+    refresh = _build_runtime_agent_telegram_evidence_refresh(
+        session_factory
+    )
+
+    assert result["probe_complete"] is True
+    assert refresh is not None
+    assert observed == {
+        "timeout": 10.0,
+        "trust_env": False,
+        "url": (
+            "http://127.0.0.1:8000/api/runtime-agent/"
+            "read-only-telegram-evidence"
+        ),
+        "json": {"channel": "notification"},
     }
 
 

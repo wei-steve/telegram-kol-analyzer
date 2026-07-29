@@ -144,6 +144,36 @@ def test_execution_policy_is_dormant_and_exact_allowlisted(tmp_path):
     assert unknown.refusal_reasons == ("unknown_playbook",)
 
 
+def test_telegram_evidence_verification_requires_complete_exact_proof():
+    complete = {
+        "evidence_fetched": True,
+        "evidence_available": True,
+        "probe_complete": True,
+        "endpoint_reachable": True,
+        "bot_identity_available": True,
+        "target_chat_available": True,
+    }
+
+    assert executor_module._verification_passed(
+        "fetch_missing_telegram_evidence",
+        complete,
+        action_data={},
+    )
+    for field in (
+        "probe_complete",
+        "endpoint_reachable",
+        "bot_identity_available",
+        "target_chat_available",
+    ):
+        incomplete = dict(complete)
+        incomplete.pop(field)
+        assert not executor_module._verification_passed(
+            "fetch_missing_telegram_evidence",
+            incomplete,
+            action_data={},
+        )
+
+
 def test_executor_requires_current_fingerprint_before_reserving_action(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     incident = _record(session_factory)

@@ -2175,3 +2175,66 @@ def test_process_expiry_expire_keep_marks_expired_without_cancelling_binding(tmp
     assert lifecycle.lifecycle_status == "expired"
     assert lifecycle.exit_reason == "expired"
     assert lifecycle.expiry_review_next_at is None
+
+
+def test_telegram_evidence_probe_is_concurrent_bounded_and_proxy_free(
+    monkeypatch,
+):
+    observed = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"ok": True, "result": {"secret": "not-returned"}}
+
+    async def scenario():
+        get_started = asyncio.Event()
+        post_started = asyncio.Event()
+
+        class Client:
+            def __init__(self, *, timeout, trust_env):
+                observed["timeout"] = timeout
+                observed["trust_env"] = trust_env
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def get(self, url):
+                observed["get_url"] = url
+                get_started.set()
+                await asyncio.wait_for(post_started.wait(), timeout=0.2)
+                return Response()
+
+            async def post(self, url, *, json):
+                observed["post_url"] = url
+                observed["payload"] = json
+                post_started.set()
+                await asyncio.wait_for(get_started.wait(), timeout=0.2)
+                return Response()
+
+        monkeypatch.setattr(operator_bot_module.httpx, "AsyncClient", Client)
+        return await operator_bot_module.probe_system_operator_bot_evidence(
+            config=SystemOperatorBotConfig(
+                bot_token="secret-token",
+                chat_id="secret-chat",
+                timeout_seconds=99,
+            )
+        )
+
+    result = asyncio.run(scenario())
+
+    assert result == {
+        "probe_complete": True,
+        "endpoint_reachable": True,
+        "bot_identity_available": True,
+        "target_chat_available": True,
+    }
+    assert observed["timeout"] == 5.0
+    assert observed["trust_env"] is False
+    assert observed["payload"] == {"chat_id": "secret-chat"}
+    assert "secret-token" not in str(result)
+    assert "secret-chat" not in str(result)

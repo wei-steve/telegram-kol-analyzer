@@ -125,6 +125,9 @@ from telegram_kol_research.runtime_agent_exchange_snapshot import (
 from telegram_kol_research.runtime_agent_production_audit import (
     RuntimeAgentProductionAuditRefresh,
 )
+from telegram_kol_research.runtime_agent_telegram_evidence import (
+    RuntimeAgentTelegramEvidenceRefresh,
+)
 from telegram_kol_research.runtime_agent_evaluation import (
     evaluate_runtime_agent_case,
     load_runtime_agent_corpus,
@@ -1937,6 +1940,9 @@ def _build_runtime_agent_cli_tools(
     production_audit_refresh: (
         RuntimeAgentProductionAuditRefresh | None
     ) = None,
+    telegram_evidence_refresh: (
+        RuntimeAgentTelegramEvidenceRefresh | None
+    ) = None,
 ) -> RuntimeAgentToolRegistry:
     def load_incident(session, incident_id: int):
         row = session.get(RuntimeIncident, incident_id)
@@ -1968,21 +1974,38 @@ def _build_runtime_agent_cli_tools(
     def incident_summary(*, incident_id: int):
         with session_factory() as session:
             row = load_incident(session, incident_id)
+            live_verification = (
+                telegram_evidence_refresh.consume_verification(
+                    incident_id=int(incident_id)
+                )
+                if telegram_evidence_refresh is not None
+                else None
+            )
             try:
                 summary = json.loads(row.redacted_summary)
             except (TypeError, ValueError, json.JSONDecodeError):
                 summary = {}
+            data = {
+                "incident_id": row.id,
+                "incident_type": row.incident_type,
+                "severity": row.severity,
+                "status": row.status,
+                "generation": row.generation,
+                "repeat_count": row.repeat_count,
+                "redacted_summary": summary,
+            }
+            if live_verification is not None:
+                data.update(live_verification)
             return {
-                "data": {
-                    "incident_id": row.id,
-                    "incident_type": row.incident_type,
-                    "severity": row.severity,
-                    "status": row.status,
-                    "generation": row.generation,
-                    "repeat_count": row.repeat_count,
-                    "redacted_summary": summary,
-                },
-                "evidence_refs": [f"incident:{row.id}"],
+                "data": data,
+                "evidence_refs": (
+                    [
+                        f"incident:{row.id}",
+                        f"telegram-evidence:{row.id}",
+                    ]
+                    if live_verification is not None
+                    else [f"incident:{row.id}"]
+                ),
             }
 
     def lifecycle_state(*, incident_id: int):
@@ -2493,6 +2516,9 @@ def _build_runtime_agent_action_handlers(
     production_audit_refresh: (
         RuntimeAgentProductionAuditRefresh | None
     ) = None,
+    telegram_evidence_refresh: (
+        RuntimeAgentTelegramEvidenceRefresh | None
+    ) = None,
 ):
     """Wire only concrete, reviewed Phase 6 actions into production entrypoints."""
 
@@ -2551,6 +2577,23 @@ def _build_runtime_agent_action_handlers(
             )
 
         handlers["rerun_production_audit"] = rerun_production_audit
+    if telegram_evidence_refresh is not None:
+
+        def fetch_missing_telegram_evidence(
+            *,
+            incident_id: int,
+            idempotency_key: str,
+            expected_fingerprint: str,
+        ) -> bool:
+            return telegram_evidence_refresh.refresh(
+                incident_id=int(incident_id),
+                idempotency_key=str(idempotency_key),
+                expected_fingerprint=str(expected_fingerprint),
+            )
+
+        handlers["fetch_missing_telegram_evidence"] = (
+            fetch_missing_telegram_evidence
+        )
     return handlers
 
 
@@ -2578,6 +2621,30 @@ def _build_runtime_agent_production_audit_refresh(
 ) -> RuntimeAgentProductionAuditRefresh:
     return RuntimeAgentProductionAuditRefresh(
         runner=_read_runtime_agent_production_audit
+    )
+
+
+def _read_runtime_agent_telegram_evidence(
+    channel: str,
+) -> dict[str, Any]:
+    if channel not in {"system_operator", "notification"}:
+        raise ValueError("invalid Telegram evidence channel")
+    with httpx.Client(timeout=10.0, trust_env=False) as client:
+        response = client.post(
+            "http://127.0.0.1:8000/api/runtime-agent/"
+            "read-only-telegram-evidence",
+            json={"channel": channel},
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def _build_runtime_agent_telegram_evidence_refresh(
+    session_factory,
+) -> RuntimeAgentTelegramEvidenceRefresh:
+    return RuntimeAgentTelegramEvidenceRefresh(
+        session_factory,
+        reader=_read_runtime_agent_telegram_evidence,
     )
 
 
@@ -2625,16 +2692,21 @@ def runtime_incident_agent_once(
     production_audit_refresh = (
         _build_runtime_agent_production_audit_refresh()
     )
+    telegram_evidence_refresh = (
+        _build_runtime_agent_telegram_evidence_refresh(session_factory)
+    )
     tools = _build_runtime_agent_cli_tools(
         session_factory,
         max_output_bytes=runtime_config.agent_max_tool_output_bytes,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
         production_audit_refresh=production_audit_refresh,
+        telegram_evidence_refresh=telegram_evidence_refresh,
     )
     action_handlers = _build_runtime_agent_action_handlers(
         tools,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
         production_audit_refresh=production_audit_refresh,
+        telegram_evidence_refresh=telegram_evidence_refresh,
     )
     worker_config = RuntimeAgentWorkerConfig(
         enabled=runtime_config.agent_enabled,
@@ -2710,16 +2782,21 @@ def runtime_incident_agent_worker(
     production_audit_refresh = (
         _build_runtime_agent_production_audit_refresh()
     )
+    telegram_evidence_refresh = (
+        _build_runtime_agent_telegram_evidence_refresh(session_factory)
+    )
     tools = _build_runtime_agent_cli_tools(
         session_factory,
         max_output_bytes=runtime_config.agent_max_tool_output_bytes,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
         production_audit_refresh=production_audit_refresh,
+        telegram_evidence_refresh=telegram_evidence_refresh,
     )
     action_handlers = _build_runtime_agent_action_handlers(
         tools,
         exchange_snapshot_refresh=exchange_snapshot_refresh,
         production_audit_refresh=production_audit_refresh,
+        telegram_evidence_refresh=telegram_evidence_refresh,
     )
     worker_config = RuntimeAgentWorkerConfig(
         enabled=True,

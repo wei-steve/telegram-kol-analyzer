@@ -131,6 +131,10 @@ def _verification_passed(
         return (
             data.get("evidence_fetched") is True
             and data.get("evidence_available") is True
+            and data.get("probe_complete") is True
+            and data.get("endpoint_reachable") is True
+            and data.get("bot_identity_available") is True
+            and data.get("target_chat_available") is True
         )
     if playbook_name == "build_read_only_reconciliation_plan":
         return (
