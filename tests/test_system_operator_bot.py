@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import time
 from datetime import UTC, datetime, timedelta
@@ -1504,6 +1505,68 @@ def test_cleanup_notification_delivery_is_durable_and_deduplicated(
             delivered_at=NOW + timedelta(minutes=2),
         )
     ) == 0
+
+
+def test_cleanup_notification_fingerprint_is_stable_across_payload_versions(
+    tmp_path,
+):
+    from telegram_kol_research import execution_events as execution_events_module
+    from telegram_kol_research.models import ExecutionEvent
+
+    session_factory = create_session_factory(tmp_path / "cleanup-version-dedup.db")
+    identity_payload = {
+        "binding_id": 208,
+        "lifecycle_id": 625,
+        "leg_ids": [901],
+        "order_ids": ["1001124388622177"],
+        "reason": "primary_position_closed",
+        "status": "resolved",
+    }
+    old_fingerprint = hashlib.sha256(
+        json.dumps(
+            identity_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    with session_factory() as session:
+        old = ExecutionEvent(
+            execution_binding_id=208,
+            venue="deepcoin",
+            action="terminal_entry_cleanup_outcome",
+            status="resolved",
+            reason="primary_position_closed",
+            response_json=json.dumps(identity_payload, sort_keys=True),
+            notification_status="pending",
+            notification_fingerprint=old_fingerprint,
+            notification_attempts=0,
+            created_at=NOW,
+        )
+        session.add(old)
+        session.commit()
+        old_id = old.id
+
+    event_id = execution_events_module.enqueue_terminal_entry_cleanup_notification(
+        session_factory,
+        lifecycle_id=625,
+        binding_id=208,
+        status="resolved",
+        leg_ids=(901,),
+        order_ids=("1001124388622177",),
+        reason="primary_position_closed",
+        created_at=NOW + timedelta(seconds=1),
+    )
+
+    assert event_id == old_id
+    with session_factory() as session:
+        assert (
+            session.query(ExecutionEvent)
+            .filter(
+                ExecutionEvent.action == "terminal_entry_cleanup_outcome"
+            )
+            .count()
+            == 1
+        )
 
 
 def test_cleanup_notification_failure_is_bounded_and_retries_after_restart(

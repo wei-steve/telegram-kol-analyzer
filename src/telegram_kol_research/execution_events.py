@@ -164,7 +164,7 @@ def enqueue_terminal_entry_cleanup_notification(
     normalized_status = str(status or "unknown").lower()
     if normalized_status not in {"resolved", "already_absent", "blocked", "unknown"}:
         normalized_status = "unknown"
-    payload = {
+    identity_payload = {
         "binding_id": int(binding_id),
         "lifecycle_id": int(lifecycle_id),
         "leg_ids": sorted({int(value) for value in leg_ids}),
@@ -173,11 +173,18 @@ def enqueue_terminal_entry_cleanup_notification(
         ),
         "reason": str(reason or "strategy_terminal")[:64],
         "status": normalized_status,
-        "notification_policy_version": "terminal-entry-cleanup-v2",
     }
     fingerprint = hashlib.sha256(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+        json.dumps(
+            identity_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode("utf-8")
     ).hexdigest()
+    payload = {
+        **identity_payload,
+        "notification_policy_version": "terminal-entry-cleanup-v2",
+    }
     now = created_at or datetime.now(UTC)
     with session_factory() as session:
         existing_id = (
