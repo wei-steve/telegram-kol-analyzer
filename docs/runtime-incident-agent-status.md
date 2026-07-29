@@ -6,12 +6,12 @@ used to advance or reinterpret the rollout.
 ```yaml
 project: runtime-incident-agent
 design_version: 1
-current_phase: 4
-phase_name: expand-read-only-evidence-and-build-evaluation-corpus
-phase_status: in_progress
-last_completed_phase: 3
-last_completed_commit: d5c5b70
-production_commit: d5c5b700117303aed6ed22d86ceb08026138df12
+current_phase: 5
+phase_name: versioned-recovery-playbooks-shadow-mode
+phase_status: planned
+last_completed_phase: 4
+last_completed_commit: 356e844
+production_commit: 356e84488316a063b0f982fc2585a57b4fd8c8d4
 local_tests:
   - "phase-4-runtime-agent-and-critical-regressions: passed"
   - "phase-4-offline-evaluation: 7 cases, all six metrics at 1.0"
@@ -19,23 +19,23 @@ local_tests:
   - "context-resolution-and-management-regressions: 176 passed"
   - "full-suite attempt: 2237 passed, 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the failing test passed in isolation"
 server_verification:
-  status: pending-phase-4-safe-window-deployment
-  deployed_commit: d5c5b700117303aed6ed22d86ceb08026138df12
+  status: complete
+  deployed_commit: 356e84488316a063b0f982fc2585a57b4fd8c8d4
   service: active-http-200
-  bounded_restarts: "clean; one pre-restart evidence claim expired and was recovered to completed after a bounded follow-up restart"
+  bounded_restarts: "clean; no post-restart service errors"
   listener: monitoring-31-enabled-groups-and-continuing
-  recognition: "raw message 8143 recovered; latest raw message 8151 completed"
+  recognition: "latest raw message 8239 had a completed recognition before and after deployment"
   contextual_resolution_inflight: 0
   position_mutation_inflight: 0
-  management_latest: "succeeded; totals unchanged except new normal successes"
-  production_safety: stable-complete-baseline-audit_abnormal
+  management_latest: "succeeded; six old partial_failed/recovery_required rows were historical, with no active claim or mutation"
+  production_safety: "monitor state readable; no anomaly fingerprint; historical abnormal source rows unchanged"
   sidecar: installed-disabled-inactive
-  agent_flag: absent
-  production_incident_row: "incident 1 remained pending with zero Agent attempts"
-  synthetic_canary: "isolated temporary database; one live-model attempt, three read-only tools, diagnosed, bounded Codex handoff available"
-  synthetic_business_rows: "raw/recognition/lifecycle/management/mutation tables all remained empty"
-  incident_agent_behavior: "read-only diagnosis and handoff only; no playbook executed"
-  remaining: "Commit, push, prove a safe deployment window, deploy Phase 4 with the Agent disabled, and run read-only server validation."
+  agent_flag: disabled
+  production_incident_row: "incident 1 remained pending/delivered; total runtime incidents remained 1"
+  phase_4_offline_gate: "7 reviewed cases; all six metrics at 1.0"
+  phase_4_readonly_tools: "all nine bounded tools executed against incident 1; only projection keys and evidence counts were inspected"
+  incident_agent_behavior: "read-only projections only; sidecar never started; no playbook or business mutation executed"
+  remaining: "Begin Phase 5 only on the next approved turn."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
@@ -144,7 +144,8 @@ When the user says `请执行自定义ai agent的下一步实施`:
 
 ### Phase 4 — Expand read-only evidence and build evaluation corpus
 
-- Status: in progress
+- Status: completed
+- Commit: `356e844` (`test: expand runtime incident agent evaluations`)
 - Local implementation: seven reviewed redacted incident fixtures, deterministic
   offline classification/tool/safety/certainty/budget/context-boundary metrics,
   coherent local/exchange comparisons, bounded related-worker history, bounded
@@ -153,8 +154,17 @@ When the user says `请执行自定义ai agent的下一步实施`:
   remains dormant by default
 - Local verification: runtime-agent and critical context-resolution/management
   regressions passed; all seven evaluation cases passed all six gates
-- Remaining: reviewed commit/push, safe-window production deployment, and
-  read-only server validation
+- Review: no remaining Critical or Important findings
+- Production verification: deployed with the Agent flag disabled and sidecar
+  inactive; service returned HTTP 200; Telegram listener monitored 31 enabled
+  groups; evidence/context claims and position mutations were zero; all nine
+  read-only projections executed against incident `1`; the runtime incident
+  count and source business state were unchanged
+
+### Phase 5 — Versioned recovery playbooks in shadow mode
+
+- Status: planned
+- Implementation started: no
 
 ## Current Phase Exit Checklist
 
@@ -168,10 +178,10 @@ Phase 4 is not complete until:
       are bounded and redacted;
 - [x] architecture and critical context-resolution/management regressions pass;
 - [x] changes receive review with no remaining Critical or Important findings;
-- [ ] changes are committed and pushed;
-- [ ] a safe production deployment window is proven;
-- [ ] production deploys with the Agent sidecar disabled and inactive;
-- [ ] service/listener/checkpoint/reconciliation continuity is verified;
-- [ ] the offline corpus gate passes from the deployed checkout;
-- [ ] reviewed production incidents are inspected through read-only tools only;
-- [ ] no business row or action authority changes.
+- [x] changes are committed and pushed;
+- [x] a safe production deployment window is proven;
+- [x] production deploys with the Agent sidecar disabled and inactive;
+- [x] service/listener/checkpoint/reconciliation continuity is verified;
+- [x] the offline corpus gate passes from the deployed checkout;
+- [x] reviewed production incidents are inspected through read-only tools only;
+- [x] no business row or action authority changes.
