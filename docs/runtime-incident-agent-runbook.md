@@ -205,6 +205,48 @@ authority for Phase 4. If a projection is incomplete, records unbounded data,
 or disagrees with its durable source row, leave Phase 4 `in_progress` and
 disable the Agent flag.
 
+### Phase 5 versioned recovery playbooks in shadow mode
+
+Phase 5 adds the closed `runtime-playbooks-v1` catalog and deterministic
+`runtime-shadow-policy-v1`. It adds no executor and authorizes no runtime
+action. The model may nominate one catalog playbook; policy independently
+records `shadow_accepted`, `shadow_refused`, or `not_requested`. Every
+diagnosis report and Codex handoff must continue to state
+`action_executed: false`.
+
+`TELEGRAM_KOL_RUNTIME_AGENT_SHADOW_PLAYBOOKS` is a comma-separated exact
+allowlist. Empty disables every shadow playbook. Wildcards and unknown names
+never pass policy. The first deployment must keep both the Agent sidecar and
+this allowlist disabled. After the normal service passes the continuity gate,
+enable the Agent only in a separately proven safe window and canary exactly one
+read-only playbook:
+
+```text
+refresh_read_only_exchange_snapshot
+```
+
+The Phase 5 catalog also contains `rerun_production_audit`,
+`recover_stale_side_effect_free_claim`, `reschedule_non_writing_ai_job`,
+`fetch_missing_telegram_evidence`, and
+`build_read_only_reconciliation_plan`. Operational nominations require exact
+durable proof that no business write is owned; absent proof is a deterministic
+refusal. No Phase 5 canary may execute any of these functions or change a
+source business row.
+
+Before widening a shadow allowlist, compare the durable nomination, policy
+version, refusal reasons, recovery status, notification text, and Codex
+handoff with the reviewed corpus. Require zero accepted unknown playbooks,
+zero accepted operational playbooks without exact prerequisite proof, and
+zero `action_executed: true` values.
+
+Immediate Phase 5 rollback is:
+
+1. clear `TELEGRAM_KOL_RUNTIME_AGENT_SHADOW_PLAYBOOKS`;
+2. stop and disable `telegram-kol-runtime-agent.service`;
+3. clear `TELEGRAM_KOL_RUNTIME_AGENT_ENABLED`;
+4. leave Phase 2 capture and deterministic notification settings unchanged;
+5. confirm the normal service and all business workers remain active.
+
 ## Rollback
 
 1. Disable the newest phase feature flag.

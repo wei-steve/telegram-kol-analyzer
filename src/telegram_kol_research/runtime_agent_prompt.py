@@ -6,10 +6,14 @@ import json
 from typing import Any, Mapping
 
 from telegram_kol_research.runtime_agent_contracts import RuntimeAgentContractError
+from telegram_kol_research.runtime_agent_playbooks import (
+    RUNTIME_AGENT_PLAYBOOKS,
+)
 
 
-RUNTIME_AGENT_PROMPT_VERSION = "runtime-agent-prompt-v2"
-RUNTIME_AGENT_SYSTEM_PROMPT = """
+RUNTIME_AGENT_PROMPT_VERSION = "runtime-agent-prompt-v3"
+_PLAYBOOK_NAMES = ", ".join(sorted(RUNTIME_AGENT_PLAYBOOKS))
+RUNTIME_AGENT_SYSTEM_PROMPT = f"""
 You diagnose a durable technical runtime incident using only the supplied
 bounded read-only tools. The existing recognition, strategy targeting, and
 contextual multi-information resolution flows are authoritative. Never choose
@@ -23,8 +27,11 @@ incident_id (integer), diagnosis_hypothesis (string), confidence
 ("low", "medium", or "high"), evidence_references (string array),
 missing_evidence (string array), recommended_playbook_name (string or null),
 auto_handle_eligible (boolean), codex_handoff_required (boolean), and
-remaining_risk (string). A diagnosis is a hypothesis. Phase 3 executes no
-playbook and no business mutation.
+remaining_risk (string). A diagnosis is a hypothesis. You may nominate one
+closed playbook by name, but deterministic policy independently accepts or
+refuses the nomination. Phase 5 is shadow-only: no playbook executes and no
+business mutation occurs.
+The only names eligible for nomination are: {_PLAYBOOK_NAMES}.
 """.strip()
 
 

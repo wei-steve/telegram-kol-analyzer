@@ -19,6 +19,10 @@ from telegram_kol_research.runtime_agent_prompt import (
     RUNTIME_AGENT_PROMPT_VERSION,
     build_runtime_agent_messages,
 )
+from telegram_kol_research.runtime_agent_policy import (
+    ShadowPlaybookDecision,
+    evaluate_shadow_playbook_nomination,
+)
 from telegram_kol_research.runtime_agent_tools import (
     RuntimeAgentToolError,
     RuntimeAgentToolRegistry,
@@ -46,6 +50,7 @@ class RuntimeAgentWorkerConfig:
     max_agent_attempts: int = 3
     retry_base_seconds: float = 5.0
     retry_max_seconds: float = 300.0
+    shadow_playbooks: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +60,7 @@ class RuntimeAgentWorkerResult:
     tool_steps: int = 0
     refused_tool_calls: int = 0
     handoff: dict[str, Any] | None = None
+    shadow_policy: dict[str, Any] | None = None
 
 
 def run_runtime_agent_loop(
@@ -239,10 +245,15 @@ def _commit_diagnosis(
     claim_token: str,
     diagnosis: RuntimeAgentDiagnosis,
     now: datetime,
+    shadow_decision: ShadowPlaybookDecision,
     prompt_version: str | None = None,
 ) -> bool:
+    ledger_diagnosis = diagnosis.to_ledger_mapping()
+    ledger_diagnosis["shadow_playbook_policy"] = (
+        shadow_decision.to_ledger_mapping()
+    )
     diagnosis_json = json.dumps(
-        diagnosis.to_ledger_mapping(),
+        ledger_diagnosis,
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
@@ -262,6 +273,7 @@ def _commit_diagnosis(
         diagnosis_json=diagnosis_json,
         evidence_refs_json=evidence_json,
         playbook_name=diagnosis.recommended_playbook_name,
+        recovery_status=shadow_decision.recovery_status,
         queue_notification=True,
         prompt_version=prompt_version,
     )
@@ -362,10 +374,17 @@ def run_runtime_agent_once(
         )
         if reusable is not None:
             diagnosis = _diagnosis_from_reusable(claimed.id, reusable)
+            shadow_decision = evaluate_shadow_playbook_nomination(
+                incident=_incident_mapping(claimed),
+                nominated_playbook=diagnosis.recommended_playbook_name,
+                enabled_playbooks=config.shadow_playbooks,
+                evidence_references=diagnosis.evidence_references,
+            )
             handoff = build_runtime_incident_handoff(
                 incident=_handoff_incident(claimed),
                 diagnosis=diagnosis,
                 attempted_queries=diagnosis.attempted_queries,
+                shadow_policy=shadow_decision.to_ledger_mapping(),
             )
             if not _commit_diagnosis(
                 session_factory,
@@ -373,6 +392,7 @@ def run_runtime_agent_once(
                 claim_token=claim_token,
                 diagnosis=diagnosis,
                 now=operation_now,
+                shadow_decision=shadow_decision,
                 prompt_version=reusable.prompt_version,
             ):
                 return RuntimeAgentWorkerResult(
@@ -382,6 +402,7 @@ def run_runtime_agent_once(
                 status="reused",
                 incident_id=claimed.id,
                 handoff=handoff,
+                shadow_policy=shadow_decision.to_ledger_mapping(),
             )
 
         messages = build_runtime_agent_messages(
@@ -443,10 +464,17 @@ def run_runtime_agent_once(
                     raise RuntimeAgentContractError(
                         "diagnosis cites evidence that was not returned"
                     )
+                shadow_decision = evaluate_shadow_playbook_nomination(
+                    incident=_incident_mapping(claimed),
+                    nominated_playbook=diagnosis.recommended_playbook_name,
+                    enabled_playbooks=config.shadow_playbooks,
+                    evidence_references=diagnosis.evidence_references,
+                )
                 handoff = build_runtime_incident_handoff(
                     incident=_handoff_incident(claimed),
                     diagnosis=diagnosis,
                     attempted_queries=attempted_queries,
+                    shadow_policy=shadow_decision.to_ledger_mapping(),
                 )
                 if not _commit_diagnosis(
                     session_factory,
@@ -454,6 +482,7 @@ def run_runtime_agent_once(
                     claim_token=claim_token,
                     diagnosis=diagnosis,
                     now=operation_now,
+                    shadow_decision=shadow_decision,
                 ):
                     return RuntimeAgentWorkerResult(
                         status="claim_lost",
@@ -467,6 +496,7 @@ def run_runtime_agent_once(
                     tool_steps=len(attempted_queries),
                     refused_tool_calls=refused,
                     handoff=handoff,
+                    shadow_policy=shadow_decision.to_ledger_mapping(),
                 )
 
             call = RuntimeAgentToolCall.from_mapping(

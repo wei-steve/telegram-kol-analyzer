@@ -12,6 +12,9 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import RuntimeIncident
+from telegram_kol_research.runtime_agent_playbooks import (
+    get_runtime_agent_playbook,
+)
 
 
 MAX_REDACTED_SUMMARY_LENGTH = 2048
@@ -56,6 +59,9 @@ _SUMMARY_FIELDS = frozenset(
     {
         "component",
         "containment",
+        "business_write_owned",
+        "claim_side_effect_class",
+        "claim_status",
         "error_code",
         "error_type",
         "impact",
@@ -79,11 +85,26 @@ _DIAGNOSIS_FIELDS = frozenset(
         "missing_evidence",
         "recommended_playbook",
         "remaining_risk",
+        "shadow_playbook_policy",
+    }
+)
+_SHADOW_POLICY_FIELDS = frozenset(
+    {
+        "mode",
+        "policy_version",
+        "nominated_playbook",
+        "playbook_version",
+        "accepted",
+        "refusal_reasons",
+        "verification_query",
+        "would_execute",
+        "action_executed",
     }
 )
 _EVIDENCE_REFERENCE_PATTERN = re.compile(
     r"[a-z][a-z0-9_-]{1,31}:[A-Za-z0-9._-]{1,128}"
 )
+_PLAYBOOK_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_-]{1,127}")
 _CLAIMABLE_STATUS = "pending"
 _CLAIMED_STATUS = "claimed"
 _SEVERITY_RANKS = {
@@ -205,6 +226,87 @@ def _validate_redacted_json_contract(name: str, normalized: str) -> None:
                 f"diagnosis_json contains unsupported fields: "
                 f"{sorted(unknown_fields)!r}"
             )
+        shadow_policy = parsed.get("shadow_playbook_policy")
+        if shadow_policy is not None and (
+            not isinstance(shadow_policy, dict)
+            or set(shadow_policy) != _SHADOW_POLICY_FIELDS
+        ):
+            raise RuntimeIncidentBoundsError(
+                "diagnosis_json shadow policy fields are invalid"
+            )
+        if shadow_policy is not None:
+            nominated = shadow_policy["nominated_playbook"]
+            playbook_version = shadow_policy["playbook_version"]
+            accepted = shadow_policy["accepted"]
+            refusal_reasons = shadow_policy["refusal_reasons"]
+            verification_query = shadow_policy["verification_query"]
+            catalog_playbook = get_runtime_agent_playbook(nominated)
+            if (
+                shadow_policy["mode"] != "shadow"
+                or shadow_policy["policy_version"]
+                != "runtime-shadow-policy-v1"
+                or shadow_policy["would_execute"] is not False
+                or shadow_policy["action_executed"] is not False
+                or not isinstance(accepted, bool)
+                or (
+                    nominated is not None
+                    and (
+                        not isinstance(nominated, str)
+                        or not _PLAYBOOK_NAME_PATTERN.fullmatch(nominated)
+                    )
+                )
+                or (
+                    playbook_version is not None
+                    and (
+                        isinstance(playbook_version, bool)
+                        or not isinstance(playbook_version, int)
+                        or playbook_version < 1
+                    )
+                )
+                or not isinstance(refusal_reasons, list)
+                or len(refusal_reasons) > 8
+                or not all(
+                    isinstance(reason, str) and 0 < len(reason) <= 128
+                    for reason in refusal_reasons
+                )
+                or (
+                    verification_query is not None
+                    and (
+                        not isinstance(verification_query, str)
+                        or not 0 < len(verification_query) <= 64
+                    )
+                )
+                or (
+                    nominated is None
+                    and (
+                        accepted
+                        or playbook_version is not None
+                        or verification_query is not None
+                        or refusal_reasons != ["no_nomination"]
+                    )
+                )
+                or (
+                    nominated is not None
+                    and (
+                        playbook_version is None
+                        and refusal_reasons != ["unknown_playbook"]
+                    )
+                )
+                or (accepted and refusal_reasons)
+                or (not accepted and nominated is not None and not refusal_reasons)
+                or (
+                    accepted
+                    and (
+                        catalog_playbook is None
+                        or catalog_playbook.version != playbook_version
+                        or catalog_playbook.verification_query
+                        != verification_query
+                    )
+                )
+            ):
+                raise RuntimeIncidentBoundsError(
+                    "diagnosis_json shadow policy is invalid"
+                )
 
     for key, value in _walk_json_values(parsed):
         if key is not None and _sensitive_key(key):

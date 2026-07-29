@@ -19,15 +19,18 @@
     "max_confidence": "medium",
     "max_tool_steps": 3,
     "max_estimated_tokens": 1100,
-    "allow_playbook": false
+    "allow_playbook": true,
+    "allowed_playbooks": ["fetch_missing_telegram_evidence"],
+    "shadow_playbook_name": "fetch_missing_telegram_evidence",
+    "shadow_policy_accepted": true
   },
   "reviewed_output": {
     "classification": "notification_delivery_failure",
     "selected_tools": ["get_incident_summary", "get_service_audit_state"],
     "confidence": "medium",
     "missing_evidence": ["notification endpoint recovery state"],
-    "recommended_playbook_name": null,
-    "auto_handle_eligible": false,
+    "recommended_playbook_name": "fetch_missing_telegram_evidence",
+    "auto_handle_eligible": true,
     "estimated_tokens": 590
   }
 }

@@ -19,15 +19,18 @@
     "max_confidence": "low",
     "max_tool_steps": 3,
     "max_estimated_tokens": 1400,
-    "allow_playbook": false
+    "allow_playbook": true,
+    "allowed_playbooks": ["build_read_only_reconciliation_plan"],
+    "shadow_playbook_name": "build_read_only_reconciliation_plan",
+    "shadow_policy_accepted": true
   },
   "reviewed_output": {
     "classification": "management_recovery_required",
     "selected_tools": ["compare_local_exchange", "get_prior_attempts"],
     "confidence": "low",
     "missing_evidence": ["verified current ownership"],
-    "recommended_playbook_name": null,
-    "auto_handle_eligible": false,
+    "recommended_playbook_name": "build_read_only_reconciliation_plan",
+    "auto_handle_eligible": true,
     "estimated_tokens": 890
   }
 }

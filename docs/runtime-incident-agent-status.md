@@ -8,18 +8,19 @@ project: runtime-incident-agent
 design_version: 1
 current_phase: 5
 phase_name: versioned-recovery-playbooks-shadow-mode
-phase_status: planned
+phase_status: in_progress
 last_completed_phase: 4
 last_completed_commit: 356e844
 production_commit: 356e84488316a063b0f982fc2585a57b4fd8c8d4
 local_tests:
-  - "phase-4-runtime-agent-and-critical-regressions: passed"
-  - "phase-4-offline-evaluation: 7 cases, all six metrics at 1.0"
+  - "phase-5-runtime-agent-and-safety-tests: 235 passed"
+  - "phase-5-offline-evaluation: 7 cases, all nine metrics at 1.0"
+  - "context-resolution-regressions: 38 passed"
+  - "strategy-management-regressions: 358 passed"
+  - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
-  - "context-resolution-and-management-regressions: 176 passed"
-  - "full-suite attempt: 2237 passed, 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the failing test passed in isolation"
 server_verification:
-  status: complete
+  status: phase-5-pending
   deployed_commit: 356e84488316a063b0f982fc2585a57b4fd8c8d4
   service: active-http-200
   bounded_restarts: "clean; no post-restart service errors"
@@ -35,7 +36,7 @@ server_verification:
   phase_4_offline_gate: "7 reviewed cases; all six metrics at 1.0"
   phase_4_readonly_tools: "all nine bounded tools executed against incident 1; only projection keys and evidence counts were inspected"
   incident_agent_behavior: "read-only projections only; sidecar never started; no playbook or business mutation executed"
-  remaining: "Begin Phase 5 only on the next approved turn."
+  remaining: "Commit and push the reviewed Phase 5 implementation, prove a safe production window, deploy with the sidecar and shadow allowlist disabled, verify continuity, then canary exactly one read-only shadow playbook with no execution."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
@@ -163,25 +164,41 @@ When the user says `请执行自定义ai agent的下一步实施`:
 
 ### Phase 5 — Versioned recovery playbooks in shadow mode
 
-- Status: planned
-- Implementation started: no
+- Status: in_progress
+- Implementation started: yes
+- Local implementation: six versioned catalog playbooks, deterministic
+  shadow-only policy, exact dormant allowlist, durable nomination/refusal
+  audit, bounded Telegram/Codex reporting, and corpus selection gates
+- Action authority change: none; Phase 5 contains no executor
+- Review: no remaining Critical or Important findings
+- Local verification: 235 runtime-agent/safety tests, 38 context-resolution
+  regressions, and 358 management regressions passed; all nine offline metrics
+  scored 1.0 across seven reviewed cases
 
 ## Current Phase Exit Checklist
 
-Phase 4 is not complete until:
+Phase 5 is not complete until:
 
-- [x] the redacted corpus covers all seven required technical incident classes;
-- [x] normal contextual ambiguity remains excluded;
-- [x] offline classification, evidence-tool, safety, certainty, budget, and
-      contextual-targeting gates pass;
-- [x] local/exchange, worker-history, prior-attempt, and protection projections
-      are bounded and redacted;
-- [x] architecture and critical context-resolution/management regressions pass;
+- [x] all six playbooks declare versioned metadata, prerequisites, refusal
+      reasons, side-effect class, idempotency, limits, and verification;
+- [x] the prompt may nominate only closed catalog names;
+- [x] deterministic policy independently accepts or refuses every nomination;
+- [x] the durable ledger rejects execute mode, `would_execute: true`, and
+      `action_executed: true`;
+- [x] Telegram reports and Codex handoffs expose the shadow result and never
+      contradict an invalid execution record;
+- [x] the reviewed corpus has zero accepted unknown or unsafe actions and every
+      decision records `action_executed: false`;
+- [x] operational nominations require exact durable non-writing proof;
+- [x] shadow playbooks are exact-allowlisted and dormant by default;
+- [x] runtime-agent, architecture, notification, context-resolution, and
+      management regressions pass locally;
 - [x] changes receive review with no remaining Critical or Important findings;
-- [x] changes are committed and pushed;
-- [x] a safe production deployment window is proven;
-- [x] production deploys with the Agent sidecar disabled and inactive;
-- [x] service/listener/checkpoint/reconciliation continuity is verified;
-- [x] the offline corpus gate passes from the deployed checkout;
-- [x] reviewed production incidents are inspected through read-only tools only;
-- [x] no business row or action authority changes.
+- [ ] changes are committed and pushed;
+- [ ] a safe production deployment window is proven;
+- [ ] production deploys with the Agent sidecar and shadow allowlist disabled;
+- [ ] service/listener/checkpoint/reconciliation continuity is verified;
+- [ ] the deployed checkout passes the offline corpus and focused Phase 5 gates;
+- [ ] exactly one read-only shadow playbook is canaried;
+- [ ] the canary records only nominations and policy results, with no business
+      row mutation and no `action_executed: true`.

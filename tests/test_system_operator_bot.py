@@ -112,6 +112,87 @@ def test_runtime_incident_diagnosis_notification_labels_hypothesis_and_no_action
     assert 0 < len(rendered) <= operator_bot_module.RUNTIME_INCIDENT_MESSAGE_MAX_CHARS
 
 
+def test_runtime_incident_diagnosis_notification_labels_shadow_policy(tmp_path):
+    session_factory = create_session_factory(tmp_path / "runtime-shadow.db")
+    incident = _record_runtime_incident(session_factory)
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        row.status = "diagnosed"
+        row.playbook_name = "refresh_read_only_exchange_snapshot"
+        row.recovery_status = "shadow_accepted"
+        row.diagnosis_json = json.dumps(
+            {
+                "hypothesis": "Exchange evidence may be stale.",
+                "confidence": "medium",
+                "missing_evidence": ["fresh exchange state"],
+                "recommended_playbook": "refresh_read_only_exchange_snapshot",
+                "auto_handle_eligible": True,
+                "codex_handoff_required": False,
+                "remaining_risk": "State has not been refreshed.",
+                "attempted_queries": ["get_incident_summary"],
+                "shadow_playbook_policy": {
+                    "mode": "shadow",
+                    "policy_version": "runtime-shadow-policy-v1",
+                    "nominated_playbook": "refresh_read_only_exchange_snapshot",
+                    "playbook_version": 1,
+                    "accepted": True,
+                    "refusal_reasons": [],
+                    "verification_query": "compare_local_exchange",
+                    "would_execute": False,
+                    "action_executed": False,
+                },
+            }
+        )
+        row.evidence_refs_json = f'["incident:{incident.id}"]'
+        rendered = operator_bot_module.format_runtime_incident_diagnosis_notification(
+            row
+        )
+
+    assert "影子预案: refresh_read_only_exchange_snapshot" in rendered
+    assert "策略评估: 接受（仅影子）" in rendered
+    assert "自动操作: 未执行" in rendered
+
+
+def test_runtime_incident_notification_does_not_contradict_executed_shadow_record(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "runtime-invalid-shadow.db")
+    incident = _record_runtime_incident(session_factory)
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        row.status = "diagnosed"
+        row.diagnosis_json = json.dumps(
+            {
+                "hypothesis": "Invalid durable policy state.",
+                "confidence": "low",
+                "missing_evidence": [],
+                "recommended_playbook": "rerun_production_audit",
+                "auto_handle_eligible": False,
+                "codex_handoff_required": True,
+                "remaining_risk": "Requires manual verification.",
+                "attempted_queries": [],
+                "shadow_playbook_policy": {
+                    "mode": "shadow",
+                    "policy_version": "runtime-shadow-policy-v1",
+                    "nominated_playbook": "rerun_production_audit",
+                    "playbook_version": 1,
+                    "accepted": True,
+                    "refusal_reasons": [],
+                    "verification_query": "get_service_audit_state",
+                    "would_execute": False,
+                    "action_executed": True,
+                },
+            }
+        )
+        rendered = operator_bot_module.format_runtime_incident_diagnosis_notification(
+            row
+        )
+
+    assert "策略评估: 无效记录" in rendered
+    assert "自动操作: 记录异常，需人工核验" in rendered
+    assert "自动操作: 未执行" not in rendered
+
+
 def test_runtime_incident_delivery_uses_diagnosis_report_for_diagnosed_row(
     tmp_path,
     monkeypatch,

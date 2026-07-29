@@ -53,6 +53,15 @@ def _final(incident_id):
     }
 
 
+def _shadow_final(incident_id):
+    payload = _final(incident_id)
+    payload["final"]["recommended_playbook_name"] = (
+        "refresh_read_only_exchange_snapshot"
+    )
+    payload["final"]["auto_handle_eligible"] = True
+    return payload
+
+
 def _registry(call_count):
     return RuntimeAgentToolRegistry(
         providers={
@@ -184,13 +193,141 @@ def test_worker_runs_bounded_tool_loop_and_commits_structured_diagnosis(tmp_path
     with session_factory() as session:
         row = session.get(RuntimeIncident, incident.id)
         assert row.status == "diagnosed"
-        assert row.prompt_version == "runtime-agent-prompt-v2"
+        assert row.prompt_version == "runtime-agent-prompt-v3"
         assert "Provider retries may have been exhausted." in row.diagnosis_json
         assert row.evidence_refs_json == (
             f'["incident:{incident.id}","worker-job:42"]'
         )
         assert row.notification_status == "pending"
         assert row.notified_at is None
+
+
+def test_worker_records_shadow_policy_result_but_never_executes_playbook(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        row.incident_type = "management_partial_failed"
+        session.commit()
+    turns = iter(
+        (
+            {
+                "tool_call": {
+                    "id": "call-1",
+                    "name": "get_incident_summary",
+                    "arguments": {"incident_id": incident.id},
+                }
+            },
+            _shadow_final(incident.id),
+        )
+    )
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            shadow_playbooks=frozenset(
+                {"refresh_read_only_exchange_snapshot"}
+            ),
+        ),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: next(turns),
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    assert result.shadow_policy is not None
+    assert result.shadow_policy["accepted"] is True
+    assert result.shadow_policy["action_executed"] is False
+    assert result.handoff["attempted_playbooks"] == [
+        {
+            "name": "refresh_read_only_exchange_snapshot",
+            "policy_version": "runtime-shadow-policy-v1",
+            "accepted": True,
+            "refusal_reasons": [],
+            "action_executed": False,
+        }
+    ]
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        stored = __import__("json").loads(row.diagnosis_json)
+        assert row.playbook_name == "refresh_read_only_exchange_snapshot"
+        assert row.recovery_status == "shadow_accepted"
+        assert stored["shadow_playbook_policy"]["accepted"] is True
+        assert stored["shadow_playbook_policy"]["action_executed"] is False
+
+
+def test_worker_records_policy_refusal_for_unsafe_nomination(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    final = _final(incident.id)
+    final["final"]["recommended_playbook_name"] = "retry_business_instruction"
+    final["final"]["auto_handle_eligible"] = True
+    final["final"]["evidence_references"] = [f"incident:{incident.id}"]
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            shadow_playbooks=frozenset({"retry_business_instruction"}),
+        ),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: final,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    assert result.shadow_policy["accepted"] is False
+    assert result.shadow_policy["refusal_reasons"] == ["unknown_playbook"]
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        assert row.recovery_status == "shadow_refused"
+
+
+def test_worker_accepts_operational_shadow_only_with_durable_non_writing_proof(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="model_provider_job",
+        source_record_id="job-safe",
+        incident_type="provider_retry_exhausted",
+        severity="high",
+        fingerprint="e" * 64,
+        generation=1,
+        redacted_summary=(
+            '{"business_write_owned":false,'
+            '"error_type":"provider_timeout"}'
+        ),
+        occurred_at=NOW,
+        feature_policy_version="runtime-incident-phase-5-v1",
+        prompt_version="runtime-agent-prompt-v3",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    final = _final(incident.id)
+    final["final"]["recommended_playbook_name"] = (
+        "reschedule_non_writing_ai_job"
+    )
+    final["final"]["auto_handle_eligible"] = True
+    final["final"]["evidence_references"] = [f"incident:{incident.id}"]
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            shadow_playbooks=frozenset(
+                {"reschedule_non_writing_ai_job"}
+            ),
+        ),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: final,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    assert result.shadow_policy["accepted"] is True
+    assert result.shadow_policy["action_executed"] is False
 
 
 def test_worker_reserves_final_turn_after_three_evidence_tools(tmp_path):

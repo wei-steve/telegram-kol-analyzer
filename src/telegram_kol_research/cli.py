@@ -2443,6 +2443,7 @@ def runtime_incident_agent_once(
         max_prompt_bytes=runtime_config.agent_max_prompt_bytes,
         max_model_output_bytes=runtime_config.agent_max_tool_output_bytes,
         claim_lease_seconds=runtime_config.agent_claim_lease_seconds,
+        shadow_playbooks=runtime_config.agent_shadow_playbooks,
     )
     if runtime_config.agent_enabled:
         llm_config = load_llm_proxy_config()
@@ -2508,6 +2509,7 @@ def runtime_incident_agent_worker(
         max_prompt_bytes=runtime_config.agent_max_prompt_bytes,
         max_model_output_bytes=runtime_config.agent_max_tool_output_bytes,
         claim_lease_seconds=runtime_config.agent_claim_lease_seconds,
+        shadow_playbooks=runtime_config.agent_shadow_playbooks,
     )
     llm_config = load_llm_proxy_config()
 

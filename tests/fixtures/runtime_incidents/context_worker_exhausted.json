@@ -19,14 +19,17 @@
     "max_confidence": "medium",
     "max_tool_steps": 3,
     "max_estimated_tokens": 1200,
-    "allow_playbook": false
+    "allow_playbook": true,
+    "allowed_playbooks": ["reschedule_non_writing_ai_job"],
+    "shadow_playbook_name": "reschedule_non_writing_ai_job",
+    "shadow_policy_accepted": false
   },
   "reviewed_output": {
     "classification": "context_worker_exhausted",
     "selected_tools": ["get_incident_summary", "get_worker_state"],
     "confidence": "medium",
     "missing_evidence": ["provider recovery state"],
-    "recommended_playbook_name": null,
+    "recommended_playbook_name": "reschedule_non_writing_ai_job",
     "auto_handle_eligible": false,
     "estimated_tokens": 690
   }

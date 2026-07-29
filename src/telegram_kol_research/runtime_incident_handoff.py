@@ -54,6 +54,7 @@ def build_runtime_incident_handoff(
     incident: Mapping[str, Any],
     diagnosis: RuntimeAgentDiagnosis,
     attempted_queries: Sequence[str],
+    shadow_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if set(incident) != _ALLOWED_INCIDENT_FIELDS:
         raise RuntimeIncidentHandoffError("incident handoff fields are invalid")
@@ -68,6 +69,41 @@ def build_runtime_incident_handoff(
     }
     _validate_redacted(compact_incident)
     bounded_queries = [str(query)[:64] for query in tuple(attempted_queries)[:16]]
+    attempted_playbooks: list[dict[str, Any]] = []
+    if isinstance(shadow_policy, Mapping):
+        if (
+            shadow_policy.get("mode") != "shadow"
+            or shadow_policy.get("policy_version")
+            != "runtime-shadow-policy-v1"
+            or shadow_policy.get("would_execute") is not False
+            or shadow_policy.get("action_executed") is not False
+        ):
+            raise RuntimeIncidentHandoffError(
+                "shadow playbook audit violates Phase 5 boundary"
+            )
+        nominated = shadow_policy.get("nominated_playbook")
+        refusal_reasons = shadow_policy.get("refusal_reasons")
+        if isinstance(nominated, str) and nominated:
+            attempted_playbooks.append(
+                {
+                    "name": nominated[:128],
+                    "policy_version": str(
+                        shadow_policy.get("policy_version") or "unknown"
+                    )[:64],
+                    "accepted": shadow_policy.get("accepted") is True,
+                    "refusal_reasons": [
+                        str(reason)[:128]
+                        for reason in (
+                            refusal_reasons
+                            if isinstance(refusal_reasons, list)
+                            else []
+                        )[:8]
+                    ],
+                    "action_executed": (
+                        shadow_policy.get("action_executed") is True
+                    ),
+                }
+            )
     prompt = (
         f"请调查运行异常 incident_id={diagnosis.incident_id}。\n"
         "先读取 AGENTS.md 和该事件的 Codex 交接包。\n"
@@ -82,6 +118,7 @@ def build_runtime_incident_handoff(
         "incident": compact_incident,
         "evidence_references": list(diagnosis.evidence_references),
         "attempted_queries": bounded_queries,
+        "attempted_playbooks": attempted_playbooks,
         "agent_hypothesis": {
             "text": diagnosis.diagnosis_hypothesis,
             "confidence": diagnosis.confidence,
@@ -172,4 +209,9 @@ def load_runtime_incident_handoff(
         },
         diagnosis=diagnosis,
         attempted_queries=diagnosis.attempted_queries,
+        shadow_policy=(
+            stored.get("shadow_playbook_policy")
+            if isinstance(stored.get("shadow_playbook_policy"), dict)
+            else None
+        ),
     )

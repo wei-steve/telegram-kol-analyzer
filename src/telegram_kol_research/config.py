@@ -30,8 +30,9 @@ class RuntimeIncidentConfig:
     agent_max_prompt_bytes: int = 16_384
     agent_max_tool_output_bytes: int = 8192
     agent_claim_lease_seconds: float = 120.0
-    feature_policy_version: str = "runtime-incident-phase-3-v1"
-    prompt_version: str = "runtime-agent-prompt-v2"
+    agent_shadow_playbooks: frozenset[str] = frozenset()
+    feature_policy_version: str = "runtime-incident-phase-5-v1"
+    prompt_version: str = "runtime-agent-prompt-v3"
     tool_policy_version: str = "runtime-agent-tools-v2"
 
     def captures(self, incident_type: str) -> bool:
@@ -59,6 +60,13 @@ def load_runtime_incident_config(
         item.strip().lower()
         for item in env.get(
             "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES", ""
+        ).split(",")
+        if item.strip()
+    )
+    agent_shadow_playbooks = frozenset(
+        item.strip().lower()
+        for item in env.get(
+            "TELEGRAM_KOL_RUNTIME_AGENT_SHADOW_PLAYBOOKS", ""
         ).split(",")
         if item.strip()
     )
@@ -119,4 +127,5 @@ def load_runtime_incident_config(
         agent_claim_lease_seconds=max(
             5.0, min(agent_claim_lease_seconds, 3600.0)
         ),
+        agent_shadow_playbooks=agent_shadow_playbooks,
     )

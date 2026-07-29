@@ -19,15 +19,18 @@
     "max_confidence": "medium",
     "max_tool_steps": 3,
     "max_estimated_tokens": 1400,
-    "allow_playbook": false
+    "allow_playbook": true,
+    "allowed_playbooks": ["refresh_read_only_exchange_snapshot"],
+    "shadow_playbook_name": "refresh_read_only_exchange_snapshot",
+    "shadow_policy_accepted": true
   },
   "reviewed_output": {
     "classification": "management_partial_failed",
     "selected_tools": ["get_lifecycle_state", "compare_local_exchange"],
     "confidence": "medium",
     "missing_evidence": ["fresh exchange state"],
-    "recommended_playbook_name": null,
-    "auto_handle_eligible": false,
+    "recommended_playbook_name": "refresh_read_only_exchange_snapshot",
+    "auto_handle_eligible": true,
     "estimated_tokens": 820
   }
 }

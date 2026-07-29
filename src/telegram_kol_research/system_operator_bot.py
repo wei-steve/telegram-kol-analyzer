@@ -157,6 +157,32 @@ def format_runtime_incident_diagnosis_notification(incident) -> str:
     if not isinstance(diagnosis, dict):
         diagnosis = {}
     handoff_required = diagnosis.get("codex_handoff_required") is True
+    shadow_policy = diagnosis.get("shadow_playbook_policy")
+    if not isinstance(shadow_policy, dict):
+        shadow_policy = {}
+    shadow_policy_present = bool(shadow_policy)
+    shadow_policy_valid = (
+        shadow_policy.get("mode") == "shadow"
+        and shadow_policy.get("policy_version") == "runtime-shadow-policy-v1"
+        and shadow_policy.get("would_execute") is False
+        and shadow_policy.get("action_executed") is False
+        and isinstance(shadow_policy.get("accepted"), bool)
+    )
+    nominated_playbook = (
+        shadow_policy.get("nominated_playbook")
+        if shadow_policy_valid
+        else None
+    )
+    if shadow_policy_present and not shadow_policy_valid:
+        shadow_result = "无效记录"
+    elif nominated_playbook:
+        shadow_result = (
+            "接受（仅影子）"
+            if shadow_policy.get("accepted") is True
+            else "拒绝"
+        )
+    else:
+        shadow_result = "未提名"
     missing = diagnosis.get("missing_evidence")
     if isinstance(missing, list):
         missing_text = "; ".join(str(item) for item in missing[:4]) or "-"
@@ -177,7 +203,16 @@ def format_runtime_incident_diagnosis_notification(incident) -> str:
             f"{_safe_runtime_incident_value(diagnosis.get('remaining_risk'), limit=240)}"
         ),
         f"Codex交接: {'需要' if handoff_required else '不需要'}",
-        "自动操作: 未执行",
+        (
+            "影子预案: "
+            f"{_safe_runtime_incident_value(nominated_playbook, limit=128)}"
+        ),
+        f"策略评估: {shadow_result}",
+        (
+            "自动操作: 未执行"
+            if not shadow_policy_present or shadow_policy_valid
+            else "自动操作: 记录异常，需人工核验"
+        ),
         "边界: 未参与策略识别或上下文策略解析。",
     ]
     return "\n".join(lines)[:RUNTIME_INCIDENT_MESSAGE_MAX_CHARS]

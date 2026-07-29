@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 from sqlalchemy import inspect, text
@@ -346,3 +347,93 @@ def test_expired_claim_cannot_commit_a_transition(tmp_path):
         now=NOW + timedelta(minutes=5),
         diagnosis_json='{"hypothesis":"stale"}',
     )
+
+
+@pytest.mark.parametrize(
+    "shadow_policy",
+    [
+        {
+            "mode": "execute",
+            "policy_version": "runtime-shadow-policy-v1",
+            "nominated_playbook": "rerun_production_audit",
+            "playbook_version": 1,
+            "accepted": True,
+            "refusal_reasons": [],
+            "verification_query": "get_service_audit_state",
+            "would_execute": False,
+            "action_executed": False,
+        },
+        {
+            "mode": "shadow",
+            "policy_version": "runtime-shadow-policy-v1",
+            "nominated_playbook": "rerun_production_audit",
+            "playbook_version": 1,
+            "accepted": True,
+            "refusal_reasons": [],
+            "verification_query": "get_service_audit_state",
+            "would_execute": True,
+            "action_executed": False,
+        },
+        {
+            "mode": "shadow",
+            "policy_version": "runtime-shadow-policy-v1",
+            "nominated_playbook": "rerun_production_audit",
+            "playbook_version": 1,
+            "accepted": True,
+            "refusal_reasons": [],
+            "verification_query": "get_service_audit_state",
+            "would_execute": False,
+            "action_executed": True,
+        },
+        {
+            "mode": "shadow",
+            "policy_version": "runtime-shadow-policy-v1",
+            "nominated_playbook": "retry_business_instruction",
+            "playbook_version": 1,
+            "accepted": True,
+            "refusal_reasons": [],
+            "verification_query": "get_worker_state",
+            "would_execute": False,
+            "action_executed": False,
+        },
+    ],
+)
+def test_phase5_ledger_rejects_non_shadow_or_executed_policy(
+    tmp_path, shadow_policy
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    incident = _record(session_factory)
+    claim = claim_runtime_incident(
+        session_factory,
+        incident_id=incident.id,
+        claim_token="worker-a",
+        claimed_at=NOW,
+        claim_expires_at=NOW + timedelta(minutes=5),
+    )
+    assert claim is not None
+
+    diagnosis = json.dumps(
+        {
+            "hypothesis": "audit required",
+            "confidence": "medium",
+            "missing_evidence": [],
+            "recommended_playbook": "rerun_production_audit",
+            "auto_handle_eligible": True,
+            "codex_handoff_required": False,
+            "remaining_risk": "audit not rerun",
+            "attempted_queries": [],
+            "shadow_playbook_policy": shadow_policy,
+        },
+        sort_keys=True,
+    )
+
+    with pytest.raises(RuntimeIncidentBoundsError, match="shadow policy"):
+        transition_runtime_incident(
+            session_factory,
+            incident_id=incident.id,
+            from_status="claimed",
+            to_status="diagnosed",
+            claim_token="worker-a",
+            now=NOW,
+            diagnosis_json=diagnosis,
+        )
