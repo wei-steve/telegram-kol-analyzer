@@ -2373,6 +2373,7 @@ function initTradingSymbolSelector(form) {
   }
   const allowedInput = selector.querySelector('[data-allowed-symbols-input]');
   const riskInput = selector.querySelector('[data-symbol-risk-input]');
+  const thresholdsInput = selector.querySelector('[data-symbol-entry-thresholds-input]');
   const searchInput = selector.querySelector('[data-symbol-search]');
   const summary = selector.querySelector('[data-symbol-selector-summary]');
   const selectedList = selector.querySelector('[data-selected-symbol-list]');
@@ -2382,7 +2383,19 @@ function initTradingSymbolSelector(form) {
     symbols: [],
     selected: new Set(parseSymbolList(allowedInput?.value || '')),
     riskBySymbol: parseSymbolRiskMap(riskInput?.value || '{}'),
+    thresholdsBySymbol: parseSymbolEntryThresholdMap(thresholdsInput?.value || '{}'),
     query: '',
+  };
+
+  const ensureSymbolEntryThresholds = (symbol) => {
+    if (!Object.prototype.hasOwnProperty.call(state.thresholdsBySymbol, symbol)) {
+      state.thresholdsBySymbol[symbol] = {
+        market_leg_threshold: '0',
+        first_limit_offset: '0',
+        second_limit_offset: '0',
+      };
+    }
+    return state.thresholdsBySymbol[symbol];
   };
 
   const syncInputs = () => {
@@ -2391,14 +2404,17 @@ function initTradingSymbolSelector(form) {
       allowedInput.value = selectedSymbols.join(',');
     }
     const riskPayload = {};
-    selectedSymbols.forEach((symbol) => {
-      const value = Number(state.riskBySymbol[symbol]);
+    Object.entries(state.riskBySymbol).forEach(([symbol, rawValue]) => {
+      const value = Number(rawValue);
       if (Number.isFinite(value) && value > 0) {
         riskPayload[symbol] = value;
       }
     });
     if (riskInput) {
       riskInput.value = JSON.stringify(riskPayload);
+    }
+    if (thresholdsInput) {
+      thresholdsInput.value = JSON.stringify(state.thresholdsBySymbol);
     }
   };
 
@@ -2416,18 +2432,25 @@ function initTradingSymbolSelector(form) {
       return;
     }
     selectedSymbols.forEach((symbol) => {
-      const row = document.createElement('label');
-      row.className = 'symbol-risk-row';
-      const label = document.createElement('span');
-      label.textContent = `${symbol} 最大亏损 USDT`;
-      const input = document.createElement('input');
-      input.type = 'number';
-      input.min = '1';
-      input.step = '1';
-      input.placeholder = '默认';
-      input.value = state.riskBySymbol[symbol] || '';
-      input.addEventListener('input', () => {
-        const value = Number(input.value);
+      const row = document.createElement('section');
+      row.className = 'symbol-entry-settings-card';
+      const title = document.createElement('strong');
+      title.className = 'symbol-entry-settings-title';
+      title.textContent = symbol;
+      const grid = document.createElement('div');
+      grid.className = 'symbol-entry-settings-grid';
+
+      const riskLabel = document.createElement('label');
+      const riskText = document.createElement('span');
+      riskText.textContent = '最大亏损 USDT';
+      const riskControl = document.createElement('input');
+      riskControl.type = 'number';
+      riskControl.min = '1';
+      riskControl.step = '1';
+      riskControl.placeholder = '默认';
+      riskControl.value = state.riskBySymbol[symbol] || '';
+      riskControl.addEventListener('input', () => {
+        const value = Number(riskControl.value);
         if (Number.isFinite(value) && value > 0) {
           state.riskBySymbol[symbol] = value;
         } else {
@@ -2435,9 +2458,35 @@ function initTradingSymbolSelector(form) {
         }
         syncInputs();
       });
-      row.append(label, input);
+      riskLabel.append(riskText, riskControl);
+      grid.appendChild(riskLabel);
+
+      const thresholds = ensureSymbolEntryThresholds(symbol);
+      [
+        ['market_leg_threshold', '第一腿市价阈值'],
+        ['first_limit_offset', '第一腿限价偏移'],
+        ['second_limit_offset', '第二腿限价偏移'],
+      ].forEach(([field, text]) => {
+        const label = document.createElement('label');
+        const labelText = document.createElement('span');
+        labelText.textContent = text;
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = '0';
+        input.step = 'any';
+        input.value = thresholds[field] || '0';
+        input.dataset.thresholdField = field;
+        input.addEventListener('input', () => {
+          thresholds[field] = String(input.value || '').trim() || '0';
+          syncInputs();
+        });
+        label.append(labelText, input);
+        grid.appendChild(label);
+      });
+      row.append(title, grid);
       riskList.appendChild(row);
     });
+    syncInputs();
   };
 
   const renderSelectedSymbols = () => {
@@ -2461,7 +2510,6 @@ function initTradingSymbolSelector(form) {
       chip.title = `移除 ${symbol}`;
       chip.addEventListener('click', () => {
         state.selected.delete(symbol);
-        delete state.riskBySymbol[symbol];
         syncInputs();
         renderSymbols();
         renderSelectedSymbols();
@@ -2489,9 +2537,9 @@ function initTradingSymbolSelector(form) {
       checkbox.addEventListener('change', () => {
         if (checkbox.checked) {
           state.selected.add(item.symbol);
+          ensureSymbolEntryThresholds(item.symbol);
         } else {
           state.selected.delete(item.symbol);
-          delete state.riskBySymbol[item.symbol];
         }
         syncInputs();
         renderSymbols();
@@ -2517,6 +2565,7 @@ function initTradingSymbolSelector(form) {
     });
   }
 
+  state.selected.forEach((symbol) => ensureSymbolEntryThresholds(symbol));
   syncInputs();
   renderSelectedSymbols();
   renderRiskRows();
@@ -2528,18 +2577,6 @@ function initTradingSymbolSelector(form) {
         symbol: String(item.symbol || '').toUpperCase(),
         instrument_id: String(item.instrument_id || '').toUpperCase(),
       })).filter((item) => item.symbol);
-      symbols.forEach((item) => {
-        const symbol = String(item.symbol || '').toUpperCase();
-        if (item.selected) {
-          state.selected.add(symbol);
-        }
-        if (item.max_loss_usdt !== null && item.max_loss_usdt !== undefined) {
-          const value = Number(item.max_loss_usdt);
-          if (Number.isFinite(value) && value > 0) {
-            state.riskBySymbol[symbol] = value;
-          }
-        }
-      });
       syncInputs();
       renderSymbols();
       renderSelectedSymbols();
@@ -2579,6 +2616,63 @@ function parseSymbolRiskMap(value) {
   }
 }
 
+function isNonnegativeDecimalText(value) {
+  if (typeof value === 'boolean' || value === null || typeof value === 'object') {
+    return false;
+  }
+  const text = String(value).trim();
+  return /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(text);
+}
+
+function normalizeEntryThresholdValue(value, fieldName) {
+  const text = String(value ?? '').trim();
+  if (!text) {
+    return '0';
+  }
+  if (!isNonnegativeDecimalText(value)) {
+    throw new Error(`${fieldName} 必须是非负小数`);
+  }
+  return text;
+}
+
+function parseSymbolEntryThresholdMap(value) {
+  let parsed;
+  try {
+    parsed = JSON.parse(value || '{}');
+  } catch {
+    throw new Error('币种固定阈值配置格式无效');
+  }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+    throw new Error('币种固定阈值配置必须是对象');
+  }
+  return Object.fromEntries(
+    Object.entries(parsed).map(([rawSymbol, rawThresholds]) => {
+      const symbol = String(rawSymbol || '').trim().toUpperCase();
+      if (!symbol || !rawThresholds || Array.isArray(rawThresholds)
+          || typeof rawThresholds !== 'object') {
+        throw new Error('币种固定阈值配置格式无效');
+      }
+      return [
+        symbol,
+        {
+          market_leg_threshold: normalizeEntryThresholdValue(
+            rawThresholds.market_leg_threshold,
+            `${symbol}.market_leg_threshold`,
+          ),
+          first_limit_offset: normalizeEntryThresholdValue(
+            rawThresholds.first_limit_offset,
+            `${symbol}.first_limit_offset`,
+          ),
+          second_limit_offset: normalizeEntryThresholdValue(
+            rawThresholds.second_limit_offset,
+            `${symbol}.second_limit_offset`,
+          ),
+        },
+      ];
+    }),
+  );
+}
+
 function bindTradingSettingsForm() {
   const form = document.querySelector('[data-trading-settings-form]');
   if (!form) {
@@ -2588,6 +2682,19 @@ function bindTradingSettingsForm() {
   const status = form.querySelector('[data-trading-settings-save-status]');
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
+    const formData = new FormData(form);
+    let symbolEntryThresholds;
+    try {
+      symbolEntryThresholds = parseSymbolEntryThresholdMap(
+        formData.get('symbol_entry_thresholds') || '{}',
+      );
+    } catch (error) {
+      if (status) {
+        status.textContent = error.message || '币种固定阈值配置无效';
+        status.classList.add('is-error');
+      }
+      return;
+    }
     const submitButton = form.querySelector('button[type="submit"]');
     if (submitButton) {
       submitButton.disabled = true;
@@ -2596,7 +2703,6 @@ function bindTradingSettingsForm() {
       status.textContent = '正在保存...';
       status.classList.remove('is-error');
     }
-    const formData = new FormData(form);
     const numericValue = (name, fallback) => {
       const parsed = Number(formData.get(name));
       return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -2617,6 +2723,7 @@ function bindTradingSettingsForm() {
       min_ai_confidence: Number(formData.get('min_ai_confidence') || 0.75),
       allowed_symbols: String(formData.get('allowed_symbols') || 'BTC,ETH'),
       symbol_max_loss_usdt: parseSymbolRiskMap(formData.get('symbol_max_loss_usdt') || '{}'),
+      symbol_entry_thresholds: symbolEntryThresholds,
       entry_range_order_style: String(formData.get('entry_range_order_style') || 'conservative'),
       take_profit_allocations: String(formData.get('take_profit_allocations') || '50,30,20'),
       move_stop_to_breakeven_after_tp1: Boolean(form.querySelector('[name="move_stop_to_breakeven_after_tp1"]')?.checked),

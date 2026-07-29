@@ -25,10 +25,37 @@ from telegram_kol_research.recovery_decisions import apply_recovery_review_decis
 from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
+from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import _summarize_verified_exchange_protection_rows
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.web_queries import list_exited_strategies
 from telegram_kol_research.web_queries import list_verified_deepcoin_history_positions
+
+
+def test_trading_settings_page_keeps_legacy_range_controls_as_hidden_rollback_state(
+    tmp_path,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    save_trading_settings(
+        app.state.session_factory,
+        {
+            "max_market_entry_deviation_pct": 0.27,
+            "entry_range_order_style": "conservative",
+        },
+    )
+
+    html = TestClient(app).get("/more-panel").text
+
+    assert (
+        'type="hidden" name="max_market_entry_deviation_pct" value="0.27"'
+        in html
+    )
+    assert (
+        'type="hidden" name="entry_range_order_style" value="conservative"'
+        in html
+    )
+    assert "现价入场最大偏离 %" not in html
+    assert "区间入场方式" not in html
 
 
 def test_history_position_time_order_prefers_closed_time_and_uses_stable_id(tmp_path):
@@ -1323,7 +1350,13 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "data-selected-symbol-list" in response.text
     assert "data-selected-symbol-risk-list" in response.text
     assert 'name="symbol_max_loss_usdt"' in response.text
-    assert "单点附近市价容忍 %" in response.text
+    assert 'name="symbol_entry_thresholds"' in response.text
+    assert "data-symbol-entry-thresholds-input" in response.text
+    assert 'type="hidden" name="max_market_entry_deviation_pct"' in response.text
+    assert 'type="hidden" name="entry_range_order_style"' in response.text
+    assert "现价入场最大偏离 %" not in response.text
+    assert "区间入场方式" not in response.text
+    assert "单点“附近”市价容忍 %" in response.text
     assert "20.0" in response.text
     assert "DeepSeek V4 Flash" in response.text
     assert "MiMo V2.5" in response.text

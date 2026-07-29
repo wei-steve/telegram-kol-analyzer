@@ -16,6 +16,82 @@ def test_static_assets_are_served(tmp_path):
     assert response.status_code == 200
 
 
+def test_trading_symbol_assets_preserve_decimal_threshold_state(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    js = client.get("/static/app.js").text
+    css = client.get("/static/app.css").text
+    selector_start = js.index("function initTradingSymbolSelector")
+    selector_end = js.index("\nfunction parseSymbolList", selector_start)
+    selector_block = js[selector_start:selector_end]
+    fetch_start = selector_block.index("fetch('/api/trading-settings/symbols')")
+    fetch_block = selector_block[fetch_start:]
+
+    assert "thresholdsBySymbol" in selector_block
+    assert "data-symbol-entry-thresholds-input" in selector_block
+    assert "ensureSymbolEntryThresholds" in selector_block
+    assert "market_leg_threshold" in selector_block
+    assert "first_limit_offset" in selector_block
+    assert "second_limit_offset" in selector_block
+    assert "第一腿市价阈值" in selector_block
+    assert "第一腿限价偏移" in selector_block
+    assert "第二腿限价偏移" in selector_block
+    assert "input.min = '0';" in selector_block
+    assert "input.step = 'any';" in selector_block
+    assert "delete state.thresholdsBySymbol" not in selector_block
+    assert selector_block.count("delete state.riskBySymbol") == 1
+    assert "Object.entries(state.riskBySymbol).forEach" in selector_block
+    assert "item.entry_thresholds" not in fetch_block
+    assert "if (item.selected)" not in fetch_block
+    assert "item.max_loss_usdt" not in fetch_block
+    assert ".value = JSON.stringify(state.thresholdsBySymbol)" in selector_block
+    assert "symbolEntryThresholds = parseSymbolEntryThresholdMap" in js
+    assert "symbol_entry_thresholds: symbolEntryThresholds" in js
+    assert "max_market_entry_deviation_pct: numericValue" in js
+    assert "entry_range_order_style: String" in js
+    assert ".symbol-entry-settings-grid" in css
+
+
+def test_symbol_threshold_parser_preserves_small_decimal_strings(tmp_path):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required for the threshold parser behavior test")
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    parser_start = js.index("function isNonnegativeDecimalText")
+    parser_end = js.index("\nfunction bindTradingSettingsForm", parser_start)
+    parser_source = js[parser_start:parser_end]
+    harness = textwrap.dedent(
+        f"""
+        {parser_source}
+        const parsed = parseSymbolEntryThresholdMap(JSON.stringify({{
+          pepe: {{
+            market_leg_threshold: '0.000003',
+            first_limit_offset: '0.000001',
+            second_limit_offset: '',
+          }},
+        }}));
+        if (parsed.PEPE.market_leg_threshold !== '0.000003') process.exit(1);
+        if (parsed.PEPE.first_limit_offset !== '0.000001') process.exit(2);
+        if (parsed.PEPE.second_limit_offset !== '0') process.exit(3);
+        try {{
+          parseSymbolEntryThresholdMap(JSON.stringify({{
+            BTC: {{
+              market_leg_threshold: '-1',
+              first_limit_offset: '0',
+              second_limit_offset: '0',
+            }},
+          }}));
+          process.exit(4);
+        }} catch (error) {{
+          if (!String(error.message).includes('market_leg_threshold')) process.exit(5);
+        }}
+        """
+    )
+
+    subprocess.run(["node", "-e", harness], check=True, capture_output=True, text=True)
+
+
 def test_deepcoin_history_assets_are_scoped_to_the_history_panel(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

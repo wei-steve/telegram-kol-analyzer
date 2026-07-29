@@ -2743,17 +2743,37 @@ body {
 
 .selected-symbol-risk-list {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  grid-template-columns: 1fr;
   gap: 8px;
 }
 
-.symbol-risk-row {
-  grid-template-columns: 1fr 92px;
-  align-items: center;
-  padding: 8px;
+.symbol-entry-settings-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
   border: 1px solid rgba(148, 163, 184, 0.16);
   border-radius: 6px;
   background: rgba(15, 23, 42, 0.5);
+}
+
+.symbol-entry-settings-title {
+  color: #bae6fd;
+  font-size: 0.88rem;
+}
+
+.symbol-entry-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(130px, 1fr));
+  gap: 8px;
+}
+
+.symbol-entry-settings-grid label {
+  min-width: 0;
+}
+
+.symbol-entry-settings-grid input {
+  width: 100%;
+  min-width: 0;
 }
 
 .symbol-risk-empty {
@@ -2769,6 +2789,10 @@ body {
 
   .trading-settings-grid {
     grid-template-columns: 1fr;
+  }
+
+  .symbol-entry-settings-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
