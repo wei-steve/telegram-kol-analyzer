@@ -2477,7 +2477,7 @@ def _build_runtime_agent_action_handlers(
 
 
 def _read_runtime_agent_exchange_snapshot() -> dict[str, Any]:
-    with httpx.Client(timeout=5.0) as client:
+    with httpx.Client(timeout=20.0) as client:
         response = client.get(
             "http://127.0.0.1:8000/api/runtime-agent/"
             "read-only-exchange-snapshot"

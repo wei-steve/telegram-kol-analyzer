@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 from telegram_kol_research.cli import (
     _build_runtime_agent_action_handlers,
     _build_runtime_agent_cli_tools,
+    _read_runtime_agent_exchange_snapshot,
     app,
 )
 from telegram_kol_research.runtime_agent_tools import (
@@ -394,6 +395,47 @@ def test_phase6_wires_refresh_handler_to_independent_live_verification(
         "local_vs_durable_last_observed"
     )
     assert len(calls) == 2
+
+
+def test_runtime_agent_exchange_snapshot_reader_allows_bounded_provider_latency(
+    monkeypatch,
+):
+    observed = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "snapshot_kind": "bounded_read_only_exchange",
+                "complete": True,
+                "position_count": 0,
+                "open_order_count": 0,
+                "fingerprint": "a" * 64,
+            }
+
+    class Client:
+        def __init__(self, *, timeout):
+            observed["timeout"] = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get(self, url):
+            observed["url"] = url
+            return Response()
+
+    monkeypatch.setattr("telegram_kol_research.cli.httpx.Client", Client)
+
+    result = _read_runtime_agent_exchange_snapshot()
+
+    assert observed["timeout"] == 20.0
+    assert observed["url"].startswith("http://127.0.0.1:8000/")
+    assert result["complete"] is True
 
 
 def test_phase4_protection_projection_is_bounded_and_omits_order_ids(tmp_path):
