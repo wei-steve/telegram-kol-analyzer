@@ -7,6 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -17,6 +18,15 @@ class LLMProxyConfig:
     api_key: str
     model: str
     timeout_seconds: float
+
+
+class RuntimeAgentLLMConfigError(ValueError):
+    """Dedicated Runtime Agent provider configuration is incomplete."""
+
+
+_RUNTIME_AGENT_LLM_CONFIG_ERROR = (
+    "dedicated Runtime Agent provider configuration is invalid"
+)
 
 
 _FINAL_DIAGNOSIS_TOOL_NAME = "submit_runtime_diagnosis"
@@ -79,6 +89,53 @@ def load_llm_proxy_config(
         api_key=env.get("TELEGRAM_KOL_LLM_API_KEY", ""),
         model=env.get("TELEGRAM_KOL_LLM_MODEL", "gpt-4.1-mini"),
         timeout_seconds=float(env.get("TELEGRAM_KOL_LLM_TIMEOUT_SECONDS", "60")),
+    )
+
+
+def load_runtime_agent_llm_config(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | os.PathLike[str]] | None = None,
+) -> LLMProxyConfig:
+    """Load only the dedicated, fail-closed Runtime Agent provider."""
+
+    paths = (
+        [".env", "config/llm.env", "config/runtime_incident_agent.env"]
+        if env_file_paths is None
+        else env_file_paths
+    )
+    env = dict(_load_env_file_values(paths))
+    env.update(os.environ if environ is None else environ)
+    base_url = env.get(
+        "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL", ""
+    ).strip()
+    api_key = env.get(
+        "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY", ""
+    ).strip()
+    model = env.get("TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL", "").strip()
+    try:
+        timeout_seconds = float(
+            env.get(
+                "TELEGRAM_KOL_RUNTIME_AGENT_LLM_TIMEOUT_SECONDS", "30"
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeAgentLLMConfigError(
+            _RUNTIME_AGENT_LLM_CONFIG_ERROR
+        ) from exc
+    parsed_url = urlsplit(base_url)
+    if (
+        parsed_url.scheme != "https"
+        or not parsed_url.netloc
+        or not api_key
+        or not model
+        or timeout_seconds != timeout_seconds
+    ):
+        raise RuntimeAgentLLMConfigError(_RUNTIME_AGENT_LLM_CONFIG_ERROR)
+    return LLMProxyConfig(
+        base_url=base_url.rstrip("/"),
+        api_key=api_key,
+        model=model,
+        timeout_seconds=max(5.0, min(timeout_seconds, 120.0)),
     )
 
 

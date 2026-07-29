@@ -3,8 +3,10 @@ import pytest
 
 from telegram_kol_research.llm_chat import (
     LLMProxyConfig,
+    RuntimeAgentLLMConfigError,
     build_proxy_chat_payload,
     load_llm_proxy_config,
+    load_runtime_agent_llm_config,
     request_grounded_chat_answer,
     request_structured_chat_turn,
 )
@@ -28,6 +30,49 @@ def test_build_proxy_chat_payload_matches_openai_compatible_shape():
         payload["messages"][1]["content"] == "Group prompt:\nPrioritize recent changes"
     )
     assert payload["messages"][-1]["content"] == "Summarize this group"
+
+
+def test_runtime_agent_llm_config_is_isolated():
+    config = load_runtime_agent_llm_config(
+        environ={
+            "TELEGRAM_KOL_LLM_BASE_URL": "https://shared.invalid/v1",
+            "TELEGRAM_KOL_LLM_API_KEY": "shared-key",
+            "TELEGRAM_KOL_LLM_MODEL": "shared-model",
+            "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL": (
+                "https://api.xiaomimimo.com/v1"
+            ),
+            "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY": "agent-key",
+            "TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL": "mimo-v2.5",
+            "TELEGRAM_KOL_RUNTIME_AGENT_LLM_TIMEOUT_SECONDS": "999",
+        },
+        env_file_paths=[],
+    )
+
+    assert config == LLMProxyConfig(
+        base_url="https://api.xiaomimimo.com/v1",
+        api_key="agent-key",
+        model="mimo-v2.5",
+        timeout_seconds=120.0,
+    )
+
+
+def test_runtime_agent_llm_config_never_falls_back_to_shared_key():
+    shared_key = "shared-key-must-not-leak"
+
+    with pytest.raises(RuntimeAgentLLMConfigError) as exc_info:
+        load_runtime_agent_llm_config(
+            environ={
+                "TELEGRAM_KOL_LLM_BASE_URL": "https://shared.invalid/v1",
+                "TELEGRAM_KOL_LLM_API_KEY": shared_key,
+                "TELEGRAM_KOL_LLM_MODEL": "shared-model",
+            },
+            env_file_paths=[],
+        )
+
+    assert str(exc_info.value) == (
+        "dedicated Runtime Agent provider configuration is invalid"
+    )
+    assert shared_key not in str(exc_info.value)
 
 
 def test_request_grounded_chat_answer_reads_openai_compatible_response():
