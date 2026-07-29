@@ -11,8 +11,12 @@ phase_name: low-risk-automatic-recovery
 phase_status: in_progress
 last_completed_phase: 5
 last_completed_commit: 8ec6542
-production_commit: 0b2aecc16a2c3cb0e238acc5379877922ac7481c
+production_commit: 25e833665aac8e660c249c3399d14e884c7bf92d
 local_tests:
+  - "phase-6-production-audit-runtime-web-focused: 333 passed"
+  - "phase-6-production-audit-context-management-regressions: 396 passed"
+  - "phase-6-production-audit-listener-monitor-mutation-regressions: 140 passed, 2 known deprecation warnings"
+  - "phase-6-production-audit-offline-evaluation: 7 cases, all nine metrics at 1.0"
   - "phase-6-read-only-exchange-refresh-timeout-fix-runtime-web-focused: 262 passed"
   - "phase-6-read-only-exchange-refresh-runtime-web-focused: 261 passed"
   - "phase-6-read-only-exchange-refresh-context-management-regressions: 396 passed"
@@ -50,8 +54,8 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-6-read-only-exchange-refresh-verified
-  deployed_commit: 0b2aecc16a2c3cb0e238acc5379877922ac7481c
+  status: phase-6-production-audit-verified
+  deployed_commit: 25e833665aac8e660c249c3399d14e884c7bf92d
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
   listener: monitoring-31-enabled-groups-and-continuing
@@ -110,14 +114,18 @@ server_verification:
   phase_6_exchange_refresh_deployment: "commits 06a188a and 0b2aecc deployed through two separately proven safe windows; service active HTTP 200, sidecar disabled/inactive, all Agent/shadow/action flags empty/off, and the loopback endpoint returned one complete bounded snapshot while refusing a proxy-forwarded request with HTTP 404"
   phase_6_exchange_refresh_canary: "the first isolated temporary-database attempt failed closed because the five-second internal HTTP timeout was shorter than one observed provider response; no production ledger or business row changed. Commit 0b2aecc raised the bounded timeout to 20 seconds, after which one fresh isolated canary executed exactly two coherent read-only account snapshots and reached verified/action_verified with incident and exchange-snapshot evidence only"
   phase_6_exchange_refresh_postdeploy: "262 deployed focused tests passed; the seven-case offline gate kept all nine metrics at 1.0; production runtime incident count remained 3; latest raw message 8353 completed recognition; latest management batch 80 remained succeeded; no evidence/context/management/position-mutation/recovery work was in flight. The no-notify monitor had one transient adapter_failure and returned to monitor_error null with only the known audit_abnormal baseline on the bounded retry"
-  remaining: "Keep all Agent/action flags empty/off. refresh_read_only_exchange_snapshot now has a deployed reviewed handler and positive isolated canary. Every remaining playbook still requires its own reviewed handler, verification proof, safe window, and canary; rerun_production_audit is the next read-only candidate."
+  phase_6_production_audit_deployment: "commit 25e8336 deployed after a fresh zero-in-flight safe-window check; service active HTTP 200, sidecar disabled/inactive, and every Agent/shadow/action flag and allowlist remained empty/off"
+  phase_6_production_audit_boundary: "the root main service alone runs the fixed read-only audit command with a 20-second timeout, 1 MiB combined-output ceiling, dedicated automatically removed scratch root, and process-wide single-flight lock. The loopback endpoint refused X-Forwarded-For with HTTP 404; simultaneous requests returned one HTTP 200 and one immediate HTTP 409; a later request returned HTTP 200; scratch residue stayed zero. The unprivileged telegram-kol-agent identity consumed the bounded endpoint without database ownership or credential expansion"
+  phase_6_production_audit_canary: "one isolated temporary-database management_partial_failed incident enabled exactly rerun_production_audit in-process; the deployed handler completed one production read-only audit and reached verified/action_verified with only incident:1 and audit-run:1 evidence. The production ledger remained at 3 incidents and 1 earlier recovery attempt; latest management batch 80 remained succeeded with unchanged updated_at 2026-07-29 06:39:13.358810"
+  phase_6_production_audit_postdeploy: "333 deployed focused tests passed; the seven-case offline gate kept all nine metrics at 1.0; latest raw message 8354 completed as non-strategy; evidence/context/management/position-mutation/recovery work in flight was zero. The no-notify monitor returned monitor_error null with only the known audit_abnormal baseline. Before deployment it returned two transient adapter_failure results, then recovered to the same known baseline on the third bounded attempt"
+  remaining: "Keep all Agent/action flags empty/off. Three reviewed handlers now have positive isolated canaries: build_read_only_reconciliation_plan, refresh_read_only_exchange_snapshot, and rerun_production_audit. Every remaining playbook still requires its own reviewed handler, exact non-writing proof, safe window, and canary; recover_stale_side_effect_free_claim is the next operational-reversible candidate."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
 known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
   - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
-  - "Phase 6 production wiring currently implements the read-only reconciliation-plan and exchange-snapshot-refresh handlers. Audit, claim recovery, AI-job reschedule, and Telegram-evidence playbooks fail closed as executor_not_configured until separately reviewed handlers exist."
+  - "Phase 6 production wiring currently implements the read-only reconciliation-plan, exchange-snapshot-refresh, and production-audit handlers. Claim recovery, AI-job reschedule, and Telegram-evidence playbooks fail closed as executor_not_configured until separately reviewed handlers exist."
   - "Historical MiMo v4/v6 attempts failed closed on text-form tool output and fabricated evidence. Prompt v7 now passed an isolated live closed-final validation with only actually gathered evidence, while production incident 2 remains preserved as escalated for audit history."
   - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
@@ -302,10 +310,12 @@ Phase 5 is not complete until:
   attempt-budget, and one-active-action gates; per-incident freeze; global
   circuit breaker; playbook-specific fail-closed verification; bounded
   Telegram/Codex action evidence; and dormant action flags
-- Production handler scope: only
-  `build_read_only_reconciliation_plan` is wired, and it records a bounded
-  read-only plan from durable last-observed state; all other catalog actions
-  refuse execution without an explicitly injected reviewed handler
+- Production handler scope: `build_read_only_reconciliation_plan`,
+  `refresh_read_only_exchange_snapshot`, and `rerun_production_audit` are
+  wired. They respectively record a bounded non-writing plan, refresh and
+  compare coherent read-only account state, and run a bounded read-only
+  production audit. All other catalog actions refuse execution without an
+  explicitly injected reviewed handler
 - Provider isolation implementation: dedicated
   `TELEGRAM_KOL_RUNTIME_AGENT_LLM_*` configuration with no fallback to shared
   credentials; direct MiMo `mimo-v2.5`; token accounting remains console-only
@@ -359,6 +369,14 @@ Phase 5 is not complete until:
   on the original five-second internal HTTP timeout; after a bounded
   twenty-second timeout fix, a fresh isolated canary reached
   `action_verified`. Production incident and business rows remained unchanged.
+- The third Phase 6 handler, `rerun_production_audit`, is deployed at
+  `25e8336` and reviewed with no Critical, Important, or Minor findings. The
+  root main service runs one fixed, bounded audit subprocess behind a
+  loopback-only, proxy-refusing, single-flight endpoint; the unprivileged
+  sidecar receives only the fixed proof projection. A temporary-database
+  one-shot canary reached `action_verified` with `incident` and `audit-run`
+  evidence only. Production incident, recovery-attempt, and management rows
+  were unchanged.
 
 ## Current Phase 6 Exit Checklist
 
@@ -382,6 +400,7 @@ Phase 5 is not complete until:
 - [x] service/listener/checkpoint/reconciliation continuity is verified;
 - [x] the reviewed production model provider is available;
 - [x] the live provider completes a closed final using only gathered evidence;
-- [x] both implemented production handlers pass isolated reversible canaries;
+- [x] all three implemented production handlers pass isolated reversible
+      canaries;
 - [ ] each remaining playbook receives its own handler, verification proof,
       safe window, and canary before enablement.
