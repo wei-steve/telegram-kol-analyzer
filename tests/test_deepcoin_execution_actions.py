@@ -976,6 +976,165 @@ def test_exact_bound_close_accepts_explicit_legacy_manual_bind(tmp_path):
     assert len(client.order_payloads) == 1
 
 
+def test_exact_bound_close_cancels_pending_entry_leg_before_market_close(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(
+        session_factory,
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = StrategyLifecycle(
+            chat_id=binding.chat_id,
+            message_id=binding.message_id,
+            symbol=binding.symbol,
+            side=binding.side,
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 30, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 30, 0, 1, tzinfo=UTC),
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=2,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id="entry-2",
+                client_order_id="client-2",
+                status="pending",
+                attribution_status="unassigned",
+            )
+        )
+        session.commit()
+
+    class Client(_FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.operations = []
+            self.trigger_pending.append(
+                {
+                    "ordId": "entry-2",
+                    "clOrdId": "client-2",
+                    "instId": "ETH-USDT-SWAP",
+                }
+            )
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.operations.append("list_trigger")
+            return list(self.trigger_pending)
+
+        def list_open_orders(self, *, inst_id=None):
+            self.operations.append("list_open")
+            return list(self.open_orders)
+
+        def cancel_trigger_order(self, cancel_payload):
+            self.operations.append("cancel_entry")
+            self.trigger_pending = [
+                order
+                for order in self.trigger_pending
+                if order.get("ordId") != cancel_payload.get("ordId")
+            ]
+            return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
+
+        def place_order(self, order_payload):
+            self.operations.append("close_position")
+            return super().place_order(order_payload)
+
+    client = Client()
+
+    result = close_bound_position_market(
+        session_factory,
+        pos_id="pos-1",
+        deepcoin_client=client,
+        executed_at=datetime(2026, 7, 30, 1, tzinfo=UTC),
+    )
+
+    assert result["submitted"] is True
+    assert client.operations.index("cancel_entry") < client.operations.index(
+        "close_position"
+    )
+    with session_factory() as session:
+        pending_leg = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.order_id == "entry-2")
+            .one()
+        )
+        assert pending_leg.status == "cancelled"
+        assert pending_leg.terminal_reason == "terminal_entry_cleanup_confirmed"
+
+
+def test_exact_bound_close_does_not_submit_when_pending_entry_cancel_is_unconfirmed(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(
+        session_factory,
+        order_id="entry-1,entry-2",
+        client_order_id="client-1,client-2",
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        session.add(
+            StrategyLifecycle(
+                chat_id=binding.chat_id,
+                message_id=binding.message_id,
+                symbol=binding.symbol,
+                side=binding.side,
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 30, tzinfo=UTC),
+                entered_at=datetime(2026, 7, 30, 0, 1, tzinfo=UTC),
+                execution_binding_id=binding.id,
+            )
+        )
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=2,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id="entry-2",
+                client_order_id="client-2",
+                status="pending",
+                attribution_status="unassigned",
+            )
+        )
+        session.commit()
+
+    class Client(_FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.trigger_pending.append(
+                {
+                    "ordId": "entry-2",
+                    "clOrdId": "client-2",
+                    "instId": "ETH-USDT-SWAP",
+                }
+            )
+
+        def cancel_trigger_order(self, cancel_payload):
+            return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
+
+    client = Client()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="terminal_entry_cleanup_blocked",
+    ):
+        close_bound_position_market(
+            session_factory,
+            pos_id="pos-1",
+            deepcoin_client=client,
+            executed_at=datetime(2026, 7, 30, 1, tzinfo=UTC),
+        )
+
+    assert client.order_payloads == []
+
+
 def test_reviewed_equivalent_assignments_authorize_close_and_tpsl_management(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = _reviewed_equivalent_binding(session_factory)

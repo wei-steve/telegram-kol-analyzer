@@ -634,6 +634,29 @@ def close_bound_position_market(
     if close_size <= 0:
         raise DeepcoinExecutionActionError("non_positive_close_size")
 
+    cleanup_lifecycle_id = _terminal_cleanup_lifecycle_id_for_binding(
+        session_factory,
+        binding.id,
+    )
+    cleanup_event_ids: tuple[int, ...] = ()
+    if cleanup_lifecycle_id is not None:
+        from telegram_kol_research.terminal_entry_cleanup import (
+            cleanup_terminal_entry_legs,
+        )
+
+        cleanup_result = cleanup_terminal_entry_legs(
+            session_factory,
+            lifecycle_id=cleanup_lifecycle_id,
+            deepcoin_client=deepcoin_client,
+            reason="manual_full_close",
+            cleaned_at=now,
+        )
+        cleanup_event_ids = cleanup_result.event_ids
+        if cleanup_result.status not in {"resolved", "already_absent"}:
+            raise DeepcoinExecutionActionError(
+                f"terminal_entry_cleanup_{cleanup_result.status}"
+            )
+
     payload = {
         "instId": inst_id,
         "tdMode": _deepcoin_margin_mode(binding.margin_mode),
@@ -733,6 +756,7 @@ def close_bound_position_market(
         "order_id": order_id,
         "close_size": close_size,
         "event_id": event_id,
+        "cleanup_event_ids": list(cleanup_event_ids),
         "executed_at": now.isoformat(),
     }
 
@@ -1508,7 +1532,17 @@ def _pending_entry_leg_order_keys(
             .filter(ExecutionOrderLeg.execution_binding_id == int(binding_id))
             .filter(ExecutionOrderLeg.purpose == "entry")
             .filter(ExecutionOrderLeg.pos_id.is_(None))
-            .filter(ExecutionOrderLeg.status.in_(["pending", "open", "submitted"]))
+            .filter(
+                ExecutionOrderLeg.status.in_(
+                    [
+                        "pending",
+                        "open",
+                        "submitted",
+                        "partially_filled",
+                        "partial",
+                    ]
+                )
+            )
             .all()
         )
     return {
@@ -1523,6 +1557,47 @@ def _pending_entry_leg_order_keys(
             if str(leg.client_order_id or "").strip()
         },
     }
+
+
+def _terminal_cleanup_lifecycle_id_for_binding(
+    session_factory: sessionmaker,
+    binding_id: int,
+) -> int | None:
+    with session_factory() as session:
+        pending_leg = (
+            session.query(ExecutionOrderLeg.id)
+            .filter(ExecutionOrderLeg.execution_binding_id == int(binding_id))
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .filter(ExecutionOrderLeg.pos_id.is_(None))
+            .filter(
+                ExecutionOrderLeg.status.in_(
+                    [
+                        "pending",
+                        "open",
+                        "submitted",
+                        "partially_filled",
+                        "partial",
+                    ]
+                )
+            )
+            .first()
+        )
+        if pending_leg is None:
+            return None
+        lifecycle_ids = [
+            int(row_id)
+            for (row_id,) in (
+                session.query(StrategyLifecycle.id)
+                .filter(StrategyLifecycle.execution_binding_id == int(binding_id))
+                .order_by(StrategyLifecycle.id.desc())
+                .all()
+            )
+        ]
+    if len(lifecycle_ids) != 1:
+        raise DeepcoinExecutionActionError(
+            "terminal_entry_cleanup_lifecycle_not_unique"
+        )
+    return lifecycle_ids[0]
 
 
 def _require_verified_binding_positions(
