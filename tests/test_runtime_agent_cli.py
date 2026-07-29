@@ -513,10 +513,19 @@ def test_phase6_production_audit_runner_uses_requested_database_path(
         return {
             "snapshot_status": "stable",
             "snapshot_validation": "ok",
+            "schema_status": "available",
             "output_complete": True,
+            "batches_truncated": False,
             "malformed_row_count": 0,
+            "malformed_field_count": 0,
+            "legacy_pending_management": {
+                "complete": True,
+                "truncated": False,
+                "scan_truncated": False,
+            },
             "counts": {
                 "batches_total": 0,
+                "blocked": 0,
                 "submit_unknown": 0,
                 "partial_failed": 0,
                 "recovery_required": 0,

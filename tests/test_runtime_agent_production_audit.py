@@ -12,10 +12,19 @@ def _audit(**overrides):
     value = {
         "snapshot_status": "stable",
         "snapshot_validation": "ok",
+        "schema_status": "available",
         "output_complete": True,
+        "batches_truncated": False,
         "malformed_row_count": 0,
+        "malformed_field_count": 0,
+        "legacy_pending_management": {
+            "complete": True,
+            "truncated": False,
+            "scan_truncated": False,
+        },
         "counts": {
             "batches_total": 80,
+            "blocked": 32,
             "submit_unknown": 0,
             "partial_failed": 1,
             "recovery_required": 5,
@@ -46,10 +55,15 @@ def test_rerun_captures_one_bounded_complete_audit_proof():
         "monitor_error": None,
         "snapshot_status": "stable",
         "snapshot_validation": "ok",
+        "schema_status": "available",
         "output_complete": True,
+        "batches_truncated": False,
         "malformed_row_count": 0,
+        "malformed_field_count": 0,
+        "legacy_complete": True,
         "counts": {
             "batches_total": 80,
+            "blocked": 32,
             "submit_unknown": 0,
             "partial_failed": 1,
             "recovery_required": 5,
@@ -64,6 +78,7 @@ def test_historical_abnormal_counts_do_not_make_a_complete_audit_incomplete():
         runner=lambda: _audit(
             counts={
                 "batches_total": 80,
+                "blocked": 32,
                 "submit_unknown": 0,
                 "partial_failed": 1,
                 "recovery_required": 5,
@@ -83,6 +98,7 @@ def test_historical_abnormal_counts_do_not_make_a_complete_audit_incomplete():
     assert verification["monitor_error"] is None
     assert set(verification["counts"]) == {
         "batches_total",
+        "blocked",
         "submit_unknown",
         "partial_failed",
         "recovery_required",
@@ -96,6 +112,17 @@ def test_historical_abnormal_counts_do_not_make_a_complete_audit_incomplete():
         ({"snapshot_validation": "not_run"}, "audit_incomplete"),
         ({"output_complete": False}, "audit_incomplete"),
         ({"malformed_row_count": 1}, "audit_incomplete"),
+        ({"malformed_field_count": 1}, "audit_incomplete"),
+        (
+            {
+                "legacy_pending_management": {
+                    "complete": False,
+                    "truncated": False,
+                    "scan_truncated": False,
+                }
+            },
+            "audit_incomplete",
+        ),
     ),
 )
 def test_incomplete_audit_is_captured_for_fail_closed_verification(
@@ -126,7 +153,10 @@ def test_incomplete_audit_is_captured_for_fail_closed_verification(
         _audit(counts=[]),
         _audit(counts={"batches_total": -1}),
         _audit(malformed_row_count=True),
+        _audit(malformed_field_count=True),
         _audit(output_complete="yes"),
+        _audit(batches_truncated="no"),
+        _audit(legacy_pending_management={}),
     ),
 )
 def test_malformed_or_unbounded_audit_result_is_rejected(result):
@@ -188,4 +218,3 @@ def test_ephemeral_audit_captures_are_bounded_to_32():
     assert refresh.has_capture(1) is False
     assert refresh.has_capture(2) is True
     assert refresh.has_capture(33) is True
-
