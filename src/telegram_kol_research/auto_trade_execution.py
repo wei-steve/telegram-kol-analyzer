@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from collections.abc import Callable
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func
@@ -56,6 +57,7 @@ from telegram_kol_research.recovery_scan import _resolve_signal_max_loss_usdt
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import apply_trading_settings_to_group_config
 from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.trading_settings import SymbolEntryThresholds
 from telegram_kol_research.strategy_management_planner import (
     plan_strategy_management_batch,
 )
@@ -413,6 +415,7 @@ def _auto_process_single_message_trade_signal(
             processed_at=now,
             extra={"symbol": symbol},
         )
+    entry_thresholds = settings.entry_thresholds_for_symbol(symbol)
     if candidate.confidence < settings.min_ai_confidence:
         return _record_entry_auto_trade_skip(
             session_factory,
@@ -561,7 +564,7 @@ def _auto_process_single_message_trade_signal(
         current_price=reference_price,
         entry_range=entry_range,
         side=side,
-        max_deviation_pct=settings.max_market_entry_deviation_pct,
+        max_distance=entry_thresholds.market_leg_threshold,
     ):
         auto_draft = _build_auto_hybrid_deepcoin_draft(
             signal=signal,
@@ -571,7 +574,7 @@ def _auto_process_single_message_trade_signal(
             stop_loss_text=candidate.stop_loss_text,
             take_profit_text=candidate.take_profit_text,
             take_profit_allocations=settings.take_profit_allocations,
-            max_market_entry_deviation_pct=settings.max_market_entry_deviation_pct,
+            entry_thresholds=entry_thresholds,
             contract_spec_provider=contract_spec_provider,
         )
         execution_plan = "range_hybrid_market_half_limit_half"
@@ -760,6 +763,9 @@ def _auto_process_management_signal(
                     "status": "blocked",
                     "reason": "revision_binding_missing",
                 }
+            revision_entry_thresholds = settings.entry_thresholds_for_symbol(
+                str(binding.symbol)
+            )
             reference_price = _safe_ticker_price(
                 deepcoin_client,
                 inst_id=_to_deepcoin_swap_instrument(str(binding.symbol)),
@@ -788,6 +794,7 @@ def _auto_process_management_signal(
                     risk_budget_usdt=(
                         max_loss_usdt * float(kwargs["remaining_fraction"])
                     ),
+                    entry_thresholds=revision_entry_thresholds,
                     contract_spec_provider=contract_spec_provider,
                 )
                 return submit_strategy_revision_replacement_live(
@@ -806,6 +813,7 @@ def _auto_process_management_signal(
                     stop_loss_text=candidate.stop_loss_text,
                     take_profit_text=candidate.take_profit_text,
                     risk_budget_usdt=max_loss_usdt,
+                    entry_thresholds=revision_entry_thresholds,
                     contract_spec_provider=contract_spec_provider,
                 )
             except Exception:
@@ -865,15 +873,16 @@ def market_price_is_near_entry_edge(
     current_price: float | None,
     entry_range: tuple[float, float],
     side: str,
-    max_deviation_pct: float,
+    max_distance: Decimal,
 ) -> bool:
-    if current_price is None:
+    if current_price is None or max_distance <= 0:
         return False
     low, high = sorted((float(entry_range[0]), float(entry_range[1])))
     anchor = high if side.lower() == "long" else low
-    if anchor <= 0:
-        return False
-    return abs(float(current_price) - anchor) / anchor * 100 <= float(max_deviation_pct)
+    return (
+        abs(Decimal(str(current_price)) - Decimal(str(anchor)))
+        <= max_distance
+    )
 
 
 def _build_auto_market_deepcoin_draft(
@@ -936,7 +945,7 @@ def _build_auto_hybrid_deepcoin_draft(
     stop_loss_text: str | None,
     take_profit_text: str | None,
     take_profit_allocations: list[float],
-    max_market_entry_deviation_pct: float,
+    entry_thresholds: SymbolEntryThresholds,
     contract_spec_provider: DeepcoinContractSpecProvider | None,
 ) -> dict[str, Any] | None:
     if reference_price is None:
@@ -968,9 +977,8 @@ def _build_auto_hybrid_deepcoin_draft(
             "stop_loss": stop_loss_text,
             "take_profit": take_profit_text,
             "take_profit_allocations": take_profit_allocations,
-            "entry_range_order_style": "hybrid",
             "current_price": reference_price,
-            "max_market_entry_deviation_pct": max_market_entry_deviation_pct,
+            **entry_thresholds.to_dict(),
             "risk_budget_usdt": signal.max_loss_usdt,
             "strategy_instance_id": strategy_instance_id,
             "source": {
@@ -990,6 +998,7 @@ def _build_revision_deepcoin_draft(
     stop_loss_text: str | None,
     take_profit_text: str | None,
     risk_budget_usdt: float,
+    entry_thresholds: SymbolEntryThresholds,
     contract_spec_provider: DeepcoinContractSpecProvider | None,
 ) -> dict[str, Any]:
     instrument_id = _to_deepcoin_swap_instrument(str(binding.symbol))
@@ -1012,6 +1021,7 @@ def _build_revision_deepcoin_draft(
             "entry_range": f"{entry_range[0]}-{entry_range[1]}",
             "stop_loss": stop_loss_text,
             "take_profit": take_profit_text,
+            **entry_thresholds.to_dict(),
             "risk_budget_usdt": float(risk_budget_usdt),
             "strategy_instance_id": str(binding.strategy_instance_id),
             "source": {

@@ -785,7 +785,13 @@ def test_group_position_limit_isolated_by_chat_below_boundary_reaches_submission
             "auto_trade_enabled": True,
             "max_concurrent_positions": 4,
             "allowed_symbols": ["BTC", "ETH"],
-            "max_market_entry_deviation_pct": 0.01,
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "0",
+                    "first_limit_offset": "0",
+                    "second_limit_offset": "0",
+                }
+            },
         },
     )
     _seed_verified_positions(session_factory, chat_id=100, count=3)
@@ -1169,7 +1175,13 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
             "auto_trade_enabled": True,
             "default_max_loss_usdt": 20,
             "allowed_symbols": ["BTC", "ETH"],
-            "max_market_entry_deviation_pct": 0.01,
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "50",
+                    "first_limit_offset": "90",
+                    "second_limit_offset": "80",
+                }
+            },
         },
     )
     fake_client = _FakeDeepcoinClient()
@@ -1188,7 +1200,10 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     assert fake_client.orders == []
     assert len(fake_client.trigger_orders) == 2
     assert fake_client.trigger_orders[0]["orderType"] == "limit"
-    assert fake_client.trigger_orders[0]["triggerPrice"] == "68206.8"
+    assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
+        "68290.0",
+        "68080.0",
+    ]
     assert all(not any(key.startswith("tp") for key in order) for order in fake_client.trigger_orders)
     assert fake_client.trigger_orders[0]["slTriggerPx"] == "67500.0"
     assert fake_client.protections == []
@@ -1209,7 +1224,13 @@ def test_trigger_limit_entry_persists_tpsl_intent_before_parent_submission(tmp_p
             "auto_trade_enabled": True,
             "default_max_loss_usdt": 20,
             "allowed_symbols": ["BTC"],
-            "max_market_entry_deviation_pct": 0.01,
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "0",
+                    "first_limit_offset": "0",
+                    "second_limit_offset": "0",
+                }
+            },
         },
     )
 
@@ -1281,7 +1302,13 @@ def test_trigger_limit_entry_defers_when_tpsl_snapshot_is_malformed(tmp_path):
             "auto_trade_enabled": True,
             "default_max_loss_usdt": 20,
             "allowed_symbols": ["BTC"],
-            "max_market_entry_deviation_pct": 0.01,
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "0",
+                    "first_limit_offset": "0",
+                    "second_limit_offset": "0",
+                }
+            },
         },
     )
 
@@ -1427,7 +1454,7 @@ def test_sl_only_trigger_entry_snapshots_and_persists_protection_intent(tmp_path
     )
 
 
-def test_auto_process_range_entry_uses_half_market_and_adjusted_opposite_endpoint_when_near_edge(tmp_path):
+def test_auto_process_range_entry_uses_fixed_threshold_and_second_offset_when_near_edge(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_message_id = _persist_candidate(
         session_factory,
@@ -1443,7 +1470,13 @@ def test_auto_process_range_entry_uses_half_market_and_adjusted_opposite_endpoin
             "auto_trade_enabled": True,
             "default_max_loss_usdt": 20,
             "allowed_symbols": ["BTC", "ETH"],
-            "max_market_entry_deviation_pct": 0.15,
+            "symbol_entry_thresholds": {
+                "ETH": {
+                    "market_leg_threshold": "4",
+                    "first_limit_offset": "2",
+                    "second_limit_offset": "2",
+                }
+            },
         },
     )
     fake_client = _FakeDeepcoinClient()
@@ -1463,8 +1496,8 @@ def test_auto_process_range_entry_uses_half_market_and_adjusted_opposite_endpoin
     assert fake_client.orders[0]["ordType"] == "market"
     assert fake_client.orders[0]["sz"] == "2.5"
     assert fake_client.trigger_orders[0]["orderType"] == "limit"
-    assert fake_client.trigger_orders[0]["triggerPrice"] == "1567.34"
-    assert [order["sz"] for order in fake_client.trigger_orders] == ["4.4"]
+    assert fake_client.trigger_orders[0]["triggerPrice"] == "1567.0"
+    assert [order["sz"] for order in fake_client.trigger_orders] == ["4.5"]
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
@@ -1476,6 +1509,203 @@ def test_auto_process_range_entry_uses_half_market_and_adjusted_opposite_endpoin
         "open_market_position",
         "set_position_tpsl",
     ]
+
+
+def test_auto_process_short_range_uses_fixed_market_threshold_and_second_offset(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="ETH short 1585-1605 SL 1625 TP 1550",
+        entry_text="1585-1605",
+        stop_loss_text="1625",
+        take_profit_text="1550",
+        symbol="ETH",
+        side="short",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "allowed_symbols": ["BTC", "ETH"],
+            "symbol_entry_thresholds": {
+                "ETH": {
+                    "market_leg_threshold": "4",
+                    "first_limit_offset": "2",
+                    "second_limit_offset": "2",
+                }
+            },
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 1, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert [order["ordType"] for order in fake_client.orders] == ["market"]
+    assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
+        "1603.0"
+    ]
+
+
+def test_auto_process_zero_fixed_market_threshold_keeps_two_limit_legs(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "allowed_symbols": ["BTC", "ETH"],
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "0",
+                    "first_limit_offset": "90",
+                    "second_limit_offset": "80",
+                }
+            },
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+    fake_client.ticker_prices["BTC-USDT-SWAP"] = 68200.0
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 1, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert fake_client.orders == []
+    assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
+        "68290.0",
+        "68080.0",
+    ]
+
+
+def test_strategy_revision_uses_binding_symbol_fixed_offsets_for_both_drafts(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:54:ETH:long",
+            kol_id="group:100",
+            chat_id=100,
+            message_id=54,
+            symbol="ETH",
+            side="long",
+            venue="deepcoin",
+            status="open",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=54,
+            symbol="ETH",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 1, 7, 55, tzinfo=UTC),
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.flush()
+        raw = RawMessage(
+            chat_id=100,
+            message_id=55,
+            sender_id=200,
+            sender_name="Alice",
+            posted_at=datetime(2026, 7, 1, 8, 0, tzinfo=UTC),
+            text="revise ETH entry to 1580-1590",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="long",
+                event_type="strategy_revision",
+                target_lifecycle_id=lifecycle.id,
+                entry_text="1580-1590",
+                stop_loss_text="1550",
+                take_profit_text="1650",
+                recognition_generation="revision-generation",
+                parse_source="mimo_authoritative",
+                confidence=0.99,
+            )
+        )
+        session.commit()
+        raw_message_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "allowed_symbols": ["BTC", "ETH"],
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "200",
+                    "first_limit_offset": "90",
+                    "second_limit_offset": "80",
+                },
+                "ETH": {
+                    "market_leg_threshold": "4",
+                    "first_limit_offset": "2",
+                    "second_limit_offset": "3",
+                },
+            },
+        },
+    )
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    original_builder = auto_module._build_revision_deepcoin_draft
+    built_drafts = []
+
+    def recording_builder(**kwargs):
+        draft = original_builder(**kwargs)
+        built_drafts.append(draft)
+        return draft
+
+    def execute_revision(_session_factory, *, replacement_writer, **_kwargs):
+        return replacement_writer(batch_id=1, remaining_fraction=0.5)
+
+    monkeypatch.setattr(auto_module, "_build_revision_deepcoin_draft", recording_builder)
+    monkeypatch.setattr(auto_module, "execute_strategy_revision", execute_revision)
+    monkeypatch.setattr(
+        auto_module,
+        "submit_strategy_revision_replacement_live",
+        lambda _session_factory, *, draft, **_kwargs: draft,
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 7, 1, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["symbol"] == "ETH"
+    assert len(built_drafts) == 2
+    assert [
+        [leg["price"] for leg in draft["order_legs"]]
+        for draft in built_drafts
+    ] == [[1592.0, 1583.0], [1592.0, 1583.0]]
 
 
 def test_auto_process_message_trade_signal_uses_symbol_specific_risk_budget(tmp_path):
@@ -1976,6 +2206,13 @@ def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_
             "auto_trade_enabled": True,
             "default_max_loss_usdt": 20,
             "allowed_symbols": ["BTC", "ETH"],
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "0",
+                    "first_limit_offset": "0",
+                    "second_limit_offset": "0",
+                }
+            },
         },
     )
     fake_client = _FakeDeepcoinClient()
@@ -1993,8 +2230,8 @@ def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_
     assert result["status"] == "submitted"
     assert fake_client.orders == []
     assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
-        "59388.9",
-        "58988.3",
+        "59300.0",
+        "58900.0",
     ]
     assert fake_client.protections == []
     assert fake_client.trigger_orders[0]["slTriggerPx"] == "57800.0"
