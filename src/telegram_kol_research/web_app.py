@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import asyncio
 import json
 import logging
@@ -182,6 +182,7 @@ from telegram_kol_research.runtime_agent_telegram_evidence import (
 )
 from telegram_kol_research.time_utils import DEFAULT_LOCAL_TIMEZONE
 from telegram_kol_research.trading_settings import (
+    SymbolEntryThresholds,
     load_trading_settings,
     save_trading_settings,
 )
@@ -2768,6 +2769,7 @@ def _build_trading_symbol_rows(
     *,
     selected_symbols: list[str],
     symbol_max_loss_usdt: dict[str, float],
+    entry_thresholds_for_symbol: Callable[[str], SymbolEntryThresholds],
 ) -> list[dict[str, Any]]:
     selected = {str(symbol).upper() for symbol in selected_symbols}
     rows_by_symbol: dict[str, dict[str, Any]] = {}
@@ -2784,6 +2786,7 @@ def _build_trading_symbol_rows(
             "instrument_id": instrument_id or _to_deepcoin_swap_instrument(symbol),
             "selected": symbol in selected,
             "max_loss_usdt": symbol_max_loss_usdt.get(symbol),
+            "entry_thresholds": entry_thresholds_for_symbol(symbol).to_dict(),
         }
     for symbol in selected:
         rows_by_symbol.setdefault(
@@ -2793,6 +2796,7 @@ def _build_trading_symbol_rows(
                 "instrument_id": _to_deepcoin_swap_instrument(symbol),
                 "selected": True,
                 "max_loss_usdt": symbol_max_loss_usdt.get(symbol),
+                "entry_thresholds": entry_thresholds_for_symbol(symbol).to_dict(),
             },
         )
     return sorted(rows_by_symbol.values(), key=lambda item: item["symbol"])
@@ -5046,6 +5050,7 @@ def create_web_app(
                 exchange_symbols,
                 selected_symbols=saved_symbols,
                 symbol_max_loss_usdt=settings.symbol_max_loss_usdt,
+                entry_thresholds_for_symbol=settings.entry_thresholds_for_symbol,
             )
         }
 

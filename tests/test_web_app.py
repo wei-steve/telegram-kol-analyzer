@@ -872,6 +872,18 @@ def test_trading_settings_api_persists_runtime_risk_defaults(tmp_path):
             "min_ai_confidence": 0.8,
             "allowed_symbols": "BTC,ETH,SOL",
             "symbol_max_loss_usdt": {"BTC": 20, "ETH": 15, "SOL": 10},
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "200",
+                    "first_limit_offset": "90",
+                    "second_limit_offset": "90",
+                },
+                "PEPE": {
+                    "market_leg_threshold": "0.000003",
+                    "first_limit_offset": "0.000001",
+                    "second_limit_offset": "0.000002",
+                },
+            },
             "entry_range_order_style": "conservative",
             "take_profit_allocations": "50,30,20",
             "move_stop_to_breakeven_after_tp1": True,
@@ -884,12 +896,67 @@ def test_trading_settings_api_persists_runtime_risk_defaults(tmp_path):
     assert response.json()["nearby_entry_market_deviation_pct"] == 1.25
     assert response.json()["allowed_symbols"] == ["BTC", "ETH", "SOL"]
     assert response.json()["symbol_max_loss_usdt"] == {"BTC": 20.0, "ETH": 15.0, "SOL": 10.0}
+    assert response.json()["symbol_entry_thresholds"] == {
+        "BTC": {
+            "market_leg_threshold": "200",
+            "first_limit_offset": "90",
+            "second_limit_offset": "90",
+        },
+        "PEPE": {
+            "market_leg_threshold": "0.000003",
+            "first_limit_offset": "0.000001",
+            "second_limit_offset": "0.000002",
+        },
+    }
 
     reloaded = client.get("/api/trading-settings")
     assert reloaded.status_code == 200
     assert reloaded.json()["auto_trade_enabled"] is True
     assert reloaded.json()["nearby_entry_market_deviation_pct"] == 1.25
     assert reloaded.json()["take_profit_allocations"] == [50.0, 30.0, 20.0]
+    assert reloaded.json()["symbol_entry_thresholds"] == response.json()[
+        "symbol_entry_thresholds"
+    ]
+
+
+def test_trading_settings_api_returns_fresh_fixed_entry_defaults(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/api/trading-settings")
+
+    assert response.status_code == 200
+    assert response.json()["symbol_entry_thresholds"] == {
+        "BTC": {
+            "market_leg_threshold": "200",
+            "first_limit_offset": "90",
+            "second_limit_offset": "90",
+        },
+        "ETH": {
+            "market_leg_threshold": "4",
+            "first_limit_offset": "2",
+            "second_limit_offset": "2",
+        },
+    }
+
+
+def test_trading_settings_api_rejects_negative_fixed_entry_threshold(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "-1",
+                    "first_limit_offset": "90",
+                    "second_limit_offset": "90",
+                }
+            }
+        },
+    )
+
+    assert response.status_code == 422
+    assert "market_leg_threshold" in response.json()["detail"]
 
 
 def test_management_execution_mode_api_persists_shadow_with_auto_trade_disabled(tmp_path):
@@ -981,18 +1048,33 @@ def test_trading_settings_symbols_api_lists_deepcoin_symbols_with_selection(tmp_
             "instrument_id": "BTC-USDT-SWAP",
             "selected": True,
             "max_loss_usdt": 20.0,
+            "entry_thresholds": {
+                "market_leg_threshold": "200",
+                "first_limit_offset": "90",
+                "second_limit_offset": "90",
+            },
         },
         {
             "symbol": "ETH",
             "instrument_id": "ETH-USDT-SWAP",
             "selected": False,
             "max_loss_usdt": None,
+            "entry_thresholds": {
+                "market_leg_threshold": "4",
+                "first_limit_offset": "2",
+                "second_limit_offset": "2",
+            },
         },
         {
             "symbol": "SOL",
             "instrument_id": "SOL-USDT-SWAP",
             "selected": True,
             "max_loss_usdt": 10.0,
+            "entry_thresholds": {
+                "market_leg_threshold": "0",
+                "first_limit_offset": "0",
+                "second_limit_offset": "0",
+            },
         },
     ]
 
@@ -1024,12 +1106,22 @@ def test_trading_settings_symbols_api_falls_back_to_saved_symbols(tmp_path):
             "instrument_id": "BTC-USDT-SWAP",
             "selected": True,
             "max_loss_usdt": None,
+            "entry_thresholds": {
+                "market_leg_threshold": "200",
+                "first_limit_offset": "90",
+                "second_limit_offset": "90",
+            },
         },
         {
             "symbol": "ETH",
             "instrument_id": "ETH-USDT-SWAP",
             "selected": True,
             "max_loss_usdt": 15.0,
+            "entry_thresholds": {
+                "market_leg_threshold": "4",
+                "first_limit_offset": "2",
+                "second_limit_offset": "2",
+            },
         },
     ]
 
@@ -4366,7 +4458,7 @@ def test_recovery_execution_queue_api_returns_payload_preview_only(tmp_path):
     assert response.json()["items"][0]["payload_preview"]["contract"] == "BTC-USDT"
     assert response.json()["items"][0]["deepcoin_order_draft"]["instrument_id"] == "BTC-USDT-SWAP"
     assert response.json()["items"][0]["deepcoin_order_draft"]["blocking_reason_codes"] == ["contract_size_unverified"]
-    assert response.json()["items"][0]["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 0.062321
+    assert response.json()["items"][0]["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 0.063291
     assert response.json()["items"][0]["contract_spec_status"] == {
         "code": "missing",
         "label": "缺少规格校验",
@@ -4468,7 +4560,7 @@ def test_recovery_execution_queue_api_applies_configured_contract_specs(tmp_path
         "quantity_unit": "contracts",
     }
     assert draft["blocking_reason_codes"] == []
-    assert draft["order_legs"][0]["quantity"] == 62.0
+    assert draft["order_legs"][0]["quantity"] == 63.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
 
 
