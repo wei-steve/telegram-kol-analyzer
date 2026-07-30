@@ -218,13 +218,13 @@
       持仓({{ exchange_snapshot.positions|length }})
     </button>
     <button type="button" class="exchange-tab" data-exchange-position-tab="open-orders" aria-selected="false">
-      当前委托({{ exchange_snapshot.open_orders|length }})
+      当前委托{% if not lazy_exchange_tabs %}({{ exchange_snapshot.open_orders|length }}){% endif %}
     </button>
     <button type="button" class="exchange-tab" data-exchange-position-tab="order-history" aria-selected="false">
-      历史委托({{ exchange_snapshot.order_history|length }})
+      历史委托{% if not lazy_exchange_tabs %}({{ exchange_snapshot.order_history|length }}){% endif %}
     </button>
     <button type="button" class="exchange-tab" data-exchange-position-tab="position-history" aria-selected="false">
-      历史仓位({{ exchange_snapshot.position_history|length }})
+      历史仓位{% if not lazy_exchange_tabs %}({{ exchange_snapshot.position_history|length }}){% endif %}
     </button>
   </div>
 
@@ -238,7 +238,7 @@
   {% endif %}
 
   <div class="exchange-tab-panels">
-    <section class="exchange-tab-panel is-active" data-exchange-position-panel="positions">
+    <section class="exchange-tab-panel is-active" data-exchange-position-panel="positions" data-exchange-tab-loaded="true">
       <div class="exchange-view-panel is-active" data-exchange-view-panel="list">
         {{ card_list(exchange_snapshot.positions | list, '暂无持仓', 'position') }}
       </div>
@@ -269,31 +269,43 @@
       {% endif %}
     </section>
 
-    <section class="exchange-tab-panel" data-exchange-position-panel="open-orders">
+    <section class="exchange-tab-panel" data-exchange-position-panel="open-orders" data-exchange-tab-loaded="{{ 'false' if lazy_exchange_tabs else 'true' }}">
+      {% if lazy_exchange_tabs %}
+        <p class="exchange-empty" data-exchange-tab-loading>打开分页后加载当前委托</p>
+      {% else %}
       <div class="exchange-view-panel is-active" data-exchange-view-panel="list">
         {{ card_list(exchange_snapshot.open_orders | list, '暂无当前委托', 'order') }}
       </div>
       <div class="exchange-view-panel" data-exchange-view-panel="grouped">
         {{ grouped_list(exchange_snapshot.grouped.open_orders, '暂无当前委托', 'order') }}
       </div>
+      {% endif %}
     </section>
 
-    <section class="exchange-tab-panel" data-exchange-position-panel="order-history">
+    <section class="exchange-tab-panel" data-exchange-position-panel="order-history" data-exchange-tab-loaded="{{ 'false' if lazy_exchange_tabs else 'true' }}">
+      {% if lazy_exchange_tabs %}
+        <p class="exchange-empty" data-exchange-tab-loading>打开分页后加载历史委托</p>
+      {% else %}
       <div class="exchange-view-panel is-active" data-exchange-view-panel="list">
         {{ card_list(exchange_snapshot.order_history | list, '暂无历史委托', 'order-history') }}
       </div>
       <div class="exchange-view-panel" data-exchange-view-panel="grouped">
         {{ grouped_list(exchange_snapshot.grouped.order_history, '暂无历史委托', 'order-history') }}
       </div>
+      {% endif %}
     </section>
 
-    <section class="exchange-tab-panel" data-exchange-position-panel="position-history" data-exchange-history-panel>
+    <section class="exchange-tab-panel" data-exchange-position-panel="position-history" data-exchange-tab-loaded="{{ 'false' if lazy_exchange_tabs else 'true' }}" data-exchange-history-panel>
+      {% if lazy_exchange_tabs %}
+        <p class="exchange-empty" data-exchange-tab-loading>打开分页后加载历史仓位</p>
+      {% else %}
       <div class="exchange-view-panel is-active" data-exchange-view-panel="list">
         {{ card_list(exchange_snapshot.position_history | list, '暂无历史仓位', 'history-position') }}
       </div>
       <div class="exchange-view-panel" data-exchange-view-panel="grouped">
         {{ grouped_list(exchange_snapshot.grouped.position_history, '暂无历史仓位', 'history-position') }}
       </div>
+      {% endif %}
     </section>
   </div>
 </section>

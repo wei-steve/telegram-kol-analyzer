@@ -1284,6 +1284,178 @@ def _load_exchange_position_snapshot(
     return snapshot
 
 
+def _empty_exchange_snapshot() -> dict[str, Any]:
+    return {
+        "positions": [],
+        "unattributed_protection_orders": [],
+        "open_orders": [],
+        "order_history": [],
+        "position_history": [],
+        "error": None,
+    }
+
+
+def _load_exchange_live_snapshot(
+    session_factory,
+    *,
+    deepcoin_client_factory,
+    group_label_by_chat_id: dict[int, str],
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+) -> dict[str, Any]:
+    """Load only live positions and their exact pending TPSL evidence."""
+    snapshot = _empty_exchange_snapshot()
+    position_error: dict[str, str] = {}
+    unattributed_protection_orders: list[dict[str, str]] = []
+    snapshot["positions"] = _load_deepcoin_live_position_rows(
+        session_factory,
+        deepcoin_client_factory=deepcoin_client_factory,
+        group_label_by_chat_id=group_label_by_chat_id,
+        contract_spec_provider=contract_spec_provider,
+        error_state=position_error,
+        unattributed_protection_rows=unattributed_protection_orders,
+    )
+    snapshot["unattributed_protection_orders"] = unattributed_protection_orders
+    if position_error:
+        snapshot["error"] = position_error["error"]
+    return snapshot
+
+
+def _load_exchange_tab_snapshot(
+    session_factory,
+    *,
+    tab_name: str,
+    deepcoin_client_factory,
+    group_label_by_chat_id: dict[int, str],
+    pending_entry_signals: list[dict[str, Any]],
+    trading_settings,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    order_limit: int = 20,
+) -> dict[str, Any]:
+    """Load exactly one non-live exchange tab."""
+    if tab_name not in {"open-orders", "order-history", "position-history"}:
+        raise ValueError("unsupported exchange position tab")
+
+    snapshot = _empty_exchange_snapshot()
+    try:
+        client = deepcoin_client_factory()
+    except Exception:
+        logger.exception("Deepcoin exchange tab client creation failed")
+        snapshot["error"] = "unavailable"
+        return snapshot
+
+    if tab_name == "open-orders":
+        raw_open_orders = _safe_deepcoin_list(client, "list_open_orders")
+        instruments = _exchange_snapshot_instrument_ids(
+            positions=[],
+            open_orders=raw_open_orders,
+            order_history=[],
+            pending_entry_signals=pending_entry_signals,
+            allowed_symbols=getattr(trading_settings, "allowed_symbols", []),
+        )
+        raw_trigger_orders: list[dict[str, Any]] = []
+        for inst_id in sorted(instruments):
+            raw_trigger_orders.extend(
+                _safe_deepcoin_list(
+                    client,
+                    "list_trigger_orders_pending",
+                    inst_id=inst_id,
+                )
+            )
+        snapshot["open_orders"] = _dedupe_exchange_rows(
+            [
+                *(
+                    _exchange_order_row(order, source="普通委托")
+                    for order in raw_open_orders
+                ),
+                *(
+                    _exchange_order_row(order, source="触发委托")
+                    for order in raw_trigger_orders
+                ),
+            ],
+            limit=order_limit,
+        )
+        _attach_exchange_order_bindings(
+            session_factory,
+            snapshot["open_orders"],
+            group_label_by_chat_id=group_label_by_chat_id,
+        )
+        return snapshot
+
+    if tab_name == "order-history":
+        raw_order_history = _safe_deepcoin_list(client, "list_order_history")
+        instruments = _exchange_snapshot_instrument_ids(
+            positions=[],
+            open_orders=[],
+            order_history=raw_order_history,
+            pending_entry_signals=pending_entry_signals,
+            allowed_symbols=getattr(trading_settings, "allowed_symbols", []),
+        )
+        raw_trigger_history: list[dict[str, Any]] = []
+        for inst_id in sorted(instruments):
+            raw_trigger_history.extend(
+                _safe_deepcoin_list(
+                    client,
+                    "list_trigger_order_history",
+                    inst_id=inst_id,
+                )
+            )
+        snapshot["order_history"] = _dedupe_exchange_rows(
+            [
+                *(
+                    _exchange_order_row(order, source="历史委托")
+                    for order in raw_order_history
+                ),
+                *(
+                    _exchange_order_row(order, source="触发历史")
+                    for order in raw_trigger_history
+                ),
+            ],
+            limit=order_limit,
+        )
+        _attach_exchange_order_bindings(
+            session_factory,
+            snapshot["order_history"],
+            group_label_by_chat_id=group_label_by_chat_id,
+        )
+        return snapshot
+
+    instruments = _exchange_snapshot_instrument_ids(
+        positions=[],
+        open_orders=[],
+        order_history=[],
+        pending_entry_signals=pending_entry_signals,
+        allowed_symbols=getattr(trading_settings, "allowed_symbols", []),
+    )
+    raw_position_history: list[dict[str, Any]] = []
+    for inst_id in sorted(instruments):
+        raw_position_history.extend(
+            _safe_deepcoin_list(client, "list_position_history", inst_id=inst_id)
+        )
+    snapshot["position_history"] = sorted(
+        (
+            _exchange_position_history_row(
+                position,
+                contract_spec_provider=contract_spec_provider,
+            )
+            for position in raw_position_history
+            if _float_or_none(position.get("avgPx")) is not None
+            and _float_or_none(position.get("closeAvgPx")) is not None
+            and _float_or_none(position.get("closePos")) not in (None, 0.0)
+        ),
+        key=lambda row: (
+            row.get("exited_at") or datetime.min.replace(tzinfo=UTC),
+            row["history_sort_id"],
+        ),
+        reverse=True,
+    )[:order_limit]
+    _attach_exchange_history_position_bindings(
+        session_factory,
+        snapshot["position_history"],
+        group_label_by_chat_id=group_label_by_chat_id,
+    )
+    return snapshot
+
+
 def _annotate_exchange_snapshot_attribution(
     snapshot: dict[str, Any],
     *,
@@ -3856,6 +4028,88 @@ def create_web_app(
             "holding_positions": holding_positions,
             "pending_entry_signals": pending_entry_signals,
             "exited_positions": exited_positions,
+            "lazy_exchange_tabs": False,
+        }
+
+    def build_initial_positions_panel_context() -> dict[str, Any]:
+        pending_entry_signals = list_pending_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=200,
+            symbol_whitelist_by_chat_id=_symbol_whitelist_by_chat_id(
+                app.state.group_config
+            ),
+        )
+        holding_positions = list_holding_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=200,
+        )
+        group_label_by_chat_id = _group_label_by_chat_id(app.state.group_config)
+        exchange_snapshot = _load_exchange_live_snapshot(
+            app.state.session_factory,
+            deepcoin_client_factory=app.state.deepcoin_client_factory,
+            group_label_by_chat_id=group_label_by_chat_id,
+            contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+        )
+        exchange_snapshot = _annotate_exchange_snapshot_attribution(
+            exchange_snapshot,
+            holding_positions=holding_positions,
+            pending_entry_signals=pending_entry_signals,
+            exited_positions=[],
+            group_label_by_chat_id=group_label_by_chat_id,
+        )
+        return {
+            "exchange_snapshot": exchange_snapshot,
+            "holding_positions": holding_positions,
+            "pending_entry_signals": pending_entry_signals,
+            "exited_positions": [],
+            "lazy_exchange_tabs": True,
+        }
+
+    def build_exchange_position_tab_context(tab_name: str) -> dict[str, Any]:
+        pending_entry_signals = list_pending_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=200,
+            symbol_whitelist_by_chat_id=_symbol_whitelist_by_chat_id(
+                app.state.group_config
+            ),
+        )
+        holding_positions = list_holding_strategies(
+            app.state.session_factory,
+            chat_id=None,
+            limit=200,
+        )
+        exited_positions = (
+            list_verified_deepcoin_history_positions(
+                app.state.session_factory,
+                chat_id=None,
+                limit=50,
+            )
+            if tab_name in {"order-history", "position-history"}
+            else []
+        )
+        group_label_by_chat_id = _group_label_by_chat_id(app.state.group_config)
+        exchange_snapshot = _load_exchange_tab_snapshot(
+            app.state.session_factory,
+            tab_name=tab_name,
+            deepcoin_client_factory=app.state.deepcoin_client_factory,
+            group_label_by_chat_id=group_label_by_chat_id,
+            pending_entry_signals=pending_entry_signals,
+            trading_settings=load_trading_settings(app.state.session_factory),
+            contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+        )
+        exchange_snapshot = _annotate_exchange_snapshot_attribution(
+            exchange_snapshot,
+            holding_positions=holding_positions,
+            pending_entry_signals=pending_entry_signals,
+            exited_positions=exited_positions,
+            group_label_by_chat_id=group_label_by_chat_id,
+        )
+        return {
+            "tab_name": tab_name,
+            "exchange_snapshot": exchange_snapshot,
         }
 
     def build_strategy_record_payload(
@@ -4370,11 +4624,25 @@ def create_web_app(
         )
 
     @app.get("/positions-panel")
-    def positions_panel_partial(request: Request):
+    def positions_panel_partial(request: Request, initial: str | None = None):
         return templates.TemplateResponse(
             request,
             "_exchange_positions_panel.html",
-            build_positions_panel_context(),
+            (
+                build_initial_positions_panel_context()
+                if initial == "positions"
+                else build_positions_panel_context()
+            ),
+        )
+
+    @app.get("/positions-panel/tabs/{tab_name}")
+    def positions_panel_tab_partial(request: Request, tab_name: str):
+        if tab_name not in {"open-orders", "order-history", "position-history"}:
+            raise HTTPException(status_code=404, detail="unknown exchange position tab")
+        return templates.TemplateResponse(
+            request,
+            "_exchange_position_tab.html",
+            build_exchange_position_tab_context(tab_name),
         )
 
     @app.get("/")
