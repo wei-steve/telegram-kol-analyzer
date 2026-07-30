@@ -233,6 +233,9 @@ class DeepcoinRestClient:
     ) -> None:
         self._credentials = credentials
         self._http_client = http_client
+        self._owns_http_client = http_client is None
+        self._http_client_lock = threading.Lock()
+        self._closed = False
         self._timestamp_factory = timestamp_factory or _utc_timestamp_ms
         self._monotonic_factory = monotonic_factory or time.monotonic
         self._sleep_fn = sleep_fn or time.sleep
@@ -252,6 +255,45 @@ class DeepcoinRestClient:
             )
         else:
             self._tpsl_rate_limiter = _shared_tpsl_limiter(credentials)
+
+    def close(self) -> None:
+        """Release a lazily owned HTTP connection exactly once."""
+        with self._http_client_lock:
+            if self._closed:
+                return
+            self._closed = True
+            client = self._http_client if self._owns_http_client else None
+            self._http_client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception as exc:
+                raise DeepcoinClientError(
+                    f"Deepcoin client cleanup failed: {exc}"
+                ) from exc
+
+    def __enter__(self) -> "DeepcoinRestClient":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _get_http_client(self):
+        with self._http_client_lock:
+            if self._closed:
+                raise DeepcoinClientError("Deepcoin client is closed")
+            if self._http_client is None:
+                self._http_client = httpx.Client(
+                    base_url=self._credentials.base_url,
+                    timeout=self._credentials.timeout_seconds,
+                )
+            return self._http_client
 
     def place_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_PLACE_ORDER_PATH, order_payload)
@@ -522,11 +564,7 @@ class DeepcoinRestClient:
         )
         headers["Content-Type"] = "application/json"
 
-        owns_client = self._http_client is None
-        client = self._http_client or httpx.Client(
-            base_url=self._credentials.base_url,
-            timeout=self._credentials.timeout_seconds,
-        )
+        client = self._get_http_client()
         try:
             response = client.request(method, request_path, content=body, headers=headers)
             response.raise_for_status()
@@ -549,18 +587,6 @@ class DeepcoinRestClient:
                     "Deepcoin write response was not JSON"
                 ) from exc
             raise DeepcoinClientError("Deepcoin response was not JSON") from exc
-        finally:
-            if owns_client:
-                try:
-                    client.close()
-                except Exception as exc:
-                    if method.upper() == "POST":
-                        raise DeepcoinRequestOutcomeUnknown(
-                            f"Deepcoin request outcome unknown during cleanup: {exc}"
-                        ) from exc
-                    raise DeepcoinClientError(
-                        f"Deepcoin client cleanup failed: {exc}"
-                    ) from exc
 
         if str(payload.get("code", "0")) not in {"0", ""}:
             raise DeepcoinDefiniteRejection(

@@ -31,6 +31,7 @@ class _CapturingHttpClient:
     def __init__(self, payload):
         self.payload = payload
         self.requests = []
+        self.close_calls = 0
 
     def request(self, method, request_path, content="", headers=None):
         self.requests.append(
@@ -42,6 +43,9 @@ class _CapturingHttpClient:
             }
         )
         return _FakeResponse(self.payload)
+
+    def close(self):
+        self.close_calls += 1
 
 
 class _FailingHttpClient:
@@ -321,6 +325,53 @@ def test_two_default_clients_share_process_limiter_by_credential_uid():
     first = DeepcoinRestClient(credentials)
     second = DeepcoinRestClient(credentials)
     assert first._tpsl_rate_limiter is second._tpsl_rate_limiter
+
+
+def test_deepcoin_client_reuses_owned_http_connection_and_closes_once(monkeypatch):
+    created_clients = []
+
+    def build_http_client(*, base_url, timeout):
+        client = _CapturingHttpClient({"code": "0", "data": []})
+        client.base_url = base_url
+        client.timeout = timeout
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        "telegram_kol_research.deepcoin_client.httpx.Client",
+        build_http_client,
+    )
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(
+            api_key="key",
+            api_secret="secret",
+            passphrase="pass",
+            base_url="https://api.deepcoin.test",
+            timeout_seconds=7,
+        )
+    )
+
+    client.list_positions()
+    client.list_open_orders()
+    client.close()
+    client.close()
+
+    assert len(created_clients) == 1
+    assert len(created_clients[0].requests) == 2
+    assert created_clients[0].close_calls == 1
+
+
+def test_deepcoin_client_does_not_close_injected_http_client():
+    http_client = _CapturingHttpClient({"code": "0", "data": []})
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+    )
+
+    client.list_positions()
+    client.close()
+
+    assert http_client.close_calls == 0
 
 
 def test_tpsl_limiter_enforces_450_per_minute_with_fake_clock():
