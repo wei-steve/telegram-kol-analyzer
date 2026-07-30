@@ -28,6 +28,7 @@ from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import _summarize_verified_exchange_protection_rows
+from telegram_kol_research.web_app import _load_exchange_tab_snapshot
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.web_queries import list_exited_strategies
 from telegram_kol_research.web_queries import list_verified_deepcoin_history_positions
@@ -916,6 +917,86 @@ def test_positions_panel_tab_route_reads_only_requested_dataset(
     assert {method for method, _inst_id in exchange.calls} == expected_methods
     assert f'data-exchange-position-panel="{tab_name}"' in response.text
     assert 'data-exchange-tab-loaded="true"' in response.text
+
+
+def test_positions_panel_tab_failure_stays_retryable(tmp_path):
+    class BrokenOpenOrdersClient(_RecordingExchangePositionsClient):
+        def list_open_orders(self):
+            self.calls.append(("list_open_orders", None))
+            raise RuntimeError("exchange unavailable")
+
+    exchange = BrokenOpenOrdersClient()
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=lambda: exchange,
+        )
+    )
+
+    response = client.get("/positions-panel/tabs/open-orders")
+
+    assert response.status_code == 200
+    assert 'data-exchange-tab-loaded="false"' in response.text
+    assert "Deepcoin 数据暂不可用" in response.text
+
+
+def test_positions_panel_open_orders_does_not_drop_tpsl_after_twenty_regular_orders(
+    tmp_path,
+):
+    class ManyOpenOrdersClient(_RecordingExchangePositionsClient):
+        def list_open_orders(self):
+            self.calls.append(("list_open_orders", None))
+            return [
+                {
+                    "ordId": f"regular-{index}",
+                    "instId": "BTC-USDT-SWAP",
+                    "ordType": "limit",
+                    "posSide": "long",
+                }
+                for index in range(25)
+            ]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.calls.append(("list_trigger_orders_pending", inst_id))
+            return [
+                {
+                    "ordId": "tpsl-kept",
+                    "instId": inst_id,
+                    "triggerOrderType": "TPSL",
+                    "posSide": "long",
+                }
+            ]
+
+    exchange = ManyOpenOrdersClient()
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=lambda: exchange,
+        )
+    )
+
+    response = client.get("/positions-panel/tabs/open-orders")
+
+    assert response.status_code == 200
+    assert "order tpsl-kept" in response.text
+
+
+def test_position_history_tab_includes_persisted_history_symbols(tmp_path):
+    exchange = _RecordingExchangePositionsClient()
+
+    _load_exchange_tab_snapshot(
+        create_session_factory(tmp_path / "research.db"),
+        tab_name="position-history",
+        deepcoin_client_factory=lambda: exchange,
+        group_label_by_chat_id={},
+        pending_entry_signals=[],
+        trading_settings=SimpleNamespace(allowed_symbols=[]),
+        known_history_symbols=["DOGE"],
+    )
+
+    assert exchange.calls == [
+        ("list_position_history", "DOGE-USDT-SWAP"),
+    ]
 
 
 def _seed_live_bound_strategy(database_path, *, pos_id: str = "pos-live") -> None:

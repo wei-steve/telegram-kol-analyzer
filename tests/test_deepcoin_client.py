@@ -351,14 +351,39 @@ def test_deepcoin_client_reuses_owned_http_connection_and_closes_once(monkeypatc
         )
     )
 
-    client.list_positions()
-    client.list_open_orders()
-    client.close()
+    with client:
+        client.list_positions()
+        client.list_open_orders()
     client.close()
 
     assert len(created_clients) == 1
     assert len(created_clients[0].requests) == 2
     assert created_clients[0].close_calls == 1
+
+
+def test_deepcoin_client_closes_owned_http_connection_after_unscoped_request(
+    monkeypatch,
+):
+    created_clients = []
+
+    def build_http_client(*, base_url, timeout):
+        client = _CapturingHttpClient({"code": "0", "data": []})
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        "telegram_kol_research.deepcoin_client.httpx.Client",
+        build_http_client,
+    )
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass")
+    )
+
+    client.list_positions()
+    client.list_open_orders()
+
+    assert len(created_clients) == 2
+    assert [item.close_calls for item in created_clients] == [1, 1]
 
 
 def test_deepcoin_client_does_not_close_injected_http_client():

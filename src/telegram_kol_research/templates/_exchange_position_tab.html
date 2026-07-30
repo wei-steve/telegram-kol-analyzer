@@ -20,7 +20,7 @@
 <section
   class="exchange-tab-panel"
   data-exchange-position-panel="{{ tab_name }}"
-  data-exchange-tab-loaded="true"
+  data-exchange-tab-loaded="{{ 'false' if exchange_snapshot.error else 'true' }}"
   {% if tab_name == 'position-history' %}data-exchange-history-panel{% endif %}
 >
   {% if exchange_snapshot.error %}

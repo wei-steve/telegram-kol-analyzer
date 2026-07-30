@@ -1756,6 +1756,8 @@ function positionsPanelComparableMarkup(root) {
   const clone = root.cloneNode(true);
   setExchangePositionTab(clone, 'positions');
   setExchangePositionView(clone, 'list');
+  clone.querySelectorAll('[data-exchange-position-panel]:not([data-exchange-position-panel="positions"])')
+    .forEach((panel) => panel.remove());
   clone.querySelectorAll('details[open]').forEach((details) => {
     details.removeAttribute('open');
   });

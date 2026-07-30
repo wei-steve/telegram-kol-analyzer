@@ -389,6 +389,11 @@ def test_positions_change_comparison_ignores_browsing_only_dom_state(tmp_path):
     assert "setExchangePositionView(clone, 'list');" in comparable_block
     assert "clone.querySelectorAll('details[open]')" in comparable_block
     assert "details.removeAttribute('open')" in comparable_block
+    assert (
+        "clone.querySelectorAll('[data-exchange-position-panel]:not("
+        "[data-exchange-position-panel=\"positions\"])')"
+    ) in comparable_block
+    assert "panel.remove()" in comparable_block
     assert "current.outerHTML === fragment.outerHTML" not in check_block
     assert check_block.index("positionsPanelComparableMarkup(current)") < (
         check_block.index("positionsPanelComparableMarkup(fragment)")

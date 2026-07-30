@@ -236,6 +236,7 @@ class DeepcoinRestClient:
         self._owns_http_client = http_client is None
         self._http_client_lock = threading.Lock()
         self._closed = False
+        self._reuse_http_client = False
         self._timestamp_factory = timestamp_factory or _utc_timestamp_ms
         self._monotonic_factory = monotonic_factory or time.monotonic
         self._sleep_fn = sleep_fn or time.sleep
@@ -273,6 +274,10 @@ class DeepcoinRestClient:
                 ) from exc
 
     def __enter__(self) -> "DeepcoinRestClient":
+        with self._http_client_lock:
+            if self._closed:
+                raise DeepcoinClientError("Deepcoin client is closed")
+            self._reuse_http_client = True
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -564,7 +569,15 @@ class DeepcoinRestClient:
         )
         headers["Content-Type"] = "application/json"
 
-        client = self._get_http_client()
+        owns_request_client = self._owns_http_client and not self._reuse_http_client
+        client = (
+            httpx.Client(
+                base_url=self._credentials.base_url,
+                timeout=self._credentials.timeout_seconds,
+            )
+            if owns_request_client
+            else self._get_http_client()
+        )
         try:
             response = client.request(method, request_path, content=body, headers=headers)
             response.raise_for_status()
@@ -587,6 +600,18 @@ class DeepcoinRestClient:
                     "Deepcoin write response was not JSON"
                 ) from exc
             raise DeepcoinClientError("Deepcoin response was not JSON") from exc
+        finally:
+            if owns_request_client:
+                try:
+                    client.close()
+                except Exception as exc:
+                    if method.upper() == "POST":
+                        raise DeepcoinRequestOutcomeUnknown(
+                            f"Deepcoin request outcome unknown during cleanup: {exc}"
+                        ) from exc
+                    raise DeepcoinClientError(
+                        f"Deepcoin client cleanup failed: {exc}"
+                    ) from exc
 
         if str(payload.get("code", "0")) not in {"0", ""}:
             raise DeepcoinDefiniteRejection(

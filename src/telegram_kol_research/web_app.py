@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable
 import asyncio
@@ -1304,16 +1304,25 @@ def _load_exchange_live_snapshot(
 ) -> dict[str, Any]:
     """Load only live positions and their exact pending TPSL evidence."""
     snapshot = _empty_exchange_snapshot()
+    try:
+        client = deepcoin_client_factory()
+    except Exception:
+        logger.exception("Deepcoin live snapshot client creation failed")
+        snapshot["error"] = "unavailable"
+        return snapshot
     position_error: dict[str, str] = {}
     unattributed_protection_orders: list[dict[str, str]] = []
-    snapshot["positions"] = _load_deepcoin_live_position_rows(
-        session_factory,
-        deepcoin_client_factory=deepcoin_client_factory,
-        group_label_by_chat_id=group_label_by_chat_id,
-        contract_spec_provider=contract_spec_provider,
-        error_state=position_error,
-        unattributed_protection_rows=unattributed_protection_orders,
-    )
+    scope = client if hasattr(client, "__enter__") else nullcontext(client)
+    with scope:
+        snapshot["positions"] = _load_deepcoin_live_position_rows(
+            session_factory,
+            deepcoin_client_factory=deepcoin_client_factory,
+            group_label_by_chat_id=group_label_by_chat_id,
+            contract_spec_provider=contract_spec_provider,
+            error_state=position_error,
+            deepcoin_client=client,
+            unattributed_protection_rows=unattributed_protection_orders,
+        )
     snapshot["unattributed_protection_orders"] = unattributed_protection_orders
     if position_error:
         snapshot["error"] = position_error["error"]
@@ -1330,6 +1339,8 @@ def _load_exchange_tab_snapshot(
     trading_settings,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     order_limit: int = 20,
+    open_order_limit: int = 100,
+    known_history_symbols: list[str] | None = None,
 ) -> dict[str, Any]:
     """Load exactly one non-live exchange tab."""
     if tab_name not in {"open-orders", "order-history", "position-history"}:
@@ -1343,8 +1354,47 @@ def _load_exchange_tab_snapshot(
         snapshot["error"] = "unavailable"
         return snapshot
 
+    scope = client if hasattr(client, "__enter__") else nullcontext(client)
+    with scope:
+        return _load_exchange_tab_snapshot_from_client(
+            session_factory,
+            tab_name=tab_name,
+            client=client,
+            snapshot=snapshot,
+            group_label_by_chat_id=group_label_by_chat_id,
+            pending_entry_signals=pending_entry_signals,
+            trading_settings=trading_settings,
+            contract_spec_provider=contract_spec_provider,
+            order_limit=order_limit,
+            open_order_limit=open_order_limit,
+            known_history_symbols=known_history_symbols or [],
+        )
+
+
+def _load_exchange_tab_snapshot_from_client(
+    session_factory,
+    *,
+    tab_name: str,
+    client,
+    snapshot: dict[str, Any],
+    group_label_by_chat_id: dict[int, str],
+    pending_entry_signals: list[dict[str, Any]],
+    trading_settings,
+    contract_spec_provider: DeepcoinContractSpecProvider | None,
+    order_limit: int,
+    open_order_limit: int,
+    known_history_symbols: list[str],
+) -> dict[str, Any]:
+    error_state: dict[str, str] = {}
     if tab_name == "open-orders":
-        raw_open_orders = _safe_deepcoin_list(client, "list_open_orders")
+        raw_open_orders = _safe_deepcoin_list(
+            client,
+            "list_open_orders",
+            error_state=error_state,
+        )
+        if error_state:
+            snapshot["error"] = "unavailable"
+            return snapshot
         instruments = _exchange_snapshot_instrument_ids(
             positions=[],
             open_orders=raw_open_orders,
@@ -1359,8 +1409,12 @@ def _load_exchange_tab_snapshot(
                     client,
                     "list_trigger_orders_pending",
                     inst_id=inst_id,
+                    error_state=error_state,
                 )
             )
+        if error_state:
+            snapshot["error"] = "unavailable"
+            return snapshot
         snapshot["open_orders"] = _dedupe_exchange_rows(
             [
                 *(
@@ -1372,7 +1426,7 @@ def _load_exchange_tab_snapshot(
                     for order in raw_trigger_orders
                 ),
             ],
-            limit=order_limit,
+            limit=open_order_limit,
         )
         _attach_exchange_order_bindings(
             session_factory,
@@ -1382,7 +1436,14 @@ def _load_exchange_tab_snapshot(
         return snapshot
 
     if tab_name == "order-history":
-        raw_order_history = _safe_deepcoin_list(client, "list_order_history")
+        raw_order_history = _safe_deepcoin_list(
+            client,
+            "list_order_history",
+            error_state=error_state,
+        )
+        if error_state:
+            snapshot["error"] = "unavailable"
+            return snapshot
         instruments = _exchange_snapshot_instrument_ids(
             positions=[],
             open_orders=[],
@@ -1397,8 +1458,12 @@ def _load_exchange_tab_snapshot(
                     client,
                     "list_trigger_order_history",
                     inst_id=inst_id,
+                    error_state=error_state,
                 )
             )
+        if error_state:
+            snapshot["error"] = "unavailable"
+            return snapshot
         snapshot["order_history"] = _dedupe_exchange_rows(
             [
                 *(
@@ -1426,11 +1491,24 @@ def _load_exchange_tab_snapshot(
         pending_entry_signals=pending_entry_signals,
         allowed_symbols=getattr(trading_settings, "allowed_symbols", []),
     )
+    instruments.update(
+        _symbol_to_deepcoin_inst_id(symbol)
+        for symbol in known_history_symbols
+        if str(symbol or "").strip()
+    )
     raw_position_history: list[dict[str, Any]] = []
     for inst_id in sorted(instruments):
         raw_position_history.extend(
-            _safe_deepcoin_list(client, "list_position_history", inst_id=inst_id)
+            _safe_deepcoin_list(
+                client,
+                "list_position_history",
+                inst_id=inst_id,
+                error_state=error_state,
+            )
         )
+    if error_state:
+        snapshot["error"] = "unavailable"
+        return snapshot
     snapshot["position_history"] = sorted(
         (
             _exchange_position_history_row(
@@ -1918,7 +1996,13 @@ def _infer_exchange_order_role(item: dict[str, Any]) -> str | None:
     return None
 
 
-def _safe_deepcoin_list(client, method_name: str, *, inst_id: str | None = None) -> list[dict[str, Any]]:
+def _safe_deepcoin_list(
+    client,
+    method_name: str,
+    *,
+    inst_id: str | None = None,
+    error_state: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     method = getattr(client, method_name, None)
     if method is None:
         return []
@@ -1929,9 +2013,13 @@ def _safe_deepcoin_list(client, method_name: str, *, inst_id: str | None = None)
             rows = method()
         except Exception:
             logger.exception("Deepcoin %s load failed", method_name)
+            if error_state is not None:
+                error_state["error"] = "unavailable"
             return []
     except Exception:
         logger.exception("Deepcoin %s load failed", method_name)
+        if error_state is not None:
+            error_state["error"] = "unavailable"
         return []
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
@@ -4099,6 +4187,11 @@ def create_web_app(
             pending_entry_signals=pending_entry_signals,
             trading_settings=load_trading_settings(app.state.session_factory),
             contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+            known_history_symbols=[
+                str(row.get("symbol") or "")
+                for row in exited_positions
+                if row.get("symbol")
+            ],
         )
         exchange_snapshot = _annotate_exchange_snapshot_attribution(
             exchange_snapshot,
