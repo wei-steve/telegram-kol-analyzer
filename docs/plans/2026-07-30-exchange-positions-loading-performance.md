@@ -299,25 +299,36 @@ Verify:
 
 ## Deployment Status — 2026-07-30
 
-Local implementation and review are complete at commit `c412482`. The focused
-regression suite passed 317 tests, static compilation passed, and review found
-no remaining Critical or Important issue. The branch was pushed to GitHub.
+Local implementation and review completed with 317 focused tests passing,
+static compilation passing, and no remaining Critical or Important review
+finding. The reviewed branch was pushed to GitHub.
 
-Production deployment is intentionally deferred because the required safe
-restart window could not be proven. The bounded read-only production audit was
-complete and stable with zero `submit_unknown`, but the production database
-still reported:
+The later read-only safe-window check classified the previously ambiguous
+durable states without changing them:
 
-- one active `partial_failed` management batch, last updated
-  `2026-07-21 15:20:33`;
-- five active `recovery_required` management batches, latest update
-  `2026-07-23 11:28:51`;
-- three recognition decisions still in `execution_pending`, latest update
-  `2026-07-28 03:01:57`;
-- no unresolved execution event created in the most recent 30 minutes.
+- the historical `partial_failed` and `recovery_required` batches had not
+  changed since July 21–23;
+- there was no `planned`, `executing`, `reconciling`, or `submit_unknown`
+  management batch;
+- the only raw message in the preceding 30 minutes had been authoritatively
+  classified as `非策略` with automation `skipped`;
+- there was no execution event or management-batch update in the preceding
+  30 minutes.
 
-No service restart, deployment, exchange write, or trading-setting change was
-performed. Before deployment, resolve or explicitly classify those durable
-active states through the existing read-only audit/runbook path, rerun the same
-safe-window checks, then deploy commit `c412482` or its documentation-only
-successor with `scripts/server_git_update.sh`.
+Production was then fast-forwarded and restarted through
+`scripts/server_git_update.sh`. The deployed SHA was
+`84bc61e01e9eb85c5b180cba47274b027a632384`, and
+`telegram-kol.service` returned to `active/running`.
+
+Read-only production verification returned:
+
+- focused initial route: HTTP 200, 11,667 bytes;
+- three steady-state initial requests: 0.291 s, 0.292 s, and 0.279 s;
+- open-orders tab: HTTP 200 in 0.520 s;
+- order-history tab: HTTP 200 in 0.840 s;
+- position-history tab: HTTP 200 in 2.368 s.
+
+The first request immediately after restart took 4.973 s while the process and
+upstream connection path were cold. All subsequent measured initial requests
+met the sub-two-second target. Verification performed no exchange write,
+notification, or trading-setting change.
