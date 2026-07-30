@@ -440,6 +440,18 @@ def test_app_js_restores_exchange_position_tab_after_partial_reload(tmp_path):
     )
 
 
+def test_app_js_lazy_loads_exchange_position_tabs(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    js = client.get("/static/app.js").text
+
+    assert "async function loadExchangePositionTab(root, tab)" in js
+    assert "/positions-panel/tabs/${encodeURIComponent(tab)}" in js
+    assert "panel.dataset.exchangeTabLoaded === 'true'" in js
+    assert "loadExchangePositionTab(root, target)" in js
+    assert "/positions-panel?initial=positions" in js
+
+
 def test_exchange_position_tab_persists_across_dom_replacement(tmp_path):
     if shutil.which("node") is None:
         pytest.skip("Node.js is required for the browser-state behavior test")

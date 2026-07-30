@@ -3,6 +3,7 @@ import re
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from telegram_kol_research.db import create_session_factory
@@ -823,6 +824,98 @@ def test_positions_panel_builds_one_annotated_exchange_snapshot_per_request(tmp_
 
     assert response.status_code == 200
     assert factory_calls == [True]
+
+
+class _RecordingExchangePositionsClient:
+    def __init__(self):
+        self.calls: list[tuple[str, str | None]] = []
+
+    def list_positions(self):
+        self.calls.append(("list_positions", None))
+        return [
+            {
+                "pos": "1",
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-live",
+                "posSide": "long",
+                "avgPx": "60000",
+            }
+        ]
+
+    def list_open_orders(self):
+        self.calls.append(("list_open_orders", None))
+        return []
+
+    def list_order_history(self):
+        self.calls.append(("list_order_history", None))
+        return []
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        self.calls.append(("list_trigger_orders_pending", inst_id))
+        return []
+
+    def list_trigger_order_history(self, *, inst_id):
+        self.calls.append(("list_trigger_order_history", inst_id))
+        return []
+
+    def list_position_history(self, *, inst_id):
+        self.calls.append(("list_position_history", inst_id))
+        return []
+
+
+def test_positions_panel_initial_load_reads_only_live_positions(tmp_path):
+    exchange = _RecordingExchangePositionsClient()
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=lambda: exchange,
+        )
+    )
+
+    response = client.get("/positions-panel?initial=positions")
+
+    assert response.status_code == 200
+    assert exchange.calls == [
+        ("list_positions", None),
+        ("list_trigger_orders_pending", "BTC-USDT-SWAP"),
+    ]
+    assert 'data-exchange-position-panel="open-orders"' in response.text
+    assert 'data-exchange-tab-loaded="false"' in response.text
+
+
+@pytest.mark.parametrize(
+    ("tab_name", "expected_methods"),
+    [
+        (
+            "open-orders",
+            {"list_open_orders", "list_trigger_orders_pending"},
+        ),
+        (
+            "order-history",
+            {"list_order_history", "list_trigger_order_history"},
+        ),
+        ("position-history", {"list_position_history"}),
+    ],
+)
+def test_positions_panel_tab_route_reads_only_requested_dataset(
+    tmp_path,
+    tab_name,
+    expected_methods,
+):
+    exchange = _RecordingExchangePositionsClient()
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=lambda: exchange,
+        )
+    )
+
+    response = client.get(f"/positions-panel/tabs/{tab_name}")
+
+    assert response.status_code == 200
+    assert {method for method, _inst_id in exchange.calls} == expected_methods
+    assert f'data-exchange-position-panel="{tab_name}"' in response.text
+    assert 'data-exchange-tab-loaded="true"' in response.text
 
 
 def _seed_live_bound_strategy(database_path, *, pos_id: str = "pos-live") -> None:
