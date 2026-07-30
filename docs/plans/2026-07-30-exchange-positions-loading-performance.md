@@ -296,3 +296,28 @@ Verify:
 - three measured initial requests meet the latency target;
 - lazy tabs return correct counts and existing exact attribution;
 - no exchange write or notification was produced by verification.
+
+## Deployment Status — 2026-07-30
+
+Local implementation and review are complete at commit `c412482`. The focused
+regression suite passed 317 tests, static compilation passed, and review found
+no remaining Critical or Important issue. The branch was pushed to GitHub.
+
+Production deployment is intentionally deferred because the required safe
+restart window could not be proven. The bounded read-only production audit was
+complete and stable with zero `submit_unknown`, but the production database
+still reported:
+
+- one active `partial_failed` management batch, last updated
+  `2026-07-21 15:20:33`;
+- five active `recovery_required` management batches, latest update
+  `2026-07-23 11:28:51`;
+- three recognition decisions still in `execution_pending`, latest update
+  `2026-07-28 03:01:57`;
+- no unresolved execution event created in the most recent 30 minutes.
+
+No service restart, deployment, exchange write, or trading-setting change was
+performed. Before deployment, resolve or explicitly classify those durable
+active states through the existing read-only audit/runbook path, rerun the same
+safe-window checks, then deploy commit `c412482` or its documentation-only
+successor with `scripts/server_git_update.sh`.
