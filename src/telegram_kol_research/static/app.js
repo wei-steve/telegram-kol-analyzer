@@ -10,6 +10,7 @@ let promptCenterState = {
 let hasDeferredMessageRefresh = false;
 let recoveryRefreshPromise = null;
 let pendingPositionsFragment = null;
+const exchangePositionTabRequests = new WeakMap();
 const STRATEGY_RECORD_FILTER_KEY = 'telegram-workbench:strategy-filter';
 const STRATEGY_RECORD_GROUP_KEY = 'telegram-workbench:strategy-group';
 const STRATEGY_RECORD_SCROLL_KEY = 'telegram-workbench:strategy-scroll';
@@ -1769,7 +1770,7 @@ async function checkPositionsPanelForChanges() {
   const current = container?.querySelector('[data-exchange-position-tabs]');
   if (!container || !current) return false;
   try {
-    const fragment = await fetchWorkbenchPartial('/positions-panel', '[data-exchange-position-tabs]');
+    const fragment = await fetchWorkbenchPartial('/positions-panel?initial=positions', '[data-exchange-position-tabs]');
     if (current !== container.querySelector('[data-exchange-position-tabs]')) return false;
     const uiState = exchangePositionUiState(current);
     applyExchangePositionUiState(fragment, uiState);
@@ -1790,7 +1791,7 @@ async function checkPositionsPanelForChanges() {
 }
 
 async function loadPositionsPanel() {
-  const fragment = await fetchWorkbenchPartial('/positions-panel', '[data-exchange-position-tabs]');
+  const fragment = await fetchWorkbenchPartial('/positions-panel?initial=positions', '[data-exchange-position-tabs]');
   commitPositionsPanel(fragment);
 }
 
@@ -2259,6 +2260,7 @@ function bindExchangePositionTabs() {
         const target = tab.dataset.exchangePositionTab;
         setExchangePositionTab(root, target);
         saveExchangePositionTab(target);
+        loadExchangePositionTab(root, target);
       });
     });
     viewButtons.forEach((button) => {
@@ -2270,7 +2272,68 @@ function bindExchangePositionTabs() {
     });
     restoreExchangePositionTab(root);
     restoreExchangePositionView(root);
+    const restoredTab = exchangePositionTab();
+    if (restoredTab !== 'positions' && root.querySelector?.(
+      `[data-exchange-position-panel="${restoredTab}"]`,
+    )) {
+      loadExchangePositionTab(root, restoredTab);
+    }
   });
+}
+
+async function loadExchangePositionTab(root, tab) {
+  if (!root || tab === 'positions' || !EXCHANGE_POSITION_TABS.includes(tab)) {
+    return tab === 'positions';
+  }
+  if (typeof root.querySelector !== 'function') return false;
+  const selector = `[data-exchange-position-panel="${tab}"]`;
+  const panel = root.querySelector(selector);
+  if (!panel) return false;
+  if (panel.dataset.exchangeTabLoaded === 'true') return true;
+
+  let requests = exchangePositionTabRequests.get(root);
+  if (!requests) {
+    requests = new Map();
+    exchangePositionTabRequests.set(root, requests);
+  }
+  if (requests.has(tab)) return requests.get(tab);
+
+  panel.setAttribute('aria-busy', 'true');
+  const loading = panel.querySelector('[data-exchange-tab-loading]');
+  if (loading) loading.textContent = '正在加载 Deepcoin 数据...';
+  const request = (async () => {
+    try {
+      const fragment = await fetchWorkbenchPartial(
+        `/positions-panel/tabs/${encodeURIComponent(tab)}`,
+        selector,
+      );
+      const current = root.querySelector(selector);
+      if (!current) return false;
+      current.replaceWith(fragment);
+      setExchangePositionTab(root, exchangePositionTab());
+      setExchangePositionView(root, exchangePositionViewMode());
+      bindBoundPositionCloseButtons();
+      bindLivePositionAttributionButtons();
+      return true;
+    } catch (error) {
+      const current = root.querySelector(selector);
+      if (current) {
+        current.dataset.exchangeTabLoaded = 'false';
+        current.removeAttribute('aria-busy');
+        const notice = document.createElement('p');
+        notice.className = 'exchange-empty';
+        notice.dataset.exchangeTabLoading = '';
+        notice.setAttribute('role', 'alert');
+        notice.textContent = `加载失败：${error.message || '请重新点击分页重试'}`;
+        current.replaceChildren(notice);
+      }
+      return false;
+    } finally {
+      requests.delete(tab);
+    }
+  })();
+  requests.set(tab, request);
+  return request;
 }
 
 function exchangePositionTab() {
