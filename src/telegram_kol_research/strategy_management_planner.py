@@ -483,6 +483,39 @@ def _plan_strategy_management_batch_locked(
                     execution_mode=execution_mode,
                 )
 
+    if intent == "adjust_stop_loss" and candidate.stop_loss_text not in (None, ""):
+        if candidate.stop_price_source != "current_message_text":
+            return _persist_blocked(
+                session_factory,
+                identity=identity,
+                raw_message_id=raw_message_id,
+                intent=intent,
+                reason_code="explicit_stop_adjustment_source_unverified",
+                planned_at=now,
+                execution_mode=execution_mode,
+            )
+        try:
+            explicit_stop = Decimal(str(candidate.stop_loss_text))
+            price_tick = Decimal(str(contract_spec.price_tick))
+        except (InvalidOperation, TypeError, ValueError):
+            explicit_stop = Decimal("0")
+            price_tick = Decimal("0")
+        exact_tick = (
+            explicit_stop > 0
+            and price_tick > 0
+            and explicit_stop % price_tick == 0
+        )
+        if not exact_tick:
+            return _persist_blocked(
+                session_factory,
+                identity=identity,
+                raw_message_id=raw_message_id,
+                intent=intent,
+                reason_code="explicit_stop_adjustment_not_risk_tightening",
+                planned_at=now,
+                execution_mode=execution_mode,
+            )
+
     protection_by_pos_id: dict[str, dict[str, Any]] = {}
     if (
         intent in PROTECTION_EVIDENCE_INTENTS
@@ -670,6 +703,34 @@ def _plan_strategy_management_batch_locked(
                         planned_at=now,
                         execution_mode=execution_mode,
                     )
+
+    if intent == "adjust_stop_loss" and candidate.stop_loss_text not in (None, ""):
+        explicit_stop = Decimal(str(candidate.stop_loss_text))
+        verified_stops: list[Decimal] = []
+        for protection in protection_by_pos_id.values():
+            try:
+                verified_stop = Decimal(str(protection.get("stop_loss")))
+            except (InvalidOperation, TypeError, ValueError):
+                verified_stop = Decimal("0")
+            if not verified_stop.is_finite() or verified_stop <= 0:
+                verified_stops = []
+                break
+            verified_stops.append(verified_stop)
+        tightens = bool(verified_stops) and (
+            all(explicit_stop > stop for stop in verified_stops)
+            if str(lifecycle.side).lower() == "long"
+            else all(explicit_stop < stop for stop in verified_stops)
+        )
+        if not tightens:
+            return _persist_blocked(
+                session_factory,
+                identity=identity,
+                raw_message_id=raw_message_id,
+                intent=intent,
+                reason_code="explicit_stop_adjustment_not_risk_tightening",
+                planned_at=now,
+                execution_mode=execution_mode,
+            )
 
     planned_close_sizes: tuple[str | None, ...]
     if effective_fraction is None:

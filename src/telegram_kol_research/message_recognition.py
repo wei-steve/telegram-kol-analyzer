@@ -1085,10 +1085,19 @@ def _apply_lifecycle_event_decision(
         decision["exit_price"] = None
 
     try:
-        normalized_management_action, management_fraction = normalize_management_intent(
-            decision,
-            raw_message.text or "",
+        management_directive = resolve_management_directive(
+            text=raw_message.text or "",
+            lifecycle_event=decision,
         )
+        if management_directive.intent == "none":
+            normalized_management_action = (
+                str(decision.get("management_action") or "").strip().lower()
+                or "position_update"
+            )
+            management_fraction = None
+        else:
+            normalized_management_action = management_directive.intent
+            management_fraction = management_directive.fraction
     except ValueError as exc:
         if str(exc) != "management_fraction_ambiguous":
             raise
@@ -1278,7 +1287,7 @@ def _apply_lifecycle_event_decision(
             stop_price_source=(
                 str(decision.get("stop_price_source"))
                 if decision.get("stop_price_source") not in (None, "")
-                else None
+                else management_directive.stop_price_source
             ),
             requested_take_profit=explicit_take_profit,
         )
@@ -1870,6 +1879,7 @@ def _apply_deterministic_management_scope_if_matched(
     for target in targets:
         target_decision = dict(scoped_decision)
         if directive.intent in {
+            "adjust_stop_loss",
             "move_stop_to_break_even",
             "partial_then_break_even",
         }:

@@ -109,6 +109,11 @@ def _persist_exact_management_target(
     attribution_evidence=None,
     pos_ids=("pos-b",),
     management_fraction="default",
+    side="short",
+    current_stop_loss=None,
+    requested_stop_loss=None,
+    stop_price_source=None,
+    management_text="B strategy exit",
 ):
     with session_factory() as session:
         entry_a = RawMessage(
@@ -127,7 +132,7 @@ def _persist_exact_management_target(
             chat_id=100,
             message_id=30,
             posted_at=PLANNED_AT,
-            text="B strategy exit",
+            text=management_text,
         )
         session.add_all([entry_a, entry_b, management])
         session.flush()
@@ -143,9 +148,10 @@ def _persist_exact_management_target(
             chat_id=100,
             message_id=20,
             symbol="BTC",
-            side="short",
+            side=side,
             lifecycle_status="entered",
             signal_at=PLANNED_AT,
+            stop_loss=current_stop_loss,
         )
         session.add_all([lifecycle_a, lifecycle_b])
         session.flush()
@@ -168,13 +174,14 @@ def _persist_exact_management_target(
 
         binding_b = None
         if selected_has_binding:
+            strategy_instance_id = f"deepcoin:100:20:BTC:{side}"
             binding_b = ExecutionBinding(
-                strategy_instance_id="deepcoin:100:20:BTC:short",
+                strategy_instance_id=strategy_instance_id,
                 kol_id="alice",
                 chat_id=100,
                 message_id=20,
                 symbol="BTC",
-                side="short",
+                side=side,
                 venue="deepcoin",
                 pos_id=pos_ids[0],
                 status="active",
@@ -186,7 +193,7 @@ def _persist_exact_management_target(
                 session.add(
                     ExecutionOrderLeg(
                         execution_binding_id=binding_b.id,
-                        strategy_instance_id="deepcoin:100:20:BTC:short",
+                        strategy_instance_id=strategy_instance_id,
                         leg_index=index,
                         purpose="entry",
                         order_kind="market",
@@ -230,7 +237,7 @@ def _persist_exact_management_target(
             SignalCandidate(
                 raw_message_id=management.id,
                 symbol="BTC",
-                side="short",
+                side=side,
                 event_type="close_signal" if intent == "full_exit" else "position_update",
                 target_lifecycle_id=lifecycle_b.id,
                 management_action=intent,
@@ -243,6 +250,8 @@ def _persist_exact_management_target(
                     else None
                 ),
                 recognition_generation="generation-b",
+                stop_loss_text=requested_stop_loss,
+                stop_price_source=stop_price_source,
                 parse_source="mimo_authoritative",
                 confidence=0.99,
             )
@@ -1042,6 +1051,75 @@ def test_safe_explicit_break_even_stop_is_carried_to_market_execution(
         "stop_loss_text": "64000",
         "stop_price_source": "current_message_text",
     }
+
+
+def test_explicit_stop_adjustment_that_loosens_risk_is_blocked_not_closed(
+    monkeypatch,
+    tmp_path,
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "explicit-adjust-stop.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="adjust_stop_loss",
+        side="long",
+        current_stop_loss=62400,
+        requested_stop_loss="61900",
+        stop_price_source="current_message_text",
+        management_text="BTC市价62600附近，止损下移动500点，调整61900。",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    with session_factory() as session:
+        entry_leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=binding_id,
+            pos_id="pos-b",
+        ).one()
+        upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=binding_id,
+            execution_order_leg_id=entry_leg.id,
+            strategy_instance_id=entry_leg.strategy_instance_id,
+            pos_id="pos-b",
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            order_id="production-current-sl",
+            purpose="stop_loss",
+            trigger_price="62400",
+            size_text="0",
+            status="verified",
+            evidence_source="entry_protection_response",
+            evidence={"match": "exact_written_order"},
+            seen_at=PLANNED_AT,
+        )
+        session.commit()
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [_position(avg_px="63695", side="long")],
+            tpsl_orders=[
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-b",
+                    "posSide": "long",
+                    "triggerOrderType": "TPSL",
+                    "slTriggerPx": "62400",
+                    "sz": "0",
+                    "ordId": "production-current-sl",
+                }
+            ],
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "explicit_stop_adjustment_not_risk_tightening"
+    assert result.batch.intent == "adjust_stop_loss"
+    assert result.batch.effective_action == "adjust_stop_loss"
+    assert result.batch.legs == ()
 
 
 @pytest.mark.parametrize(

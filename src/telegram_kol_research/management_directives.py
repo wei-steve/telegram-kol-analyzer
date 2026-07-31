@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
@@ -101,17 +102,10 @@ def resolve_management_directive(
     strategy_thread_id = _positive_int_or_none(
         lifecycle_event.get("strategy_thread_id")
     )
-    declared_stop_source = str(
-        lifecycle_event.get("stop_price_source") or ""
-    ).strip().lower()
     current_message_stop = (
         stop_loss
-        if declared_stop_source == "current_message_text"
-        or (
-            not declared_stop_source
-            and stop_loss is not None
-            and stop_loss in normalized_text
-        )
+        if stop_loss is not None
+        and _text_contains_explicit_stop_value(normalized_text, stop_loss)
         else None
     )
     current_message_stop_source = (
@@ -154,6 +148,23 @@ def resolve_management_directive(
             stop_price_source=current_message_stop_source,
         )
 
+    if event_type in {
+        "exit_position", "exit_full", "full_exit", "close_position",
+    } or (
+        any(term in combined for term in _FULL_EXIT_TERMS)
+        and not any(
+            term in combined
+            for term in ("剩余仓位", "剩余持仓", "其余仓位", "剩下仓位")
+        )
+    ):
+        return _directive(
+            "full_exit",
+            symbol=symbol,
+            side=side,
+            reason_code="explicit_full_exit",
+            strategy_thread_id=strategy_thread_id,
+        )
+
     if raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}:
         if stop_loss is None:
             return ManagementDirective(
@@ -178,6 +189,17 @@ def resolve_management_directive(
             stop_price_source=current_message_stop_source,
         )
 
+    if event_type == "position_update" and current_message_stop is not None:
+        return _directive(
+            "adjust_stop_loss",
+            symbol=symbol,
+            side=side,
+            stop_loss=current_message_stop,
+            reason_code="explicit_stop_adjustment_requires_position_validation",
+            strategy_thread_id=strategy_thread_id,
+            stop_price_source=current_message_stop_source,
+        )
+
     if any(term in combined for term in _TAIL_TERMS):
         return _directive(
             "partial_take_profit",
@@ -190,17 +212,6 @@ def resolve_management_directive(
                 or "出局" in combined
                 else "tail_retention"
             ),
-            strategy_thread_id=strategy_thread_id,
-        )
-
-    if event_type in {
-        "exit_position", "exit_full", "full_exit", "close_position",
-    } or any(term in combined for term in _FULL_EXIT_TERMS):
-        return _directive(
-            "full_exit",
-            symbol=symbol,
-            side=side,
-            reason_code="explicit_full_exit",
             strategy_thread_id=strategy_thread_id,
         )
 
@@ -403,3 +414,42 @@ def _normalized_optional(value: Any, *, upper: bool) -> str | None:
     if not normalized:
         return None
     return normalized.upper() if upper else normalized.lower()
+
+
+def _text_contains_explicit_stop_value(text: str, value: str) -> bool:
+    try:
+        expected = Decimal(str(value).replace(",", ""))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    if not expected.is_finite() or expected <= 0:
+        return False
+    for match in re.finditer(
+        r"(?<![\d.])\d+(?:,\d{3})*(?:\.\d+)?(?![\d.])",
+        text,
+    ):
+        if (
+            match.start() > 0
+            and text[match.start() - 1] in "百千万亿"
+        ) or (
+            match.end() < len(text)
+            and text[match.end()] in "百千万亿"
+        ):
+            continue
+        token = match.group(0)
+        try:
+            observed = Decimal(token.replace(",", ""))
+        except InvalidOperation:
+            continue
+        if observed == expected:
+            prefix = text[max(0, match.start() - 32):match.start()]
+            suffix = text[match.end():min(len(text), match.end() + 16)]
+            if re.search(
+                r"(?:止损|stop\s*loss|\bmove\s+stop(?:\s+to)?|\bsl\b|"
+                r"保护(?:到|至|价)|保本(?:到|至))",
+                prefix,
+            ) or re.match(
+                r"\s*(?:(?:作为|设为|当作)\s*)?(?:止损|stop\s*loss|\bsl\b)",
+                suffix,
+            ):
+                return True
+    return False

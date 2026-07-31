@@ -219,7 +219,83 @@ def test_break_even_accepts_explicit_current_message_stop_price() -> None:
         },
     )
 
+    assert directive.intent == "adjust_stop_loss"
     assert directive.stop_loss == "64500"
+    assert directive.stop_price_source == "current_message_text"
+
+
+def test_explicit_stop_price_overrides_generic_protection_action() -> None:
+    directive = resolve_management_directive(
+        text="BTC市价62600附近，止损下移动500点，调整61900。",
+        lifecycle_event={
+            "event_type": "position_update",
+            "symbol": "BTC",
+            "side": "long",
+            "management_action": "move_stop_to_protect",
+            "stop_loss": 61900.0,
+        },
+    )
+
+    assert directive.intent == "adjust_stop_loss"
+    assert directive.stop_loss == "61900.0"
+    assert directive.stop_price_source == "current_message_text"
+
+
+def test_market_quote_is_not_proof_of_explicit_stop_price() -> None:
+    directive = resolve_management_directive(
+        text="BTC市价61900附近，移动止损到成本价。",
+        lifecycle_event={
+            "event_type": "position_update",
+            "symbol": "BTC",
+            "side": "long",
+            "management_action": "move_stop_to_protect",
+            "stop_loss": 61900,
+            "stop_price_source": "current_message_text",
+        },
+    )
+
+    assert directive.intent == "move_stop_to_break_even"
+    assert directive.stop_loss is None
+    assert directive.stop_price_source is None
+
+
+def test_explicit_full_exit_precedes_stop_adjustment() -> None:
+    directive = resolve_management_directive(
+        text="止损调到61900，随后全部平仓。",
+        lifecycle_event={
+            "event_type": "position_update",
+            "symbol": "BTC",
+            "side": "long",
+            "management_action": "move_stop_to_protect",
+            "stop_loss": 61900,
+        },
+    )
+
+    assert directive.intent == "full_exit"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "BTC 61900止损，移动保护。",
+        "BTC 调整到61900作为止损，移动保护。",
+        "BTC move stop to 61900",
+    ],
+)
+def test_price_first_explicit_stop_never_becomes_break_even(text: str) -> None:
+    directive = resolve_management_directive(
+        text=text,
+        lifecycle_event={
+            "event_type": "position_update",
+            "symbol": "BTC",
+            "side": "long",
+            "management_action": "move_stop_to_protect",
+            "stop_loss": 61900,
+        },
+    )
+
+    assert directive.intent == "adjust_stop_loss"
+    assert directive.stop_loss == "61900"
     assert directive.stop_price_source == "current_message_text"
 
 

@@ -5056,3 +5056,33 @@ def test_live_automated_stop_adjustment_delegates_to_exact_batch(tmp_path):
     assert result["status"] == "succeeded"
     assert len(client.cancel_calls) == 5
     assert len(client.set_calls) == 5
+
+
+def test_explicit_stop_on_triggered_market_side_blocks_before_any_write(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "market-side-stop.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory,
+        action="adjust_stop_loss",
+        stop_loss="64000",
+    )
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.quote["price"] = "64200"
+
+    with pytest.raises(
+        ManagementBatchExecutionError,
+        match="explicit_stop_market_side_invalid",
+    ):
+        execute_management_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=client,
+            executed_at=NOW,
+        )
+
+    assert client.cancel_calls == []
+    assert client.set_calls == []

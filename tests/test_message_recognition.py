@@ -3291,6 +3291,81 @@ def test_ai_lifecycle_event_explicit_stop_overrides_protection_price(tmp_path, m
     assert candidate.take_profit_text == "1845"
 
 
+@pytest.mark.parametrize(
+    "management_text",
+    [
+        "BTC市价62600附近，止损下移动500点，调整61900。",
+        "BTC 61900止损，移动保护。",
+    ],
+)
+def test_ai_lifecycle_event_explicit_stop_never_becomes_break_even_close(
+    tmp_path,
+    monkeypatch,
+    management_text,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=-1002337721508,
+            message_id=9818,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 7, 31, 10, 31, 47, tzinfo=UTC),
+            entered_at=datetime(2026, 7, 31, 11, 48, tzinfo=UTC),
+            entry_price_actual=63695,
+            stop_loss=62400,
+            take_profit="65000/66100",
+        )
+        raw_message = RawMessage(
+            chat_id=-1002337721508,
+            message_id=9824,
+            posted_at=datetime(2026, 7, 31, 14, 10, 24, tzinfo=UTC),
+            text=management_text,
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+
+    _mock_deepseek_lifecycle_event(
+        monkeypatch,
+        {
+            "event_type": "position_update",
+            "target_lifecycle_id": lifecycle_id,
+            "symbol": "BTC",
+            "side": "long",
+            "stop_loss": 61900.0,
+            "management_action": "move_stop_to_protect",
+            "confidence": 0.95,
+            "reason": "BTC多单止损调整至61900。",
+        },
+    )
+
+    result = recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type("Provider", (), {
+                "is_configured": True,
+                "base_url": "http://deepseek.test",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "timeout_seconds": 10,
+            })(),
+        ),
+    )
+
+    assert result.parse_source == "lifecycle_ai"
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+
+    assert candidate.event_type == "position_update"
+    assert candidate.management_action == "adjust_stop_loss"
+    assert candidate.stop_loss_text == "61900"
+    assert candidate.stop_price_source == "current_message_text"
+
+
 def test_ai_lifecycle_event_ignores_implausible_stop_and_uses_protection_price(
     tmp_path,
     monkeypatch,

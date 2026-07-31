@@ -1673,6 +1673,14 @@ def _execute_protection_batch(
                 for leg in batch.legs
             }
             skip_old_cancel = True
+        if batch.effective_action == "adjust_stop_loss":
+            _require_explicit_stop_write_boundary(
+                batch=batch,
+                binding=binding,
+                deepcoin_client=deepcoin_client,
+                inst_id=inst_id,
+                current_rows_by_pos_id=current_protection_rows_by_pos_id,
+            )
         prepared_legs = []
         for leg in batch.legs:
             old_rows = list(current_protection_rows_by_pos_id[leg.pos_id])
@@ -3165,6 +3173,80 @@ def _planned_stop_price(*, batch: ManagementBatchRecord, leg: Any) -> str:
         return str(leg.avg_entry_price).strip()
 
     raise ManagementBatchExecutionError("planned_stop_loss_missing")
+
+
+def _require_explicit_stop_write_boundary(
+    *,
+    batch: ManagementBatchRecord,
+    binding: ExecutionBinding,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    inst_id: str,
+    current_rows_by_pos_id: dict[str, list[dict[str, Any]]],
+) -> None:
+    try:
+        quote = deepcoin_client.get_ticker_quote(inst_id=inst_id)
+    except Exception as exc:
+        raise ManagementBatchExecutionError(
+            "explicit_stop_market_quote_unavailable"
+        ) from exc
+    if (
+        not isinstance(quote, dict)
+        or str(quote.get("instrument_id") or "").upper() != inst_id.upper()
+        or quote.get("price_field") not in {"last", "lastPx"}
+    ):
+        raise ManagementBatchExecutionError(
+            "explicit_stop_market_quote_unavailable"
+        )
+    market_price = _decimal_or_none(quote.get("price"))
+    if market_price is None or market_price <= 0:
+        raise ManagementBatchExecutionError(
+            "explicit_stop_market_quote_unavailable"
+        )
+    side = str(binding.side or "").strip().lower()
+    if side not in {"long", "short"}:
+        raise ManagementBatchExecutionError("explicit_stop_market_side_invalid")
+    for leg in batch.legs:
+        planned_stop = _decimal_or_none(
+            _planned_stop_price(batch=batch, leg=leg)
+        )
+        current_stops = {
+            price
+            for row in current_rows_by_pos_id.get(str(leg.pos_id), [])
+            if (price := _snapshot_stop_price(row))
+            is not None
+            and price > 0
+        }
+        if planned_stop is None:
+            raise ManagementBatchExecutionError("planned_stop_loss_invalid")
+        if side == "long":
+            market_safe = planned_stop < market_price
+            tightens = bool(current_stops) and all(
+                planned_stop > stop for stop in current_stops
+            )
+        else:
+            market_safe = planned_stop > market_price
+            tightens = bool(current_stops) and all(
+                planned_stop < stop for stop in current_stops
+            )
+        if not market_safe:
+            raise ManagementBatchExecutionError(
+                "explicit_stop_market_side_invalid"
+            )
+        if not tightens:
+            raise ManagementBatchExecutionError(
+                "explicit_stop_not_risk_tightening"
+            )
+
+
+def _snapshot_stop_price(row: dict[str, Any]) -> Decimal | None:
+    purpose = str(row.get("purpose") or "").strip().lower()
+    if purpose == "stop_loss":
+        return _decimal_or_none(row.get("trigger_price"))
+    if purpose == "combined":
+        stop_loss = row.get("stop_loss")
+        if isinstance(stop_loss, dict):
+            return _decimal_or_none(stop_loss.get("trigger_price"))
+    return None
 
 
 def _adjusted_combined_protection_row(
