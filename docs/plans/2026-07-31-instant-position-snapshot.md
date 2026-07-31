@@ -306,3 +306,30 @@ Record exact timings and deployment status in this plan, commit the
 documentation-only update, push it, and update production only after another
 safe-window check.
 
+## Production rollout result
+
+Completed on 2026-07-31:
+
+- Production commit: `84a8e3458512a2efc8864788a181aa7631fb806c`.
+- The initial `/?view=positions` document now server-renders the persisted
+  position snapshot. It does not wait for a Deepcoin refresh.
+- A stale focused panel response completed in `0.2087s`; three concurrent
+  reads during its background refresh completed in `0.1067–0.1216s`.
+- The background refresh changed the persisted snapshot version successfully.
+- Warm localhost server-rendered position documents completed in
+  `0.0337–0.0438s` (one additional sample was `0.4311s`). A request made while
+  the service startup refresh was still active took `2.7345s`, without losing
+  the persisted position cards.
+- Chrome authenticated reloads commonly rendered the two position cards in
+  `0.817–1.201s`. Two network/browser outliers remained (`6.939s` and
+  `10.020s`); the latter occurred immediately after deployment and did not
+  render the position fragment. These outliers are outside the now-fast
+  application data path and should be investigated separately at the
+  browser/authentication/network layer if they remain user-visible.
+- Versioned JavaScript is served with
+  `Cache-Control: public, max-age=31536000, immutable`.
+- The persisted cache contained no credential marker, the service was active,
+  and post-deployment logs contained no `Traceback`, `ERROR`, `Exception`, or
+  `Failed` markers.
+- Regression: `322 passed`; compile, JavaScript syntax, and whitespace checks
+  also passed.
