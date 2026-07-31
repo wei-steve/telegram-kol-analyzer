@@ -378,7 +378,11 @@
 
   <section class="dashboard-tab-panel workbench-panel" data-dashboard-panel="exchange-positions" data-workbench-panel="positions">
     <div data-lazy-workbench="positions" aria-busy="false">
+      {% if render_initial_positions %}
+      {% include "_exchange_positions_panel.html" %}
+      {% else %}
       {% with loading_text='打开持仓后加载 Deepcoin 实时数据' %}{% include "_workbench_loading.html" %}{% endwith %}
+      {% endif %}
     </div>
   </section>
 

@@ -940,6 +940,30 @@ def test_positions_panel_fresh_snapshot_avoids_deepcoin_read(tmp_path):
     assert "持仓数据刚刚更新" in response.text
 
 
+def test_positions_view_server_renders_cached_snapshot_in_initial_document(tmp_path):
+    snapshot_path = tmp_path / "web-cache" / "positions.json"
+    LivePositionSnapshotStore(snapshot_path).finish_success(
+        _cached_live_position_snapshot("initial-document-pos"),
+        captured_at=datetime(2026, 7, 31, 8, 15, tzinfo=UTC),
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("fresh initial document must avoid Deepcoin")
+        ),
+        live_position_snapshot_path=snapshot_path,
+        position_snapshot_now_provider=lambda: datetime(
+            2026, 7, 31, 8, 15, 2, tzinfo=UTC
+        ),
+    )
+
+    response = TestClient(app).get("/?view=positions")
+
+    assert response.status_code == 200
+    assert "initial-document-pos" in response.text
+    assert 'data-position-snapshot-state="current"' in response.text
+
+
 def test_positions_panel_stale_snapshot_returns_cached_then_refreshes(tmp_path):
     snapshot_path = tmp_path / "web-cache" / "positions.json"
     store = LivePositionSnapshotStore(snapshot_path)

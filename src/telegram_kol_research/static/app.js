@@ -4327,6 +4327,13 @@ window.addEventListener('DOMContentLoaded', () => {
   bindDetailPanelControls();
   bindDashboardTabs();
   bindMobileWorkNavigation();
+  const initialPositionsPanel = document.querySelector(
+    '[data-lazy-workbench="positions"] [data-exchange-position-tabs]',
+  );
+  if (initialPositionsPanel) {
+    markWorkbenchLoaded('positions');
+    schedulePositionSnapshotRefresh(initialPositionsPanel);
+  }
   scheduleInitialWorkbenchView();
   bindHomeEventFilters();
   bindGroupContext();

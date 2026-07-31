@@ -4997,28 +4997,34 @@ def create_web_app(
         )
 
     @app.get("/")
-    def index(request: Request):
+    def index(request: Request, view: str | None = None):
         freshness = load_database_freshness(
             app.state.session_factory,
             now=app.state.now_provider(),
         )
         monitor_status = build_monitor_status()
         live_listener_enabled = monitor_status["state"] == "monitoring"
+        context = {
+            "live_listener_enabled": live_listener_enabled,
+            "monitor_status": monitor_status,
+            "live_listener_status_reason": app.state.live_listener_status_reason,
+            "session_lock_owner_pid": _extract_session_lock_owner_pid(
+                app.state.live_listener_status_reason
+            ),
+            "database_latest_message_at": freshness["latest_message_at"],
+            "database_stale_hours": freshness["stale_hours"],
+            "asset_version": app.state.asset_version,
+            "render_deferred_more": False,
+            "render_initial_positions": view == "positions",
+        }
+        if view == "positions":
+            context.update(
+                build_initial_positions_panel_context(schedule_refresh=True)
+            )
         return templates.TemplateResponse(
             request,
             "index.html",
-            {
-                "live_listener_enabled": live_listener_enabled,
-                "monitor_status": monitor_status,
-                "live_listener_status_reason": app.state.live_listener_status_reason,
-                "session_lock_owner_pid": _extract_session_lock_owner_pid(
-                    app.state.live_listener_status_reason
-                ),
-                "database_latest_message_at": freshness["latest_message_at"],
-                "database_stale_hours": freshness["stale_hours"],
-                "asset_version": app.state.asset_version,
-                "render_deferred_more": False,
-            },
+            context,
         )
 
     @app.get("/more-panel")
