@@ -13,6 +13,7 @@ let pendingPositionsFragment = null;
 const POSITION_SNAPSHOT_RETRY_DELAYS = [1000, 2000, 4000];
 let positionSnapshotRetryTimer = null;
 let positionSnapshotRetryToken = 0;
+let positionSnapshotRetryAttempt = 0;
 const exchangePositionTabRequests = new WeakMap();
 const STRATEGY_RECORD_FILTER_KEY = 'telegram-workbench:strategy-filter';
 const STRATEGY_RECORD_GROUP_KEY = 'telegram-workbench:strategy-group';
@@ -1709,7 +1710,7 @@ function bindStrategyRecordController() {
   updateStrategyRecordChangesBadge();
 }
 
-function commitPositionsPanel(fragment) {
+function commitPositionsPanel(fragment, { preserveSnapshotRetryBudget = false } = {}) {
   const container = document.querySelector('[data-lazy-workbench="positions"]');
   if (!container || !fragment) return false;
   const current = container.querySelector('[data-exchange-position-tabs]');
@@ -1722,7 +1723,9 @@ function commitPositionsPanel(fragment) {
   bindBoundPositionCloseButtons();
   bindDeepcoinPositionSync();
   bindLivePositionAttributionButtons();
-  schedulePositionSnapshotRefresh(fragment);
+  schedulePositionSnapshotRefresh(fragment, {
+    preserveRetryBudget: preserveSnapshotRetryBudget,
+  });
   return true;
 }
 
@@ -1793,7 +1796,9 @@ async function checkPositionsPanelForChanges({ applySnapshotRefresh = false } = 
       && current.dataset.positionSnapshotState !== 'current'
     ) {
       clearPendingPositionsRefreshNotice();
-      return commitPositionsPanel(fragment);
+      return commitPositionsPanel(fragment, {
+        preserveSnapshotRetryBudget: true,
+      });
     }
     pendingPositionsFragment = fragment;
     showPendingPositionsRefreshNotice();
@@ -1803,41 +1808,42 @@ async function checkPositionsPanelForChanges({ applySnapshotRefresh = false } = 
   }
 }
 
-function cancelPositionSnapshotRefresh() {
+function cancelPositionSnapshotRefresh({ resetRetryBudget = true } = {}) {
   positionSnapshotRetryToken += 1;
   if (positionSnapshotRetryTimer !== null) {
     window.clearTimeout(positionSnapshotRetryTimer);
     positionSnapshotRetryTimer = null;
   }
+  if (resetRetryBudget) positionSnapshotRetryAttempt = 0;
 }
 
-function schedulePositionSnapshotRefresh(root) {
-  cancelPositionSnapshotRefresh();
+function schedulePositionSnapshotRefresh(
+  root,
+  { preserveRetryBudget = false } = {},
+) {
+  cancelPositionSnapshotRefresh({ resetRetryBudget: !preserveRetryBudget });
   if (!root || root.dataset.positionSnapshotState === 'current') return;
+  if (positionSnapshotRetryAttempt >= POSITION_SNAPSHOT_RETRY_DELAYS.length) return;
   const token = positionSnapshotRetryToken;
-
-  const scheduleAttempt = (index) => {
-    if (index >= POSITION_SNAPSHOT_RETRY_DELAYS.length) return;
-    positionSnapshotRetryTimer = window.setTimeout(async () => {
-      positionSnapshotRetryTimer = null;
-      const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView;
-      const current = document.querySelector('[data-lazy-workbench="positions"] [data-exchange-position-tabs]');
-      if (
-        token !== positionSnapshotRetryToken
-        || activeView !== 'positions'
-        || current !== root
-      ) {
-        return;
-      }
-      await checkPositionsPanelForChanges({ applySnapshotRefresh: true });
-      if (token !== positionSnapshotRetryToken) return;
-      const refreshed = document.querySelector('[data-lazy-workbench="positions"] [data-exchange-position-tabs]');
-      if (!refreshed || refreshed.dataset.positionSnapshotState === 'current') return;
-      scheduleAttempt(index + 1);
-    }, POSITION_SNAPSHOT_RETRY_DELAYS[index]);
-  };
-
-  scheduleAttempt(0);
+  const delay = POSITION_SNAPSHOT_RETRY_DELAYS[positionSnapshotRetryAttempt];
+  positionSnapshotRetryAttempt += 1;
+  positionSnapshotRetryTimer = window.setTimeout(async () => {
+    positionSnapshotRetryTimer = null;
+    const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView;
+    const current = document.querySelector('[data-lazy-workbench="positions"] [data-exchange-position-tabs]');
+    if (
+      token !== positionSnapshotRetryToken
+      || activeView !== 'positions'
+      || current !== root
+    ) {
+      return;
+    }
+    await checkPositionsPanelForChanges({ applySnapshotRefresh: true });
+    if (token !== positionSnapshotRetryToken) return;
+    const refreshed = document.querySelector('[data-lazy-workbench="positions"] [data-exchange-position-tabs]');
+    if (!refreshed || refreshed.dataset.positionSnapshotState === 'current') return;
+    schedulePositionSnapshotRefresh(refreshed, { preserveRetryBudget: true });
+  }, delay);
 }
 
 async function loadPositionsPanel() {

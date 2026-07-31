@@ -894,6 +894,7 @@ def _load_deepcoin_live_position_rows(
     error_state: dict[str, str] | None = None,
     deepcoin_client=None,
     unattributed_protection_rows: list[dict[str, str]] | None = None,
+    source_capture: dict[str, Any] | None = None,
 ) -> list[dict[str, object]]:
     try:
         if deepcoin_client is None:
@@ -914,6 +915,14 @@ def _load_deepcoin_live_position_rows(
         deepcoin_client,
         active_positions,
     )
+    if source_capture is not None:
+        source_capture.update(
+            {
+                "positions": positions,
+                "tpsl_orders": tpsl_orders,
+                "tpsl_evidence_available": tpsl_evidence_available,
+            }
+        )
     with session_factory() as session:
         active_pos_ids = {
             pos_id
@@ -1313,6 +1322,7 @@ def _load_exchange_live_snapshot(
         return snapshot
     position_error: dict[str, str] = {}
     unattributed_protection_orders: list[dict[str, str]] = []
+    source_capture: dict[str, Any] = {}
     scope = client if hasattr(client, "__enter__") else nullcontext(client)
     with scope:
         snapshot["positions"] = _load_deepcoin_live_position_rows(
@@ -1323,10 +1333,61 @@ def _load_exchange_live_snapshot(
             error_state=position_error,
             deepcoin_client=client,
             unattributed_protection_rows=unattributed_protection_orders,
+            source_capture=source_capture,
         )
     snapshot["unattributed_protection_orders"] = unattributed_protection_orders
     if position_error:
         snapshot["error"] = position_error["error"]
+    else:
+        snapshot["_live_source"] = source_capture
+    return snapshot
+
+
+class _CachedLivePositionClient:
+    def __init__(self, source: dict[str, Any]) -> None:
+        self._positions = list(source.get("positions") or [])
+        self._tpsl_orders = list(source.get("tpsl_orders") or [])
+        self._tpsl_evidence_available = bool(
+            source.get("tpsl_evidence_available", True)
+        )
+
+    def list_positions(self):
+        return self._positions
+
+    def list_trigger_orders_pending(self, *, inst_id: str):
+        if not self._tpsl_evidence_available:
+            raise DeepcoinClientError("cached TPSL evidence unavailable")
+        normalized_inst_id = str(inst_id or "").upper()
+        return [
+            order
+            for order in self._tpsl_orders
+            if not str(order.get("instId") or "")
+            or str(order.get("instId") or "").upper() == normalized_inst_id
+        ]
+
+
+def _materialize_cached_live_position_snapshot(
+    session_factory,
+    *,
+    payload: dict[str, Any],
+    group_label_by_chat_id: dict[int, str],
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+) -> dict[str, Any]:
+    source = payload.get("_live_source")
+    if not isinstance(source, dict):
+        return payload
+    snapshot = _empty_exchange_snapshot()
+    unattributed_protection_orders: list[dict[str, str]] = []
+    client = _CachedLivePositionClient(source)
+    snapshot["positions"] = _load_deepcoin_live_position_rows(
+        session_factory,
+        deepcoin_client_factory=lambda: client,
+        group_label_by_chat_id=group_label_by_chat_id,
+        contract_spec_provider=contract_spec_provider,
+        deepcoin_client=client,
+        unattributed_protection_rows=unattributed_protection_orders,
+    )
+    snapshot["unattributed_protection_orders"] = unattributed_protection_orders
     return snapshot
 
 
@@ -3479,8 +3540,31 @@ def create_web_app(
                         startup_delay_seconds=app.state.reconcile_startup_delay_seconds,
                     )
                 )
+            if (
+                app.state.live_position_snapshot_store.read() is None
+                and app.state.position_snapshot_startup_task is None
+            ):
+                app.state.position_snapshot_startup_task = asyncio.create_task(
+                    asyncio.to_thread(refresh_live_position_snapshot)
+                )
+                app.state.position_snapshot_startup_task.add_done_callback(
+                    _log_background_task_result(
+                        "position_snapshot_startup_task"
+                    )
+                )
             yield
         finally:
+            position_snapshot_startup_task = (
+                app.state.position_snapshot_startup_task
+            )
+            if position_snapshot_startup_task is not None:
+                try:
+                    await position_snapshot_startup_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.position_snapshot_startup_task = None
             await _stop_semantic_review_task(app)
             # ── lifecycle monitor shutdown ──
             lcm_task = getattr(app.state, "lifecycle_monitor_task", None)
@@ -3727,6 +3811,7 @@ def create_web_app(
     app.state.system_operator_bot_command_task = None
     app.state.strategy_management_notification_task = None
     app.state.runtime_incident_notification_task = None
+    app.state.position_snapshot_startup_task = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client
     app.state.reconcile_once_runner = run_reconcile_once
@@ -4153,9 +4238,9 @@ def create_web_app(
             "lazy_exchange_tabs": False,
         }
 
-    def refresh_live_position_snapshot(*, refresh_claimed: bool = False):
+    def refresh_live_position_snapshot():
         store = app.state.live_position_snapshot_store
-        if not refresh_claimed and not store.begin_refresh():
+        if not store.begin_refresh():
             return store.read()
         try:
             exchange_snapshot = _load_exchange_live_snapshot(
@@ -4169,8 +4254,15 @@ def create_web_app(
             if exchange_snapshot.get("error"):
                 store.finish_failure(str(exchange_snapshot["error"]))
                 return store.read()
+            source = exchange_snapshot.get("_live_source")
+            if not isinstance(source, dict):
+                store.finish_failure("live source unavailable")
+                return store.read()
             return store.finish_success(
-                exchange_snapshot,
+                {
+                    **_empty_exchange_snapshot(),
+                    "_live_source": source,
+                },
                 captured_at=app.state.position_snapshot_now_provider(),
             )
         except Exception as exc:
@@ -4233,33 +4325,32 @@ def create_web_app(
         group_label_by_chat_id = _group_label_by_chat_id(app.state.group_config)
         store = app.state.live_position_snapshot_store
         position_snapshot = store.read()
+        refresh_scheduled = False
         if position_snapshot is None:
-            if store.begin_refresh():
-                position_snapshot = refresh_live_position_snapshot(
-                    refresh_claimed=True
-                )
+            if background_tasks is not None:
+                background_tasks.add_task(refresh_live_position_snapshot)
+                refresh_scheduled = True
             else:
-                position_snapshot = store.read()
+                position_snapshot = refresh_live_position_snapshot()
         else:
             metadata = position_snapshot_metadata(position_snapshot)
             if (
                 metadata["age_seconds"] is not None
                 and metadata["age_seconds"]
                 >= app.state.position_snapshot_refresh_seconds
-                and store.begin_refresh()
             ):
-                position_snapshot = store.read()
                 if background_tasks is not None:
-                    background_tasks.add_task(
-                        refresh_live_position_snapshot,
-                        refresh_claimed=True,
-                    )
+                    background_tasks.add_task(refresh_live_position_snapshot)
+                    refresh_scheduled = True
                 else:
-                    position_snapshot = refresh_live_position_snapshot(
-                        refresh_claimed=True
-                    )
+                    position_snapshot = refresh_live_position_snapshot()
         exchange_snapshot = (
-            position_snapshot.payload
+            _materialize_cached_live_position_snapshot(
+                app.state.session_factory,
+                payload=position_snapshot.payload,
+                group_label_by_chat_id=group_label_by_chat_id,
+                contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+            )
             if position_snapshot is not None
             else {
                 **_empty_exchange_snapshot(),
@@ -4279,7 +4370,10 @@ def create_web_app(
             "pending_entry_signals": pending_entry_signals,
             "exited_positions": [],
             "lazy_exchange_tabs": True,
-            "position_snapshot": position_snapshot_metadata(position_snapshot),
+            "position_snapshot": {
+                **position_snapshot_metadata(position_snapshot),
+                **({"state": "refreshing"} if refresh_scheduled else {}),
+            },
         }
 
     def build_exchange_position_tab_context(tab_name: str) -> dict[str, Any]:

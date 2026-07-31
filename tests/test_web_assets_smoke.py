@@ -253,6 +253,49 @@ def test_position_snapshot_assets_use_bounded_automatic_refresh(tmp_path):
     assert ".position-snapshot-status--stale" in css
     assert ".position-snapshot-status--error" in css
 
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required for the bounded retry behavior test")
+    refresh_start = js.index("function cancelPositionSnapshotRefresh")
+    refresh_end = js.index("\nasync function loadPositionsPanel", refresh_start)
+    refresh_source = js[refresh_start:refresh_end]
+    harness = textwrap.dedent(
+        f"""
+        const POSITION_SNAPSHOT_RETRY_DELAYS = [1000, 2000, 4000];
+        let positionSnapshotRetryTimer = null;
+        let positionSnapshotRetryToken = 0;
+        let positionSnapshotRetryAttempt = 0;
+        const root = {{ dataset: {{ positionSnapshotState: 'error' }} }};
+        const dashboard = {{ dataset: {{ activeWorkbenchView: 'positions' }} }};
+        const window = {{
+          setTimeout: (fn) => setTimeout(fn, 0),
+          clearTimeout: (timer) => clearTimeout(timer),
+        }};
+        const document = {{
+          querySelector: (selector) => selector.includes('trader-dashboard') ? dashboard : root,
+        }};
+        let calls = 0;
+        async function checkPositionsPanelForChanges() {{
+          calls += 1;
+          root.dataset.positionSnapshotState = calls % 2 ? 'refreshing' : 'error';
+          schedulePositionSnapshotRefresh(root, {{ preserveRetryBudget: true }});
+          return true;
+        }}
+        {refresh_source}
+        schedulePositionSnapshotRefresh(root);
+        setTimeout(() => {{
+          if (calls !== 3) process.exit(1);
+          process.exit(0);
+        }}, 100);
+        """
+    )
+    subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
 
 def test_positions_refresh_normalizes_and_restores_in_memory_ui_state(tmp_path):
     if shutil.which("node") is None:

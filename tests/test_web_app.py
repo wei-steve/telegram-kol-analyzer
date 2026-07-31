@@ -17,6 +17,7 @@ from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
+from telegram_kol_research.live_position_snapshot import LivePositionSnapshotStore
 from telegram_kol_research.recovery_decisions import list_recovery_decisions
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
@@ -5278,6 +5279,34 @@ def test_versioned_workbench_assets_are_immutable_but_mismatches_revalidate(
     )
     assert "immutable" not in mismatched.headers.get("cache-control", "")
     assert "immutable" not in unversioned.headers.get("cache-control", "")
+
+
+@pytest.mark.parametrize("corrupt_cache", [False, True])
+def test_app_startup_prewarms_missing_or_corrupt_position_snapshot(
+    tmp_path,
+    corrupt_cache,
+):
+    snapshot_path = tmp_path / "web-cache" / "positions.json"
+    if corrupt_cache:
+        snapshot_path.parent.mkdir(parents=True)
+        snapshot_path.write_text("{corrupt", encoding="utf-8")
+    called = threading.Event()
+
+    class EmptyDeepcoinClient:
+        def list_positions(self):
+            called.set()
+            return []
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=EmptyDeepcoinClient,
+        live_position_snapshot_path=snapshot_path,
+    )
+
+    with TestClient(app):
+        assert called.wait(timeout=1)
+
+    assert LivePositionSnapshotStore(snapshot_path).read() is not None
 
 
 def test_runtime_agent_telegram_evidence_endpoint_is_bounded_and_exact(

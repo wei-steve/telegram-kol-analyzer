@@ -968,7 +968,11 @@ def test_positions_panel_stale_snapshot_returns_cached_then_refreshes(tmp_path):
     ]
     assert refreshed is not None
     assert refreshed.version != old.version
-    assert refreshed.payload["positions"][0]["pos_id"] == "pos-live"
+    assert refreshed.payload["positions"] == []
+    assert (
+        refreshed.payload["_live_source"]["positions"][0]["posId"]
+        == "pos-live"
+    )
 
 
 def test_positions_panel_without_snapshot_loads_and_persists_fallback(tmp_path):
@@ -987,10 +991,11 @@ def test_positions_panel_without_snapshot_loads_and_persists_fallback(tmp_path):
     persisted = LivePositionSnapshotStore(snapshot_path).read()
 
     assert response.status_code == 200
-    assert "pos-live" in response.text
+    assert "pos-live" not in response.text
+    assert 'data-position-snapshot-state="refreshing"' in response.text
     assert persisted is not None
-    assert persisted.payload["positions"][0]["pos_id"] == "pos-live"
-    assert 'data-position-snapshot-state="current"' in response.text
+    assert persisted.payload["positions"] == []
+    assert persisted.payload["_live_source"]["positions"][0]["posId"] == "pos-live"
 
 
 def test_positions_panel_failed_refresh_preserves_successful_snapshot(tmp_path):
@@ -1021,6 +1026,84 @@ def test_positions_panel_failed_refresh_preserves_successful_snapshot(tmp_path):
     assert current is not None
     assert current.version == saved.version
     assert current.last_error == "unavailable"
+
+
+def test_positions_panel_rebuilds_local_evidence_instead_of_using_cached_attribution(
+    tmp_path,
+):
+    snapshot_path = tmp_path / "web-cache" / "positions.json"
+    LivePositionSnapshotStore(snapshot_path).finish_success(
+        {
+            **_cached_live_position_snapshot(),
+            "_live_source": {
+                "positions": [
+                    {
+                        "pos": "1",
+                        "instId": "BTC-USDT-SWAP",
+                        "posId": "cached-pos",
+                        "posSide": "long",
+                        "avgPx": "60000",
+                    }
+                ],
+                "tpsl_orders": [],
+                "tpsl_evidence_available": True,
+            },
+            "positions": [
+                {
+                    **_cached_live_position_snapshot()["positions"][0],
+                    "persisted_attribution": {
+                        "state": "bound",
+                        "label": "已验证归属",
+                        "group_name": "STALE-GROUP",
+                    },
+                }
+            ],
+        },
+        captured_at=datetime(2026, 7, 31, 8, 15, tzinfo=UTC),
+    )
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("cached response must not call Deepcoin")
+        ),
+        live_position_snapshot_path=snapshot_path,
+        position_snapshot_now_provider=lambda: datetime(
+            2026, 7, 31, 8, 15, 1, tzinfo=UTC
+        ),
+    )
+
+    response = TestClient(app).get("/positions-panel?initial=positions")
+
+    assert response.status_code == 200
+    assert "cached-pos" in response.text
+    assert "STALE-GROUP" not in response.text
+    assert "归属待确认" in response.text
+
+
+def test_position_snapshot_claim_is_not_leaked_when_rendering_fails(tmp_path):
+    snapshot_path = tmp_path / "web-cache" / "positions.json"
+    LivePositionSnapshotStore(snapshot_path).finish_success(
+        {
+            **_cached_live_position_snapshot(),
+            "positions": None,
+        },
+        captured_at=datetime(2026, 7, 31, 8, 15, tzinfo=UTC),
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        live_position_snapshot_path=snapshot_path,
+        position_snapshot_now_provider=lambda: datetime(
+            2026, 7, 31, 8, 16, tzinfo=UTC
+        ),
+    )
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/positions-panel?initial=positions"
+    )
+
+    assert response.status_code == 500
+    assert app.state.live_position_snapshot_store.begin_refresh() is True
 
 
 @pytest.mark.parametrize(
