@@ -21,6 +21,7 @@ from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
+from telegram_kol_research.live_position_snapshot import LivePositionSnapshotStore
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_scan import RecoveryDecision
@@ -882,6 +883,142 @@ def test_positions_panel_initial_load_reads_only_live_positions(tmp_path):
     ]
     assert 'data-exchange-position-panel="open-orders"' in response.text
     assert 'data-exchange-tab-loaded="false"' in response.text
+
+
+def _cached_live_position_snapshot(pos_id="cached-pos"):
+    return {
+        "positions": [
+            {
+                "symbol": "BTC",
+                "inst_id": "BTC-USDT-SWAP",
+                "pos_id": pos_id,
+                "side": "long",
+                "entry_text": "60000",
+                "position_size_text": "1 contracts BTC-USDT-SWAP",
+                "exchange_protection_orders": [],
+            }
+        ],
+        "unattributed_protection_orders": [],
+        "open_orders": [],
+        "order_history": [],
+        "position_history": [],
+        "error": None,
+    }
+
+
+def test_positions_panel_fresh_snapshot_avoids_deepcoin_read(tmp_path):
+    snapshot_path = tmp_path / "web-cache" / "positions.json"
+    captured_at = datetime(2026, 7, 31, 8, 15, tzinfo=UTC)
+    saved = LivePositionSnapshotStore(snapshot_path).finish_success(
+        _cached_live_position_snapshot(),
+        captured_at=captured_at,
+    )
+    factory_calls = []
+
+    def forbidden_factory():
+        factory_calls.append(True)
+        raise AssertionError("fresh position snapshot must avoid Deepcoin")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=forbidden_factory,
+        live_position_snapshot_path=snapshot_path,
+        position_snapshot_now_provider=lambda: datetime(
+            2026, 7, 31, 8, 15, 2, tzinfo=UTC
+        ),
+    )
+
+    response = TestClient(app).get("/positions-panel?initial=positions")
+
+    assert response.status_code == 200
+    assert factory_calls == []
+    assert "cached-pos" in response.text
+    assert f'data-position-snapshot-version="{saved.version}"' in response.text
+    assert 'data-position-snapshot-state="current"' in response.text
+
+
+def test_positions_panel_stale_snapshot_returns_cached_then_refreshes(tmp_path):
+    snapshot_path = tmp_path / "web-cache" / "positions.json"
+    store = LivePositionSnapshotStore(snapshot_path)
+    old = store.finish_success(
+        _cached_live_position_snapshot(),
+        captured_at=datetime(2026, 7, 31, 8, 15, tzinfo=UTC),
+    )
+    exchange = _RecordingExchangePositionsClient()
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: exchange,
+        live_position_snapshot_path=snapshot_path,
+        position_snapshot_now_provider=lambda: datetime(
+            2026, 7, 31, 8, 15, 10, tzinfo=UTC
+        ),
+    )
+
+    response = TestClient(app).get("/positions-panel?initial=positions")
+    refreshed = app.state.live_position_snapshot_store.read()
+
+    assert response.status_code == 200
+    assert "cached-pos" in response.text
+    assert 'data-position-snapshot-state="refreshing"' in response.text
+    assert exchange.calls == [
+        ("list_positions", None),
+        ("list_trigger_orders_pending", "BTC-USDT-SWAP"),
+    ]
+    assert refreshed is not None
+    assert refreshed.version != old.version
+    assert refreshed.payload["positions"][0]["pos_id"] == "pos-live"
+
+
+def test_positions_panel_without_snapshot_loads_and_persists_fallback(tmp_path):
+    snapshot_path = tmp_path / "web-cache" / "positions.json"
+    exchange = _RecordingExchangePositionsClient()
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: exchange,
+        live_position_snapshot_path=snapshot_path,
+        position_snapshot_now_provider=lambda: datetime(
+            2026, 7, 31, 8, 15, tzinfo=UTC
+        ),
+    )
+
+    response = TestClient(app).get("/positions-panel?initial=positions")
+    persisted = LivePositionSnapshotStore(snapshot_path).read()
+
+    assert response.status_code == 200
+    assert "pos-live" in response.text
+    assert persisted is not None
+    assert persisted.payload["positions"][0]["pos_id"] == "pos-live"
+    assert 'data-position-snapshot-state="current"' in response.text
+
+
+def test_positions_panel_failed_refresh_preserves_successful_snapshot(tmp_path):
+    snapshot_path = tmp_path / "web-cache" / "positions.json"
+    store = LivePositionSnapshotStore(snapshot_path)
+    saved = store.finish_success(
+        _cached_live_position_snapshot(),
+        captured_at=datetime(2026, 7, 31, 8, 15, tzinfo=UTC),
+    )
+
+    def broken_factory():
+        raise RuntimeError("exchange unavailable")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=broken_factory,
+        live_position_snapshot_path=snapshot_path,
+        position_snapshot_now_provider=lambda: datetime(
+            2026, 7, 31, 8, 16, tzinfo=UTC
+        ),
+    )
+
+    response = TestClient(app).get("/positions-panel?initial=positions")
+    current = app.state.live_position_snapshot_store.read()
+
+    assert response.status_code == 200
+    assert "cached-pos" in response.text
+    assert current is not None
+    assert current.version == saved.version
+    assert current.last_error == "unavailable"
 
 
 @pytest.mark.parametrize(

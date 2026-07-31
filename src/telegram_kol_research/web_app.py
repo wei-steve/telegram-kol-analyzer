@@ -18,7 +18,7 @@ import httpx
 from sqlalchemy import func
 
 try:
-    from fastapi import FastAPI, Request
+    from fastapi import BackgroundTasks, FastAPI, Request
     from fastapi import HTTPException
     from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
     from fastapi.staticfiles import StaticFiles
@@ -63,6 +63,7 @@ from telegram_kol_research.gate_market_data import GateMarketDataProvider
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
 from telegram_kol_research.live_updates import LiveUpdateBroker
+from telegram_kol_research.live_position_snapshot import LivePositionSnapshotStore
 from telegram_kol_research.message_recognition import recognize_message_now
 from telegram_kol_research.models import (
     AiPromptTestRun,
@@ -3309,6 +3310,10 @@ def create_web_app(
     strategy_management_worker_max_batches: int = 10,
     runtime_agent_production_audit_runner=None,
     runtime_agent_telegram_evidence_runner=None,
+    live_position_snapshot_path: str | Path | None = None,
+    position_snapshot_now_provider=None,
+    position_snapshot_refresh_seconds: float = 5.0,
+    position_snapshot_stale_seconds: float = 30.0,
 ) -> FastAPI:
     """Create the minimal FastAPI app used by the web command."""
 
@@ -3640,6 +3645,23 @@ def create_web_app(
     app.state.deepcoin_contract_spec_provider = deepcoin_contract_spec_provider
     app.state.deepcoin_client_factory = (
         deepcoin_client_factory or build_deepcoin_client_from_env
+    )
+    app.state.live_position_snapshot_store = LivePositionSnapshotStore(
+        Path(live_position_snapshot_path)
+        if live_position_snapshot_path is not None
+        else resolved_database_path.parent
+        / "web_cache"
+        / "deepcoin_live_positions.json"
+    )
+    app.state.position_snapshot_now_provider = (
+        position_snapshot_now_provider or app.state.now_provider
+    )
+    app.state.position_snapshot_refresh_seconds = max(
+        0.0, float(position_snapshot_refresh_seconds)
+    )
+    app.state.position_snapshot_stale_seconds = max(
+        app.state.position_snapshot_refresh_seconds,
+        float(position_snapshot_stale_seconds),
     )
     app.state.deepcoin_reconcile_runner = (
         deepcoin_reconcile_runner or run_deepcoin_execution_reconcile_loop
@@ -4119,7 +4141,70 @@ def create_web_app(
             "lazy_exchange_tabs": False,
         }
 
-    def build_initial_positions_panel_context() -> dict[str, Any]:
+    def refresh_live_position_snapshot(*, refresh_claimed: bool = False):
+        store = app.state.live_position_snapshot_store
+        if not refresh_claimed and not store.begin_refresh():
+            return store.read()
+        try:
+            exchange_snapshot = _load_exchange_live_snapshot(
+                app.state.session_factory,
+                deepcoin_client_factory=app.state.deepcoin_client_factory,
+                group_label_by_chat_id=_group_label_by_chat_id(
+                    app.state.group_config
+                ),
+                contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+            )
+            if exchange_snapshot.get("error"):
+                store.finish_failure(str(exchange_snapshot["error"]))
+                return store.read()
+            return store.finish_success(
+                exchange_snapshot,
+                captured_at=app.state.position_snapshot_now_provider(),
+            )
+        except Exception as exc:
+            logger.exception("Deepcoin live position snapshot refresh failed")
+            store.finish_failure(str(exc))
+            return store.read()
+
+    def position_snapshot_metadata(snapshot) -> dict[str, Any]:
+        if snapshot is None:
+            return {
+                "version": "",
+                "state": "error",
+                "captured_at": None,
+                "age_seconds": None,
+                "last_error": "unavailable",
+            }
+        now = app.state.position_snapshot_now_provider()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        else:
+            now = now.astimezone(UTC)
+        captured_at = snapshot.captured_at
+        if captured_at.tzinfo is None:
+            captured_at = captured_at.replace(tzinfo=UTC)
+        else:
+            captured_at = captured_at.astimezone(UTC)
+        age_seconds = max(0.0, (now - captured_at).total_seconds())
+        if snapshot.refreshing:
+            state = "refreshing"
+        elif snapshot.last_error:
+            state = "error"
+        elif age_seconds > app.state.position_snapshot_stale_seconds:
+            state = "stale"
+        else:
+            state = "current"
+        return {
+            "version": snapshot.version,
+            "state": state,
+            "captured_at": captured_at,
+            "age_seconds": age_seconds,
+            "last_error": snapshot.last_error,
+        }
+
+    def build_initial_positions_panel_context(
+        background_tasks: BackgroundTasks | None = None,
+    ) -> dict[str, Any]:
         pending_entry_signals = list_pending_strategies(
             app.state.session_factory,
             chat_id=None,
@@ -4134,11 +4219,40 @@ def create_web_app(
             limit=200,
         )
         group_label_by_chat_id = _group_label_by_chat_id(app.state.group_config)
-        exchange_snapshot = _load_exchange_live_snapshot(
-            app.state.session_factory,
-            deepcoin_client_factory=app.state.deepcoin_client_factory,
-            group_label_by_chat_id=group_label_by_chat_id,
-            contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+        store = app.state.live_position_snapshot_store
+        position_snapshot = store.read()
+        if position_snapshot is None:
+            if store.begin_refresh():
+                position_snapshot = refresh_live_position_snapshot(
+                    refresh_claimed=True
+                )
+            else:
+                position_snapshot = store.read()
+        else:
+            metadata = position_snapshot_metadata(position_snapshot)
+            if (
+                metadata["age_seconds"] is not None
+                and metadata["age_seconds"]
+                >= app.state.position_snapshot_refresh_seconds
+                and store.begin_refresh()
+            ):
+                position_snapshot = store.read()
+                if background_tasks is not None:
+                    background_tasks.add_task(
+                        refresh_live_position_snapshot,
+                        refresh_claimed=True,
+                    )
+                else:
+                    position_snapshot = refresh_live_position_snapshot(
+                        refresh_claimed=True
+                    )
+        exchange_snapshot = (
+            position_snapshot.payload
+            if position_snapshot is not None
+            else {
+                **_empty_exchange_snapshot(),
+                "error": "unavailable",
+            }
         )
         exchange_snapshot = _annotate_exchange_snapshot_attribution(
             exchange_snapshot,
@@ -4153,6 +4267,7 @@ def create_web_app(
             "pending_entry_signals": pending_entry_signals,
             "exited_positions": [],
             "lazy_exchange_tabs": True,
+            "position_snapshot": position_snapshot_metadata(position_snapshot),
         }
 
     def build_exchange_position_tab_context(tab_name: str) -> dict[str, Any]:
@@ -4717,12 +4832,16 @@ def create_web_app(
         )
 
     @app.get("/positions-panel")
-    def positions_panel_partial(request: Request, initial: str | None = None):
+    def positions_panel_partial(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        initial: str | None = None,
+    ):
         return templates.TemplateResponse(
             request,
             "_exchange_positions_panel.html",
             (
-                build_initial_positions_panel_context()
+                build_initial_positions_panel_context(background_tasks)
                 if initial == "positions"
                 else build_positions_panel_context()
             ),

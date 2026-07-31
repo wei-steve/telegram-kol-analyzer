@@ -204,7 +204,15 @@
   </div>
 {%- endmacro %}
 
-<section class="panel exchange-positions-panel" data-exchange-position-tabs>
+<section
+  class="panel exchange-positions-panel"
+  data-exchange-position-tabs
+  {% if position_snapshot is defined %}
+  data-position-snapshot-version="{{ position_snapshot.version }}"
+  data-position-snapshot-state="{{ position_snapshot.state }}"
+  {% if position_snapshot.captured_at %}data-position-snapshot-captured-at="{{ position_snapshot.captured_at.isoformat() }}"{% endif %}
+  {% endif %}
+>
   <div class="panel-heading">
     <div>
       <h2>交易持仓</h2>
