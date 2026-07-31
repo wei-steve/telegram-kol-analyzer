@@ -10,6 +10,9 @@ let promptCenterState = {
 let hasDeferredMessageRefresh = false;
 let recoveryRefreshPromise = null;
 let pendingPositionsFragment = null;
+const POSITION_SNAPSHOT_RETRY_DELAYS = [1000, 2000, 4000];
+let positionSnapshotRetryTimer = null;
+let positionSnapshotRetryToken = 0;
 const exchangePositionTabRequests = new WeakMap();
 const STRATEGY_RECORD_FILTER_KEY = 'telegram-workbench:strategy-filter';
 const STRATEGY_RECORD_GROUP_KEY = 'telegram-workbench:strategy-group';
@@ -1719,6 +1722,7 @@ function commitPositionsPanel(fragment) {
   bindBoundPositionCloseButtons();
   bindDeepcoinPositionSync();
   bindLivePositionAttributionButtons();
+  schedulePositionSnapshotRefresh(fragment);
   return true;
 }
 
@@ -1767,7 +1771,7 @@ function positionsPanelComparableMarkup(root) {
   return clone.outerHTML;
 }
 
-async function checkPositionsPanelForChanges() {
+async function checkPositionsPanelForChanges({ applySnapshotRefresh = false } = {}) {
   const container = document.querySelector('[data-lazy-workbench="positions"]');
   const current = container?.querySelector('[data-exchange-position-tabs]');
   if (!container || !current) return false;
@@ -1784,12 +1788,56 @@ async function checkPositionsPanelForChanges() {
       clearPendingPositionsRefreshNotice();
       return false;
     }
+    if (
+      applySnapshotRefresh
+      && current.dataset.positionSnapshotState !== 'current'
+    ) {
+      clearPendingPositionsRefreshNotice();
+      return commitPositionsPanel(fragment);
+    }
     pendingPositionsFragment = fragment;
     showPendingPositionsRefreshNotice();
     return true;
   } catch {
     return false;
   }
+}
+
+function cancelPositionSnapshotRefresh() {
+  positionSnapshotRetryToken += 1;
+  if (positionSnapshotRetryTimer !== null) {
+    window.clearTimeout(positionSnapshotRetryTimer);
+    positionSnapshotRetryTimer = null;
+  }
+}
+
+function schedulePositionSnapshotRefresh(root) {
+  cancelPositionSnapshotRefresh();
+  if (!root || root.dataset.positionSnapshotState === 'current') return;
+  const token = positionSnapshotRetryToken;
+
+  const scheduleAttempt = (index) => {
+    if (index >= POSITION_SNAPSHOT_RETRY_DELAYS.length) return;
+    positionSnapshotRetryTimer = window.setTimeout(async () => {
+      positionSnapshotRetryTimer = null;
+      const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView;
+      const current = document.querySelector('[data-lazy-workbench="positions"] [data-exchange-position-tabs]');
+      if (
+        token !== positionSnapshotRetryToken
+        || activeView !== 'positions'
+        || current !== root
+      ) {
+        return;
+      }
+      await checkPositionsPanelForChanges({ applySnapshotRefresh: true });
+      if (token !== positionSnapshotRetryToken) return;
+      const refreshed = document.querySelector('[data-lazy-workbench="positions"] [data-exchange-position-tabs]');
+      if (!refreshed || refreshed.dataset.positionSnapshotState === 'current') return;
+      scheduleAttempt(index + 1);
+    }, POSITION_SNAPSHOT_RETRY_DELAYS[index]);
+  };
+
+  scheduleAttempt(0);
 }
 
 async function loadPositionsPanel() {
@@ -2042,6 +2090,7 @@ function setWorkbenchView(requestedView) {
   const panels = document.querySelectorAll('[data-workbench-panel]');
   if (!dashboard || !buttons.length || !panels.length) return;
   const view = WORKBENCH_VIEWS.includes(requestedView) ? requestedView : 'strategies';
+  if (view !== 'positions') cancelPositionSnapshotRefresh();
   dashboard.dataset.activeWorkbenchView = view;
   dashboard.classList.remove(...WORKBENCH_VIEWS.map((item) => `mobile-view-${item}`));
   dashboard.classList.add(`mobile-view-${view}`);

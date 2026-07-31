@@ -201,7 +201,7 @@ def test_focus_recovery_checks_positions_without_replacing_visible_panel(tmp_pat
         "/static/app.js"
     ).text
 
-    assert "async function checkPositionsPanelForChanges()" in js
+    assert "async function checkPositionsPanelForChanges(" in js
 
     recovery_start = js.index("function scheduleRecoveryRefresh")
     recovery_end = js.index("\nfunction ", recovery_start + 1)
@@ -236,6 +236,22 @@ def test_silent_positions_check_discards_snapshot_after_visible_panel_changes(tm
     assert check_block.index(stale_guard) < check_block.index(
         "pendingPositionsFragment = fragment;"
     )
+
+
+def test_position_snapshot_assets_use_bounded_automatic_refresh(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+    css = client.get("/static/app.css").text
+
+    assert "function schedulePositionSnapshotRefresh" in js
+    assert "function cancelPositionSnapshotRefresh" in js
+    assert "const POSITION_SNAPSHOT_RETRY_DELAYS = [1000, 2000, 4000];" in js
+    assert "applySnapshotRefresh: true" in js
+    assert "dataset.positionSnapshotState" in js
+    assert "cancelPositionSnapshotRefresh();" in js
+    assert ".position-snapshot-status" in css
+    assert ".position-snapshot-status--stale" in css
+    assert ".position-snapshot-status--error" in css
 
 
 def test_positions_refresh_normalizes_and_restores_in_memory_ui_state(tmp_path):

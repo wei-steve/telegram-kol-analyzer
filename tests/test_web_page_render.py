@@ -935,6 +935,7 @@ def test_positions_panel_fresh_snapshot_avoids_deepcoin_read(tmp_path):
     assert "cached-pos" in response.text
     assert f'data-position-snapshot-version="{saved.version}"' in response.text
     assert 'data-position-snapshot-state="current"' in response.text
+    assert "持仓数据刚刚更新" in response.text
 
 
 def test_positions_panel_stale_snapshot_returns_cached_then_refreshes(tmp_path):
@@ -960,6 +961,7 @@ def test_positions_panel_stale_snapshot_returns_cached_then_refreshes(tmp_path):
     assert response.status_code == 200
     assert "cached-pos" in response.text
     assert 'data-position-snapshot-state="refreshing"' in response.text
+    assert "正在刷新 Deepcoin" in response.text
     assert exchange.calls == [
         ("list_positions", None),
         ("list_trigger_orders_pending", "BTC-USDT-SWAP"),

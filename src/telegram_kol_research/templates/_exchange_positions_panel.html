@@ -221,6 +221,30 @@
     <button type="button" class="secondary-button" data-dashboard-tab="main">返回主界面</button>
   </div>
 
+  {% if position_snapshot is defined %}
+    <div
+      class="position-snapshot-status position-snapshot-status--{{ position_snapshot.state }}"
+      role="status"
+      aria-live="polite"
+      data-position-snapshot-status
+    >
+      {% if position_snapshot.state == 'current' %}
+        <span>持仓数据刚刚更新</span>
+      {% elif position_snapshot.state == 'refreshing' %}
+        <span>正在刷新 Deepcoin，当前展示最近成功快照</span>
+      {% elif position_snapshot.state == 'stale' %}
+        <span>持仓快照已超过 30 秒，正在等待刷新</span>
+      {% else %}
+        <span>Deepcoin 刷新失败，当前展示最近成功数据</span>
+      {% endif %}
+      {% if position_snapshot.captured_at %}
+        <time datetime="{{ position_snapshot.captured_at.isoformat() }}">
+          {{ position_snapshot.captured_at.strftime('%H:%M:%S') }} UTC
+        </time>
+      {% endif %}
+    </div>
+  {% endif %}
+
   <div class="exchange-tab-strip" role="tablist" aria-label="交易持仓分页">
     <button type="button" class="exchange-tab is-active" data-exchange-position-tab="positions" aria-selected="true">
       持仓({{ exchange_snapshot.positions|length }})
