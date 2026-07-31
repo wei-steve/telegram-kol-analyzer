@@ -3386,6 +3386,7 @@ def create_web_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         try:
+            app.state.web_event_loop = asyncio.get_running_loop()
             if app.state.semantic_review_task is None:
                 app.state.semantic_review_task = asyncio.create_task(
                     _supervise_semantic_review_runner(app)
@@ -3570,7 +3571,7 @@ def create_web_app(
             )
             if position_snapshot_refresh_task is not None:
                 try:
-                    await position_snapshot_refresh_task
+                    await asyncio.wrap_future(position_snapshot_refresh_task)
                 except asyncio.CancelledError:
                     pass
                 except Exception:
@@ -3824,6 +3825,7 @@ def create_web_app(
     app.state.runtime_incident_notification_task = None
     app.state.position_snapshot_startup_task = None
     app.state.position_snapshot_refresh_task = None
+    app.state.web_event_loop = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client
     app.state.reconcile_once_runner = run_reconcile_once
@@ -4325,8 +4327,13 @@ def create_web_app(
         refresh_task = app.state.position_snapshot_refresh_task
         if refresh_task is not None and not refresh_task.done():
             return True
-        refresh_task = asyncio.create_task(
-            asyncio.to_thread(refresh_live_position_snapshot)
+        event_loop = app.state.web_event_loop
+        if event_loop is None:
+            refresh_live_position_snapshot()
+            return True
+        refresh_task = asyncio.run_coroutine_threadsafe(
+            asyncio.to_thread(refresh_live_position_snapshot),
+            event_loop,
         )
         refresh_task.add_done_callback(
             _log_background_task_result("position_snapshot_refresh_task")
@@ -4965,7 +4972,7 @@ def create_web_app(
         )
 
     @app.get("/positions-panel")
-    async def positions_panel_partial(
+    def positions_panel_partial(
         request: Request,
         initial: str | None = None,
     ):
