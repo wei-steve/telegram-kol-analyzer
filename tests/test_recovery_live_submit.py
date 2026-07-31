@@ -1114,10 +1114,26 @@ def test_process_live_preserves_distinct_price_legacy_trigger_legs(tmp_path):
     )
     first_leg, second_leg = signal.payload["deepcoin_order_draft"]["order_legs"]
     assert first_leg["price"] != second_leg["price"]
-    _replace_queued_order_legs(
+    legacy_legs = [
+        {
+            **first_leg,
+            "allocation_pct": 50.0,
+            "risk_budget_usdt": 50.0,
+            "quantity": 63.0,
+            "base_asset_estimate": 0.063,
+        },
+        {
+            **second_leg,
+            "allocation_pct": 50.0,
+            "risk_budget_usdt": 50.0,
+            "quantity": 84.0,
+            "base_asset_estimate": 0.084,
+        },
+    ]
+    queued_draft = _replace_queued_order_legs(
         session_factory,
         signal.id,
-        [dict(first_leg), dict(second_leg)],
+        legacy_legs,
     )
     fake_client = _FakeDeepcoinClient()
 
@@ -1132,6 +1148,11 @@ def test_process_live_preserves_distinct_price_legacy_trigger_legs(tmp_path):
         str(first_leg["price"]),
         str(second_leg["price"]),
     ]
+    assert [payload["sz"] for payload in fake_client.trigger_payloads] == [
+        "63.0",
+        "84.0",
+    ]
+    assert result["deepcoin_order_draft"] == queued_draft
     with session_factory() as session:
         assert session.query(ExecutionOrderLeg).count() == 2
 

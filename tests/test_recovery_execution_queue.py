@@ -88,8 +88,8 @@ def test_recovery_execution_preview_lists_approved_limit_orders_only(tmp_path):
         68090.0,
     ]
     assert [leg["quantity"] for leg in row["deepcoin_order_draft"]["order_legs"]] == [
-        0.063291,
-        0.084746,
+        0.072464,
+        0.072464,
     ]
 
 
@@ -216,6 +216,6 @@ def test_recovery_execution_preview_applies_contract_specs_when_available(tmp_pa
     }
     assert draft["blocking_reason_codes"] == []
     assert draft["contract_spec"]["instrument_id"] == "BTC-USDT-SWAP"
-    assert draft["order_legs"][0]["quantity"] == 63.0
+    assert draft["order_legs"][0]["quantity"] == 72.0
     assert draft["order_legs"][0]["quantity_unit"] == "contracts"
-    assert draft["order_legs"][1]["quantity"] == 84.0
+    assert draft["order_legs"][1]["quantity"] == 72.0

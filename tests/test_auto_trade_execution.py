@@ -1494,10 +1494,10 @@ def test_auto_process_range_entry_uses_fixed_threshold_and_second_offset_when_ne
     assert len(fake_client.orders) == 1
     assert len(fake_client.trigger_orders) == 1
     assert fake_client.orders[0]["ordType"] == "market"
-    assert fake_client.orders[0]["sz"] == "2.5"
+    assert fake_client.orders[0]["sz"] == "3.2"
     assert fake_client.trigger_orders[0]["orderType"] == "limit"
     assert fake_client.trigger_orders[0]["triggerPrice"] == "1567.0"
-    assert [order["sz"] for order in fake_client.trigger_orders] == ["4.5"]
+    assert [order["sz"] for order in fake_client.trigger_orders] == ["3.2"]
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
@@ -1551,9 +1551,11 @@ def test_auto_process_short_range_uses_fixed_market_threshold_and_second_offset(
 
     assert result["status"] == "submitted"
     assert [order["ordType"] for order in fake_client.orders] == ["market"]
+    assert [order["sz"] for order in fake_client.orders] == ["3.2"]
     assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
         "1603.0"
     ]
+    assert [order["sz"] for order in fake_client.trigger_orders] == ["3.2"]
 
 
 def test_auto_process_zero_fixed_market_threshold_keeps_two_limit_legs(tmp_path):

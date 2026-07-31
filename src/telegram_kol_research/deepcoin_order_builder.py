@@ -74,6 +74,11 @@ def build_deepcoin_order_draft(
     )
     risk_budget = float(_require_value(payload_preview, "risk_budget_usdt"))
     stop_loss = _parse_optional_price(payload_preview.get("stop_loss"), symbol=symbol)
+    normalized_stop_loss = (
+        _normalize_price(stop_loss, contract_spec)
+        if stop_loss is not None
+        else None
+    )
     margin_mode = _normalize_margin_mode(payload_preview.get("margin_mode"))
     position_mode = _normalize_position_mode(payload_preview.get("position_mode"))
     strategy_instance_id = str(
@@ -157,6 +162,11 @@ def build_deepcoin_order_draft(
             second_limit_offset=second_limit_offset,
             contract_spec=contract_spec,
         )
+        first_allocation_pct, second_allocation_pct = _range_entry_allocations(
+            first_price=hybrid_market_price,
+            second_price=limit_price,
+            stop_loss=normalized_stop_loss,
+        )
         order_legs = [
             _order_leg(
                 side=open_side,
@@ -169,18 +179,18 @@ def build_deepcoin_order_draft(
                     kol_code=source_kol_code,
                     message_id=source_message_id,
                 ),
-                allocation_pct=50.0,
+                allocation_pct=first_allocation_pct,
                 risk_budget_usdt=_leg_risk_budget(
                     risk_budget=risk_budget,
-                    allocation_pct=50.0,
+                    allocation_pct=first_allocation_pct,
                 ),
                 quantity=_estimate_leg_quantity(
                     risk_budget=risk_budget,
-                    allocation_pct=50.0,
+                    allocation_pct=first_allocation_pct,
                     entry_price=hybrid_market_price,
-                    stop_loss=stop_loss,
+                    stop_loss=normalized_stop_loss,
                 ),
-                stop_loss=stop_loss,
+                stop_loss=normalized_stop_loss,
                 contract_spec=contract_spec,
             ),
             _order_leg(
@@ -194,18 +204,18 @@ def build_deepcoin_order_draft(
                     kol_code=source_kol_code,
                     message_id=source_message_id,
                 ),
-                allocation_pct=50.0,
+                allocation_pct=second_allocation_pct,
                 risk_budget_usdt=_leg_risk_budget(
                     risk_budget=risk_budget,
-                    allocation_pct=50.0,
+                    allocation_pct=second_allocation_pct,
                 ),
                 quantity=_estimate_leg_quantity(
                     risk_budget=risk_budget,
-                    allocation_pct=50.0,
+                    allocation_pct=second_allocation_pct,
                     entry_price=limit_price,
-                    stop_loss=stop_loss,
+                    stop_loss=normalized_stop_loss,
                 ),
-                stop_loss=stop_loss,
+                stop_loss=normalized_stop_loss,
                 contract_spec=contract_spec,
             ),
         ]
@@ -217,6 +227,11 @@ def build_deepcoin_order_draft(
             first_limit_offset=first_limit_offset,
             second_limit_offset=second_limit_offset,
             contract_spec=contract_spec,
+        )
+        first_allocation_pct, second_allocation_pct = _range_entry_allocations(
+            first_price=first_price,
+            second_price=second_price,
+            stop_loss=normalized_stop_loss,
         )
         order_legs = [
             _order_leg(
@@ -230,18 +245,18 @@ def build_deepcoin_order_draft(
                     kol_code=source_kol_code,
                     message_id=source_message_id,
                 ),
-                allocation_pct=50.0,
+                allocation_pct=first_allocation_pct,
                 risk_budget_usdt=_leg_risk_budget(
                     risk_budget=risk_budget,
-                    allocation_pct=50.0,
+                    allocation_pct=first_allocation_pct,
                 ),
                 quantity=_estimate_leg_quantity(
                     risk_budget=risk_budget,
-                    allocation_pct=50.0,
+                    allocation_pct=first_allocation_pct,
                     entry_price=first_price,
-                    stop_loss=stop_loss,
+                    stop_loss=normalized_stop_loss,
                 ),
-                stop_loss=stop_loss,
+                stop_loss=normalized_stop_loss,
                 contract_spec=contract_spec,
             ),
             _order_leg(
@@ -255,18 +270,18 @@ def build_deepcoin_order_draft(
                     kol_code=source_kol_code,
                     message_id=source_message_id,
                 ),
-                allocation_pct=50.0,
+                allocation_pct=second_allocation_pct,
                 risk_budget_usdt=_leg_risk_budget(
                     risk_budget=risk_budget,
-                    allocation_pct=50.0,
+                    allocation_pct=second_allocation_pct,
                 ),
                 quantity=_estimate_leg_quantity(
                     risk_budget=risk_budget,
-                    allocation_pct=50.0,
+                    allocation_pct=second_allocation_pct,
                     entry_price=second_price,
-                    stop_loss=stop_loss,
+                    stop_loss=normalized_stop_loss,
                 ),
-                stop_loss=stop_loss,
+                stop_loss=normalized_stop_loss,
                 contract_spec=contract_spec,
             ),
         ]
@@ -298,8 +313,8 @@ def build_deepcoin_order_draft(
         "position_mode": position_mode,
         "order_legs": order_legs,
         "stop_loss": (
-            float(f"{_normalize_price(stop_loss, contract_spec):g}")
-            if stop_loss is not None
+            float(f"{normalized_stop_loss:g}")
+            if normalized_stop_loss is not None
             else None
         ),
         "take_profit_legs": take_profit_legs,
@@ -311,7 +326,7 @@ def build_deepcoin_order_draft(
             "strategy_instance_id_required_for_exit_matching",
             *quantity_notes,
             *(
-                ["range_entry_hybrid_market_half_limit_half"]
+                ["range_entry_hybrid_market_dynamic_risk_limit"]
                 if hybrid_market_price is not None
                 else []
             ),
@@ -463,6 +478,26 @@ def _estimate_leg_quantity(
         raise DeepcoinOrderDraftError("stop_loss must differ from entry price")
     leg_risk = risk_budget * allocation_pct / 100
     return round(leg_risk / price_risk, 6)
+
+
+def _range_entry_allocations(
+    *,
+    first_price: float,
+    second_price: float,
+    stop_loss: float | None,
+) -> tuple[float, float]:
+    if stop_loss is None:
+        return 50.0, 50.0
+    first_distance = abs(first_price - stop_loss)
+    second_distance = abs(second_price - stop_loss)
+    total_distance = first_distance + second_distance
+    if first_distance <= 0 or second_distance <= 0 or total_distance <= 0:
+        raise DeepcoinOrderDraftError("stop_loss must differ from entry price")
+    first_allocation = min(
+        65.0,
+        max(50.0, first_distance / total_distance * 100),
+    )
+    return first_allocation, 100.0 - first_allocation
 
 
 def _leg_risk_budget(
