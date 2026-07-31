@@ -18,7 +18,7 @@ import httpx
 from sqlalchemy import func
 
 try:
-    from fastapi import BackgroundTasks, FastAPI, Request
+    from fastapi import FastAPI, Request
     from fastapi import HTTPException
     from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
     from fastapi.staticfiles import StaticFiles
@@ -3565,6 +3565,17 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.position_snapshot_startup_task = None
+            position_snapshot_refresh_task = (
+                app.state.position_snapshot_refresh_task
+            )
+            if position_snapshot_refresh_task is not None:
+                try:
+                    await position_snapshot_refresh_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.position_snapshot_refresh_task = None
             await _stop_semantic_review_task(app)
             # ── lifecycle monitor shutdown ──
             lcm_task = getattr(app.state, "lifecycle_monitor_task", None)
@@ -3812,6 +3823,7 @@ def create_web_app(
     app.state.strategy_management_notification_task = None
     app.state.runtime_incident_notification_task = None
     app.state.position_snapshot_startup_task = None
+    app.state.position_snapshot_refresh_task = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client
     app.state.reconcile_once_runner = run_reconcile_once
@@ -4306,8 +4318,25 @@ def create_web_app(
             "last_error": snapshot.last_error,
         }
 
+    def schedule_live_position_snapshot_refresh() -> bool:
+        startup_task = app.state.position_snapshot_startup_task
+        if startup_task is not None and not startup_task.done():
+            return True
+        refresh_task = app.state.position_snapshot_refresh_task
+        if refresh_task is not None and not refresh_task.done():
+            return True
+        refresh_task = asyncio.create_task(
+            asyncio.to_thread(refresh_live_position_snapshot)
+        )
+        refresh_task.add_done_callback(
+            _log_background_task_result("position_snapshot_refresh_task")
+        )
+        app.state.position_snapshot_refresh_task = refresh_task
+        return True
+
     def build_initial_positions_panel_context(
-        background_tasks: BackgroundTasks | None = None,
+        *,
+        schedule_refresh: bool = False,
     ) -> dict[str, Any]:
         pending_entry_signals = list_pending_strategies(
             app.state.session_factory,
@@ -4327,9 +4356,8 @@ def create_web_app(
         position_snapshot = store.read()
         refresh_scheduled = False
         if position_snapshot is None:
-            if background_tasks is not None:
-                background_tasks.add_task(refresh_live_position_snapshot)
-                refresh_scheduled = True
+            if schedule_refresh:
+                refresh_scheduled = schedule_live_position_snapshot_refresh()
             else:
                 position_snapshot = refresh_live_position_snapshot()
         else:
@@ -4339,9 +4367,8 @@ def create_web_app(
                 and metadata["age_seconds"]
                 >= app.state.position_snapshot_refresh_seconds
             ):
-                if background_tasks is not None:
-                    background_tasks.add_task(refresh_live_position_snapshot)
-                    refresh_scheduled = True
+                if schedule_refresh:
+                    refresh_scheduled = schedule_live_position_snapshot_refresh()
                 else:
                     position_snapshot = refresh_live_position_snapshot()
         exchange_snapshot = (
@@ -4938,16 +4965,15 @@ def create_web_app(
         )
 
     @app.get("/positions-panel")
-    def positions_panel_partial(
+    async def positions_panel_partial(
         request: Request,
-        background_tasks: BackgroundTasks,
         initial: str | None = None,
     ):
         return templates.TemplateResponse(
             request,
             "_exchange_positions_panel.html",
             (
-                build_initial_positions_panel_context(background_tasks)
+                build_initial_positions_panel_context(schedule_refresh=True)
                 if initial == "positions"
                 else build_positions_panel_context()
             ),

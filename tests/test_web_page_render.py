@@ -1,5 +1,7 @@
 ﻿import json
 import re
+import threading
+import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -973,6 +975,45 @@ def test_positions_panel_stale_snapshot_returns_cached_then_refreshes(tmp_path):
         refreshed.payload["_live_source"]["positions"][0]["posId"]
         == "pos-live"
     )
+
+
+def test_positions_panel_stale_snapshot_does_not_wait_for_background_refresh(
+    tmp_path,
+):
+    snapshot_path = tmp_path / "web-cache" / "positions.json"
+    LivePositionSnapshotStore(snapshot_path).finish_success(
+        _cached_live_position_snapshot(),
+        captured_at=datetime(2026, 7, 31, 8, 15, tzinfo=UTC),
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingDeepcoinClient:
+        def list_positions(self):
+            started.set()
+            assert release.wait(timeout=2)
+            return []
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=BlockingDeepcoinClient,
+        live_position_snapshot_path=snapshot_path,
+        position_snapshot_now_provider=lambda: datetime(
+            2026, 7, 31, 8, 15, 10, tzinfo=UTC
+        ),
+    )
+
+    with TestClient(app) as client:
+        started_at = time.monotonic()
+        response = client.get("/positions-panel?initial=positions")
+        elapsed = time.monotonic() - started_at
+        assert started.wait(timeout=1)
+        release.set()
+
+    assert response.status_code == 200
+    assert elapsed < 0.5
+    assert "cached-pos" in response.text
+    assert 'data-position-snapshot-state="refreshing"' in response.text
 
 
 def test_positions_panel_without_snapshot_loads_and_persists_fallback(tmp_path):
