@@ -4344,6 +4344,7 @@ def create_web_app(
     def build_initial_positions_panel_context(
         *,
         schedule_refresh: bool = False,
+        allow_sync_refresh: bool = True,
     ) -> dict[str, Any]:
         pending_entry_signals = list_pending_strategies(
             app.state.session_factory,
@@ -4365,7 +4366,7 @@ def create_web_app(
         if position_snapshot is None:
             if schedule_refresh:
                 refresh_scheduled = schedule_live_position_snapshot_refresh()
-            else:
+            elif allow_sync_refresh:
                 position_snapshot = refresh_live_position_snapshot()
         else:
             metadata = position_snapshot_metadata(position_snapshot)
@@ -4376,7 +4377,7 @@ def create_web_app(
             ):
                 if schedule_refresh:
                     refresh_scheduled = schedule_live_position_snapshot_refresh()
-                else:
+                elif allow_sync_refresh:
                     position_snapshot = refresh_live_position_snapshot()
         exchange_snapshot = (
             _materialize_cached_live_position_snapshot(
@@ -5019,7 +5020,7 @@ def create_web_app(
         }
         if view == "positions":
             context.update(
-                build_initial_positions_panel_context(schedule_refresh=True)
+                build_initial_positions_panel_context(allow_sync_refresh=False)
             )
         return templates.TemplateResponse(
             request,
