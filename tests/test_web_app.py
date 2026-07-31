@@ -5261,6 +5261,25 @@ def test_runtime_agent_production_audit_endpoint_is_single_flight(tmp_path):
     assert calls == 2
 
 
+def test_versioned_workbench_assets_are_immutable_but_mismatches_revalidate(
+    tmp_path,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    client = TestClient(app)
+
+    current = client.get(f"/static/app.js?v={app.state.asset_version}")
+    mismatched = client.get("/static/app.js?v=old")
+    unversioned = client.get("/static/app.css")
+
+    assert current.status_code == 200
+    assert (
+        current.headers["cache-control"]
+        == "public, max-age=31536000, immutable"
+    )
+    assert "immutable" not in mismatched.headers.get("cache-control", "")
+    assert "immutable" not in unversioned.headers.get("cache-control", "")
+
+
 def test_runtime_agent_telegram_evidence_endpoint_is_bounded_and_exact(
     tmp_path,
 ):

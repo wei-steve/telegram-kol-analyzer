@@ -3734,6 +3734,18 @@ def create_web_app(
     app.state.telegram_operation_lock = asyncio.Lock()
     app.state.asset_version = _static_asset_version()
 
+    @app.middleware("http")
+    async def cache_versioned_workbench_assets(request: Request, call_next):
+        response = await call_next(request)
+        if (
+            request.url.path in {"/static/app.js", "/static/app.css"}
+            and request.query_params.get("v") == str(app.state.asset_version)
+        ):
+            response.headers["Cache-Control"] = (
+                "public, max-age=31536000, immutable"
+            )
+        return response
+
     async def ensure_live_tasks_match_targets() -> None:
         if not app.state.live_target_titles:
             for task_name in ("live_listener_task", "reconcile_task"):
