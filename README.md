@@ -128,6 +128,27 @@ Report generation:
 PYTHONPATH=src python -m telegram_kol_research.cli report --output-path reports/leaderboard.json
 ```
 
+Read-only KOL strategy PnL audit from a bounded JSON snapshot:
+
+```bash
+PYTHONPATH=src python -m telegram_kol_research.cli audit-kol-pnl \
+  --messages-json .audit-results/suozhang/messages.json \
+  --decisions-json .audit-results/suozhang/decisions.json \
+  --lifecycle-json .audit-results/suozhang/lifecycles.json \
+  --chat-id=-1002368892075 \
+  --symbol BTC --symbol ETH \
+  --cutoff 2026-08-01T02:19:12Z \
+  --output-dir .audit-results/suozhang
+```
+
+Use `--messages-json -` to stream a read-only server query through stdin. The
+first run captures digest-verified public candles; repeat with `--offline` to
+prove deterministic replay. Use `--reconstruction-only` while reviewing the
+decision ledger. The command writes local ignored artifacts only: it does not
+modify the project database, repair lifecycle rows, place orders, or calculate
+actual Deepcoin account PnL. Any unreviewed candidate or unresolved event stops
+the final report from being claimed.
+
 Manual review queue:
 
 ```bash

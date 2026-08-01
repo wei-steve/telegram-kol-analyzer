@@ -10,6 +10,7 @@ import re
 import sqlite3
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
@@ -83,6 +84,22 @@ from telegram_kol_research.production_safety_monitor import (
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
 from telegram_kol_research.live_updates import LiveUpdateBroker
+from telegram_kol_research.kol_audit_market_data import (
+    BinanceAuditMarketData,
+    load_cached_candles,
+)
+from telegram_kol_research.kol_pnl_audit import (
+    load_audit_messages,
+    load_reviewed_decisions,
+    reconstruct_audit_strategies,
+    replay_audit_strategy,
+)
+from telegram_kol_research.kol_pnl_reporting import (
+    AuditReportMetadata,
+    compare_lifecycle_snapshot,
+    summarize_audit_results,
+    write_audit_artifacts,
+)
 from telegram_kol_research.llm_adjudication import (
     export_llm_adjudication_pack,
     export_llm_submission_sample,
@@ -1758,6 +1775,271 @@ def report(
         },
     )
     typer.echo(f"Report written to {written_path}")
+
+
+@app.command("audit-kol-pnl")
+def audit_kol_pnl(
+    messages_json: str = typer.Option(
+        ...,
+        "--messages-json",
+        help="Raw-message JSON array path, or '-' to read from stdin.",
+    ),
+    decisions_json: Path = typer.Option(
+        ...,
+        "--decisions-json",
+        help="Reviewed reconstruction decisions JSON.",
+    ),
+    lifecycle_json: Path | None = typer.Option(
+        None,
+        "--lifecycle-json",
+        help="Optional read-only lifecycle snapshot JSON for comparison.",
+    ),
+    chat_id: int = typer.Option(..., "--chat-id"),
+    symbols: list[str] = typer.Option(
+        None,
+        "--symbol",
+        help="Audit symbol; repeat for BTC and ETH.",
+    ),
+    cutoff: str = typer.Option(..., "--cutoff", help="UTC ISO-8601 audit cutoff."),
+    output_dir: Path = typer.Option(..., "--output-dir"),
+    offline: bool = typer.Option(
+        False,
+        "--offline",
+        help="Require an existing verified candle cache; make no market request.",
+    ),
+    reconstruction_only: bool = typer.Option(
+        False,
+        "--reconstruction-only",
+        help="Write normalized reconstruction evidence without replaying candles.",
+    ),
+) -> None:
+    """Build a read-only, evidence-backed BTC/ETH KOL strategy PnL audit."""
+
+    bounded_output = _bounded_audit_output_directory(output_dir)
+    normalized_symbols = tuple(dict.fromkeys(
+        str(symbol or "").strip().upper() for symbol in (symbols or ["BTC", "ETH"])
+    ))
+    if not normalized_symbols or any(symbol not in {"BTC", "ETH"} for symbol in normalized_symbols):
+        raise typer.BadParameter("--symbol must contain only BTC and/or ETH")
+    audit_cutoff = _parse_audit_cutoff(cutoff)
+    try:
+        raw_message_payload = _load_json_input(messages_json)
+        raw_decision_payload = json.loads(decisions_json.read_text(encoding="utf-8"))
+        messages = tuple(
+            message
+            for message in load_audit_messages(raw_message_payload)
+            if message.chat_id == chat_id and message.posted_at <= audit_cutoff
+        )
+        decisions = load_reviewed_decisions(raw_decision_payload)
+        reconstruction = reconstruct_audit_strategies(messages, decisions)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        typer.echo(f"Audit input validation failed: {exc}")
+        raise typer.Exit(code=2) from exc
+
+    bounded_output.mkdir(parents=True, exist_ok=True)
+    reconstruction_payload = {
+        "chat_id": chat_id,
+        "cutoff": _audit_timestamp_text(audit_cutoff),
+        "symbols": list(normalized_symbols),
+        "strategies": [
+            strategy.to_dict()
+            for strategy in reconstruction.strategies
+            if strategy.symbol in normalized_symbols
+        ],
+        "excluded": [
+            {"message_id": item.message_id, "reason": item.reason}
+            for item in reconstruction.excluded
+        ],
+        "unresolved": [
+            {"message_id": item.message_id, "reason": item.reason}
+            for item in reconstruction.unresolved
+        ],
+    }
+    _write_audit_json(
+        bounded_output / "reconstruction.json", reconstruction_payload
+    )
+    if reconstruction.unresolved:
+        typer.echo(
+            f"Audit reconstruction has {len(reconstruction.unresolved)} unresolved item(s); "
+            "no final PnL report was claimed."
+        )
+        raise typer.Exit(code=2)
+    if reconstruction_only:
+        typer.echo(f"Audit reconstruction written to {bounded_output / 'reconstruction.json'}")
+        return
+
+    scoped_strategies = tuple(
+        strategy
+        for strategy in reconstruction.strategies
+        if strategy.symbol in normalized_symbols
+    )
+    if not scoped_strategies:
+        typer.echo("Audit reconstruction contains no in-scope strategies.")
+        raise typer.Exit(code=2)
+
+    candle_rows: dict[str, tuple[Any, ...]] = {}
+    candle_digests: list[str] = []
+    start_at = min(strategy.published_at for strategy in scoped_strategies)
+    try:
+        for symbol in normalized_symbols:
+            if not any(strategy.symbol == symbol for strategy in scoped_strategies):
+                continue
+            candles, digest = _capture_or_load_audit_candles(
+                symbol=symbol,
+                start_at=start_at,
+                end_at=audit_cutoff,
+                cache_path=bounded_output / "candles" / f"{symbol.lower()}-5m.json",
+                offline=offline,
+            )
+            candle_rows[symbol] = candles
+            candle_digests.append(f"{symbol}:{digest}")
+    except Exception as exc:
+        typer.echo(f"Audit candle evidence failed: {exc}")
+        raise typer.Exit(code=2) from exc
+
+    results = tuple(
+        replay_audit_strategy(
+            strategy,
+            candle_rows[strategy.symbol],
+            cutoff=audit_cutoff,
+        )
+        for strategy in scoped_strategies
+    )
+    lifecycle_rows: list[dict[str, Any]] = []
+    if lifecycle_json is not None:
+        try:
+            loaded_lifecycles = json.loads(lifecycle_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            typer.echo(f"Lifecycle snapshot validation failed: {exc}")
+            raise typer.Exit(code=2) from exc
+        if not isinstance(loaded_lifecycles, list):
+            typer.echo("Lifecycle snapshot must be a JSON array.")
+            raise typer.Exit(code=2)
+        lifecycle_rows = loaded_lifecycles
+
+    source_digest = _canonical_json_digest(raw_message_payload)
+    decision_digest = _canonical_json_digest(raw_decision_payload)
+    combined_candle_digest = hashlib.sha256(
+        "\n".join(sorted(candle_digests)).encode("utf-8")
+    ).hexdigest()
+    metadata = AuditReportMetadata(
+        audit_cutoff=_audit_timestamp_text(audit_cutoff),
+        source_sha256=source_digest,
+        candle_sha256=combined_candle_digest,
+        decision_sha256=decision_digest,
+        code_revision=_audit_code_revision(),
+        methodology_version="1",
+    )
+    summaries = summarize_audit_results(results)
+    differences = compare_lifecycle_snapshot(scoped_strategies, lifecycle_rows)
+    written = write_audit_artifacts(
+        output_dir=bounded_output,
+        results=results,
+        summaries=summaries,
+        differences=differences,
+        metadata=metadata,
+    )
+    typer.echo(f"Audit report written to {written.markdown_path}")
+    typer.echo(f"Machine-readable results written to {written.json_path}")
+
+
+def _capture_or_load_audit_candles(
+    *,
+    symbol: str,
+    start_at: datetime,
+    end_at: datetime,
+    cache_path: Path,
+    offline: bool,
+) -> tuple[tuple[Any, ...], str]:
+    if offline:
+        candles, manifest = load_cached_candles(cache_path)
+        if manifest.symbol != symbol or manifest.interval != "5m":
+            raise ValueError("cached candle scope does not match the audit")
+        if manifest.start_at > start_at or manifest.end_at < end_at:
+            raise ValueError("cached candles do not cover the audit interval")
+        return candles, manifest.sha256
+    with BinanceAuditMarketData() as provider:
+        candles, manifest = provider.capture_candles(
+            symbol=symbol,
+            interval="5m",
+            start_at=start_at,
+            end_at=end_at,
+            cache_path=cache_path,
+        )
+    return candles, manifest.sha256
+
+
+def _bounded_audit_output_directory(path: Path) -> Path:
+    resolved = path.resolve()
+    forbidden = {
+        Path(resolved.anchor),
+        Path.home().resolve(),
+        Path.cwd().resolve(),
+        Path(__file__).resolve().parents[2],
+    }
+    if resolved in forbidden:
+        raise typer.BadParameter("--output-dir must be a bounded output directory")
+    return resolved
+
+
+def _load_json_input(path: str) -> Any:
+    if path == "-":
+        return json.loads(sys.stdin.read())
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _parse_audit_cutoff(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise typer.BadParameter("--cutoff must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise typer.BadParameter("--cutoff must include a timezone")
+    return parsed.astimezone(UTC)
+
+
+def _audit_timestamp_text(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _canonical_json_digest(payload: Any) -> str:
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _audit_code_revision() -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else "unknown"
+
+
+def _write_audit_json(path: Path, payload: Any) -> None:
+    rendered = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        handle.write(rendered)
+    temporary.replace(path)
 
 
 @app.command("recovery-dry-run")
