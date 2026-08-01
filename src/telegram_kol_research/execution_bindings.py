@@ -2554,8 +2554,18 @@ def sync_manual_closed_deepcoin_positions(
                         lifecycle.updated_at = now
                 continue
 
+            take_profit_closed = _binding_has_proven_take_profit_close(
+                session,
+                binding=row,
+                pos_ids=pos_ids,
+                client=client,
+            )
             row.status = "closed"
-            row.last_exchange_status = "manual_closed_or_not_found_on_exchange"
+            row.last_exchange_status = (
+                "take_profit_closed_on_exchange"
+                if take_profit_closed
+                else "manual_closed_or_not_found_on_exchange"
+            )
             row.updated_at = now
             result.manually_closed += 1
 
@@ -2566,8 +2576,12 @@ def sync_manual_closed_deepcoin_positions(
                 .all()
             ):
                 if leg.pos_id and str(leg.pos_id) in pos_ids:
-                    leg.status = "manually_closed"
-                    leg.terminal_reason = "manual_position_missing"
+                    leg.status = "closed" if take_profit_closed else "manually_closed"
+                    leg.terminal_reason = (
+                        "take_profit_position_closed"
+                        if take_profit_closed
+                        else "manual_position_missing"
+                    )
                     leg.updated_at = now
 
             lifecycle = (
@@ -2584,7 +2598,7 @@ def sync_manual_closed_deepcoin_positions(
                 lifecycle.exit_reason = (
                     "kol_signal"
                     if lifecycle.management_action == "exit_requested"
-                    else "manual"
+                    else ("take_profit" if take_profit_closed else "manual")
                 )
                 lifecycle.exited_at = now
                 lifecycle.updated_at = now
@@ -2939,6 +2953,160 @@ def _position_history_proves_full_close(
         ):
             return True
     return False
+
+
+def _binding_has_proven_take_profit_close(
+    session,
+    *,
+    binding: ExecutionBinding,
+    pos_ids: list[str],
+    client: DeepcoinReadOnlyClient,
+) -> bool:
+    if not pos_ids:
+        return False
+    position_history_reader = getattr(client, "list_position_history", None)
+    trigger_history_reader = getattr(client, "list_trigger_order_history", None)
+    order_history_reader = getattr(client, "list_order_history", None)
+    if not all(
+        callable(reader)
+        for reader in (
+            position_history_reader,
+            trigger_history_reader,
+            order_history_reader,
+        )
+    ):
+        return False
+    instrument_id = _binding_instrument_id(binding)
+    try:
+        trigger_history = trigger_history_reader(inst_id=instrument_id)
+        order_history = order_history_reader(inst_id=instrument_id)
+    except Exception:
+        return False
+    if not isinstance(trigger_history, list) or not isinstance(order_history, list):
+        return False
+
+    expected_position_side = _normalize_position_side(str(binding.side or ""))
+    expected_close_side = "buy" if expected_position_side == "short" else "sell"
+    for pos_id in pos_ids:
+        owned_take_profits = (
+            session.query(PositionProtectionLedger)
+            .filter(PositionProtectionLedger.venue == "deepcoin")
+            .filter(PositionProtectionLedger.execution_binding_id == int(binding.id))
+            .filter(PositionProtectionLedger.pos_id == str(pos_id))
+            .filter(PositionProtectionLedger.purpose == "take_profit")
+            .filter(PositionProtectionLedger.status.in_(["verified", "active"]))
+            .all()
+        )
+        owned_by_order_id = {
+            str(row.order_id): row
+            for row in owned_take_profits
+            if row.order_id and _to_float(row.trigger_price) not in (None, 0)
+        }
+        if not owned_by_order_id:
+            return False
+        try:
+            position_history = position_history_reader(
+                inst_id=instrument_id,
+                pos_id=str(pos_id),
+            )
+        except Exception:
+            return False
+        exact_closed_rows = [
+            history
+            for history in (position_history if isinstance(position_history, list) else [])
+            if isinstance(history, dict)
+            and _position_history_row_proves_full_close(
+                history,
+                instrument_id=instrument_id,
+                position_side=expected_position_side,
+                pos_id=str(pos_id),
+            )
+        ]
+        if len(exact_closed_rows) != 1:
+            return False
+        close_times = _timestamp_ms_values(
+            exact_closed_rows[0], "uTime", "closeTime", "cTime", "ts"
+        )
+        if not close_times:
+            return False
+
+        matching_children: list[dict[str, Any]] = []
+        for trigger in trigger_history:
+            if not isinstance(trigger, dict):
+                continue
+            order_id = _first_string(
+                trigger, "ordId", "orderId", "order_id", "id"
+            )
+            ledger_row = owned_by_order_id.get(str(order_id or ""))
+            if ledger_row is None:
+                continue
+            trigger_price = _first_string(
+                trigger,
+                "tpTriggerPx",
+                "tpTriggerPrice",
+                "closeTPTriggerPrice",
+                "triggerPx",
+            )
+            if not _numbers_equal(
+                _to_float(trigger_price), _to_float(ledger_row.trigger_price)
+            ):
+                continue
+            normalized_trigger = {
+                **trigger,
+                "px": trigger_price,
+                "triggerPx": trigger_price,
+            }
+            for child in order_history:
+                if not isinstance(child, dict):
+                    continue
+                if not _trigger_child_order_matches(normalized_trigger, child):
+                    continue
+                if not _truthy_exchange_flag(child.get("reduceOnly")):
+                    continue
+                if str(child.get("side") or "").lower() != expected_close_side:
+                    continue
+                child_times = _timestamp_ms_values(
+                    child, "fillTime", "uTime", "cTime", "ts"
+                )
+                if not (close_times & child_times):
+                    continue
+                matching_children.append(child)
+        if len(matching_children) != 1:
+            return False
+    return True
+
+
+def _position_history_row_proves_full_close(
+    row: dict[str, Any],
+    *,
+    instrument_id: str,
+    position_side: str,
+    pos_id: str,
+) -> bool:
+    if _first_string(row, "posId", "pos_id", "id") != pos_id:
+        return False
+    if _binding_instrument_id_from_value(
+        row.get("instId") or row.get("symbol")
+    ) != instrument_id:
+        return False
+    if _normalize_position_side(
+        str(row.get("posSide") or row.get("side") or "")
+    ) != position_side:
+        return False
+    opened = _to_float(row.get("pos") or row.get("size"))
+    closed = _to_float(
+        row.get("closePos") or row.get("close_pos") or row.get("closedSize")
+    )
+    return bool(
+        opened is not None
+        and opened > 0
+        and closed is not None
+        and abs(opened - closed) <= 1e-9
+    )
+
+
+def _truthy_exchange_flag(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes"}
 
 
 def _binding_instrument_id(binding: ExecutionBinding) -> str:

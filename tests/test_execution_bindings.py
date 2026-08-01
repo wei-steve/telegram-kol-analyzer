@@ -4504,6 +4504,136 @@ def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, bi
     assert lifecycle.exit_reason == "manual"
 
 
+@pytest.mark.parametrize("ambiguous_child", [False, True])
+def test_sync_missing_position_attributes_verified_take_profit_close(
+    tmp_path, ambiguous_child
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(pos_id="pos-tp-closed", status="active", side="short"),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        pos_id="pos-tp-closed",
+        status="active",
+        attribution_status="verified",
+    )
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).one()
+        leg.response_json = json.dumps({"posId": "pos-tp-closed"})
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id="deepcoin:100:55:BTC:short",
+                pos_id="pos-tp-closed",
+                instrument_id="BTC-USDT-SWAP",
+                side="short",
+                order_id="tp-owned",
+                purpose="take_profit",
+                trigger_price="63800",
+                size_text="4",
+                status="verified",
+                evidence_source="test_exact_owner",
+                evidence_json="{}",
+                last_verified_at=datetime(2026, 7, 31, 8, 39),
+            )
+        )
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="short",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 31, 3, 20),
+                entered_at=datetime(2026, 7, 31, 3, 23),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return []
+
+        def list_position_history(self, *, inst_id, pos_id=None):
+            assert inst_id == "BTC-USDT-SWAP"
+            assert pos_id == "pos-tp-closed"
+            return [
+                {
+                    "posId": "pos-tp-closed",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "short",
+                    "pos": "8",
+                    "closePos": "8",
+                    "uTime": "1785487255000",
+                }
+            ]
+
+        def list_trigger_order_history(self, *, inst_id):
+            return [
+                {
+                    "ordId": "tp-owned",
+                    "instId": inst_id,
+                    "posSide": "short",
+                    "px": "0",
+                    "tpTriggerPrice": "63800",
+                    "uTime": "1785487255000",
+                }
+            ]
+
+        def list_order_history(self, *, inst_id=None):
+            row = {
+                "ordId": "trigger-child-close",
+                "instId": inst_id,
+                "posSide": "short",
+                "side": "buy",
+                "reduceOnly": "true",
+                "state": "filled",
+                "fillPx": "63800",
+                "fillSz": "4",
+                "uTime": "1785487255000",
+            }
+            return [
+                row,
+                *(
+                    [{**row, "ordId": "ambiguous-second-child"}]
+                    if ambiguous_child
+                    else []
+                ),
+            ]
+
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=FakeClient(),
+        synced_at=datetime(2026, 7, 31, 8, 41),
+    )
+
+    assert result.manually_closed == 1
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = session.query(StrategyLifecycle).one()
+        leg = session.query(ExecutionOrderLeg).one()
+    assert binding.status == "closed"
+    assert binding.last_exchange_status == (
+        "manual_closed_or_not_found_on_exchange"
+        if ambiguous_child
+        else "take_profit_closed_on_exchange"
+    )
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == ("manual" if ambiguous_child else "take_profit")
+    assert leg.status == ("manually_closed" if ambiguous_child else "closed")
+    assert leg.terminal_reason == (
+        "manual_position_missing"
+        if ambiguous_child
+        else "take_profit_position_closed"
+    )
+
+
 def test_reconcile_then_sync_closes_a_previously_verified_missing_position(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(

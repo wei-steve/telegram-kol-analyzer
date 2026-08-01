@@ -3575,7 +3575,6 @@ def test_partial_then_break_even_uses_explicit_stop_and_ignores_zero_combined_si
         for row in client.set_calls
         if row["posId"] == "pos-1"
     ] == [
-        ("pos-1", "63000", None, "1"),
         ("pos-1", None, "64100", None),
     ]
     assert all(row.get("slTriggerPx") != "64103.8" for row in client.set_calls)
@@ -4106,6 +4105,14 @@ def test_partial_then_break_even_replaces_protection_after_exchange_resizes_old_
     assert [
         (row["posId"], row.get("tpTriggerPx"), row.get("slTriggerPx"), row.get("sz"))
         for row in client.set_calls
+        if row["posId"] == "pos-1"
+    ] == [
+        ("pos-1", "62000", None, "1"),
+        ("pos-1", None, "64000", None),
+    ]
+    assert [
+        (row["posId"], row.get("tpTriggerPx"), row.get("slTriggerPx"), row.get("sz"))
+        for row in client.set_calls
         if row["posId"] == "pos-2"
     ] == [
         ("pos-2", "62500", None, "2"),
@@ -4113,7 +4120,7 @@ def test_partial_then_break_even_replaces_protection_after_exchange_resizes_old_
     ]
 
 
-def test_precancelled_partial_protection_reallocates_staged_targets_to_remaining_size():
+def test_partial_protection_consumes_completed_take_profit_stage():
     from telegram_kol_research.strategy_management_executor import (
         _resize_protection_rows_for_remaining_position,
     )
@@ -4140,10 +4147,115 @@ def test_precancelled_partial_protection_reallocates_staged_targets_to_remaining
         rows=rows,
     )
 
-    assert [row["size"] for row in resized] == ["2", "1", "1"]
+    assert resized == [
+        {"purpose": "stop_loss", "size": "2", "trigger_price": "61000"},
+        {"purpose": "take_profit", "size": "2", "trigger_price": "67100"},
+    ]
 
 
-def test_precancelled_partial_protection_rejects_more_stages_than_remaining_steps():
+def test_partial_protection_consumes_production_ladder_first_stage():
+    from telegram_kol_research.strategy_management_executor import (
+        _resize_protection_rows_for_remaining_position,
+    )
+
+    batch = SimpleNamespace(
+        target_snapshot={
+            "contract_spec": {"quantity_step": "1", "min_quantity": "1"}
+        }
+    )
+    leg = SimpleNamespace(
+        preflight_size="8",
+        planned_close_size="4",
+        quantity_step="1",
+    )
+    rows = [
+        {"purpose": "stop_loss", "size": "8", "trigger_price": "65500"},
+        {"purpose": "take_profit", "size": "4", "trigger_price": "63800"},
+        {"purpose": "take_profit", "size": "2", "trigger_price": "63100"},
+        {"purpose": "take_profit", "size": "2", "trigger_price": "62400"},
+    ]
+
+    resized = _resize_protection_rows_for_remaining_position(
+        batch=batch,
+        leg=leg,
+        rows=rows,
+    )
+
+    assert resized == [
+        {"purpose": "stop_loss", "size": "4", "trigger_price": "65500"},
+        {"purpose": "take_profit", "size": "2", "trigger_price": "63100"},
+        {"purpose": "take_profit", "size": "2", "trigger_price": "62400"},
+    ]
+
+
+def test_partial_protection_consumes_part_of_next_take_profit_stage():
+    from telegram_kol_research.strategy_management_executor import (
+        _resize_protection_rows_for_remaining_position,
+    )
+
+    batch = SimpleNamespace(
+        target_snapshot={
+            "contract_spec": {"quantity_step": "1", "min_quantity": "1"}
+        }
+    )
+    leg = SimpleNamespace(
+        preflight_size="8",
+        planned_close_size="5",
+        quantity_step="1",
+    )
+    rows = [
+        {"purpose": "stop_loss", "size": "8", "trigger_price": "65500"},
+        {"purpose": "take_profit", "size": "4", "trigger_price": "63800"},
+        {"purpose": "take_profit", "size": "2", "trigger_price": "63100"},
+        {"purpose": "take_profit", "size": "2", "trigger_price": "62400"},
+    ]
+
+    resized = _resize_protection_rows_for_remaining_position(
+        batch=batch,
+        leg=leg,
+        rows=rows,
+    )
+
+    assert resized == [
+        {"purpose": "stop_loss", "size": "3", "trigger_price": "65500"},
+        {"purpose": "take_profit", "size": "1", "trigger_price": "63100"},
+        {"purpose": "take_profit", "size": "2", "trigger_price": "62400"},
+    ]
+
+
+def test_partial_protection_consumes_every_existing_take_profit_stage():
+    from telegram_kol_research.strategy_management_executor import (
+        _resize_protection_rows_for_remaining_position,
+    )
+
+    batch = SimpleNamespace(
+        target_snapshot={
+            "contract_spec": {"quantity_step": "1", "min_quantity": "1"}
+        }
+    )
+    leg = SimpleNamespace(
+        preflight_size="8",
+        planned_close_size="6",
+        quantity_step="1",
+    )
+    rows = [
+        {"purpose": "stop_loss", "size": "8", "trigger_price": "65500"},
+        {"purpose": "take_profit", "size": "4", "trigger_price": "63800"},
+        {"purpose": "take_profit", "size": "2", "trigger_price": "63100"},
+    ]
+
+    resized = _resize_protection_rows_for_remaining_position(
+        batch=batch,
+        leg=leg,
+        rows=rows,
+    )
+
+    assert resized == [
+        {"purpose": "stop_loss", "size": "2", "trigger_price": "65500"}
+    ]
+
+
+def test_partial_protection_rejects_take_profit_total_exceeding_preflight_size():
     from telegram_kol_research.strategy_management_executor import (
         ManagementBatchExecutionError,
         _resize_protection_rows_for_remaining_position,
@@ -4155,20 +4267,19 @@ def test_precancelled_partial_protection_rejects_more_stages_than_remaining_step
         }
     )
     leg = SimpleNamespace(
-        preflight_size="3",
+        preflight_size="4",
         planned_close_size="1",
         quantity_step="1",
     )
     rows = [
-        {"purpose": "stop_loss", "size": "3", "trigger_price": "61000"},
-        {"purpose": "take_profit", "size": "1", "trigger_price": "65000"},
-        {"purpose": "take_profit", "size": "1", "trigger_price": "66000"},
-        {"purpose": "take_profit", "size": "1", "trigger_price": "67000"},
+        {"purpose": "stop_loss", "size": "4", "trigger_price": "61000"},
+        {"purpose": "take_profit", "size": "3", "trigger_price": "65000"},
+        {"purpose": "take_profit", "size": "2", "trigger_price": "66000"},
     ]
 
     with pytest.raises(
         ManagementBatchExecutionError,
-        match="protection_take_profit_stages_exceed_remaining_size",
+        match="protection_take_profit_total_exceeds_preflight_size",
     ):
         _resize_protection_rows_for_remaining_position(
             batch=batch,

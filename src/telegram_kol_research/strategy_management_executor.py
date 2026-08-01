@@ -1684,12 +1684,21 @@ def _execute_protection_batch(
         prepared_legs = []
         for leg in batch.legs:
             old_rows = list(current_protection_rows_by_pos_id[leg.pos_id])
+            replacement_rows = old_rows
+            if batch.effective_action == "partial_then_break_even":
+                replacement_rows = _resize_protection_rows_for_remaining_position(
+                    batch=batch,
+                    leg=leg,
+                    rows=normalize_protection_snapshot_rows(
+                        (leg.old_tpsl or {}).get("row_snapshots") or []
+                    ),
+                )
             prepared_legs.append(
                 (
                     leg,
                     old_rows,
                     _adjusted_protection_rows(
-                        batch=batch, leg=leg, old_rows=old_rows
+                        batch=batch, leg=leg, old_rows=replacement_rows
                     ),
                     _protection_payload_common(
                         binding=binding,
@@ -2423,11 +2432,7 @@ def _precancelled_protection_rows(
         raise ManagementBatchExecutionError(
             "protection_precancel_success_evidence_incomplete"
         )
-    return _resize_protection_rows_for_remaining_position(
-        batch=batch,
-        leg=leg,
-        rows=rows,
-    )
+    return rows
 
 
 def _resize_protection_rows_for_remaining_position(
@@ -2467,67 +2472,88 @@ def _resize_protection_rows_for_remaining_position(
     for source in rows:
         row = dict(source)
         size = _decimal_or_none(row.get("size"))
-        if size == preflight:
-            row["size"] = _plain_decimal(remaining)
-        resized.append(row)
-
-    take_profit_indexes = [
-        index
-        for index, row in enumerate(resized)
-        if row.get("purpose") == "take_profit"
-        or (
+        has_take_profit = row.get("purpose") == "take_profit" or (
             row.get("purpose") == "combined"
             and isinstance(row.get("take_profit"), dict)
             and _has_positive_trigger(row["take_profit"])
         )
-    ]
-    if not take_profit_indexes:
-        return resized
-    if remaining < min_quantity * len(take_profit_indexes):
-        raise ManagementBatchExecutionError(
-            "protection_take_profit_stages_exceed_remaining_size"
-        )
+        if size == preflight and not has_take_profit:
+            row["size"] = _plain_decimal(remaining)
+        resized.append(row)
 
-    weights: list[Decimal] = []
-    for index in take_profit_indexes:
-        row = resized[index]
+    take_profit_stages: list[tuple[int, Decimal]] = []
+    for index, row in enumerate(resized):
+        purpose = row.get("purpose")
+        if purpose == "combined" and isinstance(row.get("take_profit"), dict):
+            if _has_positive_trigger(row["take_profit"]):
+                raise ManagementBatchExecutionError(
+                    "protection_take_profit_combined_consumption_unsupported"
+                )
+            continue
+        if purpose != "take_profit":
+            continue
         size = (
             preflight
             if row.get("full_position")
             else _decimal_or_none(row.get("size"))
         )
-        if size is None or size <= 0 or size % quantity_step != 0:
+        if (
+            size is None
+            or size <= 0
+            or size < min_quantity
+            or size % quantity_step != 0
+        ):
             raise ManagementBatchExecutionError(
                 "protection_take_profit_size_invalid"
             )
-        weights.append(size)
-    total_weight = sum(weights, Decimal("0"))
-    distributable = remaining - min_quantity * len(take_profit_indexes)
-    allocations = [min_quantity for _ in take_profit_indexes]
-    fractional: list[tuple[Decimal, int]] = []
-    allocated_extra = Decimal("0")
-    for offset, weight in enumerate(weights):
-        ideal = distributable * weight / total_weight
-        extra = (ideal // quantity_step) * quantity_step
-        allocations[offset] += extra
-        allocated_extra += extra
-        fractional.append((ideal - extra, offset))
-    leftover_steps = int((distributable - allocated_extra) / quantity_step)
-    for _fraction, offset in sorted(
-        fractional, key=lambda item: (-item[0], item[1])
-    )[:leftover_steps]:
-        allocations[offset] += quantity_step
+        take_profit_stages.append((index, size))
 
-    if sum(allocations, Decimal("0")) != remaining:
+    total_before = sum((size for _index, size in take_profit_stages), Decimal("0"))
+    if total_before > preflight:
         raise ManagementBatchExecutionError(
-            "protection_take_profit_allocation_invalid"
+            "protection_take_profit_total_exceeds_preflight_size"
         )
-    for index, allocation in zip(
-        take_profit_indexes, allocations, strict=True
-    ):
-        resized[index]["full_position"] = False
-        resized[index]["size"] = _plain_decimal(allocation)
-    return resized
+
+    close_to_consume = _decimal_or_none(leg.planned_close_size)
+    if close_to_consume is None or close_to_consume <= 0:
+        raise ManagementBatchExecutionError("protection_close_size_invalid")
+    removed_indexes: set[int] = set()
+    for index, stage_size in take_profit_stages:
+        if close_to_consume <= 0:
+            break
+        consumed = min(stage_size, close_to_consume)
+        stage_remaining = stage_size - consumed
+        close_to_consume -= consumed
+        if stage_remaining == 0:
+            removed_indexes.add(index)
+            continue
+        if (
+            stage_remaining < min_quantity
+            or stage_remaining % quantity_step != 0
+        ):
+            raise ManagementBatchExecutionError(
+                "protection_take_profit_size_invalid"
+            )
+        if resized[index].get("full_position"):
+            resized[index]["full_position"] = False
+        resized[index]["size"] = _plain_decimal(stage_remaining)
+
+    result = [
+        row for index, row in enumerate(resized) if index not in removed_indexes
+    ]
+    total_after = sum(
+        (
+            _decimal_or_none(row.get("size")) or Decimal("0")
+            for row in result
+            if row.get("purpose") == "take_profit"
+        ),
+        Decimal("0"),
+    )
+    if total_after > remaining:
+        raise ManagementBatchExecutionError(
+            "protection_take_profit_total_exceeds_remaining_size"
+        )
+    return result
 
 
 def _plain_decimal(value: Decimal) -> str:
