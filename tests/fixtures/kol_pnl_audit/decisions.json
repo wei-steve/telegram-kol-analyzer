@@ -1,0 +1,122 @@
+{
+  "strategies": [
+    {
+      "audit_id": "-1002368892075:1001:BTC:long:1",
+      "chat_id": -1002368892075,
+      "symbol": "BTC",
+      "side": "long",
+      "ordinal": 1,
+      "published_at": "2026-06-08T01:17:06Z",
+      "source_message_id": 1001,
+      "entry_legs": [{"price": "62450", "allocation_pct": "100"}],
+      "stop": {"price": "61700", "trigger": "close", "interval": "15m"},
+      "take_profits": ["62950", "63250", "64050", "66500"],
+      "confidence": "high",
+      "reason_codes": []
+    },
+    {
+      "audit_id": "-1002368892075:1003:BTC:short:1",
+      "chat_id": -1002368892075,
+      "symbol": "BTC",
+      "side": "short",
+      "ordinal": 1,
+      "published_at": "2026-07-20T06:40:31Z",
+      "source_message_id": 1003,
+      "entry_legs": [{"price": "64300", "allocation_pct": "100"}],
+      "stop": {"price": "64850", "trigger": "touch"},
+      "take_profits": ["63800", "63500"],
+      "confidence": "high",
+      "reason_codes": ["composite_strategy_split"]
+    },
+    {
+      "audit_id": "-1002368892075:1003:BTC:long:2",
+      "chat_id": -1002368892075,
+      "symbol": "BTC",
+      "side": "long",
+      "ordinal": 2,
+      "published_at": "2026-07-20T06:40:31Z",
+      "source_message_id": 1003,
+      "entry_legs": [{"price": "62200", "allocation_pct": "100"}],
+      "stop": {"price": "61800", "trigger": "touch"},
+      "take_profits": ["62700", "63300"],
+      "confidence": "high",
+      "reason_codes": ["composite_strategy_split"]
+    },
+    {
+      "audit_id": "-1002368892075:1006:BTC:long:1",
+      "chat_id": -1002368892075,
+      "symbol": "BTC",
+      "side": "long",
+      "ordinal": 1,
+      "published_at": "2026-07-02T01:38:57Z",
+      "source_message_id": 1006,
+      "entry_legs": [{"price": "58950", "allocation_pct": "100"}],
+      "stop": {"price": "58600", "trigger": "touch"},
+      "take_profits": ["59300", "59600", "60350"],
+      "confidence": "medium",
+      "reason_codes": ["reviewed_numeric_correction"]
+    },
+    {
+      "audit_id": "-1002368892075:1009:ETH:short:1",
+      "chat_id": -1002368892075,
+      "symbol": "ETH",
+      "side": "short",
+      "ordinal": 1,
+      "published_at": "2026-07-28T03:34:52Z",
+      "source_message_id": 1009,
+      "entry_legs": [
+        {"price": "1916", "allocation_pct": "60"},
+        {"price": "1923", "allocation_pct": "40"}
+      ],
+      "stop": {"price": "1945", "trigger": "close", "interval": "1h"},
+      "take_profits": ["1900", "1890", "1860"],
+      "confidence": "high",
+      "reason_codes": ["composite_strategy_split"]
+    },
+    {
+      "audit_id": "-1002368892075:1009:ETH:long:2",
+      "chat_id": -1002368892075,
+      "symbol": "ETH",
+      "side": "long",
+      "ordinal": 2,
+      "published_at": "2026-07-28T03:34:52Z",
+      "source_message_id": 1009,
+      "entry_legs": [{"price": "1823", "allocation_pct": "100"}],
+      "stop": {"price": "1800", "trigger": "close", "interval": "1h"},
+      "take_profits": ["1840", "1855", "1875"],
+      "confidence": "high",
+      "reason_codes": ["composite_strategy_split"]
+    }
+  ],
+  "excluded_messages": [
+    {"message_id": 1002, "reason": "promotional_excluded"}
+  ],
+  "duplicate_messages": [
+    {
+      "message_id": 1004,
+      "target_audit_id": "-1002368892075:1001:BTC:long:1",
+      "reason": "duplicate_continuation"
+    }
+  ],
+  "event_links": [
+    {
+      "message_id": 1005,
+      "target_audit_id": "-1002368892075:1001:BTC:long:1",
+      "event_type": "move_stop_to_break_even"
+    },
+    {
+      "message_id": 1007,
+      "target_audit_id": "-1002368892075:1001:BTC:long:1",
+      "event_type": "target_update",
+      "price": "65300"
+    },
+    {
+      "message_id": 1008,
+      "target_audit_id": "-1002368892075:1003:BTC:long:2",
+      "event_type": "cancel_pending_entry"
+    }
+  ],
+  "unresolved_events": [
+    {"message_id": 1010, "reason": "ambiguous_event_target"}
+  ]
+}

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
@@ -15,6 +15,37 @@ from telegram_kol_research.take_profit_plan import (
 
 class AuditValidationError(ValueError):
     """Raised when audit evidence cannot form a safe normalized strategy."""
+
+
+@dataclass(frozen=True, slots=True)
+class AuditSourceMessage:
+    chat_id: int
+    message_id: int
+    posted_at: datetime
+    text: str
+    reply_to_message_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AuditDisposition:
+    message_id: int
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class AuditDecisionSet:
+    strategies: tuple[Mapping[str, Any], ...]
+    excluded_messages: tuple[Mapping[str, Any], ...]
+    duplicate_messages: tuple[Mapping[str, Any], ...]
+    event_links: tuple[Mapping[str, Any], ...]
+    unresolved_events: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AuditReconstruction:
+    strategies: tuple["NormalizedAuditStrategy", ...]
+    excluded: tuple[AuditDisposition, ...]
+    unresolved: tuple[AuditDisposition, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +215,222 @@ class NormalizedAuditStrategy:
             "confidence": self.confidence,
             "reason_codes": list(self.reason_codes),
         }
+
+
+def load_audit_messages(payload: Any) -> tuple[AuditSourceMessage, ...]:
+    """Validate and chronologically order a raw-message JSON snapshot."""
+
+    if not isinstance(payload, list):
+        raise AuditValidationError("audit messages must be a JSON array")
+    result: list[AuditSourceMessage] = []
+    seen: set[tuple[int, int]] = set()
+    for raw in payload:
+        if not isinstance(raw, Mapping):
+            raise AuditValidationError("each audit message must be an object")
+        row = AuditSourceMessage(
+            chat_id=int(raw["chat_id"]),
+            message_id=int(raw["message_id"]),
+            posted_at=_timestamp(raw.get("posted_at")),
+            text=str(raw.get("text") or ""),
+            reply_to_message_id=(
+                int(raw["reply_to_message_id"])
+                if raw.get("reply_to_message_id") not in (None, "")
+                else None
+            ),
+        )
+        identity = (row.chat_id, row.message_id)
+        if identity in seen:
+            raise AuditValidationError("audit message identities must be unique")
+        seen.add(identity)
+        result.append(row)
+    return tuple(sorted(result, key=lambda row: (row.posted_at, row.message_id)))
+
+
+def load_reviewed_decisions(payload: Any) -> AuditDecisionSet:
+    """Load explicit human-reviewed reconstruction decisions."""
+
+    if not isinstance(payload, Mapping):
+        raise AuditValidationError("reviewed decisions must be a JSON object")
+
+    def rows(name: str) -> tuple[Mapping[str, Any], ...]:
+        value = payload.get(name) or ()
+        if not isinstance(value, (list, tuple)) or not all(
+            isinstance(item, Mapping) for item in value
+        ):
+            raise AuditValidationError(f"{name} must be an array of objects")
+        return tuple(dict(item) for item in value)
+
+    return AuditDecisionSet(
+        strategies=rows("strategies"),
+        excluded_messages=rows("excluded_messages"),
+        duplicate_messages=rows("duplicate_messages"),
+        event_links=rows("event_links"),
+        unresolved_events=rows("unresolved_events"),
+    )
+
+
+def reconstruct_audit_strategies(
+    messages: Iterable[AuditSourceMessage],
+    decisions: AuditDecisionSet,
+) -> AuditReconstruction:
+    """Apply reviewed decisions and fail closed on unreviewed candidates."""
+
+    ordered_messages = tuple(sorted(messages, key=lambda row: (row.posted_at, row.message_id)))
+    by_id = {row.message_id: row for row in ordered_messages}
+    if len(by_id) != len(ordered_messages):
+        raise AuditValidationError("message IDs must be unique within an audit snapshot")
+
+    strategies: dict[str, NormalizedAuditStrategy] = {}
+    reviewed_message_ids: set[int] = set()
+    for decision in decisions.strategies:
+        source_id = int(decision["source_message_id"])
+        source = _decision_message(by_id, source_id)
+        strategy_payload = {
+            **dict(decision),
+            "evidence": [
+                {
+                    "message_id": source.message_id,
+                    "posted_at": _timestamp_text(source.posted_at),
+                    "role": "strategy",
+                }
+            ],
+            "management_events": [],
+        }
+        strategy_payload.pop("source_message_id", None)
+        strategy = NormalizedAuditStrategy.from_dict(strategy_payload)
+        if strategy.audit_id in strategies:
+            raise AuditValidationError("audit strategy IDs must be unique")
+        if strategy.chat_id != source.chat_id:
+            raise AuditValidationError("strategy chat does not match source evidence")
+        strategies[strategy.audit_id] = strategy
+        reviewed_message_ids.add(source_id)
+
+    excluded: list[AuditDisposition] = []
+    for decision in decisions.excluded_messages:
+        message_id = int(decision["message_id"])
+        _decision_message(by_id, message_id)
+        excluded.append(
+            AuditDisposition(
+                message_id=message_id,
+                reason=_required_text(decision.get("reason"), "exclusion reason"),
+            )
+        )
+        reviewed_message_ids.add(message_id)
+
+    for decision in decisions.duplicate_messages:
+        message_id = int(decision["message_id"])
+        message = _decision_message(by_id, message_id)
+        strategy = _decision_strategy(strategies, decision.get("target_audit_id"))
+        reason = _required_text(decision.get("reason"), "duplicate reason")
+        evidence = (*strategy.evidence, AuditMessageEvidence(
+            message_id=message.message_id,
+            posted_at=message.posted_at,
+            role=reason,
+        ))
+        strategies[strategy.audit_id] = replace(strategy, evidence=_ordered_evidence(evidence))
+        reviewed_message_ids.add(message_id)
+
+    for decision in decisions.event_links:
+        message_id = int(decision["message_id"])
+        message = _decision_message(by_id, message_id)
+        strategy = _decision_strategy(strategies, decision.get("target_audit_id"))
+        event = AuditManagementEvent(
+            event_type=_required_text(decision.get("event_type"), "event type"),
+            message_id=message.message_id,
+            occurred_at=message.posted_at,
+            allocation_pct=(
+                _positive_decimal(decision.get("allocation_pct"), "event allocation")
+                if decision.get("allocation_pct") not in (None, "")
+                else None
+            ),
+            price=(
+                _positive_decimal(decision.get("price"), "event price")
+                if decision.get("price") not in (None, "")
+                else None
+            ),
+        )
+        strategies[strategy.audit_id] = replace(
+            strategy,
+            evidence=_ordered_evidence((*strategy.evidence, AuditMessageEvidence(
+                message_id=message.message_id,
+                posted_at=message.posted_at,
+                role="management",
+            ))),
+            management_events=tuple(sorted(
+                (*strategy.management_events, event),
+                key=lambda item: (item.occurred_at, item.message_id),
+            )),
+        )
+        reviewed_message_ids.add(message_id)
+
+    unresolved: list[AuditDisposition] = []
+    for decision in decisions.unresolved_events:
+        message_id = int(decision["message_id"])
+        _decision_message(by_id, message_id)
+        unresolved.append(AuditDisposition(
+            message_id=message_id,
+            reason=_required_text(decision.get("reason"), "unresolved reason"),
+        ))
+        reviewed_message_ids.add(message_id)
+
+    for message in ordered_messages:
+        if message.message_id in reviewed_message_ids:
+            continue
+        if _looks_like_strategy_candidate(message.text):
+            unresolved.append(AuditDisposition(
+                message_id=message.message_id,
+                reason="unreviewed_strategy_candidate",
+            ))
+
+    return AuditReconstruction(
+        strategies=tuple(sorted(
+            strategies.values(),
+            key=lambda item: (
+                item.published_at,
+                item.evidence[0].message_id,
+                item.ordinal,
+                item.audit_id,
+            ),
+        )),
+        excluded=tuple(sorted(excluded, key=lambda item: item.message_id)),
+        unresolved=tuple(sorted(unresolved, key=lambda item: item.message_id)),
+    )
+
+
+def _decision_message(
+    by_id: Mapping[int, AuditSourceMessage], message_id: int
+) -> AuditSourceMessage:
+    message = by_id.get(message_id)
+    if message is None:
+        raise AuditValidationError(f"reviewed message {message_id} is missing")
+    return message
+
+
+def _decision_strategy(
+    strategies: Mapping[str, NormalizedAuditStrategy], audit_id: Any
+) -> NormalizedAuditStrategy:
+    identity = _required_text(audit_id, "target audit ID")
+    strategy = strategies.get(identity)
+    if strategy is None:
+        raise AuditValidationError(f"reviewed strategy {identity} is missing")
+    return strategy
+
+
+def _ordered_evidence(
+    evidence: Iterable[AuditMessageEvidence],
+) -> tuple[AuditMessageEvidence, ...]:
+    return tuple(sorted(evidence, key=lambda item: (item.posted_at, item.message_id)))
+
+
+def _looks_like_strategy_candidate(text: str) -> bool:
+    normalized = str(text or "").lower()
+    has_symbol = any(token in normalized for token in ("比特币", "btc", "以太币", "eth"))
+    has_risk = "止损" in normalized
+    has_entry = any(
+        token in normalized
+        for token in ("做多", "开多", "反弹多", "做空", "开空", "附近空", "附近反弹")
+    )
+    return has_symbol and has_risk and has_entry
 
 
 def _message_evidence(payload: Mapping[str, Any]) -> AuditMessageEvidence:
