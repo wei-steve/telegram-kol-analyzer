@@ -1,0 +1,30 @@
+[
+  {
+    "id": 1,
+    "chat_id": -1002368892075,
+    "message_id": 1001,
+    "symbol": "BTC",
+    "side": "long",
+    "lifecycle_status": "exited",
+    "signal_at": "2026-06-08T01:17:06Z",
+    "entered_at": "2026-06-08T02:00:00Z",
+    "exited_at": "2026-06-08T01:30:00Z",
+    "entry_range_low": "103",
+    "entry_range_high": "103",
+    "management_signal_message_id": null
+  },
+  {
+    "id": 2,
+    "chat_id": -1002368892075,
+    "message_id": 1001,
+    "symbol": "BTC",
+    "side": "long",
+    "lifecycle_status": "pending_entry",
+    "signal_at": "2026-06-08T01:17:06Z",
+    "entered_at": null,
+    "exited_at": null,
+    "entry_range_low": "62450",
+    "entry_range_high": "62450",
+    "management_signal_message_id": null
+  }
+]
