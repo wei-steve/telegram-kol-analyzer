@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -10,7 +11,9 @@ from telegram_kol_research.kol_pnl_audit import (
     load_audit_messages,
     load_reviewed_decisions,
     reconstruct_audit_strategies,
+    replay_audit_strategy,
 )
+from telegram_kol_research.kol_audit_market_data import AuditCandle
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "kol_pnl_audit"
@@ -158,3 +161,229 @@ def test_reconstruction_fails_closed_for_unreviewed_strategy_candidate():
     assert (1011, "unreviewed_strategy_candidate") in [
         (item.message_id, item.reason) for item in result.unresolved
     ]
+
+
+def _candle(minutes, *, open, high, low, close, width=5):
+    opened_at = datetime(2026, 6, 8, 1, 20, tzinfo=UTC) + timedelta(minutes=minutes)
+    return AuditCandle(
+        opened_at=opened_at,
+        closed_at=opened_at + timedelta(minutes=width) - timedelta(milliseconds=1),
+        open=Decimal(str(open)),
+        high=Decimal(str(high)),
+        low=Decimal(str(low)),
+        close=Decimal(str(close)),
+    )
+
+
+def _replay_strategy(**overrides):
+    return NormalizedAuditStrategy.from_dict(_strategy_payload(**overrides))
+
+
+def test_replay_does_not_fill_from_candle_that_opened_before_publication():
+    strategy = _replay_strategy(published_at="2026-06-08T01:22:00Z")
+    candles = [
+        _candle(0, open=62500, high=62500, low=62400, close=62450),
+        _candle(5, open=62600, high=62650, low=62550, close=62600),
+    ]
+
+    result = replay_audit_strategy(
+        strategy, candles, cutoff=datetime(2026, 6, 8, 1, 30, tzinfo=UTC)
+    )
+
+    assert result.status == "unfilled"
+    assert result.entry_price is None
+
+
+def test_replay_uses_weighted_price_after_two_entry_legs_fill():
+    strategy = _replay_strategy(
+        entry_legs=[
+            {"price": "62450", "allocation_pct": "60"},
+            {"price": "62300", "allocation_pct": "40"},
+        ]
+    )
+    candles = [
+        _candle(0, open=62500, high=62520, low=62440, close=62460),
+        _candle(5, open=62400, high=62410, low=62290, close=62310),
+    ]
+
+    result = replay_audit_strategy(
+        strategy, candles, cutoff=datetime(2026, 6, 8, 1, 30, tzinfo=UTC)
+    )
+
+    assert result.status == "open"
+    assert result.entry_price == Decimal("62390")
+    assert result.filled_entry_allocation_pct == Decimal("100")
+    assert result.open_allocation_pct == Decimal("100")
+
+
+def test_replay_keeps_unfilled_second_leg_pending_without_inventing_size():
+    strategy = _replay_strategy(
+        entry_legs=[
+            {"price": "62450", "allocation_pct": "60"},
+            {"price": "62000", "allocation_pct": "40"},
+        ]
+    )
+    result = replay_audit_strategy(
+        strategy,
+        [_candle(0, open=62500, high=62520, low=62440, close=62460)],
+        cutoff=datetime(2026, 6, 8, 1, 25, tzinfo=UTC),
+    )
+
+    assert result.status == "open"
+    assert result.filled_entry_allocation_pct == Decimal("60")
+    assert result.open_allocation_pct == Decimal("100")
+    assert "pending_entry_leg" in result.reason_codes
+
+
+def test_replay_applies_staged_targets_and_exact_r():
+    strategy = _replay_strategy(
+        take_profits=["62950", "63250"],
+    )
+    candles = [
+        _candle(0, open=62450, high=62500, low=62400, close=62480),
+        _candle(5, open=62500, high=63000, low=62480, close=62900),
+        _candle(10, open=63000, high=63300, low=62950, close=63200),
+    ]
+
+    result = replay_audit_strategy(
+        strategy, candles, cutoff=datetime(2026, 6, 8, 1, 40, tzinfo=UTC)
+    )
+
+    assert result.status == "closed"
+    assert result.exit_reason == "take_profit"
+    assert result.targets_reached == 2
+    assert float(result.realized_r) == pytest.approx(13 / 15)
+    assert result.open_allocation_pct == 0
+
+
+def test_replay_does_not_move_stop_to_break_even_without_explicit_event():
+    strategy = _replay_strategy(take_profits=["62950", "63250"])
+    candles = [
+        _candle(0, open=62450, high=62500, low=62400, close=62480),
+        _candle(5, open=62500, high=63000, low=62480, close=62900),
+        _candle(10, open=62400, high=62420, low=61650, close=61680, width=15),
+    ]
+
+    result = replay_audit_strategy(
+        strategy, candles, cutoff=datetime(2026, 6, 8, 1, 40, tzinfo=UTC)
+    )
+
+    assert result.status == "closed"
+    assert result.exit_reason == "stop_loss"
+    assert float(result.realized_r) == pytest.approx(-1 / 6)
+
+
+def test_replay_explicit_protection_moves_only_remaining_position_to_break_even():
+    strategy = _replay_strategy(
+        take_profits=["62950", "63250"],
+        management_events=[{
+            "event_type": "move_stop_to_break_even",
+            "message_id": 6497,
+            "occurred_at": "2026-06-08T01:31:00Z",
+        }],
+    )
+    candles = [
+        _candle(0, open=62450, high=62500, low=62400, close=62480),
+        _candle(5, open=62500, high=63000, low=62480, close=62900),
+        _candle(15, open=62500, high=62510, low=62400, close=62440),
+    ]
+
+    result = replay_audit_strategy(
+        strategy, candles, cutoff=datetime(2026, 6, 8, 1, 40, tzinfo=UTC)
+    )
+
+    assert result.status == "closed"
+    assert result.exit_reason == "break_even"
+    assert float(result.realized_r) == pytest.approx(1 / 3)
+
+
+@pytest.mark.parametrize(
+    ("trigger", "interval", "expected"),
+    [
+        ("touch", None, "closed"),
+        ("close", "15m", "open"),
+    ],
+)
+def test_replay_distinguishes_touch_and_close_qualified_stops(
+    trigger, interval, expected
+):
+    stop = {"price": "61700", "trigger": trigger}
+    if interval:
+        stop["interval"] = interval
+    strategy = _replay_strategy(stop=stop)
+    candles = [
+        _candle(0, open=62450, high=62500, low=62400, close=62480),
+        _candle(5, open=62300, high=62320, low=61650, close=61800),
+    ]
+
+    result = replay_audit_strategy(
+        strategy, candles, cutoff=datetime(2026, 6, 8, 1, 31, tzinfo=UTC)
+    )
+
+    assert result.status == expected
+
+
+def test_replay_explicit_partial_then_full_exit_uses_next_candle_open():
+    strategy = _replay_strategy(management_events=[
+        {
+            "event_type": "partial_exit",
+            "message_id": 6497,
+            "occurred_at": "2026-06-08T01:26:00Z",
+            "allocation_pct": "30",
+        },
+        {
+            "event_type": "full_exit",
+            "message_id": 6498,
+            "occurred_at": "2026-06-08T01:31:00Z",
+        },
+    ])
+    candles = [
+        _candle(0, open=62450, high=62500, low=62400, close=62480),
+        _candle(10, open=62700, high=62720, low=62680, close=62710),
+        _candle(15, open=62600, high=62620, low=62580, close=62610),
+    ]
+
+    result = replay_audit_strategy(
+        strategy, candles, cutoff=datetime(2026, 6, 8, 1, 40, tzinfo=UTC)
+    )
+
+    assert result.status == "closed"
+    assert result.exit_reason == "kol_full_exit"
+    assert [item.price for item in result.exits] == [Decimal("62700"), Decimal("62600")]
+    assert [item.allocation_pct for item in result.exits] == [Decimal("30"), Decimal("70")]
+
+
+def test_replay_cancel_before_entry_prevents_future_fill():
+    strategy = _replay_strategy(management_events=[{
+        "event_type": "cancel_pending_entry",
+        "message_id": 6497,
+        "occurred_at": "2026-06-08T01:21:00Z",
+    }])
+
+    result = replay_audit_strategy(
+        strategy,
+        [_candle(5, open=62450, high=62500, low=62400, close=62480)],
+        cutoff=datetime(2026, 6, 8, 1, 30, tzinfo=UTC),
+    )
+
+    assert result.status == "cancelled"
+    assert result.entry_price is None
+
+
+def test_replay_same_candle_stop_and_target_uses_adverse_order():
+    strategy = _replay_strategy(
+        stop={"price": "61700", "trigger": "touch"},
+        take_profits=["62950"],
+    )
+    candles = [
+        _candle(0, open=62450, high=62500, low=62400, close=62480),
+        _candle(5, open=62400, high=63000, low=61600, close=62500),
+    ]
+
+    result = replay_audit_strategy(
+        strategy, candles, cutoff=datetime(2026, 6, 8, 1, 30, tzinfo=UTC)
+    )
+
+    assert result.exit_reason == "stop_loss"
+    assert result.realized_r == Decimal("-1")
+    assert "intrabar_order_uncertain" in result.reason_codes

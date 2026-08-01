@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
+from telegram_kol_research.kol_audit_market_data import AuditCandle
 from telegram_kol_research.take_profit_plan import (
     TakeProfitPlanError,
     build_take_profit_plan,
@@ -46,6 +47,43 @@ class AuditReconstruction:
     strategies: tuple["NormalizedAuditStrategy", ...]
     excluded: tuple[AuditDisposition, ...]
     unresolved: tuple[AuditDisposition, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AuditEntryFill:
+    price: Decimal
+    allocation_pct: Decimal
+    occurred_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AuditExitFill:
+    price: Decimal
+    allocation_pct: Decimal
+    occurred_at: datetime
+    reason: str
+    realized_r: Decimal
+    return_pct: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class AuditStrategyResult:
+    audit_id: str
+    symbol: str
+    side: str
+    status: str
+    entry_price: Decimal | None
+    entered_at: datetime | None
+    filled_entry_allocation_pct: Decimal
+    initial_risk: Decimal | None
+    exits: tuple[AuditExitFill, ...]
+    targets_reached: int
+    realized_r: Decimal
+    realized_return_pct: Decimal
+    open_allocation_pct: Decimal
+    exit_reason: str | None
+    confidence: str
+    reason_codes: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +433,322 @@ def reconstruct_audit_strategies(
         excluded=tuple(sorted(excluded, key=lambda item: item.message_id)),
         unresolved=tuple(sorted(unresolved, key=lambda item: item.message_id)),
     )
+
+
+def replay_audit_strategy(
+    strategy: NormalizedAuditStrategy,
+    candles: Iterable[AuditCandle],
+    *,
+    cutoff: datetime,
+) -> AuditStrategyResult:
+    """Replay one reviewed strategy without mutating operational state."""
+
+    audit_cutoff = _timestamp(cutoff)
+    ordered_candles = tuple(sorted(
+        (
+            candle
+            for candle in candles
+            if candle.opened_at >= strategy.published_at
+            and candle.opened_at <= audit_cutoff
+        ),
+        key=lambda candle: candle.opened_at,
+    ))
+    events = tuple(sorted(
+        (
+            event
+            for event in strategy.management_events
+            if event.occurred_at <= audit_cutoff
+        ),
+        key=lambda event: (event.occurred_at, event.message_id),
+    ))
+    event_index = 0
+    cancelled = False
+    entries_frozen = False
+    protected = False
+    entry_fills: dict[int, AuditEntryFill] = {}
+    exits: list[AuditExitFill] = []
+    next_target = 0
+    remaining = Decimal("100")
+    reasons = list(strategy.reason_codes)
+    exit_reason: str | None = None
+    entered_at: datetime | None = None
+
+    for candle in ordered_candles:
+        while event_index < len(events) and events[event_index].occurred_at <= candle.opened_at:
+            event = events[event_index]
+            event_index += 1
+            if event.event_type in {"cancel_pending_entry", "replace_pending_entry"}:
+                entries_frozen = True
+                if not entry_fills:
+                    cancelled = True
+                    exit_reason = "cancelled"
+                reasons.append(event.event_type)
+                continue
+            if event.event_type == "move_stop_to_break_even":
+                if entry_fills and remaining > 0:
+                    protected = True
+                    reasons.append("explicit_break_even")
+                continue
+            if event.event_type in {"partial_exit", "full_exit"} and entry_fills and remaining > 0:
+                allocation = (
+                    remaining
+                    if event.event_type == "full_exit"
+                    else min(event.allocation_pct or Decimal("0"), remaining)
+                )
+                if allocation <= 0:
+                    reasons.append("invalid_management_allocation")
+                    continue
+                entry_price = _weighted_entry(entry_fills.values())
+                initial_risk = abs(entry_price - strategy.stop.price)
+                exits.append(_exit_fill(
+                    strategy=strategy,
+                    entry_price=entry_price,
+                    initial_risk=initial_risk,
+                    price=candle.open,
+                    allocation=allocation,
+                    occurred_at=candle.opened_at,
+                    reason=(
+                        "kol_full_exit"
+                        if event.event_type == "full_exit"
+                        else "kol_partial_exit"
+                    ),
+                ))
+                remaining -= allocation
+                entries_frozen = True
+                exit_reason = exits[-1].reason
+                if remaining == 0:
+                    break
+        if remaining == 0:
+            break
+        if cancelled and not entry_fills:
+            continue
+
+        if not entries_frozen:
+            for index, leg in enumerate(strategy.entry_legs):
+                if index in entry_fills:
+                    continue
+                if candle.low <= leg.price <= candle.high:
+                    entry_fills[index] = AuditEntryFill(
+                        price=leg.price,
+                        allocation_pct=leg.allocation_pct,
+                        occurred_at=candle.opened_at,
+                    )
+                    entered_at = entered_at or candle.opened_at
+        if not entry_fills:
+            continue
+
+        entry_price = _weighted_entry(entry_fills.values())
+        initial_risk = abs(entry_price - strategy.stop.price)
+        if initial_risk <= 0:
+            reasons.append("zero_initial_risk")
+            return _result(
+                strategy=strategy,
+                status="unresolved",
+                entry_fills=entry_fills,
+                entered_at=entered_at,
+                exits=exits,
+                targets_reached=next_target,
+                remaining=remaining,
+                exit_reason="invalid_initial_risk",
+                reasons=reasons,
+            )
+
+        stop_price = entry_price if protected else strategy.stop.price
+        stop_hit = _stop_hit(
+            strategy=strategy,
+            candle=candle,
+            price=stop_price,
+            protected=protected,
+        )
+        target_hit = (
+            next_target < len(strategy.take_profits)
+            and _target_hit(strategy, candle, strategy.take_profits[next_target].price)
+        )
+        if stop_hit:
+            if target_hit:
+                reasons.append("intrabar_order_uncertain")
+            reason = "break_even" if protected else "stop_loss"
+            exits.append(_exit_fill(
+                strategy=strategy,
+                entry_price=entry_price,
+                initial_risk=initial_risk,
+                price=stop_price,
+                allocation=remaining,
+                occurred_at=candle.closed_at,
+                reason=reason,
+            ))
+            remaining = Decimal("0")
+            entries_frozen = True
+            exit_reason = reason
+            break
+
+        while next_target < len(strategy.take_profits):
+            target = strategy.take_profits[next_target]
+            if not _target_hit(strategy, candle, target.price):
+                break
+            allocation = min(target.allocation_pct, remaining)
+            if allocation <= 0:
+                break
+            exits.append(_exit_fill(
+                strategy=strategy,
+                entry_price=entry_price,
+                initial_risk=initial_risk,
+                price=target.price,
+                allocation=allocation,
+                occurred_at=candle.opened_at,
+                reason=f"target_{next_target + 1}",
+            ))
+            remaining -= allocation
+            next_target += 1
+            entries_frozen = True
+            reasons.append(exits[-1].reason)
+            if remaining == 0:
+                exit_reason = "take_profit"
+                break
+        if remaining == 0:
+            break
+
+    while event_index < len(events):
+        event = events[event_index]
+        event_index += 1
+        if event.event_type in {"cancel_pending_entry", "replace_pending_entry"}:
+            entries_frozen = True
+            if not entry_fills:
+                cancelled = True
+                exit_reason = "cancelled"
+            reasons.append(event.event_type)
+
+    status = (
+        "closed"
+        if entry_fills and remaining == 0
+        else "open"
+        if entry_fills
+        else "cancelled"
+        if cancelled
+        else "unfilled"
+    )
+    if entry_fills and len(entry_fills) < len(strategy.entry_legs) and not entries_frozen:
+        reasons.append("pending_entry_leg")
+    return _result(
+        strategy=strategy,
+        status=status,
+        entry_fills=entry_fills,
+        entered_at=entered_at,
+        exits=exits,
+        targets_reached=next_target,
+        remaining=remaining,
+        exit_reason=exit_reason,
+        reasons=reasons,
+    )
+
+
+def _result(
+    *,
+    strategy: NormalizedAuditStrategy,
+    status: str,
+    entry_fills: Mapping[int, AuditEntryFill],
+    entered_at: datetime | None,
+    exits: Iterable[AuditExitFill],
+    targets_reached: int,
+    remaining: Decimal,
+    exit_reason: str | None,
+    reasons: Iterable[str],
+) -> AuditStrategyResult:
+    ordered_exits = tuple(exits)
+    entry_price = _weighted_entry(entry_fills.values()) if entry_fills else None
+    initial_risk = (
+        abs(entry_price - strategy.stop.price) if entry_price is not None else None
+    )
+    return AuditStrategyResult(
+        audit_id=strategy.audit_id,
+        symbol=strategy.symbol,
+        side=strategy.side,
+        status=status,
+        entry_price=entry_price,
+        entered_at=entered_at,
+        filled_entry_allocation_pct=sum(
+            (item.allocation_pct for item in entry_fills.values()), Decimal("0")
+        ),
+        initial_risk=initial_risk,
+        exits=ordered_exits,
+        targets_reached=targets_reached,
+        realized_r=sum((item.realized_r for item in ordered_exits), Decimal("0")),
+        realized_return_pct=sum(
+            (item.return_pct for item in ordered_exits), Decimal("0")
+        ),
+        open_allocation_pct=remaining if entry_fills else Decimal("0"),
+        exit_reason=exit_reason,
+        confidence=strategy.confidence,
+        reason_codes=tuple(dict.fromkeys(reasons)),
+    )
+
+
+def _weighted_entry(fills: Iterable[AuditEntryFill]) -> Decimal:
+    rows = tuple(fills)
+    total = sum((item.allocation_pct for item in rows), Decimal("0"))
+    return sum(
+        (item.price * item.allocation_pct for item in rows), Decimal("0")
+    ) / total
+
+
+def _exit_fill(
+    *,
+    strategy: NormalizedAuditStrategy,
+    entry_price: Decimal,
+    initial_risk: Decimal,
+    price: Decimal,
+    allocation: Decimal,
+    occurred_at: datetime,
+    reason: str,
+) -> AuditExitFill:
+    signed_move = (
+        price - entry_price if strategy.side == "long" else entry_price - price
+    )
+    weight = allocation / Decimal("100")
+    return AuditExitFill(
+        price=price,
+        allocation_pct=allocation,
+        occurred_at=occurred_at,
+        reason=reason,
+        realized_r=signed_move / initial_risk * weight,
+        return_pct=signed_move / entry_price * Decimal("100") * weight,
+    )
+
+
+def _stop_hit(
+    *,
+    strategy: NormalizedAuditStrategy,
+    candle: AuditCandle,
+    price: Decimal,
+    protected: bool,
+) -> bool:
+    if protected or strategy.stop.trigger == "touch":
+        return candle.low <= price if strategy.side == "long" else candle.high >= price
+    if not _is_interval_close(candle, strategy.stop.interval):
+        return False
+    return candle.close < price if strategy.side == "long" else candle.close > price
+
+
+def _target_hit(
+    strategy: NormalizedAuditStrategy,
+    candle: AuditCandle,
+    price: Decimal,
+) -> bool:
+    return candle.high >= price if strategy.side == "long" else candle.low <= price
+
+
+def _is_interval_close(candle: AuditCandle, interval: str | None) -> bool:
+    seconds = {
+        "5m": 300,
+        "15m": 900,
+        "1h": 3600,
+        "4h": 14400,
+        "1d": 86400,
+    }.get(str(interval or ""))
+    if seconds is None:
+        return False
+    closed_boundary = int(candle.closed_at.timestamp() * 1000) + 1
+    return closed_boundary % (seconds * 1000) == 0
 
 
 def _decision_message(
