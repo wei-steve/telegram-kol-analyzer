@@ -194,6 +194,18 @@ def test_replay_does_not_fill_from_candle_that_opened_before_publication():
     assert result.entry_price is None
 
 
+def test_replay_does_not_use_candle_data_past_audit_cutoff():
+    strategy = _replay_strategy(published_at="2026-06-08T01:20:00Z")
+    candle = _candle(0, open=62500, high=62500, low=62400, close=62450)
+
+    result = replay_audit_strategy(
+        strategy, [candle], cutoff=datetime(2026, 6, 8, 1, 22, tzinfo=UTC)
+    )
+
+    assert result.status == "unfilled"
+    assert result.entry_price is None
+
+
 def test_replay_uses_weighted_price_after_two_entry_legs_fill():
     strategy = _replay_strategy(
         entry_legs=[
@@ -265,7 +277,7 @@ def test_replay_does_not_move_stop_to_break_even_without_explicit_event():
     ]
 
     result = replay_audit_strategy(
-        strategy, candles, cutoff=datetime(2026, 6, 8, 1, 40, tzinfo=UTC)
+        strategy, candles, cutoff=datetime(2026, 6, 8, 1, 45, tzinfo=UTC)
     )
 
     assert result.status == "closed"

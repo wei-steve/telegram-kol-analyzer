@@ -464,7 +464,7 @@ def replay_audit_strategy(
             candle
             for candle in candles
             if candle.opened_at >= strategy.published_at
-            and candle.opened_at <= audit_cutoff
+            and candle.closed_at <= audit_cutoff
         ),
         key=lambda candle: candle.opened_at,
     ))
