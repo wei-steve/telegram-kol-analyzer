@@ -502,6 +502,12 @@ def replay_audit_strategy(
                     exit_reason = "cancelled"
                 reasons.append(event.event_type)
                 continue
+            if event.event_type == "full_exit" and not entry_fills:
+                entries_frozen = True
+                cancelled = True
+                exit_reason = "cancelled"
+                reasons.append("full_exit_before_external_fill")
+                continue
             if event.event_type == "move_stop_to_break_even":
                 if entry_fills and remaining > 0:
                     protected = True
@@ -638,12 +644,18 @@ def replay_audit_strategy(
     while event_index < len(events):
         event = events[event_index]
         event_index += 1
-        if event.event_type in {"cancel_pending_entry", "replace_pending_entry"}:
+        if event.event_type in {
+            "cancel_pending_entry", "replace_pending_entry", "full_exit"
+        }:
             entries_frozen = True
             if not entry_fills:
                 cancelled = True
                 exit_reason = "cancelled"
-            reasons.append(event.event_type)
+            reasons.append(
+                "full_exit_before_external_fill"
+                if event.event_type == "full_exit" and not entry_fills
+                else event.event_type
+            )
 
     status = (
         "closed"
