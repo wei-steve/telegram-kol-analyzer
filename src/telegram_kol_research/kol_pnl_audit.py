@@ -512,6 +512,11 @@ def replay_audit_strategy(
                 if entry_fills and remaining > 0:
                     protected = True
                     reasons.append("explicit_break_even")
+                elif not entry_fills:
+                    entries_frozen = True
+                    cancelled = True
+                    exit_reason = "cancelled"
+                    reasons.append("protection_before_external_fill")
                 continue
             if event.event_type == "stop_update":
                 active_stop_price = event.price or active_stop_price
@@ -644,6 +649,15 @@ def replay_audit_strategy(
     while event_index < len(events):
         event = events[event_index]
         event_index += 1
+        if event.event_type == "move_stop_to_break_even":
+            if entry_fills and remaining > 0:
+                reasons.append("explicit_break_even")
+            elif not entry_fills:
+                entries_frozen = True
+                cancelled = True
+                exit_reason = "cancelled"
+                reasons.append("protection_before_external_fill")
+            continue
         if event.event_type in {
             "cancel_pending_entry", "replace_pending_entry", "full_exit"
         }:

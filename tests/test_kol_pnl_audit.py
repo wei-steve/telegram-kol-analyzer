@@ -427,6 +427,24 @@ def test_replay_full_exit_before_external_fill_cancels_pending_entry():
     assert "full_exit_before_external_fill" in result.reason_codes
 
 
+def test_replay_protection_before_external_fill_cancels_future_entry():
+    strategy = _replay_strategy(management_events=[{
+        "event_type": "move_stop_to_break_even",
+        "message_id": 6497,
+        "occurred_at": "2026-06-08T01:21:00Z",
+    }])
+
+    result = replay_audit_strategy(
+        strategy,
+        [_candle(5, open=62450, high=62500, low=62400, close=62480)],
+        cutoff=datetime(2026, 6, 8, 1, 30, tzinfo=UTC),
+    )
+
+    assert result.status == "cancelled"
+    assert result.entry_price is None
+    assert "protection_before_external_fill" in result.reason_codes
+
+
 def test_replay_same_candle_stop_and_target_uses_adverse_order():
     strategy = _replay_strategy(
         stop={"price": "61700", "trigger": "touch"},
