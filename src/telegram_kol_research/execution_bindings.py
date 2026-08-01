@@ -3056,10 +3056,21 @@ def _binding_has_proven_take_profit_close(
                 "px": trigger_price,
                 "triggerPx": trigger_price,
             }
+            if not is_fill_evidence(
+                {**normalized_trigger, "_evidence_source": "trigger_fill"}
+            ):
+                continue
+            planned_size = _to_float(ledger_row.size_text)
+            if planned_size is None or planned_size <= 0:
+                continue
             for child in order_history:
                 if not isinstance(child, dict):
                     continue
                 if not _trigger_child_order_matches(normalized_trigger, child):
+                    continue
+                if classify_leg_exchange_state(child) != "filled":
+                    continue
+                if not _numbers_equal(_order_row_size(child), planned_size):
                     continue
                 if not _truthy_exchange_flag(child.get("reduceOnly")):
                     continue

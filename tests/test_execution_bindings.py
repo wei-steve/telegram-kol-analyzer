@@ -4504,9 +4504,9 @@ def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, bi
     assert lifecycle.exit_reason == "manual"
 
 
-@pytest.mark.parametrize("ambiguous_child", [False, True])
+@pytest.mark.parametrize("evidence_case", ["proven", "ambiguous", "unproven"])
 def test_sync_missing_position_attributes_verified_take_profit_close(
-    tmp_path, ambiguous_child
+    tmp_path, evidence_case
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
@@ -4582,6 +4582,10 @@ def test_sync_missing_position_attributes_verified_take_profit_close(
                     "posSide": "short",
                     "px": "0",
                     "tpTriggerPrice": "63800",
+                    "triggerTime": (
+                        "1785487255000" if evidence_case != "unproven" else "0"
+                    ),
+                    "errorCode": "0",
                     "uTime": "1785487255000",
                 }
             ]
@@ -4602,7 +4606,7 @@ def test_sync_missing_position_attributes_verified_take_profit_close(
                 row,
                 *(
                     [{**row, "ordId": "ambiguous-second-child"}]
-                    if ambiguous_child
+                    if evidence_case == "ambiguous"
                     else []
                 ),
             ]
@@ -4620,17 +4624,21 @@ def test_sync_missing_position_attributes_verified_take_profit_close(
         leg = session.query(ExecutionOrderLeg).one()
     assert binding.status == "closed"
     assert binding.last_exchange_status == (
-        "manual_closed_or_not_found_on_exchange"
-        if ambiguous_child
-        else "take_profit_closed_on_exchange"
+        "take_profit_closed_on_exchange"
+        if evidence_case == "proven"
+        else "manual_closed_or_not_found_on_exchange"
     )
     assert lifecycle.lifecycle_status == "exited"
-    assert lifecycle.exit_reason == ("manual" if ambiguous_child else "take_profit")
-    assert leg.status == ("manually_closed" if ambiguous_child else "closed")
+    assert lifecycle.exit_reason == (
+        "take_profit" if evidence_case == "proven" else "manual"
+    )
+    assert leg.status == (
+        "closed" if evidence_case == "proven" else "manually_closed"
+    )
     assert leg.terminal_reason == (
-        "manual_position_missing"
-        if ambiguous_child
-        else "take_profit_position_closed"
+        "take_profit_position_closed"
+        if evidence_case == "proven"
+        else "manual_position_missing"
     )
 
 

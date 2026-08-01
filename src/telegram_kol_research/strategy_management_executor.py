@@ -2460,6 +2460,8 @@ def _resize_protection_rows_for_remaining_position(
     if (
         quantity_step is None
         or min_quantity is None
+        or quantity_step <= 0
+        or min_quantity <= 0
         or persisted_step != quantity_step
         or remaining % quantity_step != 0
         or min_quantity % quantity_step != 0

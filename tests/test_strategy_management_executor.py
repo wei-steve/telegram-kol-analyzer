@@ -3751,6 +3751,13 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
         ("pos-1", "64000"),
         ("pos-2", "64500"),
     ]
+    take_profits = [row for row in client.set_calls if "tpTriggerPx" in row]
+    assert [
+        (row["posId"], row["tpTriggerPx"], row["sz"])
+        for row in take_profits
+    ] == [
+        ("pos-2", "62500", "2"),
+    ]
 
 
 def test_close_preflight_falls_back_from_inline_price_to_exact_ledger(tmp_path):
@@ -4280,6 +4287,47 @@ def test_partial_protection_rejects_take_profit_total_exceeding_preflight_size()
     with pytest.raises(
         ManagementBatchExecutionError,
         match="protection_take_profit_total_exceeds_preflight_size",
+    ):
+        _resize_protection_rows_for_remaining_position(
+            batch=batch,
+            leg=leg,
+            rows=rows,
+        )
+
+
+@pytest.mark.parametrize(
+    ("quantity_step", "min_quantity"),
+    [("0", "1"), ("-1", "1"), ("1", "0"), ("1", "-1")],
+)
+def test_partial_protection_rejects_nonpositive_contract_quantities(
+    quantity_step, min_quantity
+):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        _resize_protection_rows_for_remaining_position,
+    )
+
+    batch = SimpleNamespace(
+        target_snapshot={
+            "contract_spec": {
+                "quantity_step": quantity_step,
+                "min_quantity": min_quantity,
+            }
+        }
+    )
+    leg = SimpleNamespace(
+        preflight_size="4",
+        planned_close_size="1",
+        quantity_step=quantity_step,
+    )
+    rows = [
+        {"purpose": "stop_loss", "size": "4", "trigger_price": "61000"},
+        {"purpose": "take_profit", "size": "4", "trigger_price": "65000"},
+    ]
+
+    with pytest.raises(
+        ManagementBatchExecutionError,
+        match="protection_remaining_contract_spec_invalid",
     ):
         _resize_protection_rows_for_remaining_position(
             batch=batch,
