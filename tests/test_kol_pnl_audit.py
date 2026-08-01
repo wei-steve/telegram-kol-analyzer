@@ -297,6 +297,33 @@ def test_replay_explicit_protection_moves_only_remaining_position_to_break_even(
     assert float(result.realized_r) == pytest.approx(1 / 3)
 
 
+def test_replay_applies_explicit_stop_price_and_close_interval_update():
+    strategy = _replay_strategy(management_events=[{
+        "event_type": "stop_update",
+        "message_id": 6497,
+        "occurred_at": "2026-06-08T01:26:00Z",
+        "price": "62300",
+        "trigger": "close",
+        "interval": "5m",
+    }])
+    candles = [
+        _candle(0, open=62450, high=62500, low=62400, close=62480),
+        _candle(10, open=62400, high=62420, low=62200, close=62250),
+    ]
+
+    result = replay_audit_strategy(
+        strategy, candles, cutoff=datetime(2026, 6, 8, 1, 40, tzinfo=UTC)
+    )
+
+    assert result.status == "closed"
+    assert result.exit_reason == "stop_loss"
+    assert result.exits[0].price == Decimal("62300")
+    assert result.realized_r == Decimal("-0.2")
+    serialized = strategy.to_dict()["management_events"][0]
+    assert serialized["trigger"] == "close"
+    assert serialized["interval"] == "5m"
+
+
 @pytest.mark.parametrize(
     ("trigger", "interval", "expected"),
     [

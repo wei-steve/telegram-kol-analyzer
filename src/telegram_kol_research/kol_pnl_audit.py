@@ -119,6 +119,8 @@ class AuditManagementEvent:
     occurred_at: datetime
     allocation_pct: Decimal | None = None
     price: Decimal | None = None
+    trigger: str | None = None
+    interval: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +249,8 @@ class NormalizedAuditStrategy:
                         if item.price is not None
                         else {}
                     ),
+                    **({"trigger": item.trigger} if item.trigger else {}),
+                    **({"interval": item.interval} if item.interval else {}),
                 }
                 for item in self.management_events
             ],
@@ -386,7 +390,18 @@ def reconstruct_audit_strategies(
                 if decision.get("price") not in (None, "")
                 else None
             ),
+            trigger=(
+                _stop_trigger(decision.get("trigger"))
+                if decision.get("trigger") not in (None, "")
+                else None
+            ),
+            interval=(
+                _stop_interval(decision.get("interval"))
+                if decision.get("interval") not in (None, "")
+                else None
+            ),
         )
+        _validate_management_event(event)
         strategies[strategy.audit_id] = replace(
             strategy,
             evidence=_ordered_evidence((*strategy.evidence, AuditMessageEvidence(
@@ -465,6 +480,9 @@ def replay_audit_strategy(
     cancelled = False
     entries_frozen = False
     protected = False
+    active_stop_price = strategy.stop.price
+    active_stop_trigger = strategy.stop.trigger
+    active_stop_interval = strategy.stop.interval
     entry_fills: dict[int, AuditEntryFill] = {}
     exits: list[AuditExitFill] = []
     next_target = 0
@@ -488,6 +506,13 @@ def replay_audit_strategy(
                 if entry_fills and remaining > 0:
                     protected = True
                     reasons.append("explicit_break_even")
+                continue
+            if event.event_type == "stop_update":
+                active_stop_price = event.price or active_stop_price
+                active_stop_trigger = event.trigger or active_stop_trigger
+                active_stop_interval = event.interval
+                protected = False
+                reasons.append("explicit_stop_update")
                 continue
             if event.event_type in {"partial_exit", "full_exit"} and entry_fills and remaining > 0:
                 allocation = (
@@ -553,12 +578,14 @@ def replay_audit_strategy(
                 reasons=reasons,
             )
 
-        stop_price = entry_price if protected else strategy.stop.price
+        stop_price = entry_price if protected else active_stop_price
         stop_hit = _stop_hit(
             strategy=strategy,
             candle=candle,
             price=stop_price,
             protected=protected,
+            trigger=active_stop_trigger,
+            interval=active_stop_interval,
         )
         target_hit = (
             next_target < len(strategy.take_profits)
@@ -721,10 +748,12 @@ def _stop_hit(
     candle: AuditCandle,
     price: Decimal,
     protected: bool,
+    trigger: str,
+    interval: str | None,
 ) -> bool:
-    if protected or strategy.stop.trigger == "touch":
+    if protected or trigger == "touch":
         return candle.low <= price if strategy.side == "long" else candle.high >= price
-    if not _is_interval_close(candle, strategy.stop.interval):
+    if not _is_interval_close(candle, interval):
         return False
     return candle.close < price if strategy.side == "long" else candle.close > price
 
@@ -859,7 +888,7 @@ def _take_profits(values: Iterable[Any], *, side: str) -> tuple[AuditTakeProfit,
 def _management_event(payload: Mapping[str, Any]) -> AuditManagementEvent:
     allocation = payload.get("allocation_pct")
     price = payload.get("price")
-    return AuditManagementEvent(
+    event = AuditManagementEvent(
         event_type=_required_text(payload.get("event_type"), "management event type"),
         message_id=int(payload["message_id"]),
         occurred_at=_timestamp(payload.get("occurred_at")),
@@ -873,7 +902,42 @@ def _management_event(payload: Mapping[str, Any]) -> AuditManagementEvent:
             if price not in (None, "")
             else None
         ),
+        trigger=(
+            _stop_trigger(payload.get("trigger"))
+            if payload.get("trigger") not in (None, "")
+            else None
+        ),
+        interval=(
+            _stop_interval(payload.get("interval"))
+            if payload.get("interval") not in (None, "")
+            else None
+        ),
     )
+    _validate_management_event(event)
+    return event
+
+
+def _validate_management_event(event: AuditManagementEvent) -> None:
+    if event.event_type != "stop_update":
+        return
+    if event.price is None or event.trigger is None:
+        raise AuditValidationError("stop update requires price and trigger")
+    if event.trigger == "close" and event.interval is None:
+        raise AuditValidationError("close stop update requires a supported interval")
+
+
+def _stop_trigger(value: Any) -> str:
+    trigger = str(value or "").strip().lower()
+    if trigger not in {"touch", "close"}:
+        raise AuditValidationError("stop trigger must be touch or close")
+    return trigger
+
+
+def _stop_interval(value: Any) -> str:
+    interval = str(value or "").strip().lower()
+    if interval not in {"5m", "15m", "1h", "4h", "1d"}:
+        raise AuditValidationError("stop interval must be supported")
+    return interval
 
 
 def _positive_decimal(value: Any, label: str) -> Decimal:
