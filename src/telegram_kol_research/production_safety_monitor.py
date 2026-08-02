@@ -37,7 +37,7 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_runtime_incident_best_effort,
 )
 from telegram_kol_research.system_operator_bot import (
-    load_notification_bot_config,
+    load_system_operator_bot_config,
     send_system_operator_bot_message,
     system_operator_bot_enabled,
 )
@@ -136,7 +136,7 @@ MONITOR_TEST_NOTIFICATION_TEXT = (
 def _load_monitor_bot_config():
     """Load only the service environment, never checkout configuration files."""
 
-    return load_notification_bot_config(env_file_paths=[])
+    return load_system_operator_bot_config(env_file_paths=[])
 
 
 @dataclass(frozen=True, slots=True)

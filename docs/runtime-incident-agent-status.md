@@ -8,11 +8,14 @@ project: runtime-incident-agent
 design_version: 1
 current_phase: 8R.1
 phase_name: monitoring-observability-repair
-phase_status: planned
+phase_status: in_progress
 last_completed_phase: 6
 last_completed_commit: 46852f0
 production_commit: e3e784a07a005bdc23f6f18c6f4294b0fdb19b95
 local_tests:
+  - "phase-8r.1-monitor-observability-focused: 192 passed, 1 Linux-only systemd sandbox probe skipped"
+  - "phase-8r.1-critical-runtime-regressions: 36 passed, 2 known sqlite deprecation warnings"
+  - "phase-8r.1-review: no remaining Critical or Important findings; the final root-portable CLI regression test passed after the sole Minor review note was addressed"
   - "phase-8r-roadmap-boundary: 10 passed"
   - "phase-6-non-writing-ai-job-source-review-baseline: 115 passed"
   - "phase-6-non-writing-ai-job-offline-evaluation: 7 cases, all nine metrics at 1.0"

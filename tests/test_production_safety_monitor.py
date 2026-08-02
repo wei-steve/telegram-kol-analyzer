@@ -7,9 +7,13 @@ from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import get_type_hints
 
 import pytest
+from typer.testing import CliRunner
 
+from telegram_kol_research.cli import app
+import telegram_kol_research.production_safety_monitor as monitor_module
 from telegram_kol_research.production_safety_monitor import MAX_ALERT_LENGTH
 from telegram_kol_research.production_safety_monitor import MONITOR_TEST_NOTIFICATION_TEXT
 from telegram_kol_research.production_safety_monitor import MonitorExpectations
@@ -57,6 +61,103 @@ EXPECTATIONS = MonitorExpectations(
     management_execution_mode="live",
     max_concurrent_positions=4,
 )
+
+
+def _clear_monitor_bot_environment(monkeypatch):
+    for name in (
+        "TELEGRAM_KOL_SYSTEM_BOT_TOKEN",
+        "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID",
+        "TELEGRAM_KOL_SYSTEM_BOT_TIMEOUT_SECONDS",
+        "TELEGRAM_KOL_NOTIFICATION_BOT_TOKEN",
+        "TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID",
+        "TELEGRAM_KOL_NOTIFICATION_BOT_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_monitor_bot_config_uses_system_operator_service_environment(monkeypatch):
+    _clear_monitor_bot_environment(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_KOL_SYSTEM_BOT_TOKEN", "system-token")
+    monkeypatch.setenv("TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID", "-100123")
+    monkeypatch.setenv("TELEGRAM_KOL_SYSTEM_BOT_TIMEOUT_SECONDS", "7")
+
+    config = monitor_module._load_monitor_bot_config()
+
+    assert config.bot_token == "system-token"
+    assert config.chat_id == "-100123"
+    assert config.timeout_seconds == 7
+
+
+def test_monitor_bot_config_rejects_notification_bot_only_environment(monkeypatch):
+    _clear_monitor_bot_environment(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_KOL_NOTIFICATION_BOT_TOKEN", "notification-token")
+    monkeypatch.setenv("TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID", "-100456")
+
+    config = monitor_module._load_monitor_bot_config()
+
+    assert not monitor_module.system_operator_bot_enabled(config)
+
+
+def test_monitor_bot_config_never_reads_checkout_environment(tmp_path, monkeypatch):
+    _clear_monitor_bot_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "TELEGRAM_KOL_SYSTEM_BOT_TOKEN=checkout-token\n"
+        "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID=-100789\n",
+        encoding="utf-8",
+    )
+
+    config = monitor_module._load_monitor_bot_config()
+
+    assert not monitor_module.system_operator_bot_enabled(config)
+
+
+def test_cli_unreadable_state_reaches_bounded_monitor_handling(tmp_path, monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text("existing", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == state_path:
+            raise PermissionError("bounded test detail")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda path: None,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "ProductionSafetyAdapters",
+        lambda **kwargs: _RecordingAdapters(),
+    )
+
+    assert get_type_hints(cli_module.monitor_production_safety)["state_path"] is str
+    result = CliRunner().invoke(
+        app,
+        [
+            "monitor-production-safety",
+            "--expected-head",
+            "a" * 40,
+            "--expected-auto-trade-enabled",
+            "--expected-management-mode",
+            "live",
+            "--expected-max-concurrent-positions",
+            "4",
+            "--state-path",
+            str(state_path),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    summary = json.loads(result.stdout)
+    assert summary["reason_codes"] == ["state_invalid"]
+    assert "state.json" not in result.output
+    assert "PermissionError" not in result.output
 
 
 def _snapshot(**overrides):

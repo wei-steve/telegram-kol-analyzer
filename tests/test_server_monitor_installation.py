@@ -24,6 +24,13 @@ def _normalized(path: Path) -> str:
     return " ".join(path.read_text(encoding="utf-8").split())
 
 
+def _state_repair_program() -> str:
+    installer = INSTALLER_PATH.read_text(encoding="utf-8")
+    return installer.split("# BEGIN_STATE_METADATA_REPAIR\n", 1)[1].split(
+        "# END_STATE_METADATA_REPAIR", 1
+    )[0]
+
+
 def test_monitor_service_uses_dedicated_identity_and_exact_command():
     service = SERVICE_PATH.read_text(encoding="utf-8")
     normalized = _normalized(SERVICE_PATH)
@@ -263,7 +270,9 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert "DEEP_API" not in installer
     assert "DEEPCOIN" not in installer.upper()
     assert 'install -o root -g root -m 0600 "$env_source" "$ENV_FILE"' in installer
-    assert 'install -d -o "$MONITOR_USER" -g "$MONITOR_GROUP" -m 0700 "$STATE_DIRECTORY"' in installer
+    assert 'install -d -o root -g root -m 0700 "$STATE_DIRECTORY"' in installer
+    assert 'chown "$MONITOR_USER:$MONITOR_GROUP" "$STATE_DIRECTORY"' in installer
+    assert 'chmod 0700 "$STATE_DIRECTORY"' in installer
     assert 'runuser -u "$MONITOR_USER" -- test -x "$PRODUCTION_ROOT/.venv/bin/telegram-kol-research"' in installer
     assert 'runuser -u "$MONITOR_USER" -- test -r "$PRODUCTION_ROOT/data/research.db"' in installer
     assert "telegram-kol-monitor-test-notification.service" in installer
@@ -276,6 +285,79 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
         'install -o root -g root -m 0644 "$DIAGNOSTIC_SOURCE" '
         '"$DIAGNOSTIC_DEST"'
     ) in installer
+
+
+def test_installer_repairs_existing_state_metadata_without_replacing_content():
+    installer = INSTALLER_PATH.read_text(encoding="utf-8")
+
+    assert 'STATE_FILE="$STATE_DIRECTORY/state.json"' in installer
+    assert 'if [[ -e "$STATE_FILE" || -L "$STATE_FILE" ]]; then' in installer
+    assert 'install -d -o root -g root -m 0700 "$STATE_DIRECTORY"' in installer
+    assert 'chown "$MONITOR_USER:$MONITOR_GROUP" "$STATE_DIRECTORY"' in installer
+    assert "os.O_NOFOLLOW" in installer
+    assert "os.fchown" in installer
+    assert "os.fchmod" in installer
+    assert 'install -o "$MONITOR_USER" -g "$MONITOR_GROUP" -m 0600' not in installer
+    assert 'rm -f "$STATE_FILE"' not in installer
+    assert installer.index("# END_STATE_METADATA_REPAIR") < installer.index(
+        "systemctl daemon-reload"
+    )
+
+
+def test_state_metadata_repair_preserves_bytes_and_sets_exact_metadata(tmp_path):
+    state_path = tmp_path / "state.json"
+    sentinel = b'{"sentinel":"preserve-exactly"}\n'
+    state_path.write_bytes(sentinel)
+    state_path.chmod(0o666)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _state_repair_program(),
+            str(state_path),
+            str(os.getuid()),
+            str(os.getgid()),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert state_path.read_bytes() == sentinel
+    metadata = state_path.stat()
+    assert metadata.st_uid == os.getuid()
+    assert metadata.st_gid == os.getgid()
+    assert metadata.st_mode & 0o777 == 0o600
+
+
+def test_state_metadata_repair_refuses_symlink_without_touching_target(tmp_path):
+    target = tmp_path / "target"
+    target.write_text("untouched", encoding="utf-8")
+    target.chmod(0o644)
+    state_path = tmp_path / "state.json"
+    state_path.symlink_to(target)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _state_repair_program(),
+            str(state_path),
+            str(os.getuid()),
+            str(os.getgid()),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode != 0
+    assert target.read_text(encoding="utf-8") == "untouched"
+    assert target.stat().st_mode & 0o777 == 0o644
 
 
 def test_installer_orders_enable_after_install_and_reload_and_targets_timer_only():

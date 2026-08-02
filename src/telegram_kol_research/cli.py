@@ -2116,8 +2116,8 @@ def monitor_production_safety(
         Path("."),
         "--checkout-path",
     ),
-    state_path: Path = typer.Option(
-        Path("/var/lib/telegram-kol-monitor/state.json"),
+    state_path: str = typer.Option(
+        "/var/lib/telegram-kol-monitor/state.json",
         "--state-path",
     ),
     settings_url: str = typer.Option(
@@ -2175,7 +2175,7 @@ def monitor_production_safety(
             management_execution_mode=expected_management_mode,
             max_concurrent_positions=expected_max_concurrent_positions,
         ),
-        state_path=state_path,
+        state_path=Path(state_path),
         adapters=ProductionSafetyAdapters(
             database_path=database_path,
             checkout_path=checkout_path,
