@@ -35,6 +35,7 @@ from telegram_kol_research.models import (
     PositionAttributionAudit,
     PositionProtectionLeg,
     PositionProtectionLedger,
+    PositionProtectionRevision,
     PendingTpslSnapshotObservation,
     StrategyLifecycle,
     TriggerProtectionIntent,
@@ -171,11 +172,35 @@ def _save_trigger_protection_intent(session_factory, *, recovery_state="pending"
     with session_factory() as session:
         leg = session.query(ExecutionOrderLeg).one()
         request = json.loads(leg.request_json)
+        create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=int(leg.id),
+            role="primary_stop",
+            leg_index=1,
+            planned_trigger_price=str(request["slTriggerPx"]),
+            planned_size=str(request["sz"]),
+        )
+        create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=int(leg.id),
+            role="backup_stop",
+            leg_index=1,
+            planned_trigger_price=None,
+            planned_size=None,
+        )
+        fingerprint_request = dict(request)
+        fingerprint_request["tpTriggerPx"] = request.get("tpTriggerPx")
+        fingerprint_request["slTriggerPx"] = request.get("slTriggerPx")
         session.add(TriggerProtectionIntent(
             venue="deepcoin", execution_binding_id=leg.execution_binding_id,
             execution_order_leg_id=leg.id,
             request_fingerprint=hashlib.sha256(json.dumps(
-                request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                fingerprint_request,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
             ).encode()).hexdigest(),
             pre_submit_tpsl_baseline_json="[]", correlation_id="intent-1",
             parent_trigger_order_id="entry-1",
@@ -957,12 +982,97 @@ def test_reconcile_adopts_saved_trigger_protection_intent_once(tmp_path):
     with session_factory() as session:
         intent = session.query(TriggerProtectionIntent).one()
         rows = session.query(PositionProtectionLedger).all()
+        revisions = session.query(PositionProtectionRevision).all()
     assert intent.recovery_state == "adopted"
     assert intent.adopted_order_id == "tpsl-1"
     assert len(rows) == 1
+    assert len(revisions) == 1
+    assert revisions[0].status == "active"
+    assert json.loads(revisions[0].protection_json)["order_ids"] == ["tpsl-1"]
     assert rows[0].evidence_source == "reconciliation_trigger_protection_intent"
     assert result.protection_adopted == 1
     assert duplicate.protection_adopted == 0
+
+
+def test_reconcile_anonymous_stop_ignores_same_signature_unfilled_sibling(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _seed_trigger_protection_adoption(session_factory)
+    with session_factory() as session:
+        first = session.query(ExecutionOrderLeg).one()
+        first_request = json.loads(first.request_json)
+        first_request.pop("tpOrdPx", None)
+        first_request.pop("tpTriggerPx", None)
+        first.request_json = json.dumps(first_request)
+        event = session.query(ExecutionEvent).one()
+        event.request_json = json.dumps(first_request)
+        session.commit()
+    _save_trigger_protection_intent(session_factory)
+
+    sibling_request = {
+        **first_request,
+        "clOrdId": "entry-client-2",
+        "price": "1808",
+        "triggerPrice": "1808",
+    }
+    sibling_leg_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=2,
+            order_kind="trigger_limit",
+            strategy_instance_id="deepcoin:100:55:ETH:short",
+            order_id="entry-2",
+            client_order_id="entry-client-2",
+            status="pending",
+            attribution_status="unassigned",
+            request=sibling_request,
+        ),
+    )
+    with session_factory() as session:
+        sibling = session.get(ExecutionOrderLeg, sibling_leg_id)
+        session.add(
+            TriggerProtectionIntent(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=sibling_leg_id,
+                request_fingerprint=hashlib.sha256(
+                    json.dumps(
+                        sibling_request,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+                pre_submit_tpsl_baseline_json="[]",
+                correlation_id="intent-2",
+                parent_trigger_order_id="entry-2",
+                recovery_state="pending",
+            )
+        )
+        session.commit()
+
+    anonymous_stop = _pending_combined_tpsl("tpsl-1")
+    anonymous_stop["posId"] = ""
+    anonymous_stop.pop("tpTriggerPx", None)
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([anonymous_stop]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        intents = session.query(TriggerProtectionIntent).order_by(
+            TriggerProtectionIntent.id.asc()
+        ).all()
+        ledger = session.query(PositionProtectionLedger).one()
+        sibling = session.get(ExecutionOrderLeg, sibling_leg_id)
+    assert result.protection_adopted == 1
+    assert intents[0].recovery_state == "adopted"
+    assert intents[0].adopted_order_id == "tpsl-1"
+    assert intents[1].recovery_state == "pending"
+    assert sibling.pos_id is None
+    assert ledger.pos_id == "pos-1"
+    assert ledger.order_id == "tpsl-1"
 
 
 def test_reconcile_binds_verified_fill_to_planned_protection_before_child_adoption(

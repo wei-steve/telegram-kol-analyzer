@@ -167,6 +167,97 @@ def upsert_entry_protection_ledger_action(
     )
 
 
+def finalize_trigger_protection_adoption(
+    session,
+    *,
+    action: EntryProtectionLedgerRepairAction,
+    intent: TriggerProtectionIntent,
+    seen_at: datetime,
+    evidence_source: str = "reconciliation_trigger_protection_intent",
+) -> PositionProtectionLedger:
+    """Atomically bind one verified child order and its exact ledger identity."""
+
+    entry_leg = session.get(ExecutionOrderLeg, int(action.leg_id))
+    if (
+        entry_leg is None
+        or int(entry_leg.execution_binding_id or 0) != int(action.binding_id)
+        or str(entry_leg.pos_id or "").strip() != str(action.pos_id)
+        or str(entry_leg.status or "").lower() != "active"
+        or str(entry_leg.attribution_status or "").lower() != "verified"
+        or int(intent.execution_binding_id or 0) != int(action.binding_id)
+        or int(intent.execution_order_leg_id or 0) != int(action.leg_id)
+    ):
+        raise ValueError("trigger_protection_adoption_identity_invalid")
+
+    from telegram_kol_research.models import PositionProtectionLeg
+    from telegram_kol_research.position_protection_legs import (
+        bind_verified_exchange_order,
+        bind_verified_filled_position_protection,
+    )
+    from telegram_kol_research.protection_revisions import (
+        activate_protection_revision,
+    )
+    from telegram_kol_research.trigger_protection_intents import (
+        transition_trigger_protection_intent,
+    )
+
+    bind_verified_filled_position_protection(
+        session,
+        execution_order_leg_id=int(action.leg_id),
+        pos_id=action.pos_id,
+    )
+    primary = (
+        session.query(PositionProtectionLeg)
+        .filter(PositionProtectionLeg.execution_order_leg_id == int(action.leg_id))
+        .filter(PositionProtectionLeg.role == "primary_stop")
+        .filter(PositionProtectionLeg.leg_index == 1)
+        .one_or_none()
+    )
+    if primary is None:
+        raise ValueError("trigger_protection_primary_leg_missing")
+    bind_verified_exchange_order(
+        session,
+        primary,
+        exchange_order_id=action.order_id,
+        readback_evidence=action.evidence,
+    )
+    row = upsert_entry_protection_ledger_action(
+        session,
+        action,
+        evidence_source=evidence_source,
+        seen_at=seen_at,
+    )
+    if row is None:
+        raise ValueError("trigger_protection_ledger_write_failed")
+    transition_trigger_protection_intent(
+        session,
+        intent,
+        recovery_state="adopted",
+        adopted_order_id=action.order_id,
+    )
+    activate_protection_revision(
+        session,
+        venue="deepcoin",
+        execution_binding_id=action.binding_id,
+        execution_order_leg_id=action.leg_id,
+        strategy_instance_id=action.strategy_instance_id,
+        pos_id=action.pos_id,
+        source=evidence_source,
+        protection_json={
+            "order_ids": [action.order_id],
+            "rows": [
+                {
+                    "order_id": action.order_id,
+                    "purpose": action.purpose,
+                    "trigger_price": action.trigger_price,
+                    "size_text": action.size_text,
+                }
+            ],
+        },
+    )
+    return row
+
+
 def build_entry_protection_ledger_repair_plan(
     session_factory,
     *,

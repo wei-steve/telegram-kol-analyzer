@@ -1214,8 +1214,9 @@ def _reconcile_saved_trigger_protection_intents(
     """Apply saved trigger intents using only this bounded, read-only snapshot."""
     from telegram_kol_research.entry_protection_ledger_repair import (
         EntryProtectionLedgerRepairRefusal,
+        TriggerProtectionOwnerState,
+        finalize_trigger_protection_adoption,
         plan_trigger_protection_intent_adoption,
-        upsert_entry_protection_ledger_action,
     )
     from telegram_kol_research.trigger_protection_intents import (
         transition_trigger_protection_intent,
@@ -1271,6 +1272,20 @@ def _reconcile_saved_trigger_protection_intents(
         for intent in saved_intents
         if intent.id is not None and int(intent.execution_order_leg_id) in legs_by_id
     }
+    intent_owner_states = {
+        int(intent.id): TriggerProtectionOwnerState(
+            execution_order_leg_id=int(leg.id),
+            status=str(leg.status or ""),
+            attribution_status=str(leg.attribution_status or ""),
+            pos_id=str(leg.pos_id) if leg.pos_id else None,
+            parent_order_id=str(leg.order_id) if leg.order_id else None,
+        )
+        for intent in saved_intents
+        if intent.id is not None
+        and (
+            leg := legs_by_id.get(int(intent.execution_order_leg_id))
+        ) is not None
+    }
     events = session.query(ExecutionEvent).filter(
         ExecutionEvent.venue == "deepcoin", ExecutionEvent.action == "create_trigger_entry"
     ).order_by(ExecutionEvent.id.asc()).all()
@@ -1293,22 +1308,18 @@ def _reconcile_saved_trigger_protection_intents(
             history_tpsl_rows=snapshot.trigger_history,
             existing_ledger_rows=existing_ledger_rows, existing_intents=all_intents,
             existing_intent_requests=intent_requests,
+            existing_intent_owner_states=intent_owner_states,
             history_time_range_start=parent.created_at, history_time_range_end=recovered_at,
         )
         if adoption.action is not None:
-            row = upsert_entry_protection_ledger_action(session, adoption.action,
-                evidence_source="reconciliation_trigger_protection_intent", seen_at=recovered_at)
-            if row is not None:
-                transition_trigger_protection_intent(session, intent, recovery_state="adopted", adopted_order_id=adoption.action.order_id)
-                _bind_adopted_primary_protection_leg(
-                    session,
-                    entry_leg=leg,
-                    pos_id=adoption.action.pos_id,
-                    exchange_order_id=adoption.action.order_id,
-                    evidence=adoption.action.evidence,
-                )
-                existing_ledger_rows.append(row)
-                result.protection_adopted += 1
+            row = finalize_trigger_protection_adoption(
+                session,
+                action=adoption.action,
+                intent=intent,
+                seen_at=recovered_at,
+            )
+            existing_ledger_rows.append(row)
+            result.protection_adopted += 1
         elif adoption.deferred is not None:
             result.protection_adoption_deferred += 1
             _record_protection_adoption_refusal(session, leg=leg, refusal=EntryProtectionLedgerRepairRefusal(
@@ -1319,48 +1330,6 @@ def _reconcile_saved_trigger_protection_intents(
         elif adoption.refusal is not None:
             _refuse_trigger_intent(session, leg, intent, adoption.refusal, recovered_at, result, transition_trigger_protection_intent)
     return handled
-
-
-def _bind_adopted_primary_protection_leg(
-    session,
-    *,
-    entry_leg: ExecutionOrderLeg,
-    pos_id: str,
-    exchange_order_id: str,
-    evidence: dict[str, Any],
-) -> None:
-    """Promote only the exact attached primary-stop leg after exchange adoption."""
-
-    from telegram_kol_research.models import PositionProtectionLeg
-    from telegram_kol_research.position_protection_legs import (
-        bind_filled_position,
-        bind_verified_exchange_order,
-    )
-
-    protection_legs = (
-        session.query(PositionProtectionLeg)
-        .filter(PositionProtectionLeg.execution_order_leg_id == int(entry_leg.id))
-        .order_by(PositionProtectionLeg.id.asc())
-        .all()
-    )
-    for protection_leg in protection_legs:
-        bind_filled_position(session, protection_leg, pos_id=pos_id)
-    protection_leg = (
-        session.query(PositionProtectionLeg)
-        .filter(PositionProtectionLeg.execution_order_leg_id == int(entry_leg.id))
-        .filter(PositionProtectionLeg.role == "primary_stop")
-        .filter(PositionProtectionLeg.leg_index == 1)
-        .one_or_none()
-    )
-    if protection_leg is None:
-        return
-    bind_filled_position(session, protection_leg, pos_id=pos_id)
-    bind_verified_exchange_order(
-        session,
-        protection_leg,
-        exchange_order_id=exchange_order_id,
-        readback_evidence=evidence,
-    )
 
 
 def _trigger_intent_due(intent, now: datetime) -> bool:
