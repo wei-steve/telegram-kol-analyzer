@@ -297,7 +297,27 @@ def plan_source_deletion_full_exit(
                 reason_code="source_deletion_frozen_identity_changed",
                 target_lifecycle_id=deletion_exit.target_lifecycle_id,
             )
-        generation = f"source_deleted:{event.event_fingerprint}"
+        scope_pos_ids = sorted(
+            {
+                str(pos_id)
+                for (pos_id,) in session.query(ExecutionOrderLeg.pos_id)
+                .filter(
+                    ExecutionOrderLeg.execution_binding_id == binding.id,
+                    ExecutionOrderLeg.purpose == "entry",
+                    ExecutionOrderLeg.pos_id.is_not(None),
+                    ExecutionOrderLeg.attribution_status == "verified",
+                )
+                .all()
+                if str(pos_id or "").strip()
+            }
+        )
+        scope_digest = hashlib.sha256(
+            (
+                f"{event.event_fingerprint}|"
+                + ",".join(scope_pos_ids)
+            ).encode("utf-8")
+        ).hexdigest()[:48]
+        generation = f"source_deleted:{scope_digest}"
         candidate = (
             session.query(SignalCandidate)
             .filter(
@@ -329,6 +349,7 @@ def plan_source_deletion_full_exit(
             "event_id": int(event.id),
             "exit_id": int(deletion_exit.id),
             "event_fingerprint": str(event.event_fingerprint),
+            "scope_pos_ids": scope_pos_ids,
         }
         session.commit()
 

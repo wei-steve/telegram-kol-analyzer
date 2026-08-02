@@ -21,6 +21,7 @@ from telegram_kol_research.models import (
     TelegramSourceMessageEvent,
     TradeSignal,
 )
+from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 from telegram_kol_research.position_authority_lock import position_authority_lock
 from telegram_kol_research.source_message_deletion import (
     source_message_execution_authority,
@@ -129,12 +130,12 @@ def run_source_message_deletion_worker_tick(
                     session_factory,
                     exit_id=exit_id,
                     claim_token=claim_token,
-                    new_state="recovery_required",
-                    reason="flat_reconciliation_exception",
+                    new_state="reconciling",
+                    reason="flat_reconciliation_retry",
                     error=f"flat_reconciliation_exception:{type(exc).__name__}:{exc}",
                     updated_at=now,
                 )
-                counts["recovery_required"] += 1
+                counts["waiting"] += 1
                 continue
             if final_state == "succeeded":
                 counts["finalized"] += 1
@@ -472,6 +473,17 @@ def finalize_source_message_deletion_exit(
                     for value in (_clean_id(leg.pos_id),)
                     if value is not None
                 }
+                active_exact_pos_ids = {
+                    value
+                    for leg in legs
+                    if (
+                        leg.attribution_status == "verified"
+                        and str(leg.status or "").strip().lower()
+                        not in TERMINAL_ENTRY_LEG_STATES
+                    )
+                    for value in (_clean_id(leg.pos_id),)
+                    if value is not None
+                }
                 leg_order_ids = {
                     value
                     for leg in legs
@@ -686,12 +698,14 @@ def finalize_source_message_deletion_exit(
                         leg.execution_order_leg_id in {entry.id for entry in legs}
                         and _clean_id(leg.pos_id) in exact_pos_ids
                         for leg in management_legs
-                    ) and management_pos_ids == exact_pos_ids
+                    ) and not (
+                        active_exact_pos_ids - management_pos_ids
+                    )
                     if (
                         management_terminal
                         and close_intents_complete
                         and all_intents_terminal
-                        and management_pos_ids < exact_pos_ids
+                        and bool(active_exact_pos_ids - management_pos_ids)
                     ):
                         deletion_exit.management_batch_id = None
                         deletion_exit.state = "closing_positions"

@@ -113,13 +113,14 @@ def test_source_deletion_full_exit_preserves_original_ancestry_and_exact_pos_ids
     assert (result.status, result.reason_code) == ("ready", None)
     assert result.batch is not None
     assert result.batch.recognition_decision_id == decision_id
-    assert result.batch.recognition_generation == f"source_deleted:{deletion.event_fingerprint}"
+    assert result.batch.recognition_generation.startswith("source_deleted:")
     assert result.batch.intent == "full_exit"
     assert [leg.pos_id for leg in result.batch.legs] == ["pos-deleted"]
     assert result.batch.target_snapshot["source_deletion"] == {
         "event_id": deletion.event_id,
         "exit_id": deletion.exit_id,
         "event_fingerprint": deletion.event_fingerprint,
+        "scope_pos_ids": ["pos-deleted"],
     }
     with session_factory() as session:
         deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)

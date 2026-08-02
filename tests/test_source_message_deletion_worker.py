@@ -250,6 +250,25 @@ class _PositionClient(_ExactCancelClient):
         return rows
 
 
+class _LatePositionClient(_ExactCancelClient):
+    def __init__(self):
+        super().__init__([])
+
+    def list_positions(self, *, inst_id=None):
+        return [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-late",
+                "posSide": "short",
+                "pos": "2",
+                "avgPx": "62100",
+                "mgnMode": "cross",
+                "posMode": "split",
+                "cTime": "1721000001000",
+            }
+        ]
+
+
 def _confirm_management_batch(session_factory, batch_id):
     with session_factory() as session:
         batch = session.get(StrategyManagementBatch, batch_id)
@@ -261,6 +280,11 @@ def _confirm_management_batch(session_factory, batch_id):
         )
         for management_leg in management_legs:
             management_leg.status = "confirmed"
+            entry_leg = session.get(
+                ExecutionOrderLeg, management_leg.execution_order_leg_id
+            )
+            entry_leg.status = "closed"
+            entry_leg.terminal_reason = "management_full_close_confirmed"
             session.add(
                 PositionMutationIntent(
                     idempotency_key=(
@@ -899,6 +923,7 @@ def test_final_reconcile_reopens_exit_scope_for_a_late_verified_position(tmp_pat
         with factory() as session:
             binding = session.get(ExecutionBinding, binding_id)
             binding.pos_id = "pos-filled,pos-late"
+            binding.order_id = "entry-filled,entry-late"
             session.add(
                 ExecutionOrderLeg(
                     execution_binding_id=binding_id,
@@ -906,11 +931,14 @@ def test_final_reconcile_reopens_exit_scope_for_a_late_verified_position(tmp_pat
                     leg_index=2,
                     purpose="entry",
                     order_kind="market",
-                    order_id="entry-filled",
+                    order_id="entry-late",
                     pos_id="pos-late",
                     status="active",
                     attribution_status="verified",
-                    attribution_evidence_json='{"source":"late_fill_readback"}',
+                    attribution_evidence_json=(
+                        '{"policy_version":2,'
+                        '"evidence_type":"verified_by_current_policy"}'
+                    ),
                 )
             )
             session.commit()
@@ -934,6 +962,44 @@ def test_final_reconcile_reopens_exit_scope_for_a_late_verified_position(tmp_pat
         assert deletion_exit.state == "closing_positions"
         assert deletion_exit.management_batch_id is None
         assert deletion_exit.last_reason == "position_exit_scope_expanded"
+
+    replanned = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=_LatePositionClient,
+        contract_spec_provider=_ContractSpecs(),
+        processed_at=NOW,
+    )
+
+    assert replanned.planned_exits == 1
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        replacement_batch_id = deletion_exit.management_batch_id
+        assert replacement_batch_id != batch_id
+        replacement_pos_ids = {
+            pos_id
+            for (pos_id,) in session.query(StrategyManagementLeg.pos_id)
+            .filter(
+                StrategyManagementLeg.management_batch_id
+                == replacement_batch_id
+            )
+            .all()
+        }
+        assert replacement_pos_ids == {"pos-late"}
+        deletion_exit.state = "reconciling"
+        session.commit()
+    _confirm_management_batch(session_factory, replacement_batch_id)
+
+    finalized = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=_LatePositionClient,
+        snapshot_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            errors={}, positions=[], open_orders=[], pending_trigger_orders=[]
+        ),
+        binding_reconciler=lambda *_args, **_kwargs: None,
+        processed_at=NOW,
+    )
+
+    assert finalized.finalized == 1
 
 
 def test_flat_finalization_waits_while_exact_entry_order_is_live(tmp_path):
