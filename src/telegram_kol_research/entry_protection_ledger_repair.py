@@ -372,6 +372,20 @@ def build_entry_protection_ledger_repair_plan(
 
     created_at = now or datetime.now(UTC)
     pending_cache: dict[str, list[dict[str, Any]]] = {}
+    live_position_rows: list[dict[str, Any]] = []
+    live_position_snapshot_error: str | None = None
+    if include_trigger_entries:
+        try:
+            raw_positions = deepcoin_client.list_positions()
+        except Exception as exc:
+            live_position_snapshot_error = type(exc).__name__
+        else:
+            if isinstance(raw_positions, list) and all(
+                isinstance(row, dict) for row in raw_positions
+            ):
+                live_position_rows = list(raw_positions)
+            else:
+                live_position_snapshot_error = "invalid_list_response"
     actions: list[EntryProtectionLedgerRepairAction] = []
     refusals: list[EntryProtectionLedgerRepairRefusal] = []
     with session_factory() as session:
@@ -443,6 +457,9 @@ def build_entry_protection_ledger_repair_plan(
                     pending_cache=pending_cache,
                     existing_order_ids=existing_order_ids,
                     existing_order_associations=existing_order_associations,
+                    live_position_rows=live_position_rows,
+                    live_position_snapshot_error=live_position_snapshot_error,
+                    observed_at=created_at,
                 )
                 if clean_pos_id:
                     planned = [row for row in planned if row.pos_id == clean_pos_id]
@@ -667,6 +684,9 @@ def _plan_trigger_entry_repair(
     pending_cache: dict[str, list[dict[str, Any]]],
     existing_order_ids: set[str],
     existing_order_associations: set[tuple[str, str, int, int, str, str]],
+    live_position_rows: list[dict[str, Any]],
+    live_position_snapshot_error: str | None,
+    observed_at: datetime,
 ) -> tuple[list[EntryProtectionLedgerRepairAction], EntryProtectionLedgerRepairRefusal | None]:
     binding_id = int(event.execution_binding_id or 0)
     request = _loads_json(event.request_json)
@@ -713,6 +733,27 @@ def _plan_trigger_entry_repair(
             reason="trigger_entry_tpsl_identity_conflict",
             evidence={"candidate_order_ids": exact_order_ids},
         )
+    if live_position_snapshot_error is not None:
+        return [], EntryProtectionLedgerRepairRefusal(
+            event_id=int(event.id) if event.id is not None else None,
+            binding_id=binding_id,
+            pos_id=str(leg.pos_id or "") or None,
+            reason="trigger_protection_position_snapshot_unavailable",
+            evidence={"snapshot_error": live_position_snapshot_error},
+        )
+    live_position_result = build_trigger_protection_live_position(
+        entry_leg=leg,
+        position_rows=live_position_rows,
+        observed_at=observed_at,
+    )
+    if live_position_result.refusal is not None:
+        refusal = live_position_result.refusal
+        return [], replace(
+            refusal,
+            event_id=int(event.id) if event.id is not None else None,
+        )
+    live_position = live_position_result.position
+    assert live_position is not None
     pending_rows = _cached_pending_tpsl_rows(
         pending_cache, deepcoin_client=deepcoin_client, inst_id=instrument_id
     )
@@ -777,6 +818,7 @@ def _plan_trigger_entry_repair(
             existing_intents=existing_intents,
             existing_intent_requests=intent_requests,
             existing_intent_owner_states=owner_states,
+            live_position=live_position,
             history_time_range_start=event.created_at,
             history_time_range_end=datetime.now(UTC),
         )
@@ -786,6 +828,9 @@ def _plan_trigger_entry_repair(
                 intent=intent,
                 existing_intents=existing_intents,
                 owner_states=owner_states,
+            )
+            evidence["live_position"] = _bounded_live_position_evidence(
+                live_position
             )
             return [replace(result.action, evidence=evidence)], None
         if result.refusal is not None:
@@ -812,6 +857,19 @@ def _plan_trigger_entry_repair(
         existing_order_associations=existing_order_associations,
     )
     return ([result.action] if result.action is not None else []), result.refusal
+
+
+def _bounded_live_position_evidence(
+    position: TriggerProtectionLivePosition,
+) -> dict[str, Any]:
+    return {
+        "pos_id": position.pos_id,
+        "instrument_id": position.instrument_id,
+        "side": position.side,
+        "size_text": position.size_text,
+        "created_at": position.created_at.isoformat(),
+        "observed_at": position.observed_at.isoformat(),
+    }
 
 
 def _bounded_sibling_owner_states(
@@ -978,6 +1036,7 @@ def plan_trigger_protection_intent_adoption(
     history_tpsl_rows: list[dict[str, Any]],
     existing_ledger_rows: list[PositionProtectionLedger],
     existing_intents: list[TriggerProtectionIntent],
+    live_position: TriggerProtectionLivePosition,
     existing_intent_requests: dict[int, dict[str, Any]] | None = None,
     existing_intent_owner_states: dict[int, TriggerProtectionOwnerState] | None = None,
     history_time_range_start: datetime | None = None,
@@ -1028,6 +1087,12 @@ def plan_trigger_protection_intent_adoption(
         or int(parent_event.execution_binding_id or 0) != binding_id
         or _trigger_protection_fingerprint(request) != intent.request_fingerprint
         or _trigger_protection_fingerprint(event_request) != intent.request_fingerprint
+        or live_position.pos_id != pos_id
+        or live_position.instrument_id.upper() != instrument_id.upper()
+        or live_position.side.lower() != side.lower()
+        or not _same_numeric_text(
+            live_position.size_text, _request_size_text(request) or ""
+        )
     ):
         return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_intent_identity_invalid")
 
@@ -1090,6 +1155,25 @@ def plan_trigger_protection_intent_adoption(
                 and _row_matches_expected_protection_set(row, expected_rows)
                 and _same_size_text(_row_size_text(row), _request_size_text(request))
             ):
+                candidate_created_at = _row_creation_time(row)
+                if candidate_created_at is None:
+                    return _intent_refusal(
+                        parent_event,
+                        binding_id,
+                        pos_id,
+                        "trigger_protection_candidate_time_unavailable",
+                        [_row_order_id(row)],
+                    )
+                if candidate_created_at < _coerce_utc_naive(
+                    live_position.created_at
+                ):
+                    return _intent_refusal(
+                        parent_event,
+                        binding_id,
+                        pos_id,
+                        "trigger_protection_candidate_predates_fill",
+                        [_row_order_id(row)],
+                    )
                 candidates.append((row, source))
     if not candidates:
         return TriggerProtectionIntentAdoptionResult(
@@ -1671,6 +1755,14 @@ def _row_time(row: dict[str, Any]) -> datetime | None:
     for key in ("cTime", "uTime", "createdAt", "created_at", "createdTime"):
         value = row.get(key)
         parsed = _parse_datetime(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _row_creation_time(row: dict[str, Any]) -> datetime | None:
+    for key in ("cTime", "createdAt", "created_at", "createdTime"):
+        parsed = _parse_datetime(row.get(key))
         if parsed is not None:
             return parsed
     return None

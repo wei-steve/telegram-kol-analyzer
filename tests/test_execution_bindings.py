@@ -211,14 +211,22 @@ def _save_trigger_protection_intent(session_factory, *, recovery_state="pending"
 
 
 class _ProtectionAdoptionReconciliationClient:
-    def __init__(self, pending_rows=None, *, history_rows=None, pending_error=None):
+    def __init__(
+        self,
+        pending_rows=None,
+        *,
+        history_rows=None,
+        pending_error=None,
+        positions=None,
+    ):
         self.pending_rows = list(pending_rows or [])
         self.pending_error = pending_error
         self.history_rows = list(history_rows or [])
         self.pending_calls = 0
+        self.positions = positions
 
     def list_positions(self):
-        return [
+        default = [
             {
                 "instId": "ETH-USDT-SWAP",
                 "posId": "pos-1",
@@ -230,6 +238,7 @@ class _ProtectionAdoptionReconciliationClient:
                 "cTime": "1784512860000",
             }
         ]
+        return default if self.positions is None else list(self.positions)
 
     def list_open_orders(self):
         return []
@@ -411,6 +420,8 @@ def _pending_combined_tpsl(order_id):
         "sz": "4.4",
         "tpTriggerPx": "1860",
         "slTriggerPx": "1900",
+        "cTime": "1784512861000",
+        "uTime": "1784512861000",
     }
 
 
@@ -993,6 +1004,80 @@ def test_reconcile_adopts_saved_trigger_protection_intent_once(tmp_path):
     assert rows[0].evidence_source == "reconciliation_trigger_protection_intent"
     assert result.protection_adopted == 1
     assert duplicate.protection_adopted == 0
+
+
+def test_reconcile_saved_trigger_protection_requires_live_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).one()
+        leg.pos_id = "pos-1"
+        leg.status = "active"
+        leg.attribution_status = "verified"
+        session.commit()
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient(
+            [_pending_combined_tpsl("tpsl-stale")],
+            positions=[],
+        ),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        primary = session.query(PositionProtectionLeg).filter(
+            PositionProtectionLeg.role == "primary_stop"
+        ).one()
+        assert session.query(PositionProtectionLedger).count() == 0
+        assert session.query(PositionProtectionRevision).count() == 0
+    assert result.protection_adopted == 0
+    assert intent.recovery_state != "adopted"
+    assert primary.exchange_order_id is None
+
+
+def test_reconcile_saved_trigger_protection_refuses_position_size_change(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).one()
+        leg.pos_id = "pos-1"
+        leg.status = "active"
+        leg.attribution_status = "verified"
+        session.commit()
+    reduced_position = {
+        "instId": "ETH-USDT-SWAP",
+        "posId": "pos-1",
+        "posSide": "short",
+        "pos": "2.2",
+        "avgPx": "1883",
+        "mgnMode": "cross",
+        "mrgPosition": "split",
+        "cTime": "1784512860000",
+    }
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient(
+            [_pending_combined_tpsl("tpsl-old-size")],
+            positions=[reduced_position],
+        ),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        primary = session.query(PositionProtectionLeg).filter(
+            PositionProtectionLeg.role == "primary_stop"
+        ).one()
+        assert session.query(PositionProtectionLedger).count() == 0
+        assert session.query(PositionProtectionRevision).count() == 0
+    assert result.protection_adopted == 0
+    assert intent.recovery_state != "adopted"
+    assert primary.exchange_order_id is None
 
 
 def test_reconcile_anonymous_stop_ignores_same_signature_unfilled_sibling(tmp_path):

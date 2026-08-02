@@ -1292,6 +1292,7 @@ def _reconcile_saved_trigger_protection_intents(
     from telegram_kol_research.entry_protection_ledger_repair import (
         EntryProtectionLedgerRepairRefusal,
         TriggerProtectionOwnerState,
+        build_trigger_protection_live_position,
         finalize_trigger_protection_adoption,
         plan_trigger_protection_intent_adoption,
     )
@@ -1385,11 +1386,30 @@ def _reconcile_saved_trigger_protection_intents(
             ), recovered_at, result, transition_trigger_protection_intent)
             continue
         parent = parent_events[0]
+        live_position_result = build_trigger_protection_live_position(
+            entry_leg=leg,
+            position_rows=snapshot.positions,
+            observed_at=recovered_at,
+        )
+        if live_position_result.refusal is not None:
+            _refuse_trigger_intent(
+                session,
+                leg,
+                intent,
+                live_position_result.refusal,
+                recovered_at,
+                result,
+                transition_trigger_protection_intent,
+            )
+            continue
+        live_position = live_position_result.position
+        assert live_position is not None
         adoption = plan_trigger_protection_intent_adoption(
             session, entry_leg=leg, intent=intent, parent_event=parent,
             pending_tpsl_rows=snapshot.pending_trigger_orders,
             history_tpsl_rows=snapshot.trigger_history,
             existing_ledger_rows=existing_ledger_rows, existing_intents=all_intents,
+            live_position=live_position,
             existing_intent_requests=intent_requests,
             existing_intent_owner_states=intent_owner_states,
             history_time_range_start=parent.created_at, history_time_range_end=recovered_at,

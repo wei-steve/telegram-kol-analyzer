@@ -29,9 +29,27 @@ from telegram_kol_research.position_protection_legs import create_or_get_protect
 
 
 class FakeDeepcoinClient:
-    def __init__(self, rows):
+    def __init__(self, rows, *, positions=None):
         self.rows = rows
         self.pending_calls = []
+        self.position_calls = 0
+        self.positions = (
+            [
+                {
+                    "posId": "pos-1",
+                    "instId": "ETH-USDT-SWAP",
+                    "posSide": "short",
+                    "pos": "0.6",
+                    "cTime": "2026-08-02T00:05:10Z",
+                }
+            ]
+            if positions is None
+            else list(positions)
+        )
+
+    def list_positions(self):
+        self.position_calls += 1
+        return list(self.positions)
 
     def list_trigger_orders_pending(self, *, inst_id):
         self.pending_calls.append(inst_id)
@@ -414,7 +432,23 @@ def test_trigger_entry_repair_matches_unique_expected_protection_shape(tmp_path)
                 side="short",
                 size="6.2",
             ),
-        ]
+        ],
+        positions=[
+            {
+                "posId": "1001124219349221",
+                "instId": "ETH-USDT-SWAP",
+                "posSide": "short",
+                "pos": "4.4",
+                "cTime": "2026-07-20T00:11:12Z",
+            },
+            {
+                "posId": "1001124219426042",
+                "instId": "ETH-USDT-SWAP",
+                "posSide": "short",
+                "pos": "6.2",
+                "cTime": "2026-07-20T00:13:13Z",
+            },
+        ],
     )
 
     plan = build_entry_protection_ledger_repair_plan(
@@ -467,6 +501,57 @@ def test_failed_trigger_intent_repair_uses_verified_filled_leg_ownership(tmp_pat
             "has_pos_id": False,
         }
     ]
+    assert action.evidence["live_position"] == {
+        "pos_id": "pos-1",
+        "instrument_id": "ETH-USDT-SWAP",
+        "side": "short",
+        "size_text": "0.6",
+        "created_at": "2026-08-02T00:05:10",
+        "observed_at": "2026-08-02T01:00:00+00:00",
+    }
+    assert client.position_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("positions", "reason"),
+    [
+        ([], "trigger_protection_position_not_live"),
+        (
+            [
+                {
+                    "posId": "pos-1",
+                    "instId": "ETH-USDT-SWAP",
+                    "posSide": "short",
+                    "pos": "0.5",
+                    "cTime": "2026-08-02T00:05:10Z",
+                }
+            ],
+            "trigger_protection_position_size_changed",
+        ),
+    ],
+)
+def test_failed_trigger_intent_repair_requires_current_live_position(
+    tmp_path,
+    positions,
+    reason,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_failed_trigger_intent_repair(session_factory)
+
+    plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=FakeDeepcoinClient(
+            [_anonymous_stop_child("stop-child-1")],
+            positions=positions,
+        ),
+        now=datetime(2026, 8, 2, 1, 0, tzinfo=UTC),
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+
+    assert plan.actions == ()
+    assert any(row.reason == reason for row in plan.refusals)
 
 
 def test_failed_trigger_intent_repair_apply_finalizes_all_identity_records(tmp_path):
@@ -586,7 +671,16 @@ def test_entry_protection_repair_skips_already_repaired_trigger_entry(tmp_path):
                 side="short",
                 size="4.4",
             )
-        ]
+        ],
+        positions=[
+            {
+                "posId": "1001124219349221",
+                "instId": "ETH-USDT-SWAP",
+                "posSide": "short",
+                "pos": "4.4",
+                "cTime": "2026-07-20T00:11:12Z",
+            }
+        ],
     )
     initial_plan = build_entry_protection_ledger_repair_plan(
         session_factory,
@@ -708,6 +802,14 @@ def test_intent_adoption_plans_one_new_exact_trigger_entry_protection(tmp_path):
             history_tpsl_rows=[],
             existing_ledger_rows=[],
             existing_intents=[intent],
+            live_position=repair_module.TriggerProtectionLivePosition(
+                pos_id="pos-1",
+                instrument_id="ETH-USDT-SWAP",
+                side="short",
+                size_text="4.4",
+                created_at=datetime(2026, 7, 20, 0, 11, 12),
+                observed_at=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),
+            ),
         )
 
     assert result.action is not None
@@ -776,6 +878,65 @@ def test_intent_adoption_accepts_unique_stop_only_candidate_without_position_id(
     assert result.action.evidence["match"] == (
         "verified_filled_leg_unique_child"
     )
+
+
+def test_pending_trigger_protection_candidate_before_position_is_refused(tmp_path):
+    result = _plan_intent_adoption(
+        tmp_path,
+        live_position_created_at=datetime(2026, 7, 20, 0, 11, 14),
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_predates_fill"
+
+
+def test_history_trigger_protection_candidate_before_position_is_refused(tmp_path):
+    history = _pending_tpsl_row(
+        "tpsl-history",
+        purpose="combined",
+        price="1860",
+        stop_price="1900",
+        ctime="2026-07-20T00:11:13Z",
+        inst_id="ETH-USDT-SWAP",
+        side="short",
+        size="4.4",
+    )
+    history.update({"posId": "pos-1", "parentOrdId": "entry-1"})
+
+    result = _plan_intent_adoption(
+        tmp_path,
+        pending_rows=[],
+        history_rows=[history],
+        history_time_range_start=datetime(2026, 7, 20, 0, 11),
+        history_time_range_end=datetime(2026, 7, 20, 0, 12),
+        live_position_created_at=datetime(2026, 7, 20, 0, 11, 14),
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_predates_fill"
+
+
+def test_trigger_protection_candidate_time_unavailable_is_refused(tmp_path):
+    result = _plan_intent_adoption(
+        tmp_path,
+        pending_update={"cTime": "", "uTime": ""},
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_time_unavailable"
+
+
+def test_trigger_protection_candidate_at_position_time_is_allowed(tmp_path):
+    result = _plan_intent_adoption(
+        tmp_path,
+        live_position_created_at=datetime(2026, 7, 20, 0, 11, 13),
+    )
+
+    assert result.refusal is None
+    assert result.action is not None
 
 
 def test_intent_adoption_refuses_conflicting_position_aliases_for_anonymous_stop(tmp_path):
@@ -1146,6 +1307,7 @@ def _plan_intent_adoption(
     planner_session=None, existing_intents=None, request_update=None, adopted_order_id=None,
     fingerprint_without_internal_metadata=False, match_existing_intent_fingerprint=False,
     existing_intent_requests=None, existing_intent_owner_states=None,
+    live_position_created_at=datetime(2026, 7, 20, 0, 11, 12),
 ):
     session_factory = create_session_factory(tmp_path / "intent-adoption.db")
     _seed_trigger_entry_fill(session_factory, binding_id=152, legs=[{
@@ -1189,6 +1351,14 @@ def _plan_intent_adoption(
             existing_intents=[intent] if existing_intents is None else [intent, *existing_intents],
             existing_intent_requests=existing_intent_requests,
             existing_intent_owner_states=existing_intent_owner_states,
+            live_position=repair_module.TriggerProtectionLivePosition(
+                pos_id="pos-1",
+                instrument_id="ETH-USDT-SWAP",
+                side="short",
+                size_text=str(request.get("sz")),
+                created_at=live_position_created_at,
+                observed_at=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),
+            ),
             history_time_range_start=history_time_range_start,
             history_time_range_end=history_time_range_end,
         )
@@ -1392,7 +1562,16 @@ def test_trigger_entry_repair_refuses_duplicate_expected_protection_shape(tmp_pa
                 side="short",
                 size="4.4",
             ),
-        ]
+        ],
+        positions=[
+            {
+                "posId": "1001124219349221",
+                "instId": "ETH-USDT-SWAP",
+                "posSide": "short",
+                "pos": "4.4",
+                "cTime": "2026-07-20T00:11:12Z",
+            }
+        ],
     )
 
     plan = build_entry_protection_ledger_repair_plan(
