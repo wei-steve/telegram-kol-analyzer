@@ -76,7 +76,7 @@ def run_break_even_convergence_worker_tick(
             discovered=1, alerted=alerted, skipped=1
         )
 
-    client = object() if execution_mode == "shadow" else deepcoin_client_factory()
+    client = deepcoin_client_factory()
     try:
         result = executor(
             session_factory,

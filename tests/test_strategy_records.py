@@ -19,6 +19,8 @@ from telegram_kol_research.models import (
     SignalCandidate,
     SourceMessageDeletionExit,
     StrategyLifecycle,
+    StrategyBreakEvenConvergence,
+    StrategyBreakEvenConvergenceLeg,
     StrategyManagementBatch,
     StrategyManagementLeg,
     TriggerProtectionIntent,
@@ -34,6 +36,96 @@ from telegram_kol_research.strategy_records import (
 
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+
+
+def test_strategy_detail_projects_shadow_break_even_decision_as_not_executed(tmp_path):
+    sf = create_session_factory(tmp_path / "break-even-detail.db")
+    with sf() as session:
+        raw = RawMessage(
+            chat_id=10,
+            message_id=101,
+            text="BTC short",
+            archived_target_group=True,
+        )
+        binding = ExecutionBinding(
+            strategy_instance_id="strategy-break-even-detail",
+            kol_id="group:10",
+            chat_id=10,
+            message_id=101,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            status="active",
+            pos_id="pos-1",
+        )
+        session.add_all([raw, binding])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=10,
+            message_id=101,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            entered_at=NOW,
+            execution_binding_id=binding.id,
+        )
+        entry = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            order_id="pos-1",
+            pos_id="pos-1",
+            venue="deepcoin",
+            attribution_status="verified",
+            status="active",
+        )
+        session.add_all([lifecycle, entry])
+        session.flush()
+        convergence = StrategyBreakEvenConvergence(
+            strategy_instance_id=binding.strategy_instance_id,
+            execution_binding_id=binding.id,
+            target_lifecycle_id=lifecycle.id,
+            trigger_type="tp1_fill",
+            trigger_identity="tp-1",
+            trigger_evidence_json='{"evidence_tier":"exact_order_terminal"}',
+            target_snapshot_json="{}",
+            execution_mode="shadow",
+            status="shadow_planned",
+            planned_at=NOW,
+            completed_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(convergence)
+        session.flush()
+        session.add(StrategyBreakEvenConvergenceLeg(
+            convergence_id=convergence.id,
+            execution_order_leg_id=entry.id,
+            pos_id="pos-1",
+            preflight_size="5",
+            avg_entry_price="63076.7",
+            old_protection_json="[]",
+            decision_json='{"action":"full_exit","market_price":"63461.2"}',
+            status="shadow_planned",
+            reason_code="shadow_only_no_exchange_write",
+            updated_at=NOW,
+        ))
+        session.commit()
+        lifecycle_id = int(lifecycle.id)
+
+    detail = load_strategy_record_detail(
+        sf,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={10: "大镖客"},
+    )
+
+    convergence_detail = detail["execution"]["break_even_convergences"][0]
+    assert convergence_detail["execution_mode"] == "shadow"
+    assert convergence_detail["status"] == "shadow_planned"
+    assert convergence_detail["legs"][0]["decision"]["action"] == "full_exit"
+    assert convergence_detail["legs"][0]["mutation_intent_id"] is None
 
 
 def test_strategy_records_expose_source_deletion_recovery_and_flat_proof(tmp_path):

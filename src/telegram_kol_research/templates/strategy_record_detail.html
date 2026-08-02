@@ -219,6 +219,34 @@
     </div>
 
     <div aria-label="仓位管理证据">
+      <h3>自动成本保护收敛</h3>
+      {% for convergence in record.execution.break_even_convergences %}
+        <article data-break-even-convergence-id="{{ convergence.id }}">
+          <h4>收敛任务 #{{ convergence.id }} · {{ convergence.trigger_type }}</h4>
+          <dl>
+            <dt>执行模式</dt><dd>{{ convergence.execution_mode }}</dd>
+            <dt>状态</dt><dd>{{ convergence.status }} · {{ convergence.reason_code or '无原因码' }}</dd>
+            <dt>触发身份</dt><dd>{{ convergence.trigger_identity }}</dd>
+            <dt>触发证据</dt><dd><pre>{{ convergence.trigger_evidence | tojson(indent=2) }}</pre></dd>
+          </dl>
+          {% for leg in convergence.legs %}
+            <section data-break-even-position-id="{{ leg.pos_id }}">
+              <h5>持仓腿 {{ leg.pos_id }}</h5>
+              <dl>
+                <dt>成本价</dt><dd>{{ leg.avg_entry_price }}</dd>
+                <dt>执行前数量</dt><dd>{{ leg.preflight_size }}</dd>
+                <dt>逐腿状态</dt><dd>{{ leg.status }} · {{ leg.reason_code or '无原因码' }}</dd>
+                <dt>市场决策</dt><dd><pre>{{ leg.decision | tojson(indent=2) }}</pre></dd>
+                <dt>mutation intent</dt><dd>{{ leg.mutation_intent_id or '-' }}</dd>
+                <dt>交易所订单</dt><dd>{{ leg.exchange_order_id or '-' }}</dd>
+              </dl>
+            </section>
+          {% endfor %}
+        </article>
+      {% else %}
+        <p>暂无自动成本保护收敛任务</p>
+      {% endfor %}
+
       <h3>仓位管理批次</h3>
       {% for batch in record.execution.management_batches %}
         <article

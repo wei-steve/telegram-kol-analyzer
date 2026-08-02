@@ -1118,3 +1118,25 @@ quantity, creation time, or `sz=0` may be shown to an operator as supporting
 context, but an apply is allowed only for the separately reviewed exact
 `ordId → posId` actions in the fingerprinted plan. Runtime code must never
 reuse those review fields as automatic attribution rules.
+## 第一止盈后自动成本保护
+
+自动成本保护由 `strategy_break_even_convergences` 和
+`strategy_break_even_convergence_legs` 持久化。只有交易所精确订单终态或完整仓位差额证据能证明
+TP1 成交；新的反向策略消息本身不能结束旧策略，也不能授权平仓。
+
+排查顺序：
+
+1. 查询收敛任务的 `trigger_evidence_json`、`target_snapshot_json`、`status` 和
+   `reason_code`，确认触发订单及策略身份唯一。
+2. 查询逐腿的 `pos_id`、`preflight_size`、`avg_entry_price` 和 `decision_json`。
+3. 核对冻结目标里的未成交入场腿已经撤销并取得终态回读；结果未知时只能继续只读回查。
+4. 核对已成交 TP1 没有重新出现，剩余止盈总量不超过当前持仓量。
+5. 对 `set_break_even` 核对新止损已按相同 `pos_id` 和实际均价出现在待执行 TPSL；
+   对 `full_exit` 核对精确 `closePosId` 已经归零；对 `keep_tighter_stop` 核对系统没有写单。
+6. 查询对应 `position_mutation_intents`。`submitting`、`recovery_required` 或未知结果禁止人工
+   重跑提交；先用交易所仓位、待执行 TPSL、订单历史和成交记录完成只读对账。
+
+关闭或回滚：把交易设置中的 `move_stop_to_breakeven_after_tp1` 关闭，或把管理执行模式切到
+`disabled`。上线前先使用 `shadow`：它会保存行情和逐腿决策，但不会撤单、改止损或平仓。
+遇到 `automatic_break_even_*` 保护异常告警时，按告警中的任务 ID 和 `posId` 核对；在所有未知
+mutation 得到确定终态前不得切回 live。

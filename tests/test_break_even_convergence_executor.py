@@ -268,7 +268,7 @@ def test_unknown_deferred_cancel_enters_recovery_without_further_writes(tmp_path
     ]
 
 
-def test_shadow_convergence_never_calls_exchange_cancel(tmp_path):
+def test_shadow_convergence_reads_and_decides_but_never_writes_exchange(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     convergence = _seed_convergence(session_factory, mode="shadow")
     client = TriggerCancelClient()
@@ -282,11 +282,21 @@ def test_shadow_convergence_never_calls_exchange_cancel(tmp_path):
     )
 
     assert result.status == "shadow_planned"
-    assert client.calls == []
+    assert not [
+        call for call in client.calls
+        if call[0] in {
+            "cancel_trigger_order",
+            "set_position_sltp",
+            "cancel_position_sltp",
+            "place_order",
+        }
+    ]
     with session_factory() as session:
         assert session.get(StrategyBreakEvenConvergence, convergence.id).status == (
             "shadow_planned"
         )
+        leg = session.query(StrategyBreakEvenConvergenceLeg).one()
+        assert json.loads(leg.decision_json)["action"] == "set_break_even"
 
 
 def test_short_leg_below_cost_adds_exact_break_even_stop_and_completes(tmp_path):

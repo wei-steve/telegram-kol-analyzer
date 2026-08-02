@@ -80,11 +80,16 @@ def execute_break_even_convergence(
             session.commit()
             return _result(convergence)
         if convergence.execution_mode == "shadow":
-            convergence.status = "shadow_planned"
+            convergence.status = "shadow_deciding"
             convergence.reason_code = None
             convergence.updated_at = now
             session.commit()
-            return _result(convergence)
+            return _execute_shadow_market_decisions(
+                session_factory,
+                convergence_id=int(convergence_id),
+                deepcoin_client=deepcoin_client,
+                executed_at=now,
+            )
         if convergence.execution_mode != "live":
             raise RuntimeError("break_even_convergence_execution_mode_invalid")
         snapshot = _load_target_snapshot(convergence.target_snapshot_json)
@@ -399,6 +404,58 @@ def _execute_market_decisions(
         reason_code=None,
         finished_at=executed_at,
     )
+
+
+def _execute_shadow_market_decisions(
+    session_factory: sessionmaker,
+    *,
+    convergence_id: int,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    executed_at: datetime,
+) -> BreakEvenConvergenceExecutionResult:
+    """Persist the exact would-do decisions while making zero exchange writes."""
+
+    try:
+        positions, pending, quote = _load_complete_market_preflight(
+            session_factory,
+            convergence_id=convergence_id,
+            deepcoin_client=deepcoin_client,
+        )
+        _reserve_market_decisions(
+            session_factory,
+            convergence_id=convergence_id,
+            positions=positions,
+            pending=pending,
+            quote=quote,
+            decided_at=executed_at,
+        )
+    except Exception:
+        return _finish_convergence(
+            session_factory,
+            convergence_id=convergence_id,
+            status="shadow_planned",
+            reason_code="shadow_market_preflight_unavailable",
+            finished_at=executed_at,
+        )
+    with session_factory() as session:
+        legs = (
+            session.query(StrategyBreakEvenConvergenceLeg)
+            .filter_by(convergence_id=convergence_id)
+            .all()
+        )
+        for leg in legs:
+            leg.status = "shadow_planned"
+            leg.reason_code = "shadow_only_no_exchange_write"
+            leg.updated_at = executed_at
+        convergence = session.get(StrategyBreakEvenConvergence, convergence_id)
+        if convergence is None:
+            raise LookupError("break_even_convergence_not_found")
+        convergence.status = "shadow_planned"
+        convergence.reason_code = None
+        convergence.completed_at = executed_at
+        convergence.updated_at = executed_at
+        session.commit()
+        return _result(convergence)
 
 
 def _load_complete_market_preflight(

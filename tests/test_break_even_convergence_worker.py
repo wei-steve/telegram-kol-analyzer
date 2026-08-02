@@ -90,16 +90,14 @@ def _seed(session_factory, *, mode="live", status="planned"):
         return int(convergence.id)
 
 
-def test_shadow_tick_executes_plan_without_constructing_exchange_client(tmp_path):
+def test_shadow_tick_executes_plan_with_read_client(tmp_path):
     sf = create_session_factory(tmp_path / "research.db")
     convergence_id = _seed(sf, mode="shadow")
     calls = []
 
     result = run_break_even_convergence_worker_tick(
         sf,
-        deepcoin_client_factory=lambda: (_ for _ in ()).throw(
-            AssertionError("exchange client must stay dormant")
-        ),
+        deepcoin_client_factory=lambda: object(),
         executor=lambda _sf, **kwargs: calls.append(kwargs) or type(
             "Result", (), {"status": "shadow_planned", "reason_code": None}
         )(),

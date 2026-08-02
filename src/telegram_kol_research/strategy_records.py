@@ -34,6 +34,8 @@ from telegram_kol_research.models import (
     SignalCandidate,
     SourceMessageDeletionExit,
     StrategyLifecycle,
+    StrategyBreakEvenConvergence,
+    StrategyBreakEvenConvergenceLeg,
     StrategyManagementBatch,
     StrategyManagementLeg,
     StrategyMessageLink,
@@ -368,6 +370,33 @@ def load_strategy_record_detail(
             )
             .all()
             if management_batch_ids
+            else []
+        )
+        break_even_convergences = (
+            session.query(StrategyBreakEvenConvergence)
+            .filter(
+                StrategyBreakEvenConvergence.target_lifecycle_id == lifecycle.id
+            )
+            .order_by(
+                StrategyBreakEvenConvergence.planned_at,
+                StrategyBreakEvenConvergence.id,
+            )
+            .all()
+        )
+        break_even_ids = {int(row.id) for row in break_even_convergences}
+        break_even_legs = (
+            session.query(StrategyBreakEvenConvergenceLeg)
+            .filter(
+                StrategyBreakEvenConvergenceLeg.convergence_id.in_(
+                    break_even_ids
+                )
+            )
+            .order_by(
+                StrategyBreakEvenConvergenceLeg.convergence_id,
+                StrategyBreakEvenConvergenceLeg.id,
+            )
+            .all()
+            if break_even_ids
             else []
         )
         entry_leg_ids = {int(row.id) for row in order_legs if row.purpose == "entry"}
@@ -991,6 +1020,17 @@ def load_strategy_record_detail(
                     legs=legs_by_batch_id.get(int(row.id), []),
                 )
                 for row in management_batches
+            ],
+            "break_even_convergences": [
+                _break_even_convergence_detail(
+                    row,
+                    legs=[
+                        leg
+                        for leg in break_even_legs
+                        if int(leg.convergence_id) == int(row.id)
+                    ],
+                )
+                for row in break_even_convergences
             ],
             "management_confirmations": [
                 _management_confirmation_summary(
@@ -1690,6 +1730,40 @@ def _management_batch_detail(
         "reconciled_at": _as_utc(row.reconciled_at),
         "completed_at": _as_utc(row.completed_at),
         "legs": [_management_leg_detail(leg) for leg in legs],
+    }
+
+
+def _break_even_convergence_detail(
+    row: StrategyBreakEvenConvergence,
+    *,
+    legs: list[StrategyBreakEvenConvergenceLeg],
+) -> dict[str, object]:
+    return {
+        "id": int(row.id),
+        "strategy_instance_id": row.strategy_instance_id,
+        "trigger_type": row.trigger_type,
+        "trigger_identity": row.trigger_identity,
+        "trigger_evidence": _safe_json_value(row.trigger_evidence_json),
+        "execution_mode": row.execution_mode,
+        "status": row.status,
+        "reason_code": row.reason_code,
+        "planned_at": _as_utc(row.planned_at),
+        "completed_at": _as_utc(row.completed_at),
+        "legs": [
+            {
+                "id": int(leg.id),
+                "execution_order_leg_id": int(leg.execution_order_leg_id),
+                "pos_id": leg.pos_id,
+                "preflight_size": leg.preflight_size,
+                "avg_entry_price": leg.avg_entry_price,
+                "decision": _safe_json_value(leg.decision_json),
+                "status": leg.status,
+                "reason_code": leg.reason_code,
+                "mutation_intent_id": leg.mutation_intent_id,
+                "exchange_order_id": leg.exchange_order_id,
+            }
+            for leg in legs
+        ],
     }
 
 
