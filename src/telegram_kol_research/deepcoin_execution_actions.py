@@ -95,6 +95,7 @@ class _PendingEntryLeg:
     order_id: str | None
     client_order_id: str | None
     status: str
+    has_position: bool = False
 
 
 @serialized_position_authority_mutation
@@ -1170,16 +1171,24 @@ def cancel_pending_entry_legs(
     trade_signal: TradeSignalRecord,
     deepcoin_client: DeepcoinTradingClientProtocol,
     executed_at: datetime | None = None,
+    allow_position_bound_remainder: bool = False,
 ) -> dict[str, Any]:
     """Cancel only unfilled entry legs while preserving an already-entered binding."""
 
     now = executed_at or datetime.now(UTC)
     binding = _load_binding_for_signal(session_factory, trade_signal)
-    pending_legs = _pending_entry_legs(session_factory, binding.id)
+    pending_legs = _pending_entry_legs(
+        session_factory,
+        binding.id,
+        include_position_bound=allow_position_bound_remainder,
+    )
     if not pending_legs:
         raise DeepcoinExecutionActionError("no_pending_entry_leg_to_cancel")
     _require_unique_pending_entry_leg_identities(pending_legs)
-    if any(leg.status in {"partially_filled", "partial"} for leg in pending_legs):
+    if any(
+        leg.status in {"partially_filled", "partial"} and not leg.has_position
+        for leg in pending_legs
+    ):
         raise DeepcoinExecutionActionError("pending_entry_leg_partially_filled")
 
     inst_id = _to_deepcoin_swap_instrument(binding.symbol)
@@ -1196,8 +1205,9 @@ def cancel_pending_entry_legs(
         raise DeepcoinExecutionActionError(
             "pending_entry_terminal_evidence_unavailable"
         )
+    unfilled_legs = [leg for leg in pending_legs if not leg.has_position]
     _require_no_pending_entry_fill_evidence(
-        pending_legs,
+        unfilled_legs,
         history_rows=history_rows,
         fill_rows=fill_rows,
     )
@@ -1207,7 +1217,7 @@ def cancel_pending_entry_legs(
     ]
     if absent_legs:
         _require_cancelled_history_for_pending_entry_legs(
-            absent_legs,
+            [leg for leg in absent_legs if not leg.has_position],
             history_rows=history_rows,
             fill_rows=fill_rows,
         )
@@ -1216,6 +1226,7 @@ def cancel_pending_entry_legs(
             leg_ids={leg.id for leg in absent_legs},
             terminal_reason="pending_entry_order_absent_confirmed",
             updated_at=now,
+            preserve_position_leg=True,
         )
         _remove_cancelled_order_ids_from_active_binding(
             session_factory,
@@ -1343,7 +1354,7 @@ def cancel_pending_entry_legs(
         if leg.id in {item["leg_id"] for item in cancelled_orders}
     ]
     _require_cancelled_history_for_pending_entry_legs(
-        cancelled_legs,
+        [leg for leg in cancelled_legs if not leg.has_position],
         history_rows=post_history_rows,
         fill_rows=post_fill_rows,
     )
@@ -1354,6 +1365,7 @@ def cancel_pending_entry_legs(
             leg_ids={int(cancelled_order["leg_id"])},
             terminal_reason="operator_cancelled_unfilled_entry_leg",
             updated_at=now,
+            preserve_position_leg=True,
         )
     _remove_cancelled_order_ids_from_active_binding(
         session_factory,
@@ -1594,13 +1606,14 @@ def _load_exact_active_binding_for_position(
 def _pending_entry_legs(
     session_factory: sessionmaker,
     binding_id: int,
+    *,
+    include_position_bound: bool = False,
 ) -> list[_PendingEntryLeg]:
     with session_factory() as session:
         legs = (
             session.query(ExecutionOrderLeg)
             .filter(ExecutionOrderLeg.execution_binding_id == int(binding_id))
             .filter(ExecutionOrderLeg.purpose == "entry")
-            .filter(ExecutionOrderLeg.pos_id.is_(None))
             .filter(
                 ExecutionOrderLeg.status.in_(
                     [
@@ -1615,6 +1628,8 @@ def _pending_entry_legs(
             .order_by(ExecutionOrderLeg.id.asc())
             .all()
         )
+        if not include_position_bound:
+            legs = [leg for leg in legs if not leg.pos_id]
         return [
             _PendingEntryLeg(
                 id=int(leg.id),
@@ -1625,6 +1640,7 @@ def _pending_entry_legs(
                     else None
                 ),
                 status=str(leg.status or "").lower(),
+                has_position=bool(leg.pos_id),
             )
             for leg in legs
             if leg.order_id or leg.client_order_id
@@ -1868,6 +1884,7 @@ def _mark_pending_entry_leg_ids_cancelled(
     leg_ids: set[int],
     terminal_reason: str,
     updated_at: datetime,
+    preserve_position_leg: bool = False,
 ) -> None:
     with session_factory() as session:
         legs = (
@@ -1878,8 +1895,12 @@ def _mark_pending_entry_leg_ids_cancelled(
         if len(legs) != len(leg_ids):
             raise DeepcoinExecutionActionError("pending_entry_leg_identity_changed")
         for leg in legs:
-            leg.status = "cancelled"
-            leg.terminal_reason = terminal_reason
+            if preserve_position_leg and leg.pos_id:
+                leg.status = "active"
+                leg.terminal_reason = None
+            else:
+                leg.status = "cancelled"
+                leg.terminal_reason = terminal_reason
             leg.updated_at = updated_at
         session.commit()
 

@@ -58,12 +58,19 @@ def cleanup_terminal_entry_legs(
     deepcoin_client: DeepcoinTradingClientProtocol,
     reason: str,
     cleaned_at: datetime | None = None,
+    expected_binding_id: int | None = None,
+    allow_position_bound_remainder: bool = False,
 ) -> TerminalEntryCleanupResult:
     now = cleaned_at or datetime.now(UTC)
     with session_factory() as session:
         lifecycle = session.get(StrategyLifecycle, int(lifecycle_id))
         if lifecycle is None or lifecycle.execution_binding_id is None:
             raise LookupError("terminal_entry_cleanup_lifecycle_not_bound")
+        if (
+            expected_binding_id is not None
+            and int(lifecycle.execution_binding_id) != int(expected_binding_id)
+        ):
+            raise LookupError("terminal_entry_cleanup_binding_identity_changed")
         binding = session.get(ExecutionBinding, int(lifecycle.execution_binding_id))
         if binding is None:
             raise LookupError("terminal_entry_cleanup_binding_not_found")
@@ -77,7 +84,7 @@ def cleanup_terminal_entry_legs(
             leg
             for leg in pending_legs
             if str(leg.status or "").lower() in _CANCELLABLE_ENTRY_STATES
-            and not leg.pos_id
+            and (allow_position_bound_remainder or not leg.pos_id)
         ]
         if not pending_legs:
             return TerminalEntryCleanupResult(
@@ -146,6 +153,7 @@ def cleanup_terminal_entry_legs(
             trade_signal=trade_signal,
             deepcoin_client=deepcoin_client,
             executed_at=now,
+            allow_position_bound_remainder=allow_position_bound_remainder,
         )
     except DeepcoinExecutionActionError as exc:
         mark_trade_signal_failed(
@@ -193,6 +201,7 @@ def cleanup_terminal_entry_legs(
                     trade_signal=trade_signal,
                     deepcoin_client=deepcoin_client,
                     executed_at=now,
+                    allow_position_bound_remainder=allow_position_bound_remainder,
                 )
             except Exception:
                 mark_trade_signal_failed(
@@ -256,8 +265,12 @@ def cleanup_terminal_entry_legs(
             .all()
         )
         for leg in legs:
-            leg.status = "cancelled"
-            leg.terminal_reason = terminal_reason
+            if allow_position_bound_remainder and leg.pos_id:
+                leg.status = "active"
+                leg.terminal_reason = None
+            else:
+                leg.status = "cancelled"
+                leg.terminal_reason = terminal_reason
             leg.updated_at = now
         session.commit()
     mark_trade_signal_submitted(

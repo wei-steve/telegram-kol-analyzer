@@ -248,6 +248,8 @@ def plan_source_deletion_full_exit(
         if (
             deletion_exit.raw_message_id is None
             or deletion_exit.target_lifecycle_id is None
+            or deletion_exit.execution_binding_id is None
+            or not deletion_exit.strategy_instance_id
             or deletion_exit.source_event_id is None
         ):
             return ManagementPlanningResult(
@@ -259,6 +261,9 @@ def plan_source_deletion_full_exit(
         lifecycle = session.get(
             StrategyLifecycle, int(deletion_exit.target_lifecycle_id)
         )
+        binding = session.get(
+            ExecutionBinding, int(deletion_exit.execution_binding_id)
+        )
         event = session.get(
             TelegramSourceMessageEvent, int(deletion_exit.source_event_id)
         )
@@ -267,10 +272,29 @@ def plan_source_deletion_full_exit(
             .filter(RecognitionDecision.raw_message_id == deletion_exit.raw_message_id)
             .one_or_none()
         )
-        if raw_message is None or lifecycle is None or event is None or decision is None:
+        if (
+            raw_message is None
+            or lifecycle is None
+            or binding is None
+            or event is None
+            or decision is None
+        ):
             return ManagementPlanningResult(
                 status="blocked",
                 reason_code="source_deletion_original_ancestry_missing",
+                target_lifecycle_id=deletion_exit.target_lifecycle_id,
+            )
+        if (
+            lifecycle.execution_binding_id != deletion_exit.execution_binding_id
+            or binding.strategy_instance_id != deletion_exit.strategy_instance_id
+            or lifecycle.chat_id != raw_message.chat_id
+            or lifecycle.message_id != raw_message.message_id
+            or binding.chat_id != raw_message.chat_id
+            or binding.message_id != raw_message.message_id
+        ):
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="source_deletion_frozen_identity_changed",
                 target_lifecycle_id=deletion_exit.target_lifecycle_id,
             )
         generation = f"source_deleted:{event.event_fingerprint}"
@@ -328,6 +352,25 @@ def plan_source_deletion_full_exit(
                 status="blocked",
                 reason_code="source_deletion_planned_batch_missing",
                 target_lifecycle_id=result.target_lifecycle_id,
+            )
+        if (
+            batch.target_lifecycle_id != deletion_exit.target_lifecycle_id
+            or batch.execution_binding_id != deletion_exit.execution_binding_id
+            or batch.strategy_instance_id != deletion_exit.strategy_instance_id
+            or batch.raw_message_id != deletion_exit.raw_message_id
+        ):
+            batch.status = "blocked"
+            batch.reason_code = "source_deletion_frozen_identity_changed"
+            batch.updated_at = now
+            deletion_exit.state = "recovery_required"
+            deletion_exit.last_reason = "position_exit_identity_changed"
+            deletion_exit.last_error = "source_deletion_frozen_identity_changed"
+            deletion_exit.updated_at = now
+            session.commit()
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="source_deletion_frozen_identity_changed",
+                target_lifecycle_id=deletion_exit.target_lifecycle_id,
             )
         target_snapshot = json.loads(batch.target_snapshot_json or "{}")
         target_snapshot["source_deletion"] = event_identity

@@ -13,9 +13,11 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    PositionMutationIntent,
     SourceMessageDeletionExit,
     StrategyLifecycle,
     StrategyManagementBatch,
+    StrategyManagementLeg,
     TelegramSourceMessageEvent,
 )
 from telegram_kol_research.position_authority_lock import position_authority_lock
@@ -298,6 +300,8 @@ def run_source_message_deletion_worker_tick(
                 deepcoin_client=get_client(),
                 reason="source_message_deleted",
                 cleaned_at=now,
+                expected_binding_id=binding_id,
+                allow_position_bound_remainder=True,
             )
         except Exception as exc:
             _transition_claimed(
@@ -324,6 +328,18 @@ def run_source_message_deletion_worker_tick(
             )
             counts["recovery_required"] += 1
             continue
+        if int(cleanup.binding_id) != int(binding_id):
+            _transition_claimed(
+                session_factory,
+                exit_id=exit_id,
+                claim_token=claim_token,
+                new_state="recovery_required",
+                reason="entry_cancel_binding_identity_changed",
+                error="entry_cancel_binding_identity_changed",
+                updated_at=now,
+            )
+            counts["recovery_required"] += 1
+            continue
 
         signal_ids = _trade_signal_ids_for_events(
             session_factory,
@@ -345,6 +361,7 @@ def run_source_message_deletion_worker_tick(
                 (
                     session.query(ExecutionOrderLeg)
                     .filter(ExecutionOrderLeg.id.in_(cleanup.leg_ids))
+                    .filter(ExecutionOrderLeg.pos_id.is_(None))
                     .update(
                         {
                             ExecutionOrderLeg.terminal_reason: (
@@ -432,10 +449,48 @@ def finalize_source_message_deletion_exit(
                     if deletion_exit.management_batch_id is not None
                     else None
                 )
+                exact_pos_ids = {
+                    value
+                    for leg in legs
+                    if leg.attribution_status == "verified"
+                    for value in (_clean_id(leg.pos_id),)
+                    if value is not None
+                }
+                identity_invalid = (
+                    lifecycle is None
+                    or binding is None
+                    or lifecycle.execution_binding_id
+                    != deletion_exit.execution_binding_id
+                    or binding.strategy_instance_id
+                    != deletion_exit.strategy_instance_id
+                    or any(
+                        leg.strategy_instance_id
+                        != deletion_exit.strategy_instance_id
+                        for leg in legs
+                    )
+                    or any(
+                        leg.pos_id and leg.attribution_status != "verified"
+                        for leg in legs
+                    )
+                    or (
+                        not legs
+                        and bool(binding.order_id or binding.client_order_id or binding.pos_id)
+                    )
+                )
+                if identity_invalid:
+                    deletion_exit.state = "recovery_required"
+                    deletion_exit.last_reason = "frozen_ledger_identity_unverified"
+                    deletion_exit.last_error = "frozen_ledger_identity_unverified"
+                    deletion_exit.last_reconciled_at = now
+                    deletion_exit.claim_token = None
+                    deletion_exit.claimed_at = None
+                    deletion_exit.updated_at = now
+                    session.commit()
+                    return "recovery_required"
 
                 if errors:
-                    deletion_exit.state = "recovery_required"
-                    deletion_exit.last_reason = "flat_snapshot_incomplete"
+                    deletion_exit.state = "reconciling"
+                    deletion_exit.last_reason = "flat_snapshot_retry"
                     deletion_exit.last_error = json.dumps(
                         errors, sort_keys=True, default=str
                     )
@@ -444,7 +499,7 @@ def finalize_source_message_deletion_exit(
                     deletion_exit.claimed_at = None
                     deletion_exit.updated_at = now
                     session.commit()
-                    return "recovery_required"
+                    return "waiting"
 
                 if batch is not None and batch.status in {
                     "blocked",
@@ -479,6 +534,67 @@ def finalize_source_message_deletion_exit(
                         reconciled_at=now,
                     )
 
+                if batch is not None:
+                    management_legs = (
+                        session.query(StrategyManagementLeg)
+                        .filter(StrategyManagementLeg.management_batch_id == batch.id)
+                        .order_by(StrategyManagementLeg.id.asc())
+                        .all()
+                    )
+                    prefixes = tuple(
+                        f"management:{batch.id}:{leg.id}:"
+                        for leg in management_legs
+                    )
+                    mutation_intents = (
+                        session.query(PositionMutationIntent)
+                        .filter(
+                            PositionMutationIntent.execution_binding_id
+                            == deletion_exit.execution_binding_id
+                        )
+                        .all()
+                    )
+                    related_intents = [
+                        intent
+                        for intent in mutation_intents
+                        if any(
+                            intent.idempotency_key.startswith(prefix)
+                            for prefix in prefixes
+                        )
+                    ]
+                    management_terminal = bool(management_legs) and all(
+                        leg.status == "confirmed" for leg in management_legs
+                    )
+                    close_intents_complete = all(
+                        any(
+                            intent.idempotency_key.startswith(
+                                f"management:{batch.id}:{leg.id}:close:"
+                            )
+                            and intent.status == "confirmed"
+                            for intent in related_intents
+                        )
+                        for leg in management_legs
+                    )
+                    all_intents_terminal = bool(related_intents) and all(
+                        intent.status == "confirmed" for intent in related_intents
+                    )
+                    exact_management_ownership = all(
+                        leg.execution_order_leg_id in {entry.id for entry in legs}
+                        and _clean_id(leg.pos_id) in exact_pos_ids
+                        for leg in management_legs
+                    )
+                    if not (
+                        management_terminal
+                        and close_intents_complete
+                        and all_intents_terminal
+                        and exact_management_ownership
+                    ):
+                        return _mark_reconciliation_waiting(
+                            session,
+                            deletion_exit=deletion_exit,
+                            reason="position_exit_mutations_not_terminal",
+                            reconciled_at=now,
+                        )
+
                 live_order_rows = list(getattr(snapshot, "open_orders", []) or [])
                 live_order_rows.extend(
                     list(getattr(snapshot, "pending_trigger_orders", []) or [])
@@ -509,13 +625,6 @@ def finalize_source_message_deletion_exit(
                         reconciled_at=now,
                     )
 
-                exact_pos_ids = {
-                    value
-                    for leg in legs
-                    if leg.attribution_status == "verified"
-                    for value in (_clean_id(leg.pos_id),)
-                    if value is not None
-                }
                 visible_position_rows = [
                     row
                     for row in list(getattr(snapshot, "positions", []) or [])

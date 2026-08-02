@@ -5,12 +5,14 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionMutationIntent,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
     SourceMessageDeletionExit,
     StrategyLifecycle,
     StrategyManagementBatch,
+    StrategyManagementLeg,
     TelegramSourceMessageEvent,
 )
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
@@ -330,6 +332,77 @@ def test_worker_partial_fill_is_fail_closed_without_cancelling(tmp_path):
         assert session.query(SourceMessageDeletionExit).one().state == "recovery_required"
 
 
+def test_worker_cancels_partial_fill_remainder_then_preserves_exact_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, _, binding_id, leg_id = _seed_pending_strategy(
+        session_factory,
+        chat_id=10,
+        message_id=100,
+        order_id="order-deleted",
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.pos_id = "pos-partial"
+        binding.status = "active"
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.status = "partially_filled"
+        leg.pos_id = "pos-partial"
+        leg.attribution_status = "verified"
+        session.commit()
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=10,
+        message_id=100,
+        deleted_at=NOW,
+    )
+    client = _ExactCancelClient(["order-deleted"], partial_fill=True)
+
+    result = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: client,
+        processed_at=NOW,
+    )
+
+    assert result.cancelled == 1
+    assert client.cancelled == ["order-deleted"]
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert leg.status == "active"
+        assert leg.pos_id == "pos-partial"
+        assert leg.terminal_reason is None
+        assert deletion_exit.state == "closing_positions"
+
+
+def test_worker_refuses_cleanup_when_frozen_lifecycle_binding_has_drifted(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, lifecycle_id, _, _ = _seed_pending_strategy(
+        session_factory,
+        chat_id=10,
+        message_id=100,
+        order_id="order-deleted",
+    )
+    record_source_message_deleted(
+        session_factory,
+        chat_id=10,
+        message_id=100,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        session.get(StrategyLifecycle, lifecycle_id).execution_binding_id = None
+        session.commit()
+    client = _ExactCancelClient(["order-deleted"])
+
+    result = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: client,
+        processed_at=NOW,
+    )
+
+    assert result.recovery_required == 1
+    assert client.cancelled == []
+
+
 def test_worker_plans_exact_full_exit_after_entry_cancellation_stage(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_filled_strategy(session_factory)
@@ -356,6 +429,38 @@ def test_worker_plans_exact_full_exit_after_entry_cancellation_stage(tmp_path):
         deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
         assert deletion_exit.state == "closing_positions"
         assert deletion_exit.management_batch_id is not None
+
+
+def test_worker_blocks_full_exit_planning_when_frozen_binding_has_drifted(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "closing_positions"
+        lifecycle = session.get(
+            StrategyLifecycle, deletion_exit.target_lifecycle_id
+        )
+        lifecycle.execution_binding_id = None
+        session.commit()
+
+    result = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=_PositionClient,
+        contract_spec_provider=_ContractSpecs(),
+        processed_at=NOW,
+    )
+
+    assert result.recovery_required == 1
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert deletion_exit.state == "recovery_required"
+        assert deletion_exit.management_batch_id is None
 
 
 def test_pending_only_deletion_finishes_cancelled_after_flat_snapshot(tmp_path):
@@ -433,10 +538,10 @@ def test_flat_finalization_fails_closed_when_exchange_snapshot_has_errors(tmp_pa
         finalized_at=NOW,
     )
 
-    assert status == "recovery_required"
+    assert status == "waiting"
     with session_factory() as session:
         deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
-        assert deletion_exit.state == "recovery_required"
+        assert deletion_exit.state == "reconciling"
         assert deletion_exit.flat_proof_json is None
 
 
@@ -497,6 +602,41 @@ def test_filled_deletion_requires_a_durable_exit_batch_before_flat_completion(tm
     assert status == "recovery_required"
 
 
+def test_unverified_position_identity_can_never_be_declared_flat(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.pos_id == "pos-filled")
+            .one()
+        )
+        leg.attribution_status = "unassigned"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={},
+            positions=[{"posId": "pos-filled", "pos": "3"}],
+            open_orders=[],
+            pending_trigger_orders=[],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "recovery_required"
+
+
 def test_filled_deletion_finishes_exited_only_after_terminal_management_batch(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_filled_strategy(session_factory)
@@ -538,6 +678,42 @@ def test_filled_deletion_finishes_exited_only_after_terminal_management_batch(tm
     with session_factory() as session:
         batch = session.get(StrategyManagementBatch, batch_id)
         batch.status = "succeeded"
+        session.commit()
+
+    assert finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=flat_snapshot,
+        finalized_at=NOW,
+    ) == "waiting"
+
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        management_legs = (
+            session.query(StrategyManagementLeg)
+            .filter(StrategyManagementLeg.management_batch_id == batch_id)
+            .all()
+        )
+        for management_leg in management_legs:
+            management_leg.status = "confirmed"
+            session.add(
+                PositionMutationIntent(
+                    idempotency_key=(
+                        f"management:{batch_id}:{management_leg.id}:close:test"
+                    ),
+                    venue="deepcoin",
+                    operation="close_position",
+                    strategy_instance_id=batch.strategy_instance_id,
+                    execution_binding_id=batch.execution_binding_id,
+                    execution_order_leg_id=management_leg.execution_order_leg_id,
+                    pos_id=management_leg.pos_id,
+                    authority_fingerprint="a" * 64,
+                    request_fingerprint="b" * 64,
+                    status="confirmed",
+                    reserved_at=NOW,
+                    confirmed_at=NOW,
+                )
+            )
         session.commit()
 
     assert finalize_source_message_deletion_exit(
