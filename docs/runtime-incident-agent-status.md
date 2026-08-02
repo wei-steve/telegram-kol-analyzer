@@ -153,6 +153,7 @@ phase_7_disposition: deferred_non_blocking
 phase_8r_roadmap_control:
   design_commit: 15c9d7a
   implementation_plan_commit: 3bd2ef1
+  task_0_commit: 5323a47
   task_0_status: completed
   runtime_change: none
   production_restart: not_required
