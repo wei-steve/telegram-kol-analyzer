@@ -8,6 +8,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_protection_ledger_repair import (
     EntryProtectionLedgerRepairAction,
     EntryProtectionLedgerRepairPlan,
+    TriggerProtectionOwnerState,
     apply_entry_protection_ledger_repair_plan,
     build_entry_protection_ledger_repair_plan,
     plan_trigger_protection_intent_adoption,
@@ -602,6 +603,85 @@ def test_intent_adoption_refuses_anonymous_stop_with_same_pending_intent_fingerp
     assert result.refusal.reason == "trigger_protection_candidate_not_unique"
 
 
+def test_intent_adoption_ignores_same_signature_unfilled_sibling(tmp_path):
+    other_intent = TriggerProtectionIntent(
+        id=777,
+        venue="deepcoin",
+        execution_binding_id=152,
+        execution_order_leg_id=290,
+        request_fingerprint="different-fingerprint",
+        pre_submit_tpsl_baseline_json="[]",
+        correlation_id="other",
+        recovery_state="pending",
+    )
+
+    result = _plan_intent_adoption(
+        tmp_path,
+        request_update={
+            "price": "1828",
+            "sz": "0.6",
+            "tpTriggerPx": None,
+            "slTriggerPx": "1695",
+        },
+        pending_update={
+            "posId": "",
+            "sz": "0.6",
+            "tpTriggerPx": None,
+            "slTriggerPx": "1695",
+        },
+        existing_intents=[other_intent],
+        existing_intent_requests="same_as_current",
+        existing_intent_owner_states={
+            777: TriggerProtectionOwnerState(
+                execution_order_leg_id=290,
+                status="pending",
+                attribution_status="unassigned",
+                pos_id=None,
+                parent_order_id="entry-2",
+            )
+        },
+    )
+
+    assert result.refusal is None
+    assert result.action is not None
+    assert result.action.order_id == "tpsl-new"
+    assert result.action.pos_id == "pos-1"
+
+
+def test_intent_adoption_refuses_same_signature_filled_sibling(tmp_path):
+    other_intent = TriggerProtectionIntent(
+        id=777,
+        venue="deepcoin",
+        execution_binding_id=152,
+        execution_order_leg_id=290,
+        request_fingerprint="different-fingerprint",
+        pre_submit_tpsl_baseline_json="[]",
+        correlation_id="other",
+        recovery_state="pending",
+    )
+
+    result = _plan_intent_adoption(
+        tmp_path,
+        request_update={"tpTriggerPx": None},
+        pending_update={"posId": "", "tpTriggerPx": None, "slTriggerPx": "1900"},
+        existing_intents=[other_intent],
+        existing_intent_requests="same_as_current",
+        existing_intent_owner_states={
+            777: TriggerProtectionOwnerState(
+                execution_order_leg_id=290,
+                status="active",
+                attribution_status="verified",
+                pos_id="pos-2",
+                parent_order_id="entry-2",
+            )
+        },
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_not_unique"
+
+
 def test_intent_adoption_requires_absent_unrequested_protection_side(tmp_path):
     result = _plan_intent_adoption(
         tmp_path,
@@ -811,7 +891,7 @@ def _plan_intent_adoption(
     existing_ledger_rows=None, history_time_range_start=None, history_time_range_end=None,
     planner_session=None, existing_intents=None, request_update=None, adopted_order_id=None,
     fingerprint_without_internal_metadata=False, match_existing_intent_fingerprint=False,
-    existing_intent_requests=None,
+    existing_intent_requests=None, existing_intent_owner_states=None,
 ):
     session_factory = create_session_factory(tmp_path / "intent-adoption.db")
     _seed_trigger_entry_fill(session_factory, binding_id=152, legs=[{
@@ -854,6 +934,7 @@ def _plan_intent_adoption(
             history_tpsl_rows=history_rows or [], existing_ledger_rows=existing_ledger_rows or [],
             existing_intents=[intent] if existing_intents is None else [intent, *existing_intents],
             existing_intent_requests=existing_intent_requests,
+            existing_intent_owner_states=existing_intent_owner_states,
             history_time_range_start=history_time_range_start,
             history_time_range_end=history_time_range_end,
         )

@@ -102,6 +102,26 @@ class TriggerProtectionIntentAdoptionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TriggerProtectionOwnerState:
+    """Authoritative fill state for one protection intent's entry leg."""
+
+    execution_order_leg_id: int
+    status: str
+    attribution_status: str
+    pos_id: str | None
+    parent_order_id: str | None
+
+    @property
+    def is_verified_filled_owner(self) -> bool:
+        return (
+            str(self.status or "").lower() == "active"
+            and str(self.attribution_status or "").lower() == "verified"
+            and bool(str(self.pos_id or "").strip())
+            and bool(str(self.parent_order_id or "").strip())
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class EntryProtectionLedgerRepairPlan:
     created_at: datetime
     actions: tuple[EntryProtectionLedgerRepairAction, ...]
@@ -630,6 +650,7 @@ def plan_trigger_protection_intent_adoption(
     existing_ledger_rows: list[PositionProtectionLedger],
     existing_intents: list[TriggerProtectionIntent],
     existing_intent_requests: dict[int, dict[str, Any]] | None = None,
+    existing_intent_owner_states: dict[int, TriggerProtectionOwnerState] | None = None,
     history_time_range_start: datetime | None = None,
     history_time_range_end: datetime | None = None,
 ) -> TriggerProtectionIntentAdoptionResult:
@@ -758,16 +779,13 @@ def plan_trigger_protection_intent_adoption(
     assert order_id is not None
     anonymous_stop_key = _anonymous_stop_request_key(request)
     if not _row_position_ids(row) and any(
-        not (
-            other_intent is intent
-            or (intent.id is not None and other_intent.id == intent.id)
+        _other_intent_can_own_anonymous_stop(
+            intent=intent,
+            other_intent=other_intent,
+            anonymous_stop_key=anonymous_stop_key,
+            existing_intent_requests=existing_intent_requests,
+            existing_intent_owner_states=existing_intent_owner_states,
         )
-        and str(other_intent.recovery_state or "") in {"pending", "retrying", "submitting"}
-        and anonymous_stop_key is not None
-        and existing_intent_requests is not None
-        and _anonymous_stop_request_key(
-            existing_intent_requests.get(int(other_intent.id or 0), {})
-        ) == anonymous_stop_key
         for other_intent in existing_intents
     ):
         return _intent_refusal(
@@ -842,6 +860,40 @@ def plan_trigger_protection_intent_adoption(
             },
         )
     )
+
+
+def _other_intent_can_own_anonymous_stop(
+    *,
+    intent: TriggerProtectionIntent,
+    other_intent: TriggerProtectionIntent,
+    anonymous_stop_key: tuple[str, str, str, str] | None,
+    existing_intent_requests: dict[int, dict[str, Any]] | None,
+    existing_intent_owner_states: dict[int, TriggerProtectionOwnerState] | None,
+) -> bool:
+    if other_intent is intent or (
+        intent.id is not None and other_intent.id == intent.id
+    ):
+        return False
+    if str(other_intent.recovery_state or "") not in {
+        "pending",
+        "retrying",
+        "submitting",
+    }:
+        return False
+    if anonymous_stop_key is None or existing_intent_requests is None:
+        return False
+    other_id = int(other_intent.id or 0)
+    if (
+        _anonymous_stop_request_key(existing_intent_requests.get(other_id, {}))
+        != anonymous_stop_key
+    ):
+        return False
+    if existing_intent_owner_states is None:
+        return True
+    owner_state = existing_intent_owner_states.get(other_id)
+    if owner_state is None:
+        return True
+    return bool(owner_state.is_verified_filled_owner)
 
 
 def _intent_refusal(
