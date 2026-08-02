@@ -11,7 +11,7 @@ phase_name: monitoring-observability-repair
 phase_status: in_progress
 last_completed_phase: 6
 last_completed_commit: 46852f0
-production_commit: e3e784a07a005bdc23f6f18c6f4294b0fdb19b95
+production_commit: 2449382bd53195950b42ec6052fb4e6dee4fb9cd
 local_tests:
   - "phase-8r.1-monitor-observability-focused: 192 passed, 1 Linux-only systemd sandbox probe skipped"
   - "phase-8r.1-critical-runtime-regressions: 36 passed, 2 known sqlite deprecation warnings"
@@ -66,8 +66,8 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-6-diagnosis-agent-active
-  deployed_commit: e3e784a07a005bdc23f6f18c6f4294b0fdb19b95
+  status: phase-8r.1-monitor-repair-staged-disabled
+  deployed_commit: 2449382bd53195950b42ec6052fb4e6dee4fb9cd
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
   listener: monitoring-31-enabled-groups-and-continuing
@@ -139,7 +139,11 @@ server_verification:
   phase_6_non_writing_ai_job_review: "reschedule_non_writing_ai_job was rejected before implementation. context_worker_exhausted would re-enter the authoritative contextual path with the live auto-trade executor, while semantic_review provider exhaustion can be rescheduled only by mutating RecognitionDecision. Neither production adapter emits business_write_owned false, and get_worker_state has no semantic-review resolver. Production read-only inspection found zero related runtime incidents, zero exhausted context attempts, and two historical terminal semantic-review failures with three attempts, no claim, and no schedule. No runtime change, deployment, or restart occurred"
   phase_6_completion: "Phase 6 is complete with four reviewed deployed handlers and two documented fail-closed rejections. At completion every Agent/shadow/action flag and allowlist was empty/off. Optional Phase 7 is blocked because its separately required explicit user approval has not been given"
   phase_6_diagnosis_activation: "after explicit user instruction, the already deployed read-only diagnosis sidecar was enabled persistently without restarting the main service. Preflight proved a complete stable audit, only the known audit_abnormal baseline, no evidence/context/management/position-mutation/recovery work in flight, no claimable runtime incidents, a complete dedicated provider configuration, and empty shadow/action allowlists. The sidecar runs as telegram-kol-agent, is enabled/active, and repeatedly reports idle; the main service remains active HTTP 200. TELEGRAM_KOL_RUNTIME_AGENT_ENABLED is true while shadow/action allowlists remain empty and action authority remains false"
-  remaining: "Begin only Phase 8R.1 from the standard implementation trigger. Repair independent monitoring observability without widening Runtime Agent authority. Keep shadow and action allowlists empty and action authority off. Phase 7 remains deferred, unauthorized, and non-blocking."
+  phase_8r_1_deployment: "A fresh safe-window gate proved the latest raw message 8994 had completed recognition, with zero recognition claims, context work, management work, position mutations, recent execution events, runtime claims, or recovery attempts. Commit 2449382 was deployed with a bounded main-service restart; the service returned HTTP 200 and the Runtime Agent resumed active/idle."
+  phase_8r_1_monitor_staging: "The monitor timer is disabled and inactive. The installer preserved the existing state bytes, converged state.json to telegram-kol-monitor:telegram-kol-monitor mode 0600, installed the reviewed system-operator-only environment, and left the timer off. Obsolete notification-bot fields were removed from the monitor-only credential file after a root-owned 0600 backup was created."
+  phase_8r_1_diagnostic: "The deployed no-notify diagnostic reached the monitor and returned monitor_error null with only the known audit_abnormal result. The deployed process loads a complete system-operator bot configuration from the service environment without reading checkout configuration."
+  phase_8r_1_deployed_tests: "193 focused tests passed; 36 critical runtime regressions passed with 10 deprecation warnings. Main service and Runtime Agent are active; Agent action authority is false and both playbook allowlists are empty."
+  remaining: "Complete only Phase 8R.1 server activation: send the one reviewed monitor test notification, enable the independent monitor timer, verify the first bounded notified run has no notification_config_missing, and recheck service/listener/Agent continuity. Do not start Phase 8R.2."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
@@ -477,7 +481,7 @@ Phase 5 is not complete until:
 
 ### Phase 8R — Proactive Read-Only Incident Detection
 
-- Status: approved and planned
+- Status: in progress
 - Roadmap-control Task 0: completed locally with 10 focused tests passing;
   documentation and test changes only, so no production restart was required
 - Current task: `8R.1 monitoring-observability-repair`
@@ -491,5 +495,7 @@ Phase 5 is not complete until:
   safe window with immediate independent rollback
 - Authority state: Phase 6 diagnosis may remain active; shadow and action
   allowlists remain empty; action authority remains false
-- Next action: start only Task 8R.1 from
-  `docs/plans/2026-08-02-proactive-readonly-incident-agent.md`
+- Task 8R.1 local and deployed code: commit `2449382`; monitor installation is
+  staged with the timer disabled and the no-notify diagnostic verified
+- Next action: finish only the Task 8R.1 notification canary and timer
+  activation, then verify the first bounded run and production continuity
