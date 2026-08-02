@@ -355,3 +355,41 @@ def test_init_db_backfills_deleted_source_indexes_on_legacy_raw_table(tmp_path):
     index_names = {row["name"] for row in inspect(engine).get_indexes("raw_messages")}
     assert "ix_raw_messages_source_status" in index_names
     assert "ix_raw_messages_deletion_event_fingerprint" in index_names
+
+
+def test_duplicate_deletion_never_reopens_completed_exit(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=12,
+                message_id=34,
+                text="target",
+                archived_target_group=True,
+            )
+        )
+        session.commit()
+    first = record_source_message_deleted(
+        session_factory,
+        chat_id=12,
+        message_id=34,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, first.exit_id)
+        original_fingerprint = deletion_exit.target_fingerprint
+        deletion_exit.state = "succeeded"
+        deletion_exit.completed_at = datetime(2026, 8, 2, 5, 0, tzinfo=UTC)
+        session.commit()
+
+    duplicate = record_source_message_deleted(
+        session_factory,
+        chat_id=12,
+        message_id=34,
+    )
+
+    assert duplicate.exit_state == "succeeded"
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, first.exit_id)
+        assert deletion_exit.state == "succeeded"
+        assert deletion_exit.target_fingerprint == original_fingerprint
+        assert deletion_exit.completed_at == datetime(2026, 8, 2, 5, 0)

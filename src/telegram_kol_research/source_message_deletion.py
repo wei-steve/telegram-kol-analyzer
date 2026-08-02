@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
+from functools import wraps
 import json
 from threading import RLock
 from typing import Any
@@ -60,6 +61,17 @@ def source_message_execution_authority(session_factory: sessionmaker):
 
     with _source_execution_lock(session_factory):
         yield
+
+
+def serialized_source_message_execution(func):
+    """Hold source authority until exchange identities are durably ledgered."""
+
+    @wraps(func)
+    def wrapped(session_factory, *args, **kwargs):
+        with source_message_execution_authority(session_factory):
+            return func(session_factory, *args, **kwargs)
+
+    return wrapped
 
 
 def deletion_event_fingerprint(*, chat_id: int, message_id: int) -> str:
@@ -321,31 +333,36 @@ def _bind_deletion_event_in_session(
             .order_by(ExecutionBinding.id.asc())
             .first()
         )
-    deletion_exit.raw_message_id = raw_message.id
-    deletion_exit.target_lifecycle_id = lifecycle.id if lifecycle is not None else None
-    deletion_exit.execution_binding_id = binding.id if binding is not None else None
-    deletion_exit.strategy_instance_id = (
-        binding.strategy_instance_id if binding is not None else None
-    )
-    deletion_exit.state = "pending"
-    deletion_exit.updated_at = updated_at
-    target_identity = {
-        "event_id": int(event.id),
-        "raw_message_id": int(raw_message.id),
-        "target_lifecycle_id": (
-            int(lifecycle.id) if lifecycle is not None else None
-        ),
-        "execution_binding_id": int(binding.id) if binding is not None else None,
-        "strategy_instance_id": (
-            str(binding.strategy_instance_id)
-            if binding is not None and binding.strategy_instance_id is not None
-            else None
-        ),
-    }
-    deletion_exit.target_fingerprint = sha256(
-        json.dumps(target_identity, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    if lifecycle is not None and lifecycle.lifecycle_status not in {
+    exit_target_is_mutable = deletion_exit.state in {"unbound", "pending"}
+    if exit_target_is_mutable:
+        deletion_exit.raw_message_id = raw_message.id
+        deletion_exit.target_lifecycle_id = (
+            lifecycle.id if lifecycle is not None else None
+        )
+        deletion_exit.execution_binding_id = binding.id if binding is not None else None
+        deletion_exit.strategy_instance_id = (
+            binding.strategy_instance_id if binding is not None else None
+        )
+        if deletion_exit.state == "unbound":
+            deletion_exit.state = "pending"
+        deletion_exit.updated_at = updated_at
+        target_identity = {
+            "event_id": int(event.id),
+            "raw_message_id": int(raw_message.id),
+            "target_lifecycle_id": (
+                int(lifecycle.id) if lifecycle is not None else None
+            ),
+            "execution_binding_id": int(binding.id) if binding is not None else None,
+            "strategy_instance_id": (
+                str(binding.strategy_instance_id)
+                if binding is not None and binding.strategy_instance_id is not None
+                else None
+            ),
+        }
+        deletion_exit.target_fingerprint = sha256(
+            json.dumps(target_identity, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+    if exit_target_is_mutable and lifecycle is not None and lifecycle.lifecycle_status not in {
         "exited",
         "expired",
         "invalidated",

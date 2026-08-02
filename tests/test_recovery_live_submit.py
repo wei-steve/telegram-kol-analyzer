@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime
+from threading import Event, Thread
 
 import pytest
 
@@ -7,7 +8,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, RawMessage, SignalCandidate
-from telegram_kol_research.models import StrategyLifecycle, TradeSignal, TriggerTakeProfitConvergence
+from telegram_kol_research.models import SourceMessageDeletionExit, StrategyLifecycle, TradeSignal, TriggerTakeProfitConvergence
 from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
@@ -750,6 +751,74 @@ def test_entry_submit_rechecks_source_after_planning_before_exchange_write(
 
     assert fake_client.trigger_payloads == []
     assert fake_client.payloads == []
+
+
+def test_source_deletion_waits_until_exchange_identity_is_durably_ledgered(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "ledger-window.db")
+    _persist_ready_item(session_factory)
+    _persist_lifecycle(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    deletion_started = Event()
+    deletion_finished = Event()
+    deletion_thread = None
+
+    class Client(_FakeDeepcoinClient):
+        def trigger_order(self, order_payload):
+            nonlocal deletion_thread
+            self.trigger_payloads.append(order_payload)
+            if deletion_thread is None:
+                def delete_source():
+                    deletion_started.set()
+                    record_source_message_deleted(
+                        session_factory,
+                        chat_id=100,
+                        message_id=55,
+                    )
+                    deletion_finished.set()
+
+                deletion_thread = Thread(target=delete_source)
+                deletion_thread.start()
+                assert deletion_started.wait(timeout=1)
+            return {
+                "code": "0",
+                "data": {"ordId": f"trigger-{len(self.trigger_payloads)}"},
+            }
+
+    original_normalize = __import__(
+        "telegram_kol_research.recovery_live_submit",
+        fromlist=["_normalized_trigger_order_id"],
+    )._normalized_trigger_order_id
+
+    def assert_deletion_is_still_serialized(response):
+        assert not deletion_finished.wait(timeout=0.05)
+        return original_normalize(response)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit._normalized_trigger_order_id",
+        assert_deletion_is_still_serialized,
+    )
+
+    result = submit_recovery_order_live(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        deepcoin_client=Client(),
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    deletion_thread.join(timeout=1)
+
+    assert result["submitted"] is True
+    assert deletion_finished.is_set()
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        deletion_exit = session.query(SourceMessageDeletionExit).one()
+        assert deletion_exit.execution_binding_id == binding.id
+        assert deletion_exit.strategy_instance_id == binding.strategy_instance_id
 
 
 def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):

@@ -31,6 +31,7 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
 )
 from telegram_kol_research.strategy_threads import create_strategy_thread_for_lifecycle
+from telegram_kol_research.source_message_deletion import record_source_message_deleted
 
 
 def test_cancel_revision_entry_leg_requires_exact_readback_confirmation(tmp_path):
@@ -2757,6 +2758,74 @@ def test_process_trade_signal_live_recreates_trigger_entry_with_embedded_stop_on
     assert [(leg.leg_index, leg.order_id, leg.client_order_id, leg.status) for leg in legs] == [
         (1, "trigger-new", "client-new", "open")
     ]
+
+
+def test_deleted_source_blocks_trigger_entry_recreation_before_cancel(tmp_path):
+    session_factory = create_session_factory(tmp_path / "deleted-recreate.db")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=100,
+                message_id=55,
+                text="ETH long",
+                archived_target_group=True,
+            )
+        )
+        session.commit()
+    binding_id = _binding(
+        session_factory,
+        order_id="trigger-old",
+        pos_id=None,
+        status="open",
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:ETH:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="trigger-old",
+            client_order_id="client-old",
+            status="open",
+        ),
+    )
+    trade_signal = _signal(
+        session_factory,
+        action="adjust_trigger_entry_tpsl",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+    )
+    client = _FakeDeepcoinClient()
+    client.trigger_pending = [
+        {
+            "triggerOrderType": "NORMAL",
+            "ordId": "trigger-old",
+            "instId": "ETH-USDT-SWAP",
+            "side": "buy",
+            "posSide": "long",
+            "price": "1000",
+            "triggerPrice": "1000",
+            "sz": "0.1",
+            "slTriggerPx": "1567.52",
+        }
+    ]
+    record_source_message_deleted(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+    )
+
+    with pytest.raises(DeepcoinExecutionActionError, match="source_message_deleted"):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=trade_signal.id,
+            deepcoin_client=client,
+        )
+
+    assert client.cancel_trigger_payloads == []
+    assert client.trigger_payloads == []
 
 
 @pytest.mark.parametrize(

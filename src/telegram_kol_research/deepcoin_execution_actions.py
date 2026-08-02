@@ -61,6 +61,10 @@ from telegram_kol_research.trade_signals import TradeSignalRecord
 from telegram_kol_research.trade_signals import canonical_management_batch_id
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.strategy_management_batches import load_management_batch
+from telegram_kol_research.source_message_deletion import (
+    serialized_source_message_execution,
+    source_identity_execution_barrier,
+)
 
 
 class DeepcoinExecutionActionError(RuntimeError):
@@ -1381,6 +1385,7 @@ def cancel_pending_entry_legs(
 
 
 @serialized_position_authority_mutation
+@serialized_source_message_execution
 def recreate_trigger_entry_tpsl(
     session_factory: sessionmaker,
     *,
@@ -1392,6 +1397,15 @@ def recreate_trigger_entry_tpsl(
 
     now = executed_at or datetime.now(UTC)
     binding = _load_binding_for_signal(session_factory, trade_signal)
+    barrier = source_identity_execution_barrier(
+        session_factory,
+        chat_id=int(binding.chat_id),
+        message_id=int(binding.message_id),
+    )
+    if barrier.status != "allow":
+        raise DeepcoinExecutionActionError(
+            str(barrier.reason or "source_execution_blocked")
+        )
     inst_id = _to_deepcoin_swap_instrument(binding.symbol)
     old_order = _select_bound_order(
         deepcoin_client.list_trigger_orders_pending(inst_id=inst_id),

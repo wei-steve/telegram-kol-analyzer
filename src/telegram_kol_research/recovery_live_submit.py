@@ -59,6 +59,7 @@ from telegram_kol_research.trade_signals import mark_trade_signal_failed
 from telegram_kol_research.trade_signals import mark_trade_signal_submitted
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.source_message_deletion import (
+    serialized_source_message_execution,
     source_identity_execution_barrier,
     source_message_execution_authority,
 )
@@ -461,6 +462,7 @@ def _is_automatic_legacy_management_signal(
     )
 
 
+@serialized_source_message_execution
 def _submit_recovery_signal_direct(
     session_factory: sessionmaker,
     *,
