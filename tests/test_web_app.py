@@ -491,6 +491,37 @@ def test_management_worker_lifespan_starts_once_and_is_cancelled(tmp_path):
     assert app.state.strategy_management_worker_task is None
 
 
+def test_break_even_worker_lifespan_starts_once_and_is_cancelled(tmp_path):
+    started = threading.Event()
+    stopped = threading.Event()
+    calls = []
+
+    async def fake_break_even_worker(**kwargs):
+        calls.append(kwargs)
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        break_even_convergence_worker_runner=fake_break_even_worker,
+        break_even_convergence_worker_startup_delay_seconds=0,
+        break_even_convergence_worker_interval_seconds=3,
+    )
+
+    with TestClient(app):
+        assert started.wait(timeout=1)
+        assert calls[0]["session_factory"] is app.state.session_factory
+        assert calls[0]["deepcoin_client_factory"] is app.state.deepcoin_client_factory
+        assert calls[0]["interval_seconds"] == 3
+        assert app.state.break_even_convergence_worker_task is not None
+
+    assert stopped.wait(timeout=1)
+    assert app.state.break_even_convergence_worker_task is None
+
+
 def test_source_deletion_worker_lifespan_starts_dormant_runner_and_stops(tmp_path):
     started = threading.Event()
     stopped = threading.Event()

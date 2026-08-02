@@ -144,6 +144,9 @@ from telegram_kol_research.semantic_disagreement_review import run_semantic_revi
 from telegram_kol_research.strategy_management_worker import (
     run_strategy_management_worker_loop,
 )
+from telegram_kol_research.break_even_convergence_worker import (
+    run_break_even_convergence_worker_loop,
+)
 from telegram_kol_research.source_message_deletion_worker import (
     run_source_message_deletion_worker_loop,
 )
@@ -3373,6 +3376,9 @@ def create_web_app(
     strategy_management_worker_interval_seconds: float = 5.0,
     strategy_management_worker_startup_delay_seconds: float = 5.0,
     strategy_management_worker_max_batches: int = 10,
+    break_even_convergence_worker_runner=None,
+    break_even_convergence_worker_interval_seconds: float = 2.0,
+    break_even_convergence_worker_startup_delay_seconds: float = 5.0,
     source_message_deletion_worker_runner=None,
     source_message_deletion_worker_interval_seconds: float = 5.0,
     source_message_deletion_worker_max_jobs: int = 10,
@@ -3455,6 +3461,25 @@ def create_web_app(
             )
             app.state.strategy_management_worker_task.add_done_callback(
                 _log_background_task_result("strategy_management_worker_task")
+            )
+            app.state.break_even_convergence_worker_task = asyncio.create_task(
+                _run_reconcile_after_startup_delay(
+                    runner=app.state.break_even_convergence_worker_runner,
+                    startup_delay_seconds=(
+                        app.state.break_even_convergence_worker_startup_delay_seconds
+                    ),
+                    session_factory=app.state.session_factory,
+                    deepcoin_client_factory=app.state.deepcoin_client_factory,
+                    interval_seconds=(
+                        app.state.break_even_convergence_worker_interval_seconds
+                    ),
+                    now_provider=app.state.now_provider,
+                )
+            )
+            app.state.break_even_convergence_worker_task.add_done_callback(
+                _log_background_task_result(
+                    "break_even_convergence_worker_task"
+                )
             )
             app.state.source_message_deletion_worker_task = asyncio.create_task(
                 app.state.source_message_deletion_worker_runner(
@@ -3626,6 +3651,18 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.strategy_management_worker_task = None
+            break_even_worker_task = (
+                app.state.break_even_convergence_worker_task
+            )
+            if break_even_worker_task is not None:
+                break_even_worker_task.cancel()
+                try:
+                    await break_even_worker_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.break_even_convergence_worker_task = None
             source_deletion_worker_task = (
                 app.state.source_message_deletion_worker_task
             )
@@ -3835,6 +3872,17 @@ def create_web_app(
         1, int(strategy_management_worker_max_batches)
     )
     app.state.strategy_management_worker_task = None
+    app.state.break_even_convergence_worker_runner = (
+        break_even_convergence_worker_runner
+        or run_break_even_convergence_worker_loop
+    )
+    app.state.break_even_convergence_worker_interval_seconds = max(
+        0.01, float(break_even_convergence_worker_interval_seconds)
+    )
+    app.state.break_even_convergence_worker_startup_delay_seconds = max(
+        0.0, float(break_even_convergence_worker_startup_delay_seconds)
+    )
+    app.state.break_even_convergence_worker_task = None
     app.state.source_message_deletion_worker_runner = (
         source_message_deletion_worker_runner
         or run_source_message_deletion_worker_loop

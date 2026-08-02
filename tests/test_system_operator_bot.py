@@ -23,6 +23,7 @@ from telegram_kol_research.system_operator_bot import (
     format_semantic_disagreement_notification,
     format_pending_entry_expiry_review_message,
     format_position_attribution_incident_message,
+    format_position_protection_incident_message,
     deliver_pending_position_attribution_incidents,
     load_notification_bot_config,
     load_system_operator_bot_config,
@@ -31,6 +32,28 @@ from telegram_kol_research.system_operator_bot import (
 )
 
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+
+
+def test_automatic_break_even_alert_contains_exact_non_sensitive_handoff():
+    rendered = format_position_protection_incident_message({
+        "incident_type": "automatic_break_even_recovery_required",
+        "pos_id": "pos-1",
+        "evidence": {
+            "strategy_instance_id": "strategy-1",
+            "convergence_id": 17,
+            "trigger_type": "tp1_fill",
+            "status": "recovery_required",
+            "reason_code": "deferred_entry_cancel_outcome_unknown",
+            "manual_action": "Read exchange state; do not retry writes.",
+        },
+    })
+
+    assert "strategy-1" in rendered
+    assert "17" in rendered
+    assert "pos-1" in rendered
+    assert "deferred_entry_cancel_outcome_unknown" in rendered
+    assert "do not retry writes" in rendered
+    assert "API" not in rendered
 
 
 def test_source_deletion_operator_alert_is_exact_and_redacted():

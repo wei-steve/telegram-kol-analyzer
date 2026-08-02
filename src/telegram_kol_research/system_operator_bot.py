@@ -499,6 +499,19 @@ def format_position_protection_incident_message(payload: dict[str, Any]) -> str:
     """Format a high-priority, non-actionable stop-protection incident."""
 
     evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    if str(payload.get("incident_type") or "").startswith(
+        "automatic_break_even_"
+    ):
+        return "\n".join([
+            "【自动成本保护异常】",
+            f"策略: {evidence.get('strategy_instance_id') or '-'}",
+            f"收敛任务: {evidence.get('convergence_id') or '-'}",
+            f"仓位ID: {payload.get('pos_id') or '-'}",
+            f"触发类型: {evidence.get('trigger_type') or '-'}",
+            f"状态: {evidence.get('status') or '-'}",
+            f"原因: {evidence.get('reason_code') or '-'}",
+            f"人工处理: {evidence.get('manual_action') or '只读核对交易所状态后再决定。'}",
+        ])
     exchange = evidence.get("exchange") if isinstance(evidence.get("exchange"), dict) else {}
     return "\n".join([
         "【止损保护严重异常】",
