@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Callable, Literal
 
 from sqlalchemy.orm import sessionmaker
 
@@ -60,6 +60,7 @@ def cleanup_terminal_entry_legs(
     cleaned_at: datetime | None = None,
     expected_binding_id: int | None = None,
     allow_position_bound_remainder: bool = False,
+    live_execution_gate: Callable[[], bool] | None = None,
 ) -> TerminalEntryCleanupResult:
     now = cleaned_at or datetime.now(UTC)
     with session_factory() as session:
@@ -154,6 +155,7 @@ def cleanup_terminal_entry_legs(
             deepcoin_client=deepcoin_client,
             executed_at=now,
             allow_position_bound_remainder=allow_position_bound_remainder,
+            live_execution_gate=live_execution_gate,
         )
     except DeepcoinExecutionActionError as exc:
         mark_trade_signal_failed(
@@ -169,6 +171,7 @@ def cleanup_terminal_entry_legs(
             "pending_entry_filled_during_cleanup",
             "pending_entry_leg_partially_filled",
             "pending_entry_terminal_evidence_unavailable",
+            "live_execution_disabled",
         }
         return _with_notification(
             session_factory,
@@ -202,6 +205,7 @@ def cleanup_terminal_entry_legs(
                     deepcoin_client=deepcoin_client,
                     executed_at=now,
                     allow_position_bound_remainder=allow_position_bound_remainder,
+                    live_execution_gate=live_execution_gate,
                 )
             except Exception:
                 mark_trade_signal_failed(

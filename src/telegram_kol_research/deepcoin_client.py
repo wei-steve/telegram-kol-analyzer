@@ -519,10 +519,16 @@ class DeepcoinRestClient:
             raise DeepcoinClientError(
                 f"invalid ticker {price_field} for instrument: {target_instrument_id}"
             )
+        observed_at = _ticker_timestamp_iso(ticker.get("ts"))
+        if observed_at is None:
+            raise DeepcoinClientError(
+                f"ticker timestamp missing for instrument: {target_instrument_id}"
+            )
         return {
             "instrument_id": target_instrument_id,
             "price": price,
             "price_field": price_field,
+            "observed_at": observed_at,
         }
 
     def get_ticker_price(self, *, inst_id: str) -> float | None:
@@ -669,6 +675,20 @@ def _iter_deepcoin_payload_items(value: Any):
 def _utc_timestamp_ms() -> str:
     value = datetime.now(UTC)
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _ticker_timestamp_iso(value: Any) -> str | None:
+    try:
+        raw = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not raw.is_finite() or raw <= 0:
+        return None
+    seconds = raw / Decimal("1000") if raw >= Decimal("100000000000") else raw
+    try:
+        return datetime.fromtimestamp(float(seconds), tz=UTC).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _path_with_query(path: str, params: dict[str, Any]) -> str:

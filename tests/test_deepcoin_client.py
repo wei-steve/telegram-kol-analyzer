@@ -622,6 +622,7 @@ def test_get_ticker_quote_returns_structured_last_price_evidence():
                     "instId": "BTC-USDT-SWAP",
                     "last": "64688.6",
                     "lastPx": "64687.1",
+                    "ts": "1785663259000",
                 },
             ],
         }
@@ -631,7 +632,10 @@ def test_get_ticker_quote_returns_structured_last_price_evidence():
         http_client=http_client,
     )
 
-    assert client.get_ticker_quote(inst_id="BTC-USDT-SWAP") == {
+    quote = client.get_ticker_quote(inst_id="BTC-USDT-SWAP")
+    assert quote is not None
+    assert quote.pop("observed_at") == "2026-08-02T09:34:19+00:00"
+    assert quote == {
         "instrument_id": "BTC-USDT-SWAP",
         "price": "64688.6",
         "price_field": "last",
@@ -650,13 +654,17 @@ def test_get_ticker_quote_falls_back_to_last_px_when_last_is_missing():
                         "instId": "BTC-USDT-SWAP",
                         "lastPx": "64688.7",
                         "markPx": "64680",
+                        "ts": "1785663259000",
                     },
                 ],
             }
         ),
     )
 
-    assert client.get_ticker_quote(inst_id="BTC-USDT-SWAP") == {
+    quote = client.get_ticker_quote(inst_id="BTC-USDT-SWAP")
+    assert quote is not None
+    assert quote.pop("observed_at") == "2026-08-02T09:34:19+00:00"
+    assert quote == {
         "instrument_id": "BTC-USDT-SWAP",
         "price": "64688.7",
         "price_field": "lastPx",
@@ -678,6 +686,19 @@ def test_get_ticker_quote_rejects_duplicate_target_instruments():
     )
 
     with pytest.raises(DeepcoinClientError, match="duplicate ticker rows"):
+        client.get_ticker_quote(inst_id="BTC-USDT-SWAP")
+
+
+def test_get_ticker_quote_rejects_missing_exchange_timestamp():
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient({
+            "code": "0",
+            "data": [{"instId": "BTC-USDT-SWAP", "last": "64688.6"}],
+        }),
+    )
+
+    with pytest.raises(DeepcoinClientError, match="ticker timestamp missing"):
         client.get_ticker_quote(inst_id="BTC-USDT-SWAP")
 
 

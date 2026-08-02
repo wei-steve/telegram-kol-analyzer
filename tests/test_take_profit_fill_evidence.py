@@ -47,6 +47,7 @@ def test_proves_tp1_from_exact_terminal_order_history():
     result = prove_first_take_profit_fill(
         tp_order=_tp_order(),
         protection_leg=_protection_leg(),
+        expected_side="short",
         previous_observation=None,
         current_observation=None,
         trigger_history=[{
@@ -71,6 +72,7 @@ def test_rejects_exact_terminal_row_with_wrong_position_or_size():
     result = prove_first_take_profit_fill(
         tp_order=_tp_order(),
         protection_leg=_protection_leg(),
+        expected_side="short",
         previous_observation=None,
         current_observation=None,
         trigger_history=[{
@@ -89,6 +91,33 @@ def test_rejects_exact_terminal_row_with_wrong_position_or_size():
     assert result.reason_code == "tp1_exact_history_conflict"
 
 
+def test_rejects_exact_terminal_row_missing_required_identity_fields():
+    base = {
+        "ordId": "tp-1",
+        "posId": "pos-1",
+        "posSide": "short",
+        "sz": "5",
+        "state": "filled",
+    }
+    for missing in ("posId", "posSide", "sz"):
+        history = dict(base)
+        history.pop(missing)
+        result = prove_first_take_profit_fill(
+            tp_order=_tp_order(),
+            protection_leg=_protection_leg(),
+            expected_side="short",
+            previous_observation=None,
+            current_observation=None,
+            trigger_history=[history],
+            order_history=[],
+            trade_fills=[],
+            conflicting_mutations=[],
+        )
+
+        assert result.proven is False
+        assert result.reason_code == "tp1_exact_history_incomplete"
+
+
 def test_proves_tp1_from_complete_exact_position_delta():
     previous = _observation(
         10,
@@ -101,6 +130,7 @@ def test_proves_tp1_from_complete_exact_position_delta():
     result = prove_first_take_profit_fill(
         tp_order=_tp_order(),
         protection_leg=_protection_leg(),
+        expected_side="short",
         previous_observation=previous,
         current_observation=current,
         trigger_history=[],
@@ -130,6 +160,7 @@ def test_position_delta_fails_closed_for_ambiguous_or_incomplete_evidence():
         result = prove_first_take_profit_fill(
             tp_order=_tp_order(),
             protection_leg=_protection_leg(),
+            expected_side="short",
             previous_observation=previous,
             current_observation=current,
             trigger_history=[],
@@ -147,6 +178,7 @@ def test_non_first_take_profit_leg_never_authorizes_trigger():
     result = prove_first_take_profit_fill(
         tp_order=_tp_order(),
         protection_leg=protection,
+        expected_side="short",
         previous_observation=None,
         current_observation=None,
         trigger_history=[{"ordId": "tp-1", "state": "filled", "sz": "5"}],

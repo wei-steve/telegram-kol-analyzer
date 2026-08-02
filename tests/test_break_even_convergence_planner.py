@@ -99,7 +99,7 @@ def test_plans_all_verified_live_legs_and_deferred_entries(tmp_path):
         session_factory,
         trigger_type="tp1_fill",
         trigger_identity="tp-1",
-        trigger_evidence={"evidence_tier": "exact_order_terminal"},
+        trigger_evidence={"evidence_tier": "exact_order_terminal", "confirmed_at": "2026-08-02T07:00:00+00:00"},
         strategy_instance_id=strategy_id,
         planned_at=datetime(2026, 8, 2, 8, 0),
         execution_mode="shadow",
@@ -118,7 +118,7 @@ def test_repeated_tp_trigger_adopts_same_convergence(tmp_path):
     kwargs = dict(
         trigger_type="tp1_fill",
         trigger_identity="tp-1",
-        trigger_evidence={"evidence_tier": "exact_order_terminal"},
+        trigger_evidence={"evidence_tier": "exact_order_terminal", "confirmed_at": "2026-08-02T07:00:00+00:00"},
         strategy_instance_id=strategy_id,
         planned_at=datetime(2026, 8, 2, 8, 0),
         execution_mode="shadow",
@@ -141,7 +141,7 @@ def test_disabled_mode_records_blocked_task_without_executable_legs(tmp_path):
         session_factory,
         trigger_type="tp1_fill",
         trigger_identity="tp-1",
-        trigger_evidence={"evidence_tier": "exact_order_terminal"},
+        trigger_evidence={"evidence_tier": "exact_order_terminal", "confirmed_at": "2026-08-02T07:00:00+00:00"},
         strategy_instance_id=strategy_id,
         planned_at=datetime(2026, 8, 2, 8, 0),
         execution_mode="disabled",
@@ -168,7 +168,29 @@ def test_planner_rejects_unverified_or_incomplete_live_position(tmp_path):
             session_factory,
             trigger_type="tp1_fill",
             trigger_identity="tp-1",
-            trigger_evidence={"evidence_tier": "exact_order_terminal"},
+            trigger_evidence={"evidence_tier": "exact_order_terminal", "confirmed_at": "2026-08-02T07:00:00+00:00"},
+            strategy_instance_id=strategy_id,
+            planned_at=datetime(2026, 8, 2, 8, 0),
+            execution_mode="shadow",
+        )
+
+
+def test_planner_requires_post_trigger_position_observation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    strategy_id = _seed_strategy(session_factory)
+
+    with pytest.raises(
+        BreakEvenConvergencePlanningError,
+        match="break_even_live_observation_precedes_trigger",
+    ):
+        plan_or_adopt_break_even_convergence(
+            session_factory,
+            trigger_type="tp1_fill",
+            trigger_identity="tp-1",
+            trigger_evidence={
+                "evidence_tier": "exact_order_terminal",
+                "confirmed_at": "2026-08-02T07:30:00+00:00",
+            },
             strategy_instance_id=strategy_id,
             planned_at=datetime(2026, 8, 2, 8, 0),
             execution_mode="shadow",

@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.break_even_convergence_executor import (
     execute_break_even_convergence,
@@ -18,15 +18,27 @@ from telegram_kol_research.models import (
     StrategyBreakEvenConvergenceLeg,
     StrategyLifecycle,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 8, 2, 8, 0, tzinfo=UTC)
 
 
 class TriggerCancelClient:
-    def __init__(self, *, unknown=False, market_price="62000"):
+    def __init__(
+        self,
+        *,
+        unknown=False,
+        market_price="62000",
+        quote_observed_at=NOW,
+        before_cancel_gate=None,
+        after_quote=None,
+    ):
         self.unknown = unknown
         self.market_price = market_price
+        self.quote_observed_at = quote_observed_at
+        self.before_cancel_gate = before_cancel_gate
+        self.after_quote = after_quote
         self.positions = [{
             "posId": "pos-1",
             "instId": "BTC-USDT-SWAP",
@@ -72,6 +84,9 @@ class TriggerCancelClient:
         return [{"ordId": "entry-2", "clOrdId": "client-2", "state": self.history_state}]
 
     def list_trade_fills(self, *, inst_id=None):
+        if self.before_cancel_gate is not None:
+            callback, self.before_cancel_gate = self.before_cancel_gate, None
+            callback()
         return []
 
     def list_positions(self, *, inst_id=None):
@@ -80,10 +95,14 @@ class TriggerCancelClient:
 
     def get_ticker_quote(self, *, inst_id):
         self.calls.append(("get_ticker_quote", inst_id))
+        if self.after_quote is not None:
+            callback, self.after_quote = self.after_quote, None
+            callback()
         return {
             "instrument_id": inst_id,
             "price": self.market_price,
             "price_field": "last",
+            "observed_at": self.quote_observed_at.isoformat(),
         }
 
     def set_position_sltp(self, payload):
@@ -118,6 +137,11 @@ class TriggerCancelClient:
 
 
 def _seed_convergence(session_factory, *, mode="live", second_live=False):
+    save_trading_settings(session_factory, {
+        "auto_trade_enabled": mode == "live",
+        "management_execution_mode": mode,
+        "move_stop_to_breakeven_after_tp1": True,
+    }, updated_at=NOW)
     with session_factory() as session:
         binding = ExecutionBinding(
             strategy_instance_id="deepcoin:1:2:BTC:short",
@@ -221,10 +245,98 @@ def _seed_convergence(session_factory, *, mode="live", second_live=False):
         session_factory,
         trigger_type="tp1_fill",
         trigger_identity="tp-1",
-        trigger_evidence={"evidence_tier": "exact_order_terminal"},
+        trigger_evidence={"evidence_tier": "exact_order_terminal", "confirmed_at": NOW.isoformat()},
         strategy_instance_id="deepcoin:1:2:BTC:short",
         planned_at=NOW,
         execution_mode=mode,
+    )
+
+
+def test_live_task_stops_before_any_exchange_call_when_runtime_switch_is_disabled(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence = _seed_convergence(session_factory)
+    save_trading_settings(session_factory, {
+        "auto_trade_enabled": False,
+        "management_execution_mode": "disabled",
+        "move_stop_to_breakeven_after_tp1": True,
+    }, updated_at=NOW)
+    client = TriggerCancelClient()
+
+    result = execute_break_even_convergence(
+        session_factory,
+        convergence_id=convergence.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "automatic_break_even_runtime_disabled"
+    assert client.calls == []
+
+
+def test_stale_quote_blocks_protection_writes(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence = _seed_convergence(session_factory)
+    client = TriggerCancelClient(quote_observed_at=NOW - timedelta(minutes=5))
+
+    result = execute_break_even_convergence(
+        session_factory,
+        convergence_id=convergence.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "break_even_market_preflight_unavailable"
+    assert not any(call[0] in {"set_position_sltp", "place_order"} for call in client.calls)
+
+
+def test_runtime_switch_is_rechecked_before_deferred_entry_cancel(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence = _seed_convergence(session_factory)
+
+    def disable():
+        save_trading_settings(session_factory, {
+            "auto_trade_enabled": False,
+            "management_execution_mode": "disabled",
+            "move_stop_to_breakeven_after_tp1": True,
+        }, updated_at=NOW)
+
+    client = TriggerCancelClient(before_cancel_gate=disable)
+    result = execute_break_even_convergence(
+        session_factory,
+        convergence_id=convergence.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result.status == "blocked"
+    assert not any(call[0] == "cancel_trigger_order" for call in client.calls)
+
+
+def test_runtime_switch_is_rechecked_before_position_mutation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence = _seed_convergence(session_factory)
+
+    def disable():
+        save_trading_settings(session_factory, {
+            "auto_trade_enabled": False,
+            "management_execution_mode": "disabled",
+            "move_stop_to_breakeven_after_tp1": True,
+        }, updated_at=NOW)
+
+    client = TriggerCancelClient(after_quote=disable)
+    result = execute_break_even_convergence(
+        session_factory,
+        convergence_id=convergence.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result.status == "blocked"
+    assert not any(
+        call[0] in {"set_position_sltp", "cancel_position_sltp", "place_order"}
+        for call in client.calls
     )
 
 

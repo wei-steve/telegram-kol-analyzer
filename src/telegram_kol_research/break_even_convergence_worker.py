@@ -180,9 +180,9 @@ def _plan_proven_tp1_fills(session_factory, *, planned_at: datetime) -> int:
                         "execution_order_leg_id": int(row.execution_order_leg_id),
                         "pos_id": str(row.pos_id),
                         "confirmed_at": (
-                            row.completed_at.isoformat()
+                            _utc_iso(row.completed_at)
                             if row.completed_at is not None
-                            else planned_at.isoformat()
+                            else _utc_iso(planned_at)
                         ),
                     },
                 )
@@ -203,6 +203,12 @@ def _plan_proven_tp1_fills(session_factory, *, planned_at: datetime) -> int:
             continue
         planned += 1
     return planned
+
+
+def _utc_iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat()
 
 
 def _claim_one(

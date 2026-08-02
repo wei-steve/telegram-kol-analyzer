@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -1172,6 +1172,7 @@ def cancel_pending_entry_legs(
     deepcoin_client: DeepcoinTradingClientProtocol,
     executed_at: datetime | None = None,
     allow_position_bound_remainder: bool = False,
+    live_execution_gate: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Cancel only unfilled entry legs while preserving an already-entered binding."""
 
@@ -1286,6 +1287,8 @@ def cancel_pending_entry_legs(
 
     cancelled_orders: list[dict[str, Any]] = []
     for leg_id, (cancel_type, order) in sorted(visible_by_leg.items()):
+        if live_execution_gate is not None and not live_execution_gate():
+            raise DeepcoinExecutionActionError("live_execution_disabled")
         order_id = _order_id_from_payload(order)
         client_order_id = _first_string(
             order, "clOrdId", "clientOrderId", "client_order_id"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
@@ -72,6 +72,7 @@ def plan_or_adopt_break_even_convergence(
     if normalized_mode not in {"disabled", "shadow", "live"}:
         raise BreakEvenConvergencePlanningError("break_even_execution_mode_invalid")
     evidence_json = _json(trigger_evidence)
+    trigger_confirmed_at = _required_confirmation_time(trigger_evidence)
 
     with session_factory() as session:
         existing = _load_existing(
@@ -165,6 +166,10 @@ def plan_or_adopt_break_even_convergence(
             ):
                 raise BreakEvenConvergencePlanningError(
                     "break_even_live_observation_incomplete"
+                )
+            if _as_utc(observations[0].observed_at) < trigger_confirmed_at:
+                raise BreakEvenConvergencePlanningError(
+                    "break_even_live_observation_precedes_trigger"
                 )
             live_targets.append((leg, observations[0]))
 
@@ -319,3 +324,28 @@ def _json(value: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _required_confirmation_time(evidence: dict[str, Any]) -> datetime:
+    value = evidence.get("confirmed_at") if isinstance(evidence, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        raise BreakEvenConvergencePlanningError(
+            "break_even_trigger_confirmation_missing"
+        )
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise BreakEvenConvergencePlanningError(
+            "break_even_trigger_confirmation_invalid"
+        ) from None
+    if parsed.tzinfo is None:
+        raise BreakEvenConvergencePlanningError(
+            "break_even_trigger_confirmation_invalid"
+        )
+    return parsed.astimezone(UTC)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)

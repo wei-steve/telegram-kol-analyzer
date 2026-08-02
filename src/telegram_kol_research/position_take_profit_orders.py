@@ -191,9 +191,13 @@ def reconcile_trigger_take_profit_order_history(
                 previous_observation=previous_observation,
                 current_observation=current_observation,
             )
+            binding = session.get(ExecutionBinding, row.execution_binding_id)
+            if binding is None:
+                continue
             proof = prove_first_take_profit_fill(
                 tp_order=row,
                 protection_leg=protection_leg,
+                expected_side=str(binding.side),
                 previous_observation=previous_observation,
                 current_observation=current_observation,
                 trigger_history=trigger_history,

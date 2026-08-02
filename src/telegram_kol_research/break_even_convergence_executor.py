@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -41,6 +41,10 @@ from telegram_kol_research.strategy_management_market_policy import (
 from telegram_kol_research.terminal_entry_cleanup import (
     cleanup_terminal_entry_legs,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
+
+
+_MAX_QUOTE_AGE = timedelta(seconds=30)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +80,15 @@ def execute_break_even_convergence(
         if convergence.execution_mode == "disabled":
             convergence.status = "blocked"
             convergence.reason_code = "automatic_break_even_disabled"
+            convergence.updated_at = now
+            session.commit()
+            return _result(convergence)
+        if not _runtime_mode_enabled(
+            session_factory,
+            execution_mode=str(convergence.execution_mode),
+        ):
+            convergence.status = "blocked"
+            convergence.reason_code = "automatic_break_even_runtime_disabled"
             convergence.updated_at = now
             session.commit()
             return _result(convergence)
@@ -138,6 +151,10 @@ def execute_break_even_convergence(
         reason="automatic_break_even",
         cleaned_at=now,
         expected_binding_id=binding_id,
+        live_execution_gate=lambda: _runtime_mode_enabled(
+            session_factory,
+            execution_mode="live",
+        ),
     )
     with session_factory() as session:
         convergence = session.get(StrategyBreakEvenConvergence, int(convergence_id))
@@ -191,6 +208,7 @@ def _execute_market_decisions(
             session_factory,
             convergence_id=convergence_id,
             deepcoin_client=deepcoin_client,
+            observed_at=executed_at,
         )
         _reserve_market_decisions(
             session_factory,
@@ -239,6 +257,14 @@ def _execute_market_decisions(
     for item in work:
         if item["status"] == "succeeded":
             continue
+        if not _runtime_mode_enabled(session_factory, execution_mode="live"):
+            return _finish_convergence(
+                session_factory,
+                convergence_id=convergence_id,
+                status="blocked",
+                reason_code="automatic_break_even_runtime_disabled",
+                finished_at=executed_at,
+            )
         action = item["decision"].get("action")
         try:
             if action == "keep_tighter_stop":
@@ -268,9 +294,8 @@ def _execute_market_decisions(
                         f"break-even:{convergence_id}:{item['id']}:set-stop"
                     ),
                     live_execution_gate=lambda pos_id=item["pos_id"]: (
-                        exact_position_write_gate(
-                            session_factory, pos_id=pos_id
-                        )
+                        _runtime_mode_enabled(session_factory, execution_mode="live")
+                        and exact_position_write_gate(session_factory, pos_id=pos_id)
                     ),
                     now_provider=lambda: executed_at,
                     require_readback=True,
@@ -302,9 +327,8 @@ def _execute_market_decisions(
                             f"cancel-stop:{old_order_id}"
                         ),
                         live_execution_gate=lambda pos_id=item["pos_id"]: (
-                            exact_position_write_gate(
-                                session_factory, pos_id=pos_id
-                            )
+                            _runtime_mode_enabled(session_factory, execution_mode="live")
+                            and exact_position_write_gate(session_factory, pos_id=pos_id)
                         ),
                         now_provider=lambda: executed_at,
                     )
@@ -334,9 +358,8 @@ def _execute_market_decisions(
                         f"break-even:{convergence_id}:{item['id']}:full-exit"
                     ),
                     live_execution_gate=lambda pos_id=item["pos_id"]: (
-                        exact_position_write_gate(
-                            session_factory, pos_id=pos_id
-                        )
+                        _runtime_mode_enabled(session_factory, execution_mode="live")
+                        and exact_position_write_gate(session_factory, pos_id=pos_id)
                     ),
                     now_provider=lambda: executed_at,
                 )
@@ -420,6 +443,7 @@ def _execute_shadow_market_decisions(
             session_factory,
             convergence_id=convergence_id,
             deepcoin_client=deepcoin_client,
+            observed_at=executed_at,
         )
         _reserve_market_decisions(
             session_factory,
@@ -463,6 +487,7 @@ def _load_complete_market_preflight(
     *,
     convergence_id: int,
     deepcoin_client: DeepcoinTradingClientProtocol,
+    observed_at: datetime,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     with session_factory() as session:
         convergence = session.get(StrategyBreakEvenConvergence, convergence_id)
@@ -480,9 +505,39 @@ def _load_complete_market_preflight(
         or str(quote.get("instrument_id") or "").upper() != instrument_id.upper()
         or quote.get("price_field") not in {"last", "lastPx"}
         or not _positive(quote.get("price"))
+        or not _quote_is_fresh(quote.get("observed_at"), now=observed_at)
     ):
         raise RuntimeError("break_even_market_quote_unavailable")
     return positions, pending, quote
+
+
+def _runtime_mode_enabled(
+    session_factory: sessionmaker,
+    *,
+    execution_mode: str,
+) -> bool:
+    settings = load_trading_settings(session_factory)
+    if not settings.move_stop_to_breakeven_after_tp1:
+        return False
+    if execution_mode == "live":
+        return settings.live_management_execution_enabled
+    if execution_mode == "shadow":
+        return settings.management_execution_mode == "shadow"
+    return False
+
+
+def _quote_is_fresh(value: Any, *, now: datetime) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        observed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if observed.tzinfo is None:
+        return False
+    current = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    age = current.astimezone(UTC) - observed.astimezone(UTC)
+    return timedelta(seconds=-5) <= age <= _MAX_QUOTE_AGE
 
 
 def _reserve_market_decisions(

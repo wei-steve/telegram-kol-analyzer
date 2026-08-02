@@ -16,6 +16,7 @@ from telegram_kol_research.models import (
     StrategyBreakEvenConvergenceLeg,
     StrategyLifecycle,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 8, 2, 13, 0, tzinfo=UTC)
@@ -66,11 +67,17 @@ class ReadOnlyDabiaokeClient:
             "instrument_id": inst_id,
             "price": "63461.2",
             "price_field": "last",
+            "observed_at": NOW.isoformat(),
         }
 
 
 def test_dabiaoke_4163_tp1_fill_shadow_decides_exact_full_exit(tmp_path):
     sf = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(sf, {
+        "auto_trade_enabled": False,
+        "management_execution_mode": "shadow",
+        "move_stop_to_breakeven_after_tp1": True,
+    }, updated_at=NOW)
     with sf() as session:
         binding = ExecutionBinding(
             strategy_instance_id="dabiaoke:4163:BTC:short",
@@ -174,6 +181,7 @@ def test_dabiaoke_4163_tp1_fill_shadow_decides_exact_full_exit(tmp_path):
             "trigger_order_id": "tp-1",
             "trigger_price": "62400",
             "filled_size": "5",
+            "confirmed_at": NOW.isoformat(),
         },
         strategy_instance_id="dabiaoke:4163:BTC:short",
         planned_at=NOW,

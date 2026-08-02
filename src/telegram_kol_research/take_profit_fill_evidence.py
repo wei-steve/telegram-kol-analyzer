@@ -22,6 +22,7 @@ def prove_first_take_profit_fill(
     *,
     tp_order: Any,
     protection_leg: Any,
+    expected_side: str,
     previous_observation: Any | None,
     current_observation: Any | None,
     trigger_history: Iterable[Mapping[str, Any]],
@@ -36,6 +37,9 @@ def prove_first_take_profit_fill(
     size = _positive_decimal_text(_value(tp_order, "size_text"))
     if not order_id or not pos_id or size is None:
         return _failure("take_profit_identity_invalid")
+    normalized_side = _text(expected_side)
+    if normalized_side is None or normalized_side.lower() not in {"long", "short"}:
+        return _failure("take_profit_side_invalid", order_id=order_id)
     if (
         _text(_value(protection_leg, "role")) != "take_profit"
         or _integer(_value(protection_leg, "leg_index")) != 1
@@ -52,8 +56,7 @@ def prove_first_take_profit_fill(
         order_id=order_id,
         pos_id=pos_id,
         size=size,
-        side=_observation_text(previous_observation, "side")
-        or _observation_text(current_observation, "side"),
+        side=normalized_side,
         sources=(
             ("trigger_history", trigger_history, False),
             ("order_history", order_history, False),
@@ -78,6 +81,11 @@ def prove_first_take_profit_fill(
         return _failure("tp1_snapshot_incomplete", order_id=order_id)
     if previous["pos_id"] != pos_id or current["pos_id"] != pos_id:
         return _failure("tp1_position_identity_changed", order_id=order_id)
+    if (
+        str(previous["side"] or "").lower() != normalized_side.lower()
+        or str(current["side"] or "").lower() != normalized_side.lower()
+    ):
+        return _failure("tp1_position_side_changed", order_id=order_id)
 
     previous_orders = {
         row["order_id"]: row for row in previous["pending_tpsl"]
@@ -142,10 +150,17 @@ def _prove_exact_terminal(
         row_size = _positive_decimal_text(
             _first_value(row, "fillSz", "actualSz", "sz", "size")
         )
+        if row_pos_id is None or row_side is None or row_size is None:
+            return _failure(
+                "tp1_exact_history_incomplete",
+                order_id=order_id,
+                evidence={"source": source},
+            )
         if (
-            (row_pos_id is not None and row_pos_id != pos_id)
-            or (row_side is not None and side is not None and row_side.lower() != side.lower())
-            or (row_size is not None and row_size != size)
+            row_pos_id != pos_id
+            or side is None
+            or row_side.lower() != side.lower()
+            or row_size != size
         ):
             return _failure(
                 "tp1_exact_history_conflict",
