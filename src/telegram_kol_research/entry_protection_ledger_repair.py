@@ -879,6 +879,7 @@ def _plan_trigger_entry_repair(
         pending_tpsl_rows=pending_rows,
         existing_order_ids=existing_order_ids,
         existing_order_associations=existing_order_associations,
+        live_position=live_position,
     )
     return ([result.action] if result.action is not None else []), result.refusal
 
@@ -930,6 +931,7 @@ def plan_verified_trigger_entry_protection_adoption(
     pending_tpsl_rows: list[dict[str, Any]],
     existing_order_ids: set[str],
     existing_order_associations: set[tuple[str, str, int, int, str, str]],
+    live_position: TriggerProtectionLivePosition,
 ) -> EntryProtectionLedgerRepairAdoptionResult:
     """Purely match one verified trigger entry to one pending TPSL order.
 
@@ -960,6 +962,12 @@ def plan_verified_trigger_entry_protection_adoption(
         or not side
         or not _same_nonempty_text(event.order_id, entry_leg.order_id)
         or not _same_nonempty_text(event.client_order_id, entry_leg.client_order_id)
+        or live_position.pos_id != pos_id
+        or live_position.instrument_id.upper() != instrument_id.upper()
+        or live_position.side.lower() != side.lower()
+        or not _same_numeric_text(
+            live_position.size_text, _request_size_text(request) or ""
+        )
     ):
         return EntryProtectionLedgerRepairAdoptionResult(
             refusal=_refusal(event, "missing_trigger_entry_identity")
@@ -976,6 +984,28 @@ def plan_verified_trigger_entry_protection_adoption(
         and _row_matches_trigger_entry_expected_protection(row, expected_rows)
         and _same_size_text(_row_size_text(row), _request_size_text(request))
     ]
+    for candidate in candidates:
+        candidate_created_at = _row_creation_time(candidate)
+        if candidate_created_at is None:
+            return EntryProtectionLedgerRepairAdoptionResult(
+                refusal=EntryProtectionLedgerRepairRefusal(
+                    event_id=int(event.id) if event.id is not None else None,
+                    binding_id=binding_id,
+                    pos_id=pos_id,
+                    reason="trigger_protection_candidate_time_unavailable",
+                    evidence={"candidate_order_ids": [_row_order_id(candidate)]},
+                )
+            )
+        if candidate_created_at < _coerce_utc_naive(live_position.created_at):
+            return EntryProtectionLedgerRepairAdoptionResult(
+                refusal=EntryProtectionLedgerRepairRefusal(
+                    event_id=int(event.id) if event.id is not None else None,
+                    binding_id=binding_id,
+                    pos_id=pos_id,
+                    reason="trigger_protection_candidate_predates_fill",
+                    evidence={"candidate_order_ids": [_row_order_id(candidate)]},
+                )
+            )
     unique_order_ids = sorted({_row_order_id(row) for row in candidates if _row_order_id(row)})
     if len(unique_order_ids) != 1:
         return EntryProtectionLedgerRepairAdoptionResult(
@@ -1045,6 +1075,7 @@ def plan_verified_trigger_entry_protection_adoption(
                 "trigger_entry_order_id": event.order_id,
                 "take_profit": _expected_price(expected_rows, "take_profit"),
                 "stop_loss": _expected_price(expected_rows, "stop_loss"),
+                "live_position": _bounded_live_position_evidence(live_position),
             },
         )
     )

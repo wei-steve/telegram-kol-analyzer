@@ -938,10 +938,20 @@ def test_adoption_plans_one_exact_trigger_entry_protection_without_session_write
             pending_tpsl_rows=pending_rows,
             existing_order_ids=set(),
             existing_order_associations=set(),
+            live_position=repair_module.TriggerProtectionLivePosition(
+                pos_id="pos-1",
+                instrument_id="ETH-USDT-SWAP",
+                side="short",
+                size_text="4.4",
+                created_at=datetime(2026, 7, 20, 0, 11, 12),
+                observed_at=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),
+            ),
         )
         assert result.action is not None
         assert result.action.pos_id == "pos-1"
         assert result.action.order_id == "tpsl-1"
+        assert result.action.evidence["live_position"]["pos_id"] == "pos-1"
+        assert result.action.evidence["live_position"]["size_text"] == "4.4"
         assert result.refusal is None
         assert session.query(PositionProtectionLedger).count() == 0
 
@@ -1559,6 +1569,18 @@ def test_adoption_refuses_pending_row_without_order_id(tmp_path):
     assert result.refusal.reason == "trigger_entry_tpsl_missing"
 
 
+def test_legacy_trigger_adoption_refuses_candidate_before_live_position(tmp_path):
+    result = _plan_trigger_entry_adoption(
+        tmp_path,
+        pending_row={"cTime": "2026-07-20T00:11:13Z"},
+        live_position_created_at=datetime(2026, 7, 20, 0, 11, 14),
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_predates_fill"
+
+
 def test_adoption_refuses_pending_row_with_contradictory_position_id(tmp_path):
     result = _plan_trigger_entry_adoption(tmp_path, pending_row={"posId": "other-pos"})
 
@@ -1612,6 +1634,14 @@ def test_adoption_refuses_generic_trigger_price_when_tp_and_sl_prices_are_equal(
             pending_tpsl_rows=[pending_row],
             existing_order_ids=set(),
             existing_order_associations=set(),
+            live_position=repair_module.TriggerProtectionLivePosition(
+                pos_id="pos-1",
+                instrument_id="ETH-USDT-SWAP",
+                side="short",
+                size_text="4.4",
+                created_at=datetime(2026, 7, 20, 0, 11, 12),
+                observed_at=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),
+            ),
         )
 
     assert result.action is None
@@ -2016,6 +2046,7 @@ def _plan_trigger_entry_adoption(
     pending_row,
     existing_order_ids=None,
     existing_order_associations=None,
+    live_position_created_at=datetime(2026, 7, 20, 0, 11, 12),
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_entry_fill(
@@ -2052,6 +2083,14 @@ def _plan_trigger_entry_adoption(
             pending_tpsl_rows=[row],
             existing_order_ids=existing_order_ids or set(),
             existing_order_associations=existing_order_associations or set(),
+            live_position=repair_module.TriggerProtectionLivePosition(
+                pos_id="pos-1",
+                instrument_id="ETH-USDT-SWAP",
+                side="short",
+                size_text="4.4",
+                created_at=live_position_created_at,
+                observed_at=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),
+            ),
         )
 
 

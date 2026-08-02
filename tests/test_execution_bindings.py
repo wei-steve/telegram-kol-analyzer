@@ -452,6 +452,49 @@ def test_reconcile_protection_adoption_records_unique_exact_trigger_entry_tpsl(t
     assert client.pending_calls == 1
 
 
+def test_reconcile_legacy_trigger_adoption_requires_current_live_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).one()
+        leg.pos_id = "pos-1"
+        leg.status = "active"
+        leg.attribution_status = "verified"
+        session.commit()
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient(
+            [_pending_combined_tpsl("legacy-stale")],
+            positions=[],
+        ),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        assert session.query(PositionProtectionLedger).count() == 0
+    assert result.protection_adopted == 0
+
+
+def test_reconcile_legacy_trigger_adoption_rejects_prefill_candidate(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    candidate = _pending_combined_tpsl("legacy-prefill")
+    candidate["cTime"] = "1784512859000"
+    candidate["uTime"] = "1784512859000"
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([candidate]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        assert session.query(PositionProtectionLedger).count() == 0
+    assert result.protection_adopted == 0
+    assert result.protection_adoption_refused == 1
+
+
 def test_reconcile_submits_one_exact_backup_stop_when_explicitly_enabled(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_protection_adoption(session_factory)
@@ -464,9 +507,10 @@ def test_reconcile_submits_one_exact_backup_stop_when_explicitly_enabled(tmp_pat
         def list_positions(self, *, inst_id=None):
             rows = [{
                 "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
-                "pos": "4.4", "avgPx": "1883", "liqPx": "2000",
-                "mgnMode": "cross", "mrgPosition": "split",
-            }]
+                    "pos": "4.4", "avgPx": "1883", "liqPx": "2000",
+                    "mgnMode": "cross", "mrgPosition": "split",
+                    "cTime": "1784512860000",
+                }]
             if inst_id is None:
                 return rows
             return [row for row in rows if row["instId"] == inst_id]

@@ -1080,6 +1080,7 @@ def _adopt_verified_trigger_entry_protection(
 
     from telegram_kol_research.entry_protection_ledger_repair import (
         EntryProtectionLedgerRepairRefusal,
+        build_trigger_protection_live_position,
         plan_verified_trigger_entry_protection_adoption,
         upsert_entry_protection_ledger_action,
     )
@@ -1207,6 +1208,22 @@ def _adopt_verified_trigger_entry_protection(
                 session, leg=leg, refusal=refusal, created_at=recovered_at
             )
             continue
+        live_position_result = build_trigger_protection_live_position(
+            entry_leg=leg,
+            position_rows=snapshot.positions,
+            observed_at=recovered_at,
+        )
+        if live_position_result.refusal is not None:
+            result.protection_adoption_refused += 1
+            _record_protection_adoption_refusal(
+                session,
+                leg=leg,
+                refusal=live_position_result.refusal,
+                created_at=recovered_at,
+            )
+            continue
+        live_position = live_position_result.position
+        assert live_position is not None
         adoption = plan_verified_trigger_entry_protection_adoption(
             session,
             entry_leg=leg,
@@ -1214,6 +1231,7 @@ def _adopt_verified_trigger_entry_protection(
             pending_tpsl_rows=snapshot.pending_trigger_orders,
             existing_order_ids=existing_order_ids,
             existing_order_associations=existing_order_associations,
+            live_position=live_position,
         )
         if adoption.action is not None:
             row = upsert_entry_protection_ledger_action(
