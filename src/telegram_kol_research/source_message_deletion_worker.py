@@ -19,6 +19,7 @@ from telegram_kol_research.models import (
     StrategyManagementBatch,
     StrategyManagementLeg,
     TelegramSourceMessageEvent,
+    TradeSignal,
 )
 from telegram_kol_research.position_authority_lock import position_authority_lock
 from telegram_kol_research.source_message_deletion import (
@@ -57,6 +58,7 @@ def run_source_message_deletion_worker_tick(
     cleanup_executor=cleanup_terminal_entry_legs,
     exit_planner=None,
     snapshot_loader=None,
+    binding_reconciler=None,
 ) -> SourceMessageDeletionWorkerResult:
     """Process a bounded number of exact deleted-source jobs."""
 
@@ -101,6 +103,20 @@ def run_source_message_deletion_worker_tick(
             try:
                 with position_authority_lock():
                     snapshot = loader(session_factory, client=get_client())
+                    if binding_reconciler is None:
+                        from telegram_kol_research.execution_bindings import (
+                            reconcile_deepcoin_execution_bindings,
+                        )
+
+                        reconcile_bindings = reconcile_deepcoin_execution_bindings
+                    else:
+                        reconcile_bindings = binding_reconciler
+                    reconcile_bindings(
+                        session_factory,
+                        client=get_client(),
+                        recovered_at=now,
+                        snapshot=snapshot,
+                    )
                     final_state = finalize_source_message_deletion_exit(
                         session_factory,
                         deletion_exit_id=exit_id,
@@ -477,12 +493,53 @@ def finalize_source_message_deletion_exit(
                         if event is not None
                         else None
                     )
+                    hazardous_signal = (
+                        session.query(TradeSignal.id)
+                        .filter(
+                            TradeSignal.chat_id == event.chat_id,
+                            TradeSignal.message_id == event.message_id,
+                            or_(
+                                TradeSignal.attempts > 0,
+                                TradeSignal.status.in_(
+                                    {
+                                        "processing",
+                                        "executing",
+                                        "submitted",
+                                        "submit_unknown",
+                                    }
+                                ),
+                                TradeSignal.result_json.is_not(None),
+                            ),
+                        )
+                        .first()
+                        if event is not None
+                        else None
+                    )
+                    hazardous_event = (
+                        session.query(ExecutionEvent.id)
+                        .filter(
+                            ExecutionEvent.chat_id == event.chat_id,
+                            ExecutionEvent.message_id == event.message_id,
+                            or_(
+                                ExecutionEvent.order_id.is_not(None),
+                                ExecutionEvent.client_order_id.is_not(None),
+                                ExecutionEvent.pos_id.is_not(None),
+                                ExecutionEvent.request_json.is_not(None),
+                                ExecutionEvent.response_json.is_not(None),
+                            ),
+                        )
+                        .first()
+                        if event is not None
+                        else None
+                    )
                     identity_invalid = (
                         lifecycle is None
                         or lifecycle.execution_binding_id is not None
                         or binding is not None
                         or bool(legs)
                         or unexpected_binding is not None
+                        or hazardous_signal is not None
+                        or hazardous_event is not None
                     )
                 else:
                     binding_pos_ids = _split_ids(binding.pos_id) if binding else set()
@@ -622,13 +679,30 @@ def finalize_source_message_deletion_exit(
                     all_intents_terminal = bool(related_intents) and all(
                         intent.status == "confirmed" for intent in related_intents
                     )
+                    management_pos_ids = {
+                        _clean_id(leg.pos_id) for leg in management_legs
+                    }
                     exact_management_ownership = all(
                         leg.execution_order_leg_id in {entry.id for entry in legs}
                         and _clean_id(leg.pos_id) in exact_pos_ids
                         for leg in management_legs
-                    ) and {
-                        _clean_id(leg.pos_id) for leg in management_legs
-                    } == exact_pos_ids
+                    ) and management_pos_ids == exact_pos_ids
+                    if (
+                        management_terminal
+                        and close_intents_complete
+                        and all_intents_terminal
+                        and management_pos_ids < exact_pos_ids
+                    ):
+                        deletion_exit.management_batch_id = None
+                        deletion_exit.state = "closing_positions"
+                        deletion_exit.last_reason = "position_exit_scope_expanded"
+                        deletion_exit.last_error = None
+                        deletion_exit.last_reconciled_at = now
+                        deletion_exit.claim_token = None
+                        deletion_exit.claimed_at = None
+                        deletion_exit.updated_at = now
+                        session.commit()
+                        return "waiting"
                     if not (
                         management_terminal
                         and close_intents_complete
