@@ -859,6 +859,13 @@ def _apply_reconcile_snapshot(
             snapshot_errors=snapshot.errors,
             observed_at=recovered_at,
         )
+        _record_owned_position_observations(
+            session,
+            legs=legs,
+            bindings_by_id=bindings_by_id,
+            snapshot=snapshot,
+            observed_at=recovered_at,
+        )
 
         for binding in bindings:
             binding.strategy_instance_id = binding.strategy_instance_id or build_strategy_instance_id(
@@ -889,6 +896,67 @@ def _apply_reconcile_snapshot(
         result.updated = len(bindings)
         session.commit()
     return result
+
+
+def _record_owned_position_observations(
+    session,
+    *,
+    legs: list[ExecutionOrderLeg],
+    bindings_by_id: dict[int, ExecutionBinding],
+    snapshot: _ReconcileSnapshot,
+    observed_at: datetime,
+) -> None:
+    """Persist bounded observations only for verified exact live positions."""
+
+    from telegram_kol_research.position_reconciliation_observations import (
+        record_position_reconciliation_observation,
+    )
+
+    positions_by_id = {
+        pos_id: row
+        for row in snapshot.positions
+        if _has_nonzero_size(row)
+        and (pos_id := _first_string(row, "posId", "pos_id", "id"))
+    }
+    completeness_by_instrument = {
+        str(row.get("instrument_id") or "").strip().upper(): bool(
+            row.get("complete")
+        )
+        for row in snapshot.pending_tpsl_observations
+    }
+    pending_by_position: dict[str, list[dict[str, Any]]] = {}
+    for row in snapshot.pending_trigger_orders:
+        pos_id = _first_string(row, "posId", "pos_id", "closePosId")
+        if pos_id:
+            pending_by_position.setdefault(pos_id, []).append(row)
+    for leg in legs:
+        pos_id = str(leg.pos_id or "").strip()
+        if (
+            not pos_id
+            or str(leg.purpose or "") != "entry"
+            or str(leg.attribution_status or "") != "verified"
+            or str(leg.status or "").lower() not in {"active", "partially_filled"}
+        ):
+            continue
+        position = positions_by_id.get(pos_id)
+        binding = bindings_by_id.get(int(leg.execution_binding_id))
+        if position is None or binding is None or not binding.strategy_instance_id:
+            continue
+        instrument_id = _first_string(position, "instId", "inst_id") or ""
+        record_position_reconciliation_observation(
+            session,
+            venue=str(binding.venue),
+            execution_binding_id=int(binding.id),
+            execution_order_leg_id=int(leg.id),
+            strategy_instance_id=str(binding.strategy_instance_id),
+            position=position,
+            pending_tpsl=pending_by_position.get(pos_id, []),
+            snapshot_complete=(
+                not snapshot.errors
+                and completeness_by_instrument.get(instrument_id.upper(), False)
+            ),
+            observed_at=observed_at,
+        )
 
 
 def _ready_verified_trigger_take_profit_convergences(

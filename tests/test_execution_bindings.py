@@ -35,6 +35,7 @@ from telegram_kol_research.models import (
     PositionAttributionAudit,
     PositionProtectionLeg,
     PositionProtectionLedger,
+    PositionReconciliationObservation,
     PositionProtectionRevision,
     PendingTpslSnapshotObservation,
     StrategyLifecycle,
@@ -4904,6 +4905,75 @@ def test_reconcile_then_sync_closes_a_previously_verified_missing_position(tmp_p
     assert lifecycle.exit_reason == "manual"
     assert leg.status == "manually_closed"
     assert leg.terminal_reason == "manual_position_missing"
+
+
+def test_reconcile_records_complete_owned_position_observation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            pos_id="pos-observed",
+            status="active",
+            strategy_instance_id="deepcoin:100:55:BTC:long",
+        ),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        pos_id="pos-observed",
+        status="active",
+        attribution_status="verified",
+    )
+
+    class FakeClient:
+        def list_positions(self):
+            return [{
+                "posId": "pos-observed",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "pos": "7",
+                "avgPx": "64000",
+            }]
+
+        def list_open_orders(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            assert inst_id == "BTC-USDT-SWAP"
+            return [{
+                "ordId": "tp-observed",
+                "instId": inst_id,
+                "posId": "pos-observed",
+                "posSide": "long",
+                "side": "sell",
+                "sz": "3",
+                "triggerPx": "65000",
+            }]
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 8, 2, 8, 0),
+    )
+
+    with session_factory() as session:
+        row = session.query(PositionReconciliationObservation).one()
+        assert row.pos_id == "pos-observed"
+        assert row.size_text == "7"
+        assert row.avg_entry_price == "64000"
+        assert row.snapshot_complete is True
+        assert [
+            item["order_id"] for item in json.loads(row.pending_tpsl_json)
+        ] == ["tp-observed"]
 
 
 def test_sync_missing_position_cleans_pending_entry_before_lifecycle_exit(tmp_path):
