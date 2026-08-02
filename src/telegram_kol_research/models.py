@@ -19,6 +19,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy import text as sql_text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -63,7 +64,11 @@ class RawMessage(Base):
     archived_target_group: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     edit_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     source_status: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="active", index=True
+        String(32),
+        nullable=False,
+        default="active",
+        server_default=sql_text("'active'"),
+        index=True,
     )
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     deletion_event_fingerprint: Mapped[Optional[str]] = mapped_column(
@@ -104,7 +109,11 @@ class TelegramSourceMessageEvent(Base):
         String(32), nullable=False, default="unbound", index=True
     )
     processing_status: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="recorded", index=True
+        String(32),
+        nullable=False,
+        default="recorded",
+        server_default=sql_text("'recorded'"),
+        index=True,
     )
     reason_code: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     telegram_event_json: Mapped[str] = mapped_column(
@@ -160,7 +169,7 @@ class SourceMessageDeletionExit(Base):
     claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     cancellation_signal_ids_json: Mapped[str] = mapped_column(
-        Text, nullable=False, default="[]"
+        Text, nullable=False, default="[]", server_default=sql_text("'[]'")
     )
     last_reason: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
