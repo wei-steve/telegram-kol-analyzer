@@ -662,6 +662,49 @@ def test_no_binding_deletion_fails_closed_when_submit_evidence_exists(tmp_path):
     assert status == "recovery_required"
 
 
+def test_snapshot_loader_exception_remains_retryable_until_flat_proof(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_never_executed_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=30,
+        message_id=300,
+        deleted_at=NOW,
+    )
+    run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=object,
+        processed_at=NOW,
+    )
+
+    retry = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=object,
+        snapshot_loader=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            TimeoutError("temporary snapshot timeout")
+        ),
+        processed_at=NOW,
+    )
+
+    assert retry.waiting == 1
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert deletion_exit.state == "reconciling"
+        assert "TimeoutError" in deletion_exit.last_error
+
+    completed = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=object,
+        snapshot_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            errors={}, positions=[], open_orders=[], pending_trigger_orders=[]
+        ),
+        binding_reconciler=lambda *_args, **_kwargs: None,
+        processed_at=NOW,
+    )
+
+    assert completed.finalized == 1
+
+
 def test_flat_finalization_fails_closed_when_exchange_snapshot_has_errors(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_pending_strategy(
