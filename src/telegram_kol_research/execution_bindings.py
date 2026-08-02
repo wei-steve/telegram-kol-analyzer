@@ -1619,6 +1619,20 @@ def _refresh_exact_entry_leg_states(
     for leg in legs:
         if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
             continue
+        if (
+            leg.pos_id
+            and leg.attribution_status == "verified"
+            and any(
+                _first_string(position, "posId", "pos_id", "id")
+                == str(leg.pos_id)
+                and _has_nonzero_size(position)
+                for position in snapshot.positions
+            )
+        ):
+            leg.status = "active"
+            leg.terminal_reason = None
+            leg.updated_at = recovered_at
+            continue
         pending = next((row for row in pending_rows if _exchange_row_matches_leg(row, leg)), None)
         if pending is not None:
             leg.status = "pending"
@@ -3818,6 +3832,11 @@ def _apply_recorded_terminal_entry_events(
         )
         for leg in legs:
             if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+                continue
+            if leg.pos_id and leg.attribution_status == "verified":
+                # The cancel event terminates only the unfilled remainder.  A
+                # verified fill from the same entry leg remains an owned live
+                # position and must still be managed/closed by exact posId.
                 continue
             order_matches = bool(
                 event.order_id and leg.order_id and str(event.order_id) == str(leg.order_id)
