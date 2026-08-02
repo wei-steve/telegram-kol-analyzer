@@ -196,6 +196,40 @@ def bind_verified_exchange_order(
     return protection_leg
 
 
+def record_verified_take_profit_fill(
+    session: Session,
+    protection_leg: PositionProtectionLeg,
+    *,
+    evidence: dict[str, Any],
+    completed_at: datetime,
+) -> PositionProtectionLeg:
+    """Record a proven TP fill without changing immutable order ownership."""
+
+    if (
+        protection_leg.role != "take_profit"
+        or not protection_leg.pos_id
+        or not protection_leg.exchange_order_id
+        or protection_leg.status not in {"verified", "filled"}
+    ):
+        raise ValueError("protection_leg_take_profit_fill_invalid")
+    try:
+        existing = json.loads(protection_leg.readback_evidence_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+    if protection_leg.status == "filled":
+        if existing.get("tp1_fill") != evidence:
+            raise ValueError("protection_leg_take_profit_fill_conflict")
+        return protection_leg
+    existing["tp1_fill"] = evidence
+    protection_leg.readback_evidence_json = _normalized_json(existing)
+    protection_leg.status = "filled"
+    protection_leg.updated_at = completed_at
+    session.flush()
+    return protection_leg
+
+
 def _bind_immutable_text(
     protection_leg: PositionProtectionLeg, field: str, value: str
 ) -> None:

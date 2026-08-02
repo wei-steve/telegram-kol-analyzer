@@ -836,6 +836,13 @@ def _apply_reconcile_snapshot(
         _ready_verified_trigger_take_profit_convergences(
             session, legs=legs, snapshot=snapshot, recovered_at=recovered_at
         )
+        _record_owned_position_observations(
+            session,
+            legs=legs,
+            bindings_by_id=bindings_by_id,
+            snapshot=snapshot,
+            observed_at=recovered_at,
+        )
         from telegram_kol_research.position_take_profit_orders import (
             reconcile_trigger_take_profit_order_history,
         )
@@ -845,6 +852,8 @@ def _apply_reconcile_snapshot(
             positions=snapshot.positions,
             pending_orders=snapshot.pending_trigger_orders,
             trigger_history=snapshot.trigger_history,
+            order_history=snapshot.order_history,
+            trade_fills=snapshot.trade_fills,
             observed_at=recovered_at,
         )
         from telegram_kol_research.protection_health import (
@@ -857,13 +866,6 @@ def _apply_reconcile_snapshot(
             pending_orders=snapshot.pending_trigger_orders,
             trigger_history=snapshot.trigger_history,
             snapshot_errors=snapshot.errors,
-            observed_at=recovered_at,
-        )
-        _record_owned_position_observations(
-            session,
-            legs=legs,
-            bindings_by_id=bindings_by_id,
-            snapshot=snapshot,
             observed_at=recovered_at,
         )
 

@@ -18,6 +18,7 @@ from telegram_kol_research.position_protection_legs import (
     materialize_verified_position_protection,
 )
 from telegram_kol_research.models import ExecutionOrderLeg
+from datetime import datetime
 
 
 def _entry_leg_id(session_factory) -> int:
@@ -226,3 +227,43 @@ def test_bind_verified_filled_position_rejects_unverified_entry_leg(tmp_path):
                 execution_order_leg_id=entry_leg_id,
                 pos_id="pos-1",
             )
+
+
+def test_record_verified_take_profit_fill_is_idempotent(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    entry_leg_id = _entry_leg_id(session_factory)
+    completed_at = datetime(2026, 8, 2, 8, 0)
+
+    with session_factory() as session:
+        row = create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=entry_leg_id,
+            role="take_profit",
+            leg_index=1,
+            planned_trigger_price="65000",
+            planned_size="3",
+        )
+        bind_filled_position(session, row, pos_id="pos-1")
+        bind_verified_exchange_order(
+            session,
+            row,
+            exchange_order_id="tp-1",
+            readback_evidence={"ordId": "tp-1", "posId": "pos-1"},
+        )
+        first = protection_legs.record_verified_take_profit_fill(
+            session,
+            row,
+            evidence={"evidence_tier": "exact_order_terminal"},
+            completed_at=completed_at,
+        )
+        second = protection_legs.record_verified_take_profit_fill(
+            session,
+            row,
+            evidence={"evidence_tier": "exact_order_terminal"},
+            completed_at=completed_at,
+        )
+
+        assert first.id == second.id
+        assert row.status == "filled"
+        assert "exact_order_terminal" in row.readback_evidence_json

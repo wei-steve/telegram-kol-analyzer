@@ -11,6 +11,9 @@ from sqlalchemy.orm import Session
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionMutationIntent,
+    PositionProtectionLeg,
+    PositionReconciliationObservation,
     PositionTakeProfitOrder,
     TriggerTakeProfitConvergence,
     utc_now,
@@ -132,6 +135,8 @@ def reconcile_trigger_take_profit_order_history(
     positions: list[dict],
     pending_orders: list[dict],
     trigger_history: list[dict],
+    order_history: list[dict] | None = None,
+    trade_fills: list[dict] | None = None,
     observed_at: datetime | None = None,
 ) -> None:
     """Reconcile TP audit records from read-only exchange observations.
@@ -153,6 +158,58 @@ def reconcile_trigger_take_profit_order_history(
         .all()
     )
     for row in active_rows:
+        protection_leg = (
+            session.query(PositionProtectionLeg)
+            .filter_by(
+                venue=row.venue,
+                execution_order_leg_id=row.execution_order_leg_id,
+                role="take_profit",
+                exchange_order_id=row.order_id,
+            )
+            .one_or_none()
+        )
+        if protection_leg is not None and int(protection_leg.leg_index) == 1:
+            from telegram_kol_research.take_profit_fill_evidence import (
+                prove_first_take_profit_fill,
+            )
+
+            observations = (
+                session.query(PositionReconciliationObservation)
+                .filter_by(venue=row.venue, pos_id=row.pos_id)
+                .order_by(
+                    PositionReconciliationObservation.observed_at.desc(),
+                    PositionReconciliationObservation.id.desc(),
+                )
+                .limit(2)
+                .all()
+            )
+            current_observation = observations[0] if observations else None
+            previous_observation = observations[1] if len(observations) > 1 else None
+            conflicting_mutations = _conflicting_position_mutations(
+                session,
+                pos_id=row.pos_id,
+                previous_observation=previous_observation,
+                current_observation=current_observation,
+            )
+            proof = prove_first_take_profit_fill(
+                tp_order=row,
+                protection_leg=protection_leg,
+                previous_observation=previous_observation,
+                current_observation=current_observation,
+                trigger_history=trigger_history,
+                order_history=order_history or [],
+                trade_fills=trade_fills or [],
+                conflicting_mutations=conflicting_mutations,
+            )
+            if proof.proven:
+                _record_proven_tp1_fill(
+                    session=session,
+                    row=row,
+                    protection_leg=protection_leg,
+                    proof=proof,
+                    observed_at=now,
+                )
+                continue
         history = history_by_id.get(row.order_id)
         if row.order_id in pending_ids or history is None:
             continue
@@ -194,6 +251,67 @@ def reconcile_trigger_take_profit_order_history(
             convergence.completed_at = now
             convergence.updated_at = now
     session.flush()
+
+
+def _conflicting_position_mutations(
+    session: Session,
+    *,
+    pos_id: str,
+    previous_observation: PositionReconciliationObservation | None,
+    current_observation: PositionReconciliationObservation | None,
+) -> list[PositionMutationIntent]:
+    if previous_observation is None or current_observation is None:
+        return []
+    return (
+        session.query(PositionMutationIntent)
+        .filter(PositionMutationIntent.pos_id == pos_id)
+        .filter(PositionMutationIntent.operation == "close_position")
+        .filter(PositionMutationIntent.reserved_at >= previous_observation.observed_at)
+        .filter(PositionMutationIntent.reserved_at <= current_observation.observed_at)
+        .all()
+    )
+
+
+def _record_proven_tp1_fill(
+    *,
+    session: Session,
+    row: PositionTakeProfitOrder,
+    protection_leg: PositionProtectionLeg,
+    proof,
+    observed_at: datetime,
+) -> None:
+    evidence = _load_evidence(row.evidence_json)
+    evidence["tp1_fill"] = {
+        "evidence_tier": proof.evidence_tier,
+        "trigger_order_id": proof.trigger_order_id,
+        "filled_size": proof.filled_size,
+        "reason_code": proof.reason_code,
+        "evidence": proof.evidence,
+    }
+    row.status = "filled"
+    row.evidence_json = _json(evidence)
+    row.completed_at = observed_at
+    row.updated_at = observed_at
+    from telegram_kol_research.position_protection_legs import (
+        record_verified_take_profit_fill,
+    )
+
+    record_verified_take_profit_fill(
+        session,
+        protection_leg,
+        evidence=evidence["tp1_fill"],
+        completed_at=observed_at,
+    )
+
+
+def _load_evidence(value: str | None) -> dict[str, object]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
 
 
 def _require_exact_leg_ownership(
