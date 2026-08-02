@@ -145,12 +145,24 @@ class SourceMessageDeletionExit(Base):
     target_fingerprint: Mapped[Optional[str]] = mapped_column(
         String(64), nullable=True, unique=True
     )
+    management_batch_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("strategy_management_batches.id"), nullable=True, index=True
+    )
     state: Mapped[str] = mapped_column(
         String(32), nullable=False, default="pending"
     )
+    claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cancellation_signal_ids_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
+    last_reason: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     flat_proof_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_reconciled_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=utc_now, nullable=False
