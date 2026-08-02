@@ -62,7 +62,96 @@ class RawMessage(Base):
     reply_to_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     archived_target_group: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     edit_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    source_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="active", index=True
+    )
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    deletion_event_fingerprint: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class TelegramSourceMessageEvent(Base):
+    """Immutable evidence that Telegram reported a source-message event."""
+
+    __tablename__ = "telegram_source_message_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "event_type",
+            "chat_id",
+            "message_id",
+            name="uq_telegram_source_message_event_identity",
+        ),
+        Index(
+            "ix_telegram_source_message_events_source",
+            "chat_id",
+            "message_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_message_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=True, index=True
+    )
+    event_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True
+    )
+    binding_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="unbound", index=True
+    )
+    telegram_event_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
+class SourceMessageDeletionExit(Base):
+    """Durable recovery job for one deleted Telegram source message."""
+
+    __tablename__ = "source_message_deletion_exits"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_event_id", name="uq_source_message_deletion_exit_event"
+        ),
+        Index("ix_source_message_deletion_exits_state", "state", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_event_id: Mapped[int] = mapped_column(
+        ForeignKey("telegram_source_message_events.id"), nullable=False, index=True
+    )
+    raw_message_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=True, index=True
+    )
+    target_lifecycle_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("strategy_lifecycles.id"), nullable=True, index=True
+    )
+    strategy_instance_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+    state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending"
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    flat_proof_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
 
 
 class MediaAsset(Base):

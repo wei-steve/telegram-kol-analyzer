@@ -66,6 +66,9 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "sender_name": "ALTER TABLE raw_messages ADD COLUMN sender_name VARCHAR(255)",
         "archived_target_group": "ALTER TABLE raw_messages ADD COLUMN archived_target_group BOOLEAN NOT NULL DEFAULT 0",
         "edit_date": "ALTER TABLE raw_messages ADD COLUMN edit_date DATETIME",
+        "source_status": "ALTER TABLE raw_messages ADD COLUMN source_status VARCHAR(32) NOT NULL DEFAULT 'active'",
+        "deleted_at": "ALTER TABLE raw_messages ADD COLUMN deleted_at DATETIME",
+        "deletion_event_fingerprint": "ALTER TABLE raw_messages ADD COLUMN deletion_event_fingerprint VARCHAR(64)",
     },
     "media_assets": {
         "ocr_text": "ALTER TABLE media_assets ADD COLUMN ocr_text TEXT",
