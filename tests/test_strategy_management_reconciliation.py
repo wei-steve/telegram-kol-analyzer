@@ -15,9 +15,11 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     PositionMutationIntent,
+    PositionReconciliationObservation,
     RawMessage,
     RecognitionDecision,
     StrategyLifecycle,
+    StrategyBreakEvenConvergence,
     StrategyManagementBatch,
     StrategyManagementLeg,
     StrategyManagementMarketDecision,
@@ -32,6 +34,7 @@ from telegram_kol_research.strategy_management_batches import (
 from telegram_kol_research.strategy_management_reconciliation import (
     reconcile_strategy_management_batches,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.strategy_management_market_decisions import (
     reserve_break_even_market_decision,
 )
@@ -202,6 +205,85 @@ def _reconcile_management(session_factory, *, positions, orders=None):
         ),
         reconciled_at=NOW,
     )
+
+
+def _seed_partial_close_observation(session_factory, batch, *, size="1"):
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, batch.legs[0].execution_order_leg_id)
+        session.add(PositionReconciliationObservation(
+            venue="deepcoin",
+            execution_binding_id=batch.execution_binding_id,
+            execution_order_leg_id=leg.id,
+            strategy_instance_id=batch.strategy_instance_id,
+            pos_id=leg.pos_id,
+            instrument_id="BTC-USDT-SWAP",
+            side="short",
+            size_text=size,
+            avg_entry_price="63000",
+            pending_tpsl_json="[]",
+            snapshot_complete=True,
+            snapshot_fingerprint=("c" if size == "1" else "d") * 64,
+            observed_at=NOW,
+        ))
+        session.commit()
+
+
+def test_confirmed_partial_close_plans_one_shadow_break_even_convergence(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(sf, {
+        "management_execution_mode": "shadow",
+        "move_stop_to_breakeven_after_tp1": True,
+    })
+    batch = _persist_batch(sf, action="partial_close")
+    _seed_partial_close_observation(sf, batch)
+
+    _reconcile_management(sf, positions=[_position("pos-1", "1")])
+    _reconcile_management(sf, positions=[_position("pos-1", "1")])
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "succeeded"
+    with sf() as session:
+        rows = session.query(StrategyBreakEvenConvergence).all()
+        assert len(rows) == 1
+        assert rows[0].trigger_type == "confirmed_partial_close"
+        assert rows[0].trigger_identity == str(batch.id)
+        assert rows[0].execution_mode == "shadow"
+
+
+def test_partial_then_break_even_uses_convergence_instead_of_old_protection_phase(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(sf, {
+        "management_execution_mode": "shadow",
+        "move_stop_to_breakeven_after_tp1": True,
+    })
+    batch = _persist_batch(sf, action="partial_then_break_even")
+    _seed_partial_close_observation(sf, batch)
+
+    _reconcile_management(sf, positions=[_position("pos-1", "1")])
+
+    stored = load_management_batch(sf, batch.id)
+    assert stored.status == "succeeded"
+    assert stored.reason_code == "management_close_exchange_confirmed"
+    with sf() as session:
+        assert session.query(StrategyBreakEvenConvergence).count() == 1
+
+
+def test_disabled_automatic_break_even_preserves_partial_close_only(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(sf, {
+        "management_execution_mode": "shadow",
+        "move_stop_to_breakeven_after_tp1": False,
+    })
+    batch = _persist_batch(sf, action="partial_close")
+    _seed_partial_close_observation(sf, batch)
+
+    _reconcile_management(sf, positions=[_position("pos-1", "1")])
+
+    assert load_management_batch(sf, batch.id).status == "succeeded"
+    with sf() as session:
+        assert session.query(StrategyBreakEvenConvergence).count() == 0
 
 
 def test_submitted_order_with_unchanged_position_stays_pending_on_one_snapshot(tmp_path):

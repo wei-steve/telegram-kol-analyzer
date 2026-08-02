@@ -13,6 +13,10 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.deepcoin_normalization import (
     normalize_deepcoin_swap_instrument,
 )
+from telegram_kol_research.break_even_convergence_planner import (
+    BreakEvenConvergencePlanningError,
+    plan_or_adopt_break_even_convergence,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -33,6 +37,7 @@ from telegram_kol_research.strategy_management_market_decisions import (
     BreakEvenMarketDecisionConflict,
     load_break_even_market_decision_in_session,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 _ACTIVE_RECONCILIATION_STATUSES = frozenset(
@@ -111,6 +116,15 @@ def reconcile_strategy_management_batches(
     position_rows = _positions_by_id(getattr(snapshot, "positions", []))
     order_rows = _regular_order_rows(snapshot)
     counts = {"checked": 0, "succeeded": 0, "pending": 0, "frozen": 0}
+    confirmed_partial_batch_ids: list[int] = []
+    settings = load_trading_settings(session_factory)
+    automatic_break_even_enabled = bool(
+        settings.move_stop_to_breakeven_after_tp1
+        and (
+            settings.management_execution_mode == "shadow"
+            or settings.live_management_execution_enabled
+        )
+    )
 
     with session_factory() as session:
         query = session.query(StrategyManagementBatch).filter(
@@ -286,7 +300,10 @@ def reconcile_strategy_management_batches(
             if all(status == "confirmed" for status in statuses):
                 batch.reconciled_at = now
                 batch.updated_at = now
-                if batch.effective_action == "partial_then_break_even":
+                if (
+                    batch.effective_action == "partial_then_break_even"
+                    and not automatic_break_even_enabled
+                ):
                     batch.status = "protection_ready"
                     batch.reason_code = "management_close_confirmed_protection_ready"
                     batch.completed_at = None
@@ -300,6 +317,11 @@ def reconcile_strategy_management_batches(
                     _terminalize_full_close(session, batch=batch, legs=legs, now=now)
                 else:
                     _confirm_partial_close(session, batch=batch, now=now)
+                    if automatic_break_even_enabled and batch.effective_action in {
+                        "partial_close",
+                        "partial_then_break_even",
+                    }:
+                        confirmed_partial_batch_ids.append(int(batch.id))
             elif "failed" in statuses:
                 _freeze_batch(
                     session,
@@ -347,7 +369,91 @@ def reconcile_strategy_management_batches(
                 counts["pending"] += 1
         session.commit()
 
+    for batch_id in confirmed_partial_batch_ids:
+        _plan_confirmed_partial_close_break_even(
+            session_factory,
+            batch_id=batch_id,
+            planned_at=now,
+        )
+
     return ManagementReconciliationResult(**counts)
+
+
+def _plan_confirmed_partial_close_break_even(
+    session_factory: sessionmaker,
+    *,
+    batch_id: int,
+    planned_at: datetime,
+) -> None:
+    """Bridge exchange-confirmed partial closes into the durable convergence."""
+
+    settings = load_trading_settings(session_factory)
+    if (
+        not settings.move_stop_to_breakeven_after_tp1
+        or (
+            settings.management_execution_mode != "shadow"
+            and not settings.live_management_execution_enabled
+        )
+    ):
+        return
+    if settings.management_execution_mode == "shadow":
+        execution_mode = "shadow"
+    elif settings.live_management_execution_enabled:
+        execution_mode = "live"
+    else:
+        execution_mode = "disabled"
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, int(batch_id))
+        if batch is None:
+            raise RuntimeError("confirmed_partial_close_batch_missing")
+        legs = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=batch.id)
+            .order_by(StrategyManagementLeg.leg_index.asc())
+            .all()
+        )
+        evidence = {
+            "version": 1,
+            "management_batch_id": int(batch.id),
+            "effective_action": str(batch.effective_action),
+            "actual_closed_size": str(
+                sum(
+                    (Decimal(str(leg.planned_close_size)) for leg in legs),
+                    Decimal("0"),
+                )
+            ),
+            "close_legs": [
+                {
+                    "management_leg_id": int(leg.id),
+                    "execution_order_leg_id": int(leg.execution_order_leg_id),
+                    "pos_id": str(leg.pos_id),
+                    "closed_size": str(leg.planned_close_size),
+                    "exchange_order_id": leg.exchange_order_id,
+                }
+                for leg in legs
+            ],
+            "confirmed_at": planned_at.isoformat(),
+        }
+        strategy_instance_id = str(batch.strategy_instance_id)
+    try:
+        plan_or_adopt_break_even_convergence(
+            session_factory,
+            trigger_type="confirmed_partial_close",
+            trigger_identity=str(batch_id),
+            trigger_evidence=evidence,
+            strategy_instance_id=strategy_instance_id,
+            planned_at=planned_at,
+            execution_mode=execution_mode,
+        )
+    except BreakEvenConvergencePlanningError:
+        with session_factory() as session:
+            batch = session.get(StrategyManagementBatch, int(batch_id))
+            if batch is not None and batch.status == "succeeded":
+                batch.status = "reconciling"
+                batch.reason_code = "automatic_break_even_planning_pending"
+                batch.completed_at = None
+                batch.updated_at = planned_at
+                session.commit()
 
 
 def _recover_confirmed_protection_legs(

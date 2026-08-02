@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import hashlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -3718,7 +3719,8 @@ def _has_nonzero_size(position: dict[str, Any]) -> bool:
     if size in (None, ""):
         size = position.get("size")
     try:
-        return abs(float(size or 0)) > 0
+        parsed = float(size or 0)
+        return math.isfinite(parsed) and abs(parsed) > 0
     except (TypeError, ValueError):
         return False
 
