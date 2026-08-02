@@ -874,4 +874,7 @@ def test_run_live_listener_connects_client_before_waiting_for_events():
 
     assert client.connect_calls == 1
     assert client.run_until_disconnected_calls == 1
-    assert len(client.handlers) == 1
+    assert [type(event_filter).__name__ for _, event_filter in client.handlers] == [
+        "NewMessage",
+        "MessageDeleted",
+    ]

@@ -3345,6 +3345,7 @@ def create_web_app(
     media_root: str | Path | None = None,
     live_target_titles: set[str] | None = None,
     live_listener_runner=None,
+    source_deletion_recorder=None,
     telegram_client: Any | None = None,
     live_listener_status_reason: str | None = None,
     group_labels_by_title: dict[str, str] | None = None,
@@ -3523,6 +3524,7 @@ def create_web_app(
                     context_resolution_worker=app.state.context_resolution_worker,
                     system_operator_bot_config=app.state.notification_bot_config,
                     operation_lock=app.state.telegram_operation_lock,
+                    source_deletion_recorder=app.state.source_deletion_recorder,
                 )
                 app.state.reconcile_task = asyncio.create_task(
                     _run_reconcile_after_startup_delay(
@@ -3722,6 +3724,7 @@ def create_web_app(
     app.state.prompt_test_runner = run_prompt_draft_test
     app.state.live_target_titles = live_target_titles or set()
     app.state.live_listener_runner = live_listener_runner or run_live_listener
+    app.state.source_deletion_recorder = source_deletion_recorder
     app.state.live_listener_task = None
     app.state.telegram_client = telegram_client
     app.state.live_listener_status_reason = live_listener_status_reason
@@ -3879,6 +3882,7 @@ def create_web_app(
                 context_resolution_worker=app.state.context_resolution_worker,
                 system_operator_bot_config=app.state.notification_bot_config,
                 operation_lock=app.state.telegram_operation_lock,
+                source_deletion_recorder=app.state.source_deletion_recorder,
             )
         reconcile_task = app.state.reconcile_task
         if reconcile_task is None or reconcile_task.done():

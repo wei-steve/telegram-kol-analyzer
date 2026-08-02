@@ -9,6 +9,7 @@ from telegram_kol_research.models import RawMessage
 from telegram_kol_research.message_recognition import MessageRecognitionResult
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_live_listener import persist_live_message_event
+from telegram_kol_research.telegram_live_listener import run_live_listener
 
 
 class _FakeSender:
@@ -39,6 +40,28 @@ class _FakeEvent:
         self.message = _FakeMessage(text=text)
 
 
+class _FakeListenerClient:
+    def __init__(self) -> None:
+        self.handlers = []
+        self.connect_calls = 0
+        self.run_until_disconnected_calls = 0
+
+    async def connect(self):
+        self.connect_calls += 1
+
+    def add_event_handler(self, handler, event):
+        self.handlers.append((handler, event))
+
+    async def run_until_disconnected(self):
+        self.run_until_disconnected_calls += 1
+
+
+class _FakeDeletedEvent:
+    def __init__(self, *, chat_id, deleted_ids):
+        self.chat_id = chat_id
+        self.deleted_ids = deleted_ids
+
+
 def test_persist_live_message_event_writes_db_and_broker_event(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     broker = LiveUpdateBroker()
@@ -60,6 +83,128 @@ def test_persist_live_message_event_writes_db_and_broker_event(tmp_path):
     assert stored.text == "live hello"
     assert broker.published_events[-1]["chat_id"] == 123
     assert broker.published_events[-1]["message_id"] == 42
+
+
+def test_live_listener_registers_and_records_each_deleted_message(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(
+                    chat_id=123,
+                    message_id=7,
+                    text="first",
+                    archived_target_group=True,
+                ),
+                RawMessage(
+                    chat_id=123,
+                    message_id=8,
+                    text="second",
+                    archived_target_group=True,
+                ),
+            ]
+        )
+        session.commit()
+    client = _FakeListenerClient()
+    recorded = []
+
+    def recorder(session_factory, **kwargs):
+        recorded.append(kwargs)
+
+    async def scenario():
+        await run_live_listener(
+            client=client,
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP"},
+            source_deletion_recorder=recorder,
+        )
+        assert len(client.handlers) == 2
+        deleted_handler = next(
+            handler
+            for handler, event_filter in client.handlers
+            if type(event_filter).__name__ == "MessageDeleted"
+        )
+        await deleted_handler(
+            _FakeDeletedEvent(chat_id=123, deleted_ids=[7, 8])
+        )
+
+    asyncio.run(scenario())
+
+    assert [item["message_id"] for item in recorded] == [7, 8]
+    assert {item["chat_id"] for item in recorded} == {123}
+    assert all(item["telegram_event"]["deleted_ids"] == [7, 8] for item in recorded)
+
+
+def test_live_listener_deletion_waits_for_operation_lock(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=123,
+                message_id=7,
+                text="first",
+                archived_target_group=True,
+            )
+        )
+        session.commit()
+    client = _FakeListenerClient()
+    recorded = []
+
+    async def scenario():
+        operation_lock = asyncio.Lock()
+        await run_live_listener(
+            client=client,
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP"},
+            source_deletion_recorder=lambda _factory, **kwargs: recorded.append(kwargs),
+            operation_lock=operation_lock,
+        )
+        deleted_handler = next(
+            handler
+            for handler, event_filter in client.handlers
+            if type(event_filter).__name__ == "MessageDeleted"
+        )
+        await operation_lock.acquire()
+        task = asyncio.create_task(
+            deleted_handler(_FakeDeletedEvent(chat_id=123, deleted_ids=[7]))
+        )
+        await asyncio.sleep(0)
+        assert recorded == []
+        operation_lock.release()
+        await task
+
+    asyncio.run(scenario())
+    assert [item["message_id"] for item in recorded] == [7]
+
+
+def test_live_listener_does_not_target_deletion_without_chat_id(
+    tmp_path, caplog
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    client = _FakeListenerClient()
+    recorded = []
+
+    async def scenario():
+        await run_live_listener(
+            client=client,
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP"},
+            source_deletion_recorder=lambda _factory, **kwargs: recorded.append(kwargs),
+        )
+        deleted_handler = next(
+            handler
+            for handler, event_filter in client.handlers
+            if type(event_filter).__name__ == "MessageDeleted"
+        )
+        await deleted_handler(_FakeDeletedEvent(chat_id=None, deleted_ids=[7]))
+
+    asyncio.run(scenario())
+
+    assert recorded == []
+    assert "without exact chat_id" in caplog.text
 
 
 def test_persist_live_message_event_triggers_strategy_alert_processor(tmp_path):

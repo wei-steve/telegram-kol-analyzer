@@ -40,6 +40,7 @@ from telegram_kol_research.recognition_decisions import (
     save_terminal_authoritative_decision,
 )
 from telegram_kol_research.strategy_alerts import process_strategy_alert_for_record
+from telegram_kol_research.source_message_deletion import record_source_message_deleted
 from telegram_kol_research.system_operator_bot import (
     deliver_message_instruction_summary_notification,
     deliver_pending_message_instruction_summaries,
@@ -662,8 +663,9 @@ async def run_live_listener(
     context_resolution_worker: Callable[[], Any] | None = None,
     system_operator_bot_config: Any | None = None,
     operation_lock: Any | None = None,
+    source_deletion_recorder: Callable[..., Any] | None = None,
 ) -> None:
-    """Attach Telethon new-message handlers and keep the client alive."""
+    """Attach Telethon source-message handlers and keep the client alive."""
 
     try:
         from telethon import events
@@ -701,6 +703,43 @@ async def run_live_listener(
             async with operation_lock:
                 await persist_live_message_event(**persist_kwargs)
 
+    async def handle_deleted_message(event: Any) -> None:
+        chat_id = getattr(event, "chat_id", None)
+        if chat_id is None:
+            logger.warning(
+                "Ignoring Telegram MessageDeleted event without exact chat_id"
+            )
+            return
+        deleted_ids = [
+            int(message_id)
+            for message_id in (getattr(event, "deleted_ids", None) or [])
+        ]
+        if not deleted_ids:
+            return
+        recorder = source_deletion_recorder or record_source_message_deleted
+        event_payload = {
+            "chat_id": int(chat_id),
+            "deleted_ids": deleted_ids,
+        }
+
+        async def persist_deletions() -> None:
+            for message_id in deleted_ids:
+                await maybe_await(
+                    recorder(
+                        session_factory,
+                        chat_id=int(chat_id),
+                        message_id=message_id,
+                        deleted_at=utc_now(),
+                        telegram_event=event_payload,
+                    )
+                )
+
+        if operation_lock is None:
+            await persist_deletions()
+        else:
+            async with operation_lock:
+                await persist_deletions()
+
     add_event_handler = getattr(client, "add_event_handler", None)
     if not callable(add_event_handler):
         raise RuntimeError("Telegram client does not support realtime event handlers")
@@ -710,6 +749,7 @@ async def run_live_listener(
         await maybe_await(connect())
 
     add_event_handler(handle_new_message, events.NewMessage())
+    add_event_handler(handle_deleted_message, events.MessageDeleted())
     run_until_disconnected = getattr(client, "run_until_disconnected", None)
     if callable(run_until_disconnected):
         await maybe_await(run_until_disconnected())
@@ -735,6 +775,7 @@ def launch_live_listener_task(
     context_resolution_worker: Callable[[], Any] | None = None,
     system_operator_bot_config: Any | None = None,
     operation_lock: Any | None = None,
+    source_deletion_recorder: Callable[..., Any] | None = None,
 ) -> asyncio.Task[None]:
     """Schedule the realtime listener in the current event loop."""
 
@@ -758,6 +799,7 @@ def launch_live_listener_task(
             "context_resolution_worker": context_resolution_worker,
             "system_operator_bot_config": system_operator_bot_config,
             "operation_lock": operation_lock,
+            "source_deletion_recorder": source_deletion_recorder,
         },
     )
     return asyncio.create_task(runner(**kwargs))
