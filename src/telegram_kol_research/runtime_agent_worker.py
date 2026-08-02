@@ -51,6 +51,7 @@ from telegram_kol_research.runtime_incidents import (
 @dataclass(frozen=True, slots=True)
 class RuntimeAgentWorkerConfig:
     enabled: bool = False
+    incident_types: frozenset[str] | None = None
     max_tool_steps: int = 4
     max_wall_seconds: float = 45.0
     max_prompt_bytes: int = 16_384
@@ -460,7 +461,10 @@ def run_runtime_agent_once(
         return RuntimeAgentWorkerResult(status="disabled")
     operation_now = now or datetime.now(UTC)
     claimable = list_claimable_runtime_incidents(
-        session_factory, now=operation_now, limit=1
+        session_factory,
+        now=operation_now,
+        limit=1,
+        incident_types=config.incident_types,
     )
     if not claimable:
         return RuntimeAgentWorkerResult(status="idle")
@@ -474,6 +478,7 @@ def run_runtime_agent_once(
         claim_expires_at=operation_now
         + timedelta(seconds=max(5.0, min(config.claim_lease_seconds, 3600.0))),
         prompt_version=RUNTIME_AGENT_PROMPT_VERSION,
+        incident_types=config.incident_types,
     )
     if claimed is None:
         return RuntimeAgentWorkerResult(status="claim_lost", incident_id=candidate.id)

@@ -4,6 +4,7 @@ import json
 import pytest
 
 import telegram_kol_research.context_resolution_worker as context_worker_module
+from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.context_resolution_worker import (
     build_redacted_exchange_state,
     build_context_state_fingerprint,
@@ -19,6 +20,7 @@ from telegram_kol_research.models import (
     MessageInstructionItem,
     PositionProtectionLedger,
     RawMessage,
+    RuntimeIncident,
     SignalCandidate,
     StrategyLifecycle,
     StrategyThread,
@@ -496,7 +498,30 @@ def test_exhausted_worker_records_incident_only_after_source_state_commits(
 
     def capture_best_effort(adapter, *args, **kwargs):
         with session_factory() as session:
-            assert session.get(ContextResolutionAttempt, attempt_id).status == "exhausted"
+            source = session.get(ContextResolutionAttempt, attempt_id)
+            assert source.status == "exhausted"
+            source_snapshot = (
+                source.status,
+                source.last_error,
+                source.attempts,
+                source.updated_at,
+            )
+        for _ in range(3):
+            adapter(
+                session_factory,
+                config=RuntimeIncidentConfig(
+                    capture_types=frozenset({"context_worker_exhausted"})
+                ),
+                **kwargs,
+            )
+        with session_factory() as session:
+            source = session.get(ContextResolutionAttempt, attempt_id)
+            assert (
+                source.status,
+                source.last_error,
+                source.attempts,
+                source.updated_at,
+            ) == source_snapshot
         captured.append((adapter, args, kwargs))
 
     monkeypatch.setattr(
@@ -527,3 +552,8 @@ def test_exhausted_worker_records_incident_only_after_source_state_commits(
             },
         )
     ]
+    with session_factory() as session:
+        incident = session.query(RuntimeIncident).one()
+        assert incident.incident_type == "context_worker_exhausted"
+        assert incident.generation == 1
+        assert incident.repeat_count == 3

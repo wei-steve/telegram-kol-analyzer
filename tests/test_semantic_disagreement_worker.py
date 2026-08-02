@@ -10,7 +10,7 @@ import pytest
 from telegram_kol_research.ai_recognition_config import AiProviderConfig, AiRecognitionConfig
 from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import RawMessage, RecognitionDecision
+from telegram_kol_research.models import RawMessage, RecognitionDecision, RuntimeIncident
 from telegram_kol_research.recognition_decisions import claim_next_semantic_review
 import telegram_kol_research.semantic_disagreement_review as review_module
 from telegram_kol_research.semantic_disagreement_review import (
@@ -175,7 +175,30 @@ def test_worker_retry_exhaustion_is_adapted_after_failed_state_commits(
 
     def capture(adapter, *args, **kwargs):
         with factory() as session:
-            assert session.query(RecognitionDecision).one().comparison_status == "failed"
+            source = session.query(RecognitionDecision).one()
+            assert source.comparison_status == "failed"
+            source_snapshot = (
+                source.comparison_status,
+                source.comparison_error,
+                source.comparison_attempts,
+                source.updated_at,
+            )
+        for _ in range(3):
+            adapter(
+                factory,
+                config=RuntimeIncidentConfig(
+                    capture_types=frozenset({"provider_retry_exhausted"})
+                ),
+                **kwargs,
+            )
+        with factory() as session:
+            source = session.query(RecognitionDecision).one()
+            assert (
+                source.comparison_status,
+                source.comparison_error,
+                source.comparison_attempts,
+                source.updated_at,
+            ) == source_snapshot
         calls.append((adapter, args, kwargs))
 
     monkeypatch.setattr(
@@ -211,6 +234,11 @@ def test_worker_retry_exhaustion_is_adapted_after_failed_state_commits(
             },
         )
     ]
+    with factory() as session:
+        incident = session.query(RuntimeIncident).one()
+        assert incident.incident_type == "provider_retry_exhausted"
+        assert incident.generation == 1
+        assert incident.repeat_count == 3
 
 
 def test_worker_recovers_stale_running_claim(tmp_path):
@@ -429,7 +457,28 @@ def test_worker_notification_failure_is_adapted_after_delivery_state_commits(
 
     def capture(adapter, *args, **kwargs):
         with factory() as session:
-            assert session.query(RecognitionDecision).one().notification_status == "failed"
+            source = session.query(RecognitionDecision).one()
+            assert source.notification_status == "failed"
+            source_snapshot = (
+                source.notification_status,
+                source.notification_error,
+                source.updated_at,
+            )
+        for _ in range(3):
+            adapter(
+                factory,
+                config=RuntimeIncidentConfig(
+                    capture_types=frozenset({"notification_delivery_failure"})
+                ),
+                **kwargs,
+            )
+        with factory() as session:
+            source = session.query(RecognitionDecision).one()
+            assert (
+                source.notification_status,
+                source.notification_error,
+                source.updated_at,
+            ) == source_snapshot
         calls.append((adapter, args, kwargs))
 
     monkeypatch.setattr(
@@ -462,6 +511,11 @@ def test_worker_notification_failure_is_adapted_after_delivery_state_commits(
             },
         )
     ]
+    with factory() as session:
+        incident = session.query(RuntimeIncident).one()
+        assert incident.incident_type == "notification_delivery_failure"
+        assert incident.generation == 1
+        assert incident.repeat_count == 3
 
 
 def test_notification_delivery_status_update_never_overwrites_newer_automation(tmp_path):

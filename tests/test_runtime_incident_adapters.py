@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from telegram_kol_research.config import (
+    READ_ONLY_CAPTURE_PROFILE,
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
@@ -22,6 +23,177 @@ from telegram_kol_research.runtime_incident_adapters import (
 
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+
+
+def test_read_only_capture_profile_is_closed_and_excludes_business_ambiguity():
+    assert READ_ONLY_CAPTURE_PROFILE == frozenset(
+        {
+            "provider_retry_exhausted",
+            "context_worker_exhausted",
+            "management_submit_unknown",
+            "management_partial_failed",
+            "management_recovery_required",
+            "severe_protection_incident",
+            "monitor_adapter_failure",
+            "monitor_audit_incomplete",
+            "notification_delivery_failure",
+        }
+    )
+    assert READ_ONLY_CAPTURE_PROFILE.isdisjoint(
+        {
+            "unresolved",
+            "hold",
+            "ambiguous_strategy_target",
+            "audit_abnormal",
+        }
+    )
+
+
+def test_capture_and_telegram_type_allowlists_are_independent():
+    config = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES": ",".join(
+                sorted(READ_ONLY_CAPTURE_PROFILE)
+            ),
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED": "true",
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES": (
+                "management_partial_failed"
+            ),
+            "TELEGRAM_KOL_RUNTIME_AGENT_TYPES": "management_partial_failed",
+            "TELEGRAM_KOL_RUNTIME_AGENT_ENABLED": "true",
+        },
+        env_file_paths=[],
+    )
+
+    assert config.capture_types == READ_ONLY_CAPTURE_PROFILE
+    assert config.notifies("management_partial_failed") is True
+    assert config.notifies("monitor_adapter_failure") is False
+    assert config.diagnoses("management_partial_failed") is True
+    assert config.diagnoses("monitor_adapter_failure") is False
+
+
+def test_notification_type_allowlist_preserves_legacy_and_supports_capture_only():
+    legacy = load_runtime_incident_config(
+        environ={"TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED": "true"},
+        env_file_paths=[],
+    )
+    capture_only = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED": "true",
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES": "",
+        },
+        env_file_paths=[],
+    )
+
+    assert legacy.telegram_notification_types is None
+    assert legacy.notifies("management_partial_failed") is True
+    assert capture_only.telegram_notification_types == frozenset()
+    assert capture_only.notifies("management_partial_failed") is False
+
+
+@pytest.mark.parametrize(
+    ("incident_type", "adapter", "source_projection"),
+    [
+        (
+            "provider_retry_exhausted",
+            capture_provider_failure,
+            {
+                "source_kind": "semantic_review",
+                "source_record_id": "501",
+                "provider_status": "retry_exhausted",
+                "error_type": "TimeoutError",
+                "occurred_at": NOW,
+            },
+        ),
+        (
+            "context_worker_exhausted",
+            capture_context_worker_state,
+            {
+                "attempt_id": 502,
+                "raw_message_id": 1502,
+                "status": "exhausted",
+                "error_type": "TimeoutError",
+                "occurred_at": NOW,
+            },
+        ),
+        *[
+            (
+                incident_type,
+                capture_management_state,
+                {
+                    "batch_id": 503 + index,
+                    "status": status,
+                    "reason_code": "durable_terminal_state",
+                    "occurred_at": NOW,
+                },
+            )
+            for index, (status, incident_type) in enumerate(
+                (
+                    ("submit_unknown", "management_submit_unknown"),
+                    ("partial_failed", "management_partial_failed"),
+                    ("recovery_required", "management_recovery_required"),
+                )
+            )
+        ],
+        (
+            "severe_protection_incident",
+            capture_protection_state,
+            {
+                "source_record_id": "506",
+                "severity": "critical",
+                "reason_code": "stop_trigger_failed",
+                "occurred_at": NOW,
+            },
+        ),
+        (
+            "monitor_adapter_failure",
+            capture_monitor_state,
+            {
+                "checked_at": NOW,
+                "reason_codes": ("adapter_failure",),
+                "adapter_failures": ("audit",),
+            },
+        ),
+        (
+            "monitor_audit_incomplete",
+            capture_monitor_state,
+            {
+                "checked_at": NOW,
+                "reason_codes": ("audit_incomplete",),
+                "adapter_failures": ("audit",),
+            },
+        ),
+        (
+            "notification_delivery_failure",
+            capture_notification_failure,
+            {
+                "source_kind": "production_safety_monitor_notification",
+                "source_record_id": "507",
+                "error_type": "notification_config_missing",
+                "occurred_at": NOW,
+            },
+        ),
+    ],
+)
+def test_capture_profile_adapters_deduplicate_one_generation(
+    tmp_path,
+    incident_type,
+    adapter,
+    source_projection,
+):
+    session_factory = create_session_factory(tmp_path / f"parity-{incident_type}.db")
+    for _ in range(3):
+        adapter(
+            session_factory,
+            config=_enabled(incident_type),
+            **source_projection,
+        )
+
+    rows = _rows(session_factory)
+    assert len(rows) == 1
+    assert rows[0].incident_type == incident_type
+    assert rows[0].generation == 1
+    assert rows[0].repeat_count == 3
 
 
 def _enabled(*incident_types: str) -> RuntimeIncidentConfig:

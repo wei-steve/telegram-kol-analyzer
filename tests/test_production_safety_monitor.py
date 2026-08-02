@@ -874,6 +874,76 @@ def test_monitor_records_adapter_failure_after_read_only_evaluation(tmp_path):
         assert row.incident_type == "monitor_adapter_failure"
 
 
+@pytest.mark.parametrize(
+    "incident_type",
+    [
+        "monitor_adapter_failure",
+        "monitor_audit_incomplete",
+    ],
+)
+def test_monitor_failure_capture_repeats_one_generation_without_business_rows(
+    tmp_path,
+    incident_type,
+):
+    session_factory = create_session_factory(tmp_path / f"{incident_type}.db")
+    adapters = _RecordingAdapters(
+        audit=_healthy_audit(output_complete=False)
+    )
+    if incident_type == "monitor_adapter_failure":
+        adapters.read_service_state = lambda: (_ for _ in ()).throw(
+            RuntimeError("service adapter unavailable")
+        )
+    kwargs = {
+        "expectations": EXPECTATIONS,
+        "state_path": tmp_path / f"{incident_type}.json",
+        "adapters": adapters,
+        "now": datetime(2026, 7, 16, 1, 30, tzinfo=UTC),
+        "notify": False,
+        "runtime_incident_session_factory": session_factory,
+        "runtime_incident_config": RuntimeIncidentConfig(
+            capture_types=frozenset({incident_type})
+        ),
+    }
+
+    for _ in range(3):
+        run_production_safety_monitor(**kwargs)
+
+    with session_factory() as session:
+        row = session.query(RuntimeIncident).one()
+        assert row.incident_type == incident_type
+        assert row.generation == 1
+        assert row.repeat_count == 3
+        assert session.query(StrategyManagementBatch).count() == 0
+        assert session.query(PositionProtectionIncident).count() == 0
+
+
+def test_monitor_missing_notification_config_repeats_one_generation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "notify-config-missing.db")
+    kwargs = {
+        "expectations": EXPECTATIONS,
+        "state_path": tmp_path / "notify-config-missing.json",
+        "adapters": _RecordingAdapters(service_state="failed"),
+        "now": datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+        "notify": True,
+        "load_bot_config": lambda: None,
+        "runtime_incident_session_factory": session_factory,
+        "runtime_incident_config": RuntimeIncidentConfig(
+            capture_types=frozenset({"notification_delivery_failure"})
+        ),
+    }
+
+    outcomes = [run_production_safety_monitor(**kwargs) for _ in range(3)]
+
+    assert {outcome.monitor_error for outcome in outcomes} == {
+        "notification_config_missing"
+    }
+    with session_factory() as session:
+        row = session.query(RuntimeIncident).one()
+        assert row.incident_type == "notification_delivery_failure"
+        assert row.generation == 1
+        assert row.repeat_count == 3
+
+
 def test_monitor_adapts_each_durable_severe_protection_incident_once(tmp_path):
     session_factory = create_session_factory(tmp_path / "protection-incident.db")
     with session_factory() as session:
@@ -913,6 +983,13 @@ def test_monitor_adapts_each_durable_severe_protection_incident_once(tmp_path):
         session.add(source)
         session.commit()
         source_id = source.id
+        source_snapshot = (
+            source.incident_type,
+            source.fingerprint,
+            source.evidence_json,
+            source.delivery_status,
+            source.updated_at,
+        )
 
     kwargs = {
         "expectations": EXPECTATIONS,
@@ -932,12 +1009,25 @@ def test_monitor_adapts_each_durable_severe_protection_incident_once(tmp_path):
         **kwargs,
         now=datetime(2026, 7, 16, 0, 31, tzinfo=UTC),
     )
+    run_production_safety_monitor(
+        **kwargs,
+        now=datetime(2026, 7, 16, 0, 32, tzinfo=UTC),
+    )
 
     with session_factory() as session:
         row = session.query(RuntimeIncident).one()
         assert row.incident_type == "severe_protection_incident"
         assert row.source_record_id == str(source_id)
+        assert row.generation == 1
         assert row.repeat_count == 1
+        source = session.get(PositionProtectionIncident, source_id)
+        assert (
+            source.incident_type,
+            source.fingerprint,
+            source.evidence_json,
+            source.delivery_status,
+            source.updated_at,
+        ) == source_snapshot
 
 
 def test_monitor_notification_failure_is_adapted_without_changing_outcome(tmp_path):
@@ -967,7 +1057,32 @@ def test_monitor_notification_failure_is_adapted_without_changing_outcome(tmp_pa
         assert row.incident_type == "notification_delivery_failure"
 
 
-def test_monitor_adapts_durable_management_submit_unknown_once(tmp_path):
+@pytest.mark.parametrize(
+    ("source_status", "incident_type", "reason_code"),
+    [
+        (
+            "submit_unknown",
+            "management_submit_unknown",
+            "one_or_more_close_submissions_unknown",
+        ),
+        (
+            "partial_failed",
+            "management_partial_failed",
+            "one_or_more_close_submissions_failed",
+        ),
+        (
+            "recovery_required",
+            "management_recovery_required",
+            "reconciliation_required",
+        ),
+    ],
+)
+def test_monitor_adapts_each_durable_management_failure_once(
+    tmp_path,
+    source_status,
+    incident_type,
+    reason_code,
+):
     session_factory = create_session_factory(tmp_path / "management-source.db")
     with session_factory() as session:
         raw = RawMessage(chat_id=1, message_id=2, text="close")
@@ -995,14 +1110,21 @@ def test_monitor_adapts_durable_management_submit_unknown_once(tmp_path):
                 execution_order_leg_id=94,
                 pos_id="pos-1",
                 leg_index=0,
-                status="submit_unknown",
+                status=source_status,
                 planned_close_size="0.02",
                 last_error={"reason": "submission_outcome_unknown"},
             )
         ],
-        status="reconciling",
-        reason_code="one_or_more_close_submissions_unknown",
+        status=source_status,
+        reason_code=reason_code,
     )
+    with session_factory() as session:
+        persisted_batch = session.get(StrategyManagementBatch, batch.id)
+        source_snapshot = (
+            persisted_batch.status,
+            persisted_batch.reason_code,
+            persisted_batch.updated_at,
+        )
     kwargs = {
         "expectations": EXPECTATIONS,
         "state_path": tmp_path / "state.json",
@@ -1010,7 +1132,7 @@ def test_monitor_adapts_durable_management_submit_unknown_once(tmp_path):
         "notify": False,
         "runtime_incident_session_factory": session_factory,
         "runtime_incident_config": RuntimeIncidentConfig(
-            capture_types=frozenset({"management_submit_unknown"})
+            capture_types=frozenset({incident_type})
         ),
     }
 
@@ -1022,12 +1144,23 @@ def test_monitor_adapts_durable_management_submit_unknown_once(tmp_path):
         **kwargs,
         now=datetime(2026, 7, 16, 0, 31, tzinfo=UTC),
     )
+    run_production_safety_monitor(
+        **kwargs,
+        now=datetime(2026, 7, 16, 0, 32, tzinfo=UTC),
+    )
 
     with session_factory() as session:
         row = session.query(RuntimeIncident).one()
-        assert row.incident_type == "management_submit_unknown"
+        assert row.incident_type == incident_type
         assert row.source_record_id == str(batch.id)
+        assert row.generation == 1
         assert row.repeat_count == 1
+        persisted_batch = session.get(StrategyManagementBatch, batch.id)
+        assert (
+            persisted_batch.status,
+            persisted_batch.reason_code,
+            persisted_batch.updated_at,
+        ) == source_snapshot
 
 
 def test_durable_source_scan_failure_does_not_change_monitor_outcome(tmp_path):

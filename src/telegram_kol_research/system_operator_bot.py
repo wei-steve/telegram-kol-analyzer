@@ -1409,6 +1409,7 @@ def claim_next_runtime_incident_notification(
     *,
     claimed_at: datetime | None = None,
     lease_seconds: float = 120.0,
+    notification_types: frozenset[str] | None = None,
 ):
     """CAS one pending, failed, or stale runtime-incident delivery."""
 
@@ -1416,7 +1417,7 @@ def claim_next_runtime_incident_notification(
 
     now = claimed_at or datetime.now(UTC)
     stale_before = now - timedelta(seconds=max(5.0, float(lease_seconds)))
-    claimable = or_(
+    claimable_status = or_(
         RuntimeIncident.notification_status == "pending",
         and_(
             RuntimeIncident.notification_status == "failed",
@@ -1433,6 +1434,15 @@ def claim_next_runtime_incident_notification(
             )
         ),
     )
+    if notification_types is not None:
+        if not notification_types:
+            return None
+        claimable = and_(
+            claimable_status,
+            RuntimeIncident.incident_type.in_(tuple(sorted(notification_types))),
+        )
+    else:
+        claimable = claimable_status
     with session_factory() as session:
         row_id = (
             session.query(RuntimeIncident.id)
@@ -1486,6 +1496,9 @@ async def deliver_runtime_incident_notifications(
     feature_config = runtime_config or load_runtime_incident_config()
     if not feature_config.telegram_notifications_enabled:
         return 0
+    notification_types = feature_config.telegram_notification_types
+    if notification_types == frozenset():
+        return 0
     operation_now = claimed_at or datetime.now(UTC)
     delivered = 0
     for _ in range(max(1, min(int(limit), 100))):
@@ -1493,6 +1506,7 @@ async def deliver_runtime_incident_notifications(
             session_factory,
             claimed_at=claimed_at,
             lease_seconds=feature_config.notification_lease_seconds,
+            notification_types=notification_types,
         )
         if claim is None:
             break

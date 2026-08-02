@@ -657,14 +657,21 @@ def list_claimable_runtime_incidents(
     *,
     now: datetime,
     limit: int = 20,
+    incident_types: frozenset[str] | None = None,
 ) -> list[RuntimeIncident]:
     """Return a bounded oldest-first snapshot of claimable incident rows."""
 
     bounded_limit = max(1, min(int(limit), MAX_CLAIMABLE_LIMIT))
+    if incident_types == frozenset():
+        return []
     with session_factory() as session:
+        query = session.query(RuntimeIncident).filter(_claimable(now))
+        if incident_types is not None:
+            query = query.filter(
+                RuntimeIncident.incident_type.in_(tuple(sorted(incident_types)))
+            )
         rows = (
-            session.query(RuntimeIncident)
-            .filter(_claimable(now))
+            query
             .order_by(
                 RuntimeIncident.last_occurred_at,
                 RuntimeIncident.id,
@@ -734,12 +741,15 @@ def claim_runtime_incident(
     claimed_at: datetime,
     claim_expires_at: datetime,
     prompt_version: str | None = None,
+    incident_types: frozenset[str] | None = None,
 ) -> RuntimeIncident | None:
     """Claim one row through a compare-and-set update."""
 
     token = _validate_required_text("claim_token", claim_token, maximum=64)
     if claim_expires_at <= claimed_at:
         raise ValueError("claim_expires_at must be after claimed_at")
+    if incident_types == frozenset():
+        return None
     with session_factory() as session:
         claim_values: dict[str, object | None] = {
             "status": _CLAIMED_STATUS,
@@ -754,12 +764,17 @@ def claim_runtime_incident(
             claim_values["prompt_version"] = _validate_required_text(
                 "prompt_version", prompt_version, maximum=64
             )
+        claim_conditions = [
+            RuntimeIncident.id == int(incident_id),
+            _claimable(claimed_at),
+        ]
+        if incident_types is not None:
+            claim_conditions.append(
+                RuntimeIncident.incident_type.in_(tuple(sorted(incident_types)))
+            )
         incident_id_result = session.execute(
             update(RuntimeIncident)
-            .where(
-                RuntimeIncident.id == int(incident_id),
-                _claimable(claimed_at),
-            )
+            .where(*claim_conditions)
             .values(**claim_values)
             .returning(RuntimeIncident.id)
         ).scalar_one_or_none()

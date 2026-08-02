@@ -8,11 +8,17 @@ project: runtime-incident-agent
 design_version: 1
 current_phase: 8R.2
 phase_name: technical-incident-capture
-phase_status: planned
+phase_status: in_progress
 last_completed_phase: "8R.1"
 last_completed_commit: 2449382
 production_commit: 2449382bd53195950b42ec6052fb4e6dee4fb9cd
 local_tests:
+  - "phase-8r.2-monitor-policy-contract: 314 passed, 1 Linux-only installation probe skipped"
+  - "phase-8r.2-final-source-parity-and-gating-regression: 573 passed"
+  - "phase-8r.2-capture-notification-agent-focused: 252 passed"
+  - "phase-8r.2-source-adapter-and-production-path-focused: 496 passed"
+  - "phase-8r.2-runtime-agent-and-notification-focused: 154 passed"
+  - "phase-8r.2-plan replacement: tests/test_protection_health.py does not exist; protection coverage ran through tests/test_protection_ledger.py and tests/test_execution_bindings.py"
   - "phase-8r.1-monitor-observability-focused: 192 passed, 1 Linux-only systemd sandbox probe skipped"
   - "phase-8r.1-critical-runtime-regressions: 36 passed, 2 known sqlite deprecation warnings"
   - "phase-8r.1-review: no remaining Critical or Important findings; the final root-portable CLI regression test passed after the sole Minor review note was addressed"
@@ -145,7 +151,7 @@ server_verification:
   phase_8r_1_deployed_tests: "193 focused tests passed; 36 critical runtime regressions passed with 10 deprecation warnings. Main service and Runtime Agent are active; Agent action authority is false and both playbook allowlists are empty."
   phase_8r_1_activation: "A fresh activation gate again proved zero recognition, context, management, position-mutation, runtime-claim, or recovery work in flight. Exactly one reviewed monitor test-notification invocation returned sent. The timer is enabled/active with its next run scheduled; the first bounded notification-enabled run returned monitor_error null and notification_status sent for the known audit_abnormal baseline, with no notification_config_missing."
   phase_8r_1_continuity: "Main service and Runtime Agent remain active; raw message 8995 completed recognition; the Agent is idle, action authority is false, and both playbook allowlists are empty. The monitor state remains readable by its dedicated identity at mode 0600."
-  remaining: "Begin only Phase 8R.2 from the standard implementation trigger. Expand reviewed existing technical incident capture in capture-only mode, with Telegram delivery for new types still disabled. Do not implement the invariant scanner or any later Phase 8R stage."
+  remaining: "Phase 8R.2 local capture-only implementation is in progress. Before widening production capture, deploy the reviewed code dormant, atomically pin Telegram and Agent selectors to the currently approved legacy types, then enable and compare each additional capture type without Telegram or Agent claims. Do not implement the invariant scanner or any later Phase 8R stage."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"

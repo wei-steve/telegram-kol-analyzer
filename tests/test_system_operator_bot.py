@@ -358,6 +358,54 @@ def test_runtime_incident_delivery_is_disabled_without_claiming(tmp_path):
         assert row.notification_claim_token is None
 
 
+def test_runtime_incident_delivery_claims_only_exact_notification_types(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "runtime-type-filter.db")
+    capture_only = _record_runtime_incident(
+        session_factory,
+        source_record_id="monitor-adapter",
+        incident_type="monitor_adapter_failure",
+        fingerprint="b" * 64,
+    )
+    allowed = _record_runtime_incident(
+        session_factory,
+        source_record_id="management-partial",
+        incident_type="management_partial_failed",
+        fingerprint="c" * 64,
+    )
+    deliveries = []
+
+    async def capture(**kwargs):
+        deliveries.append(kwargs["text"])
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "send_system_operator_bot_message",
+        capture,
+    )
+    delivered = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=RuntimeIncidentConfig(
+                telegram_notifications_enabled=True,
+                telegram_notification_types=frozenset(
+                    {"management_partial_failed"}
+                ),
+            ),
+            claimed_at=NOW,
+        )
+    )
+
+    assert delivered == 1
+    assert f"事件ID: {allowed.id}" in deliveries[0]
+    with session_factory() as session:
+        assert session.get(RuntimeIncident, allowed.id).notification_status == "delivered"
+        assert session.get(RuntimeIncident, capture_only.id).notification_status == "pending"
+
+
 def test_runtime_incident_notification_retries_failure_and_deduplicates_success(
     tmp_path,
     monkeypatch,

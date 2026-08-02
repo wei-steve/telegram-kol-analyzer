@@ -264,9 +264,13 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert "useradd --system" in installer
     assert 'if [[ "$(id -u "$MONITOR_USER")" -eq 0 || "$(id -gn "$MONITOR_USER")" != "$MONITOR_GROUP" ]]; then' in installer
     assert 'CREDENTIAL_FILE="/etc/telegram-kol-monitor.credentials"' in installer
+    assert 'RUNTIME_POLICY_FILE="$PRODUCTION_ROOT/config/runtime_incident_agent.env"' in installer
     assert "TELEGRAM_KOL_SYSTEM_BOT_TOKEN" in installer
     assert "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD" in installer
+    assert "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES" in installer
+    assert "capture_policy" in installer
+    assert "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY" not in installer
     assert "DEEP_API" not in installer
     assert "DEEPCOIN" not in installer.upper()
     assert 'install -o root -g root -m 0600 "$env_source" "$ENV_FILE"' in installer

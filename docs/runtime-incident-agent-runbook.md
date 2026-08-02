@@ -111,6 +111,14 @@ Phase 2 uses two independent, dormant-by-default settings:
 - `TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED`: only `1`, `true`, `yes`,
   or `on` enables deterministic incident delivery. Empty or any other value
   disables delivery.
+- `TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES`: optional comma-separated
+  exact incident-type delivery allowlist. When absent, legacy global delivery
+  behavior is preserved. When present but empty, no runtime incident is
+  claimed for Telegram delivery.
+- `TELEGRAM_KOL_RUNTIME_AGENT_TYPES`: optional comma-separated exact
+  incident-type diagnosis allowlist. When absent, legacy Agent behavior is
+  preserved. When present but empty, the Agent remains supervised but claims
+  no runtime incident for AI diagnosis.
 
 The first canary must set exactly one capture type and leave Telegram delivery
 off. Compare source rows with `runtime_incidents` fingerprints and repeat
@@ -344,6 +352,43 @@ Execute Phase 8R using these separately reviewed runtime stages:
 4. canary one deterministic notification rule at a time;
 5. enable bounded AI diagnosis and Codex handoff only for a proven rule;
 6. expand the rule catalog and continuous-quality metrics.
+
+Task 8R.2 uses the closed `READ_ONLY_CAPTURE_PROFILE`: provider retry
+exhaustion, contextual worker exhaustion, the three terminal management
+failure states, severe protection incidents, monitor adapter or incomplete
+audit failures, and notification delivery failures. It excludes unresolved or
+held business outcomes, ambiguous strategy targeting, and ordinary audit
+abnormalities. During capture comparison, every newly enabled type must be
+absent from both the Telegram and Agent type allowlists. Three identical source
+scans must retain one fingerprint generation, and the authoritative source
+row plus its `updated_at` must remain unchanged.
+
+Management and protection sources are repeatable durable scans. Provider,
+context-worker, and notification failures are one-shot callbacks emitted only
+after their authoritative terminal-state commit; their parity check replays
+the same reviewed callback projection three times and verifies that only the
+runtime incident repeat counter changes. Monitor failures have no business
+source row: parity is three identical monitor evaluations with zero management
+or protection rows created or changed.
+
+When Telegram delivery or the Runtime Agent is already enabled, migrate both
+selectors before widening capture. In one proven safe window, keep the capture
+list unchanged, set `TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES` and
+`TELEGRAM_KOL_RUNTIME_AGENT_TYPES` to the exact currently approved legacy
+types, reload the main service and sidecar, and verify that no unapproved type
+is claimable. Only then add capture types one at a time while leaving both
+selectors unchanged. An absent selector means legacy-all and is not a safe
+capture-only production setting.
+
+The independent monitor receives the same exact capture allowlist through its
+root-owned `/etc/telegram-kol-monitor.env`, but no Agent/provider setting or
+credential. `scripts/install_server_monitor.sh` extracts only
+`TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES` from the root-owned runtime
+policy file. Therefore each safe-window capture change must regenerate the
+monitor environment with the timer stopped, verify the installed allowlist,
+then restart/reload the main service and monitor schedule as one staged policy
+change. The Telegram and Agent selectors remain confined to their existing
+service configuration.
 
 At most one runtime stage may be implemented per user turn. New code and
 configuration default off. A first deployment never enables its feature. A

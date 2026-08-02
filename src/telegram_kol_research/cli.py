@@ -2995,6 +2995,7 @@ def runtime_incident_agent_once(
     )
     worker_config = RuntimeAgentWorkerConfig(
         enabled=runtime_config.agent_enabled,
+        incident_types=runtime_config.agent_incident_types,
         max_tool_steps=runtime_config.agent_max_tool_steps,
         max_wall_seconds=runtime_config.agent_max_wall_seconds,
         max_prompt_bytes=runtime_config.agent_max_prompt_bytes,
@@ -3085,6 +3086,7 @@ def runtime_incident_agent_worker(
     )
     worker_config = RuntimeAgentWorkerConfig(
         enabled=True,
+        incident_types=runtime_config.agent_incident_types,
         max_tool_steps=runtime_config.agent_max_tool_steps,
         max_wall_seconds=runtime_config.agent_max_wall_seconds,
         max_prompt_bytes=runtime_config.agent_max_prompt_bytes,

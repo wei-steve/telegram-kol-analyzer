@@ -104,6 +104,56 @@ def test_worker_is_dormant_by_default_and_does_not_claim_or_call_model(tmp_path)
         assert session.get(RuntimeIncident, incident.id).status == "pending"
 
 
+def test_worker_claims_only_exact_agent_incident_types(tmp_path):
+    session_factory = create_session_factory(tmp_path / "agent-type-filter.db")
+    capture_only = _record(session_factory, generation=1)
+    diagnosed = record_runtime_incident(
+        session_factory,
+        source_kind="strategy_management_batch",
+        source_record_id="42",
+        incident_type="management_partial_failed",
+        severity="high",
+        fingerprint="e" * 64,
+        redacted_summary=(
+            '{"component":"strategy_management",'
+            '"source_status":"partial_failed"}'
+        ),
+        occurred_at=NOW + timedelta(minutes=2),
+        feature_policy_version="runtime-incident-phase-6-v1",
+        prompt_version="runtime-agent-prompt-v7",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    turns = iter(
+        (
+            {
+                "tool_call": {
+                    "id": "call-filtered",
+                    "name": "get_incident_summary",
+                    "arguments": {"incident_id": diagnosed.id},
+                }
+            },
+            _final(diagnosed.id),
+        )
+    )
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            incident_types=frozenset({"management_partial_failed"}),
+        ),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: next(turns),
+        now=NOW + timedelta(minutes=3),
+    )
+
+    assert result.status == "diagnosed"
+    assert result.incident_id == diagnosed.id
+    with session_factory() as session:
+        assert session.get(RuntimeIncident, capture_only.id).status == "pending"
+        assert session.get(RuntimeIncident, diagnosed.id).status == "diagnosed"
+
+
 def test_sidecar_loop_drains_ready_incidents_then_polls_when_idle():
     results = iter(
         (

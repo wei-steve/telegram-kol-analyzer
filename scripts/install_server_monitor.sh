@@ -32,6 +32,7 @@ TIMER_DEST="/etc/systemd/system/telegram-kol-monitor.timer"
 TEST_NOTIFICATION_DEST="/etc/systemd/system/telegram-kol-monitor-test-notification.service"
 DIAGNOSTIC_DEST="/etc/systemd/system/telegram-kol-monitor-diagnostic.service"
 CREDENTIAL_FILE="/etc/telegram-kol-monitor.credentials"
+RUNTIME_POLICY_FILE="$PRODUCTION_ROOT/config/runtime_incident_agent.env"
 ENV_FILE="/etc/telegram-kol-monitor.env"
 STATE_DIRECTORY="/var/lib/telegram-kol-monitor"
 STATE_FILE="$STATE_DIRECTORY/state.json"
@@ -116,6 +117,23 @@ if grep -Ev '^(#.*|[[:space:]]*|TELEGRAM_KOL_SYSTEM_BOT_TOKEN=[A-Za-z0-9:_.-]+|T
 fi
 if [[ "$(grep -c '^TELEGRAM_KOL_SYSTEM_BOT_TOKEN=' "$CREDENTIAL_FILE")" -ne 1 || "$(grep -c '^TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID=' "$CREDENTIAL_FILE")" -ne 1 ]]; then
   echo "Monitor credential file must contain exactly one bot token and chat ID." >&2
+  exit 1
+fi
+if [[ ! -f "$RUNTIME_POLICY_FILE" || -L "$RUNTIME_POLICY_FILE" ]]; then
+  echo "Missing regular runtime policy file $RUNTIME_POLICY_FILE." >&2
+  exit 1
+fi
+if [[ "$(stat -c %u "$RUNTIME_POLICY_FILE")" != "0" || "$(stat -c %a "$RUNTIME_POLICY_FILE")" != "600" ]]; then
+  echo "Runtime policy file must be owned by root with mode 0600." >&2
+  exit 1
+fi
+if [[ "$(grep -c '^TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES=' "$RUNTIME_POLICY_FILE")" -ne 1 ]]; then
+  echo "Runtime policy file must contain exactly one capture allowlist." >&2
+  exit 1
+fi
+capture_policy="$(grep '^TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES=' "$RUNTIME_POLICY_FILE")"
+if [[ ! "$capture_policy" =~ ^TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES=([a-z0-9_]+(,[a-z0-9_]+)*)?$ ]]; then
+  echo "Runtime incident capture allowlist contains an invalid value." >&2
   exit 1
 fi
 if [[ -e "$STATE_FILE" || -L "$STATE_FILE" ]]; then
@@ -206,6 +224,7 @@ trap 'rm -f "$env_source"' EXIT
 chmod 0600 "$env_source"
 grep '^TELEGRAM_KOL_SYSTEM_BOT_' "$CREDENTIAL_FILE" > "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=%s\n' "$expected_head" >> "$env_source"
+printf '%s\n' "$capture_policy" >> "$env_source"
 
 install -o root -g root -m 0600 "$env_source" "$ENV_FILE"
 install -o root -g root -m 0644 "$SERVICE_SOURCE" "$SERVICE_DEST"

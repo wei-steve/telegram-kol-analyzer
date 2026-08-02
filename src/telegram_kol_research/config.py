@@ -9,6 +9,21 @@ from pathlib import Path
 from telegram_kol_research.llm_chat import _load_env_file_values
 
 
+READ_ONLY_CAPTURE_PROFILE = frozenset(
+    {
+        "provider_retry_exhausted",
+        "context_worker_exhausted",
+        "management_submit_unknown",
+        "management_partial_failed",
+        "management_recovery_required",
+        "severe_protection_incident",
+        "monitor_adapter_failure",
+        "monitor_audit_incomplete",
+        "notification_delivery_failure",
+    }
+)
+
+
 @dataclass(slots=True)
 class AppConfig:
     base_dir: Path = Path.cwd()
@@ -23,8 +38,10 @@ class RuntimeIncidentConfig:
 
     capture_types: frozenset[str] = frozenset()
     telegram_notifications_enabled: bool = False
+    telegram_notification_types: frozenset[str] | None = None
     notification_lease_seconds: float = 120.0
     agent_enabled: bool = False
+    agent_incident_types: frozenset[str] | None = None
     agent_max_tool_steps: int = 4
     agent_max_wall_seconds: float = 45.0
     agent_max_prompt_bytes: int = 16_384
@@ -40,6 +57,18 @@ class RuntimeIncidentConfig:
 
     def captures(self, incident_type: str) -> bool:
         return incident_type in self.capture_types
+
+    def notifies(self, incident_type: str) -> bool:
+        return self.telegram_notifications_enabled and (
+            self.telegram_notification_types is None
+            or incident_type in self.telegram_notification_types
+        )
+
+    def diagnoses(self, incident_type: str) -> bool:
+        return self.agent_enabled and (
+            self.agent_incident_types is None
+            or incident_type in self.agent_incident_types
+        )
 
 
 def _enabled_flag(value: str | None) -> bool:
@@ -81,12 +110,32 @@ def load_runtime_incident_config(
         ).split(",")
         if item.strip()
     )
+    telegram_types_key = "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES"
+    telegram_notification_types = (
+        frozenset(
+            item.strip().lower()
+            for item in env.get(telegram_types_key, "").split(",")
+            if item.strip()
+        )
+        if telegram_types_key in env
+        else None
+    )
     agent_shadow_playbooks = frozenset(
         item.strip().lower()
         for item in env.get(
             "TELEGRAM_KOL_RUNTIME_AGENT_SHADOW_PLAYBOOKS", ""
         ).split(",")
         if item.strip()
+    )
+    agent_types_key = "TELEGRAM_KOL_RUNTIME_AGENT_TYPES"
+    agent_incident_types = (
+        frozenset(
+            item.strip().lower()
+            for item in env.get(agent_types_key, "").split(",")
+            if item.strip()
+        )
+        if agent_types_key in env
+        else None
     )
     agent_action_playbooks = frozenset(
         item.strip().lower()
@@ -147,10 +196,12 @@ def load_runtime_incident_config(
         telegram_notifications_enabled=_enabled_flag(
             env.get("TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED")
         ),
+        telegram_notification_types=telegram_notification_types,
         notification_lease_seconds=max(5.0, min(lease_seconds, 3600.0)),
         agent_enabled=_enabled_flag(
             env.get("TELEGRAM_KOL_RUNTIME_AGENT_ENABLED")
         ),
+        agent_incident_types=agent_incident_types,
         agent_max_tool_steps=max(1, min(agent_tool_steps, 4)),
         agent_max_wall_seconds=max(5.0, min(agent_wall_seconds, 120.0)),
         agent_max_prompt_bytes=max(4096, min(agent_prompt_bytes, 32_768)),
