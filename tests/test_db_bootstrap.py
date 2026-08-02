@@ -189,6 +189,103 @@ def test_position_mutation_and_management_sla_schema(tmp_path):
     assert sla_columns <= item_columns
 
 
+def test_database_bootstrap_creates_break_even_convergence_schema(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        table_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        observation_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(position_reconciliation_observations)"
+            )
+        }
+        convergence_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(strategy_break_even_convergences)"
+            )
+        }
+        leg_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(strategy_break_even_convergence_legs)"
+            )
+        }
+        index_names = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list(strategy_break_even_convergences)"
+            )
+        } | {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list(strategy_break_even_convergence_legs)"
+            )
+        }
+
+    assert {
+        "position_reconciliation_observations",
+        "strategy_break_even_convergences",
+        "strategy_break_even_convergence_legs",
+    } <= table_names
+    assert {
+        "venue",
+        "execution_binding_id",
+        "execution_order_leg_id",
+        "strategy_instance_id",
+        "pos_id",
+        "instrument_id",
+        "side",
+        "size_text",
+        "avg_entry_price",
+        "pending_tpsl_json",
+        "snapshot_complete",
+        "snapshot_fingerprint",
+        "observed_at",
+    } <= observation_columns
+    assert {
+        "venue",
+        "strategy_instance_id",
+        "execution_binding_id",
+        "target_lifecycle_id",
+        "trigger_type",
+        "trigger_identity",
+        "trigger_evidence_json",
+        "target_snapshot_json",
+        "execution_mode",
+        "status",
+        "reason_code",
+        "planned_at",
+        "started_at",
+        "completed_at",
+        "updated_at",
+    } <= convergence_columns
+    assert {
+        "convergence_id",
+        "execution_order_leg_id",
+        "pos_id",
+        "preflight_size",
+        "avg_entry_price",
+        "old_protection_json",
+        "decision_json",
+        "mutation_intent_id",
+        "exchange_order_id",
+        "status",
+        "reason_code",
+    } <= leg_columns
+    assert {
+        "uq_strategy_break_even_convergence_trigger",
+        "uq_strategy_break_even_convergence_leg_position",
+    } <= index_names
+
+
 def test_database_bootstrap_creates_prompt_registry_tables(tmp_path):
     database_path = tmp_path / "research.db"
     create_session_factory(database_path)

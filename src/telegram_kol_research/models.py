@@ -1512,6 +1512,176 @@ class PositionTakeProfitOrder(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class PositionReconciliationObservation(Base):
+    """Immutable complete-or-incomplete exchange observation for one exact position."""
+
+    __tablename__ = "position_reconciliation_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "venue",
+            "pos_id",
+            "snapshot_fingerprint",
+            name="uq_position_reconciliation_observation_fingerprint",
+        ),
+        Index(
+            "ix_position_reconciliation_observations_position",
+            "venue",
+            "pos_id",
+            "observed_at",
+        ),
+        Index(
+            "ix_position_reconciliation_observations_leg",
+            "execution_order_leg_id",
+            "observed_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="deepcoin", server_default="deepcoin"
+    )
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    strategy_instance_id: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True
+    )
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    instrument_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    size_text: Mapped[str] = mapped_column(String(64), nullable=False)
+    avg_entry_price: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    pending_tpsl_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]"
+    )
+    snapshot_complete: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sql_text("0")
+    )
+    snapshot_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
+class StrategyBreakEvenConvergence(Base):
+    """One durable strategy-wide break-even convergence trigger."""
+
+    __tablename__ = "strategy_break_even_convergences"
+    __table_args__ = (
+        Index(
+            "uq_strategy_break_even_convergence_trigger",
+            "venue",
+            "strategy_instance_id",
+            "trigger_type",
+            "trigger_identity",
+            unique=True,
+        ),
+        Index(
+            "ix_strategy_break_even_convergences_status",
+            "status",
+            "planned_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="deepcoin", server_default="deepcoin"
+    )
+    strategy_instance_id: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True
+    )
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    target_lifecycle_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_lifecycles.id"), nullable=False, index=True
+    )
+    trigger_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    trigger_evidence_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default="{}"
+    )
+    target_snapshot_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default="{}"
+    )
+    execution_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="disabled", server_default="disabled"
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="planned", server_default="planned"
+    )
+    reason_code: Mapped[Optional[str]] = mapped_column(String(96), nullable=True)
+    planned_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
+class StrategyBreakEvenConvergenceLeg(Base):
+    """Durable per-position progress for one strategy break-even convergence."""
+
+    __tablename__ = "strategy_break_even_convergence_legs"
+    __table_args__ = (
+        Index(
+            "uq_strategy_break_even_convergence_leg_position",
+            "convergence_id",
+            "pos_id",
+            unique=True,
+        ),
+        Index(
+            "ix_strategy_break_even_convergence_legs_status",
+            "status",
+            "updated_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    convergence_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_break_even_convergences.id"),
+        nullable=False,
+        index=True,
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    preflight_size: Mapped[str] = mapped_column(String(64), nullable=False)
+    avg_entry_price: Mapped[str] = mapped_column(String(64), nullable=False)
+    old_protection_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]"
+    )
+    decision_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default="{}"
+    )
+    mutation_intent_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("position_mutation_intents.id"), nullable=True, index=True
+    )
+    exchange_order_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="planned", server_default="planned"
+    )
+    reason_code: Mapped[Optional[str]] = mapped_column(String(96), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
 class PositionBackupStopOrder(Base):
     """Durable ownership of one exact-position conditional backup stop."""
 
