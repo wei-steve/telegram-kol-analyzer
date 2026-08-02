@@ -15,11 +15,19 @@ from sqlalchemy import or_, update
 from telegram_kol_research.break_even_convergence_executor import (
     execute_break_even_convergence,
 )
+from telegram_kol_research.break_even_convergence_planner import (
+    BreakEvenConvergencePlanningError,
+    plan_or_adopt_break_even_convergence,
+)
 from telegram_kol_research.models import (
+    ExecutionBinding,
+    PositionProtectionLeg,
     PositionProtectionIncident,
+    PositionTakeProfitOrder,
     StrategyBreakEvenConvergence,
     StrategyBreakEvenConvergenceLeg,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 logger = logging.getLogger(__name__)
@@ -55,6 +63,7 @@ def run_break_even_convergence_worker_tick(
     """Claim at most one task; shadow/disabled paths never construct a client."""
 
     now = processed_at or datetime.now(UTC)
+    _plan_proven_tp1_fills(session_factory, planned_at=now)
     alerted = _enqueue_pending_alerts(session_factory, created_at=now)
     claimed = _claim_one(
         session_factory,
@@ -115,6 +124,85 @@ def run_break_even_convergence_worker_tick(
         alerted=alerted,
         failed=1 if status in _ALERT_STATUSES else 0,
     )
+
+
+def _plan_proven_tp1_fills(session_factory, *, planned_at: datetime) -> int:
+    """Bridge durable TP1 fill proof into exactly one convergence task."""
+
+    settings = load_trading_settings(session_factory)
+    if not settings.move_stop_to_breakeven_after_tp1:
+        return 0
+    if settings.live_management_execution_enabled:
+        execution_mode = "live"
+    elif settings.management_execution_mode == "shadow":
+        execution_mode = "shadow"
+    else:
+        execution_mode = "disabled"
+    with session_factory() as session:
+        candidates = (
+            session.query(PositionTakeProfitOrder)
+            .join(
+                PositionProtectionLeg,
+                (PositionProtectionLeg.execution_order_leg_id
+                 == PositionTakeProfitOrder.execution_order_leg_id)
+                & (PositionProtectionLeg.exchange_order_id
+                   == PositionTakeProfitOrder.order_id),
+            )
+            .filter(
+                PositionTakeProfitOrder.status == "filled",
+                PositionProtectionLeg.role == "take_profit",
+                PositionProtectionLeg.leg_index == 1,
+                PositionProtectionLeg.status == "filled",
+            )
+            .order_by(PositionTakeProfitOrder.id.asc())
+            .all()
+        )
+        work = []
+        for row in candidates:
+            binding = session.get(ExecutionBinding, row.execution_binding_id)
+            if binding is None or not binding.strategy_instance_id:
+                continue
+            try:
+                evidence = json.loads(row.evidence_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            tp1_fill = evidence.get("tp1_fill") if isinstance(evidence, dict) else None
+            if not isinstance(tp1_fill, dict) or not tp1_fill.get("evidence_tier"):
+                continue
+            work.append(
+                (
+                    str(binding.strategy_instance_id),
+                    str(row.order_id),
+                    {
+                        "version": 1,
+                        **tp1_fill,
+                        "position_take_profit_order_id": int(row.id),
+                        "execution_order_leg_id": int(row.execution_order_leg_id),
+                        "pos_id": str(row.pos_id),
+                        "confirmed_at": (
+                            row.completed_at.isoformat()
+                            if row.completed_at is not None
+                            else planned_at.isoformat()
+                        ),
+                    },
+                )
+            )
+    planned = 0
+    for strategy_instance_id, trigger_identity, evidence in work:
+        try:
+            plan_or_adopt_break_even_convergence(
+                session_factory,
+                trigger_type="tp1_fill",
+                trigger_identity=trigger_identity,
+                trigger_evidence=evidence,
+                strategy_instance_id=strategy_instance_id,
+                planned_at=planned_at,
+                execution_mode=execution_mode,
+            )
+        except BreakEvenConvergencePlanningError:
+            continue
+        planned += 1
+    return planned
 
 
 def _claim_one(

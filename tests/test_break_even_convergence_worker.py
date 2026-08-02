@@ -8,10 +8,14 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     PositionProtectionIncident,
+    PositionProtectionLeg,
+    PositionReconciliationObservation,
+    PositionTakeProfitOrder,
     StrategyBreakEvenConvergence,
     StrategyBreakEvenConvergenceLeg,
     StrategyLifecycle,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
@@ -203,3 +207,84 @@ def test_stale_intermediate_phase_is_reclaimed_after_restart(tmp_path):
 
     assert result.executed == 1
     assert calls[0]["convergence_id"] == convergence_id
+
+
+def test_proven_tp1_fill_is_planned_and_executed_in_live_mode(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    old_convergence_id = _seed(sf)
+    with sf() as session:
+        session.query(StrategyBreakEvenConvergenceLeg).delete()
+        session.query(StrategyBreakEvenConvergence).filter_by(
+            id=old_convergence_id
+        ).delete()
+        entry = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-1").one()
+        session.add_all([
+            PositionTakeProfitOrder(
+                venue="deepcoin",
+                execution_binding_id=entry.execution_binding_id,
+                execution_order_leg_id=entry.id,
+                pos_id="pos-1",
+                order_id="tp-proven-1",
+                trigger_price="62400",
+                size_text="5",
+                status="filled",
+                evidence_json=(
+                    '{"tp1_fill":{"evidence_tier":"exact_order_terminal",'
+                    '"trigger_order_id":"tp-proven-1","filled_size":"5"}}'
+                ),
+                completed_at=NOW,
+                updated_at=NOW,
+            ),
+            PositionProtectionLeg(
+                venue="deepcoin",
+                execution_binding_id=entry.execution_binding_id,
+                execution_order_leg_id=entry.id,
+                role="take_profit",
+                leg_index=1,
+                planned_trigger_price="62400",
+                planned_size="5",
+                pos_id="pos-1",
+                exchange_order_id="tp-proven-1",
+                status="filled",
+                updated_at=NOW,
+            ),
+            PositionReconciliationObservation(
+                venue="deepcoin",
+                execution_binding_id=entry.execution_binding_id,
+                execution_order_leg_id=entry.id,
+                strategy_instance_id=entry.strategy_instance_id,
+                pos_id="pos-1",
+                instrument_id="BTC-USDT-SWAP",
+                side="short",
+                size_text="5",
+                avg_entry_price="63000",
+                pending_tpsl_json="[]",
+                snapshot_complete=True,
+                snapshot_fingerprint="e" * 64,
+                observed_at=NOW,
+            ),
+        ])
+        session.commit()
+    save_trading_settings(sf, {
+        "auto_trade_enabled": True,
+        "management_execution_mode": "live",
+        "move_stop_to_breakeven_after_tp1": True,
+    })
+    calls = []
+
+    result = run_break_even_convergence_worker_tick(
+        sf,
+        deepcoin_client_factory=lambda: object(),
+        executor=lambda _sf, **kwargs: calls.append(kwargs) or type(
+            "Result", (), {"status": "completed", "reason_code": None}
+        )(),
+        processed_at=NOW,
+    )
+
+    assert result.executed == 1
+    with sf() as session:
+        convergence = session.query(StrategyBreakEvenConvergence).one()
+        assert convergence.trigger_type == "tp1_fill"
+        assert convergence.trigger_identity == "tp-proven-1"
+        assert convergence.execution_mode == "live"
+    assert calls
