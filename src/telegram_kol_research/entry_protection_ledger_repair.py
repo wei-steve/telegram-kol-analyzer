@@ -1837,7 +1837,7 @@ def _plan_fingerprint(
                 "purpose": row.purpose,
                 "trigger_price": row.trigger_price,
                 "size_text": row.size_text,
-                "evidence": row.evidence,
+                "evidence": _fingerprint_evidence(row.evidence),
             }
             for row in actions
         ],
@@ -1854,3 +1854,17 @@ def _plan_fingerprint(
     }
     encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _fingerprint_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Exclude only the local observation clock from otherwise stable evidence."""
+
+    stable = dict(evidence)
+    live_position = stable.get("live_position")
+    if isinstance(live_position, dict):
+        stable["live_position"] = {
+            key: value
+            for key, value in live_position.items()
+            if key != "observed_at"
+        }
+    return stable

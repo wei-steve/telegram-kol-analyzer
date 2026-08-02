@@ -642,6 +642,71 @@ def test_failed_trigger_intent_repair_sibling_change_invalidates_fingerprint(tmp
         )
 
 
+def test_failed_trigger_intent_repair_fingerprint_ignores_observation_clock(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_failed_trigger_intent_repair(session_factory)
+    client = FakeDeepcoinClient([_anonymous_stop_child("stop-child-1")])
+
+    reviewed = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 8, 2, 1, 0, tzinfo=UTC),
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+    current = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 8, 2, 1, 1, tzinfo=UTC),
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+
+    assert reviewed.fingerprint == current.fingerprint
+
+
+def test_failed_trigger_intent_repair_position_change_invalidates_fingerprint(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_failed_trigger_intent_repair(session_factory)
+    client = FakeDeepcoinClient([_anonymous_stop_child("stop-child-1")])
+    reviewed = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 8, 2, 1, 0, tzinfo=UTC),
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+    client.positions[0]["pos"] = "0.5"
+    current = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 8, 2, 1, 1, tzinfo=UTC),
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+
+    assert reviewed.actions
+    assert current.actions == ()
+    assert reviewed.fingerprint != current.fingerprint
+    with pytest.raises(ValueError, match="repair plan fingerprint mismatch"):
+        apply_entry_protection_ledger_repair_plan(
+            session_factory,
+            current,
+            action_id=reviewed.actions[0].action_id,
+            pos_id="pos-1",
+            expected_fingerprint=reviewed.fingerprint,
+            confirmation_token="stale-live-position-confirm",
+        )
+
+
 def test_entry_protection_repair_skips_already_repaired_trigger_entry(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_entry_fill(
