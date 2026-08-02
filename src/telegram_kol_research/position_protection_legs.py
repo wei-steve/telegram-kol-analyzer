@@ -146,6 +146,39 @@ def bind_filled_position(
     return protection_leg
 
 
+def bind_verified_filled_position_protection(
+    session: Session,
+    *,
+    execution_order_leg_id: int,
+    pos_id: str,
+) -> list[PositionProtectionLeg]:
+    """Bind a verified filled entry position to all preplanned protection legs."""
+
+    normalized_pos_id = str(pos_id or "").strip()
+    entry_leg = session.get(ExecutionOrderLeg, execution_order_leg_id)
+    if entry_leg is None:
+        raise ValueError("protection_leg_entry_missing")
+    if (
+        str(entry_leg.status or "").lower() != "active"
+        or str(entry_leg.attribution_status or "").lower() != "verified"
+        or not normalized_pos_id
+        or str(entry_leg.pos_id or "").strip() != normalized_pos_id
+    ):
+        raise ValueError("protection_leg_entry_not_verified_filled")
+    rows = (
+        session.query(PositionProtectionLeg)
+        .filter(
+            PositionProtectionLeg.execution_order_leg_id
+            == int(execution_order_leg_id)
+        )
+        .order_by(PositionProtectionLeg.id.asc())
+        .all()
+    )
+    for row in rows:
+        bind_filled_position(session, row, pos_id=normalized_pos_id)
+    return rows
+
+
 def bind_verified_exchange_order(
     session: Session,
     protection_leg: PositionProtectionLeg,

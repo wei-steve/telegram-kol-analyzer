@@ -1012,6 +1012,24 @@ def _adopt_verified_trigger_entry_protection(
         plan_verified_trigger_entry_protection_adoption,
         upsert_entry_protection_ledger_action,
     )
+    from telegram_kol_research.position_protection_legs import (
+        bind_verified_filled_position_protection,
+    )
+
+    for leg in legs:
+        if (
+            str(leg.venue or "deepcoin").lower() == "deepcoin"
+            and str(leg.purpose or "") == "entry"
+            and str(leg.order_kind or "") == "trigger_limit"
+            and str(leg.attribution_status or "") == "verified"
+            and str(leg.status or "").lower() == "active"
+            and bool(str(leg.pos_id or "").strip())
+        ):
+            bind_verified_filled_position_protection(
+                session,
+                execution_order_leg_id=int(leg.id),
+                pos_id=str(leg.pos_id),
+            )
 
     intent_leg_ids = _reconcile_saved_trigger_protection_intents(
         session, legs=legs, snapshot=snapshot, recovered_at=recovered_at, result=result

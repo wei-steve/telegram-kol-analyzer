@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import telegram_kol_research.position_protection_legs as protection_legs
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
     ExecutionBindingRecord,
@@ -16,6 +17,7 @@ from telegram_kol_research.position_protection_legs import (
     create_or_get_protection_leg,
     materialize_verified_position_protection,
 )
+from telegram_kol_research.models import ExecutionOrderLeg
 
 
 def _entry_leg_id(session_factory) -> int:
@@ -161,3 +163,66 @@ def test_materialize_verified_position_protection_creates_one_legacy_leg_per_rol
         ("take_profit", 2, "65800", "1", "waiting_fill"),
         ("take_profit", 3, "66400", "1", "waiting_fill"),
     ]
+
+
+def test_bind_verified_filled_position_to_all_planned_protection_legs(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    entry_leg_id = _entry_leg_id(session_factory)
+
+    with session_factory() as session:
+        entry_leg = session.get(ExecutionOrderLeg, entry_leg_id)
+        entry_leg.status = "active"
+        entry_leg.attribution_status = "verified"
+        entry_leg.pos_id = "pos-1"
+        for role in ("primary_stop", "backup_stop", "take_profit"):
+            create_or_get_protection_leg(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=entry_leg_id,
+                role=role,
+                leg_index=1,
+                planned_trigger_price="62000" if role != "backup_stop" else None,
+                planned_size="3" if role != "backup_stop" else None,
+            )
+
+        rows = protection_legs.bind_verified_filled_position_protection(
+            session,
+            execution_order_leg_id=entry_leg_id,
+            pos_id="pos-1",
+        )
+
+        assert {row.role for row in rows} == {
+            "primary_stop",
+            "backup_stop",
+            "take_profit",
+        }
+        assert {row.pos_id for row in rows} == {"pos-1"}
+        assert all(row.exchange_order_id is None for row in rows)
+        assert all(row.status == "waiting_fill" for row in rows)
+
+
+def test_bind_verified_filled_position_rejects_unverified_entry_leg(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    entry_leg_id = _entry_leg_id(session_factory)
+
+    with session_factory() as session:
+        entry_leg = session.get(ExecutionOrderLeg, entry_leg_id)
+        entry_leg.status = "active"
+        entry_leg.attribution_status = "unassigned"
+        entry_leg.pos_id = "pos-1"
+        create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=entry_leg_id,
+            role="primary_stop",
+            leg_index=1,
+            planned_trigger_price="62000",
+            planned_size="3",
+        )
+
+        with pytest.raises(ValueError, match="entry_not_verified_filled"):
+            protection_legs.bind_verified_filled_position_protection(
+                session,
+                execution_order_leg_id=entry_leg_id,
+                pos_id="pos-1",
+            )

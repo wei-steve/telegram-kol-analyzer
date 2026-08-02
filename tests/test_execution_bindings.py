@@ -33,6 +33,7 @@ from telegram_kol_research.models import (
     ExecutionEvent,
     ExecutionOrderLeg,
     PositionAttributionAudit,
+    PositionProtectionLeg,
     PositionProtectionLedger,
     PendingTpslSnapshotObservation,
     StrategyLifecycle,
@@ -43,6 +44,7 @@ from telegram_kol_research.deepcoin_contract_specs import StaticDeepcoinContract
 from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.position_attribution import FillEvidence
+from telegram_kol_research.position_protection_legs import create_or_get_protection_leg
 from telegram_kol_research.trigger_backup_stop_executor import (
     submit_verified_trigger_backup_stops,
 )
@@ -961,6 +963,41 @@ def test_reconcile_adopts_saved_trigger_protection_intent_once(tmp_path):
     assert rows[0].evidence_source == "reconciliation_trigger_protection_intent"
     assert result.protection_adopted == 1
     assert duplicate.protection_adopted == 0
+
+
+def test_reconcile_binds_verified_fill_to_planned_protection_before_child_adoption(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    with session_factory() as session:
+        entry_leg = session.query(ExecutionOrderLeg).one()
+        for role in ("primary_stop", "backup_stop", "take_profit"):
+            create_or_get_protection_leg(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=int(entry_leg.id),
+                role=role,
+                leg_index=1,
+                planned_trigger_price="1900" if role != "backup_stop" else None,
+                planned_size="4.4" if role != "backup_stop" else None,
+            )
+        session.commit()
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        rows = session.query(PositionProtectionLeg).order_by(
+            PositionProtectionLeg.id.asc()
+        ).all()
+        assert {row.pos_id for row in rows} == {"pos-1"}
+        assert all(row.exchange_order_id is None for row in rows)
+        assert all(row.status == "waiting_fill" for row in rows)
 
 
 @pytest.mark.parametrize("recovery_state", ["failed", "submitting", "resolved"])
