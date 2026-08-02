@@ -17,12 +17,14 @@ from telegram_kol_research.models import (
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
+    SourceMessageDeletionExit,
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
     TriggerProtectionIntent,
     TriggerProtectionStopRescue,
 )
+from telegram_kol_research.source_message_deletion import record_source_message_deleted
 from telegram_kol_research.strategy_records import (
     enrich_strategy_records_with_exchange,
     load_live_bindings_without_lifecycle,
@@ -32,6 +34,70 @@ from telegram_kol_research.strategy_records import (
 
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+
+
+def test_strategy_records_expose_source_deletion_recovery_and_flat_proof(tmp_path):
+    session_factory = create_session_factory(tmp_path / "strategy-detail.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=10,
+            message_id=101,
+            text="BTC long",
+            archived_target_group=True,
+        )
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:10:101:BTC:long",
+            kol_id="group:10",
+            chat_id=10,
+            message_id=101,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="open",
+        )
+        session.add_all([raw, binding])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=10,
+            message_id=101,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=NOW,
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=10,
+        message_id=101,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "recovery_required"
+        deletion_exit.last_reason = "entry_cancel_unknown"
+        deletion_exit.cancellation_signal_ids_json = "[41]"
+        deletion_exit.flat_proof_json = '{"verified_pos_ids":[]}'
+        session.commit()
+
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={10: "舒琴"},
+    )
+    summaries = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "舒琴"},
+        filter_name="all",
+    )
+
+    assert detail["source_deletion"]["state"] == "recovery_required"
+    assert detail["source_deletion"]["cancellation_signal_ids"] == [41]
+    assert detail["source_deletion"]["flat_proof_confirmed"] is True
+    assert summaries[0]["source_deletion"]["reason"] == "entry_cancel_unknown"
 
 
 def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
@@ -2679,4 +2745,4 @@ def test_loader_query_count_does_not_scale_with_strategy_count(tmp_path):
     finally:
         event.remove(engine, "before_cursor_execute", count_selects)
 
-    assert baseline_count == expanded_count == 10
+    assert baseline_count == expanded_count == 11

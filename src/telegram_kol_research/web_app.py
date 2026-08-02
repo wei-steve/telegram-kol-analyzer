@@ -144,6 +144,9 @@ from telegram_kol_research.semantic_disagreement_review import run_semantic_revi
 from telegram_kol_research.strategy_management_worker import (
     run_strategy_management_worker_loop,
 )
+from telegram_kol_research.source_message_deletion_worker import (
+    run_source_message_deletion_worker_loop,
+)
 from telegram_kol_research.strategy_records import (
     count_strategy_records,
     enrich_strategy_records_with_exchange,
@@ -3370,6 +3373,9 @@ def create_web_app(
     strategy_management_worker_interval_seconds: float = 5.0,
     strategy_management_worker_startup_delay_seconds: float = 5.0,
     strategy_management_worker_max_batches: int = 10,
+    source_message_deletion_worker_runner=None,
+    source_message_deletion_worker_interval_seconds: float = 5.0,
+    source_message_deletion_worker_max_jobs: int = 10,
     runtime_agent_production_audit_runner=None,
     runtime_agent_telegram_evidence_runner=None,
     live_position_snapshot_path: str | Path | None = None,
@@ -3449,6 +3455,23 @@ def create_web_app(
             )
             app.state.strategy_management_worker_task.add_done_callback(
                 _log_background_task_result("strategy_management_worker_task")
+            )
+            app.state.source_message_deletion_worker_task = asyncio.create_task(
+                app.state.source_message_deletion_worker_runner(
+                    session_factory=app.state.session_factory,
+                    deepcoin_client_factory=app.state.deepcoin_client_factory,
+                    contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                    interval_seconds=(
+                        app.state.source_message_deletion_worker_interval_seconds
+                    ),
+                    max_jobs=app.state.source_message_deletion_worker_max_jobs,
+                    now_provider=app.state.now_provider,
+                )
+            )
+            app.state.source_message_deletion_worker_task.add_done_callback(
+                _log_background_task_result(
+                    "source_message_deletion_worker_task"
+                )
             )
             if isinstance(app.state.strategy_alert_config, StrategyAlertConfig):
                 app.state.telegram_bot_command_task = asyncio.create_task(
@@ -3603,6 +3626,18 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.strategy_management_worker_task = None
+            source_deletion_worker_task = (
+                app.state.source_message_deletion_worker_task
+            )
+            if source_deletion_worker_task is not None:
+                source_deletion_worker_task.cancel()
+                try:
+                    await source_deletion_worker_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.source_message_deletion_worker_task = None
             deepcoin_reconcile_task = app.state.deepcoin_reconcile_task
             if deepcoin_reconcile_task is not None:
                 deepcoin_reconcile_task.cancel()
@@ -3800,6 +3835,17 @@ def create_web_app(
         1, int(strategy_management_worker_max_batches)
     )
     app.state.strategy_management_worker_task = None
+    app.state.source_message_deletion_worker_runner = (
+        source_message_deletion_worker_runner
+        or run_source_message_deletion_worker_loop
+    )
+    app.state.source_message_deletion_worker_interval_seconds = max(
+        0.1, float(source_message_deletion_worker_interval_seconds)
+    )
+    app.state.source_message_deletion_worker_max_jobs = max(
+        1, int(source_message_deletion_worker_max_jobs)
+    )
+    app.state.source_message_deletion_worker_task = None
     app.state.authoritative_processor = lambda raw_message_id: _run_authoritative_processor(
         app,
         raw_message_id=raw_message_id,

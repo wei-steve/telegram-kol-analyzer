@@ -1122,6 +1122,24 @@ def claim_next_strategy_management_notification(
 
 def format_terminal_entry_cleanup_notification(event) -> str:
     payload = _decode_mapping(event.response_json)
+    if event.action == "source_message_deletion_outcome":
+        state_labels = {
+            "cancelling_entries": "正在撤销原策略入场单",
+            "closing_positions": "正在市价退出原策略持仓",
+            "reconciling": "等待交易所归零证明",
+            "recovery_required": "需要人工恢复处理",
+            "succeeded": "原策略订单与仓位已确认归零",
+        }
+        return (
+            "【Telegram 原策略删除退出】\n"
+            f"删除退出ID: {payload.get('exit_id')}\n"
+            f"生命周期: {payload.get('lifecycle_id')}\n"
+            f"执行绑定: {payload.get('binding_id')}\n"
+            f"管理批次: {payload.get('management_batch_id') or '无'}\n"
+            f"状态: {state_labels.get(str(event.status), str(event.status))}\n"
+            f"原因: {_safe_management_text(payload.get('reason'), limit=160)}\n"
+            f"归零证明: {'已保存' if payload.get('flat_proof_confirmed') else '尚未完成'}"
+        )[:1200]
     terminal_anomaly = (
         payload.get("reason") == "terminal_lifecycle_entry_exposure"
     )
@@ -1172,7 +1190,12 @@ def claim_next_terminal_entry_cleanup_notification(
     )
     stale_before = now - timedelta(seconds=max(5.0, float(lease_seconds)))
     claimable = and_(
-        ExecutionEvent.action == "terminal_entry_cleanup_outcome",
+        ExecutionEvent.action.in_(
+            (
+                "terminal_entry_cleanup_outcome",
+                "source_message_deletion_outcome",
+            )
+        ),
         ExecutionEvent.notification_attempts
         < TERMINAL_ENTRY_CLEANUP_NOTIFICATION_MAX_ATTEMPTS,
         or_(

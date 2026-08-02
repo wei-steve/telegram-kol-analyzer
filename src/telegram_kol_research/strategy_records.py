@@ -32,6 +32,7 @@ from telegram_kol_research.models import (
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
+    SourceMessageDeletionExit,
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
@@ -40,6 +41,7 @@ from telegram_kol_research.models import (
     TriggerProtectionIntent,
     TriggerProtectionStopRescue,
     TriggerTakeProfitConvergence,
+    TelegramSourceMessageEvent,
 )
 
 
@@ -166,6 +168,21 @@ def load_strategy_record_detail(
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         if lifecycle is None:
             return None
+
+        deletion_exit = (
+            session.query(SourceMessageDeletionExit)
+            .filter(SourceMessageDeletionExit.target_lifecycle_id == lifecycle.id)
+            .order_by(SourceMessageDeletionExit.id.desc())
+            .first()
+        )
+        deletion_event = (
+            session.get(TelegramSourceMessageEvent, deletion_exit.source_event_id)
+            if deletion_exit is not None
+            else None
+        )
+        source_deletion = _source_deletion_detail(
+            deletion_exit, event=deletion_event
+        )
 
         strategy_thread = (
             session.get(StrategyThread, int(lifecycle.strategy_thread_id))
@@ -932,6 +949,7 @@ def load_strategy_record_detail(
             "management_action": lifecycle.management_action,
         },
         "context_resolution": context_resolution,
+        "source_deletion": source_deletion,
         "timeline": timeline,
         "execution": {
             "binding": _binding_detail(binding) if binding is not None else None,
@@ -1049,6 +1067,42 @@ def _protection_adoption_detail(
         "refusal_codes": refusal_codes,
         "adopted_rows": adopted_rows,
         "refusal_rows": parsed_refusals,
+    }
+
+
+def _source_deletion_detail(
+    deletion_exit: SourceMessageDeletionExit | None,
+    *,
+    event: TelegramSourceMessageEvent | None = None,
+) -> dict[str, object] | None:
+    if deletion_exit is None:
+        return None
+    cancellation_ids = _safe_json_value(
+        deletion_exit.cancellation_signal_ids_json
+    )
+    flat_proof = _safe_json_value(deletion_exit.flat_proof_json)
+    return {
+        "event_id": int(deletion_exit.source_event_id),
+        "exit_id": int(deletion_exit.id),
+        "state": str(deletion_exit.state),
+        "reason": deletion_exit.last_reason,
+        "attempt_count": int(deletion_exit.attempt_count or 0),
+        "management_batch_id": (
+            int(deletion_exit.management_batch_id)
+            if deletion_exit.management_batch_id is not None
+            else None
+        ),
+        "cancellation_signal_ids": (
+            cancellation_ids if isinstance(cancellation_ids, list) else []
+        ),
+        "flat_proof_confirmed": bool(deletion_exit.flat_proof_json),
+        "flat_proof": flat_proof if isinstance(flat_proof, dict) else None,
+        "recovery_required": deletion_exit.state == "recovery_required",
+        "completed_at": deletion_exit.completed_at,
+        "deleted_at": event.occurred_at if event is not None else None,
+        "event_processing_status": (
+            event.processing_status if event is not None else None
+        ),
     }
 
 
@@ -1895,6 +1949,12 @@ def load_strategy_record_summaries(
         )
 
         lifecycle_ids = {int(row.id) for row in lifecycles}
+        deletion_exits = (
+            session.query(SourceMessageDeletionExit)
+            .filter(SourceMessageDeletionExit.target_lifecycle_id.in_(lifecycle_ids))
+            .order_by(SourceMessageDeletionExit.id.desc())
+            .all()
+        )
         management_batches = (
             session.query(StrategyManagementBatch)
             .filter(StrategyManagementBatch.target_lifecycle_id.in_(lifecycle_ids))
@@ -1939,6 +1999,11 @@ def load_strategy_record_summaries(
     batches_by_lifecycle_id: dict[int, list[StrategyManagementBatch]] = defaultdict(list)
     for batch in management_batches:
         batches_by_lifecycle_id[int(batch.target_lifecycle_id)].append(batch)
+    deletion_exit_by_lifecycle_id = {
+        int(row.target_lifecycle_id): row
+        for row in deletion_exits
+        if row.target_lifecycle_id is not None
+    }
     management_legs_by_batch_id: dict[int, list[StrategyManagementLeg]] = defaultdict(list)
     for leg in management_legs:
         management_legs_by_batch_id[int(leg.management_batch_id)].append(leg)
@@ -1976,6 +2041,7 @@ def load_strategy_record_summaries(
             strategy_instance_binding_counts=strategy_instance_binding_counts,
         )
         batches = batches_by_lifecycle_id.get(int(lifecycle.id), [])
+        deletion_exit = deletion_exit_by_lifecycle_id.get(int(lifecycle.id))
         attention_reasons = _attention_reasons(
             lifecycle=lifecycle,
             candidate=candidate,
@@ -2044,6 +2110,7 @@ def load_strategy_record_summaries(
                     )
                     for batch in batches
                 ],
+                "source_deletion": _source_deletion_detail(deletion_exit),
                 "venue": (
                     str(binding.venue or "").strip().lower()
                     if binding is not None

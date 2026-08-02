@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionEvent,
     ExecutionOrderLeg,
     PositionMutationIntent,
     RawMessage,
@@ -22,11 +23,51 @@ from telegram_kol_research.source_message_deletion import (
 )
 from telegram_kol_research.source_message_deletion_worker import (
     finalize_source_message_deletion_exit,
+    run_source_message_deletion_worker_if_enabled,
     run_source_message_deletion_worker_tick,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 8, 2, 7, 0, tzinfo=UTC)
+
+
+def test_rollout_flag_keeps_exchange_worker_dormant_until_enabled(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    calls = []
+
+    def runner(*_args, **_kwargs):
+        calls.append("worker")
+        return SimpleNamespace(
+            discovered=1,
+            cancelled=0,
+            planned_exits=0,
+            finalized=0,
+            waiting=1,
+            recovery_required=0,
+        )
+
+    dormant = run_source_message_deletion_worker_if_enabled(
+        session_factory,
+        deepcoin_client_factory=lambda: calls.append("exchange"),
+        worker_runner=runner,
+        processed_at=NOW,
+    )
+    assert dormant.discovered == 0
+    assert calls == []
+
+    save_trading_settings(
+        session_factory,
+        {"telegram_source_deletion_exit_enabled": True},
+    )
+    enabled = run_source_message_deletion_worker_if_enabled(
+        session_factory,
+        deepcoin_client_factory=lambda: calls.append("exchange"),
+        worker_runner=runner,
+        processed_at=NOW,
+    )
+    assert enabled.discovered == 1
+    assert calls == ["worker"]
 
 
 def _seed_pending_strategy(
@@ -341,6 +382,15 @@ def test_worker_cancels_only_exact_deleted_strategy_entry_ids(tmp_path):
         assert session.get(ExecutionOrderLeg, other_leg_id).status == "pending"
         deletion_exit = session.query(SourceMessageDeletionExit).one()
         assert deletion_exit.state == "reconciling"
+        alert = (
+            session.query(ExecutionEvent)
+            .filter(
+                ExecutionEvent.action == "source_message_deletion_outcome"
+            )
+            .one()
+        )
+        assert alert.notification_status == "pending"
+        assert alert.execution_binding_id == deletion_exit.execution_binding_id
 
 
 def test_worker_unknown_cancel_enters_recovery_without_resubmit(tmp_path):

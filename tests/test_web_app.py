@@ -491,6 +491,39 @@ def test_management_worker_lifespan_starts_once_and_is_cancelled(tmp_path):
     assert app.state.strategy_management_worker_task is None
 
 
+def test_source_deletion_worker_lifespan_starts_dormant_runner_and_stops(tmp_path):
+    started = threading.Event()
+    stopped = threading.Event()
+    calls = []
+
+    async def fake_source_deletion_worker(**kwargs):
+        calls.append(kwargs)
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        source_message_deletion_worker_runner=fake_source_deletion_worker,
+        source_message_deletion_worker_interval_seconds=9,
+        source_message_deletion_worker_max_jobs=4,
+    )
+
+    with TestClient(app):
+        assert started.wait(timeout=1)
+        assert len(calls) == 1
+        assert calls[0]["session_factory"] is app.state.session_factory
+        assert calls[0]["deepcoin_client_factory"] is app.state.deepcoin_client_factory
+        assert calls[0]["interval_seconds"] == 9
+        assert calls[0]["max_jobs"] == 4
+        assert app.state.source_message_deletion_worker_task is not None
+
+    assert stopped.wait(timeout=1)
+    assert app.state.source_message_deletion_worker_task is None
+
+
 def test_lifespan_disconnects_shared_telegram_client_before_stopping_listener(tmp_path):
     class ShieldedDisconnectClient:
         def __init__(self):

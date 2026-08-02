@@ -2829,6 +2829,7 @@ function bindTradingSettingsForm() {
     };
     const payload = {
       auto_trade_enabled: Boolean(form.querySelector('[name="auto_trade_enabled"]')?.checked),
+      telegram_source_deletion_exit_enabled: Boolean(form.querySelector('[name="telegram_source_deletion_exit_enabled"]')?.checked),
       context_resolution_enabled: Boolean(form.querySelector('[name="context_resolution_enabled"]')?.checked),
       context_resolution_live_chat_ids: String(formData.get('context_resolution_live_chat_ids') || '')
         .split(',')

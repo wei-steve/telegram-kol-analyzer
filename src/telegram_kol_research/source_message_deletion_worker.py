@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 import json
 from uuid import uuid4
 
 from sqlalchemy import or_, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -29,6 +32,7 @@ from telegram_kol_research.source_message_deletion import (
 from telegram_kol_research.terminal_entry_cleanup import (
     cleanup_terminal_entry_legs,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 _ACTIVE_STATES = (
@@ -47,6 +51,60 @@ class SourceMessageDeletionWorkerResult:
     finalized: int = 0
     waiting: int = 0
     recovery_required: int = 0
+
+
+def run_source_message_deletion_worker_if_enabled(
+    session_factory,
+    *,
+    deepcoin_client_factory,
+    contract_spec_provider=None,
+    max_jobs: int = 10,
+    processed_at: datetime | None = None,
+    worker_runner=None,
+) -> SourceMessageDeletionWorkerResult:
+    """Keep ingestion/barriers active while exchange effects remain dormant."""
+
+    settings = load_trading_settings(session_factory)
+    if not settings.telegram_source_deletion_exit_enabled:
+        return SourceMessageDeletionWorkerResult()
+    runner = worker_runner or run_source_message_deletion_worker_tick
+    return runner(
+        session_factory,
+        deepcoin_client_factory=deepcoin_client_factory,
+        contract_spec_provider=contract_spec_provider,
+        max_jobs=max_jobs,
+        processed_at=processed_at,
+    )
+
+
+async def run_source_message_deletion_worker_loop(
+    *,
+    session_factory,
+    deepcoin_client_factory,
+    contract_spec_provider=None,
+    interval_seconds: float = 5.0,
+    max_jobs: int = 10,
+    now_provider=None,
+    worker_runner=None,
+) -> None:
+    """Poll durable deletion exits; the persisted rollout flag gates every tick."""
+
+    while True:
+        try:
+            await asyncio.to_thread(
+                run_source_message_deletion_worker_if_enabled,
+                session_factory,
+                deepcoin_client_factory=deepcoin_client_factory,
+                contract_spec_provider=contract_spec_provider,
+                max_jobs=max_jobs,
+                processed_at=(now_provider() if now_provider is not None else None),
+                worker_runner=worker_runner,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        await asyncio.sleep(max(0.1, float(interval_seconds)))
 
 
 def run_source_message_deletion_worker_tick(
@@ -532,6 +590,12 @@ def finalize_source_message_deletion_exit(
                         .filter(
                             ExecutionEvent.chat_id == event.chat_id,
                             ExecutionEvent.message_id == event.message_id,
+                            ExecutionEvent.action.not_in(
+                                {
+                                    "source_message_deletion_outcome",
+                                    "terminal_entry_cleanup_outcome",
+                                }
+                            ),
                             or_(
                                 ExecutionEvent.order_id.is_not(None),
                                 ExecutionEvent.client_order_id.is_not(None),
@@ -599,6 +663,13 @@ def finalize_source_message_deletion_exit(
                     deletion_exit.claim_token = None
                     deletion_exit.claimed_at = None
                     deletion_exit.updated_at = now
+                    _enqueue_source_deletion_notification(
+                        session,
+                        deletion_exit=deletion_exit,
+                        state="recovery_required",
+                        reason="frozen_ledger_identity_unverified",
+                        created_at=now,
+                    )
                     session.commit()
                     return "recovery_required"
 
@@ -612,6 +683,13 @@ def finalize_source_message_deletion_exit(
                     deletion_exit.claim_token = None
                     deletion_exit.claimed_at = None
                     deletion_exit.updated_at = now
+                    _enqueue_source_deletion_notification(
+                        session,
+                        deletion_exit=deletion_exit,
+                        state="recovery_required",
+                        reason="position_exit_batch_requires_recovery",
+                        created_at=now,
+                    )
                     session.commit()
                     return "waiting"
 
@@ -628,6 +706,13 @@ def finalize_source_message_deletion_exit(
                     deletion_exit.claim_token = None
                     deletion_exit.claimed_at = None
                     deletion_exit.updated_at = now
+                    _enqueue_source_deletion_notification(
+                        session,
+                        deletion_exit=deletion_exit,
+                        state="recovery_required",
+                        reason="position_exit_batch_missing",
+                        created_at=now,
+                    )
                     session.commit()
                     return "recovery_required"
                 if deletion_exit.management_batch_id is not None and batch is None:
@@ -638,6 +723,13 @@ def finalize_source_message_deletion_exit(
                     deletion_exit.claim_token = None
                     deletion_exit.claimed_at = None
                     deletion_exit.updated_at = now
+                    _enqueue_source_deletion_notification(
+                        session,
+                        deletion_exit=deletion_exit,
+                        state="recovery_required",
+                        reason="position_exit_batch_not_planned",
+                        created_at=now,
+                    )
                     session.commit()
                     return "recovery_required"
                 if batch is not None and batch.status != "succeeded":
@@ -828,6 +920,13 @@ def finalize_source_message_deletion_exit(
                         leg.status = "closed"
                         leg.terminal_reason = "source_message_deleted_exit_confirmed"
                         leg.updated_at = now
+                _enqueue_source_deletion_notification(
+                    session,
+                    deletion_exit=deletion_exit,
+                    state="succeeded",
+                    reason="exchange_flat_confirmed",
+                    created_at=now,
+                )
                 session.commit()
                 return "succeeded"
 
@@ -990,8 +1089,71 @@ def _transition_claimed(
             )
             .values(**values)
         )
+        if result.rowcount == 1:
+            deletion_exit = session.get(SourceMessageDeletionExit, int(exit_id))
+            if deletion_exit is not None:
+                _enqueue_source_deletion_notification(
+                    session,
+                    deletion_exit=deletion_exit,
+                    state=new_state,
+                    reason=reason,
+                    created_at=updated_at,
+                )
         session.commit()
         return result.rowcount == 1
+
+
+def _enqueue_source_deletion_notification(
+    session,
+    *,
+    deletion_exit: SourceMessageDeletionExit,
+    state: str,
+    reason: str,
+    created_at: datetime,
+) -> None:
+    lifecycle = (
+        session.get(StrategyLifecycle, deletion_exit.target_lifecycle_id)
+        if deletion_exit.target_lifecycle_id is not None
+        else None
+    )
+    fingerprint = sha256(
+        (
+            f"source_deletion:{deletion_exit.id}:{state}:{reason}:"
+            f"{deletion_exit.management_batch_id or ''}"
+        ).encode("utf-8")
+    ).hexdigest()
+    session.execute(
+        sqlite_insert(ExecutionEvent)
+        .values(
+            execution_binding_id=deletion_exit.execution_binding_id,
+            strategy_instance_id=deletion_exit.strategy_instance_id,
+            action="source_message_deletion_outcome",
+            status=state,
+            chat_id=(lifecycle.chat_id if lifecycle is not None else None),
+            message_id=(lifecycle.message_id if lifecycle is not None else None),
+            source_message_id=deletion_exit.raw_message_id,
+            symbol=(lifecycle.symbol if lifecycle is not None else None),
+            side=(lifecycle.side if lifecycle is not None else None),
+            reason=reason,
+            response_json=json.dumps(
+                {
+                    "exit_id": int(deletion_exit.id),
+                    "lifecycle_id": deletion_exit.target_lifecycle_id,
+                    "binding_id": deletion_exit.execution_binding_id,
+                    "management_batch_id": deletion_exit.management_batch_id,
+                    "state": state,
+                    "reason": reason,
+                    "flat_proof_confirmed": bool(deletion_exit.flat_proof_json),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            notification_status="pending",
+            notification_fingerprint=fingerprint,
+            created_at=created_at,
+        )
+        .on_conflict_do_nothing(index_elements=["notification_fingerprint"])
+    )
 
 
 def _release_claim(

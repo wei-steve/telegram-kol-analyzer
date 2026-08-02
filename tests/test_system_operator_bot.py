@@ -3,6 +3,7 @@ import hashlib
 import json
 import time
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 import httpx
 import pytest
 
@@ -30,6 +31,32 @@ from telegram_kol_research.system_operator_bot import (
 )
 
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+
+
+def test_source_deletion_operator_alert_is_exact_and_redacted():
+    rendered = operator_bot_module.format_terminal_entry_cleanup_notification(
+        SimpleNamespace(
+            id=9,
+            action="source_message_deletion_outcome",
+            status="recovery_required",
+            response_json=json.dumps(
+                {
+                    "exit_id": 7,
+                    "lifecycle_id": 31,
+                    "binding_id": 41,
+                    "management_batch_id": 51,
+                    "reason": "position_exit_batch_requires_recovery",
+                    "flat_proof_confirmed": False,
+                }
+            ),
+        )
+    )
+
+    assert "删除退出ID: 7" in rendered
+    assert "生命周期: 31" in rendered
+    assert "执行绑定: 41" in rendered
+    assert "需要人工恢复处理" in rendered
+    assert "API" not in rendered
 
 
 def _record_runtime_incident(session_factory, **overrides):

@@ -388,3 +388,19 @@ def test_apply_trading_settings_to_group_config_preserves_sender_overrides():
     assert runtime_config.groups[0].symbol_whitelist == ["SOL", "BTC"]
     assert runtime_config.groups[0].symbol_max_loss_usdt == {"SOL": 10.0}
     assert runtime_config.groups[0].tracked_senders[0].max_loss_usdt == 25
+def test_source_deletion_exit_defaults_dormant_and_round_trips(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    defaults = load_trading_settings(session_factory)
+    assert defaults.telegram_source_deletion_exit_enabled is False
+
+    saved = save_trading_settings(
+        session_factory,
+        {"telegram_source_deletion_exit_enabled": True},
+    )
+
+    assert saved.telegram_source_deletion_exit_enabled is True
+    assert (
+        load_trading_settings(session_factory).telegram_source_deletion_exit_enabled
+        is True
+    )

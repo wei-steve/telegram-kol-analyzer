@@ -60,6 +60,7 @@ class SymbolEntryThresholds:
 @dataclass(slots=True)
 class TradingSettings:
     auto_trade_enabled: bool = False
+    telegram_source_deletion_exit_enabled: bool = False
     management_execution_mode: Literal["disabled", "shadow", "live"] = "disabled"
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
@@ -240,6 +241,11 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             raw,
             "auto_trade_enabled",
             defaults.auto_trade_enabled,
+        ),
+        telegram_source_deletion_exit_enabled=_boolean_setting(
+            raw,
+            "telegram_source_deletion_exit_enabled",
+            defaults.telegram_source_deletion_exit_enabled,
         ),
         management_execution_mode=management_execution_mode,
         default_max_loss_usdt=_positive_float(
