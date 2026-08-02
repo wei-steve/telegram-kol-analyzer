@@ -1,7 +1,7 @@
 import hashlib
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -1214,7 +1214,69 @@ def test_reconcile_saved_intent_records_unavailable_snapshot_and_retries(tmp_pat
         ).order_by(PositionAttributionAudit.id.desc()).first()
     assert result.protection_snapshot_unavailable == 1
     assert intent.recovery_state == "retrying"
+    assert intent.retry_attempts == 1
     assert json.loads(audit.evidence_json)["reason"] == "trigger_protection_snapshot_unavailable"
+
+
+def test_reconcile_saved_intent_outage_does_not_exhaust_retry_budget(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    start = datetime(2026, 7, 20, 8, 5)
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([]),
+        recovered_at=start,
+    )
+    unavailable = _ProtectionAdoptionReconciliationClient(
+        pending_error=RuntimeError("unavailable")
+    )
+
+    for attempt in range(7):
+        result = reconcile_deepcoin_execution_bindings(
+            session_factory,
+            client=unavailable,
+            recovered_at=start + timedelta(minutes=5 * (attempt + 1)),
+        )
+        assert result.protection_snapshot_unavailable == 1
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        assert intent.recovery_state == "retrying"
+        assert intent.retry_attempts == 1
+
+    adopted = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient(
+            [_pending_combined_tpsl("tpsl-after-outage")]
+        ),
+        recovered_at=start + timedelta(minutes=40),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        assert intent.recovery_state == "adopted"
+        assert intent.adopted_order_id == "tpsl-after-outage"
+    assert adopted.protection_adopted == 1
+
+
+def test_reconcile_saved_intent_not_yet_observable_has_bounded_retries(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    start = datetime(2026, 7, 20, 8, 5)
+
+    for attempt in range(5):
+        reconcile_deepcoin_execution_bindings(
+            session_factory,
+            client=_ProtectionAdoptionReconciliationClient([]),
+            recovered_at=start + timedelta(hours=2 * attempt),
+        )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        assert intent.recovery_state == "failed"
+        assert intent.retry_attempts == 5
 
 
 def test_reconcile_protection_adoption_refuses_duplicate_exact_candidates(tmp_path):

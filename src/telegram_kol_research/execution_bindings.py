@@ -1205,7 +1205,13 @@ def _retry_saved_trigger_protection_intents_for_unavailable_snapshot(
             event_id=None, binding_id=int(leg.execution_binding_id), pos_id=str(leg.pos_id),
             reason="trigger_protection_snapshot_unavailable", evidence={"snapshot_sources": sources},
         ), created_at=recovered_at)
-        _schedule_trigger_intent_retry(session, intent, recovered_at, transition_trigger_protection_intent)
+        _schedule_trigger_intent_retry(
+            session,
+            intent,
+            recovered_at,
+            transition_trigger_protection_intent,
+            consume_attempt=False,
+        )
 
 
 def _reconcile_saved_trigger_protection_intents(
@@ -1262,7 +1268,13 @@ def _reconcile_saved_trigger_protection_intents(
                 event_id=None, binding_id=int(leg.execution_binding_id), pos_id=str(leg.pos_id),
                 reason="trigger_protection_snapshot_unavailable", evidence={"snapshot_sources": errors},
             ), created_at=recovered_at)
-            _schedule_trigger_intent_retry(session, intent, recovered_at, transition_trigger_protection_intent)
+            _schedule_trigger_intent_retry(
+                session,
+                intent,
+                recovered_at,
+                transition_trigger_protection_intent,
+                consume_attempt=False,
+            )
         return handled
 
     existing_ledger_rows = session.query(PositionProtectionLedger).all()
@@ -1343,13 +1355,27 @@ def _trigger_intent_due(intent, now: datetime) -> bool:
     return when <= now
 
 
-def _schedule_trigger_intent_retry(session, intent, now, transition) -> None:
-    attempts = min(int(intent.retry_attempts or 0) + 1, _TRIGGER_PROTECTION_RETRY_LIMIT)
+def _schedule_trigger_intent_retry(
+    session,
+    intent,
+    now,
+    transition,
+    *,
+    consume_attempt: bool = True,
+) -> None:
+    current_attempts = int(intent.retry_attempts or 0)
+    attempts = min(
+        current_attempts + (1 if consume_attempt else 0),
+        _TRIGGER_PROTECTION_RETRY_LIMIT,
+    )
     if attempts >= _TRIGGER_PROTECTION_RETRY_LIMIT:
         transition(session, intent, recovery_state="failed", retry_attempts=attempts)
     else:
+        backoff_attempt = max(attempts, 1)
         transition(session, intent, recovery_state="retrying", retry_attempts=attempts,
-                   next_attempt_at=now + timedelta(minutes=min(5 * 2 ** (attempts - 1), 60)))
+                   next_attempt_at=now + timedelta(
+                       minutes=min(5 * 2 ** (backoff_attempt - 1), 60)
+                   ))
 
 
 def _refuse_trigger_intent(session, leg, intent, refusal, now, result, transition) -> None:
