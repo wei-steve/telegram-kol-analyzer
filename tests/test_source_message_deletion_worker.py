@@ -791,6 +791,16 @@ def test_flat_finalization_fails_closed_when_exchange_snapshot_has_errors(tmp_pa
         deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
         assert deletion_exit.state == "reconciling"
         assert deletion_exit.flat_proof_json is None
+        alert = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "source_message_deletion_outcome")
+            .order_by(ExecutionEvent.id.desc())
+            .first()
+        )
+        assert (alert.status, alert.reason) == (
+            "reconciling",
+            "flat_snapshot_retry",
+        )
 
 
 def test_flat_finalization_waits_while_exact_order_or_position_is_live(tmp_path):
@@ -848,6 +858,107 @@ def test_filled_deletion_requires_a_durable_exit_batch_before_flat_completion(tm
     )
 
     assert status == "recovery_required"
+    with session_factory() as session:
+        alert = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "source_message_deletion_outcome")
+            .order_by(ExecutionEvent.id.desc())
+            .first()
+        )
+        assert (alert.status, alert.reason) == (
+            "recovery_required",
+            "position_exit_batch_not_planned",
+        )
+
+
+def test_flat_finalization_alert_matches_missing_exit_batch_state(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        deletion_exit.management_batch_id = 999_999
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={}, positions=[], open_orders=[], pending_trigger_orders=[]
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "recovery_required"
+    with session_factory() as session:
+        alert = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "source_message_deletion_outcome")
+            .order_by(ExecutionEvent.id.desc())
+            .first()
+        )
+        assert (alert.status, alert.reason) == (
+            "recovery_required",
+            "position_exit_batch_missing",
+        )
+
+
+def test_flat_finalization_alert_matches_failed_exit_batch_state(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "closing_positions"
+        session.commit()
+    planned = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=_PositionClient,
+        contract_spec_provider=_ContractSpecs(),
+        processed_at=NOW,
+    )
+    assert planned.planned_exits == 1
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        batch = session.get(
+            StrategyManagementBatch, deletion_exit.management_batch_id
+        )
+        batch.status = "blocked"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={}, positions=[], open_orders=[], pending_trigger_orders=[]
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "recovery_required"
+    with session_factory() as session:
+        alert = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "source_message_deletion_outcome")
+            .order_by(ExecutionEvent.id.desc())
+            .first()
+        )
+        assert (alert.status, alert.reason) == (
+            "recovery_required",
+            "position_exit_batch_requires_recovery",
+        )
 
 
 def test_unverified_position_identity_can_never_be_declared_flat(tmp_path):

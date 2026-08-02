@@ -686,8 +686,8 @@ def finalize_source_message_deletion_exit(
                     _enqueue_source_deletion_notification(
                         session,
                         deletion_exit=deletion_exit,
-                        state="recovery_required",
-                        reason="position_exit_batch_requires_recovery",
+                        state=deletion_exit.state,
+                        reason=deletion_exit.last_reason,
                         created_at=now,
                     )
                     session.commit()
@@ -709,8 +709,8 @@ def finalize_source_message_deletion_exit(
                     _enqueue_source_deletion_notification(
                         session,
                         deletion_exit=deletion_exit,
-                        state="recovery_required",
-                        reason="position_exit_batch_missing",
+                        state=deletion_exit.state,
+                        reason=deletion_exit.last_reason,
                         created_at=now,
                     )
                     session.commit()
@@ -726,8 +726,8 @@ def finalize_source_message_deletion_exit(
                     _enqueue_source_deletion_notification(
                         session,
                         deletion_exit=deletion_exit,
-                        state="recovery_required",
-                        reason="position_exit_batch_not_planned",
+                        state=deletion_exit.state,
+                        reason=deletion_exit.last_reason,
                         created_at=now,
                     )
                     session.commit()
@@ -874,6 +874,13 @@ def finalize_source_message_deletion_exit(
                     deletion_exit.claim_token = None
                     deletion_exit.claimed_at = None
                     deletion_exit.updated_at = now
+                    _enqueue_source_deletion_notification(
+                        session,
+                        deletion_exit=deletion_exit,
+                        state=deletion_exit.state,
+                        reason=deletion_exit.last_reason,
+                        created_at=now,
+                    )
                     session.commit()
                     return "recovery_required"
 

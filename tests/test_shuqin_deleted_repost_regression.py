@@ -1,8 +1,12 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+from telegram_kol_research.auto_trade_execution import (
+    auto_process_message_trade_signal,
+)
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -23,6 +27,7 @@ from telegram_kol_research.source_message_deletion import (
 from telegram_kol_research.source_message_deletion_worker import (
     run_source_message_deletion_worker_tick,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 8, 2, 8, 0, tzinfo=UTC)
@@ -55,6 +60,8 @@ class _ShuqinExchange:
         }
         self.cancelled = []
         self.position_live = True
+        self.orders = []
+        self.protections = []
 
     def list_trigger_orders_pending(self, *, inst_id):
         return list(self.pending.values())
@@ -87,6 +94,18 @@ class _ShuqinExchange:
         ]
 
     def list_positions(self, *, inst_id=None):
+        if self.orders:
+            return [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "new-pos-3429",
+                    "posSide": "long",
+                    "pos": "4",
+                    "avgPx": "1800",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                }
+            ]
         if not self.position_live:
             return []
         return [
@@ -101,6 +120,30 @@ class _ShuqinExchange:
                 "cTime": "1721000000000",
             }
         ]
+
+    def get_ticker_price(self, *, inst_id):
+        assert inst_id == "ETH-USDT-SWAP"
+        return 1800.0
+
+    def place_order(self, payload):
+        self.orders.append(payload)
+        return {
+            "code": "0",
+            "data": {"ordId": "new-entry-3429", "posId": "new-pos-3429"},
+        }
+
+    def set_position_sltp(self, payload):
+        self.protections.append(payload)
+        self.pending["new-stop-1795"] = {
+            "instId": payload.get("instId"),
+            "ordId": "new-stop-1795",
+            "posId": payload.get("posId"),
+            "posSide": payload.get("posSide"),
+            "triggerOrderType": "TPSL",
+            "slTriggerPrice": payload.get("slTriggerPx"),
+            "sz": payload.get("sz", "0"),
+        }
+        return {"code": "0", "data": {"ordId": "new-stop-1795"}}
 
 
 def _seed_old_strategy(session_factory):
@@ -216,7 +259,7 @@ def _seed_repost(session_factory):
         raw = RawMessage(
             chat_id=-100777,
             message_id=3429,
-            text="ETH long revised SL1795",
+            text="ETH long 市价进场 SL1795",
             archived_target_group=True,
         )
         session.add(raw)
@@ -229,6 +272,7 @@ def _seed_repost(session_factory):
                 event_type="entry_signal",
                 recognition_generation="shuqin-3429",
                 parse_source="mimo_authoritative",
+                entry_text="市价",
                 stop_loss_text="1795",
                 confidence=1.0,
             )
@@ -338,54 +382,47 @@ def test_shuqin_deleted_strategy_exits_before_repost_can_own_new_orders(tmp_path
         session_factory, raw_message_id=new_raw_id
     ).status == "allow"
 
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["ETH"],
+        },
+    )
+    submitted = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=new_raw_id,
+        group_config=GroupConfig(
+            groups=[
+                TargetGroupConfig(
+                    chat_title="舒琴",
+                    chat_id=-100777,
+                    enabled=True,
+                    trading_mode="auto_trade",
+                    max_loss_usdt=20,
+                    symbol_whitelist=["ETH"],
+                )
+            ]
+        ),
+        deepcoin_client=exchange,
+        contract_spec_provider=_ContractSpecs(),
+        processed_at=NOW,
+    )
+    assert submitted["status"] == "submitted"
+    assert submitted["entry_execution_type"] == "market"
+
     with session_factory() as session:
-        new_binding = ExecutionBinding(
-            strategy_instance_id="deepcoin:-100777:3429:ETH:long",
-            kol_id="group:-100777",
-            chat_id=-100777,
-            message_id=3429,
-            symbol="ETH",
-            side="long",
-            venue="deepcoin",
-            order_id="new-entry-3429",
-            pos_id="new-pos-3429",
-            status="active",
+        new_binding = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.message_id == 3429)
+            .one()
         )
-        session.add(new_binding)
-        session.flush()
-        new_leg = ExecutionOrderLeg(
-            execution_binding_id=new_binding.id,
-            strategy_instance_id=new_binding.strategy_instance_id,
-            leg_index=1,
-            purpose="entry",
-            order_kind="market",
-            order_id="new-entry-3429",
-            pos_id="new-pos-3429",
-            status="active",
-            attribution_status="verified",
-            attribution_evidence_json=(
-                '{"policy_version":2,'
-                '"evidence_type":"verified_by_current_policy"}'
-            ),
+        new_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == new_binding.id)
+            .all()
         )
-        session.add(new_leg)
-        session.flush()
-        session.add(
-            PositionProtectionLedger(
-                execution_binding_id=new_binding.id,
-                execution_order_leg_id=new_leg.id,
-                strategy_instance_id=new_binding.strategy_instance_id,
-                pos_id="new-pos-3429",
-                instrument_id="ETH-USDT-SWAP",
-                side="long",
-                order_id="new-stop-1795",
-                purpose="stop_loss",
-                trigger_price="1795",
-                status="verified",
-                evidence_source="test_fixture",
-            )
-        )
-        session.commit()
 
         old_lifecycle = session.get(StrategyLifecycle, old_lifecycle_id)
         deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
@@ -419,6 +456,9 @@ def test_shuqin_deleted_strategy_exits_before_repost_can_own_new_orders(tmp_path
         assert all(leg.status in {"cancelled", "closed"} for leg in old_legs)
         assert all(leg.terminal_reason for leg in old_legs)
         assert new_protection_ids == {"new-stop-1795"}
+        assert {leg.order_id for leg in new_legs} == {"new-entry-3429"}
+        assert {leg.pos_id for leg in new_legs} == {"new-pos-3429"}
+        assert all(leg.attribution_status == "verified" for leg in new_legs)
         assert old_protection_ids == {"old-stop-1695"}
         assert old_protection_states == {"cancelled"}
         assert {leg.order_id for leg in old_legs}.isdisjoint({"new-entry-3429"})
