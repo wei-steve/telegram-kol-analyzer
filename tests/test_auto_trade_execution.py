@@ -49,7 +49,12 @@ class _StaticContractSpecProvider:
 def test_auto_trade_blocks_deleted_source_before_any_exchange_call(tmp_path):
     session_factory = create_session_factory(tmp_path / "deleted-source.db")
     with session_factory() as session:
-        raw = RawMessage(chat_id=100, message_id=3428, text="ETH long")
+        raw = RawMessage(
+            chat_id=100,
+            message_id=3428,
+            text="ETH long",
+            archived_target_group=True,
+        )
         session.add(raw)
         session.commit()
         raw_id = raw.id

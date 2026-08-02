@@ -58,12 +58,38 @@ from telegram_kol_research.trade_signals import load_trade_signal
 from telegram_kol_research.trade_signals import mark_trade_signal_failed
 from telegram_kol_research.trade_signals import mark_trade_signal_submitted
 from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.source_message_deletion import (
+    source_identity_execution_barrier,
+    source_message_execution_authority,
+)
 from telegram_kol_research.take_profit_plan import TakeProfitPlanError
 from telegram_kol_research.take_profit_plan import build_take_profit_plan
 
 
 class RecoveryLiveSubmitError(RuntimeError):
     """Raised when a live recovery order cannot be submitted safely."""
+
+
+@contextmanager
+def _entry_source_exchange_write_gate(
+    session_factory: sessionmaker,
+    *,
+    trade_signal: TradeSignalRecord,
+    source: dict[str, Any],
+):
+    """Serialize the final source check with one entry exchange write."""
+
+    chat_id = int(source.get("chat_id") or trade_signal.chat_id)
+    message_id = int(source.get("message_id") or trade_signal.message_id)
+    with source_message_execution_authority(session_factory):
+        barrier = source_identity_execution_barrier(
+            session_factory,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+        if barrier.status != "allow":
+            raise RecoveryLiveSubmitError(str(barrier.reason or "source_execution_blocked"))
+        yield
 
 
 _TRIGGER_PROTECTION_LOCKS: dict[tuple[str, str, str, str], RLock] = {}
@@ -501,7 +527,12 @@ def _submit_recovery_signal_direct(
             )
             order_payload = build_deepcoin_market_order_payload(draft, leg)
             try:
-                response = deepcoin_client.place_order(order_payload)
+                with _entry_source_exchange_write_gate(
+                    session_factory,
+                    trade_signal=trade_signal,
+                    source=source,
+                ):
+                    response = deepcoin_client.place_order(order_payload)
             except DeepcoinClientError:
                 raise
             except Exception as exc:  # pragma: no cover - defensive boundary
@@ -587,24 +618,29 @@ def _submit_recovery_signal_direct(
         elif order_type == "limit":
             order_payload = build_deepcoin_trigger_order_payload(draft, leg)
             try:
-                if _has_embedded_trigger_protection(order_payload):
-                    response = _submit_trigger_with_protection_intent(
-                        session_factory,
-                        deepcoin_client=deepcoin_client,
-                        trade_signal=trade_signal,
-                        draft=draft,
-                        leg=leg,
-                        leg_index=index,
-                        binding_context={
-                            "kol_id": kol_id,
-                            "symbol": symbol_key,
-                            "side": side_key,
-                            "source": source,
-                        },
-                        order_payload=order_payload,
-                    )
-                else:
-                    response = deepcoin_client.trigger_order(order_payload)
+                with _entry_source_exchange_write_gate(
+                    session_factory,
+                    trade_signal=trade_signal,
+                    source=source,
+                ):
+                    if _has_embedded_trigger_protection(order_payload):
+                        response = _submit_trigger_with_protection_intent(
+                            session_factory,
+                            deepcoin_client=deepcoin_client,
+                            trade_signal=trade_signal,
+                            draft=draft,
+                            leg=leg,
+                            leg_index=index,
+                            binding_context={
+                                "kol_id": kol_id,
+                                "symbol": symbol_key,
+                                "side": side_key,
+                                "source": source,
+                            },
+                            order_payload=order_payload,
+                        )
+                    else:
+                        response = deepcoin_client.trigger_order(order_payload)
             except DeepcoinClientError:
                 raise
             except RecoveryLiveSubmitError:
@@ -625,7 +661,12 @@ def _submit_recovery_signal_direct(
         else:
             order_payload = build_deepcoin_trigger_order_payload(draft, leg)
             try:
-                response = deepcoin_client.trigger_order(order_payload)
+                with _entry_source_exchange_write_gate(
+                    session_factory,
+                    trade_signal=trade_signal,
+                    source=source,
+                ):
+                    response = deepcoin_client.trigger_order(order_payload)
             except DeepcoinClientError:
                 raise
             except Exception as exc:  # pragma: no cover - defensive boundary

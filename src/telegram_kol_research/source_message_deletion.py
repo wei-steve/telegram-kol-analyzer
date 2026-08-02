@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 import json
+from threading import RLock
 from typing import Any
 
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
@@ -40,6 +43,25 @@ class SourceExecutionBarrierDecision:
     blocking_exit_id: int | None = None
 
 
+_SOURCE_EXECUTION_LOCKS: dict[str, RLock] = {}
+_SOURCE_EXECUTION_LOCKS_GUARD = RLock()
+
+
+def _source_execution_lock(session_factory: sessionmaker) -> RLock:
+    bind = session_factory.kw.get("bind")
+    key = str(getattr(bind, "url", bind))
+    with _SOURCE_EXECUTION_LOCKS_GUARD:
+        return _SOURCE_EXECUTION_LOCKS.setdefault(key, RLock())
+
+
+@contextmanager
+def source_message_execution_authority(session_factory: sessionmaker):
+    """Serialize deletion commits with final entry-order submissions."""
+
+    with _source_execution_lock(session_factory):
+        yield
+
+
 def deletion_event_fingerprint(*, chat_id: int, message_id: int) -> str:
     identity = f"telegram:message_deleted:{int(chat_id)}:{int(message_id)}"
     return sha256(identity.encode("utf-8")).hexdigest()
@@ -52,72 +74,120 @@ def source_execution_barrier(
 ) -> SourceExecutionBarrierDecision:
     """Fail closed for a deleted source and sequence overlapping reposts."""
 
-    with session_factory() as session:
-        raw_message = session.get(RawMessage, int(raw_message_id))
-        if raw_message is None:
-            return SourceExecutionBarrierDecision(status="allow")
-        if str(raw_message.source_status or "active") == "deleted":
-            deletion_exit = (
-                session.query(SourceMessageDeletionExit)
+    with source_message_execution_authority(session_factory):
+        with session_factory() as session:
+            raw_message = session.get(RawMessage, int(raw_message_id))
+            if raw_message is None:
+                return SourceExecutionBarrierDecision(status="allow")
+            event = (
+                session.query(TelegramSourceMessageEvent)
                 .filter(
-                    SourceMessageDeletionExit.raw_message_id == raw_message.id
+                    TelegramSourceMessageEvent.event_type == "message_deleted",
+                    TelegramSourceMessageEvent.chat_id == raw_message.chat_id,
+                    TelegramSourceMessageEvent.message_id == raw_message.message_id,
+                )
+                .one_or_none()
+            )
+            if event is not None:
+                deletion_exit = _bind_deletion_event_in_session(
+                    session,
+                    event=event,
+                    updated_at=datetime.now(UTC),
+                )
+                session.commit()
+                if event.binding_state == "bound":
+                    return SourceExecutionBarrierDecision(
+                        status="block",
+                        reason="source_message_deleted",
+                        blocking_exit_id=int(deletion_exit.id),
+                    )
+            if str(raw_message.source_status or "active") == "deleted":
+                deletion_exit = (
+                    session.query(SourceMessageDeletionExit)
+                    .filter(SourceMessageDeletionExit.raw_message_id == raw_message.id)
+                    .order_by(SourceMessageDeletionExit.id.asc())
+                    .first()
+                )
+                return SourceExecutionBarrierDecision(
+                    status="block",
+                    reason="source_message_deleted",
+                    blocking_exit_id=(
+                        int(deletion_exit.id) if deletion_exit is not None else None
+                    ),
+                )
+
+            candidate = (
+                session.query(SignalCandidate)
+                .filter(
+                    SignalCandidate.raw_message_id == raw_message.id,
+                    SignalCandidate.symbol.is_not(None),
+                    SignalCandidate.side.is_not(None),
+                )
+                .order_by(SignalCandidate.id.desc())
+                .first()
+            )
+            if candidate is None:
+                return SourceExecutionBarrierDecision(status="allow")
+            symbol = str(candidate.symbol or "").strip().upper()
+            side = str(candidate.side or "").strip().lower()
+            if not symbol or not side:
+                return SourceExecutionBarrierDecision(status="allow")
+
+            overlapping_exit = (
+                session.query(SourceMessageDeletionExit)
+                .join(
+                    RawMessage,
+                    RawMessage.id == SourceMessageDeletionExit.raw_message_id,
+                )
+                .join(
+                    SignalCandidate,
+                    SignalCandidate.raw_message_id == RawMessage.id,
+                )
+                .filter(
+                    RawMessage.chat_id == raw_message.chat_id,
+                    RawMessage.id != raw_message.id,
+                    RawMessage.source_status == "deleted",
+                    SignalCandidate.symbol == symbol,
+                    SignalCandidate.side == side,
+                    SourceMessageDeletionExit.state != "succeeded",
                 )
                 .order_by(SourceMessageDeletionExit.id.asc())
                 .first()
             )
-            return SourceExecutionBarrierDecision(
-                status="block",
-                reason="source_message_deleted",
-                blocking_exit_id=(
-                    int(deletion_exit.id) if deletion_exit is not None else None
-                ),
-            )
-
-        candidate = (
-            session.query(SignalCandidate)
-            .filter(
-                SignalCandidate.raw_message_id == raw_message.id,
-                SignalCandidate.symbol.is_not(None),
-                SignalCandidate.side.is_not(None),
-            )
-            .order_by(SignalCandidate.id.desc())
-            .first()
-        )
-        if candidate is None:
-            return SourceExecutionBarrierDecision(status="allow")
-        symbol = str(candidate.symbol or "").strip().upper()
-        side = str(candidate.side or "").strip().lower()
-        if not symbol or not side:
+            if overlapping_exit is not None:
+                return SourceExecutionBarrierDecision(
+                    status="hold",
+                    reason="waiting_source_deletion_exit",
+                    blocking_exit_id=int(overlapping_exit.id),
+                )
             return SourceExecutionBarrierDecision(status="allow")
 
-        overlapping_exit = (
-            session.query(SourceMessageDeletionExit)
-            .join(
-                RawMessage,
-                RawMessage.id == SourceMessageDeletionExit.raw_message_id,
-            )
-            .join(
-                SignalCandidate,
-                SignalCandidate.raw_message_id == RawMessage.id,
-            )
+
+def source_identity_execution_barrier(
+    session_factory: sessionmaker,
+    *,
+    chat_id: int,
+    message_id: int,
+) -> SourceExecutionBarrierDecision:
+    """Apply the raw-message barrier from an exact source identity."""
+
+    with session_factory() as session:
+        raw_message_id = (
+            session.query(RawMessage.id)
             .filter(
-                RawMessage.chat_id == raw_message.chat_id,
-                RawMessage.id != raw_message.id,
-                RawMessage.source_status == "deleted",
-                SignalCandidate.symbol == symbol,
-                SignalCandidate.side == side,
-                SourceMessageDeletionExit.state != "succeeded",
+                RawMessage.chat_id == int(chat_id),
+                RawMessage.message_id == int(message_id),
+                RawMessage.archived_target_group.is_(True),
             )
-            .order_by(SourceMessageDeletionExit.id.asc())
-            .first()
+            .order_by(RawMessage.id.asc())
+            .scalar()
         )
-        if overlapping_exit is not None:
-            return SourceExecutionBarrierDecision(
-                status="hold",
-                reason="waiting_source_deletion_exit",
-                blocking_exit_id=int(overlapping_exit.id),
-            )
+    if raw_message_id is None:
         return SourceExecutionBarrierDecision(status="allow")
+    return source_execution_barrier(
+        session_factory,
+        raw_message_id=int(raw_message_id),
+    )
 
 
 def record_source_message_deleted(
@@ -138,97 +208,150 @@ def record_source_message_deleted(
     event_json = json.dumps(
         telegram_event or {}, ensure_ascii=False, sort_keys=True, default=str
     )
-    with session_factory() as session:
-        event = (
-            session.query(TelegramSourceMessageEvent)
-            .filter(
-                TelegramSourceMessageEvent.event_fingerprint == fingerprint
-            )
-            .one_or_none()
-        )
-        if event is None:
-            raw_message = (
-                session.query(RawMessage)
-                .filter(
-                    RawMessage.chat_id == int(chat_id),
-                    RawMessage.message_id == int(message_id),
+    with source_message_execution_authority(session_factory):
+        with session_factory() as session:
+            session.execute(
+                sqlite_insert(TelegramSourceMessageEvent)
+                .values(
+                    event_type="message_deleted",
+                    chat_id=int(chat_id),
+                    message_id=int(message_id),
+                    raw_message_id=None,
+                    event_fingerprint=fingerprint,
+                    binding_state="unbound",
+                    telegram_event_json=event_json,
+                    occurred_at=occurred_at,
+                    created_at=occurred_at,
+                    updated_at=occurred_at,
                 )
-                .order_by(RawMessage.id.asc())
-                .first()
+                .on_conflict_do_nothing(index_elements=["event_fingerprint"])
             )
-            binding_state = "bound" if raw_message is not None else "unbound"
-            event = TelegramSourceMessageEvent(
-                event_type="message_deleted",
-                chat_id=int(chat_id),
-                message_id=int(message_id),
-                raw_message_id=raw_message.id if raw_message is not None else None,
-                event_fingerprint=fingerprint,
-                binding_state=binding_state,
-                telegram_event_json=event_json,
-                occurred_at=occurred_at,
-                updated_at=occurred_at,
-            )
-            session.add(event)
-            session.flush()
-
-            lifecycle = None
-            binding = None
-            if raw_message is not None:
-                raw_message.source_status = "deleted"
-                raw_message.deleted_at = occurred_at
-                raw_message.deletion_event_fingerprint = fingerprint
-                lifecycle = (
-                    session.query(StrategyLifecycle)
-                    .filter(
-                        StrategyLifecycle.chat_id == int(chat_id),
-                        StrategyLifecycle.message_id == int(message_id),
-                    )
-                    .one_or_none()
-                )
-                if lifecycle is not None and lifecycle.execution_binding_id is not None:
-                    binding = session.get(
-                        ExecutionBinding, int(lifecycle.execution_binding_id)
-                    )
-                if binding is None:
-                    binding = (
-                        session.query(ExecutionBinding)
-                        .filter(
-                            ExecutionBinding.chat_id == int(chat_id),
-                            ExecutionBinding.message_id == int(message_id),
-                        )
-                        .order_by(ExecutionBinding.id.asc())
-                        .first()
-                    )
-
-            deletion_exit = SourceMessageDeletionExit(
-                source_event_id=event.id,
-                raw_message_id=raw_message.id if raw_message is not None else None,
-                target_lifecycle_id=lifecycle.id if lifecycle is not None else None,
-                strategy_instance_id=(
-                    binding.strategy_instance_id if binding is not None else None
-                ),
-                state="pending" if raw_message is not None else "unbound",
-                updated_at=occurred_at,
-            )
-            session.add(deletion_exit)
-            session.commit()
-        else:
-            deletion_exit = (
-                session.query(SourceMessageDeletionExit)
-                .filter(SourceMessageDeletionExit.source_event_id == event.id)
+            event = (
+                session.query(TelegramSourceMessageEvent)
+                .filter(TelegramSourceMessageEvent.event_fingerprint == fingerprint)
                 .one()
             )
+            session.execute(
+                sqlite_insert(SourceMessageDeletionExit)
+                .values(
+                    source_event_id=event.id,
+                    raw_message_id=None,
+                    target_lifecycle_id=None,
+                    execution_binding_id=None,
+                    strategy_instance_id=None,
+                    target_fingerprint=None,
+                    state="unbound",
+                    attempt_count=0,
+                    created_at=occurred_at,
+                    updated_at=occurred_at,
+                )
+                .on_conflict_do_nothing(index_elements=["source_event_id"])
+            )
+            deletion_exit = _bind_deletion_event_in_session(
+                session,
+                event=event,
+                updated_at=occurred_at,
+            )
+            session.commit()
+            return SourceMessageDeletionRecord(
+                event_id=int(event.id),
+                exit_id=int(deletion_exit.id),
+                event_fingerprint=str(event.event_fingerprint),
+                chat_id=int(event.chat_id),
+                message_id=int(event.message_id),
+                raw_message_id=(
+                    int(event.raw_message_id)
+                    if event.raw_message_id is not None
+                    else None
+                ),
+                binding_state=str(event.binding_state),
+                exit_state=str(deletion_exit.state),
+                deleted_at=event.occurred_at,
+            )
 
-        return SourceMessageDeletionRecord(
-            event_id=int(event.id),
-            exit_id=int(deletion_exit.id),
-            event_fingerprint=str(event.event_fingerprint),
-            chat_id=int(event.chat_id),
-            message_id=int(event.message_id),
-            raw_message_id=(
-                int(event.raw_message_id) if event.raw_message_id is not None else None
-            ),
-            binding_state=str(event.binding_state),
-            exit_state=str(deletion_exit.state),
-            deleted_at=event.occurred_at,
+
+def _bind_deletion_event_in_session(
+    session,
+    *,
+    event: TelegramSourceMessageEvent,
+    updated_at: datetime,
+) -> SourceMessageDeletionExit:
+    deletion_exit = (
+        session.query(SourceMessageDeletionExit)
+        .filter(SourceMessageDeletionExit.source_event_id == event.id)
+        .one()
+    )
+    raw_message = (
+        session.query(RawMessage)
+        .filter(
+            RawMessage.chat_id == int(event.chat_id),
+            RawMessage.message_id == int(event.message_id),
+            RawMessage.archived_target_group.is_(True),
         )
+        .order_by(RawMessage.id.asc())
+        .first()
+    )
+    if raw_message is None:
+        return deletion_exit
+
+    raw_message.source_status = "deleted"
+    raw_message.deleted_at = event.occurred_at
+    raw_message.deletion_event_fingerprint = event.event_fingerprint
+    event.raw_message_id = raw_message.id
+    event.binding_state = "bound"
+    event.updated_at = updated_at
+    lifecycle = (
+        session.query(StrategyLifecycle)
+        .filter(
+            StrategyLifecycle.chat_id == int(event.chat_id),
+            StrategyLifecycle.message_id == int(event.message_id),
+        )
+        .one_or_none()
+    )
+    binding = None
+    if lifecycle is not None and lifecycle.execution_binding_id is not None:
+        binding = session.get(ExecutionBinding, int(lifecycle.execution_binding_id))
+    if binding is None:
+        binding = (
+            session.query(ExecutionBinding)
+            .filter(
+                ExecutionBinding.chat_id == int(event.chat_id),
+                ExecutionBinding.message_id == int(event.message_id),
+            )
+            .order_by(ExecutionBinding.id.asc())
+            .first()
+        )
+    deletion_exit.raw_message_id = raw_message.id
+    deletion_exit.target_lifecycle_id = lifecycle.id if lifecycle is not None else None
+    deletion_exit.execution_binding_id = binding.id if binding is not None else None
+    deletion_exit.strategy_instance_id = (
+        binding.strategy_instance_id if binding is not None else None
+    )
+    deletion_exit.state = "pending"
+    deletion_exit.updated_at = updated_at
+    target_identity = {
+        "event_id": int(event.id),
+        "raw_message_id": int(raw_message.id),
+        "target_lifecycle_id": (
+            int(lifecycle.id) if lifecycle is not None else None
+        ),
+        "execution_binding_id": int(binding.id) if binding is not None else None,
+        "strategy_instance_id": (
+            str(binding.strategy_instance_id)
+            if binding is not None and binding.strategy_instance_id is not None
+            else None
+        ),
+    }
+    deletion_exit.target_fingerprint = sha256(
+        json.dumps(target_identity, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    if lifecycle is not None and lifecycle.lifecycle_status not in {
+        "exited",
+        "expired",
+        "invalidated",
+        "cancelled",
+    }:
+        lifecycle.management_action = "source_deletion_exit_pending"
+        lifecycle.management_note = "source_message_deleted"
+        lifecycle.updated_at = updated_at
+    return deletion_exit

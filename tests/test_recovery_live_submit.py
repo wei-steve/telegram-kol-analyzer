@@ -30,6 +30,7 @@ from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trade_signals import canonical_management_batch_id
+from telegram_kol_research.source_message_deletion import record_source_message_deleted
 
 
 class _StaticContractSpecProvider:
@@ -705,6 +706,50 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
     ]
     assert {leg.execution_binding_id for leg in legs} == {binding.id}
     assert {leg.strategy_instance_id for leg in legs} == {"deepcoin:100:55:BTC:long"}
+
+
+def test_entry_submit_rechecks_source_after_planning_before_exchange_write(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "delete-race.db")
+    _persist_ready_item(session_factory)
+    _persist_lifecycle(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    fake_client = _FakeDeepcoinClient()
+    original_builder = build_deepcoin_trigger_order_payload
+    deleted = False
+
+    def delete_after_planning(draft, leg):
+        nonlocal deleted
+        payload = original_builder(draft, leg)
+        if not deleted:
+            deleted = True
+            record_source_message_deleted(
+                session_factory,
+                chat_id=100,
+                message_id=55,
+            )
+        return payload
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit.build_deepcoin_trigger_order_payload",
+        delete_after_planning,
+    )
+
+    with pytest.raises(RecoveryLiveSubmitError, match="source_message_deleted"):
+        submit_recovery_order_live(
+            session_factory,
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="long",
+            deepcoin_client=fake_client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert fake_client.trigger_payloads == []
+    assert fake_client.payloads == []
 
 
 def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):

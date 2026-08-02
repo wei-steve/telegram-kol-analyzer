@@ -21,6 +21,7 @@ from telegram_kol_research.models import (
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
+    SourceMessageDeletionExit,
     StrategyLifecycle,
     StrategyMessageLink,
 )
@@ -50,6 +51,7 @@ def test_authoritative_apply_rechecks_deleted_source_before_auto_trade(
             chat_id=101,
             message_id=3428,
             text="BTC long entry 68000 stop 67500",
+            archived_target_group=True,
         )
         session.add(raw)
         session.commit()
@@ -91,6 +93,13 @@ def test_authoritative_apply_rechecks_deleted_source_before_auto_trade(
         )
         assert decision.automation_status == "blocked"
         assert decision.automation_reason == "source_message_deleted"
+        deletion_exit = session.query(SourceMessageDeletionExit).one()
+        lifecycle = (
+            session.query(StrategyLifecycle)
+            .filter(StrategyLifecycle.chat_id == 101)
+            .one()
+        )
+        assert deletion_exit.target_lifecycle_id == lifecycle.id
 
 
 def test_reanalysis_reuses_saved_mimo_evidence_without_model_call(

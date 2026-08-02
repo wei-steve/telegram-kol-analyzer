@@ -389,6 +389,14 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
+    "ix_raw_messages_source_status": (
+        "CREATE INDEX IF NOT EXISTS ix_raw_messages_source_status "
+        "ON raw_messages (source_status)"
+    ),
+    "ix_raw_messages_deletion_event_fingerprint": (
+        "CREATE INDEX IF NOT EXISTS ix_raw_messages_deletion_event_fingerprint "
+        "ON raw_messages (deletion_event_fingerprint)"
+    ),
     "uq_execution_events_cleanup_notification_fingerprint": (
         "CREATE UNIQUE INDEX IF NOT EXISTS "
         "uq_execution_events_cleanup_notification_fingerprint "

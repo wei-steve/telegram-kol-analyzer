@@ -136,8 +136,14 @@ class SourceMessageDeletionExit(Base):
     target_lifecycle_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("strategy_lifecycles.id"), nullable=True, index=True
     )
+    execution_binding_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=True, index=True
+    )
     strategy_instance_id: Mapped[Optional[str]] = mapped_column(
         String(255), nullable=True, index=True
+    )
+    target_fingerprint: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, unique=True
     )
     state: Mapped[str] = mapped_column(
         String(32), nullable=False, default="pending"
