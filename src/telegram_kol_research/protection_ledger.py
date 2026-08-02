@@ -181,6 +181,25 @@ def upsert_protection_ledger_row(
             created_at=now,
         )
         session.add(row)
+    else:
+        existing_owner = (
+            int(row.execution_binding_id),
+            int(row.execution_order_leg_id),
+            row.strategy_instance_id,
+            str(row.pos_id or "").strip(),
+            str(row.instrument_id or "").upper(),
+            str(row.side or "").lower(),
+        )
+        requested_owner = (
+            int(execution_binding_id),
+            int(execution_order_leg_id),
+            strategy_instance_id,
+            str(pos_id or "").strip(),
+            str(instrument_id or "").upper(),
+            str(side or "").lower(),
+        )
+        if existing_owner != requested_owner:
+            raise ValueError("protection_ledger_owner_conflict")
 
     row.execution_binding_id = int(execution_binding_id)
     row.execution_order_leg_id = int(execution_order_leg_id)

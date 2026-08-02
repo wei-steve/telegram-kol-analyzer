@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import PositionBackupStopOrder
-from telegram_kol_research.models import PositionProtectionIncident
+from telegram_kol_research.models import PositionProtectionIncident, PositionProtectionLedger
 from telegram_kol_research.protection_ledger import (
     build_account_protection_ownership,
     list_verified_ledger_rows_for_positions,
@@ -120,6 +120,73 @@ def test_upsert_protection_ledger_row_updates_by_order_id(tmp_path):
     assert rows[0].id == first_id
     assert rows[0].trigger_price == "62600"
     assert rows[0].evidence_source == "management_tpsl_replacement"
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("execution_binding_id", 145),
+        ("execution_order_leg_id", 278),
+        ("strategy_instance_id", "deepcoin:other"),
+        ("pos_id", "other-pos"),
+        ("instrument_id", "ETH-USDT-SWAP"),
+        ("side", "short"),
+    ],
+)
+def test_upsert_protection_ledger_row_refuses_owner_conflict(
+    tmp_path,
+    field,
+    changed,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    owner = {
+        "venue": "deepcoin",
+        "execution_binding_id": 144,
+        "execution_order_leg_id": 277,
+        "strategy_instance_id": "deepcoin:strategy-1",
+        "pos_id": "pos-1",
+        "instrument_id": "BTC-USDT-SWAP",
+        "side": "long",
+        "order_id": "order-1",
+    }
+    with session_factory() as session:
+        upsert_protection_ledger_row(
+            session,
+            **owner,
+            purpose="stop_loss",
+            trigger_price="61500",
+            size_text="1",
+            status="verified",
+            evidence_source="initial",
+            evidence={"version": 1},
+        )
+        session.commit()
+
+    conflicting = {**owner, field: changed}
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="protection_ledger_owner_conflict"):
+            upsert_protection_ledger_row(
+                session,
+                **conflicting,
+                purpose="stop_loss",
+                trigger_price="62000",
+                size_text="1",
+                status="verified",
+                evidence_source="conflict",
+                evidence={"version": 2},
+            )
+        session.rollback()
+
+    with session_factory() as session:
+        persisted = session.query(PositionProtectionLedger).one()
+        assert persisted.execution_binding_id == owner["execution_binding_id"]
+        assert persisted.execution_order_leg_id == owner["execution_order_leg_id"]
+        assert persisted.strategy_instance_id == owner["strategy_instance_id"]
+        assert persisted.pos_id == owner["pos_id"]
+        assert persisted.instrument_id == owner["instrument_id"]
+        assert persisted.side == owner["side"]
+        assert persisted.trigger_price == "61500"
+        assert persisted.evidence_source == "initial"
 
 
 def test_upsert_protection_ledger_row_skips_empty_order_id(tmp_path):
