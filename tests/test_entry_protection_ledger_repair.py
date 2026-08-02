@@ -803,6 +803,42 @@ def test_intent_adoption_refuses_same_signature_filled_sibling(tmp_path):
     assert result.refusal.reason == "trigger_protection_candidate_not_unique"
 
 
+def test_intent_adoption_refuses_filled_sibling_even_when_its_recovery_failed(
+    tmp_path,
+):
+    other_intent = TriggerProtectionIntent(
+        id=777,
+        venue="deepcoin",
+        execution_binding_id=152,
+        execution_order_leg_id=290,
+        request_fingerprint="different-fingerprint",
+        pre_submit_tpsl_baseline_json="[]",
+        correlation_id="other",
+        recovery_state="failed",
+    )
+
+    result = _plan_intent_adoption(
+        tmp_path,
+        request_update={"tpTriggerPx": None},
+        pending_update={"posId": "", "tpTriggerPx": None, "slTriggerPx": "1900"},
+        existing_intents=[other_intent],
+        existing_intent_requests="same_as_current",
+        existing_intent_owner_states={
+            777: TriggerProtectionOwnerState(
+                execution_order_leg_id=290,
+                status="active",
+                attribution_status="verified",
+                pos_id="pos-2",
+                parent_order_id="entry-2",
+            )
+        },
+    )
+
+    assert result.action is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_candidate_not_unique"
+
+
 def test_intent_adoption_requires_absent_unrequested_protection_side(tmp_path):
     result = _plan_intent_adoption(
         tmp_path,

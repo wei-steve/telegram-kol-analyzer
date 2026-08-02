@@ -1105,12 +1105,6 @@ def _other_intent_can_own_anonymous_stop(
         intent.id is not None and other_intent.id == intent.id
     ):
         return False
-    if str(other_intent.recovery_state or "") not in {
-        "pending",
-        "retrying",
-        "submitting",
-    }:
-        return False
     if anonymous_stop_key is None or existing_intent_requests is None:
         return False
     other_id = int(other_intent.id or 0)
