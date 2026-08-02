@@ -146,9 +146,10 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
 
     assert "phase_7_explicitly_approved: false" in status
     assert "phase_7_disposition: deferred_non_blocking" in status
-    assert "current_phase: 8R.1" in status
-    assert "phase_name: monitoring-observability-repair" in status
-    assert "phase_status: in_progress" in status
+    assert "current_phase: 8R.2" in status
+    assert "phase_name: technical-incident-capture" in status
+    assert "phase_status: planned" in status
+    assert 'last_completed_phase: "8R.1"' in status
     assert "### Phase 8R proactive read-only incident detection" in runbook
     assert (
         "Phase 8R never enables "

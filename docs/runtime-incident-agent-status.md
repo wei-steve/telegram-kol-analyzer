@@ -6,11 +6,11 @@ used to advance or reinterpret the rollout.
 ```yaml
 project: runtime-incident-agent
 design_version: 1
-current_phase: 8R.1
-phase_name: monitoring-observability-repair
-phase_status: in_progress
-last_completed_phase: 6
-last_completed_commit: 46852f0
+current_phase: 8R.2
+phase_name: technical-incident-capture
+phase_status: planned
+last_completed_phase: "8R.1"
+last_completed_commit: 2449382
 production_commit: 2449382bd53195950b42ec6052fb4e6dee4fb9cd
 local_tests:
   - "phase-8r.1-monitor-observability-focused: 192 passed, 1 Linux-only systemd sandbox probe skipped"
@@ -66,7 +66,7 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-8r.1-monitor-repair-staged-disabled
+  status: phase-8r.1-monitor-repair-complete
   deployed_commit: 2449382bd53195950b42ec6052fb4e6dee4fb9cd
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
@@ -140,17 +140,19 @@ server_verification:
   phase_6_completion: "Phase 6 is complete with four reviewed deployed handlers and two documented fail-closed rejections. At completion every Agent/shadow/action flag and allowlist was empty/off. Optional Phase 7 is blocked because its separately required explicit user approval has not been given"
   phase_6_diagnosis_activation: "after explicit user instruction, the already deployed read-only diagnosis sidecar was enabled persistently without restarting the main service. Preflight proved a complete stable audit, only the known audit_abnormal baseline, no evidence/context/management/position-mutation/recovery work in flight, no claimable runtime incidents, a complete dedicated provider configuration, and empty shadow/action allowlists. The sidecar runs as telegram-kol-agent, is enabled/active, and repeatedly reports idle; the main service remains active HTTP 200. TELEGRAM_KOL_RUNTIME_AGENT_ENABLED is true while shadow/action allowlists remain empty and action authority remains false"
   phase_8r_1_deployment: "A fresh safe-window gate proved the latest raw message 8994 had completed recognition, with zero recognition claims, context work, management work, position mutations, recent execution events, runtime claims, or recovery attempts. Commit 2449382 was deployed with a bounded main-service restart; the service returned HTTP 200 and the Runtime Agent resumed active/idle."
-  phase_8r_1_monitor_staging: "The monitor timer is disabled and inactive. The installer preserved the existing state bytes, converged state.json to telegram-kol-monitor:telegram-kol-monitor mode 0600, installed the reviewed system-operator-only environment, and left the timer off. Obsolete notification-bot fields were removed from the monitor-only credential file after a root-owned 0600 backup was created."
+  phase_8r_1_monitor_staging: "During staged deployment the monitor timer remained disabled and inactive. The installer preserved the existing state bytes, converged state.json to telegram-kol-monitor:telegram-kol-monitor mode 0600, installed the reviewed system-operator-only environment, and left the timer off until the separately approved activation. Obsolete notification-bot fields were removed from the monitor-only credential file after a root-owned 0600 backup was created."
   phase_8r_1_diagnostic: "The deployed no-notify diagnostic reached the monitor and returned monitor_error null with only the known audit_abnormal result. The deployed process loads a complete system-operator bot configuration from the service environment without reading checkout configuration."
   phase_8r_1_deployed_tests: "193 focused tests passed; 36 critical runtime regressions passed with 10 deprecation warnings. Main service and Runtime Agent are active; Agent action authority is false and both playbook allowlists are empty."
-  remaining: "Complete only Phase 8R.1 server activation: send the one reviewed monitor test notification, enable the independent monitor timer, verify the first bounded notified run has no notification_config_missing, and recheck service/listener/Agent continuity. Do not start Phase 8R.2."
+  phase_8r_1_activation: "A fresh activation gate again proved zero recognition, context, management, position-mutation, runtime-claim, or recovery work in flight. Exactly one reviewed monitor test-notification invocation returned sent. The timer is enabled/active with its next run scheduled; the first bounded notification-enabled run returned monitor_error null and notification_status sent for the known audit_abnormal baseline, with no notification_config_missing."
+  phase_8r_1_continuity: "Main service and Runtime Agent remain active; raw message 8995 completed recognition; the Agent is idle, action authority is false, and both playbook allowlists are empty. The monitor state remains readable by its dedicated identity at mode 0600."
+  remaining: "Begin only Phase 8R.2 from the standard implementation trigger. Expand reviewed existing technical incident capture in capture-only mode, with Telegram delivery for new types still disabled. Do not implement the invariant scanner or any later Phase 8R stage."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
   - "runtime-agent:read-only-diagnosis"
+  - "monitor:independent-system-operator-alerting"
 known_issues:
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
-  - "The notification-enabled monitor service also reports missing notification configuration; Phase 1 did not alter monitor configuration."
   - "The production notification-bot configuration is absent, so the new read-only Telegram evidence endpoint returns HTTP 503 for strategy-management notification sources. Runtime-incident system-operator evidence is verified; the unsupported production channel fails closed and no credential was added in Phase 6."
   - "Phase 6 production wiring implements the read-only reconciliation-plan, exchange-snapshot-refresh, production-audit, and Telegram-evidence handlers. Claim recovery and AI-job reschedule remain executor_not_configured by reviewed design: the former duplicated the authoritative stale-claim path, while the latter had no source satisfying both non-writing proof and the recognition/contextual-resolution boundary."
   - "Historical MiMo v4/v6 attempts failed closed on text-form tool output and fabricated evidence. Prompt v7 now passed an isolated live closed-final validation with only actually gathered evidence, while production incident 2 remains preserved as escalated for audit history."
@@ -484,7 +486,7 @@ Phase 5 is not complete until:
 - Status: in progress
 - Roadmap-control Task 0: completed locally with 10 focused tests passing;
   documentation and test changes only, so no production restart was required
-- Current task: `8R.1 monitoring-observability-repair`
+- Current task: `8R.2 technical-incident-capture`
 - Approved scope: deterministic proactive discovery, bounded read-only
   diagnosis, Telegram notification, Codex handoff, and read-only verification
 - Prohibited scope: order, position, protection, strategy, recognition,
@@ -495,7 +497,9 @@ Phase 5 is not complete until:
   safe window with immediate independent rollback
 - Authority state: Phase 6 diagnosis may remain active; shadow and action
   allowlists remain empty; action authority remains false
-- Task 8R.1 local and deployed code: commit `2449382`; monitor installation is
-  staged with the timer disabled and the no-notify diagnostic verified
-- Next action: finish only the Task 8R.1 notification canary and timer
-  activation, then verify the first bounded run and production continuity
+- Task 8R.1: completed at deployed commit `2449382`; the independent monitor
+  timer is enabled, its dedicated state is readable, the one reviewed test
+  notification was delivered, and the first notified run had no configuration
+  error
+- Next action: start only Task 8R.2 in capture-only mode; new incident-type
+  Telegram delivery remains disabled during that first deployment
