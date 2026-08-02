@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.models import (
     ExecutionBinding,
     RawMessage,
+    SignalCandidate,
     SourceMessageDeletionExit,
     StrategyLifecycle,
     TelegramSourceMessageEvent,
@@ -32,9 +33,91 @@ class SourceMessageDeletionRecord:
     deleted_at: datetime
 
 
+@dataclass(frozen=True)
+class SourceExecutionBarrierDecision:
+    status: str
+    reason: str | None = None
+    blocking_exit_id: int | None = None
+
+
 def deletion_event_fingerprint(*, chat_id: int, message_id: int) -> str:
     identity = f"telegram:message_deleted:{int(chat_id)}:{int(message_id)}"
     return sha256(identity.encode("utf-8")).hexdigest()
+
+
+def source_execution_barrier(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+) -> SourceExecutionBarrierDecision:
+    """Fail closed for a deleted source and sequence overlapping reposts."""
+
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        if raw_message is None:
+            return SourceExecutionBarrierDecision(status="allow")
+        if str(raw_message.source_status or "active") == "deleted":
+            deletion_exit = (
+                session.query(SourceMessageDeletionExit)
+                .filter(
+                    SourceMessageDeletionExit.raw_message_id == raw_message.id
+                )
+                .order_by(SourceMessageDeletionExit.id.asc())
+                .first()
+            )
+            return SourceExecutionBarrierDecision(
+                status="block",
+                reason="source_message_deleted",
+                blocking_exit_id=(
+                    int(deletion_exit.id) if deletion_exit is not None else None
+                ),
+            )
+
+        candidate = (
+            session.query(SignalCandidate)
+            .filter(
+                SignalCandidate.raw_message_id == raw_message.id,
+                SignalCandidate.symbol.is_not(None),
+                SignalCandidate.side.is_not(None),
+            )
+            .order_by(SignalCandidate.id.desc())
+            .first()
+        )
+        if candidate is None:
+            return SourceExecutionBarrierDecision(status="allow")
+        symbol = str(candidate.symbol or "").strip().upper()
+        side = str(candidate.side or "").strip().lower()
+        if not symbol or not side:
+            return SourceExecutionBarrierDecision(status="allow")
+
+        overlapping_exit = (
+            session.query(SourceMessageDeletionExit)
+            .join(
+                RawMessage,
+                RawMessage.id == SourceMessageDeletionExit.raw_message_id,
+            )
+            .join(
+                SignalCandidate,
+                SignalCandidate.raw_message_id == RawMessage.id,
+            )
+            .filter(
+                RawMessage.chat_id == raw_message.chat_id,
+                RawMessage.id != raw_message.id,
+                RawMessage.source_status == "deleted",
+                SignalCandidate.symbol == symbol,
+                SignalCandidate.side == side,
+                SourceMessageDeletionExit.state != "succeeded",
+            )
+            .order_by(SourceMessageDeletionExit.id.asc())
+            .first()
+        )
+        if overlapping_exit is not None:
+            return SourceExecutionBarrierDecision(
+                status="hold",
+                reason="waiting_source_deletion_exit",
+                blocking_exit_id=int(overlapping_exit.id),
+            )
+        return SourceExecutionBarrierDecision(status="allow")
 
 
 def record_source_message_deleted(

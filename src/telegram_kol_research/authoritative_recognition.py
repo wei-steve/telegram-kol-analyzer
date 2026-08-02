@@ -803,7 +803,19 @@ def process_authoritative_message(
                 "authoritative execution claim failed for stale generation"
             )
     recognition = apply_authoritative_assessment(session_factory, assessment)
-    if assessment.agreement_status == "authoritative_failed":
+    from telegram_kol_research.source_message_deletion import (
+        source_execution_barrier,
+    )
+
+    barrier = source_execution_barrier(
+        session_factory,
+        raw_message_id=raw_message_id,
+    )
+    if barrier.status == "block":
+        automation = {"status": "blocked", "reason": barrier.reason}
+    elif barrier.status == "hold":
+        automation = {"status": "deferred", "reason": barrier.reason}
+    elif assessment.agreement_status == "authoritative_failed":
         automation = {
             "status": "skipped",
             "reason": "mimo_authoritative_failed",

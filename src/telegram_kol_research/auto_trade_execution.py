@@ -141,6 +141,19 @@ def auto_process_message_trade_signal(
 ) -> dict[str, Any]:
     """Execute projected items, or use the legacy single-candidate path."""
 
+    from telegram_kol_research.source_message_deletion import (
+        source_execution_barrier,
+    )
+
+    barrier = source_execution_barrier(
+        session_factory,
+        raw_message_id=raw_message_id,
+    )
+    if barrier.status == "block":
+        return {"status": "blocked", "reason": barrier.reason}
+    if barrier.status == "hold":
+        return {"status": "deferred", "reason": barrier.reason}
+
     if has_message_instruction_items(
         session_factory,
         raw_message_id=raw_message_id,

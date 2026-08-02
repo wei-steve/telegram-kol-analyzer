@@ -24,6 +24,7 @@ from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
 from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
 from telegram_kol_research.trading_settings import save_trading_settings
+from telegram_kol_research.source_message_deletion import record_source_message_deleted
 
 
 class _StaticContractSpecProvider:
@@ -43,6 +44,32 @@ class _StaticContractSpecProvider:
             min_quantity=1,
             price_tick=0.1,
         )
+
+
+def test_auto_trade_blocks_deleted_source_before_any_exchange_call(tmp_path):
+    session_factory = create_session_factory(tmp_path / "deleted-source.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=3428, text="ETH long")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    record_source_message_deleted(
+        session_factory,
+        chat_id=100,
+        message_id=3428,
+    )
+    client = _FakeDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_id,
+        group_config=GroupConfig(groups=[]),
+        deepcoin_client=client,
+    )
+
+    assert result == {"status": "blocked", "reason": "source_message_deleted"}
+    assert client.orders == []
+    assert client.trigger_orders == []
 
 
 class _FakeDeepcoinClient:

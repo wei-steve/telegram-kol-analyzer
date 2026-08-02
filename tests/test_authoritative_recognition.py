@@ -36,6 +36,61 @@ from telegram_kol_research.strategy_threads import (
     create_strategy_thread_for_lifecycle,
     link_message_to_strategy_thread,
 )
+from telegram_kol_research.source_message_deletion import record_source_message_deleted
+
+
+def test_authoritative_apply_rechecks_deleted_source_before_auto_trade(
+    tmp_path,
+    monkeypatch,
+    stub_mimo_authoritative_model,
+):
+    session_factory = create_session_factory(tmp_path / "deleted-authoritative.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=101,
+            message_id=3428,
+            text="BTC long entry 68000 stop 67500",
+        )
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    auto_trade_calls = []
+    original_apply = apply_authoritative_assessment
+
+    def delete_source_during_authoritative_apply(factory, assessment):
+        record_source_message_deleted(
+            factory,
+            chat_id=101,
+            message_id=3428,
+        )
+        return original_apply(factory, assessment)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
+        delete_source_during_authoritative_apply,
+    )
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path / "media",
+        auto_trade_executor=lambda message_id: auto_trade_calls.append(message_id),
+    )
+
+    assert result.automation == {
+        "status": "blocked",
+        "reason": "source_message_deleted",
+    }
+    assert auto_trade_calls == []
+    with session_factory() as session:
+        decision = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == raw_id)
+            .one()
+        )
+        assert decision.automation_status == "blocked"
+        assert decision.automation_reason == "source_message_deleted"
 
 
 def test_reanalysis_reuses_saved_mimo_evidence_without_model_call(
