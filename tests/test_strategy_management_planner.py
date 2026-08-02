@@ -18,14 +18,113 @@ from telegram_kol_research.models import (
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
+    SourceMessageDeletionExit,
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.source_message_deletion import record_source_message_deleted
 
 
 PLANNED_AT = datetime(2026, 7, 15, 8, 0, tzinfo=UTC)
+
+
+def test_source_deletion_full_exit_preserves_original_ancestry_and_exact_pos_ids(
+    tmp_path,
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "source-delete-plan.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=500,
+            message_id=3428,
+            text="BTC short entry",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        decision = RecognitionDecision(
+            raw_message_id=raw.id,
+            input_kind="text",
+            authoritative_model="mimo",
+            authoritative_status="是策略",
+            authoritative_payload_json="{}",
+            agreement_status="authoritative_only",
+            differences_json="[]",
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=500,
+            message_id=3428,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=PLANNED_AT,
+        )
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:500:3428:BTC:short",
+            kol_id="group:500",
+            chat_id=500,
+            message_id=3428,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            pos_id="pos-deleted",
+            status="active",
+        )
+        session.add_all([decision, lifecycle, binding])
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=1,
+                purpose="entry",
+                order_kind="market",
+                order_id="entry-deleted",
+                pos_id="pos-deleted",
+                venue="deepcoin",
+                attribution_status="verified",
+                attribution_evidence_json=json.dumps(
+                    {"policy_version": 2, "source": "direct_order_identity"}
+                ),
+                status="active",
+            )
+        )
+        session.commit()
+        decision_id = decision.id
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=500,
+        message_id=3428,
+        deleted_at=PLANNED_AT,
+    )
+    client = _ReadOnlyDeepcoin([_position("pos-deleted")])
+
+    result = planner.plan_source_deletion_full_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert (result.status, result.reason_code) == ("ready", None)
+    assert result.batch is not None
+    assert result.batch.recognition_decision_id == decision_id
+    assert result.batch.recognition_generation == f"source_deleted:{deletion.event_fingerprint}"
+    assert result.batch.intent == "full_exit"
+    assert [leg.pos_id for leg in result.batch.legs] == ["pos-deleted"]
+    assert result.batch.target_snapshot["source_deletion"] == {
+        "event_id": deletion.event_id,
+        "exit_id": deletion.exit_id,
+        "event_fingerprint": deletion.event_fingerprint,
+    }
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert deletion_exit.management_batch_id == result.batch.id
+        assert deletion_exit.state == "closing_positions"
 
 
 def _planner():

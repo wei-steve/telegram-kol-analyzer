@@ -26,6 +26,7 @@ from telegram_kol_research.models import (
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
+    SourceMessageDeletionExit,
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementLeg,
@@ -33,6 +34,7 @@ from telegram_kol_research.models import (
     TriggerProtectionStopRescue,
     ExecutionEvent,
     PositionAttributionAudit,
+    TelegramSourceMessageEvent,
 )
 from telegram_kol_research.position_attribution import (
     TERMINAL_ENTRY_LEG_STATES,
@@ -224,6 +226,127 @@ def plan_strategy_management_batch(
             planned_at=now,
             execution_mode=resolved_execution_mode,
         )
+
+
+def plan_source_deletion_full_exit(
+    session_factory: sessionmaker,
+    *,
+    deletion_exit_id: int,
+    deepcoin_client,
+    contract_spec_provider,
+    planned_at: datetime | None = None,
+) -> ManagementPlanningResult:
+    """Plan a full exit from the exact deleted-source ledger ancestry."""
+
+    now = planned_at or datetime.now(UTC)
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, int(deletion_exit_id))
+        if deletion_exit is None:
+            return ManagementPlanningResult(
+                status="blocked", reason_code="source_deletion_exit_not_found"
+            )
+        if (
+            deletion_exit.raw_message_id is None
+            or deletion_exit.target_lifecycle_id is None
+            or deletion_exit.source_event_id is None
+        ):
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="source_deletion_exact_target_missing",
+                target_lifecycle_id=deletion_exit.target_lifecycle_id,
+            )
+        raw_message = session.get(RawMessage, int(deletion_exit.raw_message_id))
+        lifecycle = session.get(
+            StrategyLifecycle, int(deletion_exit.target_lifecycle_id)
+        )
+        event = session.get(
+            TelegramSourceMessageEvent, int(deletion_exit.source_event_id)
+        )
+        decision = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == deletion_exit.raw_message_id)
+            .one_or_none()
+        )
+        if raw_message is None or lifecycle is None or event is None or decision is None:
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="source_deletion_original_ancestry_missing",
+                target_lifecycle_id=deletion_exit.target_lifecycle_id,
+            )
+        generation = f"source_deleted:{event.event_fingerprint}"
+        candidate = (
+            session.query(SignalCandidate)
+            .filter(
+                SignalCandidate.raw_message_id == raw_message.id,
+                SignalCandidate.recognition_generation == generation,
+                SignalCandidate.management_action == "full_exit",
+                SignalCandidate.target_lifecycle_id == lifecycle.id,
+            )
+            .one_or_none()
+        )
+        if candidate is None:
+            candidate = SignalCandidate(
+                raw_message_id=raw_message.id,
+                symbol=lifecycle.symbol,
+                side=lifecycle.side,
+                event_type="close_signal",
+                target_lifecycle_id=lifecycle.id,
+                management_action="full_exit",
+                recognition_generation=generation,
+                parse_source="source_deletion",
+                confidence=1.0,
+                review_status="approved",
+            )
+            session.add(candidate)
+            session.flush()
+        candidate_id = int(candidate.id)
+        raw_message_id = int(raw_message.id)
+        event_identity = {
+            "event_id": int(event.id),
+            "exit_id": int(deletion_exit.id),
+            "event_fingerprint": str(event.event_fingerprint),
+        }
+        session.commit()
+
+    result = plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_message_id,
+        candidate_id=candidate_id,
+        deepcoin_client=deepcoin_client,
+        contract_spec_provider=contract_spec_provider,
+        planned_at=now,
+        execution_mode="live",
+    )
+    if result.status != "ready" or result.batch is None:
+        return result
+
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, int(result.batch.id))
+        deletion_exit = session.get(SourceMessageDeletionExit, int(deletion_exit_id))
+        if batch is None or deletion_exit is None:
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="source_deletion_planned_batch_missing",
+                target_lifecycle_id=result.target_lifecycle_id,
+            )
+        target_snapshot = json.loads(batch.target_snapshot_json or "{}")
+        target_snapshot["source_deletion"] = event_identity
+        batch.target_snapshot_json = json.dumps(
+            target_snapshot, ensure_ascii=False, sort_keys=True
+        )
+        batch.target_fingerprint = management_target_fingerprint(target_snapshot)
+        batch.updated_at = now
+        deletion_exit.management_batch_id = batch.id
+        deletion_exit.state = "closing_positions"
+        deletion_exit.last_reason = "position_exit_planned"
+        deletion_exit.updated_at = now
+        session.commit()
+        batch_id = int(batch.id)
+    return ManagementPlanningResult(
+        status="ready",
+        batch=load_management_batch(session_factory, batch_id),
+        target_lifecycle_id=result.target_lifecycle_id,
+    )
 
 
 def _plan_strategy_management_batch_locked(
@@ -1019,7 +1142,11 @@ def _load_exact_identity(
         candidate_query = (
             session.query(SignalCandidate)
             .filter(SignalCandidate.raw_message_id == raw_message_id)
-            .filter(SignalCandidate.parse_source == "mimo_authoritative")
+            .filter(
+                SignalCandidate.parse_source.in_(
+                    ["mimo_authoritative", "source_deletion"]
+                )
+            )
             .filter(
                 SignalCandidate.event_type.in_(["close_signal", "position_update"])
             )

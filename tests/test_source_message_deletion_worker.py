@@ -1,17 +1,24 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     RawMessage,
+    RecognitionDecision,
+    SignalCandidate,
     SourceMessageDeletionExit,
     StrategyLifecycle,
+    StrategyManagementBatch,
+    TelegramSourceMessageEvent,
 )
+from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.source_message_deletion import (
     record_source_message_deleted,
 )
 from telegram_kol_research.source_message_deletion_worker import (
+    finalize_source_message_deletion_exit,
     run_source_message_deletion_worker_tick,
 )
 
@@ -71,6 +78,86 @@ def _seed_pending_strategy(
         return raw.id, lifecycle.id, binding.id, leg.id
 
 
+def _seed_filled_strategy(session_factory):
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=20,
+            message_id=200,
+            text="BTC short",
+            archived_target_group=True,
+        )
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:20:200:BTC:short",
+            kol_id="group:20",
+            chat_id=20,
+            message_id=200,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            order_id="entry-filled",
+            pos_id="pos-filled",
+            status="active",
+        )
+        session.add_all([raw, binding])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=20,
+            message_id=200,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            execution_binding_id=binding.id,
+        )
+        session.add_all(
+            [
+                lifecycle,
+                RecognitionDecision(
+                    raw_message_id=raw.id,
+                    input_kind="text",
+                    authoritative_model="mimo",
+                    authoritative_status="是策略",
+                    authoritative_payload_json="{}",
+                    agreement_status="authoritative_only",
+                    differences_json="[]",
+                ),
+                SignalCandidate(
+                    raw_message_id=raw.id,
+                    symbol="BTC",
+                    side="short",
+                    event_type="entry_signal",
+                    recognition_generation="original",
+                    parse_source="mimo_authoritative",
+                    confidence=1.0,
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="entry-filled",
+                    pos_id="pos-filled",
+                    status="active",
+                    attribution_status="verified",
+                    attribution_evidence_json='{"policy_version": 2}',
+                ),
+            ]
+        )
+        session.commit()
+
+
+class _ContractSpecs:
+    def get_contract_spec(self, instrument_id):
+        return DeepcoinContractSpec(
+            instrument_id=instrument_id,
+            contract_value=0.001,
+            quantity_step=1,
+            min_quantity=1,
+            price_tick=0.1,
+        )
+
+
 class _ExactCancelClient:
     def __init__(self, order_ids, *, unknown=False, partial_fill=False):
         self.pending = {
@@ -117,6 +204,26 @@ class _ExactCancelClient:
         if not self.partial_fill:
             return []
         return [{"ordId": order_id} for order_id in self.cancelled]
+
+
+class _PositionClient(_ExactCancelClient):
+    def __init__(self):
+        super().__init__([])
+
+    def list_positions(self, *, inst_id=None):
+        rows = [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-filled",
+                "posSide": "short",
+                "pos": "3",
+                "avgPx": "62000",
+                "mgnMode": "cross",
+                "posMode": "split",
+                "cTime": "1721000000000",
+            }
+        ]
+        return rows
 
 
 def test_worker_cancels_only_exact_deleted_strategy_entry_ids(tmp_path):
@@ -221,3 +328,267 @@ def test_worker_partial_fill_is_fail_closed_without_cancelling(tmp_path):
     assert client.cancelled == []
     with session_factory() as session:
         assert session.query(SourceMessageDeletionExit).one().state == "recovery_required"
+
+
+def test_worker_plans_exact_full_exit_after_entry_cancellation_stage(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "closing_positions"
+        session.commit()
+
+    result = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=_PositionClient,
+        contract_spec_provider=_ContractSpecs(),
+        processed_at=NOW,
+    )
+
+    assert result.planned_exits == 1
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert deletion_exit.state == "closing_positions"
+        assert deletion_exit.management_batch_id is not None
+
+
+def test_pending_only_deletion_finishes_cancelled_after_flat_snapshot(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, lifecycle_id, _, _ = _seed_pending_strategy(
+        session_factory,
+        chat_id=10,
+        message_id=100,
+        order_id="order-deleted",
+    )
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=10,
+        message_id=100,
+        deleted_at=NOW,
+    )
+    client = _ExactCancelClient(["order-deleted"])
+    first = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: client,
+        processed_at=NOW,
+    )
+    assert first.cancelled == 1
+
+    second = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: client,
+        snapshot_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            errors={},
+            positions=[],
+            open_orders=[],
+            pending_trigger_orders=[],
+        ),
+        processed_at=NOW,
+    )
+
+    assert second.finalized == 1
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert deletion_exit.state == "succeeded"
+        assert deletion_exit.flat_proof_json is not None
+        assert lifecycle.lifecycle_status == "cancelled"
+        assert lifecycle.exit_reason == "source_message_deleted"
+
+
+def test_flat_finalization_fails_closed_when_exchange_snapshot_has_errors(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_pending_strategy(
+        session_factory,
+        chat_id=10,
+        message_id=100,
+        order_id="order-deleted",
+    )
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=10,
+        message_id=100,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={"positions": "timeout"},
+            positions=[],
+            open_orders=[],
+            pending_trigger_orders=[],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "recovery_required"
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert deletion_exit.state == "recovery_required"
+        assert deletion_exit.flat_proof_json is None
+
+
+def test_flat_finalization_waits_while_exact_order_or_position_is_live(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={},
+            positions=[{"posId": "pos-filled", "pos": "3"}],
+            open_orders=[],
+            pending_trigger_orders=[],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "waiting"
+    with session_factory() as session:
+        assert session.get(SourceMessageDeletionExit, deletion.exit_id).state == "reconciling"
+
+
+def test_filled_deletion_requires_a_durable_exit_batch_before_flat_completion(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={}, positions=[], open_orders=[], pending_trigger_orders=[]
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "recovery_required"
+
+
+def test_filled_deletion_finishes_exited_only_after_terminal_management_batch(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "closing_positions"
+        session.commit()
+    planned = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=_PositionClient,
+        contract_spec_provider=_ContractSpecs(),
+        processed_at=NOW,
+    )
+    assert planned.planned_exits == 1
+    flat_snapshot = SimpleNamespace(
+        errors={}, positions=[], open_orders=[], pending_trigger_orders=[]
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        batch_id = deletion_exit.management_batch_id
+        lifecycle_id = deletion_exit.target_lifecycle_id
+        source_event_id = deletion_exit.source_event_id
+        session.commit()
+
+    assert finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=flat_snapshot,
+        finalized_at=NOW,
+    ) == "waiting"
+
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        batch.status = "succeeded"
+        session.commit()
+
+    assert finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=flat_snapshot,
+        finalized_at=NOW,
+    ) == "succeeded"
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        event = session.get(TelegramSourceMessageEvent, source_event_id)
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert lifecycle.lifecycle_status == "exited"
+        assert lifecycle.exit_reason == "source_message_deleted"
+        assert event.processing_status == "completed"
+        assert event.reason_code == "source_message_deleted"
+        assert deletion_exit.state == "succeeded"
+
+
+def test_flat_finalization_waits_while_exact_entry_order_is_live(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, _, _, leg_id = _seed_pending_strategy(
+        session_factory,
+        chat_id=10,
+        message_id=100,
+        order_id="order-deleted",
+    )
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=10,
+        message_id=100,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.status = "cancelled"
+        leg.terminal_reason = "source_message_deleted_entry_cancelled"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={},
+            positions=[],
+            open_orders=[{"ordId": "order-deleted"}],
+            pending_trigger_orders=[],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "waiting"

@@ -10,9 +10,17 @@ from uuid import uuid4
 from sqlalchemy import or_, update
 
 from telegram_kol_research.models import (
+    ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
     SourceMessageDeletionExit,
+    StrategyLifecycle,
+    StrategyManagementBatch,
+    TelegramSourceMessageEvent,
+)
+from telegram_kol_research.position_authority_lock import position_authority_lock
+from telegram_kol_research.source_message_deletion import (
+    source_message_execution_authority,
 )
 from telegram_kol_research.terminal_entry_cleanup import (
     cleanup_terminal_entry_legs,
@@ -60,6 +68,7 @@ def run_source_message_deletion_worker_tick(
         "recovery_required": 0,
     }
     client = None
+    processed_exit_ids: set[int] = set()
 
     def get_client():
         nonlocal client
@@ -68,11 +77,170 @@ def run_source_message_deletion_worker_tick(
         return client
 
     for _ in range(max(0, int(max_jobs))):
-        claim = _claim_next_job(session_factory, claimed_at=now)
+        claim = _claim_next_job(
+            session_factory,
+            claimed_at=now,
+            excluded_exit_ids=processed_exit_ids,
+        )
         if claim is None:
             break
         counts["discovered"] += 1
         exit_id, state, claim_token = claim
+        processed_exit_ids.add(exit_id)
+        if state == "reconciling":
+            if snapshot_loader is None:
+                from telegram_kol_research.execution_bindings import (
+                    load_deepcoin_execution_reconciliation_snapshot,
+                )
+
+                loader = load_deepcoin_execution_reconciliation_snapshot
+            else:
+                loader = snapshot_loader
+            try:
+                with position_authority_lock():
+                    snapshot = loader(session_factory, client=get_client())
+                    final_state = finalize_source_message_deletion_exit(
+                        session_factory,
+                        deletion_exit_id=exit_id,
+                        snapshot=snapshot,
+                        finalized_at=now,
+                        expected_claim_token=claim_token,
+                    )
+            except Exception as exc:
+                _transition_claimed(
+                    session_factory,
+                    exit_id=exit_id,
+                    claim_token=claim_token,
+                    new_state="recovery_required",
+                    reason="flat_reconciliation_exception",
+                    error=f"flat_reconciliation_exception:{type(exc).__name__}:{exc}",
+                    updated_at=now,
+                )
+                counts["recovery_required"] += 1
+                continue
+            if final_state == "succeeded":
+                counts["finalized"] += 1
+            elif final_state == "recovery_required":
+                counts["recovery_required"] += 1
+            else:
+                counts["waiting"] += 1
+            continue
+
+        if state == "closing_positions":
+            with session_factory() as session:
+                deletion_exit = session.get(SourceMessageDeletionExit, exit_id)
+                management_batch_id = (
+                    int(deletion_exit.management_batch_id)
+                    if deletion_exit is not None
+                    and deletion_exit.management_batch_id is not None
+                    else None
+                )
+                batch = (
+                    session.get(StrategyManagementBatch, management_batch_id)
+                    if management_batch_id is not None
+                    else None
+                )
+            if batch is not None:
+                if batch.status == "succeeded":
+                    _transition_claimed(
+                        session_factory,
+                        exit_id=exit_id,
+                        claim_token=claim_token,
+                        new_state="reconciling",
+                        reason="position_exit_exchange_confirmed",
+                        updated_at=now,
+                    )
+                elif batch.status in {
+                    "blocked",
+                    "partial_failed",
+                    "submit_unknown",
+                    "recovery_required",
+                }:
+                    _transition_claimed(
+                        session_factory,
+                        exit_id=exit_id,
+                        claim_token=claim_token,
+                        new_state="recovery_required",
+                        reason="position_exit_batch_requires_recovery",
+                        error=f"management_batch_{batch.status}",
+                        updated_at=now,
+                    )
+                    counts["recovery_required"] += 1
+                    continue
+                else:
+                    _release_claim(
+                        session_factory,
+                        exit_id=exit_id,
+                        claim_token=claim_token,
+                        state="closing_positions",
+                        reason="position_exit_batch_in_progress",
+                        updated_at=now,
+                    )
+                counts["waiting"] += 1
+                continue
+            if contract_spec_provider is None:
+                _transition_claimed(
+                    session_factory,
+                    exit_id=exit_id,
+                    claim_token=claim_token,
+                    new_state="recovery_required",
+                    reason="position_exit_contract_spec_missing",
+                    error="position_exit_contract_spec_missing",
+                    updated_at=now,
+                )
+                counts["recovery_required"] += 1
+                continue
+            if exit_planner is None:
+                from telegram_kol_research.strategy_management_planner import (
+                    plan_source_deletion_full_exit,
+                )
+
+                planner = plan_source_deletion_full_exit
+            else:
+                planner = exit_planner
+            try:
+                planning = planner(
+                    session_factory,
+                    deletion_exit_id=exit_id,
+                    deepcoin_client=get_client(),
+                    contract_spec_provider=contract_spec_provider,
+                    planned_at=now,
+                )
+            except Exception as exc:
+                _transition_claimed(
+                    session_factory,
+                    exit_id=exit_id,
+                    claim_token=claim_token,
+                    new_state="recovery_required",
+                    reason="position_exit_planning_exception",
+                    error=f"position_exit_planning_exception:{type(exc).__name__}:{exc}",
+                    updated_at=now,
+                )
+                counts["recovery_required"] += 1
+                continue
+            if planning.status == "ready" and planning.batch is not None:
+                _release_claim(
+                    session_factory,
+                    exit_id=exit_id,
+                    claim_token=claim_token,
+                    state="closing_positions",
+                    reason="position_exit_planned",
+                    updated_at=now,
+                )
+                counts["planned_exits"] += 1
+                continue
+            _transition_claimed(
+                session_factory,
+                exit_id=exit_id,
+                claim_token=claim_token,
+                new_state="recovery_required",
+                reason="position_exit_planning_blocked",
+                error=f"position_exit_planning_blocked:{planning.reason_code}",
+                updated_at=now,
+            )
+            counts["recovery_required"] += 1
+            continue
+
         if state != "cancelling_entries":
             _release_claim(
                 session_factory,
@@ -201,12 +369,303 @@ def run_source_message_deletion_worker_tick(
     return SourceMessageDeletionWorkerResult(**counts)
 
 
-def _claim_next_job(session_factory, *, claimed_at: datetime):
+def finalize_source_message_deletion_exit(
+    session_factory,
+    *,
+    deletion_exit_id: int,
+    snapshot,
+    finalized_at: datetime | None = None,
+    expected_claim_token: str | None = None,
+) -> str:
+    """Commit terminal source-deletion state only after exact exchange-flat proof."""
+
+    now = finalized_at or datetime.now(UTC)
+    errors = dict(getattr(snapshot, "errors", {}) or {})
+    with position_authority_lock():
+        with source_message_execution_authority(session_factory):
+            with session_factory() as session:
+                deletion_exit = session.get(
+                    SourceMessageDeletionExit, int(deletion_exit_id)
+                )
+                if deletion_exit is None:
+                    return "skipped"
+                if (
+                    expected_claim_token is not None
+                    and deletion_exit.claim_token != expected_claim_token
+                ):
+                    return "skipped"
+
+                event = session.get(
+                    TelegramSourceMessageEvent, deletion_exit.source_event_id
+                )
+                lifecycle = (
+                    session.get(
+                        StrategyLifecycle, deletion_exit.target_lifecycle_id
+                    )
+                    if deletion_exit.target_lifecycle_id is not None
+                    else None
+                )
+                binding = (
+                    session.get(
+                        ExecutionBinding, deletion_exit.execution_binding_id
+                    )
+                    if deletion_exit.execution_binding_id is not None
+                    else None
+                )
+                legs = (
+                    session.query(ExecutionOrderLeg)
+                    .filter(
+                        ExecutionOrderLeg.execution_binding_id
+                        == deletion_exit.execution_binding_id,
+                        ExecutionOrderLeg.purpose == "entry",
+                    )
+                    .order_by(ExecutionOrderLeg.id.asc())
+                    .all()
+                    if deletion_exit.execution_binding_id is not None
+                    else []
+                )
+                batch = (
+                    session.get(
+                        StrategyManagementBatch,
+                        deletion_exit.management_batch_id,
+                    )
+                    if deletion_exit.management_batch_id is not None
+                    else None
+                )
+
+                if errors:
+                    deletion_exit.state = "recovery_required"
+                    deletion_exit.last_reason = "flat_snapshot_incomplete"
+                    deletion_exit.last_error = json.dumps(
+                        errors, sort_keys=True, default=str
+                    )
+                    deletion_exit.last_reconciled_at = now
+                    deletion_exit.claim_token = None
+                    deletion_exit.claimed_at = None
+                    deletion_exit.updated_at = now
+                    session.commit()
+                    return "recovery_required"
+
+                if batch is not None and batch.status in {
+                    "blocked",
+                    "partial_failed",
+                    "submit_unknown",
+                    "recovery_required",
+                }:
+                    deletion_exit.state = "recovery_required"
+                    deletion_exit.last_reason = "position_exit_batch_requires_recovery"
+                    deletion_exit.last_error = f"management_batch_{batch.status}"
+                    deletion_exit.last_reconciled_at = now
+                    deletion_exit.claim_token = None
+                    deletion_exit.claimed_at = None
+                    deletion_exit.updated_at = now
+                    session.commit()
+                    return "recovery_required"
+                if deletion_exit.management_batch_id is not None and batch is None:
+                    deletion_exit.state = "recovery_required"
+                    deletion_exit.last_reason = "position_exit_batch_missing"
+                    deletion_exit.last_error = "position_exit_batch_missing"
+                    deletion_exit.last_reconciled_at = now
+                    deletion_exit.claim_token = None
+                    deletion_exit.claimed_at = None
+                    deletion_exit.updated_at = now
+                    session.commit()
+                    return "recovery_required"
+                if batch is not None and batch.status != "succeeded":
+                    return _mark_reconciliation_waiting(
+                        session,
+                        deletion_exit=deletion_exit,
+                        reason="position_exit_batch_not_terminal",
+                        reconciled_at=now,
+                    )
+
+                live_order_rows = list(getattr(snapshot, "open_orders", []) or [])
+                live_order_rows.extend(
+                    list(getattr(snapshot, "pending_trigger_orders", []) or [])
+                )
+                exact_order_ids = {
+                    value
+                    for leg in legs
+                    for value in (_clean_id(leg.order_id), _clean_id(leg.client_order_id))
+                    if value is not None
+                }
+                visible_order_rows = [
+                    row
+                    for row in live_order_rows
+                    if exact_order_ids.intersection(_row_order_ids(row))
+                ]
+                locally_pending = [
+                    leg.id
+                    for leg in legs
+                    if str(leg.status or "").strip().lower()
+                    in {"pending", "open", "live", "submitted", "partially_filled", "partial_filled", "partial"}
+                    and not leg.terminal_reason
+                ]
+                if visible_order_rows or locally_pending:
+                    return _mark_reconciliation_waiting(
+                        session,
+                        deletion_exit=deletion_exit,
+                        reason="exact_entry_order_still_live",
+                        reconciled_at=now,
+                    )
+
+                exact_pos_ids = {
+                    value
+                    for leg in legs
+                    if leg.attribution_status == "verified"
+                    for value in (_clean_id(leg.pos_id),)
+                    if value is not None
+                }
+                visible_position_rows = [
+                    row
+                    for row in list(getattr(snapshot, "positions", []) or [])
+                    if _clean_id(_row_value(row, "posId", "pos_id")) in exact_pos_ids
+                    and _position_is_not_proven_zero(row)
+                ]
+                if visible_position_rows:
+                    return _mark_reconciliation_waiting(
+                        session,
+                        deletion_exit=deletion_exit,
+                        reason="exact_position_still_live",
+                        reconciled_at=now,
+                    )
+
+                if exact_pos_ids and batch is None:
+                    deletion_exit.state = "recovery_required"
+                    deletion_exit.last_reason = "position_exit_batch_not_planned"
+                    deletion_exit.last_error = "position_exit_batch_not_planned"
+                    deletion_exit.last_reconciled_at = now
+                    deletion_exit.claim_token = None
+                    deletion_exit.claimed_at = None
+                    deletion_exit.updated_at = now
+                    session.commit()
+                    return "recovery_required"
+
+                had_position = bool(exact_pos_ids)
+                proof = {
+                    "proved_at": now.isoformat(),
+                    "errors": {},
+                    "entry_order_ids": sorted(exact_order_ids),
+                    "verified_pos_ids": sorted(exact_pos_ids),
+                    "visible_entry_orders": visible_order_rows,
+                    "visible_positions": visible_position_rows,
+                    "management_batch_id": deletion_exit.management_batch_id,
+                    "management_batch_status": batch.status if batch else None,
+                }
+                deletion_exit.state = "succeeded"
+                deletion_exit.flat_proof_json = json.dumps(
+                    proof, sort_keys=True, default=str
+                )
+                deletion_exit.last_reason = "exchange_flat_confirmed"
+                deletion_exit.last_error = None
+                deletion_exit.last_reconciled_at = now
+                deletion_exit.completed_at = now
+                deletion_exit.claim_token = None
+                deletion_exit.claimed_at = None
+                deletion_exit.updated_at = now
+                if event is not None:
+                    event.processing_status = "completed"
+                    event.reason_code = "source_message_deleted"
+                    event.completed_at = now
+                    event.updated_at = now
+                if lifecycle is not None:
+                    lifecycle.lifecycle_status = "exited" if had_position else "cancelled"
+                    lifecycle.exit_reason = "source_message_deleted"
+                    lifecycle.exited_at = now if had_position else lifecycle.exited_at
+                    lifecycle.last_checked_at = now
+                    lifecycle.management_action = "source_deletion_exit_completed"
+                    lifecycle.management_note = "Exact deleted-source exposure confirmed flat"
+                    lifecycle.updated_at = now
+                if binding is not None:
+                    binding.status = "closed"
+                    binding.updated_at = now
+                for leg in legs:
+                    if _clean_id(leg.pos_id) in exact_pos_ids:
+                        leg.status = "closed"
+                        leg.terminal_reason = "source_message_deleted_exit_confirmed"
+                        leg.updated_at = now
+                session.commit()
+                return "succeeded"
+
+
+def _mark_reconciliation_waiting(
+    session,
+    *,
+    deletion_exit: SourceMessageDeletionExit,
+    reason: str,
+    reconciled_at: datetime,
+) -> str:
+    deletion_exit.state = "reconciling"
+    deletion_exit.last_reason = reason
+    deletion_exit.last_reconciled_at = reconciled_at
+    deletion_exit.claim_token = None
+    deletion_exit.claimed_at = None
+    deletion_exit.updated_at = reconciled_at
+    session.commit()
+    return "waiting"
+
+
+def _clean_id(value) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _row_value(row, *names):
+    if not isinstance(row, dict):
+        return None
+    for name in names:
+        if row.get(name) is not None:
+            return row.get(name)
+    return None
+
+
+def _row_order_ids(row) -> set[str]:
+    return {
+        value
+        for value in (
+            _clean_id(
+                _row_value(
+                    row,
+                    "orderId",
+                    "order_id",
+                    "ordId",
+                    "triggerOrderId",
+                    "trigger_order_id",
+                )
+            ),
+            _clean_id(
+                _row_value(row, "clientOrderId", "client_order_id", "clOrdId")
+            ),
+        )
+        if value is not None
+    }
+
+
+def _position_is_not_proven_zero(row) -> bool:
+    value = _row_value(row, "pos", "size", "sz", "positionSize", "position_size")
+    try:
+        return abs(float(value)) > 0
+    except (TypeError, ValueError):
+        return True
+
+
+def _claim_next_job(
+    session_factory,
+    *,
+    claimed_at: datetime,
+    excluded_exit_ids: set[int] | None = None,
+):
     stale_before = claimed_at - timedelta(minutes=5)
     with session_factory() as session:
+        query = session.query(
+            SourceMessageDeletionExit.id, SourceMessageDeletionExit.state
+        ).filter(SourceMessageDeletionExit.state.in_(_ACTIVE_STATES))
+        if excluded_exit_ids:
+            query = query.filter(
+                SourceMessageDeletionExit.id.not_in(tuple(excluded_exit_ids))
+            )
         candidates = (
-            session.query(SourceMessageDeletionExit.id, SourceMessageDeletionExit.state)
-            .filter(SourceMessageDeletionExit.state.in_(_ACTIVE_STATES))
+            query
             .filter(
                 or_(
                     SourceMessageDeletionExit.claim_token.is_(None),

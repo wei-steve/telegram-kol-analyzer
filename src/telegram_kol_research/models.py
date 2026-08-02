@@ -103,10 +103,15 @@ class TelegramSourceMessageEvent(Base):
     binding_state: Mapped[str] = mapped_column(
         String(32), nullable=False, default="unbound", index=True
     )
+    processing_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="recorded", index=True
+    )
+    reason_code: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     telegram_event_json: Mapped[str] = mapped_column(
         Text, nullable=False, default="{}"
     )
     occurred_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=utc_now, nullable=False
     )

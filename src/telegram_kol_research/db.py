@@ -70,6 +70,19 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "deleted_at": "ALTER TABLE raw_messages ADD COLUMN deleted_at DATETIME",
         "deletion_event_fingerprint": "ALTER TABLE raw_messages ADD COLUMN deletion_event_fingerprint VARCHAR(64)",
     },
+    "telegram_source_message_events": {
+        "processing_status": "ALTER TABLE telegram_source_message_events ADD COLUMN processing_status VARCHAR(32) NOT NULL DEFAULT 'recorded'",
+        "reason_code": "ALTER TABLE telegram_source_message_events ADD COLUMN reason_code VARCHAR(128)",
+        "completed_at": "ALTER TABLE telegram_source_message_events ADD COLUMN completed_at DATETIME",
+    },
+    "source_message_deletion_exits": {
+        "management_batch_id": "ALTER TABLE source_message_deletion_exits ADD COLUMN management_batch_id INTEGER",
+        "claim_token": "ALTER TABLE source_message_deletion_exits ADD COLUMN claim_token VARCHAR(64)",
+        "claimed_at": "ALTER TABLE source_message_deletion_exits ADD COLUMN claimed_at DATETIME",
+        "cancellation_signal_ids_json": "ALTER TABLE source_message_deletion_exits ADD COLUMN cancellation_signal_ids_json TEXT NOT NULL DEFAULT '[]'",
+        "last_reason": "ALTER TABLE source_message_deletion_exits ADD COLUMN last_reason VARCHAR(128)",
+        "last_reconciled_at": "ALTER TABLE source_message_deletion_exits ADD COLUMN last_reconciled_at DATETIME",
+    },
     "media_assets": {
         "ocr_text": "ALTER TABLE media_assets ADD COLUMN ocr_text TEXT",
     },
