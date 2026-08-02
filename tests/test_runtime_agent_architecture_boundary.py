@@ -132,3 +132,29 @@ def test_runtime_agent_environment_example_has_placeholders_not_secrets():
     assert "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY=" in example
     assert "TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL=mimo-v2.5" in example
     assert "sk-" not in example
+
+
+@pytest.mark.architecture
+def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
+    project_root = Path(__file__).parents[1]
+    status = (
+        project_root / "docs" / "runtime-incident-agent-status.md"
+    ).read_text(encoding="utf-8")
+    runbook = (
+        project_root / "docs" / "runtime-incident-agent-runbook.md"
+    ).read_text(encoding="utf-8")
+
+    assert "phase_7_explicitly_approved: false" in status
+    assert "phase_7_disposition: deferred_non_blocking" in status
+    assert "current_phase: 8R.1" in status
+    assert "phase_name: monitoring-observability-repair" in status
+    assert "phase_status: planned" in status
+    assert "### Phase 8R proactive read-only incident detection" in runbook
+    assert (
+        "Phase 8R never enables "
+        "`TELEGRAM_KOL_RUNTIME_AGENT_ACTIONS_ENABLED`" in runbook
+    )
+    assert (
+        "Phase 8R never populates either the shadow or action playbook "
+        "allowlist" in runbook
+    )

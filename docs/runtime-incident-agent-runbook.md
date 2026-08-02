@@ -324,6 +324,67 @@ Immediate Phase 6 rollback is:
 5. leave Phase 2 capture and deterministic notification settings unchanged;
 6. confirm the normal service and all business workers remain active.
 
+### Phase 8R proactive read-only incident detection
+
+Phase 7 bounded business recovery is deferred, unauthorized, and non-blocking.
+Phase 8R extends only proactive discovery, bounded read-only diagnosis,
+Telegram reporting, Codex handoff, and continued read-only verification.
+
+Phase 8R never enables `TELEGRAM_KOL_RUNTIME_AGENT_ACTIONS_ENABLED`.
+Phase 8R never populates either the shadow or action playbook allowlist.
+`TELEGRAM_KOL_RUNTIME_AGENT_SHADOW_PLAYBOOKS` and
+`TELEGRAM_KOL_RUNTIME_AGENT_ACTION_PLAYBOOKS` must remain empty throughout all
+Phase 8R tasks.
+
+Execute Phase 8R using these separately reviewed runtime stages:
+
+1. repair independent monitoring observability and add health evidence;
+2. widen existing technical incident capture in capture-only mode;
+3. deploy the invariant scanner dormant, then run it shadow-only;
+4. canary one deterministic notification rule at a time;
+5. enable bounded AI diagnosis and Codex handoff only for a proven rule;
+6. expand the rule catalog and continuous-quality metrics.
+
+At most one runtime stage may be implemented per user turn. New code and
+configuration default off. A first deployment never enables its feature. A
+later enablement requires another complete safe-window check and the exact
+rule or capture-type allowlist; wildcards are refused.
+
+The proactive scanner must remain outside the listener, recognition,
+contextual-resolution, execution, management, exit, protection, and
+reconciliation critical paths. Scanner or Agent failure must not block or
+change those paths. The scanner may write only additive observation and
+incident metadata; it may not write a source business row.
+
+Before every Phase 8R deployment or enablement:
+
+1. prove the reviewed commit and dormant defaults;
+2. prove no time-sensitive recognition, execution, management, exit,
+   protection, reconciliation, or recovery work is in flight;
+3. prove the read-only production snapshot is complete;
+4. preserve durable Telegram intake and checkpoint recovery;
+5. keep the scanner or new rule disabled during the first deployment;
+6. verify the main service, listener, latest recognition, contextual resolver,
+   management, protection, reconciliation, and independent monitor immediately
+   after deployment;
+7. compare source rows before and after any shadow scan and require zero source
+   mutation.
+
+If a safe window or complete snapshot cannot be proven, finish local work,
+leave the current Phase 8R task `in_progress`, and record the exact server
+verification still required. Do not restart or enable anything.
+
+Immediate Phase 8R rollback is layered and independent:
+
+1. disable the newest scanner rule or capture type;
+2. disable proactive Telegram delivery while retaining durable evidence;
+3. disable AI diagnosis while retaining deterministic incident capture;
+4. stop and disable the scanner sidecar without touching the main service;
+5. if necessary, stop the Runtime Agent sidecar while leaving normal Telegram
+   intake and every business worker active;
+6. confirm action authority is false and both playbook allowlists are empty;
+7. run the independent monitor and verify message continuity.
+
 ## Rollback
 
 1. Disable the newest phase feature flag.

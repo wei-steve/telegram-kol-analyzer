@@ -6,13 +6,14 @@ used to advance or reinterpret the rollout.
 ```yaml
 project: runtime-incident-agent
 design_version: 1
-current_phase: 7
-phase_name: optional-bounded-business-recovery
-phase_status: blocked
+current_phase: 8R.1
+phase_name: monitoring-observability-repair
+phase_status: planned
 last_completed_phase: 6
 last_completed_commit: 46852f0
 production_commit: e3e784a07a005bdc23f6f18c6f4294b0fdb19b95
 local_tests:
+  - "phase-8r-roadmap-boundary: 10 passed"
   - "phase-6-non-writing-ai-job-source-review-baseline: 115 passed"
   - "phase-6-non-writing-ai-job-offline-evaluation: 7 cases, all nine metrics at 1.0"
   - "phase-6-telegram-evidence-runtime-web-focused: 355 passed, 2 sqlite deprecation warnings"
@@ -135,7 +136,7 @@ server_verification:
   phase_6_non_writing_ai_job_review: "reschedule_non_writing_ai_job was rejected before implementation. context_worker_exhausted would re-enter the authoritative contextual path with the live auto-trade executor, while semantic_review provider exhaustion can be rescheduled only by mutating RecognitionDecision. Neither production adapter emits business_write_owned false, and get_worker_state has no semantic-review resolver. Production read-only inspection found zero related runtime incidents, zero exhausted context attempts, and two historical terminal semantic-review failures with three attempts, no claim, and no schedule. No runtime change, deployment, or restart occurred"
   phase_6_completion: "Phase 6 is complete with four reviewed deployed handlers and two documented fail-closed rejections. At completion every Agent/shadow/action flag and allowlist was empty/off. Optional Phase 7 is blocked because its separately required explicit user approval has not been given"
   phase_6_diagnosis_activation: "after explicit user instruction, the already deployed read-only diagnosis sidecar was enabled persistently without restarting the main service. Preflight proved a complete stable audit, only the known audit_abnormal baseline, no evidence/context/management/position-mutation/recovery work in flight, no claimable runtime incidents, a complete dedicated provider configuration, and empty shadow/action allowlists. The sidecar runs as telegram-kol-agent, is enabled/active, and repeatedly reports idle; the main service remains active HTTP 200. TELEGRAM_KOL_RUNTIME_AGENT_ENABLED is true while shadow/action allowlists remain empty and action authority remains false"
-  remaining: "Do not begin Phase 7 from the standard implementation trigger. Keep shadow and action allowlists empty and action authority off. The Phase 6 diagnosis sidecar may remain active. Phase 7 bounded business recovery requires a fresh explicit user approval that names Phase 7 and accepts its business-mutation scope; phase_7_explicitly_approved remains false."
+  remaining: "Begin only Phase 8R.1 from the standard implementation trigger. Repair independent monitoring observability without widening Runtime Agent authority. Keep shadow and action allowlists empty and action authority off. Phase 7 remains deferred, unauthorized, and non-blocking."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"
@@ -148,6 +149,13 @@ known_issues:
   - "Historical MiMo v4/v6 attempts failed closed on text-form tool output and fabricated evidence. Prompt v7 now passed an isolated live closed-final validation with only actually gathered evidence, while production incident 2 remains preserved as escalated for audit history."
   - "A full-suite attempt reached 2237 passed and 1 skipped before a pre-existing 0.2-second lifespan timeout failed under aggregate load; the exact test passed in isolation."
 phase_7_explicitly_approved: false
+phase_7_disposition: deferred_non_blocking
+phase_8r_roadmap_control:
+  design_commit: 15c9d7a
+  implementation_plan_commit: 3bd2ef1
+  task_0_status: completed
+  runtime_change: none
+  production_restart: not_required
 next_session_prompt: "请执行自定义ai agent的下一步实施"
 ```
 
@@ -453,13 +461,31 @@ Phase 5 is not complete until:
 
 ### Phase 7 — Optional Bounded Business Recovery
 
-- Status: blocked
+- Status: deferred, unauthorized, and non-blocking
 - Explicit approval recorded: no
 - Runtime or production change: none
-- Blocker: the canonical plan requires a fresh explicit user approval for
-  Phase 7. The ordinary implementation trigger does not grant business-mutation
-  authority.
-- Required next action: the user must explicitly approve or decline Phase 7
-  after reviewing its bounded business-recovery scope. Until then, the
-  diagnosis sidecar may remain active, but keep shadow/action allowlists empty
-  and action authority off.
+- Disposition: the user approved continuing read-only Agent improvements while
+  leaving every bounded business-recovery action out of scope. Phase 7 no
+  longer blocks those read-only phases.
+- Permanent gate: the ordinary implementation trigger and every Phase 8R task
+  grant no business-mutation authority. Phase 7 still requires a separate,
+  fresh approval that explicitly accepts its business-mutation scope.
+
+### Phase 8R — Proactive Read-Only Incident Detection
+
+- Status: approved and planned
+- Roadmap-control Task 0: completed locally with 10 focused tests passing;
+  documentation and test changes only, so no production restart was required
+- Current task: `8R.1 monitoring-observability-repair`
+- Approved scope: deterministic proactive discovery, bounded read-only
+  diagnosis, Telegram notification, Codex handoff, and read-only verification
+- Prohibited scope: order, position, protection, strategy, recognition,
+  contextual-resolution, source-business-row, service-control, and deployment
+  mutations by the Agent
+- Continuity requirement: every runtime task ships dormant or shadow-only,
+  changes at most one runtime stage per user turn, and deploys only in a proven
+  safe window with immediate independent rollback
+- Authority state: Phase 6 diagnosis may remain active; shadow and action
+  allowlists remain empty; action authority remains false
+- Next action: start only Task 8R.1 from
+  `docs/plans/2026-08-02-proactive-readonly-incident-agent.md`
