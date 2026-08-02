@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -388,7 +388,7 @@ def apply_entry_protection_ledger_repair_plan(
     confirmation_token: str,
     seen_at: datetime | None = None,
 ) -> EntryProtectionLedgerRepairResult:
-    """Apply one response-anchored action guarded by a single-use token."""
+    """Apply one exact reviewed action guarded by a single-use token."""
 
     if not expected_fingerprint:
         raise ValueError("expected_fingerprint is required")
@@ -399,10 +399,13 @@ def apply_entry_protection_ledger_repair_plan(
         for action in plan.actions
         if action.action_id == str(action_id)
         and action.pos_id == str(pos_id)
-        and action.evidence.get("match") == "response_anchored_order"
+        and action.evidence.get("match") in {
+            "response_anchored_order",
+            "verified_filled_leg_unique_child",
+        }
     ]
     if len(selected) != 1:
-        raise ValueError("exactly one response-anchored repair action is required")
+        raise ValueError("exactly one supported repair action is required")
     action = selected[0]
     consumed_at = seen_at or datetime.now(UTC)
     from telegram_kol_research.repair_confirmation import (
@@ -418,12 +421,36 @@ def apply_entry_protection_ledger_repair_plan(
         consumed_at=consumed_at,
     )
     with session_factory() as session:
-        row = upsert_entry_protection_ledger_action(
-            session,
-            action,
-            evidence_source="entry_protection_event_repair",
-            seen_at=consumed_at,
-        )
+        if action.evidence.get("match") == "verified_filled_leg_unique_child":
+            intent = (
+                session.query(TriggerProtectionIntent)
+                .filter(TriggerProtectionIntent.venue == "deepcoin")
+                .filter(
+                    TriggerProtectionIntent.execution_binding_id
+                    == int(action.binding_id)
+                )
+                .filter(
+                    TriggerProtectionIntent.execution_order_leg_id
+                    == int(action.leg_id)
+                )
+                .one_or_none()
+            )
+            if intent is None or str(intent.recovery_state or "") != "failed":
+                raise ValueError("failed trigger protection intent is required")
+            row = finalize_trigger_protection_adoption(
+                session,
+                action=action,
+                intent=intent,
+                seen_at=consumed_at,
+                evidence_source="supervised_failed_trigger_intent_repair",
+            )
+        else:
+            row = upsert_entry_protection_ledger_action(
+                session,
+                action,
+                evidence_source="entry_protection_event_repair",
+                seen_at=consumed_at,
+            )
         session.commit()
     return EntryProtectionLedgerRepairResult(applied=1 if row is not None else 0)
 
@@ -591,6 +618,93 @@ def _plan_trigger_entry_repair(
     pending_rows = _cached_pending_tpsl_rows(
         pending_cache, deepcoin_client=deepcoin_client, inst_id=instrument_id
     )
+    intent = (
+        session.query(TriggerProtectionIntent)
+        .filter(TriggerProtectionIntent.venue == "deepcoin")
+        .filter(TriggerProtectionIntent.execution_binding_id == binding_id)
+        .filter(TriggerProtectionIntent.execution_order_leg_id == int(leg.id))
+        .one_or_none()
+    )
+    if intent is not None and str(intent.recovery_state or "") == "failed":
+        existing_intents = (
+            session.query(TriggerProtectionIntent)
+            .filter(TriggerProtectionIntent.venue == "deepcoin")
+            .order_by(TriggerProtectionIntent.id.asc())
+            .all()
+        )
+        intent_leg_ids = {
+            int(row.execution_order_leg_id)
+            for row in existing_intents
+            if row.execution_order_leg_id is not None
+        }
+        intent_legs = {
+            int(row.id): row
+            for row in session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.id.in_(intent_leg_ids))
+            .all()
+        }
+        intent_requests = {
+            int(row.id): _loads_json(
+                intent_legs[int(row.execution_order_leg_id)].request_json
+            )
+            for row in existing_intents
+            if row.id is not None
+            and int(row.execution_order_leg_id) in intent_legs
+        }
+        owner_states = {
+            int(row.id): TriggerProtectionOwnerState(
+                execution_order_leg_id=int(owner_leg.id),
+                status=str(owner_leg.status or ""),
+                attribution_status=str(owner_leg.attribution_status or ""),
+                pos_id=str(owner_leg.pos_id) if owner_leg.pos_id else None,
+                parent_order_id=(
+                    str(owner_leg.order_id) if owner_leg.order_id else None
+                ),
+            )
+            for row in existing_intents
+            if row.id is not None
+            and (
+                owner_leg := intent_legs.get(int(row.execution_order_leg_id))
+            )
+            is not None
+        }
+        result = plan_trigger_protection_intent_adoption(
+            session,
+            entry_leg=leg,
+            intent=intent,
+            parent_event=event,
+            pending_tpsl_rows=pending_rows,
+            history_tpsl_rows=[],
+            existing_ledger_rows=session.query(PositionProtectionLedger).all(),
+            existing_intents=existing_intents,
+            existing_intent_requests=intent_requests,
+            existing_intent_owner_states=owner_states,
+            history_time_range_start=event.created_at,
+            history_time_range_end=datetime.now(UTC),
+        )
+        if result.action is not None:
+            evidence = dict(result.action.evidence)
+            evidence["sibling_states"] = _bounded_sibling_owner_states(
+                intent=intent,
+                existing_intents=existing_intents,
+                owner_states=owner_states,
+            )
+            return [replace(result.action, evidence=evidence)], None
+        if result.refusal is not None:
+            return [], result.refusal
+        return [], EntryProtectionLedgerRepairRefusal(
+            event_id=int(event.id) if event.id is not None else None,
+            binding_id=binding_id,
+            pos_id=str(leg.pos_id or "") or None,
+            reason=(
+                result.deferred.reason
+                if result.deferred is not None
+                else "trigger_protection_repair_deferred"
+            ),
+            evidence=(
+                result.deferred.evidence if result.deferred is not None else {}
+            ),
+        )
     result = plan_verified_trigger_entry_protection_adoption(
         session,
         entry_leg=leg,
@@ -600,6 +714,32 @@ def _plan_trigger_entry_repair(
         existing_order_associations=existing_order_associations,
     )
     return ([result.action] if result.action is not None else []), result.refusal
+
+
+def _bounded_sibling_owner_states(
+    *,
+    intent: TriggerProtectionIntent,
+    existing_intents: list[TriggerProtectionIntent],
+    owner_states: dict[int, TriggerProtectionOwnerState],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for other in existing_intents:
+        if other.id is None or other.id == intent.id:
+            continue
+        if int(other.execution_binding_id or 0) != int(intent.execution_binding_id or 0):
+            continue
+        state = owner_states.get(int(other.id))
+        if state is None:
+            continue
+        rows.append(
+            {
+                "execution_order_leg_id": int(state.execution_order_leg_id),
+                "status": str(state.status or "")[:32],
+                "attribution_status": str(state.attribution_status or "")[:32],
+                "has_pos_id": bool(str(state.pos_id or "").strip()),
+            }
+        )
+    return sorted(rows, key=lambda row: row["execution_order_leg_id"])[:20]
 
 
 def plan_verified_trigger_entry_protection_adoption(
@@ -941,7 +1081,7 @@ def plan_trigger_protection_intent_adoption(
             size_text=_row_size_text(row) or _request_size_text(request),
             evidence={
                 "match": (
-                    "trigger_protection_intent_stop_only_missing_pos_id"
+                    "verified_filled_leg_unique_child"
                     if not _row_position_ids(row)
                     else "trigger_protection_intent_post_baseline"
                 ),
@@ -1512,6 +1652,8 @@ def _plan_fingerprint(
                 "order_id": row.order_id,
                 "purpose": row.purpose,
                 "trigger_price": row.trigger_price,
+                "size_text": row.size_text,
+                "evidence": row.evidence,
             }
             for row in actions
         ],
@@ -1521,6 +1663,7 @@ def _plan_fingerprint(
                 "binding_id": row.binding_id,
                 "pos_id": row.pos_id,
                 "reason": row.reason,
+                "evidence": row.evidence,
             }
             for row in refusals
         ],

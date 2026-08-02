@@ -3481,6 +3481,21 @@ def repair_entry_protection_ledger(
 ) -> None:
     """Dry-run or repair historical entry-protection TPSL ledger rows."""
 
+    if apply and (
+        not include_trigger_entries
+        or binding_id is None
+        or not pos_id
+        or not action_id
+        or not expected_fingerprint
+        or not confirmation_token
+    ):
+        typer.echo(
+            "Refusing apply: --include-trigger-entries, --binding-id, "
+            "--pos-id, --action-id, --expected-fingerprint, and "
+            "--confirmation-token are required.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     session_factory = create_session_factory(database_path)
     client = build_deepcoin_client_from_env()
     plan = build_entry_protection_ledger_repair_plan(
@@ -3506,21 +3521,25 @@ def repair_entry_protection_ledger(
     )
     if not apply:
         return
-    if plan.has_actions and (
-        not action_id
-        or not pos_id
-        or not expected_fingerprint
-        or not confirmation_token
-    ):
+    if len(plan.actions) != 1:
         typer.echo(
-            "Refusing apply: --action-id, --pos-id, "
-            "--expected-fingerprint, and --confirmation-token are required.",
+            "Refusing apply: the current bounded repair plan must contain "
+            "exactly one action.",
             err=True,
         )
         raise typer.Exit(code=2)
+    current_plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime.now(UTC),
+        binding_id=binding_id,
+        event_id=event_id,
+        pos_id=pos_id,
+        include_trigger_entries=include_trigger_entries,
+    )
     result = apply_entry_protection_ledger_repair_plan(
         session_factory,
-        plan,
+        current_plan,
         action_id=action_id or "",
         pos_id=pos_id or "",
         expected_fingerprint=expected_fingerprint or "",

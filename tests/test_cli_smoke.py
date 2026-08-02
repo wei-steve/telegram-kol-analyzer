@@ -55,6 +55,30 @@ def test_cli_help_renders():
     assert "backfill-canonical-tpsl-ledger" in result.stdout
 
 
+def test_repair_entry_protection_ledger_apply_requires_bounded_trigger_identity(
+    tmp_path,
+):
+    result = CliRunner().invoke(
+        app,
+        [
+            "repair-entry-protection-ledger",
+            "--database-path",
+            str(tmp_path / "research.db"),
+            "--apply",
+        ],
+    )
+
+    output = result.stdout + result.stderr
+    assert result.exit_code == 2
+    assert "--include-trigger-entries" in output
+    assert "--binding-id" in output
+    assert "--pos-id" in output
+    assert "--action-id" in output
+    assert "--expected-fingerprint" in output
+    assert "--confirmation-token" in output
+    assert not (tmp_path / "research.db").exists()
+
+
 def test_repair_position_management_apply_requires_exact_action_and_fingerprint(
     tmp_path,
 ):

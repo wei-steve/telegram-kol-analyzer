@@ -20,8 +20,11 @@ from telegram_kol_research.models import (
     ExecutionEvent,
     ExecutionOrderLeg,
     PositionProtectionLedger,
+    PositionProtectionLeg,
+    PositionProtectionRevision,
     TriggerProtectionIntent,
 )
+from telegram_kol_research.position_protection_legs import create_or_get_protection_leg
 
 
 class FakeDeepcoinClient:
@@ -339,6 +342,124 @@ def test_trigger_entry_repair_matches_unique_expected_protection_shape(tmp_path)
     assert all("exchange_order_created_at" not in row.evidence for row in plan.actions)
 
 
+def test_failed_trigger_intent_repair_uses_verified_filled_leg_ownership(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    filled_leg_id, sibling_leg_id = _seed_failed_trigger_intent_repair(session_factory)
+    client = FakeDeepcoinClient([_anonymous_stop_child("stop-child-1")])
+
+    plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 8, 2, 1, 0, tzinfo=UTC),
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+
+    assert len(plan.actions) == 1
+    action = plan.actions[0]
+    assert action.leg_id == filled_leg_id
+    assert action.pos_id == "pos-1"
+    assert action.order_id == "stop-child-1"
+    assert action.evidence["match"] == "verified_filled_leg_unique_child"
+    assert action.evidence["sibling_states"] == [
+        {
+            "execution_order_leg_id": sibling_leg_id,
+            "status": "pending",
+            "attribution_status": "unassigned",
+            "has_pos_id": False,
+        }
+    ]
+
+
+def test_failed_trigger_intent_repair_apply_finalizes_all_identity_records(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    filled_leg_id, _ = _seed_failed_trigger_intent_repair(session_factory)
+    plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=FakeDeepcoinClient([_anonymous_stop_child("stop-child-1")]),
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+    action = plan.actions[0]
+
+    result = apply_entry_protection_ledger_repair_plan(
+        session_factory,
+        plan,
+        action_id=action.action_id,
+        pos_id="pos-1",
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="failed-trigger-confirm",
+        seen_at=datetime(2026, 8, 2, 1, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).filter_by(
+            execution_order_leg_id=filled_leg_id
+        ).one()
+        primary = session.query(PositionProtectionLeg).filter_by(
+            execution_order_leg_id=filled_leg_id,
+            role="primary_stop",
+            leg_index=1,
+        ).one()
+        ledger = session.query(PositionProtectionLedger).one()
+        revision = session.query(PositionProtectionRevision).one()
+    assert result.applied == 1
+    assert (intent.recovery_state, intent.adopted_order_id) == (
+        "adopted",
+        "stop-child-1",
+    )
+    assert (primary.pos_id, primary.exchange_order_id, primary.status) == (
+        "pos-1",
+        "stop-child-1",
+        "verified",
+    )
+    assert (ledger.pos_id, ledger.order_id, ledger.execution_order_leg_id) == (
+        "pos-1",
+        "stop-child-1",
+        filled_leg_id,
+    )
+    assert revision.status == "active"
+
+
+def test_failed_trigger_intent_repair_sibling_change_invalidates_fingerprint(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, sibling_leg_id = _seed_failed_trigger_intent_repair(session_factory)
+    client = FakeDeepcoinClient([_anonymous_stop_child("stop-child-1")])
+    reviewed = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+    with session_factory() as session:
+        sibling = session.get(ExecutionOrderLeg, sibling_leg_id)
+        sibling.status = "active"
+        sibling.attribution_status = "verified"
+        sibling.pos_id = "pos-2"
+        session.commit()
+    current = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+
+    assert current.fingerprint != reviewed.fingerprint
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        apply_entry_protection_ledger_repair_plan(
+            session_factory,
+            current,
+            action_id=reviewed.actions[0].action_id,
+            pos_id="pos-1",
+            expected_fingerprint=reviewed.fingerprint,
+            confirmation_token="stale-trigger-confirm",
+        )
+
+
 def test_entry_protection_repair_skips_already_repaired_trigger_entry(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_entry_fill(
@@ -556,7 +677,7 @@ def test_intent_adoption_accepts_unique_stop_only_candidate_without_position_id(
     assert result.action.purpose == "stop_loss"
     assert result.action.order_id == "tpsl-new"
     assert result.action.evidence["match"] == (
-        "trigger_protection_intent_stop_only_missing_pos_id"
+        "verified_filled_leg_unique_child"
     )
 
 
@@ -1283,6 +1404,111 @@ def _seed_trigger_entry_fill(session_factory, *, binding_id, legs):
                 )
             )
         session.commit()
+
+
+def _seed_failed_trigger_intent_repair(session_factory):
+    filled_leg_id = 289
+    sibling_leg_id = 290
+    _seed_trigger_entry_fill(
+        session_factory,
+        binding_id=152,
+        legs=[
+            {
+                "leg_id": filled_leg_id,
+                "leg_index": 1,
+                "order_id": "entry-filled",
+                "client_order_id": "entry-client-filled",
+                "pos_id": "pos-1",
+                "size": "0.6",
+                "entry_price": "1828",
+            },
+            {
+                "leg_id": sibling_leg_id,
+                "leg_index": 2,
+                "order_id": "entry-pending",
+                "client_order_id": "entry-client-pending",
+                "pos_id": "temporary-pos",
+                "size": "0.6",
+                "entry_price": "1808",
+            },
+        ],
+    )
+    with session_factory() as session:
+        legs = {
+            int(row.id): row
+            for row in session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.id).all()
+        }
+        events = {
+            str(row.order_id): row
+            for row in session.query(ExecutionEvent).order_by(ExecutionEvent.id).all()
+        }
+        for leg in legs.values():
+            request = json.loads(leg.request_json)
+            request["tpTriggerPx"] = None
+            request["slTriggerPx"] = "1695"
+            leg.request_json = json.dumps(request)
+            events[str(leg.order_id)].request_json = json.dumps(request)
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    request,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            session.add(
+                TriggerProtectionIntent(
+                    venue="deepcoin",
+                    execution_binding_id=152,
+                    execution_order_leg_id=int(leg.id),
+                    request_fingerprint=fingerprint,
+                    pre_submit_tpsl_baseline_json="[]",
+                    correlation_id=f"intent-{leg.id}",
+                    parent_trigger_order_id=str(leg.order_id),
+                    recovery_state=(
+                        "failed" if int(leg.id) == filled_leg_id else "pending"
+                    ),
+                    retry_attempts=5 if int(leg.id) == filled_leg_id else 0,
+                )
+            )
+            create_or_get_protection_leg(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=int(leg.id),
+                role="primary_stop",
+                leg_index=1,
+                planned_trigger_price="1695",
+                planned_size="0.6",
+            )
+            create_or_get_protection_leg(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=int(leg.id),
+                role="backup_stop",
+                leg_index=1,
+                planned_trigger_price=None,
+                planned_size=None,
+            )
+        sibling = legs[sibling_leg_id]
+        sibling.status = "pending"
+        sibling.attribution_status = "unassigned"
+        sibling.pos_id = None
+        session.commit()
+    return filled_leg_id, sibling_leg_id
+
+
+def _anonymous_stop_child(order_id):
+    row = _pending_tpsl_row(
+        order_id,
+        purpose="stop_loss",
+        price="1695",
+        ctime="2026-08-02T00:05:10Z",
+        inst_id="ETH-USDT-SWAP",
+        side="short",
+        size="0.6",
+    )
+    row["posId"] = ""
+    return row
 
 
 def _plan_trigger_entry_adoption(
