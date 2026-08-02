@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+import telegram_kol_research.entry_protection_ledger_repair as repair_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_protection_ledger_repair import (
     EntryProtectionLedgerRepairAction,
@@ -39,6 +40,102 @@ class FakeDeepcoinClient:
             for row in self.rows
             if str(row.get("instId") or "").upper() == inst_id
         ]
+
+
+def _live_evidence_entry_leg(*, size="0.6"):
+    return ExecutionOrderLeg(
+        id=422,
+        execution_binding_id=152,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="entry-1",
+        pos_id="pos-1",
+        venue="deepcoin",
+        attribution_status="verified",
+        status="active",
+        request_json=json.dumps(
+            {
+                "instId": "ETH-USDT-SWAP",
+                "posSide": "long",
+                "sz": size,
+                "price": "1828",
+                "slTriggerPx": "1695",
+            }
+        ),
+    )
+
+
+def _live_evidence_position(**updates):
+    row = {
+        "posId": "pos-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "long",
+        "pos": "0.6",
+        "cTime": "1785609910000",
+    }
+    row.update(updates)
+    return row
+
+
+def test_trigger_protection_live_position_requires_exact_identity_and_size():
+    observed_at = datetime(2026, 8, 2, 5, 0, tzinfo=UTC)
+
+    result = repair_module.build_trigger_protection_live_position(
+        entry_leg=_live_evidence_entry_leg(),
+        position_rows=[_live_evidence_position()],
+        observed_at=observed_at,
+    )
+
+    assert result.refusal is None
+    assert result.position is not None
+    assert result.position.pos_id == "pos-1"
+    assert result.position.instrument_id == "ETH-USDT-SWAP"
+    assert result.position.side == "long"
+    assert result.position.size_text == "0.6"
+    assert result.position.created_at == datetime(2026, 8, 1, 18, 45, 10)
+    assert result.position.observed_at == observed_at
+
+
+@pytest.mark.parametrize(
+    ("position_rows", "reason"),
+    [
+        ([], "trigger_protection_position_not_live"),
+        (
+            [_live_evidence_position(), _live_evidence_position()],
+            "trigger_protection_position_not_unique",
+        ),
+        (
+            [_live_evidence_position(instId="BTC-USDT-SWAP")],
+            "trigger_protection_position_instrument_conflict",
+        ),
+        (
+            [_live_evidence_position(posSide="short")],
+            "trigger_protection_position_side_conflict",
+        ),
+        (
+            [_live_evidence_position(pos="0.5")],
+            "trigger_protection_position_size_changed",
+        ),
+        (
+            [_live_evidence_position(cTime="")],
+            "trigger_protection_position_time_unavailable",
+        ),
+    ],
+)
+def test_trigger_protection_live_position_refuses_incomplete_evidence(
+    position_rows,
+    reason,
+):
+    result = repair_module.build_trigger_protection_live_position(
+        entry_leg=_live_evidence_entry_leg(),
+        position_rows=position_rows,
+        observed_at=datetime(2026, 8, 2, 5, 0, tzinfo=UTC),
+    )
+
+    assert result.position is None
+    assert result.refusal is not None
+    assert result.refusal.reason == reason
 
 
 def test_entry_repair_apply_accepts_only_one_response_anchored_action(

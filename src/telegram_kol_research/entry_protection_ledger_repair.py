@@ -122,6 +122,28 @@ class TriggerProtectionOwnerState:
 
 
 @dataclass(frozen=True, slots=True)
+class TriggerProtectionLivePosition:
+    """Bounded current exchange evidence for one exact trigger-entry position."""
+
+    pos_id: str
+    instrument_id: str
+    side: str
+    size_text: str
+    created_at: datetime
+    observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerProtectionLivePositionResult:
+    position: TriggerProtectionLivePosition | None = None
+    refusal: EntryProtectionLedgerRepairRefusal | None = None
+
+    def __post_init__(self) -> None:
+        if (self.position is None) == (self.refusal is None):
+            raise ValueError("live position result must have exactly one outcome")
+
+
+@dataclass(frozen=True, slots=True)
 class EntryProtectionLedgerRepairPlan:
     created_at: datetime
     actions: tuple[EntryProtectionLedgerRepairAction, ...]
@@ -136,6 +158,82 @@ class EntryProtectionLedgerRepairPlan:
 @dataclass(frozen=True, slots=True)
 class EntryProtectionLedgerRepairResult:
     applied: int
+
+
+def build_trigger_protection_live_position(
+    *,
+    entry_leg: ExecutionOrderLeg,
+    position_rows: list[dict[str, Any]],
+    observed_at: datetime,
+) -> TriggerProtectionLivePositionResult:
+    """Prove one current nonzero position exactly matches a trigger entry leg."""
+
+    binding_id = int(entry_leg.execution_binding_id or 0)
+    pos_id = str(entry_leg.pos_id or "").strip()
+    request = _loads_json(entry_leg.request_json)
+    instrument_id = str(_request_instrument_id(request) or "").upper()
+    side = str(_request_side(request) or "").lower()
+    expected_size = _request_size_text(request)
+    matching = [
+        row
+        for row in position_rows
+        if isinstance(row, dict)
+        and str(row.get("posId") or row.get("pos_id") or row.get("id") or "").strip()
+        == pos_id
+    ]
+
+    def refuse(reason: str, evidence: dict[str, Any] | None = None):
+        return TriggerProtectionLivePositionResult(
+            refusal=EntryProtectionLedgerRepairRefusal(
+                event_id=None,
+                binding_id=binding_id or None,
+                pos_id=pos_id or None,
+                reason=reason,
+                evidence=evidence or {},
+            )
+        )
+
+    if len(matching) == 0:
+        return refuse("trigger_protection_position_not_live")
+    if len(matching) != 1:
+        return refuse(
+            "trigger_protection_position_not_unique",
+            {"candidate_count": len(matching)},
+        )
+    row = matching[0]
+    current_size = _first_nonzero_text(row, "pos", "size", "availPos", "avail_pos")
+    if current_size is None:
+        return refuse("trigger_protection_position_not_live")
+    current_instrument = str(row.get("instId") or row.get("inst_id") or "").upper()
+    if not instrument_id or current_instrument != instrument_id:
+        return refuse(
+            "trigger_protection_position_instrument_conflict",
+            {"instrument_id": current_instrument or None},
+        )
+    current_side = str(row.get("posSide") or row.get("pos_side") or row.get("side") or "").lower()
+    if not side or current_side != side:
+        return refuse(
+            "trigger_protection_position_side_conflict",
+            {"side": current_side or None},
+        )
+    if expected_size is None or not _same_numeric_text(current_size, expected_size):
+        return refuse(
+            "trigger_protection_position_size_changed",
+            {"current_size": current_size, "expected_size": expected_size},
+        )
+    created_at = _parse_datetime(row.get("cTime"))
+    if created_at is None:
+        return refuse("trigger_protection_position_time_unavailable")
+    return TriggerProtectionLivePositionResult(
+        position=TriggerProtectionLivePosition(
+            pos_id=pos_id,
+            instrument_id=instrument_id,
+            side=side,
+            size_text=current_size,
+            created_at=created_at,
+            observed_at=observed_at,
+        )
+    )
 
 
 def upsert_entry_protection_ledger_action(
