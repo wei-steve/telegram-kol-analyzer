@@ -456,27 +456,72 @@ def finalize_source_message_deletion_exit(
                     for value in (_clean_id(leg.pos_id),)
                     if value is not None
                 }
-                identity_invalid = (
-                    lifecycle is None
-                    or binding is None
-                    or lifecycle.execution_binding_id
-                    != deletion_exit.execution_binding_id
-                    or binding.strategy_instance_id
-                    != deletion_exit.strategy_instance_id
-                    or any(
-                        leg.strategy_instance_id
+                leg_order_ids = {
+                    value
+                    for leg in legs
+                    for value in _split_ids(leg.order_id)
+                }
+                leg_client_order_ids = {
+                    value
+                    for leg in legs
+                    for value in _split_ids(leg.client_order_id)
+                }
+                if deletion_exit.execution_binding_id is None:
+                    unexpected_binding = (
+                        session.query(ExecutionBinding.id)
+                        .filter(
+                            ExecutionBinding.chat_id == event.chat_id,
+                            ExecutionBinding.message_id == event.message_id,
+                        )
+                        .first()
+                        if event is not None
+                        else None
+                    )
+                    identity_invalid = (
+                        lifecycle is None
+                        or lifecycle.execution_binding_id is not None
+                        or binding is not None
+                        or bool(legs)
+                        or unexpected_binding is not None
+                    )
+                else:
+                    binding_pos_ids = _split_ids(binding.pos_id) if binding else set()
+                    binding_order_ids = (
+                        _split_ids(binding.order_id) if binding else set()
+                    )
+                    binding_client_order_ids = (
+                        _split_ids(binding.client_order_id) if binding else set()
+                    )
+                    identity_invalid = (
+                        lifecycle is None
+                        or binding is None
+                        or lifecycle.execution_binding_id
+                        != deletion_exit.execution_binding_id
+                        or binding.strategy_instance_id
                         != deletion_exit.strategy_instance_id
-                        for leg in legs
+                        or any(
+                            leg.strategy_instance_id
+                            != deletion_exit.strategy_instance_id
+                            for leg in legs
+                        )
+                        or any(
+                            leg.pos_id and leg.attribution_status != "verified"
+                            for leg in legs
+                        )
+                        or not binding_pos_ids.issubset(exact_pos_ids)
+                        or not binding_order_ids.issubset(leg_order_ids)
+                        or not binding_client_order_ids.issubset(
+                            leg_client_order_ids
+                        )
+                        or (
+                            not legs
+                            and bool(
+                                binding.order_id
+                                or binding.client_order_id
+                                or binding.pos_id
+                            )
+                        )
                     )
-                    or any(
-                        leg.pos_id and leg.attribution_status != "verified"
-                        for leg in legs
-                    )
-                    or (
-                        not legs
-                        and bool(binding.order_id or binding.client_order_id or binding.pos_id)
-                    )
-                )
                 if identity_invalid:
                     deletion_exit.state = "recovery_required"
                     deletion_exit.last_reason = "frozen_ledger_identity_unverified"
@@ -581,7 +626,9 @@ def finalize_source_message_deletion_exit(
                         leg.execution_order_leg_id in {entry.id for entry in legs}
                         and _clean_id(leg.pos_id) in exact_pos_ids
                         for leg in management_legs
-                    )
+                    ) and {
+                        _clean_id(leg.pos_id) for leg in management_legs
+                    } == exact_pos_ids
                     if not (
                         management_terminal
                         and close_intents_complete
@@ -717,6 +764,14 @@ def _mark_reconciliation_waiting(
 def _clean_id(value) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _split_ids(value) -> set[str]:
+    return {
+        item
+        for raw in str(value or "").split(",")
+        if (item := raw.strip())
+    }
 
 
 def _row_value(row, *names):

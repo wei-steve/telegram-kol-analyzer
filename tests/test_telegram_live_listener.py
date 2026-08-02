@@ -180,11 +180,19 @@ def test_live_listener_deletion_waits_for_operation_lock(tmp_path):
 
 
 def test_live_listener_does_not_target_deletion_without_chat_id(
-    tmp_path, caplog
+    tmp_path, monkeypatch
 ):
+    import telegram_kol_research.telegram_live_listener as listener_module
+
     session_factory = create_session_factory(tmp_path / "research.db")
     client = _FakeListenerClient()
     recorded = []
+    warnings = []
+    monkeypatch.setattr(
+        listener_module.logger,
+        "warning",
+        lambda message, *args: warnings.append(message % args),
+    )
 
     async def scenario():
         await run_live_listener(
@@ -204,7 +212,7 @@ def test_live_listener_does_not_target_deletion_without_chat_id(
     asyncio.run(scenario())
 
     assert recorded == []
-    assert "without exact chat_id" in caplog.text
+    assert any("without exact chat_id" in message for message in warnings)
 
 
 def test_persist_live_message_event_triggers_strategy_alert_processor(tmp_path):

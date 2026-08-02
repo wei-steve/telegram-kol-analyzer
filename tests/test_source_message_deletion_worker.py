@@ -80,6 +80,27 @@ def _seed_pending_strategy(
         return raw.id, lifecycle.id, binding.id, leg.id
 
 
+def _seed_never_executed_strategy(session_factory):
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=30,
+            message_id=300,
+            text="BTC long",
+            archived_target_group=True,
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=30,
+            message_id=300,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=NOW,
+        )
+        session.add_all([raw, lifecycle])
+        session.commit()
+        return lifecycle.id
+
+
 def _seed_filled_strategy(session_factory):
     with session_factory() as session:
         raw = RawMessage(
@@ -507,6 +528,39 @@ def test_pending_only_deletion_finishes_cancelled_after_flat_snapshot(tmp_path):
         assert lifecycle.exit_reason == "source_message_deleted"
 
 
+def test_never_executed_deletion_finishes_cancelled_without_a_binding(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    lifecycle_id = _seed_never_executed_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=30,
+        message_id=300,
+        deleted_at=NOW,
+    )
+
+    first = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=object,
+        processed_at=NOW,
+    )
+    second = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=object,
+        snapshot_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            errors={}, positions=[], open_orders=[], pending_trigger_orders=[]
+        ),
+        processed_at=NOW,
+    )
+
+    assert first.waiting == 1
+    assert second.finalized == 1
+    with session_factory() as session:
+        assert session.get(SourceMessageDeletionExit, deletion.exit_id).state == "succeeded"
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert lifecycle.lifecycle_status == "cancelled"
+        assert lifecycle.exit_reason == "source_message_deleted"
+
+
 def test_flat_finalization_fails_closed_when_exchange_snapshot_has_errors(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_pending_strategy(
@@ -630,6 +684,36 @@ def test_unverified_position_identity_can_never_be_declared_flat(tmp_path):
             positions=[{"posId": "pos-filled", "pos": "3"}],
             open_orders=[],
             pending_trigger_orders=[],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "recovery_required"
+
+
+def test_binding_position_identity_missing_from_legs_can_never_be_declared_flat(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        binding = session.get(ExecutionBinding, deletion_exit.execution_binding_id)
+        binding.pos_id = "pos-filled,pos-unledgered"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={}, positions=[], open_orders=[], pending_trigger_orders=[]
         ),
         finalized_at=NOW,
     )
