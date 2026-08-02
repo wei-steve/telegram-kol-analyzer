@@ -313,6 +313,30 @@ def finalize_trigger_protection_adoption(
     )
     if primary is None:
         raise ValueError("trigger_protection_primary_leg_missing")
+    logical_order_owners = (
+        session.query(PositionProtectionLeg)
+        .filter(PositionProtectionLeg.venue == "deepcoin")
+        .filter(PositionProtectionLeg.exchange_order_id == action.order_id)
+        .all()
+    )
+    if any(int(row.id) != int(primary.id) for row in logical_order_owners):
+        raise ValueError("trigger_protection_logical_order_owned")
+    existing_ledger = (
+        session.query(PositionProtectionLedger)
+        .filter(PositionProtectionLedger.venue == "deepcoin")
+        .filter(PositionProtectionLedger.order_id == action.order_id)
+        .one_or_none()
+    )
+    if existing_ledger is not None and (
+        int(existing_ledger.execution_binding_id) != int(action.binding_id)
+        or int(existing_ledger.execution_order_leg_id) != int(action.leg_id)
+        or existing_ledger.strategy_instance_id != action.strategy_instance_id
+        or str(existing_ledger.pos_id or "") != str(action.pos_id)
+        or str(existing_ledger.instrument_id or "").upper()
+        != str(action.instrument_id).upper()
+        or str(existing_ledger.side or "").lower() != str(action.side).lower()
+    ):
+        raise ValueError("protection_ledger_owner_conflict")
     bind_verified_exchange_order(
         session,
         primary,

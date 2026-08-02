@@ -12,6 +12,7 @@ from telegram_kol_research.entry_protection_ledger_repair import (
     TriggerProtectionOwnerState,
     apply_entry_protection_ledger_repair_plan,
     build_entry_protection_ledger_repair_plan,
+    finalize_trigger_protection_adoption,
     plan_trigger_protection_intent_adoption,
     plan_verified_trigger_entry_protection_adoption,
     upsert_entry_protection_ledger_action,
@@ -603,6 +604,127 @@ def test_failed_trigger_intent_repair_apply_finalizes_all_identity_records(tmp_p
         filled_leg_id,
     )
     assert revision.status == "active"
+
+
+def test_trigger_protection_finalizer_rolls_back_when_order_owner_races_plan(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    filled_leg_id, _ = _seed_failed_trigger_intent_repair(session_factory)
+    plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=FakeDeepcoinClient(
+            [_anonymous_stop_child("stop-child-1")]
+        ),
+        now=datetime(2026, 8, 2, 1, 0, tzinfo=UTC),
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+    action = plan.actions[0]
+    with session_factory() as session:
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=999,
+                execution_order_leg_id=998,
+                strategy_instance_id="deepcoin:other",
+                pos_id="other-pos",
+                instrument_id="ETH-USDT-SWAP",
+                side="short",
+                order_id="stop-child-1",
+                purpose="stop_loss",
+                status="verified",
+                evidence_source="competing_owner",
+            )
+        )
+        session.commit()
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).filter_by(
+            execution_order_leg_id=filled_leg_id
+        ).one()
+        with pytest.raises(ValueError, match="protection_ledger_owner_conflict"):
+            finalize_trigger_protection_adoption(
+                session,
+                action=action,
+                intent=intent,
+                seen_at=datetime(2026, 8, 2, 1, 1, tzinfo=UTC),
+            )
+        session.rollback()
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).filter_by(
+            execution_order_leg_id=filled_leg_id
+        ).one()
+        primary = session.query(PositionProtectionLeg).filter_by(
+            execution_order_leg_id=filled_leg_id,
+            role="primary_stop",
+            leg_index=1,
+        ).one()
+        ledger = session.query(PositionProtectionLedger).one()
+        assert session.query(PositionProtectionRevision).count() == 0
+    assert intent.recovery_state == "failed"
+    assert intent.adopted_order_id is None
+    assert primary.exchange_order_id is None
+    assert (ledger.pos_id, ledger.execution_order_leg_id) == ("other-pos", 998)
+
+
+def test_trigger_protection_finalizer_refuses_order_bound_to_other_logical_leg(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    filled_leg_id, sibling_leg_id = _seed_failed_trigger_intent_repair(session_factory)
+    plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=FakeDeepcoinClient(
+            [_anonymous_stop_child("stop-child-1")]
+        ),
+        now=datetime(2026, 8, 2, 1, 0, tzinfo=UTC),
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+    action = plan.actions[0]
+    with session_factory() as session:
+        sibling_primary = session.query(PositionProtectionLeg).filter_by(
+            execution_order_leg_id=sibling_leg_id,
+            role="primary_stop",
+            leg_index=1,
+        ).one()
+        sibling_primary.exchange_order_id = "stop-child-1"
+        sibling_primary.status = "verified"
+        session.commit()
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).filter_by(
+            execution_order_leg_id=filled_leg_id
+        ).one()
+        with pytest.raises(
+            ValueError,
+            match="trigger_protection_logical_order_owned",
+        ):
+            finalize_trigger_protection_adoption(
+                session,
+                action=action,
+                intent=intent,
+                seen_at=datetime(2026, 8, 2, 1, 1, tzinfo=UTC),
+            )
+        session.rollback()
+
+    with session_factory() as session:
+        target_primary = session.query(PositionProtectionLeg).filter_by(
+            execution_order_leg_id=filled_leg_id,
+            role="primary_stop",
+            leg_index=1,
+        ).one()
+        intent = session.query(TriggerProtectionIntent).filter_by(
+            execution_order_leg_id=filled_leg_id
+        ).one()
+        assert session.query(PositionProtectionLedger).count() == 0
+        assert session.query(PositionProtectionRevision).count() == 0
+    assert target_primary.exchange_order_id is None
+    assert intent.recovery_state == "failed"
 
 
 def test_failed_trigger_intent_repair_sibling_change_invalidates_fingerprint(tmp_path):
